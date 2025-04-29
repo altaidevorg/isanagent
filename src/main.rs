@@ -583,15 +583,23 @@ impl<S: SharedState, P: Params + Default> AsyncNodeHandle<S, P> {
     }
 
     /// Run the node directly (outside a flow). Successors are ignored.
-    pub async fn run_async(&self, shared: &mut S) -> PostResult {
-        let mut node_guard = self.node_impl.lock().await;
-        if !node_guard.successors().is_empty() {
-            warn!(
-                "Node '{}': Running node directly, successors will be ignored. Use an AsyncFlow.",
-                node_guard.name()
-            );
-        }
-        node_guard._run_async(shared).await
+    pub fn run_async<'a>(
+        &'a self,
+        shared: &'a mut S,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = PostResult> + Send + 'a>>
+    where
+        P: Params + Default,
+    {
+        Box::pin(async move {
+            let mut node_guard = self.node_impl.lock().await;
+            if !node_guard.successors().is_empty() {
+                warn!(
+                    "Node '{}': Running node directly, successors will be ignored. Use an AsyncFlow.",
+                    node_guard.name()
+                );
+            }
+            node_guard._run_async(shared).await
+        })
     }
 
     // Helper to convert handle to NodeType for graph building
@@ -843,11 +851,13 @@ impl<S: SharedState, P: Params + Default> AsyncFlow<S, P> {
     }
 
     /// Run the asynchronous flow.
-    pub async fn run_async(&self, shared: &mut S) -> PostResult
+    pub fn run_async<'a>(
+        &'a self,
+        shared: &'a mut S,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = PostResult> + Send + 'a>>
     where
-        P: Params + Default + Clone,
+        P: Clone,
     {
-        // Box the inner future to handle recursive async calls
         Box::pin(async move {
             // Lock only to get initial state, then release
             let (start_node, initial_params, flow_name) = {
@@ -865,24 +875,22 @@ impl<S: SharedState, P: Params + Default> AsyncFlow<S, P> {
 
             while let Some(current_node) = current_node_opt {
                 // Lock briefly to get name/successors
-                let (current_node_name, successors_clone) = {
-                    match &current_node {
-                        NodeType::Sync(h) => {
-                            let node_locked = h.node_impl.lock().unwrap();
-                            (node_locked.name(), node_locked.successors().clone())
-                        }
-                        NodeType::Async(h) => {
-                            let node_locked = h.node_impl.lock().await;
-                            (node_locked.name(), node_locked.successors().clone())
-                        }
-                        NodeType::SyncFlow(f) => {
-                            let node_locked = f.node_impl.lock().unwrap();
-                            (node_locked.name(), node_locked.successors().clone())
-                        }
-                        NodeType::AsyncFlow(f) => {
-                            let node_locked = f.node_impl.lock().await;
-                            (node_locked.name(), node_locked.successors().clone())
-                        }
+                let (current_node_name, successors_clone) = match &current_node {
+                    NodeType::Sync(h) => {
+                        let node_locked = h.node_impl.lock().unwrap();
+                        (node_locked.name(), node_locked.successors().clone())
+                    }
+                    NodeType::Async(h) => {
+                        let node_locked = h.node_impl.lock().await;
+                        (node_locked.name(), node_locked.successors().clone())
+                    }
+                    NodeType::SyncFlow(f) => {
+                        let node_locked = f.node_impl.lock().unwrap();
+                        (node_locked.name(), node_locked.successors().clone())
+                    }
+                    NodeType::AsyncFlow(f) => {
+                        let node_locked = f.node_impl.lock().await;
+                        (node_locked.name(), node_locked.successors().clone())
                     }
                 };
 
@@ -906,7 +914,8 @@ impl<S: SharedState, P: Params + Default> AsyncFlow<S, P> {
                 match run_result {
                     Ok(action) => {
                         last_action = Ok(action.clone());
-                        current_node_opt = self.node_impl.lock().await.base.get_next_node(
+                        let flow_impl_guard = self.node_impl.lock().await;
+                        current_node_opt = flow_impl_guard.base.get_next_node(
                             &current_node_name,
                             &successors_clone,
                             &action,
@@ -922,7 +931,6 @@ impl<S: SharedState, P: Params + Default> AsyncFlow<S, P> {
             }
             last_action
         })
-        .await
     }
 
     // Helper to convert handle to NodeType for graph building
@@ -1454,8 +1462,7 @@ mod tests {
         assert!(state
             .log
             .iter()
-            .any(|s| s.contains("ErrorNode: Running fallback")));
-        // If post runs after fallback: assert!(state.log.iter().any(|s| s.contains("ErrorNode: Post after fallback success")));
+            .any(|s| s.contains("ErrorNode: Post after fallback success")));
         assert_eq!(state.counter, 1); // Greeter +1, ErrorNode -1 (from original post logic before fallback)
                                       // Counter depends heavily on when/if post runs after fallback
     }
