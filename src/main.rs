@@ -153,13 +153,21 @@ impl<S: SharedState, P: Params + Default> NodeType<S, P> {
         match self {
             NodeType::Sync(h) => f(h.node_impl.lock().unwrap().successors_mut()),
             NodeType::Async(h) => {
-                let mut guard = block_on(h.node_impl.lock());
-                f(guard.successors_mut())
+                // Async nodes need a runtime to lock their mutex
+                let runtime = tokio::runtime::Handle::current();
+                runtime.block_on(async {
+                    let mut guard = h.node_impl.lock().await;
+                    f(guard.successors_mut())
+                })
             }
             NodeType::SyncFlow(h) => f(h.node_impl.lock().unwrap().successors_mut()),
             NodeType::AsyncFlow(h) => {
-                let mut guard = block_on(h.node_impl.lock());
-                f(guard.successors_mut())
+                // Async flows need a runtime to lock their mutex
+                let runtime = tokio::runtime::Handle::current();
+                runtime.block_on(async {
+                    let mut guard = h.node_impl.lock().await;
+                    f(guard.successors_mut())
+                })
             }
         }
     }
@@ -171,9 +179,19 @@ impl<S: SharedState, P: Params + Default> NodeType<S, P> {
     {
         match self {
             NodeType::Sync(h) => h.node_impl.lock().unwrap().set_params(params.clone()),
-            NodeType::Async(h) => block_on(h.node_impl.lock()).set_params(params.clone()),
+            NodeType::Async(h) => {
+                let runtime = tokio::runtime::Handle::current();
+                runtime.block_on(async {
+                    h.node_impl.lock().await.set_params(params.clone());
+                });
+            }
             NodeType::SyncFlow(h) => h.node_impl.lock().unwrap().set_params(params.clone()),
-            NodeType::AsyncFlow(h) => block_on(h.node_impl.lock()).set_params(params),
+            NodeType::AsyncFlow(h) => {
+                let runtime = tokio::runtime::Handle::current();
+                runtime.block_on(async {
+                    h.node_impl.lock().await.set_params(params);
+                });
+            }
         }
     }
 
@@ -184,9 +202,15 @@ impl<S: SharedState, P: Params + Default> NodeType<S, P> {
     {
         match self {
             NodeType::Sync(h) => h.node_impl.lock().unwrap().name(),
-            NodeType::Async(h) => block_on(h.node_impl.lock()).name(),
+            NodeType::Async(h) => {
+                let runtime = tokio::runtime::Handle::current();
+                runtime.block_on(async { h.node_impl.lock().await.name() })
+            }
             NodeType::SyncFlow(h) => h.node_impl.lock().unwrap().name(),
-            NodeType::AsyncFlow(h) => block_on(h.node_impl.lock()).name(),
+            NodeType::AsyncFlow(h) => {
+                let runtime = tokio::runtime::Handle::current();
+                runtime.block_on(async { h.node_impl.lock().await.name() })
+            }
         }
     }
 }
@@ -583,23 +607,18 @@ impl<S: SharedState, P: Params + Default> AsyncNodeHandle<S, P> {
     }
 
     /// Run the node directly (outside a flow). Successors are ignored.
-    pub fn run_async<'a>(
-        &'a self,
-        shared: &'a mut S,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = PostResult> + Send + 'a>>
+    pub async fn run_async(&self, shared: &mut S) -> PostResult
     where
         P: Params + Default,
     {
-        Box::pin(async move {
-            let mut node_guard = self.node_impl.lock().await;
-            if !node_guard.successors().is_empty() {
-                warn!(
-                    "Node '{}': Running node directly, successors will be ignored. Use an AsyncFlow.",
-                    node_guard.name()
-                );
-            }
-            node_guard._run_async(shared).await
-        })
+        let mut node_guard = self.node_impl.lock().await;
+        if !node_guard.successors().is_empty() {
+            warn!(
+                "Node '{}': Running node directly, successors will be ignored. Use an AsyncFlow.",
+                node_guard.name()
+            );
+        }
+        node_guard._run_async(shared).await
     }
 
     // Helper to convert handle to NodeType for graph building
@@ -612,7 +631,8 @@ impl<S: SharedState, P: Params + Default> AsyncNodeHandle<S, P> {
     where
         P: Default,
     {
-        block_on(self.node_impl.lock()).name()
+        let runtime = tokio::runtime::Handle::current();
+        runtime.block_on(async { self.node_impl.lock().await.name() })
     }
 }
 
@@ -696,7 +716,7 @@ impl<S: SharedState, P: Params + Default> Flow<S, P> {
     where
         P: Params + Default,
     {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = tokio::runtime::Handle::current();
         runtime.block_on(async {
             self.node_impl
                 .lock()
@@ -725,6 +745,7 @@ impl<S: SharedState, P: Params + Default> Flow<S, P> {
     pub fn name(&self) -> String {
         self.node_impl.lock().unwrap().base.name.clone()
     }
+
     pub fn set_params(&self, params: P) {
         self.node_impl.lock().unwrap().base.params = params;
     }
@@ -839,7 +860,7 @@ impl<S: SharedState, P: Params + Default> AsyncFlow<S, P> {
 
     /// Set the starting node for the flow.
     pub fn start(&self, node: NodeType<S, P>) -> NodeType<S, P> {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = tokio::runtime::Handle::current();
         runtime.block_on(async {
             self.node_impl
                 .lock()
@@ -851,17 +872,18 @@ impl<S: SharedState, P: Params + Default> AsyncFlow<S, P> {
     }
 
     /// Run the asynchronous flow.
-    pub fn run_async<'a>(
-        &'a self,
-        shared: &'a mut S,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = PostResult> + Send + 'a>>
+    pub async fn run_async(&self, shared: &mut S) -> PostResult
     where
         P: Clone,
     {
-        Box::pin(async move {
+        // Using an inner function to break the recursion
+        async fn run_inner_impl<S: SharedState, P: Params + Default + Clone>(
+            flow: &AsyncFlow<S, P>, // Changed type from &mut AsyncFlowImpl to &AsyncFlow
+            shared: &mut S,
+        ) -> PostResult {
             // Lock only to get initial state, then release
             let (start_node, initial_params, flow_name) = {
-                let flow_impl_guard = self.node_impl.lock().await;
+                let flow_impl_guard = flow.node_impl.lock().await;
                 (
                     flow_impl_guard.base.start_node.clone(),
                     flow_impl_guard.base.params.clone(),
@@ -874,7 +896,6 @@ impl<S: SharedState, P: Params + Default> AsyncFlow<S, P> {
             let mut last_action = Ok("".to_string());
 
             while let Some(current_node) = current_node_opt {
-                // Lock briefly to get name/successors
                 let (current_node_name, successors_clone) = match &current_node {
                     NodeType::Sync(h) => {
                         let node_locked = h.node_impl.lock().unwrap();
@@ -897,7 +918,6 @@ impl<S: SharedState, P: Params + Default> AsyncFlow<S, P> {
                 // Set Params
                 current_node.set_params(initial_params.clone());
 
-                // Run the node logic
                 let run_result = match &current_node {
                     NodeType::Sync(h) => {
                         let mut node_locked = h.node_impl.lock().unwrap();
@@ -908,13 +928,16 @@ impl<S: SharedState, P: Params + Default> AsyncFlow<S, P> {
                         let mut node_locked = f.node_impl.lock().unwrap();
                         node_locked._run(shared)
                     }
-                    NodeType::AsyncFlow(f) => f.run_async(shared).await,
+                    NodeType::AsyncFlow(f) => {
+                        // Use Box::pin to break the recursion
+                        Box::pin(f.run_async(shared)).await
+                    }
                 };
 
                 match run_result {
                     Ok(action) => {
                         last_action = Ok(action.clone());
-                        let flow_impl_guard = self.node_impl.lock().await;
+                        let flow_impl_guard = flow.node_impl.lock().await;
                         current_node_opt = flow_impl_guard.base.get_next_node(
                             &current_node_name,
                             &successors_clone,
@@ -930,7 +953,10 @@ impl<S: SharedState, P: Params + Default> AsyncFlow<S, P> {
                 }
             }
             last_action
-        })
+        }
+
+        // Call the inner function
+        Box::pin(run_inner_impl(self, shared)).await
     }
 
     // Helper to convert handle to NodeType for graph building
@@ -943,10 +969,15 @@ impl<S: SharedState, P: Params + Default> AsyncFlow<S, P> {
     where
         P: Default,
     {
-        block_on(self.node_impl.lock()).name()
+        let runtime = tokio::runtime::Handle::current();
+        runtime.block_on(async { self.node_impl.lock().await.name() })
     }
+
     pub fn set_params(&self, params: P) {
-        block_on(self.node_impl.lock()).base.params = params;
+        let runtime = tokio::runtime::Handle::current();
+        runtime.block_on(async {
+            self.node_impl.lock().await.base.params = params;
+        })
     }
 }
 
@@ -979,14 +1010,18 @@ where
 
     /// Running an AsyncFlow asynchronously orchestrates its nodes.
     async fn _run_async(&mut self, shared: &mut S) -> PostResult {
-        let mut current_node_opt = self.base.start_node.clone();
-        let mut last_action = Ok("".to_string());
-        let flow_name = self.base.name.clone();
-        let flow_params = self.base.params.clone();
+        // Using an inner function to break the recursion
+        async fn run_inner_impl<S: SharedState, P: Params + Default + Clone>(
+            flow_impl: &mut AsyncFlowImpl<S, P>,
+            shared: &mut S,
+        ) -> PostResult {
+            let mut current_node_opt = flow_impl.base.start_node.clone();
+            let mut last_action = Ok("".to_string());
+            let flow_name = flow_impl.base.name.clone();
+            let flow_params = flow_impl.base.params.clone();
 
-        while let Some(current_node) = current_node_opt {
-            let (current_node_name, successors_clone) = {
-                match &current_node {
+            while let Some(current_node) = current_node_opt {
+                let (current_node_name, successors_clone) = match &current_node {
                     NodeType::Sync(h) => {
                         let node_locked = h.node_impl.lock().unwrap();
                         (node_locked.name(), node_locked.successors().clone())
@@ -1003,40 +1038,48 @@ where
                         let node_locked = f.node_impl.lock().await;
                         (node_locked.name(), node_locked.successors().clone())
                     }
-                }
-            };
+                };
 
-            current_node.set_params(flow_params.clone());
+                current_node.set_params(flow_params.clone());
 
-            let run_result = match &current_node {
-                NodeType::Sync(h) => {
-                    let mut node_locked = h.node_impl.lock().unwrap();
-                    node_locked._run(shared)
-                }
-                NodeType::Async(h) => h.run_async(shared).await,
-                NodeType::SyncFlow(f) => {
-                    let mut node_locked = f.node_impl.lock().unwrap();
-                    node_locked._run(shared)
-                }
-                NodeType::AsyncFlow(f) => f.run_async(shared).await,
-            };
+                let run_result = match &current_node {
+                    NodeType::Sync(h) => {
+                        let mut node_locked = h.node_impl.lock().unwrap();
+                        node_locked._run(shared)
+                    }
+                    NodeType::Async(h) => h.run_async(shared).await,
+                    NodeType::SyncFlow(f) => {
+                        let mut node_locked = f.node_impl.lock().unwrap();
+                        node_locked._run(shared)
+                    }
+                    NodeType::AsyncFlow(f) => {
+                        // Use Box::pin to break the recursion
+                        Box::pin(f.run_async(shared)).await
+                    }
+                };
 
-            match run_result {
-                Ok(action) => {
-                    last_action = Ok(action.clone());
-                    current_node_opt =
-                        self.base
-                            .get_next_node(&current_node_name, &successors_clone, &action);
-                }
-                Err(e) => {
-                    return Err(FlowError::OrchestrationError(format!(
-                        "Nested AsyncFlow '{}' failed at node '{}': {}",
-                        flow_name, current_node_name, e
-                    )));
+                match run_result {
+                    Ok(action) => {
+                        last_action = Ok(action.clone());
+                        current_node_opt = flow_impl.base.get_next_node(
+                            &current_node_name,
+                            &successors_clone,
+                            &action,
+                        );
+                    }
+                    Err(e) => {
+                        return Err(FlowError::OrchestrationError(format!(
+                            "Nested AsyncFlow '{}' failed at node '{}': {}",
+                            flow_name, current_node_name, e
+                        )));
+                    }
                 }
             }
+            last_action
         }
-        last_action
+
+        // Call the inner function
+        Box::pin(run_inner_impl(self, shared)).await
     }
 }
 
@@ -1470,15 +1513,26 @@ mod tests {
     #[tokio::test]
     async fn test_async_flow() {
         // Create nodes
-        let greeter = SyncNodeHandle::new(GreeterLogic, 1, 0).into_nodetype(); // Sync node
+        let greeter = SyncNodeHandle::new(GreeterLogic, 1, 0).into_nodetype(); // sync node
         let fareweller = AsyncNodeHandle::new(FarewellLogic, 1, 0).into_nodetype(); // Async node
 
         // Create flow
         let flow = AsyncFlow::new("AsyncGreetingFlow");
 
         // Build graph
-        flow.start(greeter.clone()) - "success" >> fareweller.clone();
-        greeter.clone() - "failure" >> fareweller.clone(); // Also go to farewell on failure
+        // Use a runtime just for initialization - this is safe as it's not nested in an async context
+        //let runtime = tokio::runtime::Handle::current();
+        //runtime.block_on(async {
+        flow.node_impl
+            .lock()
+            .await
+            .base
+            .set_start_node(greeter.clone());
+        //});
+
+        // Define transitions
+        let _ = greeter.clone() - "success" >> fareweller.clone();
+        let _ = greeter.clone() - "failure" >> fareweller.clone(); // Also go to farewell on failure
 
         // Initial state
         let mut state = MySharedState::default();
