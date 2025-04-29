@@ -763,7 +763,7 @@ where
                         "SyncFlow '{}' encountered an AsyncNode '{}'. Use AsyncFlow.",
                         self.name(),
                         current_node.name()
-                    )))
+                    )));
                 }
                 NodeType::SyncFlow(f) => {
                     let mut node_locked = f.node_impl.lock().unwrap();
@@ -779,7 +779,7 @@ where
                         "SyncFlow '{}' encountered an AsyncFlow '{}'. Use AsyncFlow.",
                         self.name(),
                         current_node.name()
-                    )))
+                    )));
                 }
             };
 
@@ -847,78 +847,82 @@ impl<S: SharedState, P: Params + Default> AsyncFlow<S, P> {
     where
         P: Params + Default + Clone,
     {
-        // Lock only to get initial state, then release
-        let (start_node, initial_params, flow_name) = {
-            let flow_impl_guard = self.node_impl.lock().await;
-            (
-                flow_impl_guard.base.start_node.clone(),
-                flow_impl_guard.base.params.clone(),
-                flow_impl_guard.base.name.clone(),
-            )
-        };
+        // Box the inner future to handle recursive async calls
+        Box::pin(async move {
+            // Lock only to get initial state, then release
+            let (start_node, initial_params, flow_name) = {
+                let flow_impl_guard = self.node_impl.lock().await;
+                (
+                    flow_impl_guard.base.start_node.clone(),
+                    flow_impl_guard.base.params.clone(),
+                    flow_impl_guard.base.name.clone(),
+                )
+            };
 
-        // Use a local mutable variable for the current node
-        let mut current_node_opt = start_node;
-        let mut last_action = Ok("".to_string());
+            // Use a local mutable variable for the current node
+            let mut current_node_opt = start_node;
+            let mut last_action = Ok("".to_string());
 
-        while let Some(current_node) = current_node_opt {
-            // Lock briefly to get name/successors
-            let (current_node_name, successors_clone) = {
-                match &current_node {
+            while let Some(current_node) = current_node_opt {
+                // Lock briefly to get name/successors
+                let (current_node_name, successors_clone) = {
+                    match &current_node {
+                        NodeType::Sync(h) => {
+                            let node_locked = h.node_impl.lock().unwrap();
+                            (node_locked.name(), node_locked.successors().clone())
+                        }
+                        NodeType::Async(h) => {
+                            let node_locked = h.node_impl.lock().await;
+                            (node_locked.name(), node_locked.successors().clone())
+                        }
+                        NodeType::SyncFlow(f) => {
+                            let node_locked = f.node_impl.lock().unwrap();
+                            (node_locked.name(), node_locked.successors().clone())
+                        }
+                        NodeType::AsyncFlow(f) => {
+                            let node_locked = f.node_impl.lock().await;
+                            (node_locked.name(), node_locked.successors().clone())
+                        }
+                    }
+                };
+
+                // Set Params
+                current_node.set_params(initial_params.clone());
+
+                // Run the node logic
+                let run_result = match &current_node {
                     NodeType::Sync(h) => {
-                        let node_locked = h.node_impl.lock().unwrap();
-                        (node_locked.name(), node_locked.successors().clone())
+                        let mut node_locked = h.node_impl.lock().unwrap();
+                        node_locked._run(shared)
                     }
-                    NodeType::Async(h) => {
-                        let node_locked = h.node_impl.lock().await;
-                        (node_locked.name(), node_locked.successors().clone())
-                    }
+                    NodeType::Async(h) => h.run_async(shared).await,
                     NodeType::SyncFlow(f) => {
-                        let node_locked = f.node_impl.lock().unwrap();
-                        (node_locked.name(), node_locked.successors().clone())
+                        let mut node_locked = f.node_impl.lock().unwrap();
+                        node_locked._run(shared)
                     }
-                    NodeType::AsyncFlow(f) => {
-                        let node_locked = f.node_impl.lock().await;
-                        (node_locked.name(), node_locked.successors().clone())
+                    NodeType::AsyncFlow(f) => f.run_async(shared).await,
+                };
+
+                match run_result {
+                    Ok(action) => {
+                        last_action = Ok(action.clone());
+                        current_node_opt = self.node_impl.lock().await.base.get_next_node(
+                            &current_node_name,
+                            &successors_clone,
+                            &action,
+                        );
                     }
-                }
-            };
-
-            // Set Params
-            current_node.set_params(initial_params.clone());
-
-            // Run the node logic
-            let run_result = match &current_node {
-                NodeType::Sync(h) => {
-                    let mut node_locked = h.node_impl.lock().unwrap();
-                    node_locked._run(shared)
-                }
-                NodeType::Async(h) => h.run_async(shared).await,
-                NodeType::SyncFlow(f) => {
-                    let mut node_locked = f.node_impl.lock().unwrap();
-                    node_locked._run(shared)
-                }
-                NodeType::AsyncFlow(f) => f.run_async(shared).await,
-            };
-
-            match run_result {
-                Ok(action) => {
-                    last_action = Ok(action.clone());
-                    current_node_opt = self.node_impl.lock().await.base.get_next_node(
-                        &current_node_name,
-                        &successors_clone,
-                        &action,
-                    );
-                }
-                Err(e) => {
-                    return Err(FlowError::OrchestrationError(format!(
-                        "AsyncFlow '{}' failed at node '{}': {}",
-                        flow_name, current_node_name, e
-                    )));
+                    Err(e) => {
+                        return Err(FlowError::OrchestrationError(format!(
+                            "AsyncFlow '{}' failed at node '{}': {}",
+                            flow_name, current_node_name, e
+                        )));
+                    }
                 }
             }
-        }
-        last_action
+            last_action
+        })
+        .await
     }
 
     // Helper to convert handle to NodeType for graph building
