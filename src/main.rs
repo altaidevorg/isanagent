@@ -2,7 +2,6 @@ use async_trait::async_trait;
 use downcast_rs::{impl_downcast, DowncastSync};
 use dyn_clone::DynClone;
 use futures::executor::block_on;
-use futures::future::join_all;
 use log::{info, warn};
 use std::any::Any;
 use std::collections::HashMap;
@@ -693,7 +692,7 @@ impl<S: SharedState, P: Params + Default> Flow<S, P> {
         runtime.block_on(async {
             self.node_impl
                 .lock()
-                .await
+                .unwrap()
                 .base
                 .set_start_node(node.clone());
         });
