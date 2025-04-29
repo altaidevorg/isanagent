@@ -154,20 +154,40 @@ impl<S: SharedState, P: Params + Default> NodeType<S, P> {
             NodeType::Sync(h) => f(h.node_impl.lock().unwrap().successors_mut()),
             NodeType::Async(h) => {
                 // Async nodes need a runtime to lock their mutex
-                let runtime = tokio::runtime::Handle::current();
-                runtime.block_on(async {
-                    let mut guard = h.node_impl.lock().await;
-                    f(guard.successors_mut())
-                })
+                if let Ok(_handle) = tokio::runtime::Handle::try_current() {
+                    // We're in a tokio context
+                    tokio::task::block_in_place(|| {
+                        futures::executor::block_on(async {
+                            let mut guard = h.node_impl.lock().await;
+                            f(guard.successors_mut())
+                        })
+                    })
+                } else {
+                    // We're not in a tokio context
+                    futures::executor::block_on(async {
+                        let mut guard = h.node_impl.lock().await;
+                        f(guard.successors_mut())
+                    })
+                }
             }
             NodeType::SyncFlow(h) => f(h.node_impl.lock().unwrap().successors_mut()),
             NodeType::AsyncFlow(h) => {
                 // Async flows need a runtime to lock their mutex
-                let runtime = tokio::runtime::Handle::current();
-                runtime.block_on(async {
-                    let mut guard = h.node_impl.lock().await;
-                    f(guard.successors_mut())
-                })
+                if let Ok(_handle) = tokio::runtime::Handle::try_current() {
+                    // We're in a tokio context
+                    tokio::task::block_in_place(|| {
+                        futures::executor::block_on(async {
+                            let mut guard = h.node_impl.lock().await;
+                            f(guard.successors_mut())
+                        })
+                    })
+                } else {
+                    // We're not in a tokio context
+                    futures::executor::block_on(async {
+                        let mut guard = h.node_impl.lock().await;
+                        f(guard.successors_mut())
+                    })
+                }
             }
         }
     }
@@ -180,17 +200,37 @@ impl<S: SharedState, P: Params + Default> NodeType<S, P> {
         match self {
             NodeType::Sync(h) => h.node_impl.lock().unwrap().set_params(params.clone()),
             NodeType::Async(h) => {
-                let runtime = tokio::runtime::Handle::current();
-                runtime.block_on(async {
-                    h.node_impl.lock().await.set_params(params.clone());
-                });
+                // Use spawn_blocking instead of block_on to avoid runtime nesting
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    // We're in a tokio context
+                    tokio::task::block_in_place(|| {
+                        futures::executor::block_on(async {
+                            h.node_impl.lock().await.set_params(params.clone());
+                        });
+                    });
+                } else {
+                    // We're not in a tokio context
+                    futures::executor::block_on(async {
+                        h.node_impl.lock().await.set_params(params.clone());
+                    });
+                }
             }
             NodeType::SyncFlow(h) => h.node_impl.lock().unwrap().set_params(params.clone()),
             NodeType::AsyncFlow(h) => {
-                let runtime = tokio::runtime::Handle::current();
-                runtime.block_on(async {
-                    h.node_impl.lock().await.set_params(params);
-                });
+                // Use spawn_blocking instead of block_on to avoid runtime nesting
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    // We're in a tokio context
+                    tokio::task::block_in_place(|| {
+                        futures::executor::block_on(async {
+                            h.node_impl.lock().await.set_params(params);
+                        });
+                    });
+                } else {
+                    // We're not in a tokio context
+                    futures::executor::block_on(async {
+                        h.node_impl.lock().await.set_params(params);
+                    });
+                }
             }
         }
     }
@@ -203,13 +243,27 @@ impl<S: SharedState, P: Params + Default> NodeType<S, P> {
         match self {
             NodeType::Sync(h) => h.node_impl.lock().unwrap().name(),
             NodeType::Async(h) => {
-                let runtime = tokio::runtime::Handle::current();
-                runtime.block_on(async { h.node_impl.lock().await.name() })
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    // We're in a tokio context
+                    tokio::task::block_in_place(|| {
+                        futures::executor::block_on(async { h.node_impl.lock().await.name() })
+                    })
+                } else {
+                    // We're not in a tokio context
+                    futures::executor::block_on(async { h.node_impl.lock().await.name() })
+                }
             }
             NodeType::SyncFlow(h) => h.node_impl.lock().unwrap().name(),
             NodeType::AsyncFlow(h) => {
-                let runtime = tokio::runtime::Handle::current();
-                runtime.block_on(async { h.node_impl.lock().await.name() })
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    // We're in a tokio context
+                    tokio::task::block_in_place(|| {
+                        futures::executor::block_on(async { h.node_impl.lock().await.name() })
+                    })
+                } else {
+                    // We're not in a tokio context
+                    futures::executor::block_on(async { h.node_impl.lock().await.name() })
+                }
             }
         }
     }
@@ -631,8 +685,15 @@ impl<S: SharedState, P: Params + Default> AsyncNodeHandle<S, P> {
     where
         P: Default,
     {
-        let runtime = tokio::runtime::Handle::current();
-        runtime.block_on(async { self.node_impl.lock().await.name() })
+        if let Ok(_handle) = tokio::runtime::Handle::try_current() {
+            // We're in a tokio context
+            tokio::task::block_in_place(|| {
+                futures::executor::block_on(async { self.node_impl.lock().await.name() })
+            })
+        } else {
+            // We're not in a tokio context
+            futures::executor::block_on(async { self.node_impl.lock().await.name() })
+        }
     }
 }
 
@@ -716,14 +777,27 @@ impl<S: SharedState, P: Params + Default> Flow<S, P> {
     where
         P: Params + Default,
     {
-        let runtime = tokio::runtime::Handle::current();
-        runtime.block_on(async {
-            self.node_impl
-                .lock()
-                .unwrap()
-                .base
-                .set_start_node(node.clone());
-        });
+        if let Ok(_handle) = tokio::runtime::Handle::try_current() {
+            // We're in a tokio context
+            tokio::task::block_in_place(|| {
+                futures::executor::block_on(async {
+                    self.node_impl
+                        .lock()
+                        .unwrap()
+                        .base
+                        .set_start_node(node.clone());
+                })
+            });
+        } else {
+            // We're not in a tokio context
+            futures::executor::block_on(async {
+                self.node_impl
+                    .lock()
+                    .unwrap()
+                    .base
+                    .set_start_node(node.clone());
+            });
+        }
         node
     }
 
@@ -859,15 +933,33 @@ impl<S: SharedState, P: Params + Default> AsyncFlow<S, P> {
     }
 
     /// Set the starting node for the flow.
-    pub fn start(&self, node: NodeType<S, P>) -> NodeType<S, P> {
-        let runtime = tokio::runtime::Handle::current();
-        runtime.block_on(async {
-            self.node_impl
-                .lock()
-                .await
-                .base
-                .set_start_node(node.clone());
-        });
+    pub fn start(&self, node: NodeType<S, P>) -> NodeType<S, P>
+    where
+        P: Params + Default,
+    {
+        if let Ok(_handle) = tokio::runtime::Handle::try_current() {
+            // We're in a tokio context
+            tokio::task::block_in_place(|| {
+                futures::executor::block_on(async {
+                    self.node_impl
+                        .clone()
+                        .lock()
+                        .await
+                        .base
+                        .set_start_node(node.clone());
+                })
+            });
+        } else {
+            // We're not in a tokio context
+            futures::executor::block_on(async {
+                self.node_impl
+                    .clone()
+                    .lock()
+                    .await
+                    .base
+                    .set_start_node(node.clone());
+            });
+        }
         node
     }
 
@@ -969,15 +1061,31 @@ impl<S: SharedState, P: Params + Default> AsyncFlow<S, P> {
     where
         P: Default,
     {
-        let runtime = tokio::runtime::Handle::current();
-        runtime.block_on(async { self.node_impl.lock().await.name() })
+        if let Ok(_handle) = tokio::runtime::Handle::try_current() {
+            // We're in a tokio context
+            tokio::task::block_in_place(|| {
+                futures::executor::block_on(async { self.node_impl.lock().await.name() })
+            })
+        } else {
+            // We're not in a tokio context
+            futures::executor::block_on(async { self.node_impl.lock().await.name() })
+        }
     }
 
     pub fn set_params(&self, params: P) {
-        let runtime = tokio::runtime::Handle::current();
-        runtime.block_on(async {
-            self.node_impl.lock().await.base.params = params;
-        })
+        if let Ok(_handle) = tokio::runtime::Handle::try_current() {
+            // We're in a tokio context
+            tokio::task::block_in_place(|| {
+                futures::executor::block_on(async {
+                    self.node_impl.lock().await.base.params = params;
+                })
+            });
+        } else {
+            // We're not in a tokio context
+            futures::executor::block_on(async {
+                self.node_impl.lock().await.base.params = params;
+            });
+        }
     }
 }
 
