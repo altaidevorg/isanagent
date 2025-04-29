@@ -1,0 +1,13 @@
+[package]
+name = "agent-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+thiserror = "1.0"
+log = "0.4"
+dyn-clone = "1.0"
+downcast-rs = "1.2.1"
