@@ -65,7 +65,7 @@ tokio = { version = "1.28.0", features = ["full"] }
 ### 1. Define your shared state
 
 ```rust
-use agentflow::*;
+use agent_rs::*;
 use std::collections::HashMap;
 
 #[derive(Clone, Debug, Default)]
@@ -78,30 +78,35 @@ struct MyState {
 
 ### 2. Create node logic
 
+Here's an example creating a guardrail node that checks if user questions are weather-related:
+
 ```rust
-use agentflow::*;
-
 #[derive(Debug, Default)]
-struct PromptNode;
+struct GuardrailNode;
 
-impl SyncLogic<MyState, EmptyParams> for PromptNode {
+impl SyncLogic<MyState, EmptyParams> for GuardrailNode {
     fn name(&self) -> String {
-        "PromptGenerator".to_string()
+        "Guardrail".to_string()
     }
 
     fn prep(&mut self, shared: &mut MyState, _params: &EmptyParams) -> PrepResult {
+        shared.conversation_history.push(shared.context.clone());
         // Generate a prompt based on state
-        let prompt = format!("Context: {}\nQuestion: What should I do next?", 
-                            shared.context);
+        let prompt = format!(
+            "User question: {}\nIs this related to weather? yes or no",
+            shared.context
+        );
+        println!("{}: Prepared the prompt", self.name());
         Ok(Box::new(prompt))
     }
 
     fn exec(&mut self, prep_res: AnySendSync, _params: &EmptyParams) -> ExecResult {
         let prompt = prep_res.downcast_ref::<String>().unwrap();
-        println!("Executing with prompt: {}", prompt);
-        
+        println!("{}: Executing with prompt: {:?}", self.name(), prompt);
+
         // In a real implementation, you would send this to an LLM
-        Ok(Box::new("I'll help you with that task.".to_string()))
+        let response = "yes".to_string();
+        Ok(Box::new(response))
     }
 
     fn post(
@@ -114,14 +119,19 @@ impl SyncLogic<MyState, EmptyParams> for PromptNode {
         match exec_res {
             Ok(response) => {
                 let response_str = response.downcast_ref::<String>().unwrap();
-                shared.conversation_history.push(response_str.clone());
-                
+                println!("{}: {:?}", self.name(), response_str);
+                shared
+                    .memory
+                    .insert("relevant".to_string(), response_str.clone());
+
                 // Determine next action based on response content
-                if response_str.contains("help") {
-                    Ok("assist".to_string())
+                let action = if response_str.contains("yes") {
+                    "assist"
                 } else {
-                    Ok("default".to_string())
-                }
+                    "do_not_assist"
+                };
+                println!("{}: Next action: {:?}", self.name(), action);
+                Ok(action.to_string())
             }
             Err(_) => Ok("error".to_string()),
         }
@@ -139,37 +149,115 @@ impl SyncLogic<MyState, EmptyParams> for PromptNode {
 }
 ```
 
+And a response node that generates answers to weather questions:
+
+```rust
+#[derive(Debug, Default)]
+struct ResponseNode;
+
+impl SyncLogic<MyState, EmptyParams> for ResponseNode {
+    fn name(&self) -> String {
+        "ResponseGenerator".to_string()
+    }
+
+    fn prep(&mut self, shared: &mut MyState, _params: &EmptyParams) -> PrepResult {
+        // Generate a response based on state
+        let prompt = format!(
+            "You are a helpful assistant. Answer the following question wisely:\n{:?}",
+            shared.context
+        );
+        println!("{}: Prepared the prompt", self.name());
+        Ok(Box::new(prompt))
+    }
+
+    fn exec(&mut self, prep_res: AnySendSync, _params: &EmptyParams) -> ExecResult {
+        let prompt = prep_res.downcast_ref::<String>().unwrap();
+        println!("{}: Executing with prompt: {:?}", self.name(), prompt);
+
+        // In a real implementation, you would send this to an LLM
+        Ok(Box::new(
+            "Here's a summary of your options: ...".to_string(),
+        ))
+    }
+
+    fn post(
+        &mut self,
+        shared: &mut MyState,
+        _prep_res: AnySendSync,
+        exec_res: ExecResult,
+        _params: &EmptyParams,
+    ) -> PostResult {
+        match exec_res {
+            Ok(response) => {
+                let response_str = response.downcast_ref::<String>().unwrap();
+                shared.conversation_history.push(response_str.clone());
+                Ok("finish".to_string())
+            }
+            Err(_) => Ok("error".to_string()),
+        }
+    }
+
+    fn exec_fallback(
+        &mut self,
+        _prep_res: AnySendSync,
+        error: FlowError,
+        _params: &EmptyParams,
+    ) -> ExecResult {
+        println!("Fallback: {:?}", error);
+        Ok(Box::new("Sorry, I could not process that.".to_string()))
+    }
+}
+```
+
 ### 3. Create and connect nodes in a flow
 
 ```rust
-use agentflow::*;
-
 fn main() {
     // Create nodes
-    let prompt_node = SyncNodeHandle::new(PromptNode, 2, 1).into_nodetype();
-    let thinking_node = SyncNodeHandle::new(ThinkingNode, 1, 0).into_nodetype();
+    let guardrail_node = SyncNodeHandle::new(GuardrailNode, 2, 1).into_nodetype();
     let response_node = SyncNodeHandle::new(ResponseNode, 1, 0).into_nodetype();
-    
+
     // Create flow
     let flow = Flow::<MyState, EmptyParams>::new("AgentConversationFlow");
-    
+
     // Build the graph with conditional routing
-    flow.start(prompt_node.clone());
-    
+    flow.start(guardrail_node.clone());
+
     // Route based on action strings
-    let _ = prompt_node.clone() - "assist" >> thinking_node.clone();
-    let _ = prompt_node.clone() - "default" >> response_node.clone();
-    let _ = thinking_node.clone() - "done" >> response_node.clone();
-    
+    let _ = guardrail_node.clone() - "assist" >> response_node.clone();
+    let _ = guardrail_node.clone() - "do_not_assist" >> guardrail_node.clone();
+
     // Initialize state and run
     let mut state = MyState::default();
-    state.context = "User is asking about weather".to_string();
-    
+    state.context =
+        "It's raining outside, but it'll be sunny in the afternoon. What should I wear today?"
+            .to_string();
+
     // Execute the flow
     let result = flow.run(&mut state);
-    println!("Flow completed with action: {:?}", result);
+    println!("Flow completed with action: {:?}", result.unwrap());
+    println!(
+        "Final message: {:?}",
+        state.conversation_history.last().unwrap()
+    );
 }
 ```
+
+In this example:
+
+1. We define a shared state (`MyState`) that holds conversation context, memory, and history.
+
+2. We implement two nodes:
+   - `GuardrailNode`: Checks if the user's question is weather-related
+   - `ResponseNode`: Generates responses to weather-related questions
+
+3. The flow logic:
+   - We start with the `GuardrailNode` which analyzes the input
+   - If the content is weather-related (action="assist"), it routes to the `ResponseNode`
+   - Otherwise, it routes back to itself as a default action
+   - The `ResponseNode` generates the final response and signals completion
+
+4. We initialize the state with a weather-related question, run the flow, and display the results.
 
 ## 🔄 Advanced Usage
 
@@ -329,28 +417,148 @@ let _ = entry_node.clone() - "process" >> sub_flow.into_nodetype();
 
 ## 🌟 Examples
 
-### Build a RAG (Retrieval-Augmented Generation) Agent
+### Build a Weather Guidance Agent
 
 ```rust
-// Define nodes for each step
-let query_parse = SyncNodeHandle::new(QueryParserNode, 1, 0).into_nodetype();
-let retrieval = SyncNodeHandle::new(DocumentRetrievalNode, 2, 1).into_nodetype();
-let context_merge = SyncNodeHandle::new(ContextMergeNode, 1, 0).into_nodetype();
-let llm_generate = SyncNodeHandle::new(LlmGenerationNode, 2, 1).into_nodetype();
+// Define state for our weather guidance agent
+#[derive(Clone, Debug, Default)]
+struct WeatherState {
+    user_question: String,
+    is_weather_related: bool,
+    conversation_history: Vec<String>,
+}
 
-// Create flow
-let rag_flow = Flow::<RagState, RagParams>::new("RagFlow");
+// Define node for checking if query is weather-related
+#[derive(Debug, Default)]
+struct GuardrailNode;
 
-// Build graph
-rag_flow.start(query_parse.clone());
-let _ = query_parse.clone() - "valid_query" >> retrieval.clone();
-let _ = query_parse.clone() - "invalid_query" >> llm_generate.clone();
-let _ = retrieval.clone() - "docs_found" >> context_merge.clone();
-let _ = retrieval.clone() - "no_docs" >> llm_generate.clone();
-let _ = context_merge.clone() - "context_ready" >> llm_generate.clone();
+impl SyncLogic<WeatherState, EmptyParams> for GuardrailNode {
+    fn name(&self) -> String {
+        "WeatherGuardrail".to_string()
+    }
 
-// Run with initialized state
-let result = rag_flow.run(&mut rag_state);
+    fn prep(&mut self, shared: &mut WeatherState, _params: &EmptyParams) -> PrepResult {
+        // Save user query to history
+        shared.conversation_history.push(shared.user_question.clone());
+        
+        // Prepare prompt that checks if query is weather-related
+        let prompt = format!(
+            "User question: {}\nIs this related to weather? yes or no",
+            shared.user_question
+        );
+        Ok(Box::new(prompt))
+    }
+
+    fn exec(&mut self, prep_res: AnySendSync, _params: &EmptyParams) -> ExecResult {
+        let prompt = prep_res.downcast_ref::<String>().unwrap();
+        
+        // In a real implementation, send to LLM to check weather relevance
+        // For example: openai.chat.completions.create({ messages: [{ role: "user", content: prompt }] })
+        
+        // Simulated response for demo
+        let is_weather = true;
+        Ok(Box::new(if is_weather { "yes" } else { "no" }.to_string()))
+    }
+
+    fn post(
+        &mut self,
+        shared: &mut WeatherState,
+        _prep_res: AnySendSync,
+        exec_res: ExecResult,
+        _params: &EmptyParams,
+    ) -> PostResult {
+        match exec_res {
+            Ok(response) => {
+                let response_str = response.downcast_ref::<String>().unwrap();
+                
+                // Update state based on result
+                shared.is_weather_related = response_str.contains("yes");
+                
+                // Return appropriate action for routing
+                if shared.is_weather_related {
+                    Ok("provide_weather_guidance".to_string())
+                } else {
+                    Ok("not_weather_related".to_string())
+                }
+            }
+            Err(_) => Ok("error".to_string()),
+        }
+    }
+}
+
+// Define node that provides weather guidance
+#[derive(Debug, Default)]
+struct WeatherResponseNode;
+
+impl SyncLogic<WeatherState, EmptyParams> for WeatherResponseNode {
+    fn name(&self) -> String {
+        "WeatherResponse".to_string()
+    }
+
+    fn prep(&mut self, shared: &mut WeatherState, _params: &EmptyParams) -> PrepResult {
+        // Generate prompt for weather-specific response
+        let prompt = format!(
+            "As a weather expert, answer this question: {}",
+            shared.user_question
+        );
+        Ok(Box::new(prompt))
+    }
+
+    fn exec(&mut self, prep_res: AnySendSync, _params: &EmptyParams) -> ExecResult {
+        let prompt = prep_res.downcast_ref::<String>().unwrap();
+        
+        // In a real implementation, send to LLM to generate weather advice
+        // Simulate response for demo
+        let response = "For rainy morning and sunny afternoon, layered clothing works best. \
+                       Start with a waterproof jacket in the morning and remove it later. \
+                       Don't forget an umbrella!".to_string();
+        
+        Ok(Box::new(response))
+    }
+
+    fn post(
+        &mut self,
+        shared: &mut WeatherState,
+        _prep_res: AnySendSync,
+        exec_res: ExecResult,
+        _params: &EmptyParams,
+    ) -> PostResult {
+        match exec_res {
+            Ok(response) => {
+                let response_str = response.downcast_ref::<String>().unwrap();
+                // Store response in conversation history
+                shared.conversation_history.push(response_str.clone());
+                Ok("complete".to_string())
+            }
+            Err(_) => Ok("error".to_string()),
+        }
+    }
+}
+
+// Create and run the weather guidance flow
+fn main() {
+    // Create nodes
+    let guardrail = SyncNodeHandle::new(GuardrailNode, 2, 1).into_nodetype();
+    let weather_response = SyncNodeHandle::new(WeatherResponseNode, 1, 0).into_nodetype();
+    let general_response = SyncNodeHandle::new(GeneralResponseNode, 1, 0).into_nodetype();
+    
+    // Create flow
+    let flow = Flow::<WeatherState, EmptyParams>::new("WeatherGuidanceFlow");
+    
+    // Build graph with conditional routing
+    flow.start(guardrail.clone());
+    let _ = guardrail.clone() - "provide_weather_guidance" >> weather_response.clone();
+    let _ = guardrail.clone() - "not_weather_related" >> general_response.clone();
+    
+    // Initialize state with user question
+    let mut state = WeatherState::default();
+    state.user_question = "It's raining now but will be sunny later. What should I wear today?".to_string();
+    
+    // Run the flow
+    let result = flow.run(&mut state);
+    println!("Flow completed with final action: {:?}", result.unwrap());
+    println!("Final response: {:?}", state.conversation_history.last().unwrap());
+}
 ```
 
 ## 🤝 Contributing

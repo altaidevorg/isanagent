@@ -133,18 +133,18 @@ impl SyncLogic<MyState, EmptyParams> for ResponseNode {
 
 fn main() {
     // Create nodes
-    let prompt_node = SyncNodeHandle::new(GuardrailNode, 2, 1).into_nodetype();
+    let guardrail_node = SyncNodeHandle::new(GuardrailNode, 2, 1).into_nodetype();
     let response_node = SyncNodeHandle::new(ResponseNode, 1, 0).into_nodetype();
 
     // Create flow
     let flow = Flow::<MyState, EmptyParams>::new("AgentConversationFlow");
 
     // Build the graph with conditional routing
-    flow.start(prompt_node.clone());
+    flow.start(guardrail_node.clone());
 
     // Route based on action strings
-    let _ = prompt_node.clone() - "assist" >> response_node.clone();
-    let _ = prompt_node.clone() - "default" >> prompt_node.clone();
+    let _ = guardrail_node.clone() - "assist" >> response_node.clone();
+    let _ = guardrail_node.clone() - "do_not_assist" >> guardrail_node.clone();
 
     // Initialize state and run
     let mut state = MyState::default();
