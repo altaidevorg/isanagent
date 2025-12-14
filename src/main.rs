@@ -1,162 +1,76 @@
-use agent_rs::*;
-use std::collections::HashMap;
+use agent_rs::{ActorLogic, NodeHandle, ActorError};
+use async_trait::async_trait;
+use tokio::time::{sleep, Duration};
 
-#[derive(Clone, Debug, Default)]
-struct MyState {
-    context: String,
-    memory: HashMap<String, String>,
-    conversation_history: Vec<String>,
+// --- Basic Message Type ---
+#[derive(Debug, Clone)]
+enum Message {
+    Ping(usize),
+    Pong(usize),
 }
 
-#[derive(Debug, Default)]
-struct GuardrailNode;
+// --- Ping Actor ---
+struct PingActor;
 
-impl SyncLogic<MyState, EmptyParams> for GuardrailNode {
-    fn name(&self) -> String {
-        "Guardrail".to_string()
+#[async_trait]
+impl ActorLogic<Message> for PingActor {
+    async fn process(&mut self, packet: Message) -> Result<Option<(String, Message)>, ActorError> {
+        match packet {
+            Message::Ping(n) => {
+                println!("[PingActor] Received Ping({})", n);
+                sleep(Duration::from_millis(100)).await;
+                Ok(Some(("pong".to_string(), Message::Pong(n + 1))))
+            }
+            _ => Err(ActorError::from("Unexpected message")),
+        }
     }
+}
 
-    fn prep(&mut self, shared: &mut MyState, _params: &EmptyParams) -> PrepResult {
-        shared.conversation_history.push(shared.context.clone());
-        // Generate a prompt based on state
-        let prompt = format!(
-            "User question: {}\nIs this related to weather? yes or no",
-            shared.context
-        );
-        println!("{}: Prepared the prompt", self.name());
-        Ok(Box::new(prompt))
-    }
+// --- Pong Actor ---
+struct PongActor;
 
-    fn exec(&mut self, prep_res: AnySendSync, _params: &EmptyParams) -> ExecResult {
-        let prompt = prep_res.downcast_ref::<String>().unwrap();
-        println!("{}: Executing with prompt: {:?}", self.name(), prompt);
-
-        // In a real implementation, you would send this to an LLM
-        let response = "yes".to_string();
-        Ok(Box::new(response))
-    }
-
-    fn post(
-        &mut self,
-        shared: &mut MyState,
-        _prep_res: AnySendSync,
-        exec_res: ExecResult,
-        _params: &EmptyParams,
-    ) -> PostResult {
-        match exec_res {
-            Ok(response) => {
-                let response_str = response.downcast_ref::<String>().unwrap();
-                println!("{}: {:?}", self.name(), response_str);
-                shared
-                    .memory
-                    .insert("relevant".to_string(), response_str.clone());
-
-                // Determine next action based on response content
-                let action = if response_str.contains("yes") {
-                    "assist"
+#[async_trait]
+impl ActorLogic<Message> for PongActor {
+    async fn process(&mut self, packet: Message) -> Result<Option<(String, Message)>, ActorError> {
+        match packet {
+            Message::Pong(n) => {
+                println!("[PongActor] Received Pong({})", n);
+                if n < 5 {
+                    sleep(Duration::from_millis(100)).await;
+                    Ok(Some(("ping".to_string(), Message::Ping(n + 1))))
                 } else {
-                    "do_not_assist"
-                };
-                println!("{}: Next action: {:?}", self.name(), action);
-                Ok(action.to_string())
+                    println!("[PongActor] Done.");
+                    Ok(None)
+                }
             }
-            Err(_) => Ok("error".to_string()),
+            _ => Err(ActorError::from("Unexpected message")),
         }
-    }
-
-    fn exec_fallback(
-        &mut self,
-        _prep_res: AnySendSync,
-        error: FlowError,
-        _params: &EmptyParams,
-    ) -> ExecResult {
-        println!("Fallback: {:?}", error);
-        Ok(Box::new("Sorry, I couldn't process that.".to_string()))
     }
 }
 
-#[derive(Debug, Default)]
-struct ResponseNode;
+// --- Main ---
 
-impl SyncLogic<MyState, EmptyParams> for ResponseNode {
-    fn name(&self) -> String {
-        "ResponseGenerator".to_string()
-    }
+#[tokio::main]
+async fn main() {
+    println!("Starting Agent-RS Actor System...");
 
-    fn prep(&mut self, shared: &mut MyState, _params: &EmptyParams) -> PrepResult {
-        // Generate a response based on state
-        let prompt = format!(
-            "You are a helpful assistant. Answer the following question wisely:\n{:?}",
-            shared.context
-        );
-        println!("{}: Prepared the prompt", self.name());
-        Ok(Box::new(prompt))
-    }
+    // Create Nodes
+    let pinger = NodeHandle::new(PingActor, 10, 3, Duration::from_millis(100));
+    let ponger = NodeHandle::new(PongActor, 10, 3, Duration::from_millis(100));
 
-    fn exec(&mut self, prep_res: AnySendSync, _params: &EmptyParams) -> ExecResult {
-        let prompt = prep_res.downcast_ref::<String>().unwrap();
-        println!("{}: Executing with prompt: {:?}", self.name(), prompt);
+    // Wire them: Ping - "pong" >> Pong
+    let _ = &pinger - "pong" >> &ponger;
+    // Wire: Pong - "ping" >> Ping
+    let _ = &ponger - "ping" >> &pinger;
 
-        // In a real implementation, you would send this to an LLM
-        Ok(Box::new(
-            "Here's a summary of your options: ...".to_string(),
-        ))
-    }
+    // Wait for wiring
+    sleep(Duration::from_millis(50)).await;
 
-    fn post(
-        &mut self,
-        shared: &mut MyState,
-        _prep_res: AnySendSync,
-        exec_res: ExecResult,
-        _params: &EmptyParams,
-    ) -> PostResult {
-        match exec_res {
-            Ok(response) => {
-                let response_str = response.downcast_ref::<String>().unwrap();
-                shared.conversation_history.push(response_str.clone());
-                Ok("finish".to_string())
-            }
-            Err(_) => Ok("error".to_string()),
-        }
-    }
+    // Start
+    println!("Sending initial Ping(0)...");
+    pinger.send_packet(Message::Ping(0)).await.unwrap();
 
-    fn exec_fallback(
-        &mut self,
-        _prep_res: AnySendSync,
-        error: FlowError,
-        _params: &EmptyParams,
-    ) -> ExecResult {
-        println!("Fallback: {:?}", error);
-        Ok(Box::new("Sorry, I could not process that.".to_string()))
-    }
-}
-
-fn main() {
-    // Create nodes
-    let guardrail_node = SyncNodeHandle::new(GuardrailNode, 2, 1).into_nodetype();
-    let response_node = SyncNodeHandle::new(ResponseNode, 1, 0).into_nodetype();
-
-    // Create flow
-    let flow = Flow::<MyState, EmptyParams>::new("AgentConversationFlow");
-
-    // Build the graph with conditional routing
-    flow.start(guardrail_node.clone());
-
-    // Route based on action strings
-    let _ = guardrail_node.clone() - "assist" >> response_node.clone();
-    let _ = guardrail_node.clone() - "do_not_assist" >> guardrail_node.clone();
-
-    // Initialize state and run
-    let mut state = MyState::default();
-    state.context =
-        "It's raining outside, but it'll be sunny in the afternoon. What should I wear today?"
-            .to_string();
-
-    // Execute the flow
-    let result = flow.run(&mut state);
-    println!("Flow completed with action: {:?}", result.unwrap());
-    println!(
-        "Final message: {:?}",
-        state.conversation_history.last().unwrap()
-    );
+    // Run for a bit
+    sleep(Duration::from_secs(2)).await;
+    println!("Exiting.");
 }
