@@ -1,0 +1,87 @@
+# Future AI Development Blueprint (agent-rs)
+
+This document serves as the primary system architectural context for any future LLMs continuing to evolve the `agent-rs` framework. If you are an AI tasked with writing a new tool, skill, integration, or feature for `agent-rs`, please read this carefully to avoid producing anti-patterns or breaking the Actor Memory Model.
+
+## 🧠 System Architecture Primer
+
+`agent-rs` completely decouples standard AI sequential blocking loops into a natively concurrent **Actor System**. 
+The core data structure traveling the entire network natively is `agent_rs::bus::BusMessage`:
+
+```rust
+pub enum BusMessage {
+    Inbound(InboundMessage),
+    Outbound(OutboundMessage),
+    Telemetry(TelemetryEvent),
+}
+```
+
+The fundamental philosophy here is **Wait-Free Threading**. Do not use `std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>`. All critical I/O, especially database storage, must route through an opaque lock-free asynchronous Actor (`MemoryActor` wrapping `SqliteMemory` for instance).
+
+### Workspace & Sandboxing
+The agent is explicitly designed to run inside a sandbox. `AltbotWorkspace` manages two boundaries:
+1. `workspace_dir` (Outer Rim): Holds `config.toml`, generated logs, and `.system_generated` internal sqlite caches.
+2. `sandbox_dir` (Inner Rim): This is the designated execution field, usually `workspace_dir/.agents`. This is where the Agent expects to load `AGENTS.md` and read `skills/`.
+
+If you are writing a new `Tool` that mutates the disk or reads files, **DO NOT** let the Agent pass absolute system paths cleanly. You MUST wrap the injection using `crate::utils::resolve_path(&sandbox_dir, &agent_path)`. Doing so naturally bounds all agent `../` directory escapes to the sandbox boundary.
+
+## 🛠 Adding a newly Native Rust Tool
+
+Tools act as the fundamental abilities the Agent uses via JSON schema during its core sequential processing loop inside `AgentLogic`.
+
+1. **Implement `Tool`**: Create a struct in `src/tools/builtin.rs` and implement the `async_trait` `Tool`.
+   - `name`: Strict string representing the tool call name.
+   - `description`: The prompt instruction to the LLM on *how* to use it.
+   - `input_schema`: Use `serde_json::json!` to define a rigid JSON schema the LLM must map arguments to.
+   - `execute`: The async function resolving the payload. Returns `Result<String, String>` (Ok/Err).
+
+2. **Register Tool**: In `src/bin/altbot.rs`, inject the new initialized instance into the global `ToolRegistry` mapped to `AgentLogic`. 
+
+### Proactive Networking during Tools
+If your Tool is incredibly slow (Scraping a massive database, generating an image, compiling code), you should update the user in real-time. Do not await in silence. 
+Inject the `tokio::sync::mpsc::Sender<BusMessage>` channel directly into your tool at creation:
+```rust
+let (tx, _rx) = tokio::sync::mpsc::channel(100);
+let my_slow_tool = MySlowTool::new(tx.clone());
+
+// Inside execute() loop:
+tx.send(BusMessage::Outbound(OutboundMessage { ... })).await.unwrap();
+```
+*Note*: This multiplexed bus routes directly back to whatever channel (Terminal, Slack thread, API) triggered the execution perfectly via its matching `chat_id`. 
+
+## 📝 Adding an AI Skill (Dynamic Markdown)
+
+Don't write Rust code if the problem is strictly formatting, instructions, or contextual workflow. 
+
+Write a `SKILL.md` inside `workspace/.agents/skills/{skill-name}/SKILL.md`.
+
+```yaml
+---
+name: code_review
+description: Analyze Rust lifetime loops
+requires:
+    bins: ["cargo", "rustc"]
+    env: ["GITHUB_TOKEN"]
+always: false
+---
+
+# Instructions
+When checking code...
+```
+
+- When `always` is **false**, the Agent will see its `description` block inside the System Prompt. It will dynamically call a built-in standard tool `load_skill_instructions` if it wants to learn how to do the specific pipeline requested.
+- When `always` is **true**, the raw markdown body is forcibly concatenated directly into every system prompt. This drastically eats context window but ensures rigid behavioral obedience (like global formatting rules).
+- The `requires` object automatically hooks into `which` and `std::env` at startup. If the environment is missing a binary or token, the Agent actively sees it marked as `[❌ UNAVAILABLE MISSING GITHUB_TOKEN]` inside context to prevent hallucinated tool execution failures.
+
+## 🏢 Implementing a new Channel
+
+`agent-rs` has distinct platforms (Channels) polling concurrently. E.g., `TerminalChannel`, `SlackChannel`, `EmailChannel`. 
+
+1. **Implement `Channel`**: Define your struct in `src/channels/{platform}.rs`.
+   - It needs to run a detached background `tokio` thread checking its respective networking protocol endpoint forever.
+   - On inbound parsing, construct `InboundMessage` matching your external packet origin (`chat_id` typically maps to UUIDs, Slack Rooms, or EMail IMAP keys). Send this to the core Actor Bus.
+   - In `Altbot`, you'll spawn this receiver thread explicitly.
+2. **Handle Outbound**: You must also expose an asynchronous listener or method specifically catching `OutboundMessage` packets flowing out of the Actor Bus so you can map the plain string response back into your network's specific protocol (e.g. `slack.chat.postMessage()`).
+
+## 📊 Telemetry Output
+
+If you add a new metric or LLM analytics block, format it explicitly as a `BusMessage::Telemetry(TelemetryEvent)` payload. The `WorkspaceLoggingActor` natively captures, serializes, and writes these structured JSON traces reliably to `conversation.jsonl` acting as the sole analytical pipeline.

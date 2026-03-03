@@ -1,6 +1,6 @@
-# AgentFlow
+# Agent-RS
 
-AgentFlow is a high-performance, actor-based framework for building complex, distinct AI agent workflows in Rust. It leverages the **Actor Model** to provide inherent concurrency, decentralized control flow, and robust error handling.
+Agent-RS is a high-performance, actor-based framework for building complex AI Agent pipelines and unified digital workspaces in Rust. Instead of simple single-threaded request/response scripts, Agent-RS leverages the **Actor Model** to distribute agent logic across parallel, supervisor-tethered nodes, enabling persistent asynchronous messaging over terminal interfaces, Slack bots, and Email.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -8,147 +8,135 @@ AgentFlow is a high-performance, actor-based framework for building complex, dis
 
 - [Overview](#overview)
 - [Key Features](#key-features)
-- [Installation](#installation)
-- [Basic Usage](#basic-usage)
-- [Advanced Patterns](#advanced-patterns)
-  - [Batching](#batching)
-  - [Supervision](#supervision)
-- [API Reference](#api-reference)
-- [Contributing](#contributing)
+- [The Agent Architecture](#the-agent-architecture)
+- [Quick Start](#quick-start)
+- [Configuring Channels](#configuring-channels)
+- [Tools and Skills](#tools-and-skills)
+- [Development Guide](#development-guide)
 
 ## 🔭 Overview
 
-AgentFlow shifts away from centralized "flow" execution to a distributed network of independent actors. Each actor is an isolated unit of logic that communicates via asynchronous message passing.
+Agent-RS was explicitly built for robust multi-modal Artificial Intelligence. Instead of the Agent being frozen inside a blocked blocking `await` loop when dealing with tools, the Agent itself runs as a decoupled Actor receiving a stream of messages from various user networks. 
 
-**Why Actor Model?**
-- **Concurrency**: Actors run in parallel by default (on Tokio).
-- **Simplicity**: No complex shared locks (`Arc<Mutex>`) required for basic flows.
-- **Resilience**: Errors are isolated; supervisors can restart failed actors without crashing the system.
-- **Flexibility**: Define complex routing logic dynamically.
+**Why an Actor Model?**
+- **100% Lock-Free Concurrency**: SQLite Memory channels and Context Assembly run without centralized `Arc<Mutex>` locks, avoiding thread contention natively.
+- **Asynchronous Channels**: The agent can process incoming emails natively in the background without affecting a real-time terminal or Slack session.
+- **Resilience**: Supervisors wrap critical tasks (like disk IO logging) and gracefully restart crashed nodes on fatal panics.
 
 ## 🌟 Key Features
 
-- **Async Native**: Built on `tokio` for high-throughput asynchronous processing.
-- **Declarative Wiring**: Connect actors using readable syntax: `&node1 - "action" >> &node2`.
-- **Smart Defaults**: Minimal boilerplate. `prep`, `post`, and `name` have sensible default implementations.
-- **Robustness**:
-  - **Typed Errors**: Explicit `ActorError` handling.
-  - **Automatic Retries**: Configure retries and backoff per actor.
-  - **Supervision**: Hierarchical fault tolerance with `Supervisor` actors.
-- **Batching**: Generic `Batcher` actor to group high-throughput messages.
+- **Multi-Channel Multiplexing**: Native channels for **Terminal (CLI)**, **Slack Socket Mode**, **IMAP/SMTP Email**, and a local **HTTP API**.
+- **Isolated SQLite Worker Memory**: Seamless Context window persistence per channel thread. (E.g., talking to the agent on Slack `D1234` is distinct memory from talking to the agent on Terminal).
+- **Proactive Multi-Step Reasoning**: Agents can yield dynamic intermediate `BusMessage::Outbound` packets to the user during long multi-tool execution sequences. 
+- **Telemetry & Observability**: Granular log streaming (capturing `reasoning_content`, `prompt_tokens`, `ToolCall`, etc.) output natively to `.system_generated/logs/conversation.jsonl`.
+- **Progressive Skill Loading**: Exposes complex Anthropic-style YAML Markdown files directly into the LLM context only when the Agent requests the tool via dependency-validated schema registries.
 
-## 📦 Installation
+## 🧠 The Agent Architecture
 
-Add AgentFlow to your `Cargo.toml`:
+The core message bus routes information between interfaces (e.g. Slack, Terminal) and the LLM execution logic.
 
+1.  **Channels**: Poll external networks or standard input and emit `BusMessage::Inbound(InboundMessage)` tagged with a distinct `chat_id` and `channel` origin. 
+2.  **Session Manager & Memory**: The Actor receives the Inbound envelope, delegates context fetching to an internal Lock-Free SQLite Memory Actor by hashing `channel:chat_id:thread_id`, and injects the previous message buffer alongside the new prompt.
+3.  **Tool Execution**: The Agent evaluates the prompt and emits `ToolCall` requests. Built-in tools process (with strict workspace dir-sandboxing and bounded execution time) and return results without holding up the global bus.
+4.  **Multiplexed Output**: Once the run completes, the Agent fires a `BusMessage::Outbound(OutboundMessage)` back to the central bus router, which pipes the envelope explicitly to the original Channel that requested it.
+
+## 🚀 Quick Start
+
+### 1. Build The Project 
+```bash
+cargo build --release
+```
+
+### 2. Configure Your Workspace
+Agent-RS expects a "Workspace" root containing your configuration and where the Agent is allowed to read/write state securely.
+
+Create a directory (e.g., `my_agent`) and place a `config.toml`:
 ```toml
-[dependencies]
-agentflow = "0.1.0"
-async-trait = "0.1.68"
-tokio = { version = "1.28.0", features = ["full"] }
+[app]
+max_iterations = 25
+max_tool_output_chars = 3000
+restrict_to_workspace = true
+
+[provider]
+model_name = "gemini-2.5-flash"
+api_key_env = "GEMINI_API_KEY"
+
+[slack]
+enabled = false
+app_token = "xapp-..."
+bot_token = "xoxb-..."
 ```
 
-## 🚀 Basic Usage
-
-### 1. Define your Message and Actor
-
-```rust
-use agent_rs::{ActorLogic, NodeHandle, ActorError};
-use async_trait::async_trait;
-
-#[derive(Clone, Debug)]
-struct MyMessage(String);
-
-struct EchoActor;
-
-#[async_trait]
-impl ActorLogic<MyMessage> for EchoActor {
-    // optional: fn name(), fn prep(), fn post() have defaults!
-    
-    async fn process(&mut self, msg: MyMessage) -> Result<Option<(String, MyMessage)>, ActorError> {
-        println!("Received: {}", msg.0);
-        Ok(Some(("next".to_string(), msg)))
-    }
-}
+### 3. Run the Agent
+```bash
+# Pass your workspace path and config relative to the binary
+cargo run --bin altbot -- --workspace my_agent --config my_agent/config.toml
 ```
 
-### 2. Wire and Run
+## � Configuring Channels
 
-```rust
-#[tokio::main]
-async fn main() {
-    // Create Nodes
-    // Logic, Buffer Size, Max Retries, Retry Wait
-    let node1 = NodeHandle::new(EchoActor, 10, 3, std::time::Duration::from_millis(100));
-    let node2 = NodeHandle::new(EchoActor, 10, 3, std::time::Duration::from_millis(100));
+The `[channel_name]` blocks in `config.toml` allow you to bring external integrations online cleanly:
 
-    // Connect them
-    let _ = &node1 - "next" >> &node2;
-
-    // Send Message
-    node1.send_packet(MyMessage("Hello Actor World!".into())).await.unwrap();
-
-    // Prevent main text from exiting immediately
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-}
+### HTTP API Channel
+Start a local REST server compatible with OpenAI JSON schemas for testing the core engine programmatically. 
+```toml
+[api]
+enabled = true
+port = 8080
+```
+```bash
+curl http://localhost:8080/v1/chat/completions -d '{"message": "Hello!"}'
 ```
 
-## 🔄 Advanced Patterns
-
-### Batching
-
-Efficiently process high-volume streams by grouping messages.
-
-```rust
-use agent_rs::Batcher;
-
-// Create a batcher that flushes every 10 items OR every 1 second
-let batcher_logic = Batcher::new(
-    10,                                // Batch Size
-    Duration::from_secs(1),            // Timeout
-    "flush".to_string(),               // Action to emit
-    |items: Vec<MyMsg>| MyMsg::Batch(items) // Wrap items
-);
-
-let batcher_node = NodeHandle::new(batcher_logic, 100, 3, Duration::ZERO);
+### Slack Socket Mode
+Listens directly to Slack Channels without requiring an ingress webhook proxy.
+```toml
+[slack]
+enabled = true
+app_token = "xapp-..."  # Requires Socket Mode toggled in Slack App Settings
+bot_token = "xoxb-..."
+reply_in_thread = true
 ```
 
-### Supervision
-
-Automatically recover from failures using a `Supervisor`.
-
-```rust
-use agent_rs::{Supervisor, SupervisorPolicy};
-
-// Factory to create a fresh instance of your actor
-let factory = || Box::new(MyFlakyActor::new());
-
-// Create Supervisor with Restart Policy
-let supervised_logic = Supervisor::new(SupervisorPolicy::Restart, factory);
-let node = NodeHandle::new(supervised_logic, 10, 3, Duration::from_millis(100));
-
-// If MyFlakyActor crashes, Supervisor will restart it and retry the message.
+### Email Pipeline
+Uses IMAP `Idler` threads and an SMTP transport pool.
+```toml
+[email]
+enabled = true
+imap_host = "imap.example.com"
+imap_username = "bot@example.com"
+imap_password = "..." # Recommened: Set via Env Var override
+smtp_host = "smtp.example.com" # etc
 ```
 
-## 📚 API Reference
+## 🛠 Tools and Skills
 
-### `ActorLogic<T>` Trait
-The core interface for your business logic.
-- `prep(msg)`: Prepare/Validate input (Default: pass-through).
-- `process(msg)`: **Required**. Core logic execution. Returns `Option<(Action, T)>`.
-- `post(result)`: Post-process output (Default: pass-through).
-- `name()`: Actor name for logging (Default: Struct name via reflection).
-- `tick_interval()` / `on_tick()`: Optional periodic background tasks.
+Agent-RS supports dual-layer extensibility: Built-in strict Rust Tools, and dynamic `Markdown` LLM Skills.
 
-### `NodeHandle<T>`
-The handle allows you to control the actor.
-- `send_packet(msg)`: Send a message to the actor.
-- `clone()`: Cheaply cloneable for usage in multiple places.
+### Built-in Tools
+Tools like `web_scrape`, `shell_exec`, `list_dir`, `read_file` are mapped natively in `src/tools/builtin.rs`. If `restrict_to_workspace` is true, Agent-RS heavily validates file-system calls preventing the AI from path traversing outside the active workspace directory or manipulating system state.
 
-## 🤝 Contributing
+### Markdown Skills (`/workspace/.agents/skills/`)
+Skills provide complex workflows, templates, or instructions natively to the Agent without recompiling Rust code. 
+Place a directory in `skills/` containing a `SKILL.md` file using YAML frontmatter:
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+```markdown
+---
+name: create_dockerfile
+description: Write optimal Rust Alpine dockerfiles
+requires:
+  bins: ["docker"]
+always: false
+---
+
+# Docker Instructions 
+When asked to containerize this app, you MUST use cargo-chef and multi-stage builds...
+```
+
+The Agent will see the capability in its system prompt and can dynamically call `load_skill_instructions(name: "create_dockerfile")` to inject this explicitly when needed.
+
+## 🤝 Development Guide
+For specific guidance on developing new Tools, Skills, or contributing to the architecture as an automated agent yourself, please refer to the dedicated [`GEMINI.md`](./GEMINI.md) blueprint document.
 
 ## 📄 License
-
 This project is licensed under the MIT License - see the LICENSE file for details.

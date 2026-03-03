@@ -1,1 +1,8 @@
 /target
+*.db
+.system_generated
+logs
+*.json
+.jsonl
+test_altbot2
+config.toml

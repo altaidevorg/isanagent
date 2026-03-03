@@ -6,6 +6,21 @@ use tokio::sync::mpsc;
 use std::ops::{Sub, Shr};
 use tokio::time::{sleep, Duration};
 
+pub mod utils;
+pub mod traits;
+pub mod memory;
+pub mod tools;
+pub mod agent;
+pub mod provider;
+pub mod scheduler;
+pub mod workspace;
+pub mod skills;
+pub mod config;
+pub mod bus;
+pub mod channels;
+pub mod session;
+pub mod logging;
+
 // --- Message Protocol ---
 
 // Define the message protocol and actor logic.
@@ -151,7 +166,7 @@ where
 /// Actors consume messages of type `T` and produce results which determine the next route.
 /// This logic runs inside the actor's event loop.
 #[async_trait]
-pub trait ActorLogic<T>: Send + Sync + 'static
+pub trait ActorLogic<T>: Send + 'static
 where
     T: Debug + Send + Sync + Clone + 'static,
 {
@@ -250,7 +265,17 @@ where T: Debug + Send + Sync + Clone + 'static
                             attempt += 1;
                             match self.logic.on_tick().await {
                                 Ok(Some((action, new_data))) => {
-                                    self.route(action, new_data).await;
+                                    let successor = self.get_successor(&action);
+                                    if let Some(sender) = successor {
+                                        info!("Actor '{}' transitioning with action '{}'.", self.name, action);
+                                        let _ = sender.send(Message::Packet(new_data)).await;
+                                    } else {
+                                        if !self.successors.is_empty() {
+                                            warn!("Actor '{}' has no successor for action '{}'. Dropping packet.", self.name, action);
+                                        } else {
+                                            info!("Actor '{}' finished chain (no successors).", self.name);
+                                        }
+                                    }
                                     break;
                                 }
                                 Ok(None) => {
@@ -300,11 +325,21 @@ where T: Debug + Send + Sync + Clone + 'static
 
                             match run_lifecycle.await {
                                 Ok(Some((action, new_data))) => {
-                                    self.route(action, new_data).await;
+                                    let successor = self.get_successor(&action);
+                                    if let Some(sender) = successor {
+                                        info!("Actor '{}' transitioning with action '{}'.", self.name, action);
+                                        let _ = sender.send(Message::Packet(new_data)).await;
+                                    } else {
+                                        if !self.successors.is_empty() {
+                                            warn!("Actor '{}' has no successor for action '{}'. Dropping packet.", self.name, action);
+                                        } else {
+                                            info!("Actor '{}' finished chain (no successors).", self.name);
+                                        }
+                                    }
                                     break; // Success
                                 }
                                 Ok(None) => {
-                                    info!("Actor '{}' withheld output (buffering?).", self.name);
+                                    info!("Actor '{}' consumed packet (no further action needed).", self.name);
                                     break; // Success (absorbed)
                                 }
                                 Err(e) => {
@@ -343,27 +378,11 @@ where T: Debug + Send + Sync + Clone + 'static
         info!("Actor '{}' run loop finished.", self.name);
     }
 
-    async fn route(&self, action: String, new_data: T) {
-         if let Some(successor) = self
-            .successors
-            .get(&action)
+    fn get_successor(&self, action: &str) -> Option<mpsc::Sender<Message<T>>> {
+        self.successors
+            .get(action)
             .or_else(|| self.successors.get("default"))
-        {
-            info!(
-                "Actor '{}' transitioning with action '{}'.",
-                self.name, action
-            );
-            let _ = successor.send(Message::Packet(new_data)).await;
-        } else {
-            if !self.successors.is_empty() {
-                warn!(
-                    "Actor '{}' has no successor for action '{}'. Dropping packet.",
-                    self.name, action
-                );
-            } else {
-                info!("Actor '{}' finished chain (no successors).", self.name);
-            }
-        }
+            .cloned()
     }
 }
 
@@ -494,6 +513,30 @@ where
             .send(Message::Packet(packet))
             .await
             .map_err(|e| e.to_string())
+    }
+
+    /// Asynchronously wire a successor to this node for a given action.
+    /// This ensures the wiring message is sent before returning.
+    pub async fn wire(&self, action: &str, target: &NodeHandle<T>) {
+        let msg = Message::AddSuccessor {
+            action: action.to_string(),
+            sender: target.sender.clone(),
+        };
+        if let Err(e) = self.sender.send(msg).await {
+             log::error!("Failed to wire successor: {}", e);
+        }
+    }
+
+    /// Create a "Listener" handle and a receiver.
+    /// This handle acts as a valid destination for actors, but sends messages directly to the returned receiver
+    /// instead of another actor. Use this to consume outputs in the main thread.
+    pub fn create_listener(name: &str, buffer: usize) -> (Self, mpsc::Receiver<Message<T>>) {
+        let (tx, rx) = mpsc::channel(buffer);
+        let handle = Self {
+            sender: tx,
+            name: name.to_string(),
+        };
+        (handle, rx)
     }
 }
 
