@@ -4,5 +4,6 @@
 logs
 *.json
 .jsonl
+test_altbot
 test_altbot2
 config.toml
