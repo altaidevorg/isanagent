@@ -613,20 +613,28 @@ impl Tool for CronTool {
                     "type": "string",
                     "description": "The message to send back to you when triggered. Required for 'add' action."
                 },
+                "chat_id": {
+                    "type": "string",
+                    "description": "The target chat ID. You must extract this explicitly from the RUNTIME CONTEXT block."
+                },
+                "channel": {
+                    "type": "string",
+                    "description": "The target channel (e.g., 'terminal', 'slack'). Extract this from the RUNTIME CONTEXT block."
+                },
                 "every_seconds": {
                     "type": "integer",
                     "description": "Execute repeatedly every N seconds. Mutually exclusive with 'at' and 'cron_expr'."
                 },
                 "at": {
                     "type": "string",
-                    "description": "Execute once at a specific ISO datetime. Mutually exclusive with 'every_seconds' and 'cron_expr'."
+                    "description": "Execute once at a specific ISO datetime. You MUST include the exact correct timezone offset from your RUNTIME CONTEXT (e.g. 2026-03-04T13:45:53+03:00, NOT ending in Z unless you are in UTC). Mutually exclusive with 'every_seconds' and 'cron_expr'."
                 },
                 "cron_expr": {
                     "type": "string",
                     "description": "Execute using a 7-part cron string. Mutually exclusive with 'every_seconds' and 'at'."
                 }
             },
-            "required": ["action"]
+            "required": ["action", "chat_id", "channel"]
         })
     }
 
@@ -643,12 +651,14 @@ impl Tool for CronTool {
 
         if action == "add" {
             let message = args.get("message").and_then(|v| v.as_str()).ok_or("Missing 'message' for add action")?;
+            let chat_id = args.get("chat_id").and_then(|v| v.as_str()).ok_or("Missing 'chat_id' for add action")?;
+            let channel = args.get("channel").and_then(|v| v.as_str()).ok_or("Missing 'channel' for add action")?;
             let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
 
             let schedule = if let Some(secs) = args.get("every_seconds").and_then(|v| v.as_i64()) {
                 crate::scheduler::ScheduleKind::Every { every_ms: secs * 1000 }
             } else if let Some(at) = args.get("at").and_then(|v| v.as_str()) {
-                let dt = chrono::DateTime::parse_from_rfc3339(at).map_err(|_| "Invalid ISO format for 'at'")?;
+                let dt = chrono::DateTime::parse_from_rfc3339(at).map_err(|_| "Invalid ISO format for 'at'. Make sure you include the proper UTC offset as provided in context.")?;
                 crate::scheduler::ScheduleKind::At { at_ms: dt.timestamp_millis() }
             } else if let Some(expr) = args.get("cron_expr").and_then(|v| v.as_str()) {
                 crate::scheduler::ScheduleKind::Cron { cron_expr: expr.to_string() }
@@ -660,6 +670,8 @@ impl Tool for CronTool {
                 id: id.clone(),
                 schedule,
                 message: message.to_string(),
+                chat_id: chat_id.to_string(),
+                channel: channel.to_string(),
             };
 
             let json_str = serde_json::to_string(&cmd).map_err(|e| e.to_string())?;
@@ -729,6 +741,109 @@ impl Tool for MessageTool {
         match self.outbound_tx.send(msg).await {
             Ok(_) => Ok(format!("Message sent to {}:{}", channel, chat_id)),
             Err(e) => Err(format!("Failed to send message: {}", e)),
+        }
+    }
+}
+
+pub struct SearchMemoryTool {
+    pub memory_node: NodeHandle<crate::memory::MemoryMessage>,
+}
+
+#[async_trait]
+impl Tool for SearchMemoryTool {
+    fn name(&self) -> &str {
+        "search_memory"
+    }
+
+    fn description(&self) -> &str {
+        "Search your long-term and short-term memory (session summaries) for past context, facts, or keywords."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Keyword or phrase to search for."
+                }
+            },
+            "required": ["query"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, String> {
+        let query = args.get("query").and_then(|v| v.as_str()).ok_or("Missing 'query'")?;
+        
+        // Use oneshot channel to await the reply from the MemoryActor
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let msg = crate::memory::MemoryMessage::SearchSummaries {
+            query: query.to_string(),
+            reply: crate::memory::SharedReply::new(tx),
+        };
+        
+        self.memory_node.send_packet(msg).await.map_err(|e| e.to_string())?;
+        
+        let results = rx.await.map_err(|_| "Memory Actor Channel Closed")?.map_err(|e| e)?;
+        
+        if results.is_empty() {
+            Ok(format!("No memory results found for '{}'.", query))
+        } else {
+            Ok(format!("Memory Search Results:\n\n{}", results.join("\n\n---\n\n")))
+        }
+    }
+}
+
+pub struct FetchMemoryByDateTool {
+    pub memory_node: NodeHandle<crate::memory::MemoryMessage>,
+}
+
+#[async_trait]
+impl Tool for FetchMemoryByDateTool {
+    fn name(&self) -> &str {
+        "fetch_memory_by_date"
+    }
+
+    fn description(&self) -> &str {
+        "Fetch long-term and short-term memory (session summaries) from a specific relative time range, like the last 7 days."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "days_ago": {
+                    "type": "integer",
+                    "description": "Number of days in the past to search from. For example, 7 means 'within the last 7 days'."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of summaries to return."
+                }
+            },
+            "required": ["days_ago", "limit"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, String> {
+        let days_ago = args.get("days_ago").and_then(|v| v.as_u64()).ok_or("Missing or invalid 'days_ago'")?;
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+        
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let msg = crate::memory::MemoryMessage::FetchSummariesByTimeRange {
+            days_ago,
+            limit,
+            reply: crate::memory::SharedReply::new(tx),
+        };
+        
+        self.memory_node.send_packet(msg).await.map_err(|e| e.to_string())?;
+        
+        let results = rx.await.map_err(|_| "Memory Actor Channel Closed")?.map_err(|e| e)?;
+        
+        if results.is_empty() {
+            Ok(format!("No memory results found in the last {} days.", days_ago))
+        } else {
+            Ok(format!("Memory Results (Last {} days):\n\n{}", days_ago, results.join("\n\n---\n\n")))
         }
     }
 }

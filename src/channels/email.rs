@@ -47,64 +47,74 @@ impl Channel for EmailChannel {
 
                     session.select("INBOX").map_err(|e| e.to_string())?;
                     
-                    let messages = session.search("UNSEEN").map_err(|e| e.to_string())?;
-                    
-                    for seq in messages {
-                        if let Ok(fetches) = session.fetch(seq.to_string(), "(ENVELOPE BODY[TEXT])") {
-                            for m in fetches.iter() {
-                                let mut sender = String::from("unknown@example.com");
-                                let mut subject = String::new();
-                                
-                                if let Some(envelope) = m.envelope() {
-                                    if let Some(subject_bytes) = envelope.subject {
-                                        subject = String::from_utf8_lossy(subject_bytes).to_string();
-                                    }
-                                    if let Some(froms) = envelope.from.as_ref() {
-                                        if let Some(from) = froms.first() {
-                                            if let (Some(mailbox), Some(host)) = (from.mailbox, from.host) {
-                                                sender = format!("{}@{}", 
-                                                    String::from_utf8_lossy(mailbox), 
-                                                    String::from_utf8_lossy(host)
-                                                );
+                    // Permanent streaming connection
+                    loop {
+                        log::info!("Searching for UNSEEN emails...");
+                        let messages = session.search("UNSEEN").map_err(|e| e.to_string())?;
+                        
+                        log::info!("Found {} UNSEEN messages", messages.len());
+                        for seq in messages {
+                            log::info!("Fetching message {}", seq);
+                            if let Ok(fetches) = session.fetch(seq.to_string(), "(ENVELOPE BODY[TEXT])") {
+                                for m in fetches.iter() {
+                                    let mut sender = String::from("unknown@example.com");
+                                    let mut subject = String::new();
+                                    
+                                    if let Some(envelope) = m.envelope() {
+                                        if let Some(subject_bytes) = envelope.subject {
+                                            subject = String::from_utf8_lossy(subject_bytes).to_string();
+                                        }
+                                        if let Some(froms) = envelope.from.as_ref() {
+                                            if let Some(from) = froms.first() {
+                                                if let (Some(mailbox), Some(host)) = (from.mailbox, from.host) {
+                                                    sender = format!("{}@{}", 
+                                                        String::from_utf8_lossy(mailbox), 
+                                                        String::from_utf8_lossy(host)
+                                                    );
+                                                }
                                             }
                                         }
                                     }
-                                }
 
-                                let mut content = String::new();
-                                if let Some(body) = m.text() {
-                                    content = String::from_utf8_lossy(body).trim().to_string();
-                                }
+                                    let mut content = String::new();
+                                    if let Some(body) = m.text() {
+                                        content = String::from_utf8_lossy(body).trim().to_string();
+                                    }
 
-                                let thread_id = subject;
-                                let chat_id = sender.clone();
+                                    let thread_id = subject;
+                                    let chat_id = sender.clone();
 
-                                let inbound = InboundMessage {
-                                    channel: "email".to_string(),
-                                    sender_id: sender.clone(),
-                                    chat_id,
-                                    thread_id: Some(thread_id),
-                                    content,
-                                    metadata: std::collections::HashMap::new(),
-                                };
+                                    let inbound = InboundMessage {
+                                        channel: "email".to_string(),
+                                        sender_id: sender.clone(),
+                                        chat_id,
+                                        thread_id: Some(thread_id),
+                                        content,
+                                        metadata: std::collections::HashMap::new(),
+                                    };
 
-                                if let Err(e) = tx.blocking_send(inbound) {
-                                    error!("Failed to route email to agent bus: {}", e);
+                                    if let Err(e) = tx.blocking_send(inbound) {
+                                        error!("Failed to route email to agent bus: {}", e);
+                                    }
                                 }
                             }
+                            // Mark as read
+                            let _ = session.store(format!("{}", seq), "+FLAGS (\\Seen)");
                         }
-                        // Mark as read
-                        let _ = session.store(format!("{}", seq), "+FLAGS (\\Seen)");
+                        
+                        log::info!("Entering IMAP IDLE state...");
+                        {
+                            let idle = session.idle().map_err(|e| e.to_string())?;
+                            idle.wait_keepalive().map_err(|e| format!("IDLE failed: {}", e))?;
+                        }
+                        log::info!("Woke up from IMAP IDLE state!");
                     }
-                    
-                    session.logout().map_err(|e| e.to_string())?;
-                    Ok(())
                 }).await;
 
                 if let Err(e) = res {
                     error!("IMAP panic: {}", e);
                 } else if let Ok(Err(e)) = res {
-                    error!("IMAP Error: {}", e);
+                    error!("IMAP Error: {}. Reconnecting in 15 seconds.", e);
                 }
 
                 tokio::time::sleep(Duration::from_secs(15)).await;
@@ -135,7 +145,8 @@ impl Channel for EmailChannel {
 
             let creds = Credentials::new(config.imap_username.clone(), config.imap_password.clone());
 
-            let mailer = SmtpTransport::builder_dangerous(&config.smtp_host)
+            let mailer = SmtpTransport::relay(&config.smtp_host)
+                .map_err(|e| format!("Invalid SMTP host: {}", e))?
                 .port(config.smtp_port)
                 .credentials(creds)
                 .build();

@@ -24,6 +24,11 @@ The agent is explicitly designed to run inside a sandbox. `AltbotWorkspace` mana
 
 If you are writing a new `Tool` that mutates the disk or reads files, **DO NOT** let the Agent pass absolute system paths cleanly. You MUST wrap the injection using `crate::utils::resolve_path(&sandbox_dir, &agent_path)`. Doing so naturally bounds all agent `../` directory escapes to the sandbox boundary.
 
+### Structured LLM Extraction
+If you are asking the LLM to yield a structured JSON payload internally (e.g. for reflection or summarization outside of the standard `ToolCall` registry):
+**DO NOT** use brittle string matching like `text.find('{')`. 
+**DO USE** `crate::utils::extract_json_from_llm_response(&text)` to safely isolate the payload from conversational wrappers or markdown blocks.
+
 ## 🛠 Adding a newly Native Rust Tool
 
 Tools act as the fundamental abilities the Agent uses via JSON schema during its core sequential processing loop inside `AgentLogic`.
@@ -85,3 +90,9 @@ When checking code...
 ## 📊 Telemetry Output
 
 If you add a new metric or LLM analytics block, format it explicitly as a `BusMessage::Telemetry(TelemetryEvent)` payload. The `WorkspaceLoggingActor` natively captures, serializes, and writes these structured JSON traces reliably to `conversation.jsonl` acting as the sole analytical pipeline.
+
+## 🧠 Memory & Reflection Pipelines
+
+The memory system has two distinct phases operating under the Actor loop:
+1. **Active Auto-Compaction** (`src/agent.rs`): If an active chat exceeds token/turn limits, a blocking summarization request is made, saved out to `SqliteMemoryActor` safely, and the raw history buffers are cleared to protect context limits.
+2. **Idle Background Reflection** (`src/reflection.rs`): An asynchronous supervisor checks idle sessions on an interval. When a predefined threshold of SQLite summaries is reached, it spawns a task converting them into a single `MEMORY.md` file saved physically to the `workspace_dir`.

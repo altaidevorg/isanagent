@@ -138,7 +138,8 @@ impl LLMClient {
             return Err(LLMError::ApiError(format!("Status {}: {}", status, text)));
         }
 
-        let json_resp: serde_json::Value = res.json().await?;
+        let raw_text = res.text().await.map_err(|e| LLMError::ApiError(e.to_string()))?;
+        let json_resp: serde_json::Value = serde_json::from_str(&raw_text).map_err(LLMError::ParseError)?;
         
         let content_val = &json_resp["choices"][0]["message"]["content"];
         let content = if content_val.is_null() {
@@ -160,6 +161,15 @@ impl LLMClient {
         } else {
             None
         };
+
+        let finish_reason = json_resp["choices"][0]["finish_reason"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string();
+
+        if usage.as_ref().map(|u| u.completion_tokens == 0).unwrap_or(false) || content.trim().is_empty() {
+            eprintln!("\n[DIAGNOSTIC] LLM returned 0 completion tokens or empty content.\nFinish reason: {}\nRaw response: {}\n", finish_reason, raw_text);
+        }
 
         info!("LLM Response received ({} chars content, reasoning: {}, usage: {})", 
             content.len(), 
@@ -188,4 +198,32 @@ impl LLMClient {
         ];
         self.chat(&messages).await
     }
+}
+
+/// Robustly extracts a JSON object from a raw LLM text response.
+/// Intended to handle markdown formatting (` ```json ... ``` `) 
+/// or conversational wrappers around the core `{ ... }` payload.
+pub fn extract_json_from_llm_response(text: &str) -> Option<serde_json::Value> {
+    // Attempt 1: Look for explicit markdown JSON blocks
+    if let Some(start_idx) = text.find("```json") {
+        let block_content = &text[start_idx + 7..];
+        if let Some(end_idx) = block_content.find("```") {
+            let json_candidate = &block_content[..end_idx].trim();
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_candidate) {
+                return Some(val);
+            }
+        }
+    }
+
+    // Attempt 2: Naive bracket matching as fallback
+    if let Some(json_start) = text.find('{') {
+        if let Some(json_end) = text.rfind('}') {
+            let json_candidate = &text[json_start..=json_end].trim();
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_candidate) {
+                return Some(val);
+            }
+        }
+    }
+
+    None
 }

@@ -52,11 +52,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("Failed to initialize SqliteMemoryActor");
     let memory_node = NodeHandle::<agent_rs::memory::MemoryMessage>::new(memory_actor, 100, 1, Duration::from_millis(5));
     
-    let session_manager = SessionManager::new(memory_node);
+    let session_manager = SessionManager::new(memory_node.clone());
 
     // 2. Setup Skills
     let skills = SkillRegistry::new(workspace.skills_path());
-    let cron_logic = CronActor::new("DailyBriefingCron");
+    let cron_logic = CronActor::new("DailyBriefingCron", db_path.to_str().unwrap())
+        .expect("Failed to initialize CronActor database");
     let cron_node = NodeHandle::new(cron_logic, 10, 3, Duration::from_millis(50));
 
     // 4. Setup Tools
@@ -92,6 +93,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tools.register(Box::new(MessageTool {
         outbound_tx: global_outbound_tx.clone(),
     }));
+    tools.register(Box::new(agent_rs::tools::builtin::SearchMemoryTool {
+        memory_node: memory_node.clone(),
+    }));
+    tools.register(Box::new(agent_rs::tools::builtin::FetchMemoryByDateTool {
+        memory_node: memory_node.clone(),
+    }));
 
     // 5. Setup Provider (Dynamic from config)
     let (model_name, api_key_env, base_url) = if let Some(p) = workspace.config.provider.clone() {
@@ -107,7 +114,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &api_key,
         &model_name,
     ).with_temperature(0.3);
-    let provider = Box::new(OpenAIProvider::new(client));
+    let provider = Box::new(OpenAIProvider::new(client.clone()));
+
+    // 5.5 Setup Reflection Engine
+    let memory_config = workspace.config.memory.clone().unwrap_or_default();
+    let reflection_engine = agent_rs::reflection::ReflectionEngine::new(
+        memory_node.clone(),
+        workspace.sandbox_dir.clone(),
+        Box::new(OpenAIProvider::new(client.clone())),
+        memory_config,
+    );
+    reflection_engine.start();
 
     // 6. Compile Agent System Prompt
     let system_prompt = workspace.compile_system_prompt();
@@ -124,6 +141,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 7. Create Agent Logic
     let max_iterations = workspace.config.max_iterations.unwrap_or(50);
     let max_tool_output_chars = workspace.config.max_tool_output_chars.unwrap_or(3000);
+    let max_recent_summaries = workspace.config.memory.as_ref()
+        .and_then(|m| m.max_recent_summaries)
+        .unwrap_or(5);
+    let short_term_threshold_turns = workspace.config.memory.as_ref()
+        .and_then(|m| m.short_term_threshold_turns)
+        .unwrap_or(20);
+    let short_term_threshold_tokens = workspace.config.memory.as_ref()
+        .and_then(|m| m.short_term_threshold_tokens)
+        .unwrap_or(100000);
 
     let agent_logic = AgentLogic::new(
         "Altbot",
@@ -134,6 +160,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &system_prompt,
         max_iterations,
         max_tool_output_chars,
+        max_recent_summaries,
+        short_term_threshold_turns,
+        short_term_threshold_tokens,
         global_outbound_tx.clone(),
     );
 
@@ -211,6 +240,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (listener_node, mut agent_rx) = NodeHandle::<BusMessage>::create_listener("completion", 100);
     let _ = &agent_node - "completion" >> &listener_node;
 
+    // Listen to cron triggers
+    let (cron_listener_node, mut cron_rx) = NodeHandle::<String>::create_listener("trigger", 100);
+    let _ = &cron_node - "trigger" >> &cron_listener_node;
+
+    let cron_agent_tx = agent_node.clone();
+    let cron_logger_tx = logger_node.clone();
+    tokio::spawn(async move {
+        while let Some(msg) = cron_rx.recv().await {
+            if let agent_rs::Message::Packet(payload) = msg {
+                
+                let mut channel_val = "cron".to_string();
+                let mut chat_id_val = "cron_global".to_string();
+                let mut content_val = payload.clone();
+
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&payload) {
+                    if let Some(msg) = parsed.get("message").and_then(|v| v.as_str()) {
+                        content_val = msg.to_string();
+                    }
+                    if let Some(cid) = parsed.get("chat_id").and_then(|v| v.as_str()) {
+                        chat_id_val = cid.to_string();
+                    }
+                    if let Some(ch) = parsed.get("channel").and_then(|v| v.as_str()) {
+                        channel_val = ch.to_string();
+                    }
+                }
+
+                let inbound = agent_rs::bus::InboundMessage {
+                    channel: channel_val,
+                    sender_id: "cron".to_string(),
+                    chat_id: chat_id_val,
+                    thread_id: None,
+                    content: content_val,
+                    metadata: HashMap::new(),
+                };
+                
+                // Also emit a telemetry event so loggers see the trigger fired
+                let tel = agent_rs::bus::TelemetryEvent::CronTrigger {
+                    job_id: "cron_event".to_string(),
+                    message: payload,
+                };
+                let _ = cron_logger_tx.send_packet(BusMessage::Telemetry(tel)).await;
+
+                // Fire into the agent
+                let _ = cron_agent_tx.send_packet(BusMessage::Inbound(inbound)).await;
+            }
+        }
+    });
+
     let agent_outbound_tx = global_outbound_tx.clone();
     tokio::spawn(async move {
         while let Some(bus_msg) = agent_rx.recv().await {
@@ -234,7 +311,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = logger_tx_outbound.send_packet(msg.clone()).await;
             if let BusMessage::Outbound(out) = msg {
                 if let Some(chan) = out_channels.get(&out.channel) {
-                    let _ = chan.send(out).await;
+                    if let Err(e) = chan.send(out).await {
+                        log::error!("Failed to deliver message via channel [{}]: {}", chan.name(), e);
+                    }
                 }
             }
         }

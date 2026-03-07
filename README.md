@@ -65,11 +65,22 @@ api_key_env = "GEMINI_API_KEY"
 enabled = false
 app_token = "xapp-..."
 bot_token = "xoxb-..."
+reply_in_thread = true
+reaction_emoji = "eyes"
+
+[memory]
+enabled = true
+short_term_threshold_turns = 20
+short_term_threshold_tokens = 100000
+short_term_threshold_mins = 15
+long_term_interval_mins = 360
+max_recent_summaries = 5
+long_term_threshold_summaries = 5
 ```
 
 ### 3. Run the Agent
 ```bash
-# Pass your workspace path and config relative to the binary
+# Pass your workspace path (and optionally, config relative to the binary).
 cargo run --bin altbot -- --workspace my_agent --config my_agent/config.toml
 ```
 
@@ -89,13 +100,14 @@ curl http://localhost:8080/v1/chat/completions -d '{"message": "Hello!"}'
 ```
 
 ### Slack Socket Mode
-Listens directly to Slack Channels without requiring an ingress webhook proxy.
+Listens directly to Slack Channels without requiring an ingress webhook proxy. Includes built-in exponential backoff for Socket drops, outbound message retry logic, and configurable immediate Emoji processing acknowledgments.
 ```toml
 [slack]
 enabled = true
 app_token = "xapp-..."  # Requires Socket Mode toggled in Slack App Settings
 bot_token = "xoxb-..."
 reply_in_thread = true
+reaction_emoji = "eyes" # Emoji assigned immediately to user messages signaling receipt
 ```
 
 ### Email Pipeline
@@ -108,6 +120,10 @@ imap_username = "bot@example.com"
 imap_password = "..." # Recommened: Set via Env Var override
 smtp_host = "smtp.example.com" # etc
 ```
+
+### Advanced Memory & Auto-Compaction
+Agent-RS automatically compacts conversational history into structured SQLite JSON summaries when session length thresholds (`short_term_threshold_turns` or `short_term_threshold_tokens`) are exceeded. 
+When enough short-term summaries accumulate, a background reflection engine consolidates the information into a long-term `MEMORY.md` injected directly into the active Agent workspace context.
 
 ## 🛠 Tools and Skills
 

@@ -19,6 +19,21 @@ impl SessionManager {
     pub async fn get_session(&self, session_key: &str) -> Result<SessionProxy, String> {
         Ok(SessionProxy::new(session_key, self.memory_node.clone()))
     }
+
+    pub fn get_memory_node(&self) -> NodeHandle<MemoryMessage> {
+        self.memory_node.clone()
+    }
+
+    pub async fn get_recent_summaries(&self, session_prefix: &str, limit: usize) -> Result<Vec<String>, String> {
+        let (tx, rx) = oneshot::channel();
+        let msg = MemoryMessage::GetRecentSummaries {
+            session_id: session_prefix.to_string(),
+            limit,
+            reply: SharedReply::new(tx),
+        };
+        self.memory_node.send_packet(msg).await.map_err(|e| e.to_string())?;
+        rx.await.map_err(|_| "Memory Actor Channel Closed".to_string())?.map_err(|e| e)
+    }
 }
 
 /// A lightweight proxy that implements the standard asynchronous `Memory` trait

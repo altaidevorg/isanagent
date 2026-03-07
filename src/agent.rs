@@ -24,6 +24,9 @@ pub struct AgentLogic {
     system_prompt: String,
     max_iterations: usize,
     max_tool_output_chars: usize,
+    max_recent_summaries: usize,
+    short_term_threshold_turns: usize,
+    short_term_threshold_tokens: usize,
     outbound_tx: mpsc::Sender<BusMessage>,
 }
 
@@ -37,6 +40,9 @@ impl AgentLogic {
         system_prompt: &str,
         max_iterations: usize,
         max_tool_output_chars: usize,
+        max_recent_summaries: usize,
+        short_term_threshold_turns: usize,
+        short_term_threshold_tokens: usize,
         outbound_tx: mpsc::Sender<BusMessage>,
     ) -> Self {
         let mut agent = Self {
@@ -48,6 +54,9 @@ impl AgentLogic {
             system_prompt: system_prompt.to_string(),
             max_iterations,
             max_tool_output_chars,
+            max_recent_summaries,
+            short_term_threshold_turns,
+            short_term_threshold_tokens,
             outbound_tx,
         };
 
@@ -61,14 +70,15 @@ impl AgentLogic {
     }
 
     /// Helper to construct the dynamic system prompt containing the latest tool definitions
-    fn build_system_prompt(&self) -> crate::utils::ChatMessage {
+    fn build_system_prompt(&self, recent_summaries: &str) -> String {
         let content = format!(
-            "{}\n\n{}\n\nYou have access to the following tools:\n{}\n\nIf you need to use a tool, output a JSON block exactly like this:\n```json\n{{\n  \"tool\": \"tool_name\",\n  \"args\": {{\"arg1\": \"value\"}}\n}}\n```\nDo not output anything else if you are calling a tool. If you are not calling a tool, respond conversationally.", 
+            "{}\n\n{}\n\n{}\n\nYou have access to the following tools:\n{}\n\nIf you need to use a tool, output a JSON block exactly like this:\n```json\n{{\n  \"tool\": \"tool_name\",\n  \"args\": {{\"arg1\": \"value\"}}\n}}\n```\nDo not output anything else if you are calling a tool. If you are not calling a tool, respond conversationally.", 
             self.system_prompt,
+            recent_summaries,
             self.skills.get_capabilities_summary(),
             serde_json::to_string_pretty(&self.tools.list_tools()).unwrap_or_default()
         );
-        crate::utils::ChatMessage::system(&content)
+        content
     }
 }
 
@@ -102,7 +112,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
 
         // 1. Build runtime context and prepend to User message before adding to memory
         let thread_info = inbound.thread_id.as_deref().map(|t| format!(", thread: '{}'", t)).unwrap_or_default();
-        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let now = chrono::Local::now().to_rfc3339();
         let runtime_context = format!("[RUNTIME CONTEXT] Current time is {}. You are navigating and responding in channel: '{}', with chat ID: '{}'{}.\n\n", now, inbound.channel, inbound.chat_id, thread_info);
         
         let contextualized_content = format!("{}{}", runtime_context, inbound.content);
@@ -122,8 +132,23 @@ impl ActorLogic<BusMessage> for AgentLogic {
             // Strip any legacy static system prompts that SQLite may have persisted
             context.retain(|msg| msg.role != "system");
 
+            // Fetch short term memory summaries
+            let prefix = format!("{}:{}", inbound.channel, inbound.chat_id);
+            let summaries = if self.max_recent_summaries > 0 {
+                self.session_manager.get_recent_summaries(&prefix, self.max_recent_summaries).await.unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            
+            let summaries_text = if !summaries.is_empty() {
+                format!("--- RECENT CONVERSATION SUMMARIES (SHORT-TERM MEMORY) ---\n{}", summaries.join("\n\n"))
+            } else {
+                String::new()
+            };
+
             // Inject the latest static system prompt to the beginning of the context
-            context.insert(0, self.build_system_prompt());
+            let system_msg = crate::utils::ChatMessage::system(&self.build_system_prompt(&summaries_text));
+            context.insert(0, system_msg);
 
             // Call Provider
             let response = self.provider.chat(&context).await.map_err(|e| ActorError::from(e.to_string()))?;
@@ -203,12 +228,79 @@ impl ActorLogic<BusMessage> for AgentLogic {
 
                 // Emit outbound response payload.
                 let outbound = OutboundMessage {
-                    channel: inbound.channel,
-                    chat_id: inbound.chat_id,
-                    thread_id: inbound.thread_id,
+                    channel: inbound.channel.clone(),
+                    chat_id: inbound.chat_id.clone(),
+                    thread_id: inbound.thread_id.clone(),
                     content: clean_response,
                     metadata: HashMap::new(),
                 };
+
+                // Auto-compaction check
+                let current_context = mem.get_context().await.map_err(|e| ActorError::from(e))?;
+                let turns = current_context.len();
+                let approx_tokens: usize = current_context.iter().map(|msg| msg.content.len() / 4).sum();
+
+                if turns >= self.short_term_threshold_turns || approx_tokens >= self.short_term_threshold_tokens {
+                    info!("[{}] Session {} reached short-term auto-compaction threshold ({} turns, {} max; ~{} tokens, {} max)",
+                          self.name, session_key, turns, self.short_term_threshold_turns, approx_tokens, self.short_term_threshold_tokens);
+                    
+                    let mut transcript = String::new();
+                    for msg in &current_context {
+                        if msg.role != "system" {
+                            transcript.push_str(&format!("{}: {}\n\n", msg.role, msg.content));
+                        }
+                    }
+
+                    let prompt = format!(
+                        "Summarize the following conversation. Extract key information, facts and any potential knowledge gaps.\n\
+                        Format your response EXACTLY as a JSON object with these keys: \"summary\", \"key_info\", \"knowledge_gaps\".\n\n\
+                        Conversation:\n{}", transcript
+                    );
+
+                    let summary_context = vec![crate::utils::ChatMessage::user(&prompt)];
+                    if let Ok(response) = self.provider.chat(&summary_context).await {
+                        let text = response.content;
+                        if let Some(val) = crate::utils::extract_json_from_llm_response(&text) {
+                            let summary = val.get("summary").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let key_info = val.get("key_info").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let knowledge_gaps = val.get("knowledge_gaps").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+                                    let memory_node = self.session_manager.get_memory_node();
+
+                                    let (tx, rx) = tokio::sync::oneshot::channel();
+                                    if let Err(e) = memory_node.send_packet(crate::memory::MemoryMessage::AddSummary {
+                                        session_id: session_key.clone(),
+                                        summary,
+                                        key_info,
+                                        knowledge_gaps,
+                                        reply: crate::memory::SharedReply::new(tx),
+                                    }).await {
+                                        log::error!("Failed to send AddSummary: {}", e);
+                                    } else {
+                                        let _ = rx.await;
+                                    }
+
+                                    let (tx, rx) = tokio::sync::oneshot::channel();
+                                    if let Err(e) = memory_node.send_packet(crate::memory::MemoryMessage::UpdateSessionMetadata {
+                                        session_id: session_key.clone(),
+                                        last_reflection_msg_id: None, // Reset because we are clearing the messages array next
+                                        reply: crate::memory::SharedReply::new(tx),
+                                    }).await {
+                                        log::error!("Failed to send UpdateSessionMetadata: {}", e);
+                                    } else {
+                                        let _ = rx.await;
+                                    }
+
+                                    // Clear raw chat history for this session, allowing it to start fresh while retaining short-term DB summaries
+                                    if let Err(e) = mem.clear().await {
+                                        log::error!("Failed to clear session after summary: {}", e);
+                                    } else {
+                                        info!("[{}] Session {} auto-compacted and cleared successfully.", self.name, session_key);
+                                    }
+                                }
+                    }
+                }
+
                 return Ok(Some(("completion".to_string(), BusMessage::Outbound(outbound))));
             }
         }

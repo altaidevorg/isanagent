@@ -28,7 +28,7 @@ impl Channel for TerminalChannel {
 
     async fn start(&self, inbound_tx: Sender<InboundMessage>) -> Result<(), String> {
         let channel_name = self.name().to_string();
-        let chat_id = self.chat_id.clone();
+        let mut chat_id = self.chat_id.clone();
         
         tokio::task::spawn_blocking(move || {
             let stdin = io::stdin();
@@ -54,7 +54,12 @@ impl Channel for TerminalChannel {
                                 println!("{}", "Safely shutting down Advanced Agent-RS System...".yellow());
                                 std::process::exit(0);
                             }
-                            println!("{}", "Unknown slash command. Try /exit to quit.".red());
+                            if text.eq_ignore_ascii_case("/new") {
+                                chat_id = uuid::Uuid::new_v4().to_string();
+                                println!("{}", "Created a fresh new session!".green());
+                                continue;
+                            }
+                            println!("{}", "Unknown slash command. Try /exit to quit, or /new to start fresh.".red());
                             continue;
                         }
 

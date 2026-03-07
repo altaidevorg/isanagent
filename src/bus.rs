@@ -45,6 +45,10 @@ pub enum TelemetryEvent {
         prompt_tokens: u32,
         completion_tokens: u32,
         total_tokens: u32,
+    },
+    CronTrigger {
+        job_id: String,
+        message: String,
     }
 }
 

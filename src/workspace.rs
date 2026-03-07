@@ -101,6 +101,9 @@ impl AltbotWorkspace {
         if let Some(user) = self.read_md_file("USER.md") {
             prompt_parts.push(format!("--- USER PROFILE ---\n{}\n", user));
         }
+        if let Some(memory) = self.read_md_file("MEMORY.md") {
+            prompt_parts.push(format!("--- LONG TERM MEMORY ---\n{}\n", memory));
+        }
 
         if prompt_parts.is_empty() {
             "You are Altbot, a helpful AI assistant.".to_string()
