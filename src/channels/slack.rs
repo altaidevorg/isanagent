@@ -36,8 +36,33 @@ impl Channel for SlackChannel {
 
         tokio::spawn(async move {
             let mut backoff_secs = 2;
+            let mut bot_user_id: Option<String> = None;
+            let mut user_names_cache: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
             loop {
+                if bot_user_id.is_none() {
+                    info!("Requesting Slack bot user ID...");
+                    let auth_res = client.post("https://slack.com/api/auth.test")
+                        .header("Authorization", format!("Bearer {}", config.bot_token))
+                        .send()
+                        .await;
+                    
+                    if let Ok(r) = auth_res {
+                        if let Ok(json) = r.json::<Value>().await {
+                            if json["ok"].as_bool() == Some(true) {
+                                if let Some(uid) = json["user_id"].as_str() {
+                                    bot_user_id = Some(uid.to_string());
+                                    info!("Slack bot connected as {}", uid);
+                                }
+                            } else {
+                                warn!("Slack auth.test failed: {:?}", json);
+                            }
+                        }
+                    } else {
+                        warn!("Failed to request Slack auth.test");
+                    }
+                }
+
                 info!("Requesting Slack Socket Mode URL...");
                 let res = client.post("https://slack.com/api/apps.connections.open")
                     .header("Authorization", format!("Bearer {}", app_token))
@@ -122,7 +147,43 @@ impl Channel for SlackChannel {
                                 }
 
                                 let text = event["text"].as_str().unwrap_or_default().to_string();
+
+                                // Avoid double-processing: Slack sends both `message` and `app_mention` for mentions in channels. Prefer `app_mention`.
+                                if ev_type == "message" {
+                                    if let Some(ref uid) = bot_user_id {
+                                        if text.contains(&format!("<@{uid}>")) {
+                                            continue;
+                                        }
+                                    }
+                                }
+
                                 let user = event["user"].as_str().unwrap_or_default().to_string();
+                                
+                                let mut display_name = user.clone();
+                                if let Some(name) = user_names_cache.get(&user) {
+                                    display_name = name.clone();
+                                } else if !user.is_empty() {
+                                    let info_url = format!("https://slack.com/api/users.info?user={}", user);
+                                    let info_res = client.get(&info_url)
+                                        .header("Authorization", format!("Bearer {}", config.bot_token))
+                                        .send()
+                                        .await;
+                                    
+                                    if let Ok(r) = info_res {
+                                        if let Ok(json) = r.json::<Value>().await {
+                                            if json["ok"].as_bool() == Some(true) {
+                                                if let Some(name) = json["user"]["profile"]["display_name"].as_str()
+                                                    .filter(|s| !s.is_empty())
+                                                    .or_else(|| json["user"]["profile"]["real_name"].as_str())
+                                                {
+                                                    user_names_cache.insert(user.clone(), name.to_string());
+                                                    display_name = name.to_string();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
                                 let chat_id = event["channel"].as_str().unwrap_or_default().to_string();
                                 let ts = event.get("ts").and_then(|v| v.as_str()).unwrap_or_default().to_string();
                                 
@@ -134,19 +195,29 @@ impl Channel for SlackChannel {
                                 }
 
                                 let mut stripped_text = text.clone();
-                                // Very naive strip of bot mention. E.g. <@U123456>
-                                if let Some(idx) = stripped_text.find("> ") {
-                                    if stripped_text.starts_with("<@") {
-                                        stripped_text = stripped_text[idx + 2..].to_string();
+                                // Robust strip of bot mention using the resolved bot_user_id
+                                if let Some(ref uid) = bot_user_id {
+                                    let mention = format!("<@{uid}>");
+                                    if stripped_text.contains(&mention) {
+                                        stripped_text = stripped_text.replace(&mention, "").trim().to_string();
+                                    }
+                                } else {
+                                    // Fallback naive strip
+                                    if let Some(idx) = stripped_text.find("> ") {
+                                        if stripped_text.starts_with("<@") {
+                                            stripped_text = stripped_text[idx + 2..].to_string();
+                                        }
                                     }
                                 }
+
+                                let payload_text = format!("(Slack User: {}) {}", display_name, stripped_text).trim().to_string();
 
                                 let msg = InboundMessage {
                                     channel: channel_name.clone(),
                                     sender_id: user,
                                     chat_id: chat_id.clone(),
                                     thread_id: thread_ts,
-                                    content: stripped_text,
+                                    content: payload_text,
                                     metadata: std::collections::HashMap::new(),
                                 };
 
