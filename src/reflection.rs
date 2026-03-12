@@ -82,7 +82,7 @@ impl ReflectionEngine {
                 );
 
                 let context = vec![ChatMessage::user(&prompt)];
-                match self.provider.chat(&context).await {
+                match self.provider.chat(&context, None).await {
                     Ok(response) => {
                         let text = response.content;
                         // Use robust JSON extractor
@@ -149,7 +149,7 @@ impl ReflectionEngine {
         );
 
         let context = vec![ChatMessage::user(&prompt)];
-        if let Ok(response) = self.provider.chat(&context).await {
+        if let Ok(response) = self.provider.chat(&context, None).await {
             let mut answer = response.content;
             if let Some(start) = answer.find("```markdown") {
                 if let Some(end) = answer[start+11..].find("```") {

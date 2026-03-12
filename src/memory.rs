@@ -40,8 +40,7 @@ impl<T> SharedReply<T> {
 pub enum MemoryMessage {
     AddMessage {
         session_id: String,
-        role: String,
-        content: String,
+        message: ChatMessage,
         reply: SharedReply<Result<(), String>>,
     },
     GetContext {
@@ -118,11 +117,17 @@ impl SqliteMemoryActor {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
                 role TEXT NOT NULL,
-                content TEXT NOT NULL,
+                content TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )",
             [],
         )?;
+
+        // Try adding the native tool calling schema columns dynamically. 
+        // Failures here are expected on existing databases after the first run.
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN name TEXT", []);
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN tool_calls TEXT", []);
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN tool_call_id TEXT", []);
 
         // Create an index to quickly filter by session_id
         conn.execute(
@@ -200,10 +205,11 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
 
     async fn process(&mut self, packet: MemoryMessage) -> Result<Option<(String, MemoryMessage)>, ActorError> {
         match packet {
-            MemoryMessage::AddMessage { session_id, role, content, reply } => {
+            MemoryMessage::AddMessage { session_id, message, reply } => {
+                let tool_calls_str = message.tool_calls.map(|tc| serde_json::to_string(&tc).unwrap_or_default());
                 let res = self.conn.execute(
-                    "INSERT INTO messages (session_id, role, content) VALUES (?1, ?2, ?3)",
-                    params![session_id, role, content],
+                    "INSERT INTO messages (session_id, role, content, name, tool_calls, tool_call_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![session_id, message.role, message.content, message.name, tool_calls_str, message.tool_call_id],
                 ).map_err(|e| e.to_string()).map(|_| ());
                 
                 let _ = reply.send(res);
@@ -211,13 +217,19 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
             MemoryMessage::GetContext { session_id, reply } => {
                 let res = (|| -> Result<Vec<ChatMessage>, String> {
                     let mut stmt = self.conn.prepare(
-                        "SELECT role, content FROM messages WHERE session_id = ?1 ORDER BY created_at ASC"
+                        "SELECT role, content, name, tool_calls, tool_call_id FROM messages WHERE session_id = ?1 ORDER BY created_at ASC"
                     ).map_err(|e| e.to_string())?;
 
                     let message_iter = stmt.query_map(params![session_id], |row| {
+                        let tool_calls_str: Option<String> = row.get(3)?;
+                        let tool_calls = tool_calls_str.and_then(|s| serde_json::from_str(&s).ok());
+                        
                         Ok(ChatMessage {
                             role: row.get(0)?,
                             content: row.get(1)?,
+                            name: row.get(2)?,
+                            tool_calls,
+                            tool_call_id: row.get(4)?,
                         })
                     }).map_err(|e| e.to_string())?;
 

@@ -15,7 +15,7 @@ impl OpenAIProvider {
 
 #[async_trait]
 impl Provider for OpenAIProvider {
-    async fn chat(&self, messages: &[ChatMessage]) -> Result<LLMResponse, LLMError> {
-        self.client.chat(messages).await
+    async fn chat(&self, messages: &[ChatMessage], tools: Option<serde_json::Value>) -> Result<LLMResponse, LLMError> {
+        self.client.chat(messages, tools).await
     }
 }

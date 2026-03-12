@@ -72,11 +72,10 @@ impl AgentLogic {
     /// Helper to construct the dynamic system prompt containing the latest tool definitions
     fn build_system_prompt(&self, recent_summaries: &str) -> String {
         let content = format!(
-            "{}\n\n{}\n\n{}\n\nYou have access to the following tools:\n{}\n\nIf you need to use a tool, output a JSON block exactly like this:\n```json\n{{\n  \"tool\": \"tool_name\",\n  \"args\": {{\"arg1\": \"value\"}}\n}}\n```\nDo not output anything else if you are calling a tool. If you are not calling a tool, respond conversationally.", 
+            "{}\n\n{}\n\n{}", 
             self.system_prompt,
             recent_summaries,
-            self.skills.get_capabilities_summary(),
-            serde_json::to_string_pretty(&self.tools.list_tools()).unwrap_or_default()
+            self.skills.get_capabilities_summary()
         );
         content
     }
@@ -117,7 +116,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
         
         let contextualized_content = format!("{}{}", runtime_context, inbound.content);
 
-        mem.add_user_message(&contextualized_content).await.map_err(|e| ActorError::from(e))?;
+        mem.add_message(crate::utils::ChatMessage::user(&contextualized_content)).await.map_err(|e| ActorError::from(e))?;
 
         // 2. Loop until no more tool calls or max iterations reached
         let mut iterations = 0;
@@ -151,7 +150,8 @@ impl ActorLogic<BusMessage> for AgentLogic {
             context.insert(0, system_msg);
 
             // Call Provider
-            let response = self.provider.chat(&context).await.map_err(|e| ActorError::from(e.to_string()))?;
+            let tools_payload = Some(serde_json::json!(self.tools.list_tools()));
+            let response = self.provider.chat(&context, tools_payload).await.map_err(|e| ActorError::from(e.to_string()))?;
             debug!("[{}] Provider responded.", self.name);
 
             // Log USAGE telemetry
@@ -173,52 +173,59 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 })).await;
             }
 
-            // Add assistant response to memory
             let response_text = response.content.clone();
-            mem.add_assistant_message(&response_text).await.map_err(|e| ActorError::from(e))?;
-
-            // Check if response contains a tool call (naive JSON parsing for simplistic tool use)
             let mut tool_invoked = false;
-            
-            if let Some(json_start) = response_text.find("```json") {
-                if let Some(json_end) = response_text[json_start+7..].find("```") {
-                    let json_str = &response_text[json_start+7..json_start+7+json_end];
-                    if let Ok(value) = serde_json::from_str::<Value>(json_str) {
-                        if let (Some(tool_name), Some(args)) = (value.get("tool").and_then(|v| v.as_str()), value.get("args")) {
-                            info!("[{}] Invoking tool: {}", self.name, tool_name);
-                            
-                            // Emit Telemetry Tool Call
-                            let _ = self.outbound_tx.send(BusMessage::Telemetry(TelemetryEvent::ToolCall {
-                                chat_id: inbound.chat_id.clone(),
-                                tool_name: tool_name.to_string(),
-                                args: serde_json::to_string(args).unwrap_or_default(),
-                            })).await;
 
-                            let tool_result = match self.tools.execute_tool(tool_name, args.clone()).await {
-                                Ok(res) => {
-                                    let mut output = res;
-                                    if output.len() > self.max_tool_output_chars {
-                                        output.truncate(self.max_tool_output_chars);
-                                        output.push_str("\n... [TRUNCATED FOR LENGTH]");
-                                    }
-                                    format!("Tool '{}' execution result:\n{}", tool_name, output)
-                                },
-                                Err(e) => format!("Tool '{}' execution failed: {}", tool_name, e),
-                            };
+            if let Some(tool_calls) = &response.tool_calls {
+                // Record the assistant message that spawned the tool calls
+                let assistant_msg = crate::utils::ChatMessage {
+                    role: "assistant".to_string(),
+                    content: if response_text.is_empty() { None } else { Some(response_text.clone()) },
+                    name: None,
+                    tool_calls: Some(tool_calls.clone()),
+                    tool_call_id: None,
+                };
+                mem.add_message(assistant_msg).await.map_err(|e| ActorError::from(e))?;
 
-                            // Emit Telemetry Tool Result
-                            let _ = self.outbound_tx.send(BusMessage::Telemetry(TelemetryEvent::ToolResult {
-                                chat_id: inbound.chat_id.clone(),
-                                tool_name: tool_name.to_string(),
-                                result: tool_result.clone(),
-                            })).await;
+                for tc in tool_calls {
+                    let tool_name = &tc.function.name;
+                    let args_str = &tc.function.arguments;
+                    info!("[{}] Invoking tool: {}", self.name, tool_name);
+                    
+                    // Emit Telemetry Tool Call
+                    let args = serde_json::from_str::<serde_json::Value>(args_str).unwrap_or_else(|_| serde_json::json!({}));
+                    let _ = self.outbound_tx.send(BusMessage::Telemetry(TelemetryEvent::ToolCall {
+                        chat_id: inbound.chat_id.clone(),
+                        tool_name: tool_name.to_string(),
+                        args: args_str.clone(),
+                    })).await;
 
-                            // Add the tool observation back as a user message
-                            mem.add_user_message(&tool_result).await.map_err(|e| ActorError::from(e))?;
-                            tool_invoked = true;
-                        }
-                    }
+                    let tool_result = match self.tools.execute_tool(tool_name, args).await {
+                        Ok(res) => {
+                            let mut output = res;
+                            if output.len() > self.max_tool_output_chars {
+                                output.truncate(self.max_tool_output_chars);
+                                output.push_str("\n... [TRUNCATED FOR LENGTH]");
+                            }
+                            output
+                        },
+                        Err(e) => format!("Error: {}", e),
+                    };
+
+                    // Emit Telemetry Tool Result
+                    let _ = self.outbound_tx.send(BusMessage::Telemetry(TelemetryEvent::ToolResult {
+                        chat_id: inbound.chat_id.clone(),
+                        tool_name: tool_name.to_string(),
+                        result: tool_result.clone(),
+                    })).await;
+
+                    // Add the tool execution back as a tool role message natively
+                    mem.add_message(crate::utils::ChatMessage::tool(&tool_result, &tc.id)).await.map_err(|e| ActorError::from(e))?;
+                    tool_invoked = true;
                 }
+            } else {
+                // Add vanilla assistant response to memory
+                mem.add_message(crate::utils::ChatMessage::assistant(&response_text)).await.map_err(|e| ActorError::from(e))?;
             }
 
             if !tool_invoked {
@@ -238,7 +245,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 // Auto-compaction check
                 let current_context = mem.get_context().await.map_err(|e| ActorError::from(e))?;
                 let turns = current_context.len();
-                let approx_tokens: usize = current_context.iter().map(|msg| msg.content.len() / 4).sum();
+                let approx_tokens: usize = current_context.iter().map(|msg| msg.content.as_deref().unwrap_or("").len() / 4).sum();
 
                 if turns >= self.short_term_threshold_turns || approx_tokens >= self.short_term_threshold_tokens {
                     info!("[{}] Session {} reached short-term auto-compaction threshold ({} turns, {} max; ~{} tokens, {} max)",
@@ -247,7 +254,11 @@ impl ActorLogic<BusMessage> for AgentLogic {
                     let mut transcript = String::new();
                     for msg in &current_context {
                         if msg.role != "system" {
-                            transcript.push_str(&format!("{}: {}\n\n", msg.role, msg.content));
+                            if let Some(content) = &msg.content {
+                                transcript.push_str(&format!("{}: {}\n\n", msg.role, content));
+                            } else if let Some(_tc) = &msg.tool_calls {
+                                transcript.push_str(&format!("{}: [Invoked Tools]\n\n", msg.role));
+                            }
                         }
                     }
 
@@ -258,7 +269,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                     );
 
                     let summary_context = vec![crate::utils::ChatMessage::user(&prompt)];
-                    if let Ok(response) = self.provider.chat(&summary_context).await {
+                    if let Ok(response) = self.provider.chat(&summary_context, None).await {
                         let text = response.content;
                         if let Some(val) = crate::utils::extract_json_from_llm_response(&text) {
                             let summary = val.get("summary").and_then(|v| v.as_str()).unwrap_or("").to_string();

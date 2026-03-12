@@ -9,20 +9,14 @@ pub trait Provider: Send + Sync {
     /// Send a chat completion request with a list of messages.
     /// Messages are defined in the specific Provider implementation, 
     /// or we can use a generic `crate::utils::ChatMessage`.
-    async fn chat(&self, messages: &[crate::utils::ChatMessage]) -> Result<crate::utils::LLMResponse, crate::utils::LLMError>;
+    async fn chat(&self, messages: &[crate::utils::ChatMessage], tools: Option<serde_json::Value>) -> Result<crate::utils::LLMResponse, crate::utils::LLMError>;
 }
 
 /// A Memory abstracts the context storage capabilities of an Agent.
 #[async_trait]
 pub trait Memory: Send + Sync {
-    /// Add a user message to the memory
-    async fn add_user_message(&mut self, content: &str) -> Result<(), String>;
-    
-    /// Add an assistant message to the memory
-    async fn add_assistant_message(&mut self, content: &str) -> Result<(), String>;
-
-    /// Add a system message to the memory (usually at initialization)
-    async fn add_system_message(&mut self, content: &str) -> Result<(), String>;
+    /// Add a message to the memory
+    async fn add_message(&mut self, message: crate::utils::ChatMessage) -> Result<(), String>;
 
     /// Retrieve the recent context as a list of messages.
     async fn get_context(&self) -> Result<Vec<crate::utils::ChatMessage>, String>;

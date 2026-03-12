@@ -55,36 +55,11 @@ impl SessionProxy {
 
 #[async_trait]
 impl Memory for SessionProxy {
-    async fn add_user_message(&mut self, content: &str) -> Result<(), String> {
+    async fn add_message(&mut self, message: ChatMessage) -> Result<(), String> {
         let (tx, rx) = oneshot::channel();
         let msg = MemoryMessage::AddMessage {
             session_id: self.session_id.clone(),
-            role: "user".to_string(),
-            content: content.to_string(),
-            reply: SharedReply::new(tx),
-        };
-        self.memory_node.send_packet(msg).await.map_err(|e| e.to_string())?;
-        rx.await.map_err(|_| "Memory Actor Channel Closed".to_string())?
-    }
-
-    async fn add_assistant_message(&mut self, content: &str) -> Result<(), String> {
-        let (tx, rx) = oneshot::channel();
-        let msg = MemoryMessage::AddMessage {
-            session_id: self.session_id.clone(),
-            role: "assistant".to_string(),
-            content: content.to_string(),
-            reply: SharedReply::new(tx),
-        };
-        self.memory_node.send_packet(msg).await.map_err(|e| e.to_string())?;
-        rx.await.map_err(|_| "Memory Actor Channel Closed".to_string())?
-    }
-
-    async fn add_system_message(&mut self, content: &str) -> Result<(), String> {
-        let (tx, rx) = oneshot::channel();
-        let msg = MemoryMessage::AddMessage {
-            session_id: self.session_id.clone(),
-            role: "system".to_string(),
-            content: content.to_string(),
+            message,
             reply: SharedReply::new(tx),
         };
         self.memory_node.send_packet(msg).await.map_err(|e| e.to_string())?;
