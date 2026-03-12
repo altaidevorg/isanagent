@@ -1,8 +1,7 @@
 use std::time::Duration;
-use tokio::time::sleep;
-use tokio::sync::mpsc;
 use std::sync::Arc;
 use std::collections::HashMap;
+use tokio::sync::{mpsc, watch};
 
 use agent_rs::{NodeHandle, ActorLogic, Supervisor, SupervisorPolicy};
 use agent_rs::agent::AgentLogic;
@@ -13,9 +12,9 @@ use agent_rs::tools::ToolRegistry;
 use agent_rs::tools::builtin::{ReadFileTool, WriteFileTool, EditFileTool, ListDirTool, ShellExecTool, WebSearchTool, WebFetchTool, CronTool, MessageTool};
 use agent_rs::workspace::AltbotWorkspace;
 use agent_rs::skills::SkillRegistry;
-use agent_rs::bus::BusMessage;
+use agent_rs::bus::{BusMessage, LoggerControlMessage};
 use agent_rs::channels::{Channel, terminal::TerminalChannel, slack::SlackChannel, api::ApiChannel, email::EmailChannel};
-use agent_rs::logging::WorkspaceLoggingActor;
+use agent_rs::logging::{create_logger_channel, init_runtime_logger, LoggingActor, LOGGER_QUEUE_CAPACITY};
 use colored::Colorize;
 use clap::Parser;
 
@@ -34,14 +33,50 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
-    println!("Starting Advanced Agent-RS System...");
-
     // 0. Parse workspace CLI arguments
     let cli_args = Args::parse();
+    let workspace_dir = std::path::PathBuf::from(
+        shellexpand::tilde(cli_args.workspace.as_deref().unwrap_or("~/.altbot")).to_string()
+    );
+
+    let (logger_bus_tx, logger_bus_rx) = create_logger_channel(LOGGER_QUEUE_CAPACITY);
+    let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
+    let (app_shutdown_tx, app_shutdown_rx) = watch::channel(false);
+    init_runtime_logger(logger_bus_tx.clone()).map_err(|e| {
+        std::io::Error::other(format!("failed to initialize runtime logger: {:?}", e))
+    })?;
+
+    let logger_factory = {
+        let wd = workspace_dir.clone();
+        move || {
+            Box::new(LoggingActor::new(wd.clone()).expect("failed to initialize logging actor"))
+                as Box<dyn ActorLogic<BusMessage>>
+        }
+    };
+    let logger_sup = Supervisor::new(SupervisorPolicy::Restart, logger_factory);
+    let logger_node = NodeHandle::<BusMessage>::new(logger_sup, 1000, 1, Duration::from_millis(10));
+    let (logger_control_listener, mut logger_control_rx) =
+        NodeHandle::<BusMessage>::create_listener("logger_control", 8);
+    logger_node.wire("logger_control", &logger_control_listener).await;
+
+    let logger_forward = logger_node.clone();
+    let runtime_handle = tokio::runtime::Handle::current();
+    std::thread::Builder::new()
+        .name("logging-forwarder".to_string())
+        .spawn(move || {
+            while let Ok(msg) = logger_bus_rx.recv() {
+                if runtime_handle.block_on(logger_forward.send_packet(msg)).is_err() {
+                    break;
+                }
+            }
+        })?;
+
+    println!("Starting Advanced Agent-RS System...");
+    log::info!("Starting Advanced Agent-RS System.");
 
     let workspace = AltbotWorkspace::new(cli_args.workspace.as_deref(), cli_args.config.as_deref())?;
     println!("Loading Altbot workspace at: {:?}", workspace.dir);
+    log::info!("Loading Altbot workspace at {:?}", workspace.dir);
 
     // 1. Setup SqliteMemoryActor and SessionManager
     let db_path = workspace.dir.join(".system_generated").join("agent_memory.db");
@@ -54,14 +89,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let session_manager = SessionManager::new(memory_node.clone());
 
-    // 2. Setup Skills
-    let skills = SkillRegistry::new(workspace.skills_path());
-    let cron_logic = CronActor::new("DailyBriefingCron", db_path.to_str().unwrap())
-        .expect("Failed to initialize CronActor database");
-    let cron_node = NodeHandle::new(cron_logic, 10, 3, Duration::from_millis(50));
-
     // 4. Setup Tools
     let (global_outbound_tx, mut global_outbound_rx) = mpsc::channel(100);
+
+    // 2. Setup Skills
+    let skills = SkillRegistry::new(workspace.skills_path());
+    let cron_logic = CronActor::new("DailyBriefingCron", db_path.to_str().unwrap(), logger_bus_tx.clone())
+        .expect("Failed to initialize CronActor database");
+    let cron_node = NodeHandle::new(cron_logic, 10, 3, Duration::from_millis(50));
 
     let mut tools = ToolRegistry::new();
     let restrict = workspace.config.restrict_to_workspace.unwrap_or(true);
@@ -123,8 +158,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         workspace.sandbox_dir.clone(),
         Box::new(OpenAIProvider::new(client.clone())),
         memory_config,
+        logger_bus_tx.clone(),
+        app_shutdown_rx.clone(),
     );
-    reflection_engine.start();
+    let reflection_task = reflection_engine.start();
 
     // 6. Compile Agent System Prompt
     let system_prompt = workspace.compile_system_prompt();
@@ -164,34 +201,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         short_term_threshold_turns,
         short_term_threshold_tokens,
         global_outbound_tx.clone(),
+        logger_bus_tx.clone(),
     );
 
     // 8. Wrap Agent in NodeHandle
     let agent_node = NodeHandle::<BusMessage>::new(agent_logic, 100, 3, Duration::from_millis(50));
-
-    // 9. Setup Supervisor Logger Node
-    let logger_factory = {
-        let wd = workspace.dir.clone();
-        move || {
-            Box::new(WorkspaceLoggingActor::new(wd.clone())) as Box<dyn ActorLogic<BusMessage>>
-        }
-    };
-    let logger_sup = Supervisor::new(SupervisorPolicy::Restart, logger_factory);
-    let logger_node = NodeHandle::<BusMessage>::new(logger_sup, 100, 1, Duration::from_millis(10));
 
     // 10. Setup Terminal Channel
     let (inbound_tx, mut inbound_rx) = mpsc::channel(100);
     let mut out_channels: HashMap<String, Arc<dyn Channel>> = HashMap::new();
 
     let terminal_chat_id = uuid::Uuid::new_v4().to_string();
-    let terminal = Arc::new(TerminalChannel::new(&terminal_chat_id));
+    let terminal = Arc::new(TerminalChannel::new(&terminal_chat_id, logger_bus_tx.clone(), shutdown_tx.clone()));
     terminal.start(inbound_tx.clone()).await?;
     out_channels.insert(terminal.name().to_string(), terminal);
 
     // 11. Setup Slack Channel
     if let Some(slack_cfg) = workspace.config.slack.clone() {
         if slack_cfg.enabled.unwrap_or(false) {
-            let slack = Arc::new(SlackChannel::new(slack_cfg));
+            let slack = Arc::new(SlackChannel::new(slack_cfg, logger_bus_tx.clone()));
             slack.start(inbound_tx.clone()).await?;
             out_channels.insert(slack.name().to_string(), slack);
         }
@@ -200,7 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 12. Setup API Channel
     if let Some(api_cfg) = workspace.config.api.clone() {
         if api_cfg.enabled.unwrap_or(false) {
-            let api = Arc::new(ApiChannel::new(api_cfg.port));
+            let api = Arc::new(ApiChannel::new(api_cfg.port, logger_bus_tx.clone()));
             api.start(inbound_tx.clone()).await?;
             out_channels.insert(api.name().to_string(), api);
         }
@@ -209,7 +237,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 13. Setup Email Channel
     if let Some(email_cfg) = workspace.config.email.clone() {
         if email_cfg.enabled.unwrap_or(false) {
-            let email_ch = Arc::new(EmailChannel::new(email_cfg));
+            let email_ch = Arc::new(EmailChannel::new(email_cfg, logger_bus_tx.clone()));
             email_ch.start(inbound_tx.clone()).await?;
             out_channels.insert(email_ch.name().to_string(), email_ch);
         }
@@ -228,10 +256,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Route inbound messages from all channels into the agent and logger
     let agent_tx = agent_node.clone();
-    let logger_tx = logger_node.clone();
+    let logger_tx = logger_bus_tx.clone();
     tokio::spawn(async move {
         while let Some(msg) = inbound_rx.recv().await {
-            let _ = logger_tx.send_packet(BusMessage::Inbound(msg.clone())).await;
+            let _ = logger_tx.send(BusMessage::Inbound(msg.clone()));
             let _ = agent_tx.send_packet(BusMessage::Inbound(msg)).await;
         }
     });
@@ -245,7 +273,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = &cron_node - "trigger" >> &cron_listener_node;
 
     let cron_agent_tx = agent_node.clone();
-    let cron_logger_tx = logger_node.clone();
+    let cron_logger_tx = logger_bus_tx.clone();
     tokio::spawn(async move {
         while let Some(msg) = cron_rx.recv().await {
             if let agent_rs::Message::Packet(payload) = msg {
@@ -280,7 +308,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     job_id: "cron_event".to_string(),
                     message: payload,
                 };
-                let _ = cron_logger_tx.send_packet(BusMessage::Telemetry(tel)).await;
+                let _ = cron_logger_tx.send(BusMessage::Telemetry(tel));
 
                 // Fire into the agent
                 let _ = cron_agent_tx.send_packet(BusMessage::Inbound(inbound)).await;
@@ -305,12 +333,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let logger_tx_outbound = logger_node.clone();
+    let logger_tx_outbound = logger_bus_tx.clone();
+    let delivery_channels = out_channels.clone();
     tokio::spawn(async move {
         while let Some(msg) = global_outbound_rx.recv().await {
-            let _ = logger_tx_outbound.send_packet(msg.clone()).await;
+            let _ = logger_tx_outbound.send(msg.clone());
             if let BusMessage::Outbound(out) = msg {
-                if let Some(chan) = out_channels.get(&out.channel) {
+                if let Some(chan) = delivery_channels.get(&out.channel) {
                     if let Err(e) = chan.send(out).await {
                         log::error!("Failed to deliver message via channel [{}]: {}", chan.name(), e);
                     }
@@ -319,8 +348,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Stay alive
-    loop {
-        sleep(Duration::from_secs(1)).await;
+    tokio::select! {
+        _ = shutdown_rx.recv() => {
+            log::info!("Shutdown requested from terminal.");
+        }
+        _ = tokio::signal::ctrl_c() => {
+            log::info!("Shutdown requested via Ctrl+C.");
+        }
     }
+
+    log::info!("Stopping channels and shutting down runtime.");
+    for channel in out_channels.values() {
+        let _ = channel.stop().await;
+    }
+
+    let _ = app_shutdown_tx.send(true);
+    let _ = reflection_task.await;
+
+    let _ = logger_bus_tx.send(BusMessage::LoggerControl(LoggerControlMessage::Flush));
+    let flush_result = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(msg) = logger_control_rx.recv().await {
+            if let agent_rs::Message::Packet(BusMessage::LoggerControl(LoggerControlMessage::Flushed)) = msg {
+                return Ok::<(), ()>(());
+            }
+        }
+        Err(())
+    }).await;
+
+    if flush_result.is_err() {
+        log::warn!("Timed out waiting for LoggingActor flush acknowledgement.");
+    }
+
+    Ok(())
 }

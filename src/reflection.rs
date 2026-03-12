@@ -1,47 +1,66 @@
 use std::path::PathBuf;
 use tokio::time::{sleep, Duration};
-use log::{info, error, debug};
 use crate::config::MemoryConfig;
 use crate::traits::Provider;
 use crate::utils::ChatMessage;
 use crate::NodeHandle;
 use crate::memory::{MemoryMessage, SharedReply};
+use crate::bus::{BusMessage, LogEvent};
+use crate::logging::LoggerHandle;
 use std::fs;
+use tokio::sync::watch;
 
 pub struct ReflectionEngine {
     memory_node: NodeHandle<MemoryMessage>,
     workspace_dir: PathBuf,
     provider: Box<dyn Provider>,
     config: MemoryConfig,
+    logger_tx: LoggerHandle,
+    shutdown_rx: watch::Receiver<bool>,
 }
 
 impl ReflectionEngine {
-    pub fn new(memory_node: NodeHandle<MemoryMessage>, workspace_dir: PathBuf, provider: Box<dyn Provider>, config: MemoryConfig) -> Self {
-        Self { memory_node, workspace_dir, provider, config }
+    pub fn new(
+        memory_node: NodeHandle<MemoryMessage>,
+        workspace_dir: PathBuf,
+        provider: Box<dyn Provider>,
+        config: MemoryConfig,
+        logger_tx: LoggerHandle,
+        shutdown_rx: watch::Receiver<bool>,
+    ) -> Self {
+        Self { memory_node, workspace_dir, provider, config, logger_tx, shutdown_rx }
     }
 
-    pub fn start(self) {
+    pub fn start(self) -> tokio::task::JoinHandle<()> {
+        let _ = self.logger_tx.send(BusMessage::Log(LogEvent::info("ReflectionEngine", "ReflectionEngine starting...")));
         tokio::spawn(async move {
             self.run_loop().await;
-        });
+        })
     }
 
-    async fn run_loop(self) {
-        info!("ReflectionEngine started.");
+    async fn run_loop(mut self) {
+        let _ = self.logger_tx.send(BusMessage::Log(LogEvent::info("ReflectionEngine", "ReflectionEngine run loop started.")));
         loop {
-            // Wake up every 1 minute to check for short-term and long-term reflections
-            sleep(Duration::from_secs(60)).await;
+            tokio::select! {
+                _ = sleep(Duration::from_secs(60)) => {}
+                changed = self.shutdown_rx.changed() => {
+                    if changed.is_ok() && *self.shutdown_rx.borrow() {
+                        let _ = self.logger_tx.send(BusMessage::Log(LogEvent::info("ReflectionEngine", "ReflectionEngine stopping...")));
+                        break;
+                    }
+                }
+            }
 
             if !self.config.enabled.unwrap_or(false) {
                 continue;
             }
 
             if let Err(e) = self.run_short_term_reflection().await {
-                error!("Short-term reflection failed: {}", e);
+                let _ = self.logger_tx.send(BusMessage::Log(LogEvent::error("ReflectionEngine", &format!("Short-term reflection failed: {}", e))));
             }
 
             if let Err(e) = self.run_long_term_reflection().await {
-                error!("Long-term reflection failed: {}", e);
+                let _ = self.logger_tx.send(BusMessage::Log(LogEvent::error("ReflectionEngine", &format!("Long-term reflection failed: {}", e))));
             }
         }
     }
@@ -68,7 +87,10 @@ impl ReflectionEngine {
                 continue;
             }
 
-            debug!("Session {} reached short-term reflection threshold (idle)", session_id);
+            let _ = self.logger_tx.send(BusMessage::Log(
+                LogEvent::debug("ReflectionEngine", &format!("Session {} reached short-term reflection threshold (idle)", session_id))
+                .with_chat_id(&session_id)
+            ));
             // Trigger summary
             let mut transcript = String::new();
             for (_, role, content) in &new_messages {
@@ -110,10 +132,18 @@ impl ReflectionEngine {
                                     }).await.map_err(|e| e.to_string())?;
                                     rx.await??;
                                     
-                                    info!("Generated short-term summary for session {}", session_id);
+                                    let _ = self.logger_tx.send(BusMessage::Log(
+                                        LogEvent::info("ReflectionEngine", &format!("Generated short-term summary for session {}", session_id))
+                                        .with_chat_id(&session_id)
+                                    ));
                                 }
                     }
-                    Err(e) => error!("Failed to call provider for reflection: {}", e),
+                    Err(e) => {
+                        let _ = self.logger_tx.send(BusMessage::Log(
+                            LogEvent::error("ReflectionEngine", &format!("Failed to call provider for reflection: {}", e))
+                            .with_chat_id(&session_id)
+                        ));
+                    }
                 }
         }
         Ok(())
@@ -165,7 +195,9 @@ impl ReflectionEngine {
             }).await.map_err(|e| e.to_string())?;
             rx.await??;
             
-            info!("Generated long-term memory update");
+            let _ = self.logger_tx.send(BusMessage::Log(
+                LogEvent::info("ReflectionEngine", "Generated long-term memory update")
+            ));
         }
         
         Ok(())

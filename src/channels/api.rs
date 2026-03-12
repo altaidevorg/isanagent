@@ -1,10 +1,12 @@
 use async_trait::async_trait;
 use crate::channels::Channel;
 use crate::bus::{InboundMessage, OutboundMessage};
+use crate::logging::LoggerHandle;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
 use log::{info, error};
 use std::sync::Arc;
+use std::sync::Mutex;
 use dashmap::DashMap;
 use axum::{
     routing::post,
@@ -34,13 +36,20 @@ struct ChatResponse {
 pub struct ApiChannel {
     port: u16,
     pending_requests: Arc<DashMap<String, oneshot::Sender<OutboundMessage>>>,
+    logger_tx: LoggerHandle,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    task_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl ApiChannel {
-    pub fn new(port: u16) -> Self {
+    pub fn new(port: u16, logger_tx: LoggerHandle) -> Self {
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         Self { 
             port,
             pending_requests: Arc::new(DashMap::new()),
+            logger_tx,
+            shutdown_tx,
+            task_handle: Mutex::new(None),
         }
     }
 }
@@ -58,24 +67,43 @@ impl Channel for ApiChannel {
             pending_requests: self.pending_requests.clone(),
             channel_name: self.name().to_string(),
         };
+        
+        let logger_tx = self.logger_tx.clone();
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let _ = logger_tx.send(crate::bus::BusMessage::Log(crate::bus::LogEvent::info("ApiChannel", "Starting API channel...")));
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let app = Router::new()
                 .route("/v1/chat/completions", post(handle_chat))
                 .with_state(state);
 
             let addr = format!("0.0.0.0:{}", port);
-            info!("API channel listening on http://{}", addr);
+            let _ = logger_tx.send(crate::bus::BusMessage::Log(crate::bus::LogEvent::info("ApiChannel", &format!("API channel listening on http://{}", addr))));
 
             let listener = tokio::net::TcpListener::bind(&addr).await.expect("Failed to bind API port");
-            axum::serve(listener, app).await.expect("API server crashed");
+            let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+                while shutdown_rx.changed().await.is_ok() {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            });
+            if let Err(e) = server.await {
+                error!("API server crashed: {}", e);
+            }
         });
+        *self.task_handle.lock().unwrap() = Some(handle);
 
         Ok(())
     }
 
     async fn stop(&self) -> Result<(), String> {
         info!("Stopping API channel...");
+        let _ = self.shutdown_tx.send(true);
+        let handle = self.task_handle.lock().unwrap().take();
+        if let Some(handle) = handle {
+            let _ = handle.await;
+        }
         Ok(())
     }
 

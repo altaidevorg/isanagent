@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use crate::channels::Channel;
-use crate::bus::{InboundMessage, OutboundMessage};
+use crate::bus::{InboundMessage, OutboundMessage, BusMessage, LogEvent};
+use crate::logging::LoggerHandle;
 use tokio::sync::mpsc::Sender;
 use std::io::{self, Write};
 use log::error;
@@ -10,12 +11,20 @@ use crossterm::{cursor, terminal::{Clear, ClearType}, execute};
 /// A Channel implementation that reads from standard input and writes to standard output.
 pub struct TerminalChannel {
     chat_id: String,
+    logger_tx: LoggerHandle,
+    shutdown_tx: tokio::sync::mpsc::UnboundedSender<()>,
 }
 
 impl TerminalChannel {
-    pub fn new(chat_id: &str) -> Self {
+    pub fn new(
+        chat_id: &str,
+        logger_tx: LoggerHandle,
+        shutdown_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    ) -> Self {
         Self {
             chat_id: chat_id.to_string(),
+            logger_tx,
+            shutdown_tx,
         }
     }
 }
@@ -29,6 +38,10 @@ impl Channel for TerminalChannel {
     async fn start(&self, inbound_tx: Sender<InboundMessage>) -> Result<(), String> {
         let channel_name = self.name().to_string();
         let mut chat_id = self.chat_id.clone();
+        let logger_tx = self.logger_tx.clone();
+        let shutdown_tx = self.shutdown_tx.clone();
+        
+        let _ = logger_tx.send(BusMessage::Log(LogEvent::info("TerminalChannel", "Starting Terminal channel...")));
         
         tokio::task::spawn_blocking(move || {
             let stdin = io::stdin();
@@ -52,7 +65,8 @@ impl Channel for TerminalChannel {
                         if text.starts_with('/') {
                             if text.eq_ignore_ascii_case("/exit") || text.eq_ignore_ascii_case("/quit") {
                                 println!("{}", "Safely shutting down Advanced Agent-RS System...".yellow());
-                                std::process::exit(0);
+                                let _ = shutdown_tx.send(());
+                                break;
                             }
                             if text.eq_ignore_ascii_case("/new") {
                                 chat_id = uuid::Uuid::new_v4().to_string();
@@ -66,7 +80,8 @@ impl Channel for TerminalChannel {
                         // Handle legacy exit variants for user convenience
                         if text.eq_ignore_ascii_case("exit") || text.eq_ignore_ascii_case("quit") {
                             println!("{}", "Safely shutting down Advanced Agent-RS System...".yellow());
-                            std::process::exit(0);
+                            let _ = shutdown_tx.send(());
+                            break;
                         }
 
                         let msg = InboundMessage {

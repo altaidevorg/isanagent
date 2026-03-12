@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
-use log::{info, debug};
+use tokio::sync::mpsc;
 use std::collections::HashMap;
 use regex::Regex;
 
@@ -9,9 +9,9 @@ use crate::{ActorLogic, ActorError};
 use crate::traits::{Provider, Memory, Tool};
 use crate::tools::ToolRegistry;
 use crate::skills::SkillRegistry;
-use crate::bus::{BusMessage, OutboundMessage, TelemetryEvent};
+use crate::bus::{BusMessage, OutboundMessage, TelemetryEvent, LogEvent};
+use crate::logging::LoggerHandle;
 use crate::session::SessionManager;
-use tokio::sync::mpsc;
 
 /// The central logic for an autonomous Agent running inside an ActorNode.
 /// It holds a LLM Provider, a persistent Memory context, and available Tools.
@@ -28,6 +28,7 @@ pub struct AgentLogic {
     short_term_threshold_turns: usize,
     short_term_threshold_tokens: usize,
     outbound_tx: mpsc::Sender<BusMessage>,
+    logger_tx: LoggerHandle,
 }
 
 impl AgentLogic {
@@ -44,6 +45,7 @@ impl AgentLogic {
         short_term_threshold_turns: usize,
         short_term_threshold_tokens: usize,
         outbound_tx: mpsc::Sender<BusMessage>,
+        logger_tx: LoggerHandle,
     ) -> Self {
         let mut agent = Self {
             name: name.to_string(),
@@ -58,6 +60,7 @@ impl AgentLogic {
             short_term_threshold_turns,
             short_term_threshold_tokens,
             outbound_tx,
+            logger_tx,
         };
 
         // Inject the skill loader tool automatically
@@ -93,16 +96,26 @@ impl ActorLogic<BusMessage> for AgentLogic {
         let inbound = match packet {
             BusMessage::Inbound(msg) => msg,
             BusMessage::Outbound(_) => {
-                info!("[{}] Received OutboundMessage instead of Inbound, skipping.", self.name);
+                let _ = self.logger_tx.send(BusMessage::Log(LogEvent::info(&self.name, "Received OutboundMessage instead of Inbound, skipping.")));
                 return Ok(None);
             }
             BusMessage::Telemetry(_) => {
-                info!("[{}] Received TelemetryEvent, skipping.", self.name);
+                let _ = self.logger_tx.send(BusMessage::Log(LogEvent::info(&self.name, "Received TelemetryEvent, skipping.")));
+                return Ok(None);
+            }
+            BusMessage::LoggerControl(_) => {
+                return Ok(None);
+            }
+            BusMessage::Log(_) => {
+                // AgentLogic ignores Log events sent by others
                 return Ok(None);
             }
         };
 
-        info!("[{}] Received from [{}]: {}", self.name, inbound.channel, inbound.content);
+        let _ = self.logger_tx.send(BusMessage::Log(
+            LogEvent::info(&self.name, &format!("Received InboundMessage from [{}] ({} chars)", inbound.channel, inbound.content.len()))
+            .with_chat_id(&inbound.chat_id)
+        ));
 
         let thread_part = inbound.thread_id.as_deref().unwrap_or("");
         let session_key = format!("{}:{}:{}", inbound.channel, inbound.chat_id, thread_part);
@@ -152,7 +165,10 @@ impl ActorLogic<BusMessage> for AgentLogic {
             // Call Provider
             let tools_payload = Some(serde_json::json!(self.tools.list_tools()));
             let response = self.provider.chat(&context, tools_payload).await.map_err(|e| ActorError::from(e.to_string()))?;
-            debug!("[{}] Provider responded.", self.name);
+            let _ = self.logger_tx.send(BusMessage::Log(
+                LogEvent::debug(&self.name, "Provider responded.")
+                .with_chat_id(&inbound.chat_id)
+            ));
 
             // Log USAGE telemetry
             if let Some(usage) = &response.usage {
@@ -190,7 +206,10 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 for tc in tool_calls {
                     let tool_name = &tc.function.name;
                     let args_str = &tc.function.arguments;
-                    info!("[{}] Invoking tool: {}", self.name, tool_name);
+                    let _ = self.logger_tx.send(BusMessage::Log(
+                        LogEvent::info(&self.name, &format!("Invoking tool: {}", tool_name))
+                        .with_chat_id(&inbound.chat_id)
+                    ));
                     
                     // Emit Telemetry Tool Call
                     let args = serde_json::from_str::<serde_json::Value>(args_str).unwrap_or_else(|_| serde_json::json!({}));
@@ -248,8 +267,11 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 let approx_tokens: usize = current_context.iter().map(|msg| msg.content.as_deref().unwrap_or("").len() / 4).sum();
 
                 if turns >= self.short_term_threshold_turns || approx_tokens >= self.short_term_threshold_tokens {
-                    info!("[{}] Session {} reached short-term auto-compaction threshold ({} turns, {} max; ~{} tokens, {} max)",
-                          self.name, session_key, turns, self.short_term_threshold_turns, approx_tokens, self.short_term_threshold_tokens);
+                    let _ = self.logger_tx.send(BusMessage::Log(
+                        LogEvent::info(&self.name, &format!("Session {} reached short-term auto-compaction threshold ({} turns, {} max; ~{} tokens, {} max)",
+                          session_key, turns, self.short_term_threshold_turns, approx_tokens, self.short_term_threshold_tokens))
+                        .with_chat_id(&inbound.chat_id)
+                    ));
                     
                     let mut transcript = String::new();
                     for msg in &current_context {
@@ -306,7 +328,10 @@ impl ActorLogic<BusMessage> for AgentLogic {
                                     if let Err(e) = mem.clear().await {
                                         log::error!("Failed to clear session after summary: {}", e);
                                     } else {
-                                        info!("[{}] Session {} auto-compacted and cleared successfully.", self.name, session_key);
+                                        let _ = self.logger_tx.send(BusMessage::Log(
+                                            LogEvent::info(&self.name, &format!("Session {} auto-compacted and cleared successfully.", session_key))
+                                            .with_chat_id(&inbound.chat_id)
+                                        ));
                                     }
                                 }
                     }

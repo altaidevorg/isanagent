@@ -1,20 +1,31 @@
 use async_trait::async_trait;
-use crate::channels::Channel;
 use crate::bus::{InboundMessage, OutboundMessage};
+use crate::channels::Channel;
 use crate::config::EmailConfig;
-use tokio::sync::mpsc::Sender;
-use log::{info, error};
-use std::time::Duration;
-use lettre::{Message, SmtpTransport, Transport, transport::smtp::authentication::Credentials};
+use crate::logging::LoggerHandle;
+use lettre::{transport::smtp::authentication::Credentials, Message, SmtpTransport, Transport};
+use log::{error, info};
 use native_tls::TlsConnector;
+use std::sync::Mutex;
+use std::time::Duration;
+use tokio::sync::{mpsc::Sender, watch};
 
 pub struct EmailChannel {
     config: EmailConfig,
+    logger_tx: LoggerHandle,
+    shutdown_tx: watch::Sender<bool>,
+    task_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl EmailChannel {
-    pub fn new(config: EmailConfig) -> Self {
-        Self { config }
+    pub fn new(config: EmailConfig, logger_tx: LoggerHandle) -> Self {
+        let (shutdown_tx, _) = watch::channel(false);
+        Self {
+            config,
+            logger_tx,
+            shutdown_tx,
+            task_handle: Mutex::new(None),
+        }
     }
 }
 
@@ -25,91 +36,28 @@ impl Channel for EmailChannel {
     }
 
     async fn start(&self, inbound_tx: Sender<InboundMessage>) -> Result<(), String> {
-        info!("Starting Email channel...");
+        let _ = self.logger_tx.send(crate::bus::BusMessage::Log(crate::bus::LogEvent::info(
+            "EmailChannel",
+            "Starting Email channel...",
+        )));
         let config = self.config.clone();
+        let logger_tx = self.logger_tx.clone();
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
+            let _ = logger_tx.send(crate::bus::BusMessage::Log(crate::bus::LogEvent::info(
+                "EmailChannel",
+                "Started email background listener task.",
+            )));
+
             loop {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+
                 let cfg = config.clone();
                 let tx = inbound_tx.clone();
-
-                let res = tokio::task::spawn_blocking(move || -> Result<(), String> {
-                    let tls = TlsConnector::builder().build().map_err(|e| e.to_string())?;
-                    let client = imap::connect(
-                        (&cfg.imap_host as &str, cfg.imap_port),
-                        &cfg.imap_host,
-                        &tls,
-                    ).map_err(|e| e.to_string())?;
-
-                    let mut session = client
-                        .login(&cfg.imap_username, &cfg.imap_password)
-                        .map_err(|e| e.0.to_string())?;
-
-                    session.select("INBOX").map_err(|e| e.to_string())?;
-                    
-                    // Permanent streaming connection
-                    loop {
-                        log::info!("Searching for UNSEEN emails...");
-                        let messages = session.search("UNSEEN").map_err(|e| e.to_string())?;
-                        
-                        log::info!("Found {} UNSEEN messages", messages.len());
-                        for seq in messages {
-                            log::info!("Fetching message {}", seq);
-                            if let Ok(fetches) = session.fetch(seq.to_string(), "(ENVELOPE BODY[TEXT])") {
-                                for m in fetches.iter() {
-                                    let mut sender = String::from("unknown@example.com");
-                                    let mut subject = String::new();
-                                    
-                                    if let Some(envelope) = m.envelope() {
-                                        if let Some(subject_bytes) = envelope.subject {
-                                            subject = String::from_utf8_lossy(subject_bytes).to_string();
-                                        }
-                                        if let Some(froms) = envelope.from.as_ref() {
-                                            if let Some(from) = froms.first() {
-                                                if let (Some(mailbox), Some(host)) = (from.mailbox, from.host) {
-                                                    sender = format!("{}@{}", 
-                                                        String::from_utf8_lossy(mailbox), 
-                                                        String::from_utf8_lossy(host)
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    let mut content = String::new();
-                                    if let Some(body) = m.text() {
-                                        content = String::from_utf8_lossy(body).trim().to_string();
-                                    }
-
-                                    let thread_id = subject;
-                                    let chat_id = sender.clone();
-
-                                    let inbound = InboundMessage {
-                                        channel: "email".to_string(),
-                                        sender_id: sender.clone(),
-                                        chat_id,
-                                        thread_id: Some(thread_id),
-                                        content,
-                                        metadata: std::collections::HashMap::new(),
-                                    };
-
-                                    if let Err(e) = tx.blocking_send(inbound) {
-                                        error!("Failed to route email to agent bus: {}", e);
-                                    }
-                                }
-                            }
-                            // Mark as read
-                            let _ = session.store(format!("{}", seq), "+FLAGS (\\Seen)");
-                        }
-                        
-                        log::info!("Entering IMAP IDLE state...");
-                        {
-                            let idle = session.idle().map_err(|e| e.to_string())?;
-                            idle.wait_keepalive().map_err(|e| format!("IDLE failed: {}", e))?;
-                        }
-                        log::info!("Woke up from IMAP IDLE state!");
-                    }
-                }).await;
+                let res = tokio::task::spawn_blocking(move || poll_inbox_once(cfg, tx)).await;
 
                 if let Err(e) = res {
                     error!("IMAP panic: {}", e);
@@ -117,29 +65,62 @@ impl Channel for EmailChannel {
                     error!("IMAP Error: {}. Reconnecting in 15 seconds.", e);
                 }
 
-                tokio::time::sleep(Duration::from_secs(15)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(15)) => {}
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_ok() && *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
             }
+
+            let _ = logger_tx.send(crate::bus::BusMessage::Log(crate::bus::LogEvent::info(
+                "EmailChannel",
+                "Email channel stopped.",
+            )));
         });
 
+        *self.task_handle.lock().unwrap() = Some(handle);
         Ok(())
     }
 
     async fn stop(&self) -> Result<(), String> {
         info!("Stopping Email channel...");
+        let _ = self.shutdown_tx.send(true);
+        let handle = self.task_handle.lock().unwrap().take();
+        if let Some(handle) = handle {
+            let _ = handle.await;
+        }
         Ok(())
     }
 
     async fn send(&self, msg: OutboundMessage) -> Result<(), String> {
         let config = self.config.clone();
-        
+
         let to_address = msg.chat_id.clone();
-        let subject = msg.thread_id.unwrap_or_else(|| "Re: Message from Altbot".to_string());
-        
+        let subject = msg
+            .thread_id
+            .unwrap_or_else(|| "Re: Message from Altbot".to_string());
+
         tokio::task::spawn_blocking(move || -> Result<(), String> {
             let email = Message::builder()
-                .from(config.email_address.parse().map_err(|e| format!("Invalid from address: {}", e))?)
-                .to(to_address.parse().map_err(|e| format!("Invalid to address: {}", e))?)
-                .subject(if subject.starts_with("Re:") { subject.clone() } else { format!("Re: {}", subject) })
+                .from(
+                    config
+                        .email_address
+                        .parse()
+                        .map_err(|e| format!("Invalid from address: {}", e))?,
+                )
+                .to(
+                    to_address
+                        .parse()
+                        .map_err(|e| format!("Invalid to address: {}", e))?,
+                )
+                .subject(if subject.starts_with("Re:") {
+                    subject.clone()
+                } else {
+                    format!("Re: {}", subject)
+                })
                 .body(msg.content.clone())
                 .map_err(|e| e.to_string())?;
 
@@ -152,11 +133,75 @@ impl Channel for EmailChannel {
                 .build();
 
             mailer.send(&email).map_err(|e| e.to_string())?;
-            
+
             info!("Successfully sent reply email to {}", to_address);
             Ok(())
         })
         .await
         .map_err(|e| format!("SMTP task panicked: {}", e))?
     }
+}
+
+fn poll_inbox_once(config: EmailConfig, tx: Sender<InboundMessage>) -> Result<(), String> {
+    let tls = TlsConnector::builder().build().map_err(|e| e.to_string())?;
+    let client = imap::connect((&config.imap_host as &str, config.imap_port), &config.imap_host, &tls)
+        .map_err(|e| e.to_string())?;
+
+    let mut session = client
+        .login(&config.imap_username, &config.imap_password)
+        .map_err(|e| e.0.to_string())?;
+
+    session.select("INBOX").map_err(|e| e.to_string())?;
+    info!("Searching for UNSEEN emails...");
+    let messages = session.search("UNSEEN").map_err(|e| e.to_string())?;
+    info!("Found {} UNSEEN messages", messages.len());
+
+    for seq in messages {
+        info!("Fetching message {}", seq);
+        if let Ok(fetches) = session.fetch(seq.to_string(), "(ENVELOPE BODY[TEXT])") {
+            for m in fetches.iter() {
+                let mut sender = String::from("unknown@example.com");
+                let mut subject = String::new();
+
+                if let Some(envelope) = m.envelope() {
+                    if let Some(subject_bytes) = envelope.subject {
+                        subject = String::from_utf8_lossy(subject_bytes).to_string();
+                    }
+                    if let Some(froms) = envelope.from.as_ref() {
+                        if let Some(from) = froms.first() {
+                            if let (Some(mailbox), Some(host)) = (from.mailbox, from.host) {
+                                sender = format!(
+                                    "{}@{}",
+                                    String::from_utf8_lossy(mailbox),
+                                    String::from_utf8_lossy(host)
+                                );
+                            }
+                        }
+                    }
+                }
+
+                let mut content = String::new();
+                if let Some(body) = m.text() {
+                    content = String::from_utf8_lossy(body).trim().to_string();
+                }
+
+                let inbound = InboundMessage {
+                    channel: "email".to_string(),
+                    sender_id: sender.clone(),
+                    chat_id: sender,
+                    thread_id: Some(subject),
+                    content,
+                    metadata: std::collections::HashMap::new(),
+                };
+
+                if let Err(e) = tx.blocking_send(inbound) {
+                    error!("Failed to route email to agent bus: {}", e);
+                }
+            }
+        }
+        let _ = session.store(format!("{}", seq), "+FLAGS (\\Seen)");
+    }
+
+    let _ = session.logout();
+    Ok(())
 }

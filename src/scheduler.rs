@@ -1,12 +1,13 @@
 use async_trait::async_trait;
 use std::str::FromStr;
-use log::{info, error};
+use log::error;
 use chrono::Utc;
 use cron::Schedule;
 use serde::{Deserialize, Serialize};
 use rusqlite::{Connection, params};
 
 use crate::{ActorLogic, ActorError};
+use crate::logging::LoggerHandle;
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "kind")]
@@ -46,10 +47,11 @@ pub struct CronActor {
     name: String,
     jobs: Vec<ActiveJob>,
     conn: Connection,
+    logger_tx: LoggerHandle,
 }
 
 impl CronActor {
-    pub fn new(name: &str, db_path: &str) -> Result<Self, rusqlite::Error> {
+    pub fn new(name: &str, db_path: &str, logger_tx: LoggerHandle) -> Result<Self, rusqlite::Error> {
         let conn = Connection::open(db_path)?;
 
         // Create the cron_jobs table if it doesn't exist
@@ -97,12 +99,13 @@ impl CronActor {
             }
         }
         
-        info!("Loaded {} cron jobs from database.", jobs.len());
+        let _ = logger_tx.send(crate::bus::BusMessage::Log(crate::bus::LogEvent::info(name, &format!("Loaded {} cron jobs from database.", jobs.len()))));
 
         Ok(Self {
             name: name.to_string(),
             jobs,
             conn,
+            logger_tx,
         })
     }
 }
@@ -123,17 +126,17 @@ impl ActorLogic<String> for CronActor {
                     // Validate Cron if needed
                     if let ScheduleKind::Cron { ref cron_expr } = schedule {
                         if let Err(e) = Schedule::from_str(cron_expr) {
-                            error!("[CronActor {}] Invalid cron expression '{}': {}", self.name, cron_expr, e);
+                            let _ = self.logger_tx.send(crate::bus::BusMessage::Log(crate::bus::LogEvent::error(&self.name, &format!("Invalid cron expression '{}': {}", cron_expr, e))));
                             return Err(ActorError::from(format!("Invalid cron expression: {}", e)));
                         }
                     }
 
-                    info!("[CronActor {}] Added job '{}' with schedule {:?}", self.name, id, schedule);
+                    let _ = self.logger_tx.send(crate::bus::BusMessage::Log(crate::bus::LogEvent::info(&self.name, &format!("Added job '{}' with schedule {:?}", id, schedule))));
                     
                     let schedule_json = match serde_json::to_string(&schedule) {
                         Ok(json) => json,
                         Err(e) => {
-                            error!("[CronActor {}] Failed to serialize schedule: {}", self.name, e);
+                            let _ = self.logger_tx.send(crate::bus::BusMessage::Log(crate::bus::LogEvent::error(&self.name, &format!("Failed to serialize schedule: {}", e))));
                             return Err(ActorError::from(format!("Failed to serialize schedule: {}", e)));
                         }
                     };
@@ -142,7 +145,7 @@ impl ActorLogic<String> for CronActor {
                         "INSERT INTO cron_jobs (id, schedule, message, last_run_at_ms, chat_id, channel) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                         params![id, schedule_json, message, None::<i64>, chat_id, channel],
                     ) {
-                        error!("[CronActor {}] Failed to save cron job to DB: {}", self.name, e);
+                        let _ = self.logger_tx.send(crate::bus::BusMessage::Log(crate::bus::LogEvent::error(&self.name, &format!("Failed to save cron job to DB: {}", e))));
                     }
 
                     self.jobs.push(ActiveJob {
@@ -160,9 +163,9 @@ impl ActorLogic<String> for CronActor {
                         "DELETE FROM cron_jobs WHERE id = ?1",
                         params![id],
                     ) {
-                        error!("[CronActor {}] Failed to remove cron job from DB: {}", self.name, e);
+                        let _ = self.logger_tx.send(crate::bus::BusMessage::Log(crate::bus::LogEvent::error(&self.name, &format!("Failed to remove cron job from DB: {}", e))));
                     }
-                    info!("[CronActor {}] Removed job '{}'", self.name, id);
+                    let _ = self.logger_tx.send(crate::bus::BusMessage::Log(crate::bus::LogEvent::info(&self.name, &format!("Removed job '{}'", id))));
                 }
             }
         }
@@ -208,7 +211,7 @@ impl ActorLogic<String> for CronActor {
                             "UPDATE cron_jobs SET last_run_at_ms = ?1 WHERE id = ?2",
                             params![job.last_run_at_ms, job.id],
                         ) {
-                            error!("[CronActor {}] Failed to update job last_run_at_ms in DB: {}", self.name, e);
+                            let _ = self.logger_tx.send(crate::bus::BusMessage::Log(crate::bus::LogEvent::error(&self.name, &format!("Failed to update job last_run_at_ms in DB: {}", e))));
                         }
                     }
                 }
@@ -226,7 +229,7 @@ impl ActorLogic<String> for CronActor {
             }
 
             if should_trigger {
-                info!("[CronActor {}] Triggering scheduled event: {}", self.name, job.id);
+                let _ = self.logger_tx.send(crate::bus::BusMessage::Log(crate::bus::LogEvent::info(&self.name, &format!("Triggering scheduled event: {}", job.id))));
                 if let Ok(json_trigger) = serde_json::to_string(&serde_json::json!({
                     "chat_id": job.chat_id,
                     "channel": job.channel,
@@ -244,7 +247,7 @@ impl ActorLogic<String> for CronActor {
                 "DELETE FROM cron_jobs WHERE id = ?1",
                 params![id],
             ) {
-                error!("[CronActor {}] Failed to remove expired AT job from DB: {}", self.name, e);
+                let _ = self.logger_tx.send(crate::bus::BusMessage::Log(crate::bus::LogEvent::error(&self.name, &format!("Failed to remove expired AT job from DB: {}", e))));
             }
         }
         

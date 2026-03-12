@@ -29,6 +29,8 @@ pub struct ToolCallRequest {
     pub id: String,
     #[serde(rename = "type")]
     pub tool_type: String, // Usually "function"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra_content: Option<serde_json::Value>,
     pub function: ToolCallFunction,
 }
 
@@ -115,6 +117,13 @@ pub struct LLMClient {
     client: reqwest::Client,
 }
 
+pub fn build_reqwest_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("failed to build reqwest client")
+}
+
 impl LLMClient {
     /// Create a new client with default settings (temp=0.7, timeout=30s).
     pub fn new_openai_compatible(base_url: &str, api_key: &str, model: &str) -> Self {
@@ -131,7 +140,7 @@ impl LLMClient {
             model: model.to_string(),
             temperature: 0.7,
             timeout: Duration::from_secs(30),
-            client: reqwest::Client::new(),
+            client: build_reqwest_client(),
         }
     }
 
@@ -224,7 +233,11 @@ impl LLMClient {
             .to_string();
 
         if usage.as_ref().map(|u| u.completion_tokens == 0).unwrap_or(false) || content.trim().is_empty() {
-            eprintln!("\n[DIAGNOSTIC] LLM returned 0 completion tokens or empty content.\nFinish reason: {}\nRaw response: {}\n", finish_reason, raw_text);
+            debug!(
+                "LLM returned empty content or zero completion tokens. finish_reason={} raw_response_len={}",
+                finish_reason,
+                raw_text.len()
+            );
         }
 
         info!("LLM Response received ({} chars content, tool_calls: {}, reasoning: {}, usage: {})", 

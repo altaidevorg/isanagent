@@ -1,64 +1,347 @@
-use std::path::PathBuf;
-use std::fs::OpenOptions;
-use std::io::Write;
-use async_trait::async_trait;
-use log::error;
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{mpsc::{sync_channel, Receiver, SyncSender}, OnceLock};
 
-use crate::{ActorLogic, ActorError};
-use crate::bus::BusMessage;
+use async_trait::async_trait;
+use log::{Level, LevelFilter, Log, Metadata, Record, SetLoggerError};
+use regex::Regex;
+use serde_json::json;
+use tokio::time::Duration;
+
+use crate::bus::{BusMessage, LogEvent, LogLevel, LoggerControlMessage, TelemetryEvent};
+use crate::{ActorError, ActorLogic};
+
+pub const LOGGER_QUEUE_CAPACITY: usize = 4096;
 
 #[derive(Clone)]
-pub struct WorkspaceLoggingActor {
-    log_file_path: PathBuf,
+pub struct LoggerHandle {
+    sender: SyncSender<BusMessage>,
 }
 
-impl WorkspaceLoggingActor {
-    pub fn new(workspace_dir: PathBuf) -> Self {
+impl LoggerHandle {
+    pub fn send(&self, msg: BusMessage) -> Result<(), String> {
+        self.sender
+            .send(msg)
+            .map_err(|_| "logger channel disconnected".to_string())
+    }
+}
+
+pub fn create_logger_channel(capacity: usize) -> (LoggerHandle, Receiver<BusMessage>) {
+    let (sender, receiver) = sync_channel(capacity);
+    (LoggerHandle { sender }, receiver)
+}
+
+static LOGGER_SENDER: OnceLock<LoggerHandle> = OnceLock::new();
+static ACTOR_RUNTIME_LOGGER: ActorRuntimeLogger = ActorRuntimeLogger;
+
+struct ActorRuntimeLogger;
+
+impl Log for ActorRuntimeLogger {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        should_capture(metadata.target(), metadata.level())
+    }
+
+    fn log(&self, record: &Record<'_>) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+
+        let Some(sender) = LOGGER_SENDER.get() else {
+            return;
+        };
+
+        let message = sanitize_message(&record.args().to_string());
+        if message.contains("LoggingActor") || message.contains("Supervisor(LoggingActor)") {
+            return;
+        }
+
+        let thread = std::thread::current();
+        let mut event = LogEvent::new(
+            map_level(record.level()),
+            record.module_path().unwrap_or(record.target()),
+            &message,
+        )
+        .with_target(record.target());
+
+        if let Some(file) = record.file() {
+            event = event.with_location(file, record.line());
+        }
+
+        event = event.with_metadata(json!({
+            "module_path": record.module_path(),
+            "file": record.file(),
+            "line": record.line(),
+            "thread_name": thread.name(),
+            "thread_id": format!("{:?}", thread.id()),
+        }));
+
+        let _ = sender.send(BusMessage::Log(event));
+    }
+
+    fn flush(&self) {}
+}
+
+pub fn init_runtime_logger(sender: LoggerHandle) -> Result<(), SetLoggerError> {
+    let _ = LOGGER_SENDER.set(sender);
+    log::set_logger(&ACTOR_RUNTIME_LOGGER)?;
+    log::set_max_level(LevelFilter::Trace);
+    Ok(())
+}
+
+fn should_capture(target: &str, level: Level) -> bool {
+    let is_internal = target == "altbot"
+        || target.starts_with("agent_rs")
+        || matches!(
+            target,
+            "Altbot"
+                | "TerminalChannel"
+                | "SlackChannel"
+                | "ApiChannel"
+                | "EmailChannel"
+                | "ReflectionEngine"
+                | "DailyBriefingCron"
+                | "BusMessage"
+                | "Telemetry"
+        );
+
+    if is_internal {
+        return true;
+    }
+
+    level <= Level::Warn
+}
+
+fn map_level(level: Level) -> LogLevel {
+    match level {
+        Level::Trace => LogLevel::Trace,
+        Level::Debug => LogLevel::Debug,
+        Level::Info => LogLevel::Info,
+        Level::Warn => LogLevel::Warn,
+        Level::Error => LogLevel::Error,
+    }
+}
+
+fn sanitize_message(message: &str) -> String {
+    static BEARER_RE: OnceLock<Regex> = OnceLock::new();
+    static GEMINI_KEY_RE: OnceLock<Regex> = OnceLock::new();
+    static EMAIL_RE: OnceLock<Regex> = OnceLock::new();
+
+    let bearer_re = BEARER_RE.get_or_init(|| Regex::new(r"Bearer\s+[A-Za-z0-9._\-]+").expect("valid bearer regex"));
+    let gemini_key_re = GEMINI_KEY_RE.get_or_init(|| Regex::new(r"AIza[0-9A-Za-z\-_]{20,}").expect("valid api key regex"));
+    let email_re = EMAIL_RE.get_or_init(|| Regex::new(r"\b([A-Za-z0-9._%+\-])([A-Za-z0-9._%+\-]*?)@([A-Za-z0-9.\-]+\.[A-Za-z]{2,})\b").expect("valid email regex"));
+
+    let redacted = bearer_re.replace_all(message, "Bearer [REDACTED]");
+    let redacted = gemini_key_re.replace_all(&redacted, "[REDACTED_API_KEY]");
+    email_re
+        .replace_all(&redacted, "$1***@$3")
+        .into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sanitize_message, should_capture};
+    use log::Level;
+
+    #[test]
+    fn sanitize_message_masks_secrets_and_emails() {
+        let message = "Bearer abc.def ghi myawesomesecret umut@altai.dev";
+        let sanitized = sanitize_message(message);
+        assert!(sanitized.contains("Bearer [REDACTED]"));
+        assert!(sanitized.contains("[REDACTED_API_KEY]"));
+        assert!(sanitized.contains("u***@altai.dev"));
+        assert!(!sanitized.contains("myawesomesecret"));
+    }
+
+    #[test]
+    fn should_capture_filters_external_noise() {
+        assert!(should_capture("agent_rs::utils", Level::Debug));
+        assert!(should_capture("SlackChannel", Level::Info));
+        assert!(!should_capture("hyper_util::client::legacy::pool", Level::Info));
+        assert!(should_capture("hyper_util::client::legacy::pool", Level::Warn));
+    }
+}
+
+/// The sole component responsible for writing workspace log files.
+pub struct LoggingActor {
+    conversation_writer: BufWriter<File>,
+    runtime_writer: BufWriter<File>,
+}
+
+impl LoggingActor {
+    pub fn new(workspace_dir: PathBuf) -> Result<Self, String> {
         let logs_dir = workspace_dir.join(".system_generated").join("logs");
-        if !logs_dir.exists() {
-            let _ = std::fs::create_dir_all(&logs_dir);
+        std::fs::create_dir_all(&logs_dir)
+            .map_err(|e| format!("Failed to create logs directory: {}", e))?;
+
+        Ok(Self {
+            conversation_writer: open_writer(&logs_dir.join("conversation.jsonl"))?,
+            runtime_writer: open_writer(&logs_dir.join("runtime.log"))?,
+        })
+    }
+
+    fn write_conversation(&mut self, packet: &BusMessage) -> Result<(), ActorError> {
+        let json_line = match packet {
+            BusMessage::Inbound(inv) => serde_json::to_string(inv),
+            BusMessage::Outbound(out) => serde_json::to_string(out),
+            BusMessage::Telemetry(tel) => serde_json::to_string(tel),
+            BusMessage::Log(_) => return Ok(()),
+            BusMessage::LoggerControl(_) => return Ok(()),
         }
-        
-        Self {
-            log_file_path: logs_dir.join("conversation.jsonl"),
-        }
+        .map_err(|e| ActorError::from(format!("Failed to serialize conversation event: {}", e)))?;
+
+        writeln!(self.conversation_writer, "{}", json_line)
+            .map_err(|e| ActorError::from(format!("Failed to write conversation log: {}", e)))
+    }
+
+    fn write_runtime_event(&mut self, event: &LogEvent) -> Result<(), ActorError> {
+        writeln!(self.runtime_writer, "{}", event.format_line())
+            .map_err(|e| ActorError::from(format!("Failed to write runtime log: {}", e)))
+    }
+
+    fn write_shadow_runtime_event(&mut self, packet: &BusMessage) -> Result<(), ActorError> {
+        let event = match packet {
+            BusMessage::Inbound(msg) => LogEvent::info(
+                "BusMessage",
+                &format!(
+                    "Inbound received on channel={} sender={} content_len={}",
+                    msg.channel,
+                    msg.sender_id,
+                    msg.content.len()
+                ),
+            )
+            .with_chat_id(&msg.chat_id)
+            .with_metadata(json!({
+                "direction": "inbound",
+                "thread_id": msg.thread_id,
+                "metadata": msg.metadata,
+            })),
+            BusMessage::Outbound(msg) => LogEvent::info(
+                "BusMessage",
+                &format!(
+                    "Outbound sent on channel={} content_len={}",
+                    msg.channel,
+                    msg.content.len()
+                ),
+            )
+            .with_chat_id(&msg.chat_id)
+            .with_metadata(json!({
+                "direction": "outbound",
+                "thread_id": msg.thread_id,
+                "metadata": msg.metadata,
+            })),
+            BusMessage::Telemetry(telemetry) => telemetry_to_log_event(telemetry),
+            BusMessage::Log(_) => return Ok(()),
+            BusMessage::LoggerControl(_) => return Ok(()),
+        };
+
+        self.write_runtime_event(&event)
+    }
+
+    fn flush_all(&mut self) -> Result<(), ActorError> {
+        self.conversation_writer
+            .flush()
+            .map_err(|e| ActorError::from(format!("Failed to flush conversation log: {}", e)))?;
+        self.runtime_writer
+            .flush()
+            .map_err(|e| ActorError::from(format!("Failed to flush runtime log: {}", e)))?;
+        Ok(())
+    }
+}
+
+impl Drop for LoggingActor {
+    fn drop(&mut self) {
+        let _ = self.flush_all();
+    }
+}
+
+fn open_writer(path: &Path) -> Result<BufWriter<File>, String> {
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
+    Ok(BufWriter::new(file))
+}
+
+fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
+    match telemetry {
+        TelemetryEvent::ToolCall {
+            chat_id,
+            tool_name,
+            args,
+        } => LogEvent::info(
+            "Telemetry",
+            &format!("ToolCall tool={} args_len={}", tool_name, args.len()),
+        )
+        .with_chat_id(chat_id),
+        TelemetryEvent::ToolResult {
+            chat_id,
+            tool_name,
+            result,
+        } => LogEvent::info(
+            "Telemetry",
+            &format!("ToolResult tool={} result_len={}", tool_name, result.len()),
+        )
+        .with_chat_id(chat_id),
+        TelemetryEvent::AgentThought { chat_id, thought } => LogEvent::debug(
+            "Telemetry",
+            &format!("AgentThought thought_len={}", thought.len()),
+        )
+        .with_chat_id(chat_id),
+        TelemetryEvent::AgentUsage {
+            chat_id,
+            model,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        } => LogEvent::info(
+            "Telemetry",
+            &format!(
+                "AgentUsage model={} prompt={} completion={} total={}",
+                model, prompt_tokens, completion_tokens, total_tokens
+            ),
+        )
+        .with_chat_id(chat_id),
+        TelemetryEvent::CronTrigger { job_id, message } => LogEvent::info(
+            "Telemetry",
+            &format!("CronTrigger job_id={} message_len={}", job_id, message.len()),
+        ),
     }
 }
 
 #[async_trait]
-impl ActorLogic<BusMessage> for WorkspaceLoggingActor {
+impl ActorLogic<BusMessage> for LoggingActor {
     fn name(&self) -> String {
-        "WorkspaceLogger".to_string()
+        "LoggingActor".to_string()
+    }
+
+    fn tick_interval(&self) -> Option<Duration> {
+        Some(Duration::from_secs(1))
+    }
+
+    async fn on_tick(&mut self) -> Result<Option<(String, BusMessage)>, ActorError> {
+        self.flush_all()?;
+        Ok(None)
     }
 
     async fn process(&mut self, packet: BusMessage) -> Result<Option<(String, BusMessage)>, ActorError> {
-        let json_line = match &packet {
-            BusMessage::Inbound(inv) => {
-                serde_json::to_string(inv)
+        match &packet {
+            BusMessage::LoggerControl(LoggerControlMessage::Flush) => {
+                self.flush_all()?;
+                return Ok(Some((
+                    "logger_control".to_string(),
+                    BusMessage::LoggerControl(LoggerControlMessage::Flushed),
+                )));
             }
-            BusMessage::Outbound(out) => {
-                serde_json::to_string(out)
+            BusMessage::LoggerControl(LoggerControlMessage::Flushed) => return Ok(None),
+            BusMessage::Log(event) => self.write_runtime_event(event)?,
+            _ => {
+                self.write_conversation(&packet)?;
+                self.write_shadow_runtime_event(&packet)?;
             }
-            BusMessage::Telemetry(tel) => {
-                serde_json::to_string(tel)
-            }
-        }.unwrap_or_else(|_| "{}".to_string());
+        }
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log_file_path)
-            .map_err(|e| {
-                error!("WorkspaceLogger I/O error: {}", e);
-                ActorError::from(format!("Failed to open log file: {}", e))
-            })?;
-
-        writeln!(file, "{}", json_line).map_err(|e| {
-            error!("WorkspaceLogger write error: {}", e);
-            ActorError::from(format!("Failed to write to log file: {}", e))
-        })?;
-
-        // Pass it through untouched on a "next" route if anything wants to chain it
-        Ok(Some(("next".to_string(), packet)))
+        Ok(None)
     }
 }

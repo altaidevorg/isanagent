@@ -305,7 +305,11 @@ where T: Debug + Send + Sync + Clone + 'static
             if let Some(msg) = msg_opt {
                 match msg {
                     Message::Packet(data) => {
-                        info!("Actor '{}' received packet: {:?}", self.name, data);
+                        info!(
+                            "Actor '{}' received packet of type '{}'.",
+                            self.name,
+                            std::any::type_name::<T>()
+                        );
                         
                         // Retry loop
                         let mut attempt = 0;
