@@ -47,26 +47,61 @@ The core message bus routes information between interfaces (e.g. Slack, Terminal
 cargo build --release
 ```
 
-### 2. Configure Your Workspace
-Agent-RS expects a "Workspace" root containing your configuration and where the Agent is allowed to read/write state securely.
+### 2. Bootstrap Your Workspace
+Agent-RS now ships with an onboarding command that creates a ready-to-edit workspace root, starter config, sandbox directory, and local skills.
 
-Create a directory (e.g., `my_agent`) and place a `config.toml`:
+```bash
+cargo run --bin altbot -- onboard --workspace my_agent
+```
+
+This creates:
+
+```text
+my_agent/
+├── config.toml
+├── .system_generated/
+└── workspace/
+    ├── AGENTS.md
+    ├── USER.md
+    ├── SOUL.md
+    └── skills/
+        ├── cron/
+        │   └── SKILL.md
+        └── skill-creator/
+            └── SKILL.md
+```
+
+The generated `config.toml` starts with these defaults:
 ```toml
-[app]
-max_iterations = 25
-max_tool_output_chars = 3000
 restrict_to_workspace = true
+max_iterations = 50
+max_tool_output_chars = 10000
 
 [provider]
-model_name = "gemini-2.5-flash"
+model_name = "gemini-3-flash-preview"
 api_key_env = "GEMINI_API_KEY"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 
 [slack]
-enabled = false
-app_token = "xapp-..."
-bot_token = "xoxb-..."
+enabled = true
+app_token = "<changethis>"
+bot_token = "<changethis>"
 reply_in_thread = true
 reaction_emoji = "eyes"
+
+[email]
+enabled = false
+imap_host = "imap.agentmail.to"
+imap_port = 993
+imap_username = "<changethis>"
+imap_password = "<changethis>"
+smtp_host = "smtp.agentmail.to"
+smtp_port = 465
+email_address = "<changethis>"
+
+[api]
+enabled = false
+port = 8080
 
 [memory]
 enabled = true
@@ -74,14 +109,17 @@ short_term_threshold_turns = 20
 short_term_threshold_tokens = 100000
 short_term_threshold_mins = 15
 long_term_interval_mins = 360
-max_recent_summaries = 5
 long_term_threshold_summaries = 5
+max_recent_summaries = 5
 ```
+
+Update the `<changethis>` placeholders, ensure `GEMINI_API_KEY` is set, and disable any channels you are not ready to use yet before running the agent.
+For example, if you are not using Slack on first boot, set `[slack].enabled = false` in `config.toml`.
 
 ### 3. Run the Agent
 ```bash
-# Pass your workspace path (and optionally, config relative to the binary).
-cargo run --bin altbot -- --workspace my_agent --config my_agent/config.toml
+# Pass your workspace path. `config.toml` defaults to <workspace>/config.toml.
+cargo run --bin altbot -- --workspace my_agent
 ```
 
 ## � Configuring Channels
@@ -132,7 +170,7 @@ Agent-RS supports dual-layer extensibility: Built-in strict Rust Tools, and dyna
 ### Built-in Tools
 Tools like `web_scrape`, `shell_exec`, `list_dir`, `read_file` are mapped natively in `src/tools/builtin.rs`. If `restrict_to_workspace` is true, Agent-RS heavily validates file-system calls preventing the AI from path traversing outside the active workspace directory or manipulating system state.
 
-### Markdown Skills (`/workspace/.agents/skills/`)
+### Markdown Skills (`/workspace/skills/`)
 Skills provide complex workflows, templates, or instructions natively to the Agent without recompiling Rust code. 
 Place a directory in `skills/` containing a `SKILL.md` file using YAML frontmatter:
 

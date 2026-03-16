@@ -10,18 +10,22 @@ use agent_rs::session::SessionManager;
 use agent_rs::provider::OpenAIProvider;
 use agent_rs::tools::ToolRegistry;
 use agent_rs::tools::builtin::{ReadFileTool, WriteFileTool, EditFileTool, ListDirTool, ShellExecTool, WebSearchTool, WebFetchTool, CronTool, MessageTool};
-use agent_rs::workspace::AltbotWorkspace;
+use agent_rs::onboarding::{onboard_workspace, BootstrapReport};
+use agent_rs::workspace::{resolve_workspace_root, AltbotWorkspace};
 use agent_rs::skills::SkillRegistry;
 use agent_rs::bus::{BusMessage, LoggerControlMessage};
 use agent_rs::channels::{Channel, terminal::TerminalChannel, slack::SlackChannel, api::ApiChannel, email::EmailChannel};
 use agent_rs::logging::{create_logger_channel, init_runtime_logger, LoggingActor, LOGGER_QUEUE_CAPACITY};
 use colored::Colorize;
-use clap::Parser;
+use clap::{Args as ClapArgs, Parser, Subcommand};
 
 /// Altbot: A terminal chat interface and autonomous agent engine
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
-struct Args {
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
     /// Optional explicit path to the workspace directory. Defaults to ~/.altbot
     #[arg(short, long)]
     workspace: Option<String>,
@@ -31,13 +35,33 @@ struct Args {
     config: Option<String>,
 }
 
+#[derive(Subcommand, Debug)]
+enum Commands {
+    Onboard(OnboardArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+struct OnboardArgs {
+    /// Optional explicit path to the workspace directory. Defaults to ~/.altbot
+    #[arg(short, long)]
+    workspace: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 0. Parse workspace CLI arguments
-    let cli_args = Args::parse();
-    let workspace_dir = std::path::PathBuf::from(
-        shellexpand::tilde(cli_args.workspace.as_deref().unwrap_or("~/.altbot")).to_string()
-    );
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Commands::Onboard(args)) => run_onboard(args.workspace.or(cli.workspace)).await,
+        None => run_altbot(cli.workspace, cli.config).await,
+    }
+}
+
+async fn run_altbot(
+    workspace_arg: Option<String>,
+    config_arg: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let workspace_dir = resolve_workspace_root(workspace_arg.as_deref());
 
     let (logger_bus_tx, logger_bus_rx) = create_logger_channel(LOGGER_QUEUE_CAPACITY);
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
@@ -74,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting Advanced Agent-RS System...");
     log::info!("Starting Advanced Agent-RS System.");
 
-    let workspace = AltbotWorkspace::new(cli_args.workspace.as_deref(), cli_args.config.as_deref())?;
+    let workspace = AltbotWorkspace::new(workspace_arg.as_deref(), config_arg.as_deref())?;
     println!("Loading Altbot workspace at: {:?}", workspace.dir);
     log::info!("Loading Altbot workspace at {:?}", workspace.dir);
 
@@ -380,4 +404,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+async fn run_onboard(workspace_arg: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let report = tokio::task::spawn_blocking(move || {
+        let workspace_root = resolve_workspace_root(workspace_arg.as_deref());
+        onboard_workspace(&workspace_root)
+    })
+    .await?
+    .map_err(std::io::Error::other)?;
+    print_onboarding_report(&report);
+    Ok(())
+}
+
+fn print_onboarding_report(report: &BootstrapReport) {
+    println!("Workspace onboarded at {}", report.root.display());
+    println!();
+
+    if !report.created.is_empty() {
+        println!("Created:");
+        for path in &report.created {
+            println!("- {}", path.display());
+        }
+        println!();
+    }
+
+    if !report.skipped.is_empty() {
+        println!("Skipped:");
+        for path in &report.skipped {
+            println!("- {}", path.display());
+        }
+        println!();
+    }
+
+    println!("Next steps:");
+    println!("1. Set GEMINI_API_KEY");
+    println!("2. Update <changethis> placeholders or disable unused channels in config.toml");
+    println!("3. Run: altbot --workspace {}", report.root.display());
 }
