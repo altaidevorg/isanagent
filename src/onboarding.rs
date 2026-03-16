@@ -135,22 +135,9 @@ fn validate_generated_files(layout: &WorkspaceLayout) -> Result<(), String> {
         "workspace/SOUL.md",
     ] {
         let path = layout.root.join(relative_path);
-        let metadata = fs::metadata(&path).map_err(|e| {
-            format!(
-                "Required onboarding file is missing or inaccessible ({}): {}",
-                path.display(),
-                e
-            )
-        })?;
-        if !metadata.is_file() {
-            return Err(format!(
-                "Required onboarding file is not a regular file: {}",
-                path.display()
-            ));
-        }
         fs::read_to_string(&path).map_err(|e| {
             format!(
-                "Required onboarding file is not readable UTF-8 ({}): {}",
+                "Required onboarding file is missing, not a file, or not readable UTF-8 ({}): {}",
                 path.display(),
                 e
             )

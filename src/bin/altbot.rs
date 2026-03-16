@@ -52,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Onboard(args)) => run_onboard(args.workspace.or(cli.workspace)),
+        Some(Commands::Onboard(args)) => run_onboard(args.workspace.or(cli.workspace)).await,
         None => run_altbot(cli.workspace, cli.config).await,
     }
 }
@@ -406,9 +406,13 @@ async fn run_altbot(
     Ok(())
 }
 
-fn run_onboard(workspace_arg: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let workspace_root = resolve_workspace_root(workspace_arg.as_deref());
-    let report = onboard_workspace(&workspace_root)?;
+async fn run_onboard(workspace_arg: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let report = tokio::task::spawn_blocking(move || {
+        let workspace_root = resolve_workspace_root(workspace_arg.as_deref());
+        onboard_workspace(&workspace_root)
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("failed to run onboarding task: {}", e)))??;
     print_onboarding_report(&report);
     Ok(())
 }
