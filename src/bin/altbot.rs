@@ -411,8 +411,8 @@ async fn run_onboard(workspace_arg: Option<String>) -> Result<(), Box<dyn std::e
         let workspace_root = resolve_workspace_root(workspace_arg.as_deref());
         onboard_workspace(&workspace_root)
     })
-    .await
-    .map_err(|e| std::io::Error::other(format!("failed to run onboarding task: {}", e)))??;
+    .await?
+    .map_err(std::io::Error::other)?;
     print_onboarding_report(&report);
     Ok(())
 }
