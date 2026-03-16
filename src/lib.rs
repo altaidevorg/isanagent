@@ -21,6 +21,7 @@ pub mod channels;
 pub mod session;
 pub mod logging;
 pub mod reflection;
+pub mod onboarding;
 
 // --- Message Protocol ---
 

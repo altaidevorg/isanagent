@@ -1,9 +1,43 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::fs;
 use log::{info, warn};
 use shellexpand;
 use crate::config::AppConfig;
 use toml;
+
+#[derive(Clone, Debug)]
+pub struct WorkspaceLayout {
+    pub root: PathBuf,
+    pub sandbox_dir: PathBuf,
+    pub skills_dir: PathBuf,
+}
+
+pub fn resolve_workspace_root(path_override: Option<&str>) -> PathBuf {
+    let path_str = path_override.unwrap_or("~/.altbot");
+    PathBuf::from(shellexpand::tilde(path_str).to_string())
+}
+
+pub fn ensure_workspace_layout(root: &Path) -> Result<WorkspaceLayout, String> {
+    if !root.exists() {
+        info!("Creating workspace directory at {:?}", root);
+    }
+    fs::create_dir_all(root).map_err(|e| format!("Failed to create workspace dir: {}", e))?;
+
+    let system_dir = root.join(".system_generated");
+    fs::create_dir_all(&system_dir).map_err(|e| format!("Failed to create .system_generated dir: {}", e))?;
+
+    let sandbox_dir = root.join("workspace");
+    fs::create_dir_all(&sandbox_dir).map_err(|e| format!("Failed to create sandbox dir: {}", e))?;
+
+    let skills_dir = sandbox_dir.join("skills");
+    fs::create_dir_all(&skills_dir).map_err(|e| format!("Failed to create skills dir: {}", e))?;
+
+    Ok(WorkspaceLayout {
+        root: root.to_path_buf(),
+        sandbox_dir,
+        skills_dir,
+    })
+}
 
 /// Represents the Altbot workspace, serving as the single source of truth
 /// for the agent's identity, memory, and skills.
@@ -18,31 +52,8 @@ impl AltbotWorkspace {
     /// Initializes a new workspace at the given path.
     /// If no path is provided, it defaults to `~/.altbot`.
     pub fn new(path_override: Option<&str>, config_override: Option<&str>) -> Result<Self, String> {
-        let path_str = path_override.unwrap_or("~/.altbot");
-        // Expand tilde or env vars
-        let expanded = shellexpand::tilde(path_str).to_string();
-        let target_dir = PathBuf::from(expanded);
-
-        // Ensure directories exist
-        if !target_dir.exists() {
-            info!("Creating workspace directory at {:?}", target_dir);
-            fs::create_dir_all(&target_dir).map_err(|e| format!("Failed to create workspace dir: {}", e))?;
-        }
-
-        let system_dir = target_dir.join(".system_generated");
-        if !system_dir.exists() {
-            fs::create_dir_all(&system_dir).map_err(|e| format!("Failed to create .system_generated dir: {}", e))?;
-        }
-
-        let sandbox_dir = target_dir.join("workspace");
-        if !sandbox_dir.exists() {
-            fs::create_dir_all(&sandbox_dir).map_err(|e| format!("Failed to create sandbox dir: {}", e))?;
-        }
-
-        let skills_dir = sandbox_dir.join("skills");
-        if !skills_dir.exists() {
-            fs::create_dir_all(&skills_dir).map_err(|e| format!("Failed to create skills dir: {}", e))?;
-        }
+        let target_dir = resolve_workspace_root(path_override);
+        let layout = ensure_workspace_layout(&target_dir)?;
 
         // 3. Load config.toml if it exists
         let config_path = config_override
@@ -58,7 +69,7 @@ impl AltbotWorkspace {
             AppConfig::default()
         };
 
-        Ok(Self { dir: target_dir, sandbox_dir, config })
+        Ok(Self { dir: layout.root, sandbox_dir: layout.sandbox_dir, config })
     }
 
     pub fn db_path(&self) -> PathBuf {

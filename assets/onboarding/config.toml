@@ -1,0 +1,38 @@
+restrict_to_workspace = true
+max_iterations = 50
+max_tool_output_chars = 10000
+
+[provider]
+model_name = "gemini-3-flash-preview"
+api_key_env = "GEMINI_API_KEY"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+
+[slack]
+enabled = true
+app_token = "<changethis>"
+bot_token = "<changethis>"
+reply_in_thread = true
+reaction_emoji = "eyes"
+
+[email]
+enabled = false
+imap_host = "imap.agentmail.to"
+imap_port = 993
+imap_username = "<changethis>"
+imap_password = "<changethis>"
+smtp_host = "smtp.agentmail.to"
+smtp_port = 465
+email_address = "<changethis>"
+
+[api]
+enabled = false
+port = 8080
+
+[memory]
+enabled = true
+short_term_threshold_turns = 20
+short_term_threshold_tokens = 100000
+short_term_threshold_mins = 15
+long_term_interval_mins = 360
+long_term_threshold_summaries = 5
+max_recent_summaries = 5
