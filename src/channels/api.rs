@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -16,9 +17,13 @@ use serde_json::Value;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
 
+#[path = "api_store.rs"]
+mod api_store;
+
 use crate::bus::{BusMessage, InboundMessage, LogEvent, OutboundMessage};
 use crate::channels::Channel;
 use crate::logging::LoggerHandle;
+use api_store::{ResponseStore, StoredResponse};
 
 const AGENT_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_API_USER: &str = "api_user";
@@ -28,16 +33,10 @@ const DEFAULT_RESPONSE_MODEL: &str = "agent-rs";
 struct ApiState {
     inbound_tx: Sender<InboundMessage>,
     pending_requests: Arc<DashMap<String, oneshot::Sender<OutboundMessage>>>,
-    responses: Arc<DashMap<String, StoredResponse>>,
+    responses_cache: Arc<DashMap<String, StoredResponse>>,
+    response_store: Arc<ResponseStore>,
     channel_name: String,
     logger_tx: LoggerHandle,
-}
-
-#[derive(Clone)]
-struct StoredResponse {
-    internal_chat_id: String,
-    sender_id: String,
-    model: String,
 }
 
 #[derive(Deserialize)]
@@ -133,23 +132,29 @@ impl IntoResponse for ApiError {
 pub struct ApiChannel {
     port: u16,
     pending_requests: Arc<DashMap<String, oneshot::Sender<OutboundMessage>>>,
-    responses: Arc<DashMap<String, StoredResponse>>,
+    responses_cache: Arc<DashMap<String, StoredResponse>>,
+    response_store: Arc<ResponseStore>,
     logger_tx: LoggerHandle,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     task_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl ApiChannel {
-    pub fn new(port: u16, logger_tx: LoggerHandle) -> Self {
+    pub fn new(
+        port: u16,
+        db_path: impl AsRef<Path>,
+        logger_tx: LoggerHandle,
+    ) -> Result<Self, String> {
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
-        Self {
+        Ok(Self {
             port,
             pending_requests: Arc::new(DashMap::new()),
-            responses: Arc::new(DashMap::new()),
+            responses_cache: Arc::new(DashMap::new()),
+            response_store: Arc::new(ResponseStore::new(db_path)?),
             logger_tx,
             shutdown_tx,
             task_handle: Mutex::new(None),
-        }
+        })
     }
 }
 
@@ -164,7 +169,8 @@ impl Channel for ApiChannel {
         let state = ApiState {
             inbound_tx,
             pending_requests: self.pending_requests.clone(),
-            responses: self.responses.clone(),
+            responses_cache: self.responses_cache.clone(),
+            response_store: self.response_store.clone(),
             channel_name: self.name().to_string(),
             logger_tx: self.logger_tx.clone(),
         };
@@ -261,27 +267,67 @@ async fn handle_responses(
     let (internal_chat_id, sender_id, model, previous_response_id) =
         match payload.previous_response_id.as_deref() {
             Some(previous_response_id) => {
-                let Some(stored) = state
-                    .responses
+                let stored = if let Some(stored) = state
+                    .responses_cache
                     .get(previous_response_id)
                     .map(|entry| entry.clone())
-                else {
-                    log_api(
-                        &state.logger_tx,
-                        LogEvent::warn(
-                            "ApiChannel",
-                            &format!(
-                                "Responses request referenced unknown previous_response_id {}",
-                                previous_response_id
-                            ),
-                        ),
-                    );
-                    return ApiError::new(
-                        StatusCode::NOT_FOUND,
-                        "previous_response_not_found",
-                        format!("Unknown previous_response_id: {}", previous_response_id),
-                    )
-                    .into_response();
+                {
+                    stored
+                } else {
+                    match state.response_store.get(previous_response_id).await {
+                        Ok(Some(stored)) => {
+                            state
+                                .responses_cache
+                                .insert(previous_response_id.to_string(), stored.clone());
+                            log_api(
+                                &state.logger_tx,
+                                LogEvent::debug(
+                                    "ApiChannel",
+                                    &format!(
+                                        "Loaded response state from DB for previous_response_id {}",
+                                        previous_response_id
+                                    ),
+                                ),
+                            );
+                            stored
+                        }
+                        Ok(None) => {
+                            log_api(
+                                &state.logger_tx,
+                                LogEvent::warn(
+                                    "ApiChannel",
+                                    &format!(
+                                    "Responses request referenced unknown previous_response_id {}",
+                                    previous_response_id
+                                ),
+                                ),
+                            );
+                            return ApiError::new(
+                                StatusCode::NOT_FOUND,
+                                "previous_response_not_found",
+                                format!("Unknown previous_response_id: {}", previous_response_id),
+                            )
+                            .into_response();
+                        }
+                        Err(e) => {
+                            log_api(
+                                &state.logger_tx,
+                                LogEvent::error(
+                                    "ApiChannel",
+                                    &format!(
+                                        "Failed to load response state for {}: {}",
+                                        previous_response_id, e
+                                    ),
+                                ),
+                            );
+                            return ApiError::new(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "response_store_unavailable",
+                                "Failed to load response state.",
+                            )
+                            .into_response();
+                        }
+                    }
                 };
 
                 (
@@ -310,14 +356,32 @@ async fn handle_responses(
 
     let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
     if store_response {
-        state.responses.insert(
-            response_id.clone(),
-            StoredResponse {
-                internal_chat_id: internal_chat_id.clone(),
-                sender_id,
-                model: model.clone(),
-            },
-        );
+        let stored = StoredResponse {
+            internal_chat_id: internal_chat_id.clone(),
+            sender_id,
+            model: model.clone(),
+        };
+        if let Err(e) = state
+            .response_store
+            .insert(&response_id, previous_response_id.as_deref(), &stored, now)
+            .await
+        {
+            log_api(
+                &state.logger_tx,
+                LogEvent::error(
+                    "ApiChannel",
+                    &format!("Failed to persist response {}: {}", response_id, e),
+                )
+                .with_chat_id(&internal_chat_id),
+            );
+            return ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "response_store_unavailable",
+                "Failed to persist response state.",
+            )
+            .into_response();
+        }
+        state.responses_cache.insert(response_id.clone(), stored);
     }
 
     log_api(

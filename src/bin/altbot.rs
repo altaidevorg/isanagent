@@ -252,7 +252,7 @@ async fn run_altbot(
     // 12. Setup API Channel
     if let Some(api_cfg) = workspace.config.api.clone() {
         if api_cfg.enabled.unwrap_or(false) {
-            let api = Arc::new(ApiChannel::new(api_cfg.port, logger_bus_tx.clone()));
+            let api = Arc::new(ApiChannel::new(api_cfg.port, &db_path, logger_bus_tx.clone())?);
             api.start(inbound_tx.clone()).await?;
             out_channels.insert(api.name().to_string(), api);
         }
