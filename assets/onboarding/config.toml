@@ -9,8 +9,11 @@ base_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/complet
 
 [slack]
 enabled = true
-app_token = "<changethis>"
+mode = "webhook"
 bot_token = "<changethis>"
+signing_secret = "<changethis>"
+webhook_port = 8090
+webhook_path = "/slack/events"
 reply_in_thread = true
 reaction_emoji = "eyes"
 
