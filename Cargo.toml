@@ -37,6 +37,7 @@ dashmap = "6.1.0"
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "tokio1", "tokio1-native-tls"] }
 imap = "2.4.1"
 native-tls = "0.2.11"
+moka = { version = "0.12.10", features = ["sync"] }
 
 [profile.dev]
 debug = false

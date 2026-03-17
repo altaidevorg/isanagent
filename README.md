@@ -137,6 +137,27 @@ port = 8080
 curl http://localhost:8080/v1/chat/completions -d '{"message": "Hello!"}'
 ```
 
+The API channel also supports a stateful `responses` flow:
+
+```bash
+curl http://localhost:8080/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"Hello!"}'
+```
+
+The response includes an `id` that can be used as `previous_response_id` on the next request:
+
+```bash
+curl http://localhost:8080/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"Continue the previous conversation.","previous_response_id":"resp_..."}'
+```
+
+Notes:
+- `store` defaults to `true` when omitted, so responses are persisted and can be continued later.
+- Set `"store": false` if you do not want a response persisted for later `previous_response_id` lookups.
+- `responses` accepts text-oriented JSON input and normalizes it into a single message before sending it into the agent runtime.
+
 ### Slack Socket Mode
 Listens directly to Slack Channels without requiring an ingress webhook proxy. Includes built-in exponential backoff for Socket drops, outbound message retry logic, and configurable immediate Emoji processing acknowledgments.
 ```toml

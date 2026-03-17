@@ -168,6 +168,27 @@ pub struct LoggingActor {
     runtime_writer: BufWriter<File>,
 }
 
+struct LoggingFallbackActor {
+    init_error: String,
+    reported: bool,
+}
+
+impl LoggingFallbackActor {
+    fn new(init_error: String) -> Self {
+        Self {
+            init_error,
+            reported: false,
+        }
+    }
+}
+
+pub fn create_logging_actor_or_fallback(workspace_dir: PathBuf) -> Box<dyn ActorLogic<BusMessage>> {
+    match LoggingActor::new(workspace_dir) {
+        Ok(actor) => Box::new(actor),
+        Err(err) => Box::new(LoggingFallbackActor::new(err)),
+    }
+}
+
 impl LoggingActor {
     pub fn new(workspace_dir: PathBuf) -> Result<Self, String> {
         let logs_dir = workspace_dir.join(".system_generated").join("logs");
@@ -343,5 +364,33 @@ impl ActorLogic<BusMessage> for LoggingActor {
         }
 
         Ok(None)
+    }
+}
+
+#[async_trait]
+impl ActorLogic<BusMessage> for LoggingFallbackActor {
+    fn name(&self) -> String {
+        "LoggingFallbackActor".to_string()
+    }
+
+    async fn process(
+        &mut self,
+        packet: BusMessage,
+    ) -> Result<Option<(String, BusMessage)>, ActorError> {
+        if !self.reported {
+            eprintln!(
+                "Logging fallback actor active; runtime logs are disabled: {}",
+                self.init_error
+            );
+            self.reported = true;
+        }
+
+        match packet {
+            BusMessage::LoggerControl(LoggerControlMessage::Flush) => Ok(Some((
+                "logger_control".to_string(),
+                BusMessage::LoggerControl(LoggerControlMessage::Flushed),
+            ))),
+            _ => Ok(None),
+        }
     }
 }
