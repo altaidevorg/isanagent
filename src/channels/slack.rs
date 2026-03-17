@@ -17,9 +17,9 @@ use serde_json::{json, Value};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc::Sender, watch, RwLock};
+use tokio::sync::{mpsc::Sender, watch, Mutex, RwLock};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 use crate::bus::{BusMessage, InboundMessage, LogEvent, OutboundMessage};
@@ -205,16 +205,7 @@ impl SlackRuntimeState {
         }
 
         {
-            let mut last_attempt = match self.last_bot_user_id_refresh_attempt.lock() {
-                Ok(guard) => guard,
-                Err(e) => {
-                    error!(
-                        "Mutex for last_bot_user_id_refresh_attempt was poisoned: {}",
-                        e
-                    );
-                    return None;
-                }
-            };
+            let mut last_attempt = self.last_bot_user_id_refresh_attempt.lock().await;
             let now = SystemTime::now();
             if let Some(previous) = last_attempt.as_ref().cloned() {
                 if let Ok(elapsed) = now.duration_since(previous) {
@@ -426,11 +417,7 @@ impl SlackChannel {
         &self,
         handle: tokio::task::JoinHandle<()>,
     ) -> Result<(), String> {
-        *self
-            .task_handle
-            .lock()
-            .map_err(|_| "Failed to lock Slack channel task handle.".to_string())? =
-            Some(handle);
+        *self.task_handle.lock().await = Some(handle);
         Ok(())
     }
 }
@@ -508,11 +495,10 @@ impl Channel for SlackChannel {
     async fn stop(&self) -> Result<(), String> {
         info!("Stopping Slack channel...");
         let _ = self.shutdown_tx.send(true);
-        let handle = self
-            .task_handle
-            .lock()
-            .map_err(|_| "Failed to lock Slack channel task handle.".to_string())?
-            .take();
+        let handle = {
+            let mut task_handle = self.task_handle.lock().await;
+            task_handle.take()
+        };
         if let Some(handle) = handle {
             let _ = handle.await;
         }
@@ -1142,6 +1128,7 @@ mod tests {
     use super::*;
     use axum::{body::{to_bytes, Body}, http::Request};
     use std::collections::VecDeque;
+    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
 
@@ -1407,7 +1394,7 @@ mod tests {
     #[tokio::test]
     async fn send_retries_rate_limits() {
         let attempts = Arc::new(AtomicUsize::new(0));
-        let responses = Arc::new(Mutex::new(VecDeque::from(vec![
+        let responses = Arc::new(StdMutex::new(VecDeque::from(vec![
             Ok(SlackHttpResponse {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 body: "rate limited".to_string(),
@@ -1436,7 +1423,7 @@ mod tests {
     #[tokio::test]
     async fn send_retries_server_errors() {
         let attempts = Arc::new(AtomicUsize::new(0));
-        let responses = Arc::new(Mutex::new(VecDeque::from(vec![
+        let responses = Arc::new(StdMutex::new(VecDeque::from(vec![
             Ok(SlackHttpResponse {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 body: "boom".to_string(),
