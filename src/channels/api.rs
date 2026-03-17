@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -12,29 +12,29 @@ use axum::{
 };
 use dashmap::{mapref::entry::Entry, DashMap};
 use log::{error, info};
+use moka::sync::Cache;
+use moka::policy::EvictionPolicy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
 
-#[path = "api_store.rs"]
-mod api_store;
-
 use crate::bus::{BusMessage, InboundMessage, LogEvent, OutboundMessage};
 use crate::channels::Channel;
+use crate::channels::api_store::{ResponseStore, StoredResponse};
 use crate::logging::LoggerHandle;
-use api_store::{ResponseStore, StoredResponse};
 
 const AGENT_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_API_USER: &str = "api_user";
 const DEFAULT_RESPONSE_MODEL: &str = "agent-rs";
+const MAX_RESPONSE_CACHE_ENTRIES: u64 = 1024;
 
 #[derive(Clone)]
 struct ApiState {
     inbound_tx: Sender<InboundMessage>,
-    pending_requests: Arc<DashMap<String, oneshot::Sender<OutboundMessage>>>,
-    responses_cache: Arc<DashMap<String, StoredResponse>>,
-    response_store: Arc<ResponseStore>,
+    pending_requests: std::sync::Arc<DashMap<String, oneshot::Sender<OutboundMessage>>>,
+    responses_cache: Cache<String, StoredResponse>,
+    response_store: std::sync::Arc<ResponseStore>,
     channel_name: String,
     logger_tx: LoggerHandle,
 }
@@ -131,9 +131,9 @@ impl IntoResponse for ApiError {
 
 pub struct ApiChannel {
     port: u16,
-    pending_requests: Arc<DashMap<String, oneshot::Sender<OutboundMessage>>>,
-    responses_cache: Arc<DashMap<String, StoredResponse>>,
-    response_store: Arc<ResponseStore>,
+    pending_requests: std::sync::Arc<DashMap<String, oneshot::Sender<OutboundMessage>>>,
+    responses_cache: Cache<String, StoredResponse>,
+    response_store: std::sync::Arc<ResponseStore>,
     logger_tx: LoggerHandle,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     task_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -148,9 +148,12 @@ impl ApiChannel {
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         Ok(Self {
             port,
-            pending_requests: Arc::new(DashMap::new()),
-            responses_cache: Arc::new(DashMap::new()),
-            response_store: Arc::new(ResponseStore::new(db_path)?),
+            pending_requests: std::sync::Arc::new(DashMap::new()),
+            responses_cache: Cache::builder()
+                .max_capacity(MAX_RESPONSE_CACHE_ENTRIES)
+                .eviction_policy(EvictionPolicy::lru())
+                .build(),
+            response_store: std::sync::Arc::new(ResponseStore::new(db_path)?),
             logger_tx,
             shutdown_tx,
             task_handle: Mutex::new(None),
@@ -181,22 +184,20 @@ impl Channel for ApiChannel {
             "ApiChannel",
             "Starting API channel...",
         )));
+        let addr = format!("0.0.0.0:{}", port);
+        let listener = tokio::net::TcpListener::bind(&addr)
+            .await
+            .map_err(|e| format!("Failed to bind API port on {}: {}", addr, e))?;
+        let _ = logger_tx.send(BusMessage::Log(LogEvent::info(
+            "ApiChannel",
+            &format!("API channel listening on http://{}", addr),
+        )));
 
         let handle = tokio::spawn(async move {
             let app = Router::new()
                 .route("/v1/chat/completions", post(handle_chat))
                 .route("/v1/responses", post(handle_responses))
                 .with_state(state);
-
-            let addr = format!("0.0.0.0:{}", port);
-            let _ = logger_tx.send(BusMessage::Log(LogEvent::info(
-                "ApiChannel",
-                &format!("API channel listening on http://{}", addr),
-            )));
-
-            let listener = tokio::net::TcpListener::bind(&addr)
-                .await
-                .expect("Failed to bind API port");
             let server = axum::serve(listener, app).with_graceful_shutdown(async move {
                 while shutdown_rx.changed().await.is_ok() {
                     if *shutdown_rx.borrow() {
@@ -208,7 +209,10 @@ impl Channel for ApiChannel {
                 error!("API server crashed: {}", e);
             }
         });
-        *self.task_handle.lock().unwrap() = Some(handle);
+        *self
+            .task_handle
+            .lock()
+            .map_err(|_| "Failed to lock API channel task handle.".to_string())? = Some(handle);
 
         Ok(())
     }
@@ -216,7 +220,11 @@ impl Channel for ApiChannel {
     async fn stop(&self) -> Result<(), String> {
         info!("Stopping API channel...");
         let _ = self.shutdown_tx.send(true);
-        let handle = self.task_handle.lock().unwrap().take();
+        let handle = self
+            .task_handle
+            .lock()
+            .map_err(|_| "Failed to lock API channel task handle.".to_string())?
+            .take();
         if let Some(handle) = handle {
             let _ = handle.await;
         }
@@ -267,11 +275,7 @@ async fn handle_responses(
     let (internal_chat_id, sender_id, model, previous_response_id) =
         match payload.previous_response_id.as_deref() {
             Some(previous_response_id) => {
-                let stored = if let Some(stored) = state
-                    .responses_cache
-                    .get(previous_response_id)
-                    .map(|entry| entry.clone())
-                {
+                let stored = if let Some(stored) = state.responses_cache.get(previous_response_id) {
                     stored
                 } else {
                     match state.response_store.get(previous_response_id).await {

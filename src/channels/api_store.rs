@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension};
 use tokio::task;
@@ -19,6 +20,12 @@ impl ResponseStore {
     pub(super) fn new(db_path: impl AsRef<Path>) -> Result<Self, String> {
         let conn = Connection::open(db_path)
             .map_err(|e| format!("Failed to open API response store: {}", e))?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .map_err(|e| format!("Failed to configure API response store busy timeout: {}", e))?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|e| format!("Failed to enable WAL mode for API response store: {}", e))?;
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(|e| format!("Failed to tune API response store synchronous mode: {}", e))?;
         conn.execute(
             "CREATE TABLE IF NOT EXISTS api_responses (
                 response_id TEXT PRIMARY KEY,
@@ -31,6 +38,23 @@ impl ResponseStore {
             [],
         )
         .map_err(|e| format!("Failed to initialize api_responses table: {}", e))?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_api_responses_previous_response_id
+             ON api_responses(previous_response_id)",
+            [],
+        )
+        .map_err(|e| {
+            format!(
+                "Failed to initialize api_responses previous_response_id index: {}",
+                e
+            )
+        })?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_api_responses_created_at
+             ON api_responses(created_at)",
+            [],
+        )
+        .map_err(|e| format!("Failed to initialize api_responses created_at index: {}", e))?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),

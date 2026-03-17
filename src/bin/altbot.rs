@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::sync::{mpsc, watch};
 
-use agent_rs::{NodeHandle, ActorLogic, Supervisor, SupervisorPolicy};
+use agent_rs::{NodeHandle, Supervisor, SupervisorPolicy};
 use agent_rs::agent::AgentLogic;
 use agent_rs::scheduler::CronActor;
 use agent_rs::session::SessionManager;
@@ -15,7 +15,7 @@ use agent_rs::workspace::{resolve_workspace_root, AltbotWorkspace};
 use agent_rs::skills::SkillRegistry;
 use agent_rs::bus::{BusMessage, LoggerControlMessage};
 use agent_rs::channels::{Channel, terminal::TerminalChannel, slack::SlackChannel, api::ApiChannel, email::EmailChannel};
-use agent_rs::logging::{create_logger_channel, init_runtime_logger, LoggingActor, LOGGER_QUEUE_CAPACITY};
+use agent_rs::logging::{create_logger_channel, create_logging_actor_or_fallback, init_runtime_logger, LoggingActor, LOGGER_QUEUE_CAPACITY};
 use colored::Colorize;
 use clap::{Args as ClapArgs, Parser, Subcommand};
 
@@ -69,13 +69,12 @@ async fn run_altbot(
     init_runtime_logger(logger_bus_tx.clone()).map_err(|e| {
         std::io::Error::other(format!("failed to initialize runtime logger: {:?}", e))
     })?;
+    LoggingActor::new(workspace_dir.clone())
+        .map_err(|e| std::io::Error::other(format!("failed to initialize logging actor: {}", e)))?;
 
     let logger_factory = {
         let wd = workspace_dir.clone();
-        move || {
-            Box::new(LoggingActor::new(wd.clone()).expect("failed to initialize logging actor"))
-                as Box<dyn ActorLogic<BusMessage>>
-        }
+        move || create_logging_actor_or_fallback(wd.clone())
     };
     let logger_sup = Supervisor::new(SupervisorPolicy::Restart, logger_factory);
     let logger_node = NodeHandle::<BusMessage>::new(logger_sup, 1000, 1, Duration::from_millis(10));
@@ -107,8 +106,11 @@ async fn run_altbot(
     if let Some(parent) = db_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let memory_actor = agent_rs::memory::SqliteMemoryActor::new(db_path.to_str().unwrap())
-        .expect("Failed to initialize SqliteMemoryActor");
+    let db_path_str = db_path
+        .to_str()
+        .ok_or_else(|| std::io::Error::other("workspace DB path is not valid UTF-8"))?;
+    let memory_actor = agent_rs::memory::SqliteMemoryActor::new(db_path_str)
+        .map_err(|e| std::io::Error::other(format!("Failed to initialize SqliteMemoryActor: {:?}", e)))?;
     let memory_node = NodeHandle::<agent_rs::memory::MemoryMessage>::new(memory_actor, 100, 1, Duration::from_millis(5));
     
     let session_manager = SessionManager::new(memory_node.clone());
@@ -118,8 +120,8 @@ async fn run_altbot(
 
     // 2. Setup Skills
     let skills = SkillRegistry::new(workspace.skills_path());
-    let cron_logic = CronActor::new("DailyBriefingCron", db_path.to_str().unwrap(), logger_bus_tx.clone())
-        .expect("Failed to initialize CronActor database");
+    let cron_logic = CronActor::new("DailyBriefingCron", db_path_str, logger_bus_tx.clone())
+        .map_err(|e| std::io::Error::other(format!("Failed to initialize CronActor database: {:?}", e)))?;
     let cron_node = NodeHandle::new(cron_logic, 10, 3, Duration::from_millis(50));
 
     let mut tools = ToolRegistry::new();
@@ -166,7 +168,8 @@ async fn run_altbot(
         ("gemini-2.5-flash".to_string(), "GEMINI_API_KEY".to_string(), "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions".to_string())
     };
 
-    let api_key = std::env::var(&api_key_env).unwrap_or_else(|_| panic!("{} must be set", api_key_env));
+    let api_key = std::env::var(&api_key_env)
+        .map_err(|_| std::io::Error::other(format!("{} must be set", api_key_env)))?;
 
     let client = agent_rs::utils::LLMClient::new_openai_compatible(
         &base_url,

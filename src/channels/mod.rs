@@ -23,3 +23,4 @@ pub mod terminal;
 pub mod slack;
 pub mod email;
 pub mod api;
+pub(crate) mod api_store;
