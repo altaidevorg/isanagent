@@ -15,7 +15,7 @@ use agent_rs::workspace::{resolve_workspace_root, AltbotWorkspace};
 use agent_rs::skills::SkillRegistry;
 use agent_rs::bus::{BusMessage, LoggerControlMessage};
 use agent_rs::channels::{Channel, terminal::TerminalChannel, slack::SlackChannel, api::ApiChannel, email::EmailChannel};
-use agent_rs::logging::{create_logger_channel, create_logging_actor_or_fallback, init_runtime_logger, LoggingActor, LOGGER_QUEUE_CAPACITY};
+use agent_rs::logging::{create_logger_channel, create_logging_actor_or_fallback, init_runtime_logger, LOGGER_QUEUE_CAPACITY};
 use colored::Colorize;
 use clap::{Args as ClapArgs, Parser, Subcommand};
 
@@ -69,8 +69,6 @@ async fn run_altbot(
     init_runtime_logger(logger_bus_tx.clone()).map_err(|e| {
         std::io::Error::other(format!("failed to initialize runtime logger: {:?}", e))
     })?;
-    LoggingActor::new(workspace_dir.clone())
-        .map_err(|e| std::io::Error::other(format!("failed to initialize logging actor: {}", e)))?;
 
     let logger_factory = {
         let wd = workspace_dir.clone();
