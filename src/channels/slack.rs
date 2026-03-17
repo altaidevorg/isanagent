@@ -691,21 +691,23 @@ async fn handle_slack_webhook(
     body: Bytes,
 ) -> Response {
     let now = current_unix_timestamp();
-    if verify_slack_signature(
+    if let Err(err) = verify_slack_signature(
         &state.signing_secret,
         &headers,
         body.as_ref(),
         now,
         state.timestamp_tolerance_secs,
-    )
-    .is_err()
-    {
+    ) {
+        warn!("Slack webhook signature verification failed: {}", err);
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
     let payload: Value = match serde_json::from_slice(body.as_ref()) {
         Ok(payload) => payload,
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        Err(e) => {
+            warn!("Failed to parse Slack webhook payload: {}", e);
+            return StatusCode::BAD_REQUEST.into_response();
+        }
     };
 
     match payload["type"].as_str().unwrap_or_default() {
