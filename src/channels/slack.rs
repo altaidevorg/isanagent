@@ -207,7 +207,13 @@ impl SlackRuntimeState {
         {
             let mut last_attempt = match self.last_bot_user_id_refresh_attempt.lock() {
                 Ok(guard) => guard,
-                Err(_) => return None,
+                Err(e) => {
+                    error!(
+                        "Mutex for last_bot_user_id_refresh_attempt was poisoned: {}",
+                        e
+                    );
+                    return None;
+                }
             };
             let now = SystemTime::now();
             if let Some(previous) = last_attempt.as_ref().cloned() {
