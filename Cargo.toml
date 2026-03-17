@@ -38,6 +38,12 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 imap = "2.4.1"
 native-tls = "0.2.11"
 moka = { version = "0.12.10", features = ["sync"] }
+hmac = "0.12.1"
+sha2 = "0.10.9"
+hex = "0.4.3"
 
 [profile.dev]
 debug = false
+
+[dev-dependencies]
+tower = { version = "0.5.2", features = ["util"] }

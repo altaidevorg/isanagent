@@ -36,13 +36,31 @@ pub struct ProviderConfig {
     pub base_url: String,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SlackMode {
+    #[default]
+    Webhook,
+    Socket,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct SlackConfig {
     pub enabled: Option<bool>,
-    pub app_token: String,
+    pub mode: Option<SlackMode>,
+    pub app_token: Option<String>,
     pub bot_token: String,
+    pub signing_secret: Option<String>,
+    pub webhook_port: Option<u16>,
+    pub webhook_path: Option<String>,
     pub reply_in_thread: Option<bool>,
     pub reaction_emoji: Option<String>,
+}
+
+impl SlackConfig {
+    pub fn mode(&self) -> SlackMode {
+        self.mode.unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

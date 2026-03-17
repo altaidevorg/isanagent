@@ -84,10 +84,16 @@ base_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/complet
 
 [slack]
 enabled = true
-app_token = "<changethis>"
+mode = "webhook"
 bot_token = "<changethis>"
+signing_secret = "<changethis>"
+webhook_port = 8090
+webhook_path = "/slack/events"
 reply_in_thread = true
 reaction_emoji = "eyes"
+# Socket mode example:
+# mode = "socket"
+# app_token = "<changethis>"
 
 [email]
 enabled = false
@@ -158,16 +164,36 @@ Notes:
 - Set `"store": false` if you do not want a response persisted for later `previous_response_id` lookups.
 - `responses` accepts text-oriented JSON input and normalizes it into a single message before sending it into the agent runtime.
 
-### Slack Socket Mode
-Listens directly to Slack Channels without requiring an ingress webhook proxy. Includes built-in exponential backoff for Socket drops, outbound message retry logic, and configurable immediate Emoji processing acknowledgments.
+### Slack Modes
+Slack now supports both Socket Mode and a dedicated webhook listener for Slack Events API. Webhook mode runs on its own HTTP listener and does not share the API channel port.
+
+#### Slack Socket Mode
 ```toml
 [slack]
 enabled = true
+mode = "socket"
 app_token = "xapp-..."  # Requires Socket Mode toggled in Slack App Settings
 bot_token = "xoxb-..."
 reply_in_thread = true
 reaction_emoji = "eyes" # Emoji assigned immediately to user messages signaling receipt
 ```
+
+#### Slack Webhook Mode
+```toml
+[slack]
+enabled = true
+mode = "webhook"
+bot_token = "xoxb-..."
+signing_secret = "..."
+webhook_port = 8090
+webhook_path = "/slack/events" # Optional, defaults to /slack/events
+reply_in_thread = true
+reaction_emoji = "eyes"
+```
+
+Notes:
+- Webhook mode listens on a dedicated port and routes incoming Slack Events API payloads into the same agent flow as Socket Mode.
+- This mode does not yet include OAuth installation flow, tenant token routing, or a shared ingress layer with the API channel.
 
 ### Email Pipeline
 Uses IMAP `Idler` threads and an SMTP transport pool.
