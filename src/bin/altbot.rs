@@ -196,7 +196,6 @@ async fn run_altbot(
 
     let api_key = std::env::var(&api_key_env)
         .map_err(|_| std::io::Error::other(format!("{} must be set", api_key_env)))?;
-
     let client =
         agent_rs::utils::LLMClient::new_openai_compatible(&base_url, &api_key, &model_name)
             .with_temperature(0.3);
@@ -308,7 +307,11 @@ async fn run_altbot(
     // 11. Setup Slack Channel
     if let Some(slack_cfg) = workspace.config.slack.clone() {
         if slack_cfg.enabled.unwrap_or(false) {
-            let slack = Arc::new(SlackChannel::new(slack_cfg, logger_bus_tx.clone()));
+            let slack = Arc::new(SlackChannel::new(
+                slack_cfg,
+                &db_path,
+                logger_bus_tx.clone(),
+            )?);
             slack.start(inbound_tx.clone()).await?;
             out_channels.insert(slack.name().to_string(), slack);
         }
