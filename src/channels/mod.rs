@@ -24,3 +24,4 @@ pub mod slack;
 pub mod email;
 pub mod api;
 pub(crate) mod api_store;
+pub(crate) mod slack_store;
