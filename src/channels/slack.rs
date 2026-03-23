@@ -23,9 +23,11 @@ use tokio::sync::{mpsc::Sender, watch, Mutex, RwLock};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 use crate::bus::{BusMessage, InboundMessage, LogEvent, OutboundMessage};
+use crate::channels::slack_store::{SlackUserProfileStore, StoredSlackUserProfile};
 use crate::channels::Channel;
 use crate::config::{SlackConfig, SlackMode};
 use crate::logging::LoggerHandle;
+use std::path::Path;
 
 const SLACK_CHANNEL_NAME: &str = "slack";
 const DEFAULT_REACTION_EMOJI: &str = "eyes";
@@ -34,7 +36,7 @@ const DEFAULT_TIMESTAMP_TOLERANCE_SECS: i64 = 300;
 const MAX_WEBHOOK_DEDUPE_ENTRIES: u64 = 10_000;
 const WEBHOOK_DEDUPE_TTL_SECS: u64 = 600;
 const MAX_USER_NAME_CACHE_ENTRIES: u64 = 10_000;
-const USER_NAME_CACHE_TTL_SECS: u64 = 21_600;
+const USER_NAME_CACHE_TTL_SECS: u64 = 604_800;
 const BOT_USER_ID_RETRY_COOLDOWN_SECS: u64 = 30;
 const DEFAULT_MAX_RETRIES: usize = 3;
 const DEFAULT_INITIAL_BACKOFF_SECS: u64 = 2;
@@ -58,6 +60,7 @@ struct SlackRuntimeState {
     bot_user_id_refresh_lock: tokio::sync::Mutex<()>,
     last_bot_user_id_refresh_attempt: Mutex<Option<SystemTime>>,
     user_names_cache: Cache<String, String>,
+    user_profile_store: Arc<SlackUserProfileStore>,
     webhook_dedupe: Cache<String, bool>,
     api_base_url: String,
 }
@@ -72,8 +75,14 @@ struct SlackWebhookState {
 }
 
 enum SlackStartMode {
-    Socket { app_token: String },
-    Webhook { signing_secret: String, port: u16, path: String },
+    Socket {
+        app_token: String,
+    },
+    Webhook {
+        signing_secret: String,
+        port: u16,
+        path: String,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -113,7 +122,11 @@ struct SlackApiResponse {
 }
 
 impl SlackRuntimeState {
-    fn new(logger_tx: LoggerHandle, api_base_url: String) -> Self {
+    fn new(
+        logger_tx: LoggerHandle,
+        api_base_url: String,
+        user_profile_store: Arc<SlackUserProfileStore>,
+    ) -> Self {
         Self {
             client: crate::utils::build_reqwest_client(),
             logger_tx,
@@ -124,6 +137,7 @@ impl SlackRuntimeState {
                 .max_capacity(MAX_USER_NAME_CACHE_ENTRIES)
                 .time_to_live(Duration::from_secs(USER_NAME_CACHE_TTL_SECS))
                 .build(),
+            user_profile_store,
             webhook_dedupe: Cache::builder()
                 .max_capacity(MAX_WEBHOOK_DEDUPE_ENTRIES)
                 .time_to_live(Duration::from_secs(WEBHOOK_DEDUPE_TTL_SECS))
@@ -221,6 +235,17 @@ impl SlackRuntimeState {
     }
 
     async fn resolve_display_name(&self, user: &str, bot_token: &str) -> String {
+        self.resolve_display_name_with_fetcher(user, || {
+            self.fetch_display_name_from_slack(user, bot_token)
+        })
+        .await
+    }
+
+    async fn resolve_display_name_with_fetcher<F, Fut>(&self, user: &str, fetcher: F) -> String
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Option<String>>,
+    {
         if user.is_empty() {
             return String::new();
         }
@@ -229,6 +254,38 @@ impl SlackRuntimeState {
             return name;
         }
 
+        let now_unix_secs = current_unix_timestamp();
+        let mut stale_persisted_name = None;
+        match self.user_profile_store.get(user).await {
+            Ok(Some(stored)) if slack_user_profile_is_fresh(&stored, now_unix_secs) => {
+                self.user_names_cache
+                    .insert(user.to_string(), stored.display_name.clone());
+                return stored.display_name;
+            }
+            Ok(Some(stored)) => {
+                stale_persisted_name = Some(stored.display_name);
+            }
+            Ok(None) => {}
+            Err(e) => warn!(
+                "Failed to load cached Slack user profile for {}: {}",
+                user, e
+            ),
+        }
+
+        if let Some(name) = fetcher().await {
+            self.cache_display_name(user, &name, now_unix_secs).await;
+            return name;
+        }
+
+        if let Some(name) = stale_persisted_name {
+            self.user_names_cache.insert(user.to_string(), name.clone());
+            return name;
+        }
+
+        user.to_string()
+    }
+
+    async fn fetch_display_name_from_slack(&self, user: &str, bot_token: &str) -> Option<String> {
         let info_url = self.api_url(&format!("users.info?user={}", user));
         let info_res = self
             .client
@@ -240,15 +297,7 @@ impl SlackRuntimeState {
         match info_res {
             Ok(response) => match response.json::<Value>().await {
                 Ok(json) if json["ok"].as_bool() == Some(true) => {
-                    if let Some(name) = json["user"]["profile"]["display_name"]
-                        .as_str()
-                        .filter(|value| !value.is_empty())
-                        .or_else(|| json["user"]["profile"]["real_name"].as_str())
-                    {
-                        self.user_names_cache
-                            .insert(user.to_string(), name.to_string());
-                        return name.to_string();
-                    }
+                    return slack_profile_display_name(&json);
                 }
                 Ok(_) => {}
                 Err(e) => warn!("Failed to decode Slack users.info response: {}", e),
@@ -256,7 +305,26 @@ impl SlackRuntimeState {
             Err(e) => warn!("Failed to fetch Slack user profile for {}: {}", user, e),
         }
 
-        user.to_string()
+        None
+    }
+
+    async fn cache_display_name(&self, user: &str, display_name: &str, fetched_at_unix_secs: i64) {
+        self.user_names_cache
+            .insert(user.to_string(), display_name.to_string());
+
+        if let Err(e) = self
+            .user_profile_store
+            .upsert(
+                user,
+                &StoredSlackUserProfile {
+                    display_name: display_name.to_string(),
+                    fetched_at_unix_secs,
+                },
+            )
+            .await
+        {
+            warn!("Failed to persist Slack user profile for {}: {}", user, e);
+        }
     }
 
     async fn process_event_callback(
@@ -331,11 +399,9 @@ impl SlackRuntimeState {
                 Ok(response) => {
                     let status = response.status();
                     let body = response.text().await.unwrap_or_default();
-                    if let Err(err) = validate_simple_slack_api_response(
-                        "Slack reaction",
-                        status,
-                        &body,
-                    ) {
+                    if let Err(err) =
+                        validate_simple_slack_api_response("Slack reaction", status, &body)
+                    {
                         warn!("{}", err);
                     }
                 }
@@ -346,15 +412,21 @@ impl SlackRuntimeState {
 }
 
 impl SlackChannel {
-    pub fn new(config: SlackConfig, logger_tx: LoggerHandle) -> Self {
-        Self::new_internal(
+    pub fn new(
+        config: SlackConfig,
+        db_path: impl AsRef<Path>,
+        logger_tx: LoggerHandle,
+    ) -> Result<Self, String> {
+        let user_profile_store = Arc::new(SlackUserProfileStore::new(db_path)?);
+        Ok(Self::new_internal(
             config,
             logger_tx,
             "https://slack.com/api".to_string(),
             DEFAULT_MAX_RETRIES,
             Duration::from_secs(DEFAULT_INITIAL_BACKOFF_SECS),
             DEFAULT_TIMESTAMP_TOLERANCE_SECS,
-        )
+            user_profile_store,
+        ))
     }
 
     fn new_internal(
@@ -364,11 +436,16 @@ impl SlackChannel {
         max_retries: usize,
         initial_backoff: Duration,
         timestamp_tolerance_secs: i64,
+        user_profile_store: Arc<SlackUserProfileStore>,
     ) -> Self {
         let (shutdown_tx, _) = watch::channel(false);
         Self {
             config,
-            shared: Arc::new(SlackRuntimeState::new(logger_tx, api_base_url)),
+            shared: Arc::new(SlackRuntimeState::new(
+                logger_tx,
+                api_base_url,
+                user_profile_store,
+            )),
             shutdown_tx,
             task_handle: Mutex::new(None),
             max_retries,
@@ -397,8 +474,7 @@ impl SlackChannel {
                     .clone()
                     .filter(|secret| !secret.trim().is_empty())
                     .ok_or_else(|| {
-                        "Slack webhook mode requires a non-empty slack.signing_secret"
-                            .to_string()
+                        "Slack webhook mode requires a non-empty slack.signing_secret".to_string()
                     })?;
                 let port = self
                     .config
@@ -413,10 +489,7 @@ impl SlackChannel {
         }
     }
 
-    async fn store_task_handle(
-        &self,
-        handle: tokio::task::JoinHandle<()>,
-    ) -> Result<(), String> {
+    async fn store_task_handle(&self, handle: tokio::task::JoinHandle<()>) -> Result<(), String> {
         *self.task_handle.lock().await = Some(handle);
         Ok(())
     }
@@ -435,7 +508,9 @@ impl Channel for SlackChannel {
         );
 
         let start_mode = self.start_mode()?;
-        self.shared.refresh_bot_user_id(&self.config.bot_token).await;
+        self.shared
+            .refresh_bot_user_id(&self.config.bot_token)
+            .await;
 
         match start_mode {
             SlackStartMode::Socket { app_token } => {
@@ -588,7 +663,10 @@ where
                 }
             },
             Err(e) => {
-                error!("Slack postMessage network error (attempt {}): {}", attempt, e);
+                error!(
+                    "Slack postMessage network error (attempt {}): {}",
+                    attempt, e
+                );
                 if attempt < max_retries {
                     tokio::time::sleep(backoff).await;
                     backoff *= 2;
@@ -777,11 +855,8 @@ async fn run_socket_mode(
                             &format!("Slack apps.connections.open failed: {:?}", json),
                         ),
                     );
-                    if wait_for_shutdown_or_timeout(
-                        shutdown_rx,
-                        Duration::from_secs(backoff_secs),
-                    )
-                    .await
+                    if wait_for_shutdown_or_timeout(shutdown_rx, Duration::from_secs(backoff_secs))
+                        .await
                     {
                         break;
                     }
@@ -796,11 +871,8 @@ async fn run_socket_mode(
                             &format!("Failed to parse Slack response: {}", e),
                         ),
                     );
-                    if wait_for_shutdown_or_timeout(
-                        shutdown_rx,
-                        Duration::from_secs(backoff_secs),
-                    )
-                    .await
+                    if wait_for_shutdown_or_timeout(shutdown_rx, Duration::from_secs(backoff_secs))
+                        .await
                     {
                         break;
                     }
@@ -816,7 +888,8 @@ async fn run_socket_mode(
                         &format!("Failed to request Slack websockets URL: {}", e),
                     ),
                 );
-                if wait_for_shutdown_or_timeout(shutdown_rx, Duration::from_secs(backoff_secs)).await
+                if wait_for_shutdown_or_timeout(shutdown_rx, Duration::from_secs(backoff_secs))
+                    .await
                 {
                     break;
                 }
@@ -842,7 +915,8 @@ async fn run_socket_mode(
                         &format!("WebSocket connection failed: {}", e),
                     ),
                 );
-                if wait_for_shutdown_or_timeout(shutdown_rx, Duration::from_secs(backoff_secs)).await
+                if wait_for_shutdown_or_timeout(shutdown_rx, Duration::from_secs(backoff_secs))
+                    .await
                 {
                     break;
                 }
@@ -966,8 +1040,7 @@ fn normalize_slack_event(
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
 
-    if thread_ts.is_none() && config.reply_in_thread.unwrap_or(false) && !chat_id.starts_with('D')
-    {
+    if thread_ts.is_none() && config.reply_in_thread.unwrap_or(false) && !chat_id.starts_with('D') {
         if !ts.is_empty() {
             thread_ts = Some(ts.clone());
         }
@@ -1060,6 +1133,18 @@ fn normalize_webhook_path(path: Option<&str>) -> String {
     }
 }
 
+fn slack_profile_display_name(json: &Value) -> Option<String> {
+    json["user"]["profile"]["display_name"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .or_else(|| json["user"]["profile"]["real_name"].as_str())
+        .map(ToOwned::to_owned)
+}
+
+fn slack_user_profile_is_fresh(profile: &StoredSlackUserProfile, now_unix_secs: i64) -> bool {
+    now_unix_secs.saturating_sub(profile.fetched_at_unix_secs) <= USER_NAME_CACHE_TTL_SECS as i64
+}
+
 fn verify_slack_signature(
     signing_secret: &str,
     headers: &HeaderMap,
@@ -1080,17 +1165,14 @@ fn verify_slack_signature(
         return Err("stale_timestamp");
     }
 
-    let provided = signature
-        .strip_prefix("v0=")
-        .ok_or("invalid_signature")?;
+    let provided = signature.strip_prefix("v0=").ok_or("invalid_signature")?;
     let provided = hex::decode(provided).map_err(|_| "invalid_signature")?;
 
     let mut mac = HmacSha256::new_from_slice(signing_secret.as_bytes())
         .map_err(|_| "invalid_signing_secret")?;
     mac.update(format!("v0:{}:", timestamp).as_bytes());
     mac.update(body);
-    mac.verify_slice(&provided)
-        .map_err(|_| "invalid_signature")
+    mac.verify_slice(&provided).map_err(|_| "invalid_signature")
 }
 
 fn current_unix_timestamp() -> i64 {
@@ -1126,10 +1208,14 @@ async fn wait_for_shutdown_or_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::{to_bytes, Body}, http::Request};
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+    };
     use std::collections::VecDeque;
-    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex as StdMutex;
+    use std::{fs, path::PathBuf};
     use tower::ServiceExt;
 
     use crate::logging::create_logger_channel;
@@ -1340,7 +1426,10 @@ mod tests {
     #[tokio::test]
     async fn webhook_handler_dispatches_once_for_duplicate_event() {
         let (state, mut inbound_rx) = test_webhook_state_with_channel();
-        state.shared.user_names_cache.insert("U123".into(), "Jane".into());
+        state
+            .shared
+            .user_names_cache
+            .insert("U123".into(), "Jane".into());
         *state.shared.bot_user_id.write().await = Some("B123".into());
         let app = build_webhook_router(state.clone(), DEFAULT_WEBHOOK_PATH);
         let body = br#"{
@@ -1465,11 +1554,8 @@ mod tests {
 
     #[test]
     fn validate_simple_slack_api_response_accepts_ok_true() {
-        let result = validate_simple_slack_api_response(
-            "Slack reaction",
-            StatusCode::OK,
-            r#"{"ok":true}"#,
-        );
+        let result =
+            validate_simple_slack_api_response("Slack reaction", StatusCode::OK, r#"{"ok":true}"#);
 
         assert!(result.is_ok());
     }
@@ -1495,6 +1581,200 @@ mod tests {
         assert!(dm_body.get("thread_ts").is_none());
     }
 
+    #[test]
+    fn slack_profile_display_name_prefers_display_name_then_real_name() {
+        let display_name = slack_profile_display_name(&json!({
+            "user": {
+                "profile": {
+                    "display_name": "Display Name",
+                    "real_name": "Real Name"
+                }
+            }
+        }));
+        let real_name = slack_profile_display_name(&json!({
+            "user": {
+                "profile": {
+                    "display_name": "",
+                    "real_name": "Real Name"
+                }
+            }
+        }));
+
+        assert_eq!(display_name.as_deref(), Some("Display Name"));
+        assert_eq!(real_name.as_deref(), Some("Real Name"));
+    }
+
+    #[tokio::test]
+    async fn resolve_display_name_uses_memory_cache_without_api_call() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let state = test_runtime_state("http://localhost", temp_db_path("slack-name-memory"));
+
+        state
+            .user_names_cache
+            .insert("U123".to_string(), "Jane".to_string());
+
+        let result = state
+            .resolve_display_name_with_fetcher("U123", || {
+                let request_count = request_count.clone();
+                async move {
+                    request_count.fetch_add(1, Ordering::SeqCst);
+                    Some("Should Not Be Used".to_string())
+                }
+            })
+            .await;
+
+        assert_eq!(result, "Jane");
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn resolve_display_name_uses_persisted_cache_after_restart() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let db_path = temp_db_path("slack-name-persisted");
+        let store = Arc::new(SlackUserProfileStore::new(&db_path).unwrap());
+        store
+            .upsert(
+                "U123",
+                &StoredSlackUserProfile {
+                    display_name: "Persisted Jane".into(),
+                    fetched_at_unix_secs: current_unix_timestamp(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let (logger_tx, _logger_rx) = create_logger_channel(8);
+        let state = Arc::new(SlackRuntimeState::new(
+            logger_tx,
+            "http://localhost".into(),
+            Arc::new(SlackUserProfileStore::new(&db_path).unwrap()),
+        ));
+
+        let result = state
+            .resolve_display_name_with_fetcher("U123", || {
+                let request_count = request_count.clone();
+                async move {
+                    request_count.fetch_add(1, Ordering::SeqCst);
+                    Some("Should Not Be Used".to_string())
+                }
+            })
+            .await;
+
+        assert_eq!(result, "Persisted Jane");
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            state.user_names_cache.get("U123").as_deref(),
+            Some("Persisted Jane")
+        );
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn resolve_display_name_refreshes_stale_persisted_cache() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let db_path = temp_db_path("slack-name-refresh");
+        let store = Arc::new(SlackUserProfileStore::new(&db_path).unwrap());
+        store
+            .upsert(
+                "U123",
+                &StoredSlackUserProfile {
+                    display_name: "Stale Jane".into(),
+                    fetched_at_unix_secs: current_unix_timestamp()
+                        - USER_NAME_CACHE_TTL_SECS as i64
+                        - 1,
+                },
+            )
+            .await
+            .unwrap();
+        let (logger_tx, _logger_rx) = create_logger_channel(8);
+        let state = Arc::new(SlackRuntimeState::new(
+            logger_tx,
+            "http://localhost".into(),
+            store.clone(),
+        ));
+
+        let result = state
+            .resolve_display_name_with_fetcher("U123", || {
+                let request_count = request_count.clone();
+                async move {
+                    request_count.fetch_add(1, Ordering::SeqCst);
+                    Some("Fresh Jane".to_string())
+                }
+            })
+            .await;
+        let persisted = store.get("U123").await.unwrap().unwrap();
+
+        assert_eq!(result, "Fresh Jane");
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_eq!(persisted.display_name, "Fresh Jane");
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn resolve_display_name_falls_back_to_stale_persisted_cache_when_fetch_fails() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let db_path = temp_db_path("slack-name-stale-fallback");
+        let store = Arc::new(SlackUserProfileStore::new(&db_path).unwrap());
+        store
+            .upsert(
+                "U123",
+                &StoredSlackUserProfile {
+                    display_name: "Stale Jane".into(),
+                    fetched_at_unix_secs: current_unix_timestamp()
+                        - USER_NAME_CACHE_TTL_SECS as i64
+                        - 1,
+                },
+            )
+            .await
+            .unwrap();
+        let (logger_tx, _logger_rx) = create_logger_channel(8);
+        let state = Arc::new(SlackRuntimeState::new(
+            logger_tx,
+            "http://localhost".into(),
+            store,
+        ));
+
+        let result = state
+            .resolve_display_name_with_fetcher("U123", || {
+                let request_count = request_count.clone();
+                async move {
+                    request_count.fetch_add(1, Ordering::SeqCst);
+                    None
+                }
+            })
+            .await;
+
+        assert_eq!(result, "Stale Jane");
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state.user_names_cache.get("U123").as_deref(),
+            Some("Stale Jane")
+        );
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn resolve_display_name_falls_back_to_user_id_without_cached_or_remote_name() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let state = test_runtime_state("http://localhost", temp_db_path("slack-name-user-id"));
+
+        let result = state
+            .resolve_display_name_with_fetcher("U123", || {
+                let request_count = request_count.clone();
+                async move {
+                    request_count.fetch_add(1, Ordering::SeqCst);
+                    None
+                }
+            })
+            .await;
+
+        assert_eq!(result, "U123");
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    }
+
     fn test_slack_config() -> SlackConfig {
         SlackConfig {
             enabled: Some(true),
@@ -1514,9 +1794,16 @@ mod tests {
         state
     }
 
-    fn test_webhook_state_with_channel() -> (SlackWebhookState, tokio::sync::mpsc::Receiver<InboundMessage>) {
+    fn test_webhook_state_with_channel() -> (
+        SlackWebhookState,
+        tokio::sync::mpsc::Receiver<InboundMessage>,
+    ) {
         let (logger_tx, _logger_rx) = create_logger_channel(8);
-        let shared = Arc::new(SlackRuntimeState::new(logger_tx, "http://localhost".into()));
+        let shared = Arc::new(SlackRuntimeState::new(
+            logger_tx,
+            "http://localhost".into(),
+            Arc::new(SlackUserProfileStore::new(":memory:").unwrap()),
+        ));
         let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(8);
         (
             SlackWebhookState {
@@ -1541,6 +1828,19 @@ mod tests {
             .header("X-Slack-Request-Timestamp", &timestamp)
             .body(Body::from(body.to_vec()))
             .unwrap()
+    }
+
+    fn test_runtime_state(api_base_url: &str, db_path: PathBuf) -> Arc<SlackRuntimeState> {
+        let (logger_tx, _logger_rx) = create_logger_channel(8);
+        Arc::new(SlackRuntimeState::new(
+            logger_tx,
+            api_base_url.to_string(),
+            Arc::new(SlackUserProfileStore::new(&db_path).unwrap()),
+        ))
+    }
+
+    fn temp_db_path(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("{}-{}.sqlite3", prefix, uuid::Uuid::new_v4()))
     }
 
     fn sign_for_test(secret: &str, timestamp: &str, body: &[u8]) -> String {

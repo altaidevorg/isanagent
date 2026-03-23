@@ -244,7 +244,7 @@ async fn run_altbot(
     // 11. Setup Slack Channel
     if let Some(slack_cfg) = workspace.config.slack.clone() {
         if slack_cfg.enabled.unwrap_or(false) {
-            let slack = Arc::new(SlackChannel::new(slack_cfg, logger_bus_tx.clone()));
+            let slack = Arc::new(SlackChannel::new(slack_cfg, &db_path, logger_bus_tx.clone())?);
             slack.start(inbound_tx.clone()).await?;
             out_channels.insert(slack.name().to_string(), slack);
         }
