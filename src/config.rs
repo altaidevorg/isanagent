@@ -10,6 +10,7 @@ pub struct AppConfig {
     pub max_iterations: Option<usize>,
     pub max_tool_output_chars: Option<usize>,
     pub memory: Option<MemoryConfig>,
+    pub multi_tenant_edge: Option<MultiTenantEdgeConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -21,6 +22,11 @@ pub struct MemoryConfig {
     pub long_term_interval_mins: Option<u64>,
     pub max_recent_summaries: Option<usize>,
     pub long_term_threshold_summaries: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct MultiTenantEdgeConfig {
+    pub activity_heartbeat_enabled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
