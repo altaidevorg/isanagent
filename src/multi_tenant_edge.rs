@@ -7,7 +7,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-use crate::bus::{BusMessage, LogEvent};
+use crate::bus::{BusMessage, LogEvent, LogLevel};
 use crate::logging::LoggerHandle;
 use crate::tool_activity::{
     ToolExecutionActivity, ToolExecutionActivityHandle, ToolExecutionActivityHandleFuture,
@@ -38,14 +38,14 @@ struct ReqwestHeartbeatTransport {
 }
 
 impl ReqwestHeartbeatTransport {
-    fn new() -> Self {
+    fn new() -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .no_proxy()
             .connect_timeout(HEARTBEAT_REQUEST_TIMEOUT)
             .timeout(HEARTBEAT_REQUEST_TIMEOUT)
             .build()
-            .expect("failed to build heartbeat reqwest client");
-        Self { client }
+            .map_err(|error| format!("failed to build heartbeat reqwest client: {}", error))?;
+        Ok(Self { client })
     }
 }
 
@@ -77,12 +77,12 @@ impl ActivityHeartbeatClient {
         })?;
         let ttl_ms = parse_heartbeat_ttl_ms(std::env::var("MTE_HEARTBEAT_TTL_MS").ok(), &logger_tx);
 
-        Ok(Self::new(
+        Self::new(
             normalize_activity_url(&base_url)?,
             token,
             heartbeat_interval_from_ttl_ms(ttl_ms),
             logger_tx,
-        ))
+        )
     }
 
     pub(crate) fn new(
@@ -90,14 +90,14 @@ impl ActivityHeartbeatClient {
         token: String,
         interval: Duration,
         logger_tx: LoggerHandle,
-    ) -> Self {
-        Self::new_with_transport(
+    ) -> Result<Self, String> {
+        Ok(Self::new_with_transport(
             url,
             token,
             interval,
             logger_tx,
-            Arc::new(ReqwestHeartbeatTransport::new()),
-        )
+            Arc::new(ReqwestHeartbeatTransport::new()?),
+        ))
     }
 
     pub(crate) fn new_with_transport(
@@ -191,15 +191,12 @@ impl ActivityHeartbeatClient {
     }
 
     fn log_with_level(&self, chat_id: &str, tool_name: &str, message: &str, level: LogLevel) {
-        let log_event = match level {
-            LogLevel::Info => LogEvent::info("MultiTenantEdgeHeartbeat", message),
-            LogLevel::Warn => LogEvent::warn("MultiTenantEdgeHeartbeat", message),
-        }
-        .with_chat_id(chat_id)
-        .with_metadata(serde_json::json!({
-            "tool_name": tool_name,
-            "activity_url": self.url,
-        }));
+        let log_event = LogEvent::new(level, "MultiTenantEdgeHeartbeat", message)
+            .with_chat_id(chat_id)
+            .with_metadata(serde_json::json!({
+                "tool_name": tool_name,
+                "activity_url": self.url,
+            }));
 
         let _ = self.logger_tx.send(BusMessage::Log(log_event));
     }
@@ -213,11 +210,6 @@ impl ToolExecutionActivity for ActivityHeartbeatClient {
             tool_name.to_string(),
         ))
     }
-}
-
-enum LogLevel {
-    Info,
-    Warn,
 }
 
 struct HeartbeatLoop {
@@ -246,6 +238,8 @@ impl HeartbeatLoop {
 
             let mut interval = tokio::time::interval(client.interval);
             interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            // We already sent the immediate startup heartbeat above, so consume the
+            // initial instant tick and wait a full interval before the next send.
             interval.tick().await;
 
             loop {
@@ -345,8 +339,8 @@ fn normalize_activity_url(base_url: &str) -> Result<String, String> {
     };
     Url::parse(&url).map_err(|error| {
         format!(
-            "multi-tenant-edge heartbeat enabled but MTE_PROXY_BASE_URL is invalid: {}",
-            error
+            "multi-tenant-edge heartbeat enabled but MTE_PROXY_BASE_URL '{}' is invalid: {}",
+            base_url, error
         )
     })?;
     Ok(url)

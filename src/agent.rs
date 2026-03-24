@@ -71,7 +71,8 @@ impl AgentLogic {
         let loader_tool = LoadSkillTool {
             registry: skill_reg,
         };
-        let tools_mut = Arc::get_mut(&mut agent.tools).unwrap();
+        let tools_mut = Arc::get_mut(&mut agent.tools)
+            .expect("expected unique ownership of tools registry during initialization");
         tools_mut.register(Box::new(loader_tool));
 
         agent
@@ -87,13 +88,12 @@ impl AgentLogic {
 
     /// Helper to construct the dynamic system prompt containing the latest tool definitions
     fn build_system_prompt(&self, recent_summaries: &str) -> String {
-        let content = format!(
+        format!(
             "{}\n\n{}\n\n{}",
             self.system_prompt,
             recent_summaries,
             self.skills.get_capabilities_summary()
-        );
-        content
+        )
     }
 
     async fn execute_tool_call(
@@ -102,13 +102,13 @@ impl AgentLogic {
         tool_name: &str,
         args: Value,
     ) -> Result<String, String> {
-        let tool_execution_activity = self
+        let activity_handle = self
             .tool_execution_activity
             .as_ref()
             .map(|tool_execution_activity| tool_execution_activity.start(chat_id, tool_name));
         let output = self.tools.execute_tool(tool_name, args).await;
-        if let Some(tool_execution_activity) = tool_execution_activity {
-            tool_execution_activity.stop().await;
+        if let Some(activity_handle) = activity_handle {
+            activity_handle.stop().await;
         }
         output
     }

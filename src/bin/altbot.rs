@@ -27,6 +27,11 @@ use agent_rs::{NodeHandle, Supervisor, SupervisorPolicy};
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use colored::Colorize;
 
+const DEFAULT_PROVIDER_MODEL_NAME: &str = "gemini-2.5-flash";
+const DEFAULT_PROVIDER_API_KEY_ENV: &str = "GEMINI_API_KEY";
+const DEFAULT_PROVIDER_BASE_URL: &str =
+    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
+
 /// Altbot: A terminal chat interface and autonomous agent engine
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -188,9 +193,9 @@ async fn run_altbot(
         (p.model_name, p.api_key_env, p.base_url)
     } else {
         (
-            "gemini-2.5-flash".to_string(),
-            "GEMINI_API_KEY".to_string(),
-            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions".to_string(),
+            DEFAULT_PROVIDER_MODEL_NAME.to_string(),
+            DEFAULT_PROVIDER_API_KEY_ENV.to_string(),
+            DEFAULT_PROVIDER_BASE_URL.to_string(),
         )
     };
 
