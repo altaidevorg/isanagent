@@ -173,8 +173,16 @@ async fn run_altbot(
         workspace_dir: workspace.sandbox_dir.clone(),
         restrict_to_workspace: restrict,
     }));
-    tools.register(Box::new(WebSearchTool));
-    tools.register(Box::new(WebFetchTool));
+    let jina = workspace.config.jina_web_backend();
+    let max_web_output_chars = workspace.config.effective_max_web_tool_output_chars();
+    tools.register(Box::new(WebSearchTool {
+        jina: jina.clone(),
+        max_output_chars: max_web_output_chars,
+    }));
+    tools.register(Box::new(WebFetchTool {
+        jina,
+        max_output_chars: max_web_output_chars,
+    }));
     tools.register(Box::new(CronTool {
         cron_node: cron_node.clone(),
     }));

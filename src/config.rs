@@ -9,8 +9,68 @@ pub struct AppConfig {
     pub email: Option<EmailConfig>,
     pub max_iterations: Option<usize>,
     pub max_tool_output_chars: Option<usize>,
+    /// Max characters returned by `web_search` / `web_fetch` (default 50_000). Separate from
+    /// `max_tool_output_chars`, which caps tool output when passed to the model.
+    pub max_web_tool_output_chars: Option<usize>,
     pub memory: Option<MemoryConfig>,
     pub multi_tenant_edge: Option<MultiTenantEdgeConfig>,
+    /// When `enabled`, `web_search` / `web_fetch` use [Jina Reader](https://r.jina.ai/) and search (`s.jina.ai`).
+    pub jina: Option<JinaConfig>,
+}
+
+/// Optional Jina Reader / Search backend for web tools (see https://jina.ai/reader ).
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct JinaConfig {
+    pub enabled: Option<bool>,
+    pub api_key: Option<String>,
+}
+
+/// Resolved settings when `[jina].enabled = true` (for wiring into tools).
+#[derive(Clone, Debug, Default)]
+pub struct JinaWebBackend {
+    pub api_key: Option<String>,
+}
+
+/// Heuristics to avoid sending obvious template values as `Authorization: Bearer`.
+/// Language-agnostic: rejects non-ASCII (Jina keys are ASCII), angle-bracket templates, and
+/// common README placeholder tokens (ASCII substrings only).
+fn jina_api_key_looks_like_placeholder(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() || t.starts_with('<') {
+        return true;
+    }
+    if !t.is_ascii() {
+        return true;
+    }
+    let lower = t.to_ascii_lowercase();
+    if lower == "changethis" {
+        return true;
+    }
+    ["optional", "placeholder", "replace_me", "replaceme"]
+        .iter()
+        .any(|pat| lower.contains(pat))
+}
+
+impl AppConfig {
+    /// Returns `Some` when `[jina].enabled` is true so tools should call r.jina.ai / s.jina.ai.
+    pub fn jina_web_backend(&self) -> Option<JinaWebBackend> {
+        let j = self.jina.as_ref()?;
+        if !j.enabled.unwrap_or(false) {
+            return None;
+        }
+        let api_key = j
+            .api_key
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !jina_api_key_looks_like_placeholder(s));
+        Some(JinaWebBackend { api_key })
+    }
+
+    /// Upper bound for `web_search` / `web_fetch` response bodies.
+    pub fn effective_max_web_tool_output_chars(&self) -> usize {
+        const DEFAULT: usize = 50_000;
+        self.max_web_tool_output_chars.unwrap_or(DEFAULT)
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]

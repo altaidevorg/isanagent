@@ -1,6 +1,7 @@
 restrict_to_workspace = true
 max_iterations = 50
 max_tool_output_chars = 10000
+# max_web_tool_output_chars = 50000  # optional cap for web_search / web_fetch (default 50000)
 
 [provider]
 model_name = "gemini-3-flash-preview"
@@ -33,6 +34,12 @@ port = 8080
 
 [multi_tenant_edge]
 activity_heartbeat_enabled = false
+
+# Optional: route web_search / web_fetch through Jina (s.jina.ai / r.jina.ai) when DuckDuckGo or
+# direct fetch fails on your network. See https://jina.ai/reader
+[jina]
+enabled = false
+# api_key = "jina_..."  # optional; higher rate limits (Authorization: Bearer)
 
 [memory]
 enabled = true

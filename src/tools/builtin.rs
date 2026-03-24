@@ -2,6 +2,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use crate::config::JinaWebBackend;
 use crate::traits::Tool;
 use crate::NodeHandle;
 
@@ -396,7 +398,241 @@ impl Tool for ShellExecTool {
     }
 }
 
-pub struct WebSearchTool;
+fn web_http_client(timeout_secs: u64) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0")
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))
+}
+
+fn parse_scraper_selector(sel: &str) -> Result<scraper::Selector, String> {
+    scraper::Selector::parse(sel).map_err(|e| format!("Invalid CSS selector {:?}: {}", sel, e))
+}
+
+fn truncate_web_output(text: String, max_chars: usize) -> String {
+    if text.len() <= max_chars {
+        return text;
+    }
+    let mut end = max_chars;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n... (truncated, {} more chars)",
+        &text[..end],
+        text.len() - end
+    )
+}
+
+fn apply_jina_bearer(
+    req: reqwest::RequestBuilder,
+    jina: Option<&JinaWebBackend>,
+) -> reqwest::RequestBuilder {
+    if let Some(j) = jina {
+        if let Some(key) = j.api_key.as_deref() {
+            return req.header("Authorization", format!("Bearer {}", key));
+        }
+    }
+    req
+}
+
+/// DuckDuckGo `/html/` often blocks scrapers; `/lite/` via POST is more reliable.
+async fn web_search_duckduckgo(query: &str, max_output_chars: usize) -> Result<String, String> {
+    let url = "https://lite.duckduckgo.com/lite/";
+    let client = web_http_client(45)?;
+
+    let res = client
+        .post(url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(format!("q={}", urlencoding::encode(query)))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let body = res.text().await.map_err(|e| e.to_string())?;
+
+    let document = scraper::Html::parse_document(&body);
+    let title_selector = parse_scraper_selector(".result-link")?;
+    let snippet_selector = parse_scraper_selector(".result-snippet")?;
+
+    let mut results = String::new();
+
+    let titles: Vec<_> = document.select(&title_selector).take(5).collect();
+    let snippets: Vec<_> = document.select(&snippet_selector).take(5).collect();
+
+    for (i, (title_elem, snippet_elem)) in titles.into_iter().zip(snippets.into_iter()).enumerate() {
+        let title = title_elem.text().collect::<Vec<_>>().join(" ");
+        let link = title_elem.value().attr("href").unwrap_or("");
+        let snippet = snippet_elem.text().collect::<Vec<_>>().join(" ").trim().to_string();
+
+        results.push_str(&format!("{}. [{}]({})\n   {}\n\n", i + 1, title, link, snippet));
+    }
+
+    if results.is_empty() {
+        return Ok("No results found.".to_string());
+    }
+
+    Ok(truncate_web_output(results, max_output_chars))
+}
+
+/// [Jina Search](https://s.jina.ai/) — useful when DuckDuckGo is unreachable from the host.
+async fn web_search_jina(
+    query: &str,
+    jina: &JinaWebBackend,
+    max_output_chars: usize,
+) -> Result<String, String> {
+    let url = format!("https://s.jina.ai/{}", urlencoding::encode(query));
+    let client = web_http_client(45)?;
+    let req = apply_jina_bearer(client.get(&url), Some(jina));
+    let res = req.send().await.map_err(|e| e.to_string())?;
+    if !res.status().is_success() {
+        return Err(format!("Jina search HTTP error: {}", res.status()));
+    }
+    let body = res.text().await.map_err(|e| e.to_string())?;
+    if body.trim().is_empty() {
+        return Ok("No results found.".to_string());
+    }
+    Ok(truncate_web_output(body, max_output_chars))
+}
+
+async fn web_fetch_direct(url: &str, max_output_chars: usize) -> Result<String, String> {
+    let client = web_http_client(30)?;
+
+    let res = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch URL: {}", e))?;
+
+    if !res.status().is_success() {
+        return Err(format!("HTTP Error: {}", res.status()));
+    }
+
+    let content_type = res
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if content_type.contains("application/json") {
+        let json_body: Value = res.json().await.map_err(|e| format!("Invalid JSON: {}", e))?;
+        let s = serde_json::to_string_pretty(&json_body).unwrap_or_default();
+        return Ok(truncate_web_output(s, max_output_chars));
+    }
+
+    let body = res
+        .text()
+        .await
+        .map_err(|e| format!("Failed to decode text: {}", e))?;
+
+    let document = scraper::Html::parse_document(&body);
+    let mut text_output = String::new();
+
+    // Heuristic HTML→text for direct fetches: skip non-content tags (scripts, chrome, SVG) and
+    // treat block-level tags as line breaks / light markdown markers. Not configurable; Jina path
+    // avoids this entirely.
+    let elements_to_ignore = ["script", "style", "noscript", "svg", "nav", "footer", "header"];
+    let block_elements = [
+        "p", "div", "section", "article", "h1", "h2", "h3", "h4", "h5", "h6", "li", "br",
+    ];
+
+    let body_selector = parse_scraper_selector("body")?;
+    if let Some(body_node) = document.select(&body_selector).next() {
+        for node in body_node.descendants() {
+            if let scraper::Node::Element(elem) = node.value() {
+                let tag = elem.name();
+
+                if elements_to_ignore.contains(&tag) {
+                    continue;
+                }
+                if block_elements.contains(&tag) {
+                    text_output.push('\n');
+                    if tag.starts_with('h') {
+                        text_output.push_str("### ");
+                    }
+                    if tag == "li" {
+                        text_output.push_str("- ");
+                    }
+                }
+            } else if let scraper::Node::Text(text_node) = node.value() {
+                let text = text_node.trim();
+                if !text.is_empty() {
+                    let mut ignore = false;
+                    let mut parent = node.parent();
+                    while let Some(p) = parent {
+                        if let scraper::Node::Element(e) = p.value() {
+                            if elements_to_ignore.contains(&e.name()) {
+                                ignore = true;
+                                break;
+                            }
+                        }
+                        parent = p.parent();
+                    }
+
+                    if !ignore {
+                        text_output.push_str(text);
+                        text_output.push(' ');
+                    }
+                }
+            }
+        }
+    }
+
+    let cleaned = text_output
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Ok(truncate_web_output(cleaned, max_output_chars))
+}
+
+/// [Jina Reader](https://r.jina.ai/) returns LLM-friendly markdown for a target URL.
+async fn web_fetch_jina(
+    url: &str,
+    jina: &JinaWebBackend,
+    max_output_chars: usize,
+) -> Result<String, String> {
+    // Jina Reader expects the target URL as a path suffix with `:` and `/` intact — do not
+    // percent-encode the whole URL or the service cannot resolve the target.
+    let reader_url = format!("https://r.jina.ai/{}", url.trim());
+    let client = web_http_client(60)?;
+    let req = apply_jina_bearer(client.get(&reader_url), Some(jina));
+    let res = req
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch URL via Jina: {}", e))?;
+    if !res.status().is_success() {
+        return Err(format!("HTTP Error (Jina reader): {}", res.status()));
+    }
+
+    let content_type = res
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if content_type.contains("application/json") {
+        let json_body: Value = res.json().await.map_err(|e| format!("Invalid JSON: {}", e))?;
+        let s = serde_json::to_string_pretty(&json_body).unwrap_or_default();
+        return Ok(truncate_web_output(s, max_output_chars));
+    }
+
+    let body = res
+        .text()
+        .await
+        .map_err(|e| format!("Failed to decode text: {}", e))?;
+    Ok(truncate_web_output(body, max_output_chars))
+}
+
+pub struct WebSearchTool {
+    /// When `Some`, use [Jina Search](https://s.jina.ai/) (`[jina].enabled` in config).
+    pub jina: Option<JinaWebBackend>,
+    /// From `max_web_tool_output_chars` in config (see `AppConfig::effective_max_web_tool_output_chars`).
+    pub max_output_chars: usize,
+}
 
 #[async_trait]
 impl Tool for WebSearchTool {
@@ -405,7 +641,7 @@ impl Tool for WebSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search the web using DuckDuckGo to find recent information."
+        "Search the web. Uses Jina (s.jina.ai) when [jina].enabled is true in config; otherwise DuckDuckGo Lite."
     }
 
     fn parameters(&self) -> Value {
@@ -422,53 +658,25 @@ impl Tool for WebSearchTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
-        let query = args.get("query")
+        let query = args
+            .get("query")
             .and_then(|v| v.as_str())
             .ok_or("Missing 'query' argument")?;
-            
-        // DuckDuckGo /html/ blocks scrapers frequently. Use /lite/ endpoint instead via POST.
-        let url = "https://lite.duckduckgo.com/lite/";
-        
-        let client = reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0")
-            .build()
-            .map_err(|e| format!("Client error: {}", e))?;
-            
-        let res = client.post(url)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(format!("q={}", urlencoding::encode(query)))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-            
-        let body = res.text().await.map_err(|e| e.to_string())?;
-        
-        let document = scraper::Html::parse_document(&body);
-        let title_selector = scraper::Selector::parse(".result-link").unwrap();
-        let snippet_selector = scraper::Selector::parse(".result-snippet").unwrap();
-        
-        let mut results = String::new();
-        
-        let titles: Vec<_> = document.select(&title_selector).take(5).collect();
-        let snippets: Vec<_> = document.select(&snippet_selector).take(5).collect();
-        
-        for (i, (title_elem, snippet_elem)) in titles.into_iter().zip(snippets.into_iter()).enumerate() {
-            let title = title_elem.text().collect::<Vec<_>>().join(" ");
-            let link = title_elem.value().attr("href").unwrap_or("");
-            let snippet = snippet_elem.text().collect::<Vec<_>>().join(" ").trim().to_string();
-            
-            results.push_str(&format!("{}. [{}]({})\n   {}\n\n", i + 1, title, link, snippet));
-        }
 
-        if results.is_empty() {
-            return Ok("No results found.".to_string());
+        if let Some(ref jina) = self.jina {
+            web_search_jina(query, jina, self.max_output_chars).await
+        } else {
+            web_search_duckduckgo(query, self.max_output_chars).await
         }
-
-        Ok(results)
     }
 }
 
-pub struct WebFetchTool;
+pub struct WebFetchTool {
+    /// When `Some`, use [Jina Reader](https://r.jina.ai/) (`[jina].enabled` in config).
+    pub jina: Option<JinaWebBackend>,
+    /// From `max_web_tool_output_chars` in config (see `AppConfig::effective_max_web_tool_output_chars`).
+    pub max_output_chars: usize,
+}
 
 #[async_trait]
 impl Tool for WebFetchTool {
@@ -477,7 +685,7 @@ impl Tool for WebFetchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch a URL and extract its main text content (HTML -> Markdown). Useful for reading articles or documentation."
+        "Fetch a URL. Uses Jina Reader (r.jina.ai) when [jina].enabled is true; otherwise direct GET with HTML text extraction or JSON pretty-print."
     }
 
     fn parameters(&self) -> Value {
@@ -494,91 +702,15 @@ impl Tool for WebFetchTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
-        let url = args.get("url")
+        let url = args
+            .get("url")
             .and_then(|v| v.as_str())
             .ok_or("Missing 'url' argument")?;
-            
-        let client = reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0")
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
-        let res = client.get(url)
-            .send()
-            .await
-            .map_err(|e| format!("Failed to fetch URL: {}", e))?;
-            
-        if !res.status().is_success() {
-            return Err(format!("HTTP Error: {}", res.status()));
-        }
-
-        let content_type = res.headers().get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-
-        if content_type.contains("application/json") {
-            let json_body: Value = res.json().await.map_err(|e| format!("Invalid JSON: {}", e))?;
-            return Ok(serde_json::to_string_pretty(&json_body).unwrap_or_default());
-        }
-
-        let body = res.text().await.map_err(|e| format!("Failed to decode text: {}", e))?;
-        
-        let document = scraper::Html::parse_document(&body);
-        let mut text_output = String::new();
-        
-        let elements_to_ignore = ["script", "style", "noscript", "svg", "nav", "footer", "header"];
-        let block_elements = ["p", "div", "section", "article", "h1", "h2", "h3", "h4", "h5", "h6", "li", "br"];
-        
-        let body_selector = scraper::Selector::parse("body").unwrap();
-        if let Some(body_node) = document.select(&body_selector).next() {
-            for node in body_node.descendants() {
-                if let scraper::Node::Element(elem) = node.value() {
-                    let tag = elem.name();
-                    
-                    if elements_to_ignore.contains(&tag) {
-                        continue;
-                    }
-                    if block_elements.contains(&tag) {
-                        text_output.push('\n');
-                        if tag.starts_with('h') { text_output.push_str("### "); }
-                        if tag == "li" { text_output.push_str("- "); }
-                    }
-                } else if let scraper::Node::Text(text_node) = node.value() {
-                    let text = text_node.trim();
-                    if !text.is_empty() {
-                        let mut ignore = false;
-                        let mut parent = node.parent();
-                        while let Some(p) = parent {
-                            if let scraper::Node::Element(e) = p.value() {
-                                if elements_to_ignore.contains(&e.name()) {
-                                    ignore = true;
-                                    break;
-                                }
-                            }
-                            parent = p.parent();
-                        }
-                        
-                        if !ignore {
-                            text_output.push_str(text);
-                            text_output.push(' ');
-                        }
-                    }
-                }
-            }
-        }
-
-        let cleaned = text_output.lines()
-            .map(|l| l.trim())
-            .filter(|l| !l.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-            
-        let max_len = 50000;
-        if cleaned.len() > max_len {
-            Ok(format!("{}\n... (truncated, {} more chars)", &cleaned[..max_len], cleaned.len() - max_len))
+        if let Some(ref jina) = self.jina {
+            web_fetch_jina(url, jina, self.max_output_chars).await
         } else {
-            Ok(cleaned)
+            web_fetch_direct(url, self.max_output_chars).await
         }
     }
 }

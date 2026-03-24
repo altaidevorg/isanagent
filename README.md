@@ -76,6 +76,7 @@ The generated `config.toml` starts with these defaults:
 restrict_to_workspace = true
 max_iterations = 50
 max_tool_output_chars = 10000
+# max_web_tool_output_chars = 50000  # optional; caps web_search / web_fetch (default 50000)
 
 [provider]
 model_name = "gemini-3-flash-preview"
