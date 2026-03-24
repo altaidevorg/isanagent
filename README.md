@@ -109,6 +109,9 @@ email_address = "<changethis>"
 enabled = false
 port = 8080
 
+[multi_tenant_edge]
+activity_heartbeat_enabled = false
+
 [memory]
 enabled = true
 short_term_threshold_turns = 20
@@ -163,6 +166,16 @@ Notes:
 - `store` defaults to `true` when omitted, so responses are persisted and can be continued later.
 - Set `"store": false` if you do not want a response persisted for later `previous_response_id` lookups.
 - `responses` accepts text-oriented JSON input and normalizes it into a single message before sending it into the agent runtime.
+
+### Multi-Tenant Edge Heartbeats
+When Agent-RS runs behind `multi-tenant-edge`, it can keep the instance alive during long background tool execution by heartbeating `POST /_internal/activity`.
+
+```toml
+[multi_tenant_edge]
+activity_heartbeat_enabled = true
+```
+
+When enabled, Agent-RS reads `MTE_PROXY_BASE_URL`, `MTE_ACTIVITY_SECRET`, and `MTE_HEARTBEAT_TTL_MS` from the process environment and sends immediate + periodic heartbeats only while tools are running. If those env vars are missing or the heartbeat endpoint rejects the call, Agent-RS logs a warning and continues the tool run without failing the request.
 
 ### Slack Modes
 Slack now supports both Socket Mode and a dedicated webhook listener for Slack Events API. Webhook mode runs on its own HTTP listener and does not share the API channel port.

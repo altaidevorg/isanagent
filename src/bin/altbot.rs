@@ -1,23 +1,36 @@
-use std::time::Duration;
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
-use agent_rs::{NodeHandle, Supervisor, SupervisorPolicy};
 use agent_rs::agent::AgentLogic;
+use agent_rs::bus::{BusMessage, LoggerControlMessage};
+use agent_rs::channels::{
+    api::ApiChannel, email::EmailChannel, slack::SlackChannel, terminal::TerminalChannel, Channel,
+};
+use agent_rs::logging::{
+    create_logger_channel, create_logging_actor_or_fallback, init_runtime_logger,
+    LOGGER_QUEUE_CAPACITY,
+};
+use agent_rs::onboarding::{onboard_workspace, BootstrapReport};
+use agent_rs::provider::OpenAIProvider;
 use agent_rs::scheduler::CronActor;
 use agent_rs::session::SessionManager;
-use agent_rs::provider::OpenAIProvider;
-use agent_rs::tools::ToolRegistry;
-use agent_rs::tools::builtin::{ReadFileTool, WriteFileTool, EditFileTool, ListDirTool, ShellExecTool, WebSearchTool, WebFetchTool, CronTool, MessageTool};
-use agent_rs::onboarding::{onboard_workspace, BootstrapReport};
-use agent_rs::workspace::{resolve_workspace_root, AltbotWorkspace};
 use agent_rs::skills::SkillRegistry;
-use agent_rs::bus::{BusMessage, LoggerControlMessage};
-use agent_rs::channels::{Channel, terminal::TerminalChannel, slack::SlackChannel, api::ApiChannel, email::EmailChannel};
-use agent_rs::logging::{create_logger_channel, create_logging_actor_or_fallback, init_runtime_logger, LOGGER_QUEUE_CAPACITY};
-use colored::Colorize;
+use agent_rs::tools::builtin::{
+    CronTool, EditFileTool, ListDirTool, MessageTool, ReadFileTool, ShellExecTool, WebFetchTool,
+    WebSearchTool, WriteFileTool,
+};
+use agent_rs::tools::ToolRegistry;
+use agent_rs::workspace::{resolve_workspace_root, AltbotWorkspace};
+use agent_rs::{NodeHandle, Supervisor, SupervisorPolicy};
 use clap::{Args as ClapArgs, Parser, Subcommand};
+use colored::Colorize;
+
+const DEFAULT_PROVIDER_MODEL_NAME: &str = "gemini-2.5-flash";
+const DEFAULT_PROVIDER_API_KEY_ENV: &str = "GEMINI_API_KEY";
+const DEFAULT_PROVIDER_BASE_URL: &str =
+    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
 
 /// Altbot: A terminal chat interface and autonomous agent engine
 #[derive(Parser, Debug)]
@@ -78,7 +91,9 @@ async fn run_altbot(
     let logger_node = NodeHandle::<BusMessage>::new(logger_sup, 1000, 1, Duration::from_millis(10));
     let (logger_control_listener, mut logger_control_rx) =
         NodeHandle::<BusMessage>::create_listener("logger_control", 8);
-    logger_node.wire("logger_control", &logger_control_listener).await;
+    logger_node
+        .wire("logger_control", &logger_control_listener)
+        .await;
 
     let logger_forward = logger_node.clone();
     let runtime_handle = tokio::runtime::Handle::current();
@@ -86,7 +101,10 @@ async fn run_altbot(
         .name("logging-forwarder".to_string())
         .spawn(move || {
             while let Ok(msg) = logger_bus_rx.recv() {
-                if runtime_handle.block_on(logger_forward.send_packet(msg)).is_err() {
+                if runtime_handle
+                    .block_on(logger_forward.send_packet(msg))
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -100,17 +118,26 @@ async fn run_altbot(
     log::info!("Loading Altbot workspace at {:?}", workspace.dir);
 
     // 1. Setup SqliteMemoryActor and SessionManager
-    let db_path = workspace.dir.join(".system_generated").join("agent_memory.db");
+    let db_path = workspace
+        .dir
+        .join(".system_generated")
+        .join("agent_memory.db");
     if let Some(parent) = db_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let db_path_str = db_path
         .to_str()
         .ok_or_else(|| std::io::Error::other("workspace DB path is not valid UTF-8"))?;
-    let memory_actor = agent_rs::memory::SqliteMemoryActor::new(db_path_str)
-        .map_err(|e| std::io::Error::other(format!("Failed to initialize SqliteMemoryActor: {:?}", e)))?;
-    let memory_node = NodeHandle::<agent_rs::memory::MemoryMessage>::new(memory_actor, 100, 1, Duration::from_millis(5));
-    
+    let memory_actor = agent_rs::memory::SqliteMemoryActor::new(db_path_str).map_err(|e| {
+        std::io::Error::other(format!("Failed to initialize SqliteMemoryActor: {:?}", e))
+    })?;
+    let memory_node = NodeHandle::<agent_rs::memory::MemoryMessage>::new(
+        memory_actor,
+        100,
+        1,
+        Duration::from_millis(5),
+    );
+
     let session_manager = SessionManager::new(memory_node.clone());
 
     // 4. Setup Tools
@@ -119,7 +146,9 @@ async fn run_altbot(
     // 2. Setup Skills
     let skills = SkillRegistry::new(workspace.skills_path());
     let cron_logic = CronActor::new("DailyBriefingCron", db_path_str, logger_bus_tx.clone())
-        .map_err(|e| std::io::Error::other(format!("Failed to initialize CronActor database: {:?}", e)))?;
+        .map_err(|e| {
+            std::io::Error::other(format!("Failed to initialize CronActor database: {:?}", e))
+        })?;
     let cron_node = NodeHandle::new(cron_logic, 10, 3, Duration::from_millis(50));
 
     let mut tools = ToolRegistry::new();
@@ -163,17 +192,18 @@ async fn run_altbot(
     let (model_name, api_key_env, base_url) = if let Some(p) = workspace.config.provider.clone() {
         (p.model_name, p.api_key_env, p.base_url)
     } else {
-        ("gemini-2.5-flash".to_string(), "GEMINI_API_KEY".to_string(), "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions".to_string())
+        (
+            DEFAULT_PROVIDER_MODEL_NAME.to_string(),
+            DEFAULT_PROVIDER_API_KEY_ENV.to_string(),
+            DEFAULT_PROVIDER_BASE_URL.to_string(),
+        )
     };
 
     let api_key = std::env::var(&api_key_env)
         .map_err(|_| std::io::Error::other(format!("{} must be set", api_key_env)))?;
-
-    let client = agent_rs::utils::LLMClient::new_openai_compatible(
-        &base_url,
-        &api_key,
-        &model_name,
-    ).with_temperature(0.3);
+    let client =
+        agent_rs::utils::LLMClient::new_openai_compatible(&base_url, &api_key, &model_name)
+            .with_temperature(0.3);
     let provider = Box::new(OpenAIProvider::new(client.clone()));
 
     // 5.5 Setup Reflection Engine
@@ -194,7 +224,7 @@ async fn run_altbot(
     // Prepare startup visual references before we move the structs
     let skill_names = skills.get_skill_names().join(", ");
     let skill_count = skills.get_skill_names().len();
-    
+
     let mut tool_names_list = tools.get_tool_names();
     tool_names_list.sort();
     let tool_names = tool_names_list.join(", ");
@@ -203,15 +233,44 @@ async fn run_altbot(
     // 7. Create Agent Logic
     let max_iterations = workspace.config.max_iterations.unwrap_or(50);
     let max_tool_output_chars = workspace.config.max_tool_output_chars.unwrap_or(3000);
-    let max_recent_summaries = workspace.config.memory.as_ref()
+    let max_recent_summaries = workspace
+        .config
+        .memory
+        .as_ref()
         .and_then(|m| m.max_recent_summaries)
         .unwrap_or(5);
-    let short_term_threshold_turns = workspace.config.memory.as_ref()
+    let short_term_threshold_turns = workspace
+        .config
+        .memory
+        .as_ref()
         .and_then(|m| m.short_term_threshold_turns)
         .unwrap_or(20);
-    let short_term_threshold_tokens = workspace.config.memory.as_ref()
+    let short_term_threshold_tokens = workspace
+        .config
+        .memory
+        .as_ref()
         .and_then(|m| m.short_term_threshold_tokens)
         .unwrap_or(100000);
+    let tool_execution_activity = if workspace
+        .config
+        .multi_tenant_edge
+        .as_ref()
+        .and_then(|cfg| cfg.activity_heartbeat_enabled)
+        .unwrap_or(false)
+    {
+        match agent_rs::multi_tenant_edge::ActivityHeartbeatClient::from_env(logger_bus_tx.clone())
+        {
+            Ok(client) => Some(std::sync::Arc::new(client)),
+            Err(error) => {
+                let _ = logger_bus_tx.send(BusMessage::Log(agent_rs::bus::LogEvent::warn(
+                    "Altbot", &error,
+                )));
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let agent_logic = AgentLogic::new(
         "Altbot",
@@ -228,6 +287,11 @@ async fn run_altbot(
         global_outbound_tx.clone(),
         logger_bus_tx.clone(),
     );
+    let agent_logic = if let Some(tool_execution_activity) = tool_execution_activity {
+        agent_logic.with_tool_execution_activity(tool_execution_activity)
+    } else {
+        agent_logic
+    };
 
     // 8. Wrap Agent in NodeHandle
     let agent_node = NodeHandle::<BusMessage>::new(agent_logic, 100, 3, Duration::from_millis(50));
@@ -237,14 +301,22 @@ async fn run_altbot(
     let mut out_channels: HashMap<String, Arc<dyn Channel>> = HashMap::new();
 
     let terminal_chat_id = uuid::Uuid::new_v4().to_string();
-    let terminal = Arc::new(TerminalChannel::new(&terminal_chat_id, logger_bus_tx.clone(), shutdown_tx.clone()));
+    let terminal = Arc::new(TerminalChannel::new(
+        &terminal_chat_id,
+        logger_bus_tx.clone(),
+        shutdown_tx.clone(),
+    ));
     terminal.start(inbound_tx.clone()).await?;
     out_channels.insert(terminal.name().to_string(), terminal);
 
     // 11. Setup Slack Channel
     if let Some(slack_cfg) = workspace.config.slack.clone() {
         if slack_cfg.enabled.unwrap_or(false) {
-            let slack = Arc::new(SlackChannel::new(slack_cfg, &db_path, logger_bus_tx.clone())?);
+            let slack = Arc::new(SlackChannel::new(
+                slack_cfg,
+                &db_path,
+                logger_bus_tx.clone(),
+            )?);
             slack.start(inbound_tx.clone()).await?;
             out_channels.insert(slack.name().to_string(), slack);
         }
@@ -253,7 +325,11 @@ async fn run_altbot(
     // 12. Setup API Channel
     if let Some(api_cfg) = workspace.config.api.clone() {
         if api_cfg.enabled.unwrap_or(false) {
-            let api = Arc::new(ApiChannel::new(api_cfg.port, &db_path, logger_bus_tx.clone())?);
+            let api = Arc::new(ApiChannel::new(
+                api_cfg.port,
+                &db_path,
+                logger_bus_tx.clone(),
+            )?);
             api.start(inbound_tx.clone()).await?;
             out_channels.insert(api.name().to_string(), api);
         }
@@ -269,15 +345,32 @@ async fn run_altbot(
     }
 
     // 14. Print clean startup banner
-    println!("\n{}", "=============================================".blue());
+    println!(
+        "\n{}",
+        "=============================================".blue()
+    );
     println!("Agent-RS Version: {}", env!("CARGO_PKG_VERSION").green());
     println!("Terminal Session ID: {}", terminal_chat_id.dimmed());
-    println!("Loaded Skills ({}): {}", skill_count.to_string().cyan(), skill_names);
-    println!("Loaded Tools ({}): {}", tool_count.to_string().yellow(), tool_names);
+    println!(
+        "Loaded Skills ({}): {}",
+        skill_count.to_string().cyan(),
+        skill_names
+    );
+    println!(
+        "Loaded Tools ({}): {}",
+        tool_count.to_string().yellow(),
+        tool_names
+    );
     println!("{}", "=============================================".blue());
     println!("\n{}", "Agent System is Running.".bold().green());
-    println!("{}", "Available actions: type a message in the terminal or on active chat channels.".cyan());
-    println!("{}", "Tip: Type '/exit' to securely shut down the engine.\n".dimmed());
+    println!(
+        "{}",
+        "Available actions: type a message in the terminal or on active chat channels.".cyan()
+    );
+    println!(
+        "{}",
+        "Tip: Type '/exit' to securely shut down the engine.\n".dimmed()
+    );
 
     // Route inbound messages from all channels into the agent and logger
     let agent_tx = agent_node.clone();
@@ -290,7 +383,8 @@ async fn run_altbot(
     });
 
     // Listen for Outbound reasoning chunks and route back to the appropriate channel and logger
-    let (listener_node, mut agent_rx) = NodeHandle::<BusMessage>::create_listener("completion", 100);
+    let (listener_node, mut agent_rx) =
+        NodeHandle::<BusMessage>::create_listener("completion", 100);
     let _ = &agent_node - "completion" >> &listener_node;
 
     // Listen to cron triggers
@@ -302,7 +396,6 @@ async fn run_altbot(
     tokio::spawn(async move {
         while let Some(msg) = cron_rx.recv().await {
             if let agent_rs::Message::Packet(payload) = msg {
-                
                 let mut channel_val = "cron".to_string();
                 let mut chat_id_val = "cron_global".to_string();
                 let mut content_val = payload.clone();
@@ -327,7 +420,7 @@ async fn run_altbot(
                     content: content_val,
                     metadata: HashMap::new(),
                 };
-                
+
                 // Also emit a telemetry event so loggers see the trigger fired
                 let tel = agent_rs::bus::TelemetryEvent::CronTrigger {
                     job_id: "cron_event".to_string(),
@@ -336,7 +429,9 @@ async fn run_altbot(
                 let _ = cron_logger_tx.send(BusMessage::Telemetry(tel));
 
                 // Fire into the agent
-                let _ = cron_agent_tx.send_packet(BusMessage::Inbound(inbound)).await;
+                let _ = cron_agent_tx
+                    .send_packet(BusMessage::Inbound(inbound))
+                    .await;
             }
         }
     });
@@ -366,7 +461,11 @@ async fn run_altbot(
             if let BusMessage::Outbound(out) = msg {
                 if let Some(chan) = delivery_channels.get(&out.channel) {
                     if let Err(e) = chan.send(out).await {
-                        log::error!("Failed to deliver message via channel [{}]: {}", chan.name(), e);
+                        log::error!(
+                            "Failed to deliver message via channel [{}]: {}",
+                            chan.name(),
+                            e
+                        );
                     }
                 }
             }
@@ -393,12 +492,16 @@ async fn run_altbot(
     let _ = logger_bus_tx.send(BusMessage::LoggerControl(LoggerControlMessage::Flush));
     let flush_result = tokio::time::timeout(Duration::from_secs(5), async {
         while let Some(msg) = logger_control_rx.recv().await {
-            if let agent_rs::Message::Packet(BusMessage::LoggerControl(LoggerControlMessage::Flushed)) = msg {
+            if let agent_rs::Message::Packet(BusMessage::LoggerControl(
+                LoggerControlMessage::Flushed,
+            )) = msg
+            {
                 return Ok::<(), ()>(());
             }
         }
         Err(())
-    }).await;
+    })
+    .await;
 
     if flush_result.is_err() {
         log::warn!("Timed out waiting for LoggingActor flush acknowledgement.");

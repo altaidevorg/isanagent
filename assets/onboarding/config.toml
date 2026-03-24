@@ -31,6 +31,9 @@ email_address = "<changethis>"
 enabled = false
 port = 8080
 
+[multi_tenant_edge]
+activity_heartbeat_enabled = false
+
 [memory]
 enabled = true
 short_term_threshold_turns = 20

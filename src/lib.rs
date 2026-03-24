@@ -1,27 +1,29 @@
 use async_trait::async_trait;
-use log::{info, warn, error};
+use log::{error, info, warn};
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::ops::{Shr, Sub};
 use tokio::sync::mpsc;
-use std::ops::{Sub, Shr};
 use tokio::time::{sleep, Duration};
 
-pub mod utils;
-pub mod traits;
-pub mod memory;
-pub mod tools;
 pub mod agent;
-pub mod provider;
-pub mod scheduler;
-pub mod workspace;
-pub mod skills;
-pub mod config;
 pub mod bus;
 pub mod channels;
-pub mod session;
+pub mod config;
 pub mod logging;
-pub mod reflection;
+pub mod memory;
+pub mod multi_tenant_edge;
 pub mod onboarding;
+pub mod provider;
+pub mod reflection;
+pub mod scheduler;
+pub mod session;
+pub mod skills;
+pub mod tool_activity;
+pub mod tools;
+pub mod traits;
+pub mod utils;
+pub mod workspace;
 
 // --- Message Protocol ---
 
@@ -130,7 +132,11 @@ where
                 match self.policy {
                     SupervisorPolicy::Stop => Err(e),
                     SupervisorPolicy::Restart => {
-                        error!("Supervisor caught error in '{}': {}. Restarting...", self.child.name(), e);
+                        error!(
+                            "Supervisor caught error in '{}': {}. Restarting...",
+                            self.child.name(),
+                            e
+                        );
                         // Restart
                         self.child = (self.factory)();
                         // Retry once
@@ -148,14 +154,18 @@ where
             Err(e) => match self.policy {
                 SupervisorPolicy::Stop => Err(e),
                 SupervisorPolicy::Restart => {
-                    error!("Supervisor caught tick error in '{}': {}. Restarting...", self.child.name(), e);
+                    error!(
+                        "Supervisor caught tick error in '{}': {}. Restarting...",
+                        self.child.name(),
+                        e
+                    );
                     self.child = (self.factory)();
                     Ok(None)
                 }
             },
         }
     }
-    
+
     fn tick_interval(&self) -> Option<Duration> {
         self.child.tick_interval()
     }
@@ -176,7 +186,11 @@ where
     /// Default implementation uses the struct name via reflection.
     fn name(&self) -> String {
         let full_name = std::any::type_name::<Self>();
-        full_name.split("::").last().unwrap_or(full_name).to_string()
+        full_name
+            .split("::")
+            .last()
+            .unwrap_or(full_name)
+            .to_string()
     }
 
     /// Optional: Prepare the data before processing.
@@ -197,7 +211,10 @@ where
 
     /// Optional: Post-process the result.
     /// Default: returns result as-is.
-    async fn post(&mut self, result: Option<(String, T)>) -> Result<Option<(String, T)>, ActorError> {
+    async fn post(
+        &mut self,
+        result: Option<(String, T)>,
+    ) -> Result<Option<(String, T)>, ActorError> {
         Ok(result)
     }
 
@@ -229,11 +246,17 @@ where
     retry_wait: Duration,
 }
 
-impl<T> ActorNode<T> 
-where T: Debug + Send + Sync + Clone + 'static
+impl<T> ActorNode<T>
+where
+    T: Debug + Send + Sync + Clone + 'static,
 {
     /// Create a new ActorNode with the given logic and receiver channel.
-    pub fn new(logic: Box<dyn ActorLogic<T>>, receiver: mpsc::Receiver<Message<T>>, max_retries: u32, retry_wait: Duration) -> Self {
+    pub fn new(
+        logic: Box<dyn ActorLogic<T>>,
+        receiver: mpsc::Receiver<Message<T>>,
+        max_retries: u32,
+        retry_wait: Duration,
+    ) -> Self {
         Self {
             receiver,
             successors: HashMap::new(),
@@ -311,17 +334,17 @@ where T: Debug + Send + Sync + Clone + 'static
                             self.name,
                             std::any::type_name::<T>()
                         );
-                        
+
                         // Retry loop
                         let mut attempt = 0;
                         loop {
                             attempt += 1;
                             // Clone data for processing if retries needed (T is Clone)
                             let data_clone = data.clone();
-                            
+
                             // Lifecycle: Prep -> Process -> Post
                             // We need to handle intermediate failures
-                            
+
                             let run_lifecycle = async {
                                 let prepped_data = self.logic.prep(data_clone).await?;
                                 let result = self.logic.process(prepped_data).await?;
@@ -333,27 +356,42 @@ where T: Debug + Send + Sync + Clone + 'static
                                 Ok(Some((action, new_data))) => {
                                     let successor = self.get_successor(&action);
                                     if let Some(sender) = successor {
-                                        info!("Actor '{}' transitioning with action '{}'.", self.name, action);
+                                        info!(
+                                            "Actor '{}' transitioning with action '{}'.",
+                                            self.name, action
+                                        );
                                         let _ = sender.send(Message::Packet(new_data)).await;
                                     } else {
                                         if !self.successors.is_empty() {
                                             warn!("Actor '{}' has no successor for action '{}'. Dropping packet.", self.name, action);
                                         } else {
-                                            info!("Actor '{}' finished chain (no successors).", self.name);
+                                            info!(
+                                                "Actor '{}' finished chain (no successors).",
+                                                self.name
+                                            );
                                         }
                                     }
                                     break; // Success
                                 }
                                 Ok(None) => {
-                                    info!("Actor '{}' consumed packet (no further action needed).", self.name);
+                                    info!(
+                                        "Actor '{}' consumed packet (no further action needed).",
+                                        self.name
+                                    );
                                     break; // Success (absorbed)
                                 }
                                 Err(e) => {
                                     if attempt >= self.max_retries {
-                                        error!("Actor '{}' failed final attempt {}: {:?}", self.name, attempt, e);
+                                        error!(
+                                            "Actor '{}' failed final attempt {}: {:?}",
+                                            self.name, attempt, e
+                                        );
                                         break; // Give up
                                     } else {
-                                        warn!("Actor '{}' attempt {} failed: {:?}. Retrying...", self.name, attempt, e);
+                                        warn!(
+                                            "Actor '{}' attempt {} failed: {:?}. Retrying...",
+                                            self.name, attempt, e
+                                        );
                                         if self.retry_wait > Duration::ZERO {
                                             sleep(self.retry_wait).await;
                                         }
@@ -367,7 +405,10 @@ where T: Debug + Send + Sync + Clone + 'static
                         break;
                     }
                     Message::AddSuccessor { action, sender } => {
-                        info!("Actor '{}' wiring successor for action '{}'.", self.name, action);
+                        info!(
+                            "Actor '{}' wiring successor for action '{}'.",
+                            self.name, action
+                        );
                         self.successors.insert(action, sender);
                     }
                 }
@@ -377,7 +418,7 @@ where T: Debug + Send + Sync + Clone + 'static
                 // If interval is Some, we only reach here if recv() returned None inside select.
                 // In select!, if recv returns None, we get None.
                 if interval.is_none() || self.receiver.is_closed() {
-                     break;
+                    break;
                 }
             }
         }
@@ -507,10 +548,7 @@ where
             actor.run().await;
         });
 
-        Self {
-            sender: tx,
-            name,
-        }
+        Self { sender: tx, name }
     }
 
     /// Send a data packet to this actor.
@@ -529,7 +567,7 @@ where
             sender: target.sender.clone(),
         };
         if let Err(e) = self.sender.send(msg).await {
-             log::error!("Failed to wire successor: {}", e);
+            log::error!("Failed to wire successor: {}", e);
         }
     }
 
