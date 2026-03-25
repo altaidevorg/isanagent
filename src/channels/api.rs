@@ -1,28 +1,32 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::{
-    extract::State,
+    extract::{Path as AxumPath, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use dashmap::{mapref::entry::Entry, DashMap};
 use log::{error, info};
-use moka::sync::Cache;
 use moka::policy::EvictionPolicy;
+use moka::sync::Cache;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
 
-use crate::bus::{BusMessage, InboundMessage, LogEvent, OutboundMessage};
-use crate::channels::Channel;
+use crate::bus::{BusMessage, InboundMessage, LogEvent, OutboundMessage, TelemetryEvent};
 use crate::channels::api_store::{ResponseStore, StoredResponse};
+use crate::channels::Channel;
 use crate::logging::LoggerHandle;
+use crate::scheduler::{
+    CronWebhookError, MultiTenantEdgeCronScheduler, PendingCronTriggerFinalize,
+};
 
 const AGENT_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_API_USER: &str = "api_user";
@@ -35,6 +39,7 @@ struct ApiState {
     pending_requests: std::sync::Arc<DashMap<String, oneshot::Sender<OutboundMessage>>>,
     responses_cache: Cache<String, StoredResponse>,
     response_store: std::sync::Arc<ResponseStore>,
+    mte_cron_scheduler: Option<std::sync::Arc<MultiTenantEdgeCronScheduler>>,
     channel_name: String,
     logger_tx: LoggerHandle,
 }
@@ -134,6 +139,7 @@ pub struct ApiChannel {
     pending_requests: std::sync::Arc<DashMap<String, oneshot::Sender<OutboundMessage>>>,
     responses_cache: Cache<String, StoredResponse>,
     response_store: std::sync::Arc<ResponseStore>,
+    mte_cron_scheduler: Option<std::sync::Arc<MultiTenantEdgeCronScheduler>>,
     logger_tx: LoggerHandle,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     task_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -154,10 +160,19 @@ impl ApiChannel {
                 .eviction_policy(EvictionPolicy::lru())
                 .build(),
             response_store: std::sync::Arc::new(ResponseStore::new(db_path)?),
+            mte_cron_scheduler: None,
             logger_tx,
             shutdown_tx,
             task_handle: Mutex::new(None),
         })
+    }
+
+    pub fn with_multi_tenant_edge_cron_scheduler(
+        mut self,
+        mte_cron_scheduler: std::sync::Arc<MultiTenantEdgeCronScheduler>,
+    ) -> Self {
+        self.mte_cron_scheduler = Some(mte_cron_scheduler);
+        self
     }
 }
 
@@ -174,6 +189,7 @@ impl Channel for ApiChannel {
             pending_requests: self.pending_requests.clone(),
             responses_cache: self.responses_cache.clone(),
             response_store: self.response_store.clone(),
+            mte_cron_scheduler: self.mte_cron_scheduler.clone(),
             channel_name: self.name().to_string(),
             logger_tx: self.logger_tx.clone(),
         };
@@ -194,10 +210,7 @@ impl Channel for ApiChannel {
         )));
 
         let handle = tokio::spawn(async move {
-            let app = Router::new()
-                .route("/v1/chat/completions", post(handle_chat))
-                .route("/v1/responses", post(handle_responses))
-                .with_state(state);
+            let app = build_router(state);
             let server = axum::serve(listener, app).with_graceful_shutdown(async move {
                 while shutdown_rx.changed().await.is_ok() {
                     if *shutdown_rx.borrow() {
@@ -245,6 +258,18 @@ impl Channel for ApiChannel {
     }
 }
 
+fn build_router(state: ApiState) -> Router {
+    let mut app = Router::new()
+        .route("/v1/chat/completions", post(handle_chat))
+        .route("/v1/responses", post(handle_responses));
+
+    if state.mte_cron_scheduler.is_some() {
+        app = app.route("/_mte/cron/{job_id}/{token}", get(handle_mte_cron_webhook));
+    }
+
+    app.with_state(state)
+}
+
 async fn handle_chat(State(state): State<ApiState>, Json(payload): Json<ChatRequest>) -> Response {
     let chat_id = uuid::Uuid::new_v4().to_string();
     let sender_id = payload.user.unwrap_or_else(|| DEFAULT_API_USER.to_string());
@@ -256,6 +281,137 @@ async fn handle_chat(State(state): State<ApiState>, Json(payload): Json<ChatRequ
         .into_response(),
         Err(err) => err.into_response(),
     }
+}
+
+async fn handle_mte_cron_webhook(
+    AxumPath((job_id, token)): AxumPath<(String, String)>,
+    State(state): State<ApiState>,
+) -> StatusCode {
+    let now = chrono::Utc::now();
+    let Some(mte_cron_scheduler) = state.mte_cron_scheduler.as_ref() else {
+        return StatusCode::NOT_FOUND;
+    };
+
+    let pending_trigger = match mte_cron_scheduler.begin_trigger(&job_id, &token, now).await {
+        Ok(trigger) => trigger,
+        Err(CronWebhookError::NotFound) => return StatusCode::NOT_FOUND,
+        Err(CronWebhookError::Internal(error)) => {
+            log_api(
+                &state.logger_tx,
+                LogEvent::error(
+                    "ApiChannel",
+                    &format!(
+                        "Failed to process multi-tenant-edge cron webhook for job {}: {}",
+                        job_id, error
+                    ),
+                ),
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+    };
+    let trigger = pending_trigger.payload().clone();
+
+    let metadata = HashMap::from([
+        (
+            "cron_job_id".to_string(),
+            Value::String(trigger.job_id.clone()),
+        ),
+        (
+            "trigger_source".to_string(),
+            Value::String("multi_tenant_edge".to_string()),
+        ),
+    ]);
+    let inbound = InboundMessage {
+        channel: trigger.channel.clone(),
+        sender_id: "cron".to_string(),
+        chat_id: trigger.chat_id.clone(),
+        thread_id: None,
+        content: trigger.message.clone(),
+        metadata,
+    };
+
+    if let Err(error) = state.inbound_tx.send(inbound).await {
+        if let Err(rollback_error) = pending_trigger.rollback().await {
+            log_api(
+                &state.logger_tx,
+                LogEvent::error(
+                    "ApiChannel",
+                    &format!(
+                        "Failed to enqueue multi-tenant-edge cron job {}: {}. Rollback/reschedule also failed: {}",
+                        trigger.job_id, error, rollback_error
+                    ),
+                )
+                .with_chat_id(&trigger.chat_id),
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+        log_api(
+            &state.logger_tx,
+            LogEvent::error(
+                "ApiChannel",
+                &format!(
+                    "Failed to enqueue multi-tenant-edge cron job {}: {}",
+                    trigger.job_id, error
+                ),
+            )
+            .with_chat_id(&trigger.chat_id),
+        );
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+
+    if let Err(error) = pending_trigger.mark_delivered(now.timestamp_millis()) {
+        log_api(
+            &state.logger_tx,
+            LogEvent::error(
+                "ApiChannel",
+                &format!(
+                    "Accepted multi-tenant-edge cron job {} into the inbound queue, but failed to mark the one-shot delivery as durable: {}",
+                    trigger.job_id, error
+                ),
+            )
+            .with_chat_id(&trigger.chat_id),
+        );
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+
+    let _ = state
+        .logger_tx
+        .send(BusMessage::Telemetry(TelemetryEvent::CronTrigger {
+            job_id: trigger.job_id.clone(),
+            message: trigger.message.clone(),
+        }));
+
+    match pending_trigger.complete().await {
+        Ok(PendingCronTriggerFinalize::Completed) => {}
+        Ok(PendingCronTriggerFinalize::CompletedWithWarning(error)) => {
+            log_api(
+                &state.logger_tx,
+                LogEvent::warn(
+                    "ApiChannel",
+                    &format!(
+                        "Accepted multi-tenant-edge cron webhook for job {}, but completion cleanup emitted a warning: {}",
+                        trigger.job_id, error
+                    ),
+                )
+                .with_chat_id(&trigger.chat_id),
+            );
+        }
+        Err(error) => unreachable!("complete() is not expected to fail after delivery is marked: {}", error),
+    }
+
+    log_api(
+        &state.logger_tx,
+        LogEvent::info(
+            "ApiChannel",
+            &format!(
+                "Accepted multi-tenant-edge cron webhook for job {}",
+                trigger.job_id
+            ),
+        )
+        .with_chat_id(&trigger.chat_id),
+    );
+
+    StatusCode::NO_CONTENT
 }
 
 async fn handle_responses(
@@ -543,4 +699,378 @@ fn collect_text_segments(value: &Value, segments: &mut Vec<String>) -> Result<()
 
 fn log_api(logger_tx: &LoggerHandle, event: LogEvent) {
     let _ = logger_tx.send(BusMessage::Log(event));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_router, ApiState};
+    use crate::channels::api_store::ResponseStore;
+    use crate::logging::create_logger_channel;
+    use crate::multi_tenant_edge::{CronRegistrationClient, CronRule, CronTransport};
+    use crate::scheduler::{ActiveJob, CronStore, MultiTenantEdgeCronScheduler, ScheduleKind};
+    use async_trait::async_trait;
+    use axum::body::Body;
+    use reqwest::StatusCode;
+    use serde_json::Value;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::sync::{mpsc, oneshot};
+    use tower::ServiceExt;
+
+    struct LocalTempDir {
+        path: std::path::PathBuf,
+    }
+
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    impl LocalTempDir {
+        fn new() -> Self {
+            let unique = format!(
+                "agent-rs-api-cron-{}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system time")
+                    .as_nanos(),
+                NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+            );
+            let path = std::env::temp_dir().join(unique);
+            std::fs::create_dir_all(&path).expect("tempdir");
+            Self { path }
+        }
+
+        fn db_path(&self) -> std::path::PathBuf {
+            self.path.join("agent.db")
+        }
+    }
+
+    impl Drop for LocalTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    struct RecordingCronTransport {
+        statuses: Arc<Mutex<Vec<StatusCode>>>,
+        records: Arc<Mutex<Vec<Vec<CronRule>>>>,
+    }
+
+    #[async_trait]
+    impl CronTransport for RecordingCronTransport {
+        async fn put_crons(
+            &self,
+            _url: &str,
+            _token: &str,
+            cron_rules: &[CronRule],
+        ) -> Result<StatusCode, String> {
+            self.records.lock().unwrap().push(cron_rules.to_vec());
+            Ok(self
+                .statuses
+                .lock()
+                .unwrap()
+                .pop()
+                .unwrap_or(StatusCode::NO_CONTENT))
+        }
+    }
+
+    fn cron_job(schedule: ScheduleKind, token: &str) -> ActiveJob {
+        ActiveJob {
+            id: "job-1".to_string(),
+            schedule,
+            message: "wake up".to_string(),
+            last_run_at_ms: None,
+            chat_id: "chat-123".to_string(),
+            channel: "terminal".to_string(),
+            webhook_token: token.to_string(),
+        }
+    }
+
+    fn build_state(
+        db_path: &std::path::Path,
+        inbound_tx: mpsc::Sender<crate::bus::InboundMessage>,
+        scheduler: Option<Arc<MultiTenantEdgeCronScheduler>>,
+    ) -> ApiState {
+        let (logger_tx, _logger_rx) = create_logger_channel(32);
+        ApiState {
+            inbound_tx,
+            pending_requests: Arc::new(dashmap::DashMap::<
+                String,
+                oneshot::Sender<crate::bus::OutboundMessage>,
+            >::new()),
+            responses_cache: moka::sync::Cache::builder().max_capacity(16).build(),
+            response_store: Arc::new(ResponseStore::new(db_path).expect("response store")),
+            mte_cron_scheduler: scheduler,
+            channel_name: "api".to_string(),
+            logger_tx,
+        }
+    }
+
+    #[tokio::test]
+    async fn mte_cron_webhook_route_enqueues_saved_message_and_returns_no_content() {
+        let temp = LocalTempDir::new();
+        let store = CronStore::new(&temp.db_path().to_string_lossy()).expect("cron store");
+        let token = "secret-token";
+        store
+            .insert_job(&cron_job(
+                ScheduleKind::Cron {
+                    cron_expr: "0 15 9 * * *".to_string(),
+                },
+                token,
+            ))
+            .expect("insert job");
+
+        let scheduler = Arc::new(
+            MultiTenantEdgeCronScheduler::new(
+                &temp.db_path().to_string_lossy(),
+                CronRegistrationClient::new_with_transport(
+                    "https://edge.example.com/_internal/crons".to_string(),
+                    "cron-token".to_string(),
+                    Arc::new(RecordingCronTransport {
+                        statuses: Arc::new(Mutex::new(Vec::new())),
+                        records: Arc::new(Mutex::new(Vec::new())),
+                    }),
+                ),
+            )
+            .expect("scheduler"),
+        );
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(4);
+        let app = build_router(build_state(&temp.db_path(), inbound_tx, Some(scheduler)));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/_mte/cron/job-1/secret-token")
+                    .method("GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let inbound = inbound_rx.recv().await.expect("cron inbound");
+        assert_eq!(inbound.channel, "terminal");
+        assert_eq!(inbound.chat_id, "chat-123");
+        assert_eq!(inbound.content, "wake up");
+        assert_eq!(inbound.sender_id, "cron");
+        assert_eq!(
+            inbound.metadata.get("cron_job_id"),
+            Some(&Value::String("job-1".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn mte_cron_webhook_route_returns_not_found_for_unknown_job_or_token() {
+        let temp = LocalTempDir::new();
+        let store = CronStore::new(&temp.db_path().to_string_lossy()).expect("cron store");
+        store
+            .insert_job(&cron_job(
+                ScheduleKind::Cron {
+                    cron_expr: "0 15 9 * * *".to_string(),
+                },
+                "secret-token",
+            ))
+            .expect("insert job");
+
+        let scheduler = Arc::new(
+            MultiTenantEdgeCronScheduler::new(
+                &temp.db_path().to_string_lossy(),
+                CronRegistrationClient::new_with_transport(
+                    "https://edge.example.com/_internal/crons".to_string(),
+                    "cron-token".to_string(),
+                    Arc::new(RecordingCronTransport {
+                        statuses: Arc::new(Mutex::new(Vec::new())),
+                        records: Arc::new(Mutex::new(Vec::new())),
+                    }),
+                ),
+            )
+            .expect("scheduler"),
+        );
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(4);
+        let app = build_router(build_state(&temp.db_path(), inbound_tx, Some(scheduler)));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/_mte/cron/job-1/wrong-token")
+                    .method("GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(inbound_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn mte_cron_webhook_route_removes_one_shot_jobs_after_first_trigger() {
+        let temp = LocalTempDir::new();
+        let store = CronStore::new(&temp.db_path().to_string_lossy()).expect("cron store");
+        let token = "one-shot-token";
+        store
+            .insert_job(&cron_job(
+                ScheduleKind::At {
+                    at_ms: chrono::Utc::now().timestamp_millis() + 60_000,
+                },
+                token,
+            ))
+            .expect("insert job");
+
+        let sync_records = Arc::new(Mutex::new(Vec::new()));
+        let scheduler = Arc::new(
+            MultiTenantEdgeCronScheduler::new(
+                &temp.db_path().to_string_lossy(),
+                CronRegistrationClient::new_with_transport(
+                    "https://edge.example.com/_internal/crons".to_string(),
+                    "cron-token".to_string(),
+                    Arc::new(RecordingCronTransport {
+                        statuses: Arc::new(Mutex::new(Vec::new())),
+                        records: sync_records.clone(),
+                    }),
+                ),
+            )
+            .expect("scheduler"),
+        );
+        let (inbound_tx, _inbound_rx) = mpsc::channel(4);
+        let app = build_router(build_state(&temp.db_path(), inbound_tx, Some(scheduler)));
+
+        let first = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/_mte/cron/job-1/one-shot-token")
+                    .method("GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("first request succeeds");
+        let second = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/_mte/cron/job-1/one-shot-token")
+                    .method("GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("second request succeeds");
+
+        assert_eq!(first.status(), StatusCode::NO_CONTENT);
+        assert_eq!(second.status(), StatusCode::NOT_FOUND);
+        assert!(store.load_jobs().expect("remaining jobs").is_empty());
+        assert_eq!(sync_records.lock().unwrap().len(), 1);
+        assert!(sync_records.lock().unwrap()[0].is_empty());
+    }
+
+    #[tokio::test]
+    async fn mte_cron_webhook_route_keeps_one_shot_job_when_enqueue_fails() {
+        let temp = LocalTempDir::new();
+        let store = CronStore::new(&temp.db_path().to_string_lossy()).expect("cron store");
+        let token = "one-shot-token";
+        let before_request = chrono::Utc::now();
+        let original_at_ms = (before_request - chrono::Duration::seconds(1)).timestamp_millis();
+        store
+            .insert_job(&cron_job(
+                ScheduleKind::At {
+                    at_ms: original_at_ms,
+                },
+                token,
+            ))
+            .expect("insert job");
+
+        let sync_records = Arc::new(Mutex::new(Vec::new()));
+        let scheduler = Arc::new(
+            MultiTenantEdgeCronScheduler::new(
+                &temp.db_path().to_string_lossy(),
+                CronRegistrationClient::new_with_transport(
+                    "https://edge.example.com/_internal/crons".to_string(),
+                    "cron-token".to_string(),
+                    Arc::new(RecordingCronTransport {
+                        statuses: Arc::new(Mutex::new(Vec::new())),
+                        records: sync_records.clone(),
+                    }),
+                ),
+            )
+            .expect("scheduler"),
+        );
+        let (inbound_tx, inbound_rx) = mpsc::channel(1);
+        drop(inbound_rx);
+        let app = build_router(build_state(&temp.db_path(), inbound_tx, Some(scheduler)));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/_mte/cron/job-1/one-shot-token")
+                    .method("GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let job = store
+            .find_job("job-1")
+            .expect("job lookup")
+            .expect("job should remain");
+        match job.schedule {
+            ScheduleKind::At { at_ms } => {
+                assert!(at_ms > before_request.timestamp_millis());
+                assert!(at_ms > original_at_ms);
+            }
+            other => panic!("expected rescheduled one-shot job, got {:?}", other),
+        }
+        assert_eq!(sync_records.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mte_cron_webhook_route_keeps_one_shot_job_when_enqueue_and_rollback_sync_fail() {
+        let temp = LocalTempDir::new();
+        let store = CronStore::new(&temp.db_path().to_string_lossy()).expect("cron store");
+        let token = "one-shot-token";
+        store
+            .insert_job(&cron_job(
+                ScheduleKind::At {
+                    at_ms: (chrono::Utc::now() - chrono::Duration::seconds(1)).timestamp_millis(),
+                },
+                token,
+            ))
+            .expect("insert job");
+
+        let scheduler = Arc::new(
+            MultiTenantEdgeCronScheduler::new(
+                &temp.db_path().to_string_lossy(),
+                CronRegistrationClient::new_with_transport(
+                    "https://edge.example.com/_internal/crons".to_string(),
+                    "cron-token".to_string(),
+                    Arc::new(RecordingCronTransport {
+                        statuses: Arc::new(Mutex::new(vec![StatusCode::INTERNAL_SERVER_ERROR])),
+                        records: Arc::new(Mutex::new(Vec::new())),
+                    }),
+                ),
+            )
+            .expect("scheduler"),
+        );
+        let (inbound_tx, inbound_rx) = mpsc::channel(1);
+        drop(inbound_rx);
+        let app = build_router(build_state(&temp.db_path(), inbound_tx, Some(scheduler)));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/_mte/cron/job-1/one-shot-token")
+                    .method("GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(store.find_job("job-1").expect("job lookup").is_some());
+    }
 }

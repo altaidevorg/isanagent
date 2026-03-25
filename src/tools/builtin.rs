@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use chrono::Utc;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -33,10 +34,10 @@ pub fn resolve_path(path: &str, workspace_dir: &Path, restrict: bool) -> Result<
             missing_components.push(p.file_name().unwrap_or_default());
             parent = p.parent();
         }
-        
+
         let mut safe_base = std::fs::canonicalize(parent.unwrap_or_else(|| Path::new(".")))
             .map_err(|e| format!("Base path normalization error: {}", e))?;
-            
+
         for comp in missing_components.into_iter().rev() {
             safe_base.push(comp);
         }
@@ -50,7 +51,7 @@ pub fn resolve_path(path: &str, workspace_dir: &Path, restrict: bool) -> Result<
     if restrict {
         let canonical_workspace = std::fs::canonicalize(workspace_dir)
             .map_err(|e| format!("Workspace normalization error: {}", e))?;
-            
+
         if !canonical.starts_with(&canonical_workspace) {
             return Err(format!(
                 "PermissionError: Path {:?} is outside allowed workspace directory {:?}",
@@ -94,9 +95,9 @@ impl Tool for ReadFileTool {
         let path_str = args.get("path")
             .and_then(|v| v.as_str())
             .ok_or("Missing or invalid 'path' argument")?;
-            
+
         let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
-        
+
         fs::read_to_string(&actual_path).map_err(|e| e.to_string())
     }
 }
@@ -137,17 +138,17 @@ impl Tool for WriteFileTool {
         let path_str = args.get("path")
             .and_then(|v| v.as_str())
             .ok_or("Missing 'path' argument")?;
-        
+
         let content = args.get("content")
             .and_then(|v| v.as_str())
             .ok_or("Missing 'content' argument")?;
-            
+
         let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
-        
+
         if let Some(parent) = actual_path.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("Failed to create parent directories: {}", e))?;
         }
-            
+
         fs::write(&actual_path, content)
             .map(|_| format!("Successfully wrote to {}", actual_path.display()))
             .map_err(|e| e.to_string())
@@ -194,17 +195,17 @@ impl Tool for EditFileTool {
         let path_str = args.get("path")
             .and_then(|v| v.as_str())
             .ok_or("Missing 'path' argument")?;
-            
+
         let old_text = args.get("old_text")
             .and_then(|v| v.as_str())
             .ok_or("Missing 'old_text' argument")?;
-            
+
         let new_text = args.get("new_text")
             .and_then(|v| v.as_str())
             .ok_or("Missing 'new_text' argument")?;
 
         let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
-        
+
         let content = fs::read_to_string(&actual_path)
             .map_err(|e| format!("Error reading file: {}", e))?;
 
@@ -256,9 +257,9 @@ impl Tool for ListDirTool {
         let path_str = args.get("path")
             .and_then(|v| v.as_str())
             .ok_or("Missing 'path' argument")?;
-            
+
         let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
-        
+
         if !actual_path.is_dir() {
             return Ok(format!("Error: Not a directory: {:?}", actual_path.display()));
         }
@@ -340,13 +341,13 @@ impl Tool for ShellExecTool {
         let command = args.get("command")
             .and_then(|v| v.as_str())
             .ok_or("Missing 'command' argument")?;
-            
+
         Self::check_safety_guards(command)?;
 
         let cwd_str = args.get("working_dir")
             .and_then(|v| v.as_str())
             .unwrap_or(".");
-            
+
         let actual_dir = resolve_path(cwd_str, &self.workspace_dir, self.restrict_to_workspace)?;
 
         let mut cmd = if cfg!(target_os = "windows") {
@@ -358,11 +359,11 @@ impl Tool for ShellExecTool {
             c.arg("-c").arg(command);
             c
         };
-        
+
         cmd.current_dir(actual_dir);
 
         let child = cmd.output();
-        
+
         match tokio::time::timeout(std::time::Duration::from_secs(60), child).await {
             Ok(Ok(output)) => {
                 let mut result = String::new();
@@ -370,17 +371,17 @@ impl Tool for ShellExecTool {
                 if !stdout.trim().is_empty() {
                     result.push_str(&stdout);
                 }
-                
+
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 if !stderr.trim().is_empty() {
                     if !result.is_empty() { result.push_str("\nSTDERR:\n"); }
                     result.push_str(&stderr);
                 }
-                
+
                 if !output.status.success() {
                     result.push_str(&format!("\nExit code: {}", output.status.code().unwrap_or(-1)));
                 }
-                
+
                 if result.is_empty() {
                     Ok("(no output)".to_string())
                 } else {
@@ -717,6 +718,8 @@ impl Tool for WebFetchTool {
 
 pub struct CronTool {
     pub cron_node: NodeHandle<String>,
+    pub multi_tenant_edge_cron_enabled: bool,
+    pub mte_cron_scheduler: Option<std::sync::Arc<crate::scheduler::MultiTenantEdgeCronScheduler>>,
 }
 
 #[async_trait]
@@ -755,7 +758,11 @@ impl Tool for CronTool {
                 },
                 "every_seconds": {
                     "type": "integer",
-                    "description": "Execute repeatedly every N seconds. Mutually exclusive with 'at' and 'cron_expr'."
+                    "description": if self.multi_tenant_edge_cron_enabled {
+                        "Execute repeatedly every N seconds. Mutually exclusive with 'at' and 'cron_expr'. Not supported when multi-tenant-edge cron scheduling is enabled."
+                    } else {
+                        "Execute repeatedly every N seconds. Mutually exclusive with 'at' and 'cron_expr'."
+                    }
                 },
                 "at": {
                     "type": "string",
@@ -763,7 +770,11 @@ impl Tool for CronTool {
                 },
                 "cron_expr": {
                     "type": "string",
-                    "description": "Execute using a 7-part cron string. Mutually exclusive with 'every_seconds' and 'at'."
+                    "description": if self.multi_tenant_edge_cron_enabled {
+                        "Execute using a 6-part UTC cron string (`second minute hour day month day-of-week`). Mutually exclusive with 'every_seconds' and 'at'."
+                    } else {
+                        "Execute using a 7-part cron string. Mutually exclusive with 'every_seconds' and 'at'."
+                    }
                 }
             },
             "required": ["action", "chat_id", "channel"]
@@ -775,6 +786,14 @@ impl Tool for CronTool {
 
         if action == "remove" {
             let job_id = args.get("job_id").and_then(|v| v.as_str()).ok_or("Missing 'job_id' for remove action")?;
+            if let Some(scheduler) = self.mte_cron_scheduler.as_ref() {
+                let removed = scheduler.remove_job(job_id, Utc::now()).await?;
+                return if removed {
+                    Ok(format!("Removed job {}", job_id))
+                } else {
+                    Ok(format!("Job {} was not found", job_id))
+                };
+            }
             let cmd = crate::scheduler::CronCommand::Remove { id: job_id.to_string() };
             let json_str = serde_json::to_string(&cmd).map_err(|e| e.to_string())?;
             self.cron_node.send_packet(json_str).await.map_err(|e| e.to_string())?;
@@ -786,17 +805,57 @@ impl Tool for CronTool {
             let chat_id = args.get("chat_id").and_then(|v| v.as_str()).ok_or("Missing 'chat_id' for add action")?;
             let channel = args.get("channel").and_then(|v| v.as_str()).ok_or("Missing 'channel' for add action")?;
             let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+            let specified_schedule_count = [
+                args.get("every_seconds").is_some(),
+                args.get("at").is_some(),
+                args.get("cron_expr").is_some(),
+            ]
+            .into_iter()
+            .filter(|present| *present)
+            .count();
+            if specified_schedule_count != 1 {
+                return Err("Must provide exactly one of 'every_seconds', 'at', or 'cron_expr' for add action".to_string());
+            }
 
             let schedule = if let Some(secs) = args.get("every_seconds").and_then(|v| v.as_i64()) {
+                if self.multi_tenant_edge_cron_enabled {
+                    return Err("every_seconds is not supported when [multi_tenant_edge].cron_scheduling_enabled = true".to_string());
+                }
                 crate::scheduler::ScheduleKind::Every { every_ms: secs * 1000 }
             } else if let Some(at) = args.get("at").and_then(|v| v.as_str()) {
                 let dt = chrono::DateTime::parse_from_rfc3339(at).map_err(|_| "Invalid ISO format for 'at'. Make sure you include the proper UTC offset as provided in context.")?;
-                crate::scheduler::ScheduleKind::At { at_ms: dt.timestamp_millis() }
+                let schedule = crate::scheduler::ScheduleKind::At { at_ms: dt.timestamp_millis() };
+                if self.multi_tenant_edge_cron_enabled {
+                    crate::scheduler::validate_multi_tenant_edge_schedule(&schedule, Utc::now())?;
+                }
+                schedule
             } else if let Some(expr) = args.get("cron_expr").and_then(|v| v.as_str()) {
+                crate::scheduler::validate_cron_expression(expr)?;
+                if self.multi_tenant_edge_cron_enabled && !crate::scheduler::is_six_field_cron_expr(expr) {
+                    return Err("cron_expr must be a 6-field UTC cron expression when [multi_tenant_edge].cron_scheduling_enabled = true".to_string());
+                }
                 crate::scheduler::ScheduleKind::Cron { cron_expr: expr.to_string() }
             } else {
-                return Err("Must provide one of 'every_seconds', 'at', or 'cron_expr' for add action".to_string());
+                unreachable!("Exactly one schedule type is guaranteed by the check above.");
             };
+
+            if let Some(scheduler) = self.mte_cron_scheduler.as_ref() {
+                scheduler
+                    .add_job(
+                        crate::scheduler::ActiveJob {
+                            id: id.clone(),
+                            schedule,
+                            message: message.to_string(),
+                            last_run_at_ms: None,
+                            chat_id: chat_id.to_string(),
+                            channel: channel.to_string(),
+                            webhook_token: crate::scheduler::generate_webhook_token(),
+                        },
+                        Utc::now(),
+                    )
+                    .await?;
+                return Ok(format!("Successfully scheduled job {} with action '{}'", id, message));
+            }
 
             let cmd = crate::scheduler::CronCommand::Add {
                 id: id.clone(),
@@ -906,18 +965,18 @@ impl Tool for SearchMemoryTool {
 
     async fn execute(&self, args: Value) -> Result<String, String> {
         let query = args.get("query").and_then(|v| v.as_str()).ok_or("Missing 'query'")?;
-        
+
         // Use oneshot channel to await the reply from the MemoryActor
         let (tx, rx) = tokio::sync::oneshot::channel();
         let msg = crate::memory::MemoryMessage::SearchSummaries {
             query: query.to_string(),
             reply: crate::memory::SharedReply::new(tx),
         };
-        
+
         self.memory_node.send_packet(msg).await.map_err(|e| e.to_string())?;
-        
+
         let results = rx.await.map_err(|_| "Memory Actor Channel Closed")?.map_err(|e| e)?;
-        
+
         if results.is_empty() {
             Ok(format!("No memory results found for '{}'.", query))
         } else {
@@ -960,18 +1019,18 @@ impl Tool for FetchMemoryByDateTool {
     async fn execute(&self, args: Value) -> Result<String, String> {
         let days_ago = args.get("days_ago").and_then(|v| v.as_u64()).ok_or("Missing or invalid 'days_ago'")?;
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
-        
+
         let (tx, rx) = tokio::sync::oneshot::channel();
         let msg = crate::memory::MemoryMessage::FetchSummariesByTimeRange {
             days_ago,
             limit,
             reply: crate::memory::SharedReply::new(tx),
         };
-        
+
         self.memory_node.send_packet(msg).await.map_err(|e| e.to_string())?;
-        
+
         let results = rx.await.map_err(|_| "Memory Actor Channel Closed")?.map_err(|e| e)?;
-        
+
         if results.is_empty() {
             Ok(format!("No memory results found in the last {} days.", days_ago))
         } else {
@@ -979,4 +1038,3 @@ impl Tool for FetchMemoryByDateTool {
         }
     }
 }
-

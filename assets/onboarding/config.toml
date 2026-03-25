@@ -34,6 +34,7 @@ port = 8080
 
 [multi_tenant_edge]
 activity_heartbeat_enabled = false
+cron_scheduling_enabled = false
 
 # Optional: route web_search / web_fetch through Jina (s.jina.ai / r.jina.ai) when DuckDuckGo or
 # direct fetch fails on your network. See https://jina.ai/reader

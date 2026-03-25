@@ -14,7 +14,10 @@ use agent_rs::logging::{
 };
 use agent_rs::onboarding::{onboard_workspace, BootstrapReport};
 use agent_rs::provider::OpenAIProvider;
-use agent_rs::scheduler::CronActor;
+use agent_rs::scheduler::{
+    validate_multi_tenant_edge_runtime, CronActor, CronSchedulingMode, CronTriggerPayload,
+    MultiTenantEdgeCronScheduler,
+};
 use agent_rs::session::SessionManager;
 use agent_rs::skills::SkillRegistry;
 use agent_rs::tools::builtin::{
@@ -145,10 +148,50 @@ async fn run_altbot(
 
     // 2. Setup Skills
     let skills = SkillRegistry::new(workspace.skills_path());
-    let cron_logic = CronActor::new("DailyBriefingCron", db_path_str, logger_bus_tx.clone())
-        .map_err(|e| {
-            std::io::Error::other(format!("Failed to initialize CronActor database: {:?}", e))
+    let multi_tenant_edge_cfg = workspace
+        .config
+        .multi_tenant_edge
+        .clone()
+        .unwrap_or_default();
+    let mte_cron_scheduler = if multi_tenant_edge_cfg
+        .cron_scheduling_enabled
+        .unwrap_or(false)
+    {
+        let api_enabled = workspace
+            .config
+            .api
+            .as_ref()
+            .and_then(|cfg| cfg.enabled)
+            .unwrap_or(false);
+        validate_multi_tenant_edge_runtime(api_enabled).map_err(std::io::Error::other)?;
+
+        let client = agent_rs::multi_tenant_edge::CronRegistrationClient::from_env()
+            .map_err(std::io::Error::other)?;
+        let scheduler = Arc::new(
+            MultiTenantEdgeCronScheduler::new(db_path_str, client).map_err(std::io::Error::other)?,
+        );
+        scheduler.sync_all(chrono::Utc::now()).await.map_err(|error| {
+            std::io::Error::other(format!(
+                "Failed to sync cron jobs to multi-tenant-edge on startup: {}",
+                error
+            ))
         })?;
+        Some(scheduler)
+    } else {
+        None
+    };
+    let cron_mode = if mte_cron_scheduler.is_some() {
+        CronSchedulingMode::MultiTenantEdge
+    } else {
+        CronSchedulingMode::Local
+    };
+    let cron_logic = CronActor::new(
+        "DailyBriefingCron",
+        db_path_str,
+        logger_bus_tx.clone(),
+        cron_mode,
+    )
+    .map_err(std::io::Error::other)?;
     let cron_node = NodeHandle::new(cron_logic, 10, 3, Duration::from_millis(50));
 
     let mut tools = ToolRegistry::new();
@@ -185,6 +228,8 @@ async fn run_altbot(
     }));
     tools.register(Box::new(CronTool {
         cron_node: cron_node.clone(),
+        multi_tenant_edge_cron_enabled: mte_cron_scheduler.is_some(),
+        mte_cron_scheduler: mte_cron_scheduler.clone(),
     }));
     tools.register(Box::new(MessageTool {
         outbound_tx: global_outbound_tx.clone(),
@@ -259,11 +304,8 @@ async fn run_altbot(
         .as_ref()
         .and_then(|m| m.short_term_threshold_tokens)
         .unwrap_or(100000);
-    let tool_execution_activity = if workspace
-        .config
-        .multi_tenant_edge
-        .as_ref()
-        .and_then(|cfg| cfg.activity_heartbeat_enabled)
+    let tool_execution_activity = if multi_tenant_edge_cfg
+        .activity_heartbeat_enabled
         .unwrap_or(false)
     {
         match agent_rs::multi_tenant_edge::ActivityHeartbeatClient::from_env(logger_bus_tx.clone())
@@ -333,11 +375,13 @@ async fn run_altbot(
     // 12. Setup API Channel
     if let Some(api_cfg) = workspace.config.api.clone() {
         if api_cfg.enabled.unwrap_or(false) {
-            let api = Arc::new(ApiChannel::new(
-                api_cfg.port,
-                &db_path,
-                logger_bus_tx.clone(),
-            )?);
+            let api = ApiChannel::new(api_cfg.port, &db_path, logger_bus_tx.clone())?;
+            let api = if let Some(mte_cron_scheduler) = mte_cron_scheduler.clone() {
+                api.with_multi_tenant_edge_cron_scheduler(mte_cron_scheduler)
+            } else {
+                api
+            };
+            let api = Arc::new(api);
             api.start(inbound_tx.clone()).await?;
             out_channels.insert(api.name().to_string(), api);
         }
@@ -399,47 +443,46 @@ async fn run_altbot(
     let (cron_listener_node, mut cron_rx) = NodeHandle::<String>::create_listener("trigger", 100);
     let _ = &cron_node - "trigger" >> &cron_listener_node;
 
-    let cron_agent_tx = agent_node.clone();
+    let cron_inbound_tx = inbound_tx.clone();
     let cron_logger_tx = logger_bus_tx.clone();
     tokio::spawn(async move {
         while let Some(msg) = cron_rx.recv().await {
             if let agent_rs::Message::Packet(payload) = msg {
-                let mut channel_val = "cron".to_string();
-                let mut chat_id_val = "cron_global".to_string();
-                let mut content_val = payload.clone();
-
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&payload) {
-                    if let Some(msg) = parsed.get("message").and_then(|v| v.as_str()) {
-                        content_val = msg.to_string();
-                    }
-                    if let Some(cid) = parsed.get("chat_id").and_then(|v| v.as_str()) {
-                        chat_id_val = cid.to_string();
-                    }
-                    if let Some(ch) = parsed.get("channel").and_then(|v| v.as_str()) {
-                        channel_val = ch.to_string();
-                    }
-                }
+                let Ok(trigger) = serde_json::from_str::<CronTriggerPayload>(&payload) else {
+                    let _ = cron_logger_tx.send(BusMessage::Log(agent_rs::bus::LogEvent::warn(
+                        "Altbot",
+                        "Failed to parse cron trigger payload emitted by scheduler",
+                    )));
+                    continue;
+                };
 
                 let inbound = agent_rs::bus::InboundMessage {
-                    channel: channel_val,
+                    channel: trigger.channel.clone(),
                     sender_id: "cron".to_string(),
-                    chat_id: chat_id_val,
+                    chat_id: trigger.chat_id.clone(),
                     thread_id: None,
-                    content: content_val,
-                    metadata: HashMap::new(),
+                    content: trigger.message.clone(),
+                    metadata: HashMap::from([
+                        (
+                            "cron_job_id".to_string(),
+                            serde_json::Value::String(trigger.job_id.clone()),
+                        ),
+                        (
+                            "trigger_source".to_string(),
+                            serde_json::Value::String("local_scheduler".to_string()),
+                        ),
+                    ]),
                 };
 
                 // Also emit a telemetry event so loggers see the trigger fired
                 let tel = agent_rs::bus::TelemetryEvent::CronTrigger {
-                    job_id: "cron_event".to_string(),
-                    message: payload,
+                    job_id: trigger.job_id.clone(),
+                    message: trigger.message.clone(),
                 };
                 let _ = cron_logger_tx.send(BusMessage::Telemetry(tel));
 
                 // Fire into the agent
-                let _ = cron_agent_tx
-                    .send_packet(BusMessage::Inbound(inbound))
-                    .await;
+                let _ = cron_inbound_tx.send(inbound).await;
             }
         }
     });

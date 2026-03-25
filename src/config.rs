@@ -87,6 +87,7 @@ pub struct MemoryConfig {
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct MultiTenantEdgeConfig {
     pub activity_heartbeat_enabled: Option<bool>,
+    pub cron_scheduling_enabled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

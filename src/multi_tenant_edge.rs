@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::{StatusCode, Url};
+use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
@@ -14,10 +15,11 @@ use crate::tool_activity::{
 };
 
 const ACTIVITY_PATH: &str = "/_internal/activity";
+const CRONS_PATH: &str = "/_internal/crons";
 const DEFAULT_HEARTBEAT_TTL_MS: u64 = 30_000;
 const MAX_HEARTBEAT_INTERVAL_MS: u64 = 30_000;
 const MIN_HEARTBEAT_INTERVAL_MS: u64 = 1_000;
-const HEARTBEAT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct ActivityHeartbeatClient {
@@ -28,24 +30,60 @@ pub struct ActivityHeartbeatClient {
     logger_tx: LoggerHandle,
 }
 
+#[derive(Clone)]
+pub struct CronRegistrationClient {
+    transport: Arc<dyn CronTransport>,
+    url: String,
+    token: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CronRule {
+    pub schedule: String,
+    pub path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PutCronsBody {
+    cron_rules: Vec<CronRule>,
+}
+
 #[async_trait]
 pub(crate) trait HeartbeatTransport: Send + Sync {
     async fn post_activity(&self, url: &str, token: &str) -> Result<StatusCode, String>;
+}
+
+#[async_trait]
+pub(crate) trait CronTransport: Send + Sync {
+    async fn put_crons(
+        &self,
+        url: &str,
+        token: &str,
+        cron_rules: &[CronRule],
+    ) -> Result<StatusCode, String>;
 }
 
 struct ReqwestHeartbeatTransport {
     client: reqwest::Client,
 }
 
+struct ReqwestCronTransport {
+    client: reqwest::Client,
+}
+
 impl ReqwestHeartbeatTransport {
     fn new() -> Result<Self, String> {
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .connect_timeout(HEARTBEAT_REQUEST_TIMEOUT)
-            .timeout(HEARTBEAT_REQUEST_TIMEOUT)
-            .build()
-            .map_err(|error| format!("failed to build heartbeat reqwest client: {}", error))?;
-        Ok(Self { client })
+        Ok(Self {
+            client: build_reqwest_client()?,
+        })
+    }
+}
+
+impl ReqwestCronTransport {
+    fn new() -> Result<Self, String> {
+        Ok(Self {
+            client: build_reqwest_client()?,
+        })
     }
 }
 
@@ -55,6 +93,27 @@ impl HeartbeatTransport for ReqwestHeartbeatTransport {
         self.client
             .post(url)
             .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .map(|response| response.status())
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[async_trait]
+impl CronTransport for ReqwestCronTransport {
+    async fn put_crons(
+        &self,
+        url: &str,
+        token: &str,
+        cron_rules: &[CronRule],
+    ) -> Result<StatusCode, String> {
+        self.client
+            .put(url)
+            .header("Authorization", format!("Bearer {}", token))
+            .json(&PutCronsBody {
+                cron_rules: cron_rules.to_vec(),
+            })
             .send()
             .await
             .map(|response| response.status())
@@ -202,6 +261,58 @@ impl ActivityHeartbeatClient {
     }
 }
 
+impl CronRegistrationClient {
+    pub fn from_env() -> Result<Self, String> {
+        let base_url = std::env::var("MTE_PROXY_BASE_URL").map_err(|_| {
+            "multi-tenant-edge cron scheduling enabled but MTE_PROXY_BASE_URL is not set"
+                .to_string()
+        })?;
+        let token = std::env::var("MTE_CRON_SECRET").map_err(|_| {
+            "multi-tenant-edge cron scheduling enabled but MTE_CRON_SECRET is not set".to_string()
+        })?;
+
+        Self::new(normalize_crons_url(&base_url)?, token)
+    }
+
+    pub(crate) fn new(url: String, token: String) -> Result<Self, String> {
+        Ok(Self::new_with_transport(
+            url,
+            token,
+            Arc::new(ReqwestCronTransport::new()?),
+        ))
+    }
+
+    pub(crate) fn new_with_transport(
+        url: String,
+        token: String,
+        transport: Arc<dyn CronTransport>,
+    ) -> Self {
+        Self {
+            transport,
+            url,
+            token,
+        }
+    }
+
+    pub async fn sync_cron_rules(&self, cron_rules: &[CronRule]) -> Result<(), String> {
+        match self
+            .transport
+            .put_crons(&self.url, &self.token, cron_rules)
+            .await
+        {
+            Ok(StatusCode::NO_CONTENT) => Ok(()),
+            Ok(status) => Err(format!(
+                "multi-tenant-edge cron sync failed with {} from {}",
+                status, self.url
+            )),
+            Err(error) => Err(format!(
+                "multi-tenant-edge cron sync request to {} failed: {}",
+                self.url, error
+            )),
+        }
+    }
+}
+
 impl ToolExecutionActivity for ActivityHeartbeatClient {
     fn start(&self, chat_id: &str, tool_name: &str) -> Box<dyn ToolExecutionActivityHandle> {
         Box::new(HeartbeatLoop::spawn(
@@ -298,6 +409,20 @@ impl ToolExecutionActivityHandle for HeartbeatLoop {
     }
 }
 
+fn build_reqwest_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(REQUEST_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .map_err(|error| {
+            format!(
+                "failed to build multi-tenant-edge reqwest client: {}",
+                error
+            )
+        })
+}
+
 fn is_permanent_heartbeat_failure(status: StatusCode) -> bool {
     matches!(
         status,
@@ -331,16 +456,28 @@ fn parse_heartbeat_ttl_ms(ttl_ms: Option<String>, logger_tx: &LoggerHandle) -> O
 }
 
 fn normalize_activity_url(base_url: &str) -> Result<String, String> {
+    normalize_internal_url(base_url, ACTIVITY_PATH, "heartbeat")
+}
+
+fn normalize_crons_url(base_url: &str) -> Result<String, String> {
+    normalize_internal_url(base_url, CRONS_PATH, "cron scheduling")
+}
+
+fn normalize_internal_url(
+    base_url: &str,
+    path: &str,
+    feature_name: &str,
+) -> Result<String, String> {
     let trimmed = base_url.trim_end_matches('/');
-    let url = if trimmed.ends_with(ACTIVITY_PATH) {
+    let url = if trimmed.ends_with(path) {
         trimmed.to_string()
     } else {
-        format!("{}{}", trimmed, ACTIVITY_PATH)
+        format!("{}{}", trimmed, path)
     };
     Url::parse(&url).map_err(|error| {
         format!(
-            "multi-tenant-edge heartbeat enabled but MTE_PROXY_BASE_URL '{}' is invalid: {}",
-            base_url, error
+            "multi-tenant-edge {} enabled but MTE_PROXY_BASE_URL '{}' is invalid: {}",
+            feature_name, base_url, error
         )
     })?;
     Ok(url)
@@ -348,7 +485,13 @@ fn normalize_activity_url(base_url: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{heartbeat_interval_from_ttl_ms, normalize_activity_url};
+    use super::{
+        heartbeat_interval_from_ttl_ms, normalize_activity_url, normalize_crons_url,
+        CronRegistrationClient, CronRule, CronTransport,
+    };
+    use async_trait::async_trait;
+    use reqwest::StatusCode;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     #[test]
@@ -397,8 +540,84 @@ mod tests {
     }
 
     #[test]
+    fn normalize_crons_url_appends_crons_path_once() {
+        assert_eq!(
+            normalize_crons_url("https://edge.example.com").expect("normalized url"),
+            "https://edge.example.com/_internal/crons"
+        );
+        assert_eq!(
+            normalize_crons_url("https://edge.example.com/_internal/crons")
+                .expect("normalized url"),
+            "https://edge.example.com/_internal/crons"
+        );
+    }
+
+    #[test]
     fn normalize_activity_url_rejects_invalid_urls() {
         let error = normalize_activity_url("://invalid").expect_err("invalid url");
-        assert!(error.contains("MTE_PROXY_BASE_URL is invalid"));
+        assert!(error.contains("MTE_PROXY_BASE_URL"));
+    }
+
+    #[test]
+    fn normalize_crons_url_rejects_invalid_urls() {
+        let error = normalize_crons_url("://invalid").expect_err("invalid url");
+        assert!(error.contains("MTE_PROXY_BASE_URL"));
+    }
+
+    #[derive(Clone, Debug)]
+    struct CronRequestRecord {
+        url: String,
+        authorization: String,
+        cron_rules: Vec<CronRule>,
+    }
+
+    struct RecordingCronTransport {
+        records: Arc<Mutex<Vec<CronRequestRecord>>>,
+        status: StatusCode,
+    }
+
+    #[async_trait]
+    impl CronTransport for RecordingCronTransport {
+        async fn put_crons(
+            &self,
+            url: &str,
+            token: &str,
+            cron_rules: &[CronRule],
+        ) -> Result<StatusCode, String> {
+            self.records.lock().unwrap().push(CronRequestRecord {
+                url: url.to_string(),
+                authorization: format!("Bearer {}", token),
+                cron_rules: cron_rules.to_vec(),
+            });
+            Ok(self.status)
+        }
+    }
+
+    #[tokio::test]
+    async fn cron_sync_uses_bearer_auth_and_expected_body() {
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let client = CronRegistrationClient::new_with_transport(
+            "https://edge.example.com/_internal/crons".to_string(),
+            "cron-token".to_string(),
+            Arc::new(RecordingCronTransport {
+                records: records.clone(),
+                status: StatusCode::NO_CONTENT,
+            }),
+        );
+        let cron_rules = vec![CronRule {
+            schedule: "0 0 9 * * *".to_string(),
+            path: "/_mte/cron/job-1/token-1".to_string(),
+        }];
+
+        client
+            .sync_cron_rules(&cron_rules)
+            .await
+            .expect("cron sync succeeds");
+
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].url, "https://edge.example.com/_internal/crons");
+        assert_eq!(records[0].authorization, "Bearer cron-token");
+        assert_eq!(records[0].cron_rules, cron_rules);
     }
 }
