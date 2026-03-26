@@ -42,12 +42,23 @@ The core message bus routes information between interfaces (e.g. Slack, Terminal
 
 ## 🚀 Quick Start
 
-### 1. Build The Project
+### 1. Build The Embedded UI
+```bash
+cd ui
+npm ci
+npm run build
+cd ..
+```
+
+Agent-RS embeds `ui/dist` into the Rust binary at compile time. If `ui/dist/index.html` is missing,
+`cargo build` / `cargo run` will fail with an actionable error.
+
+### 2. Build The Project
 ```bash
 cargo build --release
 ```
 
-### 2. Bootstrap Your Workspace
+### 3. Bootstrap Your Workspace
 Agent-RS now ships with an onboarding command that creates a ready-to-edit workspace root, starter config, sandbox directory, and local skills.
 
 ```bash
@@ -109,6 +120,8 @@ email_address = "<changethis>"
 [api]
 enabled = false
 port = 8080
+serve_ui = false
+# bind_address = "127.0.0.1" # defaults to 127.0.0.1 when serve_ui = true, else 0.0.0.0
 
 [multi_tenant_edge]
 activity_heartbeat_enabled = false
@@ -127,13 +140,13 @@ max_recent_summaries = 5
 Update the `<changethis>` placeholders, ensure `GEMINI_API_KEY` is set, and disable any channels you are not ready to use yet before running the agent.
 For example, if you are not using Slack on first boot, set `[slack].enabled = false` in `config.toml`.
 
-### 3. Run the Agent
+### 4. Run the Agent
 ```bash
 # Pass your workspace path. `config.toml` defaults to <workspace>/config.toml.
 cargo run --bin altbot -- --workspace my_agent
 ```
 
-## � Configuring Channels
+## Configuring Channels
 
 The `[channel_name]` blocks in `config.toml` allow you to bring external integrations online cleanly:
 
@@ -143,6 +156,8 @@ Start a local REST server compatible with OpenAI JSON schemas for testing the co
 [api]
 enabled = true
 port = 8080
+serve_ui = false
+# bind_address = "0.0.0.0"
 ```
 ```bash
 curl http://localhost:8080/v1/chat/completions -d '{"message": "Hello!"}'
@@ -168,6 +183,25 @@ Notes:
 - `store` defaults to `true` when omitted, so responses are persisted and can be continued later.
 - Set `"store": false` if you do not want a response persisted for later `previous_response_id` lookups.
 - `responses` accepts text-oriented JSON input and normalizes it into a single message before sending it into the agent runtime.
+
+### Built-in UI
+Enable the built-in browser UI on the same API listener. The UI calls the existing `/v1/responses`
+endpoint same-origin and keeps conversation state in the browser.
+
+```toml
+[api]
+enabled = true
+port = 8080
+serve_ui = true
+bind_address = "127.0.0.1"
+```
+
+Then open `http://127.0.0.1:8080/`.
+
+Notes:
+- `bind_address` is optional. When omitted, it defaults to `127.0.0.1` if `serve_ui = true`, otherwise `0.0.0.0`.
+- The UI does not add a new chat API surface. It uses the existing `responses` flow directly.
+- Browser-local persistence means conversations continue across refreshes in the same browser, but not across devices.
 
 ### Multi-Tenant Edge Heartbeats
 When Agent-RS runs behind `multi-tenant-edge`, it can keep the instance alive during long background tool execution by heartbeating `POST /_internal/activity`.

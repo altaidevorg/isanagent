@@ -375,7 +375,7 @@ async fn run_altbot(
     // 12. Setup API Channel
     if let Some(api_cfg) = workspace.config.api.clone() {
         if api_cfg.enabled.unwrap_or(false) {
-            let api = ApiChannel::new(api_cfg.port, &db_path, logger_bus_tx.clone())?;
+            let api = ApiChannel::new(api_cfg, &db_path, logger_bus_tx.clone())?;
             let api = if let Some(mte_cron_scheduler) = mte_cron_scheduler.clone() {
                 api.with_multi_tenant_edge_cron_scheduler(mte_cron_scheduler)
             } else {

@@ -31,6 +31,8 @@ email_address = "<changethis>"
 [api]
 enabled = false
 port = 8080
+serve_ui = false
+# bind_address = "127.0.0.1" # defaults to 127.0.0.1 when serve_ui = true, else 0.0.0.0
 
 [multi_tenant_edge]
 activity_heartbeat_enabled = false

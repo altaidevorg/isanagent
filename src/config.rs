@@ -94,6 +94,8 @@ pub struct MultiTenantEdgeConfig {
 pub struct ApiConfig {
     pub enabled: Option<bool>,
     pub port: u16,
+    pub serve_ui: Option<bool>,
+    pub bind_address: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

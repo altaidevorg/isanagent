@@ -5,8 +5,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::{
-    extract::{Path as AxumPath, State},
-    http::StatusCode,
+    body::{Body, Bytes},
+    extract::{OriginalUri, Path as AxumPath, State},
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -23,6 +24,7 @@ use tokio::sync::oneshot;
 use crate::bus::{BusMessage, InboundMessage, LogEvent, OutboundMessage, TelemetryEvent};
 use crate::channels::api_store::{ResponseStore, StoredResponse};
 use crate::channels::Channel;
+use crate::config::ApiConfig;
 use crate::logging::LoggerHandle;
 use crate::scheduler::{
     CronWebhookError, MultiTenantEdgeCronScheduler, PendingCronTriggerFinalize,
@@ -32,6 +34,8 @@ const AGENT_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_API_USER: &str = "api_user";
 const DEFAULT_RESPONSE_MODEL: &str = "agent-rs";
 const MAX_RESPONSE_CACHE_ENTRIES: u64 = 1024;
+
+include!(concat!(env!("OUT_DIR"), "/ui_assets.rs"));
 
 #[derive(Clone)]
 struct ApiState {
@@ -136,6 +140,8 @@ impl IntoResponse for ApiError {
 
 pub struct ApiChannel {
     port: u16,
+    bind_address: Option<String>,
+    serve_ui: bool,
     pending_requests: std::sync::Arc<DashMap<String, oneshot::Sender<OutboundMessage>>>,
     responses_cache: Cache<String, StoredResponse>,
     response_store: std::sync::Arc<ResponseStore>,
@@ -147,13 +153,19 @@ pub struct ApiChannel {
 
 impl ApiChannel {
     pub fn new(
-        port: u16,
+        config: ApiConfig,
         db_path: impl AsRef<Path>,
         logger_tx: LoggerHandle,
     ) -> Result<Self, String> {
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let bind_address = config
+            .bind_address
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         Ok(Self {
-            port,
+            port: config.port,
+            bind_address,
+            serve_ui: config.serve_ui.unwrap_or(false),
             pending_requests: std::sync::Arc::new(DashMap::new()),
             responses_cache: Cache::builder()
                 .max_capacity(MAX_RESPONSE_CACHE_ENTRIES)
@@ -174,6 +186,16 @@ impl ApiChannel {
         self.mte_cron_scheduler = Some(mte_cron_scheduler);
         self
     }
+
+    fn resolved_bind_address(&self) -> String {
+        if let Some(bind_address) = &self.bind_address {
+            bind_address.clone()
+        } else if self.serve_ui {
+            "127.0.0.1".to_string()
+        } else {
+            "0.0.0.0".to_string()
+        }
+    }
 }
 
 #[async_trait]
@@ -184,6 +206,7 @@ impl Channel for ApiChannel {
 
     async fn start(&self, inbound_tx: Sender<InboundMessage>) -> Result<(), String> {
         let port = self.port;
+        let serve_ui = self.serve_ui;
         let state = ApiState {
             inbound_tx,
             pending_requests: self.pending_requests.clone(),
@@ -200,7 +223,7 @@ impl Channel for ApiChannel {
             "ApiChannel",
             "Starting API channel...",
         )));
-        let addr = format!("0.0.0.0:{}", port);
+        let addr = format!("{}:{}", self.resolved_bind_address(), port);
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .map_err(|e| format!("Failed to bind API port on {}: {}", addr, e))?;
@@ -210,7 +233,7 @@ impl Channel for ApiChannel {
         )));
 
         let handle = tokio::spawn(async move {
-            let app = build_router(state);
+            let app = build_router(state, serve_ui);
             let server = axum::serve(listener, app).with_graceful_shutdown(async move {
                 while shutdown_rx.changed().await.is_ok() {
                     if *shutdown_rx.borrow() {
@@ -258,7 +281,7 @@ impl Channel for ApiChannel {
     }
 }
 
-fn build_router(state: ApiState) -> Router {
+fn build_router(state: ApiState, serve_ui: bool) -> Router {
     let mut app = Router::new()
         .route("/v1/chat/completions", post(handle_chat))
         .route("/v1/responses", post(handle_responses));
@@ -267,7 +290,86 @@ fn build_router(state: ApiState) -> Router {
         app = app.route("/_mte/cron/{job_id}/{token}", get(handle_mte_cron_webhook));
     }
 
+    if serve_ui {
+        app = app
+            .route("/", get(handle_ui_index))
+            .route("/assets/{*asset_path}", get(handle_ui_asset))
+            .fallback(get(handle_ui_fallback));
+    }
+
     app.with_state(state)
+}
+
+fn find_ui_asset(path: &str) -> Option<&'static EmbeddedUiAsset> {
+    EMBEDDED_UI_ASSETS.iter().find(|asset| asset.path == path)
+}
+
+fn index_asset() -> Option<&'static EmbeddedUiAsset> {
+    find_ui_asset("index.html")
+}
+
+fn ui_cache_control(asset: &'static EmbeddedUiAsset) -> &'static str {
+    if asset.path == "index.html" {
+        "no-cache"
+    } else if asset.path.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "public, max-age=3600"
+    }
+}
+
+fn ui_asset_response(asset: &'static EmbeddedUiAsset) -> Response {
+    let mut response = Response::new(Body::from(Bytes::from_static(asset.bytes)));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(asset.content_type),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(ui_cache_control(asset)),
+    );
+    response
+}
+
+fn is_reserved_api_path(path: &str) -> bool {
+    path == "v1" || path.starts_with("v1/") || path == "_mte" || path.starts_with("_mte/")
+}
+
+async fn handle_ui_index() -> Response {
+    match index_asset() {
+        Some(asset) => ui_asset_response(asset),
+        None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn handle_ui_asset(AxumPath(asset_path): AxumPath<String>) -> Response {
+    let asset_key = format!("assets/{}", asset_path);
+    match find_ui_asset(&asset_key) {
+        Some(asset) => ui_asset_response(asset),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn handle_ui_fallback(OriginalUri(uri): OriginalUri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+
+    if path.is_empty() {
+        return handle_ui_index().await;
+    }
+
+    if is_reserved_api_path(path) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    if let Some(asset) = find_ui_asset(path) {
+        return ui_asset_response(asset);
+    }
+
+    if path == "assets" || path.starts_with("assets/") || path.contains('.') {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    handle_ui_index().await
 }
 
 async fn handle_chat(State(state): State<ApiState>, Json(payload): Json<ChatRequest>) -> Response {
@@ -396,7 +498,10 @@ async fn handle_mte_cron_webhook(
                 .with_chat_id(&trigger.chat_id),
             );
         }
-        Err(error) => unreachable!("complete() is not expected to fail after delivery is marked: {}", error),
+        Err(error) => unreachable!(
+            "complete() is not expected to fail after delivery is marked: {}",
+            error
+        ),
     }
 
     log_api(
@@ -703,15 +808,18 @@ fn log_api(logger_tx: &LoggerHandle, event: LogEvent) {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_router, ApiState};
+    use super::{build_router, ApiState, EMBEDDED_UI_ASSETS};
+    use crate::bus::OutboundMessage;
     use crate::channels::api_store::ResponseStore;
+    use crate::config::ApiConfig;
     use crate::logging::create_logger_channel;
     use crate::multi_tenant_edge::{CronRegistrationClient, CronRule, CronTransport};
     use crate::scheduler::{ActiveJob, CronStore, MultiTenantEdgeCronScheduler, ScheduleKind};
     use async_trait::async_trait;
-    use axum::body::Body;
+    use axum::body::{to_bytes, Body};
     use reqwest::StatusCode;
     use serde_json::Value;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -806,6 +914,242 @@ mod tests {
         }
     }
 
+    #[test]
+    fn api_config_supports_ui_flags() {
+        let config: ApiConfig = toml::from_str(
+            r#"
+enabled = true
+port = 8080
+serve_ui = true
+bind_address = "127.0.0.1"
+"#,
+        )
+        .expect("api config parses");
+
+        assert_eq!(config.enabled, Some(true));
+        assert_eq!(config.port, 8080);
+        assert_eq!(config.serve_ui, Some(true));
+        assert_eq!(config.bind_address.as_deref(), Some("127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn ui_root_is_not_served_when_disabled() {
+        let temp = LocalTempDir::new();
+        let (inbound_tx, _inbound_rx) = mpsc::channel(4);
+        let app = build_router(build_state(&temp.db_path(), inbound_tx, None), false);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .method("GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn ui_root_serves_embedded_index_when_enabled() {
+        let temp = LocalTempDir::new();
+        let (inbound_tx, _inbound_rx) = mpsc::channel(4);
+        let app = build_router(build_state(&temp.db_path(), inbound_tx, None), true);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .method("GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request succeeds");
+
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let cache_control = response
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body_text = String::from_utf8(body.to_vec()).expect("utf8 html");
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type, "text/html; charset=utf-8");
+        assert_eq!(cache_control, "no-cache");
+        assert!(body_text.contains("<div id=\"root\"></div>"));
+    }
+
+    #[tokio::test]
+    async fn ui_asset_route_serves_embedded_asset_with_content_type() {
+        let asset = EMBEDDED_UI_ASSETS
+            .iter()
+            .find(|candidate| candidate.path.starts_with("assets/"))
+            .expect("built ui asset");
+        let temp = LocalTempDir::new();
+        let (inbound_tx, _inbound_rx) = mpsc::channel(4);
+        let app = build_router(build_state(&temp.db_path(), inbound_tx, None), true);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/{}", asset.path))
+                    .method("GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request succeeds");
+
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let cache_control = response
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type, asset.content_type);
+        assert_eq!(cache_control, "public, max-age=31536000, immutable");
+        assert!(!body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ui_fallback_serves_index_for_client_routes() {
+        let temp = LocalTempDir::new();
+        let (inbound_tx, _inbound_rx) = mpsc::channel(4);
+        let app = build_router(build_state(&temp.db_path(), inbound_tx, None), true);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/conversations/demo")
+                    .method("GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request succeeds");
+
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(content_type, "text/html; charset=utf-8");
+    }
+
+    #[tokio::test]
+    async fn ui_fallback_does_not_intercept_unknown_api_paths() {
+        let temp = LocalTempDir::new();
+        let (inbound_tx, _inbound_rx) = mpsc::channel(4);
+        let app = build_router(build_state(&temp.db_path(), inbound_tx, None), true);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/unknown")
+                    .method("GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn responses_route_still_works_when_ui_is_enabled() {
+        let temp = LocalTempDir::new();
+        let pending_requests = Arc::new(dashmap::DashMap::<
+            String,
+            oneshot::Sender<crate::bus::OutboundMessage>,
+        >::new());
+        let (logger_tx, _logger_rx) = create_logger_channel(32);
+        let response_store = Arc::new(ResponseStore::new(temp.db_path()).expect("response store"));
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(4);
+        let state = ApiState {
+            inbound_tx,
+            pending_requests: pending_requests.clone(),
+            responses_cache: moka::sync::Cache::builder().max_capacity(16).build(),
+            response_store,
+            mte_cron_scheduler: None,
+            channel_name: "api".to_string(),
+            logger_tx,
+        };
+        let app = build_router(state, true);
+
+        tokio::spawn(async move {
+            let inbound = inbound_rx.recv().await.expect("inbound message");
+            let outbound = OutboundMessage {
+                channel: "api".to_string(),
+                chat_id: inbound.chat_id.clone(),
+                thread_id: None,
+                content: "UI path still reaches responses.".to_string(),
+                metadata: HashMap::new(),
+            };
+            let (_, sender) = pending_requests
+                .remove(&inbound.chat_id)
+                .expect("pending request sender");
+            let _ = sender.send(outbound);
+        });
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/responses")
+                    .method("POST")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"input":"Hello from UI","store":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .expect("request succeeds");
+
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: Value = serde_json::from_slice(&body).expect("json body");
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            payload.get("object"),
+            Some(&Value::String("response".to_string()))
+        );
+        assert_eq!(
+            payload["output"][0]["content"][0]["text"],
+            Value::String("UI path still reaches responses.".to_string())
+        );
+    }
+
     #[tokio::test]
     async fn mte_cron_webhook_route_enqueues_saved_message_and_returns_no_content() {
         let temp = LocalTempDir::new();
@@ -835,7 +1179,10 @@ mod tests {
             .expect("scheduler"),
         );
         let (inbound_tx, mut inbound_rx) = mpsc::channel(4);
-        let app = build_router(build_state(&temp.db_path(), inbound_tx, Some(scheduler)));
+        let app = build_router(
+            build_state(&temp.db_path(), inbound_tx, Some(scheduler)),
+            false,
+        );
 
         let response = app
             .oneshot(
@@ -888,7 +1235,10 @@ mod tests {
             .expect("scheduler"),
         );
         let (inbound_tx, mut inbound_rx) = mpsc::channel(4);
-        let app = build_router(build_state(&temp.db_path(), inbound_tx, Some(scheduler)));
+        let app = build_router(
+            build_state(&temp.db_path(), inbound_tx, Some(scheduler)),
+            false,
+        );
 
         let response = app
             .oneshot(
@@ -935,7 +1285,10 @@ mod tests {
             .expect("scheduler"),
         );
         let (inbound_tx, _inbound_rx) = mpsc::channel(4);
-        let app = build_router(build_state(&temp.db_path(), inbound_tx, Some(scheduler)));
+        let app = build_router(
+            build_state(&temp.db_path(), inbound_tx, Some(scheduler)),
+            false,
+        );
 
         let first = app
             .clone()
@@ -999,7 +1352,10 @@ mod tests {
         );
         let (inbound_tx, inbound_rx) = mpsc::channel(1);
         drop(inbound_rx);
-        let app = build_router(build_state(&temp.db_path(), inbound_tx, Some(scheduler)));
+        let app = build_router(
+            build_state(&temp.db_path(), inbound_tx, Some(scheduler)),
+            false,
+        );
 
         let response = app
             .oneshot(
@@ -1057,7 +1413,10 @@ mod tests {
         );
         let (inbound_tx, inbound_rx) = mpsc::channel(1);
         drop(inbound_rx);
-        let app = build_router(build_state(&temp.db_path(), inbound_tx, Some(scheduler)));
+        let app = build_router(
+            build_state(&temp.db_path(), inbound_tx, Some(scheduler)),
+            false,
+        );
 
         let response = app
             .oneshot(

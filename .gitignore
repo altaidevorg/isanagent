@@ -7,3 +7,10 @@ logs
 test_altbot
 test_altbot2
 /config.toml
+/ui/node_modules
+/my_agent
+
+!ui/package.json
+!ui/package-lock.json
+!ui/components.json
+!ui/tsconfig.json
