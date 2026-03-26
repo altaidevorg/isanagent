@@ -1,4 +1,4 @@
-use agent_rs::{ActorLogic, NodeHandle, ActorError};
+use isanagent::{ActorLogic, NodeHandle, ActorError};
 use async_trait::async_trait;
 use tokio::time::{sleep, Duration};
 
@@ -52,7 +52,7 @@ impl ActorLogic<Message> for PongActor {
 
 #[tokio::main]
 async fn main() {
-    println!("Starting Agent-RS Actor System...");
+    println!("Starting isanagent Actor System...");
 
     // Create Nodes
     let pinger = NodeHandle::new(PingActor, 10, 3, Duration::from_millis(100));

@@ -1,6 +1,6 @@
-# Agent-RS
+# isanagent
 
-Agent-RS is a high-performance, actor-based framework for building complex AI Agent pipelines and unified digital workspaces in Rust. Instead of simple single-threaded request/response scripts, Agent-RS leverages the **Actor Model** to distribute agent logic across parallel, supervisor-tethered nodes, enabling persistent asynchronous messaging over terminal interfaces, Slack bots, and Email.
+isanagent is a high-performance, actor-based framework for building complex AI Agent pipelines and unified digital workspaces in Rust. Instead of simple single-threaded request/response scripts, isanagent leverages the **Actor Model** to distribute agent logic across parallel, supervisor-tethered nodes, enabling persistent asynchronous messaging over terminal interfaces, Slack bots, and Email.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -16,7 +16,7 @@ Agent-RS is a high-performance, actor-based framework for building complex AI Ag
 
 ## 🔭 Overview
 
-Agent-RS was explicitly built for robust multi-modal Artificial Intelligence. Instead of the Agent being frozen inside a blocked blocking `await` loop when dealing with tools, the Agent itself runs as a decoupled Actor receiving a stream of messages from various user networks.
+isanagent was explicitly built for robust multi-modal Artificial Intelligence. Instead of the Agent being frozen inside a blocked blocking `await` loop when dealing with tools, the Agent itself runs as a decoupled Actor receiving a stream of messages from various user networks.
 
 **Why an Actor Model?**
 - **100% Lock-Free Concurrency**: SQLite Memory channels and Context Assembly run without centralized `Arc<Mutex>` locks, avoiding thread contention natively.
@@ -50,7 +50,7 @@ npm run build
 cd ..
 ```
 
-Agent-RS embeds `ui/dist` into the Rust binary at compile time. If `ui/dist/index.html` is missing,
+isanagent embeds `ui/dist` into the Rust binary at compile time. If `ui/dist/index.html` is missing,
 `cargo build` / `cargo run` will fail with an actionable error.
 
 ### 2. Build The Project
@@ -59,10 +59,10 @@ cargo build --release
 ```
 
 ### 3. Bootstrap Your Workspace
-Agent-RS now ships with an onboarding command that creates a ready-to-edit workspace root, starter config, sandbox directory, and local skills.
+isanagent now ships with an onboarding command that creates a ready-to-edit workspace root, starter config, sandbox directory, and local skills.
 
 ```bash
-cargo run --bin altbot -- onboard --workspace my_agent
+cargo run --bin isanagent -- onboard --workspace my_agent
 ```
 
 This creates:
@@ -143,7 +143,7 @@ For example, if you are not using Slack on first boot, set `[slack].enabled = fa
 ### 4. Run the Agent
 ```bash
 # Pass your workspace path. `config.toml` defaults to <workspace>/config.toml.
-cargo run --bin altbot -- --workspace my_agent
+cargo run --bin isanagent -- --workspace my_agent
 ```
 
 ## Configuring Channels
@@ -204,17 +204,17 @@ Notes:
 - Browser-local persistence means conversations continue across refreshes in the same browser, but not across devices.
 
 ### Multi-Tenant Edge Heartbeats
-When Agent-RS runs behind `multi-tenant-edge`, it can keep the instance alive during long background tool execution by heartbeating `POST /_internal/activity`.
+When isanagent runs behind `multi-tenant-edge`, it can keep the instance alive during long background tool execution by heartbeating `POST /_internal/activity`.
 
 ```toml
 [multi_tenant_edge]
 activity_heartbeat_enabled = true
 ```
 
-When enabled, Agent-RS reads `MTE_PROXY_BASE_URL`, `MTE_ACTIVITY_SECRET`, and `MTE_HEARTBEAT_TTL_MS` from the process environment and sends immediate + periodic heartbeats only while tools are running. If those env vars are missing or the heartbeat endpoint rejects the call, Agent-RS logs a warning and continues the tool run without failing the request.
+When enabled, isanagent reads `MTE_PROXY_BASE_URL`, `MTE_ACTIVITY_SECRET`, and `MTE_HEARTBEAT_TTL_MS` from the process environment and sends immediate + periodic heartbeats only while tools are running. If those env vars are missing or the heartbeat endpoint rejects the call, isanagent logs a warning and continues the tool run without failing the request.
 
 ### Multi-Tenant Edge Cron Scheduling
-When Agent-RS runs behind `multi-tenant-edge`, it can delegate cron scheduling to `PUT /_internal/crons` so the instance can sleep between jobs and wake back up through cron webhooks.
+When isanagent runs behind `multi-tenant-edge`, it can delegate cron scheduling to `PUT /_internal/crons` so the instance can sleep between jobs and wake back up through cron webhooks.
 
 ```toml
 [api]
@@ -225,7 +225,7 @@ port = 8080
 cron_scheduling_enabled = true
 ```
 
-When enabled, Agent-RS:
+When enabled, isanagent:
 - Requires `[api].enabled = true` because the edge wakes jobs through `GET /_mte/cron/:job_id/:token` on the API listener.
 - Reads `MTE_PROXY_BASE_URL` and `MTE_CRON_SECRET` from the process environment and fails fast if they are missing or invalid.
 - Keeps storing cron jobs locally in SQLite, but pushes the full rule set to `multi-tenant-edge` on startup and after add/remove changes.
@@ -275,15 +275,15 @@ smtp_host = "smtp.example.com" # etc
 ```
 
 ### Advanced Memory & Auto-Compaction
-Agent-RS automatically compacts conversational history into structured SQLite JSON summaries when session length thresholds (`short_term_threshold_turns` or `short_term_threshold_tokens`) are exceeded.
+isanagent automatically compacts conversational history into structured SQLite JSON summaries when session length thresholds (`short_term_threshold_turns` or `short_term_threshold_tokens`) are exceeded.
 When enough short-term summaries accumulate, a background reflection engine consolidates the information into a long-term `MEMORY.md` injected directly into the active Agent workspace context.
 
 ## 🛠 Tools and Skills
 
-Agent-RS supports dual-layer extensibility: Built-in strict Rust Tools, and dynamic `Markdown` LLM Skills.
+isanagent supports dual-layer extensibility: Built-in strict Rust Tools, and dynamic `Markdown` LLM Skills.
 
 ### Built-in Tools
-Tools like `web_scrape`, `shell_exec`, `list_dir`, `read_file` are mapped natively in `src/tools/builtin.rs`. If `restrict_to_workspace` is true, Agent-RS heavily validates file-system calls preventing the AI from path traversing outside the active workspace directory or manipulating system state.
+Tools like `web_scrape`, `shell_exec`, `list_dir`, `read_file` are mapped natively in `src/tools/builtin.rs`. If `restrict_to_workspace` is true, isanagent heavily validates file-system calls preventing the AI from path traversing outside the active workspace directory or manipulating system state.
 
 ### Markdown Skills (`/workspace/skills/`)
 Skills provide complex workflows, templates, or instructions natively to the Agent without recompiling Rust code.

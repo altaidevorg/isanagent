@@ -969,7 +969,7 @@ mod tests {
     impl LocalTempDir {
         fn new() -> Self {
             let unique = format!(
-                "agent-rs-scheduler-{}-{}-{}",
+                "isanagent-scheduler-{}-{}-{}",
                 std::process::id(),
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)

@@ -558,7 +558,7 @@ mod tests {
     impl LocalTempDir {
         fn new() -> Self {
             let unique = format!(
-                "agent-rs-heartbeat-{}-{}-{}",
+                "isanagent-heartbeat-{}-{}-{}",
                 std::process::id(),
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)

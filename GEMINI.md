@@ -1,11 +1,11 @@
-# Future AI Development Blueprint (agent-rs)
+# Future AI Development Blueprint (isanagent)
 
-This document serves as the primary system architectural context for any future LLMs continuing to evolve the `agent-rs` framework. If you are an AI tasked with writing a new tool, skill, integration, or feature for `agent-rs`, please read this carefully to avoid producing anti-patterns or breaking the Actor Memory Model.
+This document serves as the primary system architectural context for any future LLMs continuing to evolve the `isanagent` framework. If you are an AI tasked with writing a new tool, skill, integration, or feature for `isanagent`, please read this carefully to avoid producing anti-patterns or breaking the Actor Memory Model.
 
 ## 🧠 System Architecture Primer
 
-`agent-rs` completely decouples standard AI sequential blocking loops into a natively concurrent **Actor System**. 
-The core data structure traveling the entire network natively is `agent_rs::bus::BusMessage`:
+`isanagent` completely decouples standard AI sequential blocking loops into a natively concurrent **Actor System**. 
+The core data structure traveling the entire network natively is `isanagent::bus::BusMessage`:
 
 ```rust
 pub enum BusMessage {
@@ -18,7 +18,7 @@ pub enum BusMessage {
 The fundamental philosophy here is **Wait-Free Threading**. Do not use `std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>`. All critical I/O, especially database storage, must route through an opaque lock-free asynchronous Actor (`MemoryActor` wrapping `SqliteMemory` for instance).
 
 ### Workspace & Sandboxing
-The agent is explicitly designed to run inside a sandbox. `AltbotWorkspace` manages two boundaries:
+The agent is explicitly designed to run inside a sandbox. `IsanagentWorkspace` manages two boundaries:
 1. `workspace_dir` (Outer Rim): Holds `config.toml`, generated logs, and `.system_generated` internal sqlite caches.
 2. `sandbox_dir` (Inner Rim): This is the designated execution field, usually `workspace_dir/.agents`. This is where the Agent expects to load `AGENTS.md` and read `skills/`.
 
@@ -39,7 +39,7 @@ Tools act as the fundamental abilities the Agent uses via JSON schema during its
    - `input_schema`: Use `serde_json::json!` to define a rigid JSON schema the LLM must map arguments to.
    - `execute`: The async function resolving the payload. Returns `Result<String, String>` (Ok/Err).
 
-2. **Register Tool**: In `src/bin/altbot.rs`, inject the new initialized instance into the global `ToolRegistry` mapped to `AgentLogic`. 
+2. **Register Tool**: In `src/bin/isanagent.rs`, inject the new initialized instance into the global `ToolRegistry` mapped to `AgentLogic`. 
 
 ### Proactive Networking during Tools
 If your Tool is incredibly slow (Scraping a massive database, generating an image, compiling code), you should update the user in real-time. Do not await in silence. 
@@ -79,7 +79,7 @@ When checking code...
 
 ## 🏢 Implementing a new Channel
 
-`agent-rs` has distinct platforms (Channels) polling concurrently. E.g., `TerminalChannel`, `SlackChannel`, `EmailChannel`. 
+`isanagent` has distinct platforms (Channels) polling concurrently. E.g., `TerminalChannel`, `SlackChannel`, `EmailChannel`. 
 
 1. **Implement `Channel`**: Define your struct in `src/channels/{platform}.rs`.
    - It needs to run a detached background `tokio` thread checking its respective networking protocol endpoint forever.

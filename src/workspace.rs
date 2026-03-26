@@ -13,7 +13,7 @@ pub struct WorkspaceLayout {
 }
 
 pub fn resolve_workspace_root(path_override: Option<&str>) -> PathBuf {
-    let path_str = path_override.unwrap_or("~/.altbot");
+    let path_str = path_override.unwrap_or("~/.isanagent");
     PathBuf::from(shellexpand::tilde(path_str).to_string())
 }
 
@@ -39,18 +39,18 @@ pub fn ensure_workspace_layout(root: &Path) -> Result<WorkspaceLayout, String> {
     })
 }
 
-/// Represents the Altbot workspace, serving as the single source of truth
+/// Represents the isanagent workspace, serving as the single source of truth
 /// for the agent's identity, memory, and skills.
 #[derive(Clone, Debug)]
-pub struct AltbotWorkspace {
+pub struct IsanagentWorkspace {
     pub dir: std::path::PathBuf,
     pub sandbox_dir: std::path::PathBuf,
     pub config: AppConfig,
 }
 
-impl AltbotWorkspace {
+impl IsanagentWorkspace {
     /// Initializes a new workspace at the given path.
-    /// If no path is provided, it defaults to `~/.altbot`.
+    /// If no path is provided, it defaults to `~/.isanagent`.
     pub fn new(path_override: Option<&str>, config_override: Option<&str>) -> Result<Self, String> {
         let target_dir = resolve_workspace_root(path_override);
         let layout = ensure_workspace_layout(&target_dir)?;
@@ -117,7 +117,7 @@ impl AltbotWorkspace {
         }
 
         if prompt_parts.is_empty() {
-            "You are Altbot, a helpful AI assistant.".to_string()
+            "You are isanagent, a helpful AI assistant.".to_string()
         } else {
             prompt_parts.join("\n")
         }

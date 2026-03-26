@@ -32,7 +32,7 @@ use crate::scheduler::{
 
 const AGENT_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_API_USER: &str = "api_user";
-const DEFAULT_RESPONSE_MODEL: &str = "agent-rs";
+const DEFAULT_RESPONSE_MODEL: &str = "isanagent";
 const MAX_RESPONSE_CACHE_ENTRIES: u64 = 1024;
 
 include!(concat!(env!("OUT_DIR"), "/ui_assets.rs"));
@@ -835,7 +835,7 @@ mod tests {
     impl LocalTempDir {
         fn new() -> Self {
             let unique = format!(
-                "agent-rs-api-cron-{}-{}-{}",
+                "isanagent-api-cron-{}-{}-{}",
                 std::process::id(),
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)

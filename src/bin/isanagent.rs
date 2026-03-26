@@ -3,30 +3,30 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
-use agent_rs::agent::AgentLogic;
-use agent_rs::bus::{BusMessage, LoggerControlMessage};
-use agent_rs::channels::{
+use isanagent::agent::AgentLogic;
+use isanagent::bus::{BusMessage, LoggerControlMessage};
+use isanagent::channels::{
     api::ApiChannel, email::EmailChannel, slack::SlackChannel, terminal::TerminalChannel, Channel,
 };
-use agent_rs::logging::{
+use isanagent::logging::{
     create_logger_channel, create_logging_actor_or_fallback, init_runtime_logger,
     LOGGER_QUEUE_CAPACITY,
 };
-use agent_rs::onboarding::{onboard_workspace, BootstrapReport};
-use agent_rs::provider::OpenAIProvider;
-use agent_rs::scheduler::{
+use isanagent::onboarding::{onboard_workspace, BootstrapReport};
+use isanagent::provider::OpenAIProvider;
+use isanagent::scheduler::{
     validate_multi_tenant_edge_runtime, CronActor, CronSchedulingMode, CronTriggerPayload,
     MultiTenantEdgeCronScheduler,
 };
-use agent_rs::session::SessionManager;
-use agent_rs::skills::SkillRegistry;
-use agent_rs::tools::builtin::{
+use isanagent::session::SessionManager;
+use isanagent::skills::SkillRegistry;
+use isanagent::tools::builtin::{
     CronTool, EditFileTool, ListDirTool, MessageTool, ReadFileTool, ShellExecTool, WebFetchTool,
     WebSearchTool, WriteFileTool,
 };
-use agent_rs::tools::ToolRegistry;
-use agent_rs::workspace::{resolve_workspace_root, AltbotWorkspace};
-use agent_rs::{NodeHandle, Supervisor, SupervisorPolicy};
+use isanagent::tools::ToolRegistry;
+use isanagent::workspace::{resolve_workspace_root, IsanagentWorkspace};
+use isanagent::{NodeHandle, Supervisor, SupervisorPolicy};
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use colored::Colorize;
 
@@ -35,14 +35,14 @@ const DEFAULT_PROVIDER_API_KEY_ENV: &str = "GEMINI_API_KEY";
 const DEFAULT_PROVIDER_BASE_URL: &str =
     "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
 
-/// Altbot: A terminal chat interface and autonomous agent engine
+/// isanagent: A terminal chat interface and autonomous agent engine
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Optional explicit path to the workspace directory. Defaults to ~/.altbot
+    /// Optional explicit path to the workspace directory. Defaults to ~/.isanagent
     #[arg(short, long)]
     workspace: Option<String>,
 
@@ -58,7 +58,7 @@ enum Commands {
 
 #[derive(ClapArgs, Debug)]
 struct OnboardArgs {
-    /// Optional explicit path to the workspace directory. Defaults to ~/.altbot
+    /// Optional explicit path to the workspace directory. Defaults to ~/.isanagent
     #[arg(short, long)]
     workspace: Option<String>,
 }
@@ -69,11 +69,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Some(Commands::Onboard(args)) => run_onboard(args.workspace.or(cli.workspace)).await,
-        None => run_altbot(cli.workspace, cli.config).await,
+        None => run_isanagent(cli.workspace, cli.config).await,
     }
 }
 
-async fn run_altbot(
+async fn run_isanagent(
     workspace_arg: Option<String>,
     config_arg: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -113,10 +113,10 @@ async fn run_altbot(
             }
         })?;
 
-    println!("Starting Advanced Agent-RS System...");
-    log::info!("Starting Advanced Agent-RS System.");
+    println!("Starting Advanced isanagent System...");
+    log::info!("Starting Advanced isanagent System.");
 
-    let workspace = AltbotWorkspace::new(workspace_arg.as_deref(), config_arg.as_deref())?;
+    let workspace = IsanagentWorkspace::new(workspace_arg.as_deref(), config_arg.as_deref())?;
     println!("Loading Altbot workspace at: {:?}", workspace.dir);
     log::info!("Loading Altbot workspace at {:?}", workspace.dir);
 
@@ -131,10 +131,10 @@ async fn run_altbot(
     let db_path_str = db_path
         .to_str()
         .ok_or_else(|| std::io::Error::other("workspace DB path is not valid UTF-8"))?;
-    let memory_actor = agent_rs::memory::SqliteMemoryActor::new(db_path_str).map_err(|e| {
+    let memory_actor = isanagent::memory::SqliteMemoryActor::new(db_path_str).map_err(|e| {
         std::io::Error::other(format!("Failed to initialize SqliteMemoryActor: {:?}", e))
     })?;
-    let memory_node = NodeHandle::<agent_rs::memory::MemoryMessage>::new(
+    let memory_node = NodeHandle::<isanagent::memory::MemoryMessage>::new(
         memory_actor,
         100,
         1,
@@ -165,7 +165,7 @@ async fn run_altbot(
             .unwrap_or(false);
         validate_multi_tenant_edge_runtime(api_enabled).map_err(std::io::Error::other)?;
 
-        let client = agent_rs::multi_tenant_edge::CronRegistrationClient::from_env()
+        let client = isanagent::multi_tenant_edge::CronRegistrationClient::from_env()
             .map_err(std::io::Error::other)?;
         let scheduler = Arc::new(
             MultiTenantEdgeCronScheduler::new(db_path_str, client).map_err(std::io::Error::other)?,
@@ -234,10 +234,10 @@ async fn run_altbot(
     tools.register(Box::new(MessageTool {
         outbound_tx: global_outbound_tx.clone(),
     }));
-    tools.register(Box::new(agent_rs::tools::builtin::SearchMemoryTool {
+    tools.register(Box::new(isanagent::tools::builtin::SearchMemoryTool {
         memory_node: memory_node.clone(),
     }));
-    tools.register(Box::new(agent_rs::tools::builtin::FetchMemoryByDateTool {
+    tools.register(Box::new(isanagent::tools::builtin::FetchMemoryByDateTool {
         memory_node: memory_node.clone(),
     }));
 
@@ -255,13 +255,13 @@ async fn run_altbot(
     let api_key = std::env::var(&api_key_env)
         .map_err(|_| std::io::Error::other(format!("{} must be set", api_key_env)))?;
     let client =
-        agent_rs::utils::LLMClient::new_openai_compatible(&base_url, &api_key, &model_name)
+        isanagent::utils::LLMClient::new_openai_compatible(&base_url, &api_key, &model_name)
             .with_temperature(0.3);
     let provider = Box::new(OpenAIProvider::new(client.clone()));
 
     // 5.5 Setup Reflection Engine
     let memory_config = workspace.config.memory.clone().unwrap_or_default();
-    let reflection_engine = agent_rs::reflection::ReflectionEngine::new(
+    let reflection_engine = isanagent::reflection::ReflectionEngine::new(
         memory_node.clone(),
         workspace.sandbox_dir.clone(),
         Box::new(OpenAIProvider::new(client.clone())),
@@ -308,11 +308,11 @@ async fn run_altbot(
         .activity_heartbeat_enabled
         .unwrap_or(false)
     {
-        match agent_rs::multi_tenant_edge::ActivityHeartbeatClient::from_env(logger_bus_tx.clone())
+        match isanagent::multi_tenant_edge::ActivityHeartbeatClient::from_env(logger_bus_tx.clone())
         {
             Ok(client) => Some(std::sync::Arc::new(client)),
             Err(error) => {
-                let _ = logger_bus_tx.send(BusMessage::Log(agent_rs::bus::LogEvent::warn(
+                let _ = logger_bus_tx.send(BusMessage::Log(isanagent::bus::LogEvent::warn(
                     "Altbot", &error,
                 )));
                 None
@@ -401,7 +401,7 @@ async fn run_altbot(
         "\n{}",
         "=============================================".blue()
     );
-    println!("Agent-RS Version: {}", env!("CARGO_PKG_VERSION").green());
+    println!("isanagent Version: {}", env!("CARGO_PKG_VERSION").green());
     println!("Terminal Session ID: {}", terminal_chat_id.dimmed());
     println!(
         "Loaded Skills ({}): {}",
@@ -447,16 +447,16 @@ async fn run_altbot(
     let cron_logger_tx = logger_bus_tx.clone();
     tokio::spawn(async move {
         while let Some(msg) = cron_rx.recv().await {
-            if let agent_rs::Message::Packet(payload) = msg {
+            if let isanagent::Message::Packet(payload) = msg {
                 let Ok(trigger) = serde_json::from_str::<CronTriggerPayload>(&payload) else {
-                    let _ = cron_logger_tx.send(BusMessage::Log(agent_rs::bus::LogEvent::warn(
+                    let _ = cron_logger_tx.send(BusMessage::Log(isanagent::bus::LogEvent::warn(
                         "Altbot",
                         "Failed to parse cron trigger payload emitted by scheduler",
                     )));
                     continue;
                 };
 
-                let inbound = agent_rs::bus::InboundMessage {
+                let inbound = isanagent::bus::InboundMessage {
                     channel: trigger.channel.clone(),
                     sender_id: "cron".to_string(),
                     chat_id: trigger.chat_id.clone(),
@@ -475,7 +475,7 @@ async fn run_altbot(
                 };
 
                 // Also emit a telemetry event so loggers see the trigger fired
-                let tel = agent_rs::bus::TelemetryEvent::CronTrigger {
+                let tel = isanagent::bus::TelemetryEvent::CronTrigger {
                     job_id: trigger.job_id.clone(),
                     message: trigger.message.clone(),
                 };
@@ -490,7 +490,7 @@ async fn run_altbot(
     let agent_outbound_tx = global_outbound_tx.clone();
     tokio::spawn(async move {
         while let Some(bus_msg) = agent_rx.recv().await {
-            if let agent_rs::Message::Packet(packet) = bus_msg {
+            if let isanagent::Message::Packet(packet) = bus_msg {
                 match packet {
                     BusMessage::Outbound(out) => {
                         let _ = agent_outbound_tx.send(BusMessage::Outbound(out)).await;
@@ -543,7 +543,7 @@ async fn run_altbot(
     let _ = logger_bus_tx.send(BusMessage::LoggerControl(LoggerControlMessage::Flush));
     let flush_result = tokio::time::timeout(Duration::from_secs(5), async {
         while let Some(msg) = logger_control_rx.recv().await {
-            if let agent_rs::Message::Packet(BusMessage::LoggerControl(
+            if let isanagent::Message::Packet(BusMessage::LoggerControl(
                 LoggerControlMessage::Flushed,
             )) = msg
             {
@@ -595,5 +595,5 @@ fn print_onboarding_report(report: &BootstrapReport) {
     println!("Next steps:");
     println!("1. Set GEMINI_API_KEY");
     println!("2. Update <changethis> placeholders or disable unused channels in config.toml");
-    println!("3. Run: altbot --workspace {}", report.root.display());
+    println!("3. Run: isanagent --workspace {}", report.root.display());
 }

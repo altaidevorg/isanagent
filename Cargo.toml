@@ -1,7 +1,15 @@
 [package]
-name = "agent-rs"
+name = "isanagent"
 version = "0.1.0"
 edition = "2021"
+
+[[bin]]
+name = "isanagent"
+path = "src/bin/isanagent.rs"
+
+[[bin]]
+name = "isanagent-demo"
+path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

@@ -90,8 +90,8 @@ pub fn init_runtime_logger(sender: LoggerHandle) -> Result<(), SetLoggerError> {
 }
 
 fn should_capture(target: &str, level: Level) -> bool {
-    let is_internal = target == "altbot"
-        || target.starts_with("agent_rs")
+    let is_internal = target == "isanagent"
+        || target.starts_with("isanagent")
         || matches!(
             target,
             "Altbot"
@@ -155,7 +155,7 @@ mod tests {
 
     #[test]
     fn should_capture_filters_external_noise() {
-        assert!(should_capture("agent_rs::utils", Level::Debug));
+        assert!(should_capture("isanagent::utils", Level::Debug));
         assert!(should_capture("SlackChannel", Level::Info));
         assert!(!should_capture("hyper_util::client::legacy::pool", Level::Info));
         assert!(should_capture("hyper_util::client::legacy::pool", Level::Warn));

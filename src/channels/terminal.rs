@@ -64,7 +64,7 @@ impl Channel for TerminalChannel {
                         // Handle terminal-specific slash commands
                         if text.starts_with('/') {
                             if text.eq_ignore_ascii_case("/exit") || text.eq_ignore_ascii_case("/quit") {
-                                println!("{}", "Safely shutting down Advanced Agent-RS System...".yellow());
+                                println!("{}", "Safely shutting down Advanced isanagent System...".yellow());
                                 let _ = shutdown_tx.send(());
                                 break;
                             }
@@ -79,7 +79,7 @@ impl Channel for TerminalChannel {
 
                         // Handle legacy exit variants for user convenience
                         if text.eq_ignore_ascii_case("exit") || text.eq_ignore_ascii_case("quit") {
-                            println!("{}", "Safely shutting down Advanced Agent-RS System...".yellow());
+                            println!("{}", "Safely shutting down Advanced isanagent System...".yellow());
                             let _ = shutdown_tx.send(());
                             break;
                         }

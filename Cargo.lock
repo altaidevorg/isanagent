@@ -18,50 +18,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "512761e0bb2578dd7380c6baaa0f4ce03e84f95e960231d1dec8bf4d7d6e2627"
 
 [[package]]
-name = "agent-rs"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "chrono",
- "clap",
- "colored",
- "cron",
- "crossterm",
- "dashmap",
- "downcast-rs",
- "duckduckgo",
- "dyn-clone",
- "futures",
- "futures-util",
- "hex",
- "hmac",
- "imap",
- "lettre",
- "log",
- "moka",
- "native-tls",
- "regex",
- "reqwest 0.12.26",
- "rusqlite",
- "scraper 0.25.0",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "shellexpand",
- "thiserror 1.0.69",
- "tokio",
- "tokio-stream",
- "tokio-tungstenite",
- "toml",
- "tower",
- "urlencoding",
- "uuid",
- "which",
-]
-
-[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1563,6 +1519,50 @@ name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
+
+[[package]]
+name = "isanagent"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "chrono",
+ "clap",
+ "colored",
+ "cron",
+ "crossterm",
+ "dashmap",
+ "downcast-rs",
+ "duckduckgo",
+ "dyn-clone",
+ "futures",
+ "futures-util",
+ "hex",
+ "hmac",
+ "imap",
+ "lettre",
+ "log",
+ "moka",
+ "native-tls",
+ "regex",
+ "reqwest 0.12.26",
+ "rusqlite",
+ "scraper 0.25.0",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "shellexpand",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "tokio-tungstenite",
+ "toml",
+ "tower",
+ "urlencoding",
+ "uuid",
+ "which",
+]
 
 [[package]]
 name = "itoa"
