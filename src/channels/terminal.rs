@@ -2,8 +2,10 @@ use async_trait::async_trait;
 use crate::channels::Channel;
 use crate::bus::{InboundMessage, OutboundMessage, BusMessage, LogEvent};
 use crate::logging::LoggerHandle;
+use crate::utils::{ContentPart, ImageUrl, resolve_path};
 use tokio::sync::mpsc::Sender;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use log::error;
 use colored::Colorize;
 use crossterm::{cursor, terminal::{Clear, ClearType}, execute};
@@ -13,6 +15,9 @@ pub struct TerminalChannel {
     chat_id: String,
     logger_tx: LoggerHandle,
     shutdown_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    /// All user-supplied `@<filepath>` references are resolved relative to this
+    /// directory.  Paths that escape the sandbox boundary are silently rejected.
+    sandbox_dir: PathBuf,
 }
 
 impl TerminalChannel {
@@ -20,13 +25,123 @@ impl TerminalChannel {
         chat_id: &str,
         logger_tx: LoggerHandle,
         shutdown_tx: tokio::sync::mpsc::UnboundedSender<()>,
+        sandbox_dir: PathBuf,
     ) -> Self {
         Self {
             chat_id: chat_id.to_string(),
             logger_tx,
             shutdown_tx,
+            sandbox_dir,
         }
     }
+}
+
+/// Detects the MIME type of an image file from its extension.
+/// Returns `None` for unsupported or non-image extensions.
+fn image_mime_from_extension(path: &std::path::Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_lowercase())
+        .as_deref()
+    {
+        Some("jpg") | Some("jpeg") => Some("image/jpeg"),
+        Some("png") => Some("image/png"),
+        Some("gif") => Some("image/gif"),
+        Some("webp") => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// Parses a terminal input string for `@<filepath>` references.
+///
+/// Each `@<path>` token is removed from the returned text and the referenced
+/// file is read from disk, base64-encoded, and returned as an
+/// `ContentPart::ImageUrl` attachment using a data URI.
+///
+/// Paths are resolved against `sandbox_dir`; any path that escapes the sandbox
+/// boundary (via `../`, absolute references outside the sandbox, etc.) is
+/// silently skipped.  Unsupported file types and unreadable files are also
+/// silently skipped (a warning is printed to stderr instead of aborting the
+/// whole message).
+fn parse_terminal_attachments(input: &str, sandbox_dir: &std::path::Path) -> (String, Vec<ContentPart>) {
+    use base64::Engine as _;
+    let engine = base64::engine::general_purpose::STANDARD;
+
+    let mut clean_parts: Vec<&str> = Vec::new();
+    let mut attachments: Vec<ContentPart> = Vec::new();
+    let mut last_end = 0;
+
+    // Find all `@<path>` tokens.  A path token starts with `@` and ends at
+    // the next whitespace character or end-of-string.
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < input.len() {
+        if bytes[i] == b'@' {
+            // Capture everything before this token as plain text
+            clean_parts.push(&input[last_end..i]);
+
+            // Advance past `@`
+            let path_start = i + 1;
+            let mut path_end = path_start;
+            while path_end < input.len() && !bytes[path_end].is_ascii_whitespace() {
+                path_end += 1;
+            }
+
+            let raw_path = &input[path_start..path_end];
+            // Only expand `~` (home directory shorthand). Intentionally do NOT
+            // use shellexpand::full() to avoid unintended environment variable
+            // expansion (e.g. `@$HOME/.ssh/id_rsa`).
+            let expanded = shellexpand::tilde(raw_path).into_owned();
+
+            // Resolve and sandbox-check the path.
+            let expanded_path = std::path::Path::new(&expanded);
+            let path_exists = expanded_path.exists()
+                || sandbox_dir.join(expanded_path).exists();
+            match resolve_path(sandbox_dir, &expanded) {
+                None if path_exists => {
+                    eprintln!("Warning: @<path> is outside the sandbox boundary, skipping.");
+                }
+                None => {
+                    eprintln!("Warning: @<path> does not exist or is not accessible, skipping.");
+                }
+                Some(file_path) => {
+                    match image_mime_from_extension(&file_path) {
+                        None => {
+                            eprintln!("Warning: @<path> is not a supported image type (jpeg/png/gif/webp), skipping.");
+                        }
+                        Some(mime) => {
+                            match std::fs::read(&file_path) {
+                                Err(_) => {
+                                    eprintln!("Warning: could not read @<path>, skipping.");
+                                }
+                                Ok(bytes) => {
+                                    let data_uri = format!("data:{};base64,{}", mime, engine.encode(&bytes));
+                                    attachments.push(ContentPart::ImageUrl {
+                                        image_url: ImageUrl {
+                                            url: data_uri,
+                                            detail: None,
+                                        },
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            last_end = path_end;
+            i = path_end;
+        } else {
+            i += 1;
+        }
+    }
+
+    // Append any trailing plain text
+    clean_parts.push(&input[last_end..]);
+
+    let clean_text = clean_parts.join("").trim().to_string();
+    (clean_text, attachments)
 }
 
 #[async_trait]
@@ -40,6 +155,7 @@ impl Channel for TerminalChannel {
         let mut chat_id = self.chat_id.clone();
         let logger_tx = self.logger_tx.clone();
         let shutdown_tx = self.shutdown_tx.clone();
+        let sandbox_dir = self.sandbox_dir.clone();
         
         let _ = logger_tx.send(BusMessage::Log(LogEvent::info("TerminalChannel", "Starting Terminal channel...")));
         
@@ -84,12 +200,16 @@ impl Channel for TerminalChannel {
                             break;
                         }
 
+                        // Parse @filepath references into multimodal attachments
+                        let (clean_text, attachments) = parse_terminal_attachments(text, &sandbox_dir);
+
                         let msg = InboundMessage {
                             channel: channel_name.clone(),
                             sender_id: "local_user".to_string(),
                             chat_id: chat_id.clone(),
                             thread_id: None,
-                            content: text.to_string(),
+                            content: clean_text,
+                            attachments,
                             metadata: Default::default(),
                         };
 
@@ -132,5 +252,111 @@ impl Channel for TerminalChannel {
         print!("{}", "> ".bold().green());
         let _ = stdout.flush();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_terminal_attachments;
+
+    #[test]
+    fn no_at_references_returns_text_unchanged() {
+        let sandbox = std::env::temp_dir();
+        let (text, attachments) = parse_terminal_attachments("hello world", &sandbox);
+        assert_eq!(text, "hello world");
+        assert!(attachments.is_empty());
+    }
+
+    #[test]
+    fn unsupported_extension_is_skipped() {
+        let sandbox = std::env::temp_dir();
+        // Create the file inside the sandbox so the only reason it's skipped is
+        // the unsupported extension, not a missing-file / sandbox rejection.
+        let path = sandbox.join("isanagent_test_skip.txt");
+        std::fs::write(&path, b"hello").ok();
+        let input = format!("show @{} please", path.display());
+        let (text, attachments) = parse_terminal_attachments(&input, &sandbox);
+        assert!(!text.contains('@'));
+        assert!(attachments.is_empty(), "non-image files must be skipped");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn missing_file_is_skipped() {
+        let sandbox = std::env::temp_dir();
+        // Build a path that is inside the sandbox but does not exist.
+        let path = sandbox.join("isanagent_nonexistent_image.png");
+        // Ensure it really doesn't exist.
+        let _ = std::fs::remove_file(&path);
+        let input = format!("see @{} thanks", path.display());
+        let (text, attachments) = parse_terminal_attachments(&input, &sandbox);
+        assert!(!text.contains('@'));
+        assert!(attachments.is_empty(), "missing file must be skipped gracefully");
+    }
+
+    #[test]
+    fn path_outside_sandbox_is_rejected() {
+        use std::io::Write as _;
+        // Create a sandbox subdirectory so we can reference a file *outside* it.
+        let tmp = std::env::temp_dir();
+        let sandbox = tmp.join("isanagent_sandbox_test");
+        std::fs::create_dir_all(&sandbox).expect("create sandbox");
+
+        // Put a real image file *outside* the sandbox (in tmp directly).
+        let outside = tmp.join("isanagent_outside_test.png");
+        let png_bytes: &[u8] = &[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        let mut f = std::fs::File::create(&outside).expect("create outside png");
+        f.write_all(png_bytes).expect("write png");
+        drop(f);
+
+        let input = format!("describe @{} please", outside.display());
+        let (_text, attachments) = parse_terminal_attachments(&input, &sandbox);
+        assert!(attachments.is_empty(), "file outside sandbox must be rejected");
+
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&sandbox);
+    }
+
+    #[test]
+    fn existing_image_is_attached_as_data_uri() {
+        use std::io::Write;
+        // Use a temporary sandbox directory and write the image inside it.
+        let sandbox = std::env::temp_dir().join("isanagent_sandbox_image_test");
+        std::fs::create_dir_all(&sandbox).expect("create sandbox");
+        let tmp = sandbox.join("isanagent_terminal_test.png");
+        // Minimal 1x1 PNG bytes
+        let png_bytes: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, // PNG signature
+            0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, // IHDR chunk length + type
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // width=1, height=1
+            0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, // bit depth=8, color type=2
+            0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, // IHDR CRC + IDAT chunk
+            0x54, 0x08, 0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, // IDAT data
+            0x00, 0x00, 0x02, 0x00, 0x01, 0xe2, 0x21, 0xbc, // IDAT data cont.
+            0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, // IDAT CRC + IEND
+            0x44, 0xae, 0x42, 0x60, 0x82, // IEND data
+        ];
+        let mut f = std::fs::File::create(&tmp).expect("create temp png");
+        f.write_all(png_bytes).expect("write png");
+        drop(f);
+
+        let input = format!("describe this image @{} please", tmp.display());
+        let (text, attachments) = parse_terminal_attachments(&input, &sandbox);
+
+        // The @path token is removed from the text
+        assert!(!text.contains('@'));
+        assert_eq!(attachments.len(), 1, "should have one image attachment");
+
+        if let crate::utils::ContentPart::ImageUrl { image_url } = &attachments[0] {
+            assert!(
+                image_url.url.starts_with("data:image/png;base64,"),
+                "expected a PNG data URI, got: {}",
+                &image_url.url[..40.min(image_url.url.len())]
+            );
+        } else {
+            panic!("expected ContentPart::ImageUrl");
+        }
+
+        let _ = std::fs::remove_dir_all(&sandbox);
     }
 }

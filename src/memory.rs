@@ -1,9 +1,10 @@
 use async_trait::async_trait;
+use log::debug;
 use rusqlite::{Connection, params};
 use tokio::sync::oneshot;
 
 use crate::{ActorLogic, ActorError};
-use crate::utils::ChatMessage;
+use crate::utils::{ChatMessage, ContentPart, MessageContent};
 use std::sync::{Arc, Mutex};
 use std::fmt;
 
@@ -206,10 +207,17 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
     async fn process(&mut self, packet: MemoryMessage) -> Result<Option<(String, MemoryMessage)>, ActorError> {
         match packet {
             MemoryMessage::AddMessage { session_id, message, reply } => {
+                let content_str = match &message.content {
+                    Some(MessageContent::Text(s)) => Some(s.clone()),
+                    Some(MessageContent::Parts(parts)) => {
+                        serde_json::to_string(parts).ok()
+                    }
+                    None => None,
+                };
                 let tool_calls_str = message.tool_calls.map(|tc| serde_json::to_string(&tc).unwrap_or_default());
                 let res = self.conn.execute(
                     "INSERT INTO messages (session_id, role, content, name, tool_calls, tool_call_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![session_id, message.role, message.content, message.name, tool_calls_str, message.tool_call_id],
+                    params![session_id, message.role, content_str, message.name, tool_calls_str, message.tool_call_id],
                 ).map_err(|e| e.to_string()).map(|_| ());
                 
                 let _ = reply.send(res);
@@ -223,10 +231,25 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     let message_iter = stmt.query_map(params![session_id], |row| {
                         let tool_calls_str: Option<String> = row.get(3)?;
                         let tool_calls = tool_calls_str.and_then(|s| serde_json::from_str(&s).ok());
-                        
+                        let content_raw: Option<String> = row.get(1)?;
+                        let content = content_raw.map(|s| {
+                            // Try to parse as a JSON array of ContentPart (multimodal).
+                            // Fall back to treating the raw string as plain text (legacy format).
+                            if s.trim_start().starts_with('[') {
+                                match serde_json::from_str::<Vec<ContentPart>>(&s) {
+                                    Ok(parts) => MessageContent::Parts(parts),
+                                    Err(_) => {
+                                        debug!("SqliteMemoryActor: failed to parse content as ContentPart array, treating as plain text");
+                                        MessageContent::Text(s)
+                                    }
+                                }
+                            } else {
+                                MessageContent::Text(s)
+                            }
+                        });
                         Ok(ChatMessage {
                             role: row.get(0)?,
-                            content: row.get(1)?,
+                            content,
                             name: row.get(2)?,
                             tool_calls,
                             tool_call_id: row.get(4)?,

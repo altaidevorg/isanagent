@@ -191,6 +191,7 @@ fn poll_inbox_once(config: EmailConfig, tx: Sender<InboundMessage>) -> Result<()
                     chat_id: sender,
                     thread_id: Some(subject),
                     content,
+                    attachments: Vec::new(),
                     metadata: std::collections::HashMap::new(),
                 };
 

@@ -1,5 +1,6 @@
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
+use crate::utils::ContentPart;
 
 /// An inbound message received from a Channel (e.g. Slack, Email).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8,7 +9,11 @@ pub struct InboundMessage {
     pub sender_id: String,
     pub chat_id: String,
     pub thread_id: Option<String>,
+    /// The plain-text portion of the message content.
     pub content: String,
+    /// Optional multimodal attachments (e.g. images) accompanying the text content.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<ContentPart>,
     pub metadata: HashMap<String, serde_json::Value>,
 }
 

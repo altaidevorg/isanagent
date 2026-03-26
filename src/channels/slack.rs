@@ -7,6 +7,7 @@ use axum::{
     routing::post,
     Router,
 };
+use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use log::{error, info, warn};
@@ -27,6 +28,7 @@ use crate::channels::slack_store::{SlackUserProfileStore, StoredSlackUserProfile
 use crate::channels::Channel;
 use crate::config::{SlackConfig, SlackMode};
 use crate::logging::LoggerHandle;
+use crate::utils::{ContentPart, ImageUrl};
 use std::path::Path;
 
 const SLACK_CHANNEL_NAME: &str = "slack";
@@ -327,6 +329,66 @@ impl SlackRuntimeState {
         }
     }
 
+    /// Downloads a Slack file (accessible via `url_private`) using the bot token
+    /// and returns it as an OpenAI-compatible `ContentPart::ImageUrl` with a
+    /// base64 data URI.  Returns `None` when the file is not a supported image
+    /// type or when the download fails.
+    async fn download_slack_file(
+        &self,
+        file: &Value,
+        bot_token: &str,
+    ) -> Option<ContentPart> {
+        let mime = file["mimetype"].as_str()?;
+        if !mime.starts_with("image/") {
+            return None;
+        }
+        // Only process MIME types that OpenAI vision supports
+        match mime {
+            "image/jpeg" | "image/png" | "image/gif" | "image/webp" => {}
+            _ => return None,
+        }
+
+        let url = file["url_private"].as_str()?;
+        match self
+            .client
+            .get(url)
+            .header("Authorization", format!("Bearer {}", bot_token))
+            .send()
+            .await
+        {
+            Err(e) => {
+                warn!("Failed to download Slack file {}: {}", url, e);
+                None
+            }
+            Ok(response) => {
+                if !response.status().is_success() {
+                    warn!(
+                        "Slack file download failed with status {}: {}",
+                        response.status(),
+                        url
+                    );
+                    return None;
+                }
+                match response.bytes().await {
+                    Err(e) => {
+                        warn!("Failed to read Slack file bytes from {}: {}", url, e);
+                        None
+                    }
+                    Ok(bytes) => {
+                        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        let data_uri = format!("data:{};base64,{}", mime, encoded);
+                        Some(ContentPart::ImageUrl {
+                            image_url: ImageUrl {
+                                url: data_uri,
+                                detail: None,
+                            },
+                        })
+                    }
+                }
+            }
+        }
+    }
+
     async fn process_event_callback(
         self: &Arc<Self>,
         envelope: Value,
@@ -350,7 +412,7 @@ impl SlackRuntimeState {
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
 
-        let Some(dispatch) = normalize_slack_event(
+        let Some(mut dispatch) = normalize_slack_event(
             config,
             event,
             bot_user_id.as_deref(),
@@ -360,6 +422,17 @@ impl SlackRuntimeState {
         ) else {
             return;
         };
+
+        // Download any image files attached to the Slack message
+        if let Some(files) = event.get("files").and_then(Value::as_array) {
+            for file in files {
+                if let Some(attachment) =
+                    self.download_slack_file(file, &config.bot_token).await
+                {
+                    dispatch.inbound.attachments.push(attachment);
+                }
+            }
+        }
 
         let reaction = dispatch.reaction.clone();
         let chat_id = dispatch.inbound.chat_id.clone();
@@ -1082,6 +1155,7 @@ fn normalize_slack_event(
             chat_id,
             thread_id: thread_ts,
             content: payload_text,
+            attachments: Vec::new(),
             metadata,
         },
         reaction,

@@ -155,9 +155,10 @@ impl ActorLogic<BusMessage> for AgentLogic {
             LogEvent::info(
                 &self.name,
                 &format!(
-                    "Received InboundMessage from [{}] ({} chars)",
+                    "Received InboundMessage from [{}] ({} chars, {} attachments)",
                     inbound.channel,
-                    inbound.content.len()
+                    inbound.content.len(),
+                    inbound.attachments.len(),
                 ),
             )
             .with_chat_id(&inbound.chat_id),
@@ -183,7 +184,13 @@ impl ActorLogic<BusMessage> for AgentLogic {
 
         let contextualized_content = format!("{}{}", runtime_context, inbound.content);
 
-        mem.add_message(crate::utils::ChatMessage::user(&contextualized_content))
+        // Build the user message – multimodal when attachments are present
+        let user_msg = if inbound.attachments.is_empty() {
+            crate::utils::ChatMessage::user(&contextualized_content)
+        } else {
+            crate::utils::ChatMessage::user_multimodal(&contextualized_content, &inbound.attachments)
+        };
+        mem.add_message(user_msg)
             .await
             .map_err(|e| ActorError::from(e))?;
 
@@ -271,7 +278,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                     content: if response_text.is_empty() {
                         None
                     } else {
-                        Some(response_text.clone())
+                        Some(crate::utils::MessageContent::Text(response_text.clone()))
                     },
                     name: None,
                     tool_calls: Some(tool_calls.clone()),
@@ -358,7 +365,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 let turns = current_context.len();
                 let approx_tokens: usize = current_context
                     .iter()
-                    .map(|msg| msg.content.as_deref().unwrap_or("").len() / 4)
+                    .map(|msg| msg.content.as_ref().map_or(0, |c| c.text_content().len()) / 4)
                     .sum();
 
                 if turns >= self.short_term_threshold_turns

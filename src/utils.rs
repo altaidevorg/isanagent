@@ -3,13 +3,70 @@ use serde_json::json;
 use std::time::Duration;
 use log::{info, debug};
 
+// --- Multimodal Content Types ---
+
+/// A single part within a multimodal message content array.
+/// Follows the OpenAI content part schema.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentPart {
+    /// Plain text content.
+    Text { text: String },
+    /// An image referenced by URL or base64 data URI.
+    ImageUrl { image_url: ImageUrl },
+}
+
+/// Image reference inside a content part.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ImageUrl {
+    /// An https URL or a base64 data URI (`data:<media_type>;base64,<data>`).
+    pub url: String,
+    /// Optional detail hint: "auto", "low", or "high".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// The value of a `ChatMessage.content` field, which may be plain text or a
+/// list of multimodal content parts (following the OpenAI spec).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum MessageContent {
+    /// A plain-text string – used for system, assistant, and tool messages.
+    Text(String),
+    /// An ordered list of content parts – used for multimodal user messages.
+    Parts(Vec<ContentPart>),
+}
+
+impl MessageContent {
+    /// Returns the concatenated plain-text of all text parts (or the string itself).
+    pub fn text_content(&self) -> String {
+        match self {
+            MessageContent::Text(s) => s.clone(),
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    ContentPart::ImageUrl { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        }
+    }
+}
+
+impl std::fmt::Display for MessageContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.text_content())
+    }
+}
+
 // --- Data Structures ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub content: Option<MessageContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -53,7 +110,24 @@ impl ChatMessage {
     pub fn user(content: &str) -> Self {
         Self {
             role: "user".to_string(),
-            content: Some(content.to_string()),
+            content: Some(MessageContent::Text(content.to_string())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    /// Create a user message with both a text portion and additional multimodal attachments.
+    /// If `attachments` is empty, this is equivalent to `user(text)`.
+    pub fn user_multimodal(text: &str, attachments: &[ContentPart]) -> Self {
+        if attachments.is_empty() {
+            return Self::user(text);
+        }
+        let mut parts = vec![ContentPart::Text { text: text.to_string() }];
+        parts.extend_from_slice(attachments);
+        Self {
+            role: "user".to_string(),
+            content: Some(MessageContent::Parts(parts)),
             name: None,
             tool_calls: None,
             tool_call_id: None,
@@ -63,7 +137,7 @@ impl ChatMessage {
     pub fn system(content: &str) -> Self {
         Self {
             role: "system".to_string(),
-            content: Some(content.to_string()),
+            content: Some(MessageContent::Text(content.to_string())),
             name: None,
             tool_calls: None,
             tool_call_id: None,
@@ -73,7 +147,7 @@ impl ChatMessage {
     pub fn assistant(content: &str) -> Self {
         Self {
             role: "assistant".to_string(),
-            content: Some(content.to_string()),
+            content: Some(MessageContent::Text(content.to_string())),
             name: None,
             tool_calls: None,
             tool_call_id: None,
@@ -83,7 +157,7 @@ impl ChatMessage {
     pub fn tool(content: &str, tool_call_id: &str) -> Self {
         Self {
             role: "tool".to_string(),
-            content: Some(content.to_string()),
+            content: Some(MessageContent::Text(content.to_string())),
             name: None,
             tool_calls: None,
             tool_call_id: Some(tool_call_id.to_string()),
@@ -268,6 +342,39 @@ impl LLMClient {
             ChatMessage::user(user)
         ];
         self.chat(&messages, None).await
+    }
+}
+
+/// Resolves `agent_path` relative to `sandbox_dir`, ensuring the resulting
+/// canonical path stays within the sandbox boundary.
+///
+/// Returns `None` when:
+/// - the path escapes the sandbox via `../` traversal or absolute references
+///   outside the sandbox directory, or
+/// - the path does not exist on disk (canonicalization requires existence).
+pub fn resolve_path(sandbox_dir: &std::path::Path, agent_path: &str) -> Option<std::path::PathBuf> {
+    // Canonicalize the sandbox root first so we can fail fast before touching
+    // any user-supplied path data.
+    let sandbox_canonical = sandbox_dir.canonicalize().ok()?;
+
+    let raw = std::path::Path::new(agent_path);
+
+    // Absolute paths are only allowed when they live inside the sandbox.
+    // Relative paths are joined against the sandbox root first.
+    let joined = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        sandbox_canonical.join(raw)
+    };
+
+    // `canonicalize` resolves symlinks and `..` components and requires the
+    // path to exist – so a non-existent file naturally returns `None`.
+    let canonical = joined.canonicalize().ok()?;
+
+    if canonical.starts_with(&sandbox_canonical) {
+        Some(canonical)
+    } else {
+        None
     }
 }
 

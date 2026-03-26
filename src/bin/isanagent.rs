@@ -355,6 +355,7 @@ async fn run_isanagent(
         &terminal_chat_id,
         logger_bus_tx.clone(),
         shutdown_tx.clone(),
+        workspace.sandbox_dir.clone(),
     ));
     terminal.start(inbound_tx.clone()).await?;
     out_channels.insert(terminal.name().to_string(), terminal);
@@ -462,6 +463,7 @@ async fn run_isanagent(
                     chat_id: trigger.chat_id.clone(),
                     thread_id: None,
                     content: trigger.message.clone(),
+                    attachments: Vec::new(),
                     metadata: HashMap::from([
                         (
                             "cron_job_id".to_string(),

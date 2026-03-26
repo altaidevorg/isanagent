@@ -29,6 +29,7 @@ use crate::logging::LoggerHandle;
 use crate::scheduler::{
     CronWebhookError, MultiTenantEdgeCronScheduler, PendingCronTriggerFinalize,
 };
+use crate::utils::{ContentPart, ImageUrl};
 
 const AGENT_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_API_USER: &str = "api_user";
@@ -48,9 +49,19 @@ struct ApiState {
     logger_tx: LoggerHandle,
 }
 
+/// A parsed and normalised chat request: plain text plus optional image attachments.
+struct ParsedChatInput {
+    content: String,
+    attachments: Vec<ContentPart>,
+}
+
+/// Request body for `POST /v1/chat/completions`.
+///
+/// `message` may be a plain JSON string **or** an OpenAI-compatible content-part
+/// array (e.g. `[{"type":"text","text":"..."},{"type":"image_url","image_url":{...}}]`).
 #[derive(Deserialize)]
 struct ChatRequest {
-    message: String,
+    message: Value,
     user: Option<String>,
 }
 
@@ -376,7 +387,14 @@ async fn handle_chat(State(state): State<ApiState>, Json(payload): Json<ChatRequ
     let chat_id = uuid::Uuid::new_v4().to_string();
     let sender_id = payload.user.unwrap_or_else(|| DEFAULT_API_USER.to_string());
 
-    match dispatch_agent_turn(&state, sender_id, chat_id, payload.message).await {
+    let parsed = match parse_chat_message_value(&payload.message) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            return ApiError::new(StatusCode::BAD_REQUEST, "invalid_input", message).into_response()
+        }
+    };
+
+    match dispatch_agent_turn(&state, sender_id, chat_id, parsed).await {
         Ok(outbound) => Json(ChatResponse {
             response: outbound.content,
         })
@@ -429,6 +447,7 @@ async fn handle_mte_cron_webhook(
         chat_id: trigger.chat_id.clone(),
         thread_id: None,
         content: trigger.message.clone(),
+        attachments: Vec::new(),
         metadata,
     };
 
@@ -686,7 +705,7 @@ async fn dispatch_agent_turn(
     state: &ApiState,
     sender_id: String,
     chat_id: String,
-    content: String,
+    input: ParsedChatInput,
 ) -> Result<OutboundMessage, ApiError> {
     let (tx, rx) = oneshot::channel();
     match state.pending_requests.entry(chat_id.clone()) {
@@ -707,7 +726,8 @@ async fn dispatch_agent_turn(
         sender_id,
         chat_id: chat_id.clone(),
         thread_id: None,
-        content,
+        content: input.content,
+        attachments: input.attachments,
         metadata: Default::default(),
     };
 
@@ -754,44 +774,136 @@ async fn dispatch_agent_turn(
     }
 }
 
-fn normalize_responses_input(input: &Value) -> Result<String, String> {
-    let mut segments = Vec::new();
-    collect_text_segments(input, &mut segments)?;
+/// Parses an OpenAI-compatible `message` value from a chat request.
+///
+/// Accepts either:
+/// - A plain JSON string: `"hello"`
+/// - An array of content parts: `[{"type":"text","text":"hello"},{"type":"image_url","image_url":{"url":"..."}}]`
+fn parse_chat_message_value(value: &Value) -> Result<ParsedChatInput, String> {
+    match value {
+        Value::String(text) => Ok(ParsedChatInput {
+            content: text.clone(),
+            attachments: Vec::new(),
+        }),
+        Value::Array(parts) => {
+            let mut text_segments: Vec<String> = Vec::new();
+            let mut attachments: Vec<ContentPart> = Vec::new();
+            for part in parts {
+                collect_content_parts(part, &mut text_segments, &mut attachments)?;
+            }
+            let content = text_segments
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            if content.is_empty() && attachments.is_empty() {
+                return Err("Chat message did not contain any text or image content.".to_string());
+            }
+            Ok(ParsedChatInput { content, attachments })
+        }
+        _ => Err("Chat message must be a string or an array of content parts.".to_string()),
+    }
+}
 
-    let normalized = segments
+fn normalize_responses_input(input: &Value) -> Result<ParsedChatInput, String> {
+    let mut text_segments: Vec<String> = Vec::new();
+    let mut attachments: Vec<ContentPart> = Vec::new();
+    collect_input_parts(input, &mut text_segments, &mut attachments)?;
+
+    let content = text_segments
         .into_iter()
         .map(|segment| segment.trim().to_string())
         .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n");
 
-    if normalized.is_empty() {
-        return Err("Responses input did not contain any supported text content.".to_string());
+    if content.is_empty() && attachments.is_empty() {
+        return Err("Responses input did not contain any text or image content.".to_string());
     }
 
-    Ok(normalized)
+    Ok(ParsedChatInput { content, attachments })
 }
 
-fn collect_text_segments(value: &Value, segments: &mut Vec<String>) -> Result<(), String> {
+/// Collects text segments and image attachments from an OpenAI content part object or array.
+fn collect_content_parts(
+    value: &Value,
+    text_segments: &mut Vec<String>,
+    attachments: &mut Vec<ContentPart>,
+) -> Result<(), String> {
     match value {
         Value::String(text) => {
-            segments.push(text.clone());
+            text_segments.push(text.clone());
+            Ok(())
+        }
+        Value::Object(map) => {
+            match map.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(text) = map.get("text").and_then(Value::as_str) {
+                        text_segments.push(text.to_string());
+                    }
+                    Ok(())
+                }
+                Some("image_url") => {
+                    if let Some(img_obj) = map.get("image_url").and_then(Value::as_object) {
+                        if let Some(url) = img_obj.get("url").and_then(Value::as_str) {
+                            let detail = img_obj
+                                .get("detail")
+                                .and_then(Value::as_str)
+                                .map(ToOwned::to_owned);
+                            attachments.push(ContentPart::ImageUrl {
+                                image_url: ImageUrl {
+                                    url: url.to_string(),
+                                    detail,
+                                },
+                            });
+                        }
+                    }
+                    Ok(())
+                }
+                _ => {
+                    // Gracefully ignore unknown content part types
+                    Ok(())
+                }
+            }
+        }
+        _ => Err("Unsupported content part type. Expected string or object.".to_string()),
+    }
+}
+
+/// Recursively collects text and image parts from a Responses API `input` value.
+fn collect_input_parts(
+    value: &Value,
+    text_segments: &mut Vec<String>,
+    attachments: &mut Vec<ContentPart>,
+) -> Result<(), String> {
+    match value {
+        Value::String(text) => {
+            text_segments.push(text.clone());
             Ok(())
         }
         Value::Array(items) => {
             for item in items {
-                collect_text_segments(item, segments)?;
+                collect_input_parts(item, text_segments, attachments)?;
             }
             Ok(())
         }
         Value::Object(map) => {
+            // Handle explicit content part objects (type: "text" / "image_url")
+            if let Some(kind) = map.get("type").and_then(Value::as_str) {
+                return collect_content_parts(value, text_segments, attachments)
+                    .map_err(|_| format!("Unsupported content part type: {}", kind));
+            }
+
+            // Convenience: objects with a top-level `text` field
             if let Some(text) = map.get("text").and_then(Value::as_str) {
-                segments.push(text.to_string());
+                text_segments.push(text.to_string());
                 return Ok(());
             }
 
+            // Convenience: objects with a nested `content` field
             if let Some(content) = map.get("content") {
-                return collect_text_segments(content, segments);
+                return collect_input_parts(content, text_segments, attachments);
             }
 
             Err("Unsupported responses input object. Expected text or content.".to_string())
