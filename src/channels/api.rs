@@ -1,16 +1,16 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::{
     body::{Body, Bytes},
-    extract::{OriginalUri, Path as AxumPath, State},
+    extract::{OriginalUri, Path as AxumPath, Query, State},
     http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use dashmap::{mapref::entry::Entry, DashMap};
@@ -18,6 +18,7 @@ use log::{error, info};
 use moka::policy::EvictionPolicy;
 use moka::sync::Cache;
 use serde::{Deserialize, Serialize};
+use regex::Regex;
 use serde_json::Value;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
@@ -33,7 +34,7 @@ use crate::NodeHandle;
 use crate::scheduler::{
     CronWebhookError, MultiTenantEdgeCronScheduler, PendingCronTriggerFinalize,
 };
-use crate::utils::{ContentPart, ImageUrl};
+use crate::utils::{ContentPart, ImageUrl, MessageContent};
 
 const AGENT_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_API_USER: &str = "api_user";
@@ -101,6 +102,23 @@ struct ResponsesResponse {
 struct SessionHistoryMessage {
     role: String,
     content: String,
+    /// Image URLs or `data:` URIs from multimodal user/assistant turns (OpenAI-style parts).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_urls: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionsQueryParams {
+    user: String,
+}
+
+#[derive(Serialize)]
+struct SessionListEntry {
+    internal_chat_id: String,
+    updated_at: i64,
+    latest_response_id: String,
+    /// First user line (truncated), ChatGPT-style sidebar label.
+    preview: String,
 }
 
 #[derive(Serialize)]
@@ -313,10 +331,12 @@ fn build_router(state: ApiState, serve_ui: bool) -> Router {
     let mut app = Router::new()
         .route("/v1/chat/completions", post(handle_chat))
         .route("/v1/responses", post(handle_responses))
+        .route("/v1/sessions", get(handle_list_sessions))
         .route(
             "/v1/sessions/{session_id}/messages",
             get(handle_session_messages),
-        );
+        )
+        .route("/v1/sessions/{session_id}", delete(handle_delete_session));
 
     if state.mte_cron_scheduler.is_some() {
         app = app.route("/_mte/cron/{job_id}/{token}", get(handle_mte_cron_webhook));
@@ -936,26 +956,104 @@ fn collect_input_parts(
     }
 }
 
-fn session_history_row(message: &ChatMessage) -> SessionHistoryMessage {
-    let mut content = message
-        .content
-        .as_ref()
-        .map(|c| c.text_content())
-        .unwrap_or_default();
-    if content.is_empty() {
-        if let Some(tool_calls) = &message.tool_calls {
-            content = serde_json::to_string(tool_calls).unwrap_or_default();
+fn runtime_context_prefix_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"^\[RUNTIME CONTEXT\] Current time is .+?\. You are navigating and responding in channel: '[^']*', with chat ID: '[^']*'(?:, thread: '[^']*')?\.\s*\n\s*",
+        )
+        .expect("runtime context strip regex")
+    })
+}
+
+fn redacted_thinking_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?s)<redacted_thinking>.*?</redacted_thinking>\s*")
+            .expect("redacted thinking strip regex")
+    })
+}
+
+fn strip_runtime_context_prefix(text: &str) -> String {
+    runtime_context_prefix_re()
+        .replace(text, "")
+        .trim_start()
+        .to_string()
+}
+
+fn strip_model_thinking_markup(text: &str) -> String {
+    redacted_thinking_re()
+        .replace_all(text, "")
+        .trim()
+        .to_string()
+}
+
+fn truncate_chat_preview(text: &str) -> String {
+    let line = text.split('\n').next().unwrap_or(text).trim();
+    let mut iter = line.chars();
+    let chunk: String = iter.by_ref().take(56).collect();
+    if iter.next().is_some() {
+        format!("{}…", chunk)
+    } else {
+        chunk
+    }
+}
+
+fn text_and_images_from_message(message: &ChatMessage) -> (String, Vec<String>) {
+    match &message.content {
+        Some(MessageContent::Parts(parts)) => {
+            let mut texts = Vec::new();
+            let mut urls = Vec::new();
+            for part in parts {
+                match part {
+                    ContentPart::Text { text } => texts.push(text.as_str()),
+                    ContentPart::ImageUrl { image_url } => urls.push(image_url.url.clone()),
+                }
+            }
+            (texts.join("\n\n"), urls)
         }
+        Some(MessageContent::Text(s)) => (s.clone(), Vec::new()),
+        None => (String::new(), Vec::new()),
     }
-    if content.is_empty() {
-        if let Some(name) = &message.name {
-            content = format!("({})", name);
+}
+
+/// Transcript rows suitable for the web UI: hides tool traces, runtime injection prefixes, and
+/// tool-only assistant turns (no user-visible assistant text).
+fn chat_messages_to_ui_transcript(messages: &[ChatMessage]) -> Vec<SessionHistoryMessage> {
+    let mut out = Vec::new();
+    for message in messages {
+        if message.role == "tool" || message.role == "system" {
+            continue;
         }
+
+        let (mut text, image_urls) = text_and_images_from_message(message);
+
+        if message.role == "user" {
+            text = strip_runtime_context_prefix(&text);
+        } else if message.role == "assistant" {
+            text = strip_model_thinking_markup(&text);
+            let visible = text.trim();
+            if visible.is_empty() && message.tool_calls.is_some() && image_urls.is_empty() {
+                continue;
+            }
+        }
+
+        let text = text.trim().to_string();
+        if text.is_empty() && image_urls.is_empty() {
+            continue;
+        }
+
+        out.push(SessionHistoryMessage {
+            role: message.role.clone(),
+            content: text,
+            image_urls: if image_urls.is_empty() {
+                None
+            } else {
+                Some(image_urls)
+            },
+        });
     }
-    SessionHistoryMessage {
-        role: message.role.clone(),
-        content,
-    }
+    out
 }
 
 /// Maps a path segment to the SQLite `messages.session_id` key.
@@ -997,6 +1095,145 @@ async fn memory_get_context(
         .map_err(|_| "Memory actor channel closed".to_string())?
 }
 
+async fn memory_first_user_preview(
+    memory_node: &NodeHandle<MemoryMessage>,
+    session_id: &str,
+) -> Result<Option<String>, String> {
+    let (tx, rx) = oneshot::channel();
+    let msg = MemoryMessage::FirstUserMessagePreview {
+        session_id: session_id.to_string(),
+        reply: SharedReply::new(tx),
+    };
+    memory_node.send_packet(msg).await.map_err(|e| e.to_string())?;
+    rx.await
+        .map_err(|_| "Memory actor channel closed".to_string())?
+}
+
+async fn memory_clear_session(
+    memory_node: &NodeHandle<MemoryMessage>,
+    memory_session_id: &str,
+) -> Result<(), String> {
+    let (tx, rx) = oneshot::channel();
+    let msg = MemoryMessage::Clear {
+        session_id: memory_session_id.to_string(),
+        reply: SharedReply::new(tx),
+    };
+    memory_node
+        .send_packet(msg)
+        .await
+        .map_err(|e| e.to_string())?;
+    rx.await
+        .map_err(|_| "Memory actor channel closed".to_string())?
+}
+
+async fn handle_list_sessions(
+    State(state): State<ApiState>,
+    Query(params): Query<SessionsQueryParams>,
+) -> Response {
+    let user = params.user.trim();
+    if user.is_empty() {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_user",
+            "Query parameter `user` is required.",
+        )
+        .into_response();
+    }
+    match state.response_store.list_sessions_by_sender(user).await {
+        Ok(rows) => {
+            let mut body = Vec::with_capacity(rows.len());
+            for row in rows {
+                let memory_sid = resolve_memory_session_id(&state, &row.internal_chat_id);
+                let preview_raw = memory_first_user_preview(&state.memory_node, memory_sid.as_ref())
+                    .await
+                    .ok()
+                    .flatten();
+                let preview = preview_raw
+                    .as_deref()
+                    .map(strip_runtime_context_prefix)
+                    .map(|s| truncate_chat_preview(&s))
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_default();
+                body.push(SessionListEntry {
+                    internal_chat_id: row.internal_chat_id,
+                    updated_at: row.updated_at,
+                    latest_response_id: row.latest_response_id,
+                    preview,
+                });
+            }
+            Json(body).into_response()
+        }
+        Err(message) => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "session_list_unavailable",
+            message,
+        )
+        .into_response(),
+    }
+}
+
+async fn handle_delete_session(
+    State(state): State<ApiState>,
+    AxumPath(session_id): AxumPath<String>,
+    Query(params): Query<SessionsQueryParams>,
+) -> Response {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_session",
+            "Empty session id.",
+        )
+        .into_response();
+    }
+    let user = params.user.trim();
+    if user.is_empty() {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_user",
+            "Query parameter `user` is required.",
+        )
+        .into_response();
+    }
+
+    let bare_id = session_id
+        .rsplit(':')
+        .find(|s| !s.is_empty())
+        .unwrap_or(session_id);
+
+    match state
+        .response_store
+        .delete_session_responses(bare_id, user)
+        .await
+    {
+        Ok(removed) => {
+            let memory_session_id = resolve_memory_session_id(&state, session_id);
+            if let Err(message) =
+                memory_clear_session(&state.memory_node, memory_session_id.as_ref()).await
+            {
+                return ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "memory_unavailable",
+                    message,
+                )
+                .into_response();
+            }
+            Json(serde_json::json!({
+                "deleted": true,
+                "responses_removed": removed,
+                "internal_chat_id": bare_id,
+            }))
+            .into_response()
+        }
+        Err(message) => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "session_delete_unavailable",
+            message,
+        )
+        .into_response(),
+    }
+}
+
 async fn handle_session_messages(
     State(state): State<ApiState>,
     AxumPath(session_id): AxumPath<String>,
@@ -1013,7 +1250,7 @@ async fn handle_session_messages(
     let memory_session_id = resolve_memory_session_id(&state, session_id);
     match memory_get_context(&state.memory_node, memory_session_id.as_ref()).await {
         Ok(rows) => {
-            let body: Vec<SessionHistoryMessage> = rows.iter().map(session_history_row).collect();
+            let body = chat_messages_to_ui_transcript(&rows);
             Json(body).into_response()
         }
         Err(message) => ApiError::new(

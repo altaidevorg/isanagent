@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use log::debug;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use tokio::sync::oneshot;
 
 use crate::{ActorLogic, ActorError};
@@ -47,6 +47,11 @@ pub enum MemoryMessage {
     GetContext {
         session_id: String,
         reply: SharedReply<Result<Vec<ChatMessage>, String>>,
+    },
+    /// Plain-text preview from the earliest user turn (for session list titles).
+    FirstUserMessagePreview {
+        session_id: String,
+        reply: SharedReply<Result<Option<String>, String>>,
     },
     Clear {
         session_id: String,
@@ -264,6 +269,51 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                         }
                     }
                     Ok(messages)
+                })();
+
+                let _ = reply.send(res);
+            }
+            MemoryMessage::FirstUserMessagePreview { session_id, reply } => {
+                let res = (|| -> Result<Option<String>, String> {
+                    let mut stmt = self
+                        .conn
+                        .prepare(
+                            "SELECT content FROM messages WHERE session_id = ?1 AND role = 'user' ORDER BY id ASC LIMIT 1",
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let content_raw: Option<String> = stmt
+                        .query_row(params![session_id], |row| row.get(0))
+                        .optional()
+                        .map_err(|e| e.to_string())?;
+                    let Some(s) = content_raw else {
+                        return Ok(None);
+                    };
+                    let message_content = if s.trim_start().starts_with('[') {
+                        match serde_json::from_str::<Vec<ContentPart>>(&s) {
+                            Ok(parts) => MessageContent::Parts(parts),
+                            Err(_) => MessageContent::Text(s),
+                        }
+                    } else {
+                        MessageContent::Text(s)
+                    };
+                    if let MessageContent::Parts(parts) = &message_content {
+                        let has_text = parts.iter().any(|p| {
+                            matches!(p, ContentPart::Text { text } if !text.trim().is_empty())
+                        });
+                        let has_image = parts
+                            .iter()
+                            .any(|p| matches!(p, ContentPart::ImageUrl { .. }));
+                        if !has_text && has_image {
+                            return Ok(Some("Image".to_string()));
+                        }
+                    }
+                    let text = message_content.text_content();
+                    let t = text.trim();
+                    if t.is_empty() {
+                        Ok(None)
+                    } else {
+                        Ok(Some(t.to_string()))
+                    }
                 })();
 
                 let _ = reply.send(res);
