@@ -944,9 +944,7 @@ fn session_history_row(message: &ChatMessage) -> SessionHistoryMessage {
         .unwrap_or_default();
     if content.is_empty() {
         if let Some(tool_calls) = &message.tool_calls {
-            if let Ok(s) = serde_json::to_string_pretty(tool_calls) {
-                content = s;
-            }
+            content = serde_json::to_string(tool_calls).unwrap_or_default();
         }
     }
     if content.is_empty() {
@@ -967,10 +965,21 @@ fn session_history_row(message: &ChatMessage) -> SessionHistoryMessage {
 /// Clients pass the bare `internal_chat_id` (uuid only); we qualify it with this channel name.
 fn resolve_memory_session_id<'a>(state: &ApiState, raw: &'a str) -> Cow<'a, str> {
     let s = raw.trim();
-    if s.contains(':') {
-        Cow::Borrowed(s)
+    let prefix = format!("{}:", state.channel_name);
+    if s.starts_with(&prefix) {
+        // Correct channel prefix; ensure canonical trailing colon.
+        if s.ends_with(':') {
+            Cow::Borrowed(s)
+        } else {
+            Cow::Owned(format!("{}:", s))
+        }
     } else {
-        Cow::Owned(format!("{}:{}:", state.channel_name, s))
+        // Extract the bare ID by taking the last non-empty colon-delimited segment.
+        // This strips any caller-supplied channel prefix (e.g. "terminal:<uuid>:")
+        // and re-qualifies it with the current channel, preventing cross-channel
+        // history access.
+        let id = s.rsplit(':').find(|seg| !seg.is_empty()).unwrap_or(s);
+        Cow::Owned(format!("{}{}:", prefix, id))
     }
 }
 

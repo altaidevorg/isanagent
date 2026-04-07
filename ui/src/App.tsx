@@ -210,10 +210,6 @@ export default function App() {
       setMessages(historyRowsToMessages(rows));
     } catch (error) {
       setErrorMessage(buildErrorMessage(error));
-      clearSessionPointers();
-      setInternalChatId(null);
-      setLatestResponseId(null);
-      setMessages([]);
     } finally {
       setHistoryLoading(false);
     }
