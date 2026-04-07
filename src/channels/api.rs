@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
@@ -26,6 +27,9 @@ use crate::channels::api_store::{ResponseStore, StoredResponse};
 use crate::channels::Channel;
 use crate::config::ApiConfig;
 use crate::logging::LoggerHandle;
+use crate::memory::{MemoryMessage, SharedReply};
+use crate::utils::ChatMessage;
+use crate::NodeHandle;
 use crate::scheduler::{
     CronWebhookError, MultiTenantEdgeCronScheduler, PendingCronTriggerFinalize,
 };
@@ -47,6 +51,7 @@ struct ApiState {
     mte_cron_scheduler: Option<std::sync::Arc<MultiTenantEdgeCronScheduler>>,
     channel_name: String,
     logger_tx: LoggerHandle,
+    memory_node: NodeHandle<MemoryMessage>,
 }
 
 /// A parsed and normalised chat request: plain text plus optional image attachments.
@@ -87,7 +92,15 @@ struct ResponsesResponse {
     model: String,
     status: &'static str,
     previous_response_id: Option<String>,
+    /// Same key as `messages.session_id` in workspace SQLite (terminal-style session).
+    internal_chat_id: String,
     output: Vec<ResponsesOutputItem>,
+}
+
+#[derive(Serialize)]
+struct SessionHistoryMessage {
+    role: String,
+    content: String,
 }
 
 #[derive(Serialize)]
@@ -158,6 +171,7 @@ pub struct ApiChannel {
     response_store: std::sync::Arc<ResponseStore>,
     mte_cron_scheduler: Option<std::sync::Arc<MultiTenantEdgeCronScheduler>>,
     logger_tx: LoggerHandle,
+    memory_node: NodeHandle<MemoryMessage>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     task_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -167,6 +181,7 @@ impl ApiChannel {
         config: ApiConfig,
         db_path: impl AsRef<Path>,
         logger_tx: LoggerHandle,
+        memory_node: NodeHandle<MemoryMessage>,
     ) -> Result<Self, String> {
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let bind_address = config
@@ -185,6 +200,7 @@ impl ApiChannel {
             response_store: std::sync::Arc::new(ResponseStore::new(db_path)?),
             mte_cron_scheduler: None,
             logger_tx,
+            memory_node,
             shutdown_tx,
             task_handle: Mutex::new(None),
         })
@@ -226,6 +242,7 @@ impl Channel for ApiChannel {
             mte_cron_scheduler: self.mte_cron_scheduler.clone(),
             channel_name: self.name().to_string(),
             logger_tx: self.logger_tx.clone(),
+            memory_node: self.memory_node.clone(),
         };
 
         let logger_tx = self.logger_tx.clone();
@@ -295,7 +312,11 @@ impl Channel for ApiChannel {
 fn build_router(state: ApiState, serve_ui: bool) -> Router {
     let mut app = Router::new()
         .route("/v1/chat/completions", post(handle_chat))
-        .route("/v1/responses", post(handle_responses));
+        .route("/v1/responses", post(handle_responses))
+        .route(
+            "/v1/sessions/{session_id}/messages",
+            get(handle_session_messages),
+        );
 
     if state.mte_cron_scheduler.is_some() {
         app = app.route("/_mte/cron/{job_id}/{token}", get(handle_mte_cron_webhook));
@@ -687,6 +708,7 @@ async fn handle_responses(
         model,
         status: "completed",
         previous_response_id,
+        internal_chat_id: internal_chat_id.clone(),
         output: vec![ResponsesOutputItem {
             id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
             kind: "message",
@@ -914,6 +936,86 @@ fn collect_input_parts(
     }
 }
 
+fn session_history_row(message: &ChatMessage) -> SessionHistoryMessage {
+    let mut content = message
+        .content
+        .as_ref()
+        .map(|c| c.text_content())
+        .unwrap_or_default();
+    if content.is_empty() {
+        if let Some(tool_calls) = &message.tool_calls {
+            if let Ok(s) = serde_json::to_string_pretty(tool_calls) {
+                content = s;
+            }
+        }
+    }
+    if content.is_empty() {
+        if let Some(name) = &message.name {
+            content = format!("({})", name);
+        }
+    }
+    SessionHistoryMessage {
+        role: message.role.clone(),
+        content,
+    }
+}
+
+/// Maps a path segment to the SQLite `messages.session_id` key.
+///
+/// [`AgentLogic`](crate::agent::AgentLogic) uses `format!("{}:{}:{}", channel, chat_id, thread_id)`;
+/// for API messages with no thread that is `api:<uuid>:` (note trailing colon).
+/// Clients pass the bare `internal_chat_id` (uuid only); we qualify it with this channel name.
+fn resolve_memory_session_id<'a>(state: &ApiState, raw: &'a str) -> Cow<'a, str> {
+    let s = raw.trim();
+    if s.contains(':') {
+        Cow::Borrowed(s)
+    } else {
+        Cow::Owned(format!("{}:{}:", state.channel_name, s))
+    }
+}
+
+async fn memory_get_context(
+    memory_node: &NodeHandle<MemoryMessage>,
+    session_id: &str,
+) -> Result<Vec<ChatMessage>, String> {
+    let (tx, rx) = oneshot::channel();
+    let msg = MemoryMessage::GetContext {
+        session_id: session_id.to_string(),
+        reply: SharedReply::new(tx),
+    };
+    memory_node.send_packet(msg).await.map_err(|e| e.to_string())?;
+    rx.await
+        .map_err(|_| "Memory actor channel closed".to_string())?
+}
+
+async fn handle_session_messages(
+    State(state): State<ApiState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Response {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_session",
+            "Empty session id.",
+        )
+        .into_response();
+    }
+    let memory_session_id = resolve_memory_session_id(&state, session_id);
+    match memory_get_context(&state.memory_node, memory_session_id.as_ref()).await {
+        Ok(rows) => {
+            let body: Vec<SessionHistoryMessage> = rows.iter().map(session_history_row).collect();
+            Json(body).into_response()
+        }
+        Err(message) => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "memory_unavailable",
+            message,
+        )
+        .into_response(),
+    }
+}
+
 fn log_api(logger_tx: &LoggerHandle, event: LogEvent) {
     let _ = logger_tx.send(BusMessage::Log(event));
 }
@@ -925,8 +1027,11 @@ mod tests {
     use crate::channels::api_store::ResponseStore;
     use crate::config::ApiConfig;
     use crate::logging::create_logger_channel;
+    use crate::memory::{MemoryMessage, SharedReply, SqliteMemoryActor};
+    use crate::utils::ChatMessage;
     use crate::multi_tenant_edge::{CronRegistrationClient, CronRule, CronTransport};
     use crate::scheduler::{ActiveJob, CronStore, MultiTenantEdgeCronScheduler, ScheduleKind};
+    use crate::NodeHandle;
     use async_trait::async_trait;
     use axum::body::{to_bytes, Body};
     use reqwest::StatusCode;
@@ -934,7 +1039,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::sync::{mpsc, oneshot};
     use tower::ServiceExt;
 
@@ -1012,6 +1117,14 @@ mod tests {
         scheduler: Option<Arc<MultiTenantEdgeCronScheduler>>,
     ) -> ApiState {
         let (logger_tx, _logger_rx) = create_logger_channel(32);
+        let memory_actor =
+            SqliteMemoryActor::new(db_path.to_str().expect("utf8 db path")).expect("memory actor");
+        let memory_node = NodeHandle::<MemoryMessage>::new(
+            memory_actor,
+            100,
+            1,
+            Duration::from_millis(5),
+        );
         ApiState {
             inbound_tx,
             pending_requests: Arc::new(dashmap::DashMap::<
@@ -1023,6 +1136,7 @@ mod tests {
             mte_cron_scheduler: scheduler,
             channel_name: "api".to_string(),
             logger_tx,
+            memory_node,
         }
     }
 
@@ -1178,6 +1292,53 @@ bind_address = "127.0.0.1"
     }
 
     #[tokio::test]
+    async fn session_messages_qualifies_bare_chat_id_with_api_channel_prefix() {
+        let temp = LocalTempDir::new();
+        let db_path = temp.db_path();
+        let (inbound_tx, _inbound_rx) = mpsc::channel(4);
+        let state = build_state(&db_path, inbound_tx, None);
+        let chat_suffix = "list-me-123e4567-e89b-12d3-a456-426614174000";
+        let memory_key = format!("api:{}:", chat_suffix);
+        let (tx, rx) = oneshot::channel();
+        state
+            .memory_node
+            .send_packet(MemoryMessage::AddMessage {
+                session_id: memory_key,
+                message: ChatMessage::user("hello from test"),
+                reply: SharedReply::new(tx),
+            })
+            .await
+            .expect("send add message");
+        rx.await.expect("oneshot").expect("add ok");
+
+        let app = build_router(state, false);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/v1/sessions/{chat_suffix}/messages"))
+                    .method("GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let rows: Vec<Value> = serde_json::from_slice(&body).expect("json array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["role"], Value::String("user".to_string()));
+        assert!(
+            rows[0]["content"]
+                .as_str()
+                .expect("content string")
+                .contains("hello from test")
+        );
+    }
+
+    #[tokio::test]
     async fn ui_fallback_does_not_intercept_unknown_api_paths() {
         let temp = LocalTempDir::new();
         let (inbound_tx, _inbound_rx) = mpsc::channel(4);
@@ -1207,6 +1368,14 @@ bind_address = "127.0.0.1"
         let (logger_tx, _logger_rx) = create_logger_channel(32);
         let response_store = Arc::new(ResponseStore::new(temp.db_path()).expect("response store"));
         let (inbound_tx, mut inbound_rx) = mpsc::channel(4);
+        let memory_actor = SqliteMemoryActor::new(temp.db_path().to_str().expect("utf8"))
+            .expect("memory actor");
+        let memory_node = NodeHandle::<MemoryMessage>::new(
+            memory_actor,
+            100,
+            1,
+            Duration::from_millis(5),
+        );
         let state = ApiState {
             inbound_tx,
             pending_requests: pending_requests.clone(),
@@ -1215,6 +1384,7 @@ bind_address = "127.0.0.1"
             mte_cron_scheduler: None,
             channel_name: "api".to_string(),
             logger_tx,
+            memory_node,
         };
         let app = build_router(state, true);
 

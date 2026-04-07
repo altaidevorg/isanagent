@@ -374,9 +374,15 @@ async fn run_isanagent(
     }
 
     // 12. Setup API Channel
-    if let Some(api_cfg) = workspace.config.api.clone() {
+    let api_local_url = if let Some(api_cfg) = workspace.config.api.clone() {
         if api_cfg.enabled.unwrap_or(false) {
-            let api = ApiChannel::new(api_cfg, &db_path, logger_bus_tx.clone())?;
+            let api_port = api_cfg.port;
+            let api = ApiChannel::new(
+                api_cfg,
+                &db_path,
+                logger_bus_tx.clone(),
+                memory_node.clone(),
+            )?;
             let api = if let Some(mte_cron_scheduler) = mte_cron_scheduler.clone() {
                 api.with_multi_tenant_edge_cron_scheduler(mte_cron_scheduler)
             } else {
@@ -385,8 +391,13 @@ async fn run_isanagent(
             let api = Arc::new(api);
             api.start(inbound_tx.clone()).await?;
             out_channels.insert(api.name().to_string(), api);
+            Some(format!("http://127.0.0.1:{api_port}/"))
+        } else {
+            None
         }
-    }
+    } else {
+        None
+    };
 
     // 13. Setup Email Channel
     if let Some(email_cfg) = workspace.config.email.clone() {
@@ -404,6 +415,12 @@ async fn run_isanagent(
     );
     println!("isanagent Version: {}", env!("CARGO_PKG_VERSION").green());
     println!("Terminal Session ID: {}", terminal_chat_id.dimmed());
+    if let Some(url) = &api_local_url {
+        println!(
+            "HTTP API (Vite UI proxies here): {}",
+            url.green()
+        );
+    }
     println!(
         "Loaded Skills ({}): {}",
         skill_count.to_string().cyan(),

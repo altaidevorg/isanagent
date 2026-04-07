@@ -1,49 +1,72 @@
-import { useEffect, useMemo, useRef, useState, useTransition } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 
-type MessageRole = "user" | "assistant";
+const SESSION_CHAT_KEY = "isanagent_internal_chat_id";
+const SESSION_RESPONSE_KEY = "isanagent_latest_response_id";
+const SESSION_USER_KEY = "isanagent_api_user_id";
 
 type Message = {
   id: string;
-  role: MessageRole;
+  role: string;
   content: string;
-  createdAt: number;
 };
 
-type Conversation = {
-  id: string;
-  title: string;
-  createdAt: number;
-  updatedAt: number;
-  latestResponseId: string | null;
-  messages: Message[];
+type HistoryRow = {
+  role: string;
+  content: string;
 };
 
-type StoredState = {
-  userId: string;
-  activeConversationId: string | null;
-  conversations: Conversation[];
-};
+function pickResponseId(raw: unknown): string | null {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+  const id = (raw as { id?: unknown }).id;
+  return typeof id === "string" && id.length > 0 ? id : null;
+}
 
-type ResponsesOutputContent = {
-  type: string;
-  text?: string;
-};
+/** Present on current isanagent; older binaries omit it. */
+function pickInternalChatId(raw: unknown): string | null {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+  const o = raw as Record<string, unknown>;
+  const snake = o.internal_chat_id;
+  const camel = o.internalChatId;
+  if (typeof snake === "string" && snake.length > 0) {
+    return snake;
+  }
+  if (typeof camel === "string" && camel.length > 0) {
+    return camel;
+  }
+  return null;
+}
 
-type ResponsesOutputItem = {
-  content?: ResponsesOutputContent[];
-};
-
-type ResponsesResponse = {
-  id: string;
-  output?: ResponsesOutputItem[];
-};
-
-const STORAGE_KEY = "agent_rs_ui_state_v1";
-const DEFAULT_TITLE = "New conversation";
+/** Used when the API does not return internal_chat_id (legacy server). */
+function extractOutputText(raw: unknown): string {
+  if (!raw || typeof raw !== "object") {
+    return "(No assistant text in response.)";
+  }
+  const output = (raw as { output?: unknown }).output;
+  if (!Array.isArray(output) || output.length === 0) {
+    return "(No assistant text in response.)";
+  }
+  const first = output[0] as { content?: unknown };
+  const parts = first?.content;
+  if (!Array.isArray(parts)) {
+    return "(No assistant text in response.)";
+  }
+  const textPart = parts.find(
+    (c: unknown) =>
+      typeof c === "object" &&
+      c !== null &&
+      (c as { type?: string }).type === "output_text" &&
+      typeof (c as { text?: string }).text === "string",
+  ) as { text?: string } | undefined;
+  return textPart?.text?.trim() || "(No assistant text in response.)";
+}
 
 function createId() {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -52,123 +75,42 @@ function createId() {
   return `id_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
-function buildDefaultState(): StoredState {
-  return {
-    userId: `ui_${createId()}`,
-    activeConversationId: null,
-    conversations: [],
-  };
-}
-
-function loadStoredState(): StoredState {
+function readSessionChatId(): string | null {
   if (typeof window === "undefined") {
-    return buildDefaultState();
+    return null;
   }
-
-  const rawValue = window.localStorage.getItem(STORAGE_KEY);
-  if (!rawValue) {
-    return buildDefaultState();
-  }
-
-  try {
-    const parsed = JSON.parse(rawValue) as Partial<StoredState>;
-    const userId =
-      typeof parsed.userId === "string" && parsed.userId.length > 0
-        ? parsed.userId
-        : `ui_${createId()}`;
-    const conversations = Array.isArray(parsed.conversations)
-      ? parsed.conversations.filter(isConversation)
-      : [];
-    const storedActiveConversationId =
-      typeof parsed.activeConversationId === "string"
-        ? parsed.activeConversationId
-        : null;
-    const activeConversationId = conversations.some(
-      (conversation) => conversation.id === storedActiveConversationId,
-    )
-      ? storedActiveConversationId
-      : conversations[0]?.id ?? null;
-
-    return {
-      userId,
-      activeConversationId,
-      conversations,
-    };
-  } catch {
-    return buildDefaultState();
-  }
+  const v = sessionStorage.getItem(SESSION_CHAT_KEY);
+  return v && v.length > 0 ? v : null;
 }
 
-function isMessage(value: unknown): value is Message {
-  if (!value || typeof value !== "object") {
-    return false;
+function readSessionResponseId(): string | null {
+  if (typeof window === "undefined") {
+    return null;
   }
-
-  const candidate = value as Partial<Message>;
-  return (
-    typeof candidate.id === "string" &&
-    (candidate.role === "user" || candidate.role === "assistant") &&
-    typeof candidate.content === "string" &&
-    typeof candidate.createdAt === "number"
-  );
+  const v = sessionStorage.getItem(SESSION_RESPONSE_KEY);
+  return v && v.length > 0 ? v : null;
 }
 
-function isConversation(value: unknown): value is Conversation {
-  if (!value || typeof value !== "object") {
-    return false;
+function persistSessionPointers(internalChatId: string, latestResponseId: string) {
+  sessionStorage.setItem(SESSION_CHAT_KEY, internalChatId);
+  sessionStorage.setItem(SESSION_RESPONSE_KEY, latestResponseId);
+}
+
+function clearSessionPointers() {
+  sessionStorage.removeItem(SESSION_CHAT_KEY);
+  sessionStorage.removeItem(SESSION_RESPONSE_KEY);
+}
+
+function apiUserId(): string {
+  if (typeof window === "undefined") {
+    return "ui_anon";
   }
-
-  const candidate = value as Partial<Conversation>;
-  return (
-    typeof candidate.id === "string" &&
-    typeof candidate.title === "string" &&
-    typeof candidate.createdAt === "number" &&
-    typeof candidate.updatedAt === "number" &&
-    (typeof candidate.latestResponseId === "string" ||
-      candidate.latestResponseId === null) &&
-    Array.isArray(candidate.messages) &&
-    candidate.messages.every(isMessage)
-  );
-}
-
-function deriveTitle(content: string) {
-  const trimmed = content.trim().replace(/\s+/g, " ");
-  if (!trimmed) {
-    return DEFAULT_TITLE;
+  let id = sessionStorage.getItem(SESSION_USER_KEY);
+  if (!id || id.length === 0) {
+    id = `ui_${createId()}`;
+    sessionStorage.setItem(SESSION_USER_KEY, id);
   }
-  if (trimmed.length <= 42) {
-    return trimmed;
-  }
-  return `${trimmed.slice(0, 39)}...`;
-}
-
-function createConversation(): Conversation {
-  const now = Date.now();
-  return {
-    id: createId(),
-    title: DEFAULT_TITLE,
-    createdAt: now,
-    updatedAt: now,
-    latestResponseId: null,
-    messages: [],
-  };
-}
-
-function extractAssistantText(response: ResponsesResponse) {
-  const content = response.output
-    ?.flatMap((item) => item.content ?? [])
-    .find((entry) => entry.type === "output_text" && typeof entry.text === "string");
-
-  return content?.text?.trim() || "The agent returned an empty response.";
-}
-
-function formatTimestamp(value: number) {
-  return new Intl.DateTimeFormat(undefined, {
-    hour: "2-digit",
-    minute: "2-digit",
-    month: "short",
-    day: "numeric",
-  }).format(new Date(value));
+  return id;
 }
 
 function buildErrorMessage(error: unknown) {
@@ -178,18 +120,22 @@ function buildErrorMessage(error: unknown) {
   return "Request failed. Try again.";
 }
 
-function rollbackOptimisticMessage(
-  conversation: Conversation,
-  userMessageId: string,
-): Conversation {
-  const messages = conversation.messages.filter((message) => message.id !== userMessageId);
+function historyRowsToMessages(rows: HistoryRow[]): Message[] {
+  return rows.map((row, i) => ({
+    id: `srv-${i}-${row.role}`,
+    role: row.role,
+    content: row.content,
+  }));
+}
 
-  return {
-    ...conversation,
-    title: messages.length === 0 ? DEFAULT_TITLE : conversation.title,
-    updatedAt: messages[messages.length - 1]?.createdAt ?? conversation.createdAt,
-    messages,
-  };
+function bubbleStyle(role: string) {
+  if (role === "user") {
+    return "ml-auto bg-primary text-primary-foreground";
+  }
+  if (role === "assistant") {
+    return "mr-auto border border-border/70 bg-background/90 text-foreground";
+  }
+  return "mx-auto max-w-[90%] border border-dashed border-border/80 bg-muted/40 text-foreground";
 }
 
 type ComposerProps = {
@@ -221,14 +167,14 @@ function Composer({ disabled, onSubmit }: ComposerProps) {
             void submit();
           }
         }}
-        placeholder="Ask Agent-RS anything. Shift+Enter for a new line."
+        placeholder="Message the agent (same session store as terminal). Shift+Enter for newline."
         value={draft}
       />
       <div className="mt-4 flex items-center justify-between gap-3">
         <p className="text-xs text-muted-foreground">
           {disabled
             ? "Waiting for the current response to finish."
-            : "Messages are stored in this browser and continued via /v1/responses."}
+            : "Transcript lives in workspace SQLite; this tab only keeps session ids in sessionStorage."}
         </p>
         <Button disabled={disabled || draft.trim().length === 0} onClick={() => void submit()}>
           {disabled ? "Working..." : "Send"}
@@ -239,121 +185,68 @@ function Composer({ disabled, onSubmit }: ComposerProps) {
 }
 
 export default function App() {
-  const [state, setState] = useState<StoredState>(() => loadStoredState());
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [internalChatId, setInternalChatId] = useState<string | null>(() => readSessionChatId());
+  const [latestResponseId, setLatestResponseId] = useState<string | null>(() => readSessionResponseId());
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [pendingConversationId, setPendingConversationId] = useState<string | null>(null);
-  const [isNavPending, startTransition] = useTransition();
+  const [pending, setPending] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [, startTransition] = useTransition();
   const endOfMessagesRef = useRef<HTMLDivElement | null>(null);
+  const requestUserId = useMemo(() => apiUserId(), []);
+
+  const loadHistory = useCallback(async (sessionId: string) => {
+    setHistoryLoading(true);
+    setErrorMessage(null);
+    try {
+      const response = await fetch(`/v1/sessions/${encodeURIComponent(sessionId)}/messages`);
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as
+          | { error?: { message?: string } }
+          | null;
+        throw new Error(payload?.error?.message || `History request failed (${response.status}).`);
+      }
+      const rows = (await response.json()) as HistoryRow[];
+      setMessages(historyRowsToMessages(rows));
+    } catch (error) {
+      setErrorMessage(buildErrorMessage(error));
+      clearSessionPointers();
+      setInternalChatId(null);
+      setLatestResponseId(null);
+      setMessages([]);
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
-    try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-    } catch {
-      // Ignore local persistence failures and keep the in-memory session usable.
+    const id = readSessionChatId();
+    if (id) {
+      void loadHistory(id);
     }
-  }, [state]);
-
-  const sortedConversations = useMemo(
-    () =>
-      [...state.conversations].sort((left, right) => right.updatedAt - left.updatedAt),
-    [state.conversations],
-  );
-
-  const activeConversation = useMemo(() => {
-    return (
-      state.conversations.find(
-        (conversation) => conversation.id === state.activeConversationId,
-      ) ?? null
-    );
-  }, [state.activeConversationId, state.conversations]);
+  }, [loadHistory]);
 
   useEffect(() => {
     endOfMessagesRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [activeConversation?.messages.length, pendingConversationId]);
-
-  const selectConversation = (conversationId: string) => {
-    startTransition(() => {
-      setState((currentState) => ({
-        ...currentState,
-        activeConversationId: conversationId,
-      }));
-    });
-  };
+  }, [messages.length, pending]);
 
   const startNewConversation = () => {
     startTransition(() => {
-      setState((currentState) => {
-        const conversation = createConversation();
-        return {
-          ...currentState,
-          activeConversationId: conversation.id,
-          conversations: [conversation, ...currentState.conversations],
-        };
-      });
+      clearSessionPointers();
+      setInternalChatId(null);
+      setLatestResponseId(null);
+      setMessages([]);
       setErrorMessage(null);
     });
   };
 
   const submitMessage = async (content: string) => {
-    if (pendingConversationId) {
+    if (pending) {
       return;
     }
 
     setErrorMessage(null);
-
-    const requestUserId = state.userId;
-    let conversationId = state.activeConversationId;
-    let latestResponseId: string | null = null;
-    const userMessage: Message = {
-      id: createId(),
-      role: "user",
-      content,
-      createdAt: Date.now(),
-    };
-
-    setState((currentState) => {
-      const conversations = [...currentState.conversations];
-      const now = Date.now();
-
-      let conversationIndex = conversationId
-        ? conversations.findIndex((conversation) => conversation.id === conversationId)
-        : -1;
-
-      if (conversationIndex === -1) {
-        const conversation = createConversation();
-        conversationId = conversation.id;
-        conversations.unshift(conversation);
-        conversationIndex = 0;
-      }
-
-      const currentConversation = conversations[conversationIndex];
-      latestResponseId = currentConversation.latestResponseId;
-
-      const nextConversation: Conversation = {
-        ...currentConversation,
-        title:
-          currentConversation.messages.length === 0 ||
-          currentConversation.title === DEFAULT_TITLE
-            ? deriveTitle(content)
-            : currentConversation.title,
-        updatedAt: now,
-        messages: [...currentConversation.messages, userMessage],
-      };
-
-      conversations[conversationIndex] = nextConversation;
-
-      return {
-        ...currentState,
-        activeConversationId: conversationId,
-        conversations,
-      };
-    });
-
-    if (!conversationId) {
-      throw new Error("Conversation state could not be created.");
-    }
-
-    setPendingConversationId(conversationId);
+    setPending(true);
 
     try {
       const response = await fetch("/v1/responses", {
@@ -376,231 +269,136 @@ export default function App() {
         throw new Error(payload?.error?.message || `Request failed with ${response.status}.`);
       }
 
-      const data = (await response.json()) as ResponsesResponse;
-      const assistantMessage: Message = {
-        id: createId(),
-        role: "assistant",
-        content: extractAssistantText(data),
-        createdAt: Date.now(),
-      };
+      const raw: unknown = await response.json();
+      const responseId = pickResponseId(raw);
+      if (!responseId) {
+        throw new Error("Invalid API response: missing id.");
+      }
 
-      setState((currentState) => ({
-        ...currentState,
-        conversations: currentState.conversations.map((conversation) =>
-          conversation.id === conversationId
-            ? {
-                ...conversation,
-                latestResponseId: data.id,
-                updatedAt: assistantMessage.createdAt,
-                messages: [...conversation.messages, assistantMessage],
-              }
-            : conversation,
-        ),
-      }));
+      const chatId = pickInternalChatId(raw);
+      if (chatId) {
+        persistSessionPointers(chatId, responseId);
+        setInternalChatId(chatId);
+        setLatestResponseId(responseId);
+        const assistantText = extractOutputText(raw);
+        setMessages((prev) => [
+          ...prev,
+          { id: createId(), role: "user", content },
+          { id: createId(), role: "assistant", content: assistantText },
+        ]);
+      } else {
+        // Older isanagent without internal_chat_id (and no GET /v1/sessions/.../messages).
+        sessionStorage.setItem(SESSION_RESPONSE_KEY, responseId);
+        sessionStorage.removeItem(SESSION_CHAT_KEY);
+        setLatestResponseId(responseId);
+        setInternalChatId(null);
+        const assistantText = extractOutputText(raw);
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: createId(),
+            role: "user",
+            content,
+          },
+          {
+            id: createId(),
+            role: "assistant",
+            content: assistantText,
+          },
+        ]);
+      }
     } catch (error) {
-      setState((currentState) => ({
-        ...currentState,
-        conversations: currentState.conversations.map((conversation) =>
-          conversation.id === conversationId
-            ? rollbackOptimisticMessage(conversation, userMessage.id)
-            : conversation,
-        ),
-      }));
       setErrorMessage(buildErrorMessage(error));
     } finally {
-      setPendingConversationId(null);
+      setPending(false);
     }
   };
 
   return (
     <div className="h-dvh overflow-hidden px-4 py-5 sm:px-6 lg:px-8">
-      <div className="mx-auto flex h-[calc(100dvh-2.5rem)] w-full max-w-7xl gap-4 overflow-hidden lg:gap-6">
-        <aside className="hidden min-h-0 w-80 shrink-0 rounded-[2rem] border border-border/70 bg-card/90 p-5 shadow-panel backdrop-blur lg:flex lg:flex-col">
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-[0.24em] text-muted-foreground">
-                Agent-RS
-              </p>
-              <h1 className="mt-2 text-2xl font-semibold tracking-tight">
-                Built-in UI
-              </h1>
-            </div>
-            <Button onClick={startNewConversation} size="sm">
+      <div className="mx-auto flex h-[calc(100dvh-2.5rem)] w-full max-w-4xl flex-col overflow-hidden rounded-[2rem] border border-border/70 bg-card/85 shadow-panel backdrop-blur">
+        <div className="flex items-center justify-between gap-3 border-b border-border/70 px-5 py-4 sm:px-6">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-[0.24em] text-muted-foreground">
+              Agent-RS
+            </p>
+            <h1 className="mt-1 text-xl font-semibold tracking-tight">Chat (server-backed)</h1>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Same <span className="font-mono">session_id</span> memory as the terminal channel; transcript
+              from <span className="font-mono">GET /v1/sessions/…/messages</span>.
+            </p>
+          </div>
+          <div className="flex flex-col items-end gap-2 sm:flex-row sm:items-center">
+            <Button onClick={startNewConversation} size="sm" variant="outline">
               New chat
             </Button>
+            <span className="rounded-full bg-accent px-3 py-1 text-xs font-medium text-accent-foreground">
+              {pending || historyLoading ? "Syncing…" : internalChatId ? "In session" : "New session"}
+            </span>
           </div>
+        </div>
 
-          <div className="mt-4 rounded-2xl bg-secondary/65 p-4 text-sm text-secondary-foreground">
-            <p className="font-medium">Local-first mode</p>
-            <p className="mt-1 text-xs leading-5 text-secondary-foreground/80">
-              Browser state persists conversations. The server only stores response chain ids.
-            </p>
-          </div>
-
-          <div className="mt-5 flex-1 overflow-y-auto pr-1">
-            <div className="space-y-2">
-              {sortedConversations.length === 0 ? (
-                <div className="rounded-2xl border border-dashed border-border bg-background/80 p-4 text-sm text-muted-foreground">
-                  Start a chat to create your first local conversation.
-                </div>
-              ) : (
-                sortedConversations.map((conversation) => {
-                  const isActive = conversation.id === state.activeConversationId;
-                  return (
-                    <button
-                      className={cn(
-                        "w-full rounded-2xl border px-4 py-3 text-left transition-colors",
-                        isActive
-                          ? "border-primary/50 bg-primary/10 text-foreground"
-                          : "border-transparent bg-background/70 hover:border-border hover:bg-accent/50",
-                      )}
-                      key={conversation.id}
-                      onClick={() => selectConversation(conversation.id)}
-                      type="button"
-                    >
-                      <div className="flex items-center justify-between gap-4">
-                        <p className="line-clamp-1 font-medium">{conversation.title}</p>
-                        <span className="text-[11px] text-muted-foreground">
-                          {formatTimestamp(conversation.updatedAt)}
-                        </span>
-                      </div>
-                      <p className="mt-2 line-clamp-2 text-xs leading-5 text-muted-foreground">
-                        {conversation.messages[conversation.messages.length - 1]?.content ||
-                          "No messages yet."}
-                      </p>
-                    </button>
-                  );
-                })
-              )}
-            </div>
-          </div>
-
-          <div className="mt-4 rounded-2xl border border-border/70 bg-background/80 p-4 text-xs text-muted-foreground">
-            <p>User id</p>
-            <p className="mt-1 break-all font-mono text-[11px] text-foreground/80">
-              {state.userId}
-            </p>
-          </div>
-        </aside>
-
-        <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-[2rem] border border-border/70 bg-card/85 shadow-panel backdrop-blur">
-          <div className="flex items-center justify-between gap-3 border-b border-border/70 px-5 py-4 sm:px-6">
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-[0.24em] text-muted-foreground">
-                Chat
-              </p>
-              <h2 className="mt-1 text-xl font-semibold tracking-tight">
-                {activeConversation?.title || "New conversation"}
-              </h2>
-            </div>
-            <div className="flex items-center gap-2">
-              <Button className="lg:hidden" onClick={startNewConversation} size="sm" variant="outline">
-                New chat
-              </Button>
-              <span className="rounded-full bg-accent px-3 py-1 text-xs font-medium text-accent-foreground">
-                {pendingConversationId ? "Waiting for response" : "Ready"}
-              </span>
-            </div>
-          </div>
-
-          <div className="border-b border-border/70 px-4 py-3 lg:hidden">
-            <div className="flex gap-2 overflow-x-auto pb-1">
-              {sortedConversations.length === 0 ? (
-                <div className="rounded-full border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
-                  No saved conversations yet
-                </div>
-              ) : (
-                sortedConversations.map((conversation) => (
-                  <button
-                    className={cn(
-                      "shrink-0 rounded-full border px-3 py-2 text-xs font-medium transition-colors",
-                      conversation.id === state.activeConversationId
-                        ? "border-primary/40 bg-primary/10 text-foreground"
-                        : "border-border bg-background/80 text-muted-foreground",
-                    )}
-                    key={conversation.id}
-                    onClick={() => selectConversation(conversation.id)}
-                    type="button"
-                  >
-                    {conversation.title}
-                  </button>
-                ))
-              )}
-            </div>
-          </div>
-
-          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4 sm:px-6">
-            {activeConversation?.messages.length ? (
-              <div className="mx-auto flex min-h-full w-full max-w-4xl flex-col gap-4">
-                {activeConversation.messages.map((message) => (
-                  <article
-                    className={cn(
-                      "max-w-[82%] rounded-[1.5rem] px-4 py-3 shadow-sm",
-                      message.role === "user"
-                        ? "ml-auto bg-primary text-primary-foreground"
-                        : "mr-auto border border-border/70 bg-background/90 text-foreground",
-                    )}
-                    key={message.id}
-                  >
-                    <div className="flex items-center justify-between gap-4">
-                      <span className="text-[11px] font-semibold uppercase tracking-[0.2em] opacity-70">
-                        {message.role}
-                      </span>
-                      <span className="text-[11px] opacity-70">
-                        {formatTimestamp(message.createdAt)}
-                      </span>
-                    </div>
-                    <p className="mt-2 whitespace-pre-wrap text-sm leading-7">
-                      {message.content}
-                    </p>
-                  </article>
-                ))}
-
-                {pendingConversationId === activeConversation.id ? (
-                  <div className="mr-auto max-w-[82%] rounded-[1.5rem] border border-dashed border-border bg-background/80 px-4 py-3 text-sm text-muted-foreground">
-                    Agent-RS is generating a response...
+        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4 sm:px-6">
+          {messages.length > 0 ? (
+            <div className="mx-auto flex min-h-full w-full max-w-3xl flex-col gap-4">
+              {messages.map((message) => (
+                <article
+                  className={cn("max-w-[82%] rounded-[1.5rem] px-4 py-3 shadow-sm", bubbleStyle(message.role))}
+                  key={message.id}
+                >
+                  <div className="flex items-center gap-4">
+                    <span className="text-[11px] font-semibold uppercase tracking-[0.2em] opacity-70">
+                      {message.role}
+                    </span>
                   </div>
-                ) : null}
+                  <p className="mt-2 whitespace-pre-wrap text-sm leading-7">{message.content}</p>
+                </article>
+              ))}
 
-                <div ref={endOfMessagesRef} />
-              </div>
-            ) : (
-              <div className="mx-auto flex min-h-full max-w-3xl flex-col justify-center">
-                <div className="rounded-[2rem] border border-dashed border-border/80 bg-background/70 p-8 text-center">
-                  <p className="text-xs font-semibold uppercase tracking-[0.3em] text-muted-foreground">
-                    Embedded UI
-                  </p>
-                  <h3 className="mt-3 text-3xl font-semibold tracking-tight">
-                    Talk to Agent-RS without Slack
-                  </h3>
-                  <p className="mx-auto mt-3 max-w-2xl text-sm leading-7 text-muted-foreground">
-                    This UI keeps conversations in your browser and continues them by sending the
-                    last stored response id back to the existing responses API.
-                  </p>
-                  <div className="mt-6 flex flex-wrap items-center justify-center gap-2 text-xs text-muted-foreground">
-                    <span className="rounded-full bg-secondary px-3 py-1">Same-origin API</span>
-                    <span className="rounded-full bg-secondary px-3 py-1">Local persistence</span>
-                    <span className="rounded-full bg-secondary px-3 py-1">Final-only responses</span>
-                  </div>
-                </div>
-              </div>
-            )}
-          </div>
-
-          <div className="border-t border-border/70 px-4 py-4 sm:px-6">
-            <div className="mx-auto max-w-4xl">
-              {errorMessage ? (
-                <div className="mb-3 rounded-2xl border border-destructive/20 bg-destructive/10 px-4 py-3 text-sm text-destructive">
-                  {errorMessage}
+              {pending ? (
+                <div className="mr-auto max-w-[82%] rounded-[1.5rem] border border-dashed border-border bg-background/80 px-4 py-3 text-sm text-muted-foreground">
+                  Agent-RS is generating a response…
                 </div>
               ) : null}
-              <Composer
-                disabled={pendingConversationId !== null || isNavPending}
-                onSubmit={submitMessage}
-              />
+
+              <div ref={endOfMessagesRef} />
             </div>
+          ) : (
+            <div className="mx-auto flex min-h-full max-w-2xl flex-col justify-center">
+              <div className="rounded-[2rem] border border-dashed border-border/80 bg-background/70 p-8 text-center">
+                <p className="text-xs font-semibold uppercase tracking-[0.3em] text-muted-foreground">
+                  Terminal-style persistence
+                </p>
+                <h2 className="mt-3 text-2xl font-semibold tracking-tight">No browser transcript cache</h2>
+                <p className="mx-auto mt-3 text-sm leading-7 text-muted-foreground">
+                  Messages are stored in the workspace database under the current session id (like the CLI).
+                  This page only keeps the session and last response id in{" "}
+                  <span className="font-mono text-xs">sessionStorage</span> so the tab can continue after
+                  refresh.
+                </p>
+                <Button className="mt-6" onClick={startNewConversation} variant="secondary">
+                  Clear tab session pointers
+                </Button>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="border-t border-border/70 px-4 py-4 sm:px-6">
+          <div className="mx-auto max-w-3xl">
+            {internalChatId ? (
+              <p className="mb-2 break-all font-mono text-[10px] text-muted-foreground">
+                session: {internalChatId}
+              </p>
+            ) : null}
+            {errorMessage ? (
+              <div className="mb-3 rounded-2xl border border-destructive/20 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+                {errorMessage}
+              </div>
+            ) : null}
+            <Composer disabled={pending || historyLoading} onSubmit={submitMessage} />
           </div>
-        </main>
+        </div>
       </div>
     </div>
   );
