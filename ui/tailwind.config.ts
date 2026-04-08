@@ -5,6 +5,15 @@ const config: Config = {
   content: ["./index.html", "./src/**/*.{ts,tsx}"],
   theme: {
     extend: {
+      fontFamily: {
+        sans: [
+          '"DM Sans"',
+          "ui-sans-serif",
+          "system-ui",
+          "-apple-system",
+          "sans-serif",
+        ],
+      },
       borderRadius: {
         lg: "var(--radius)",
         md: "calc(var(--radius) - 2px)",
@@ -17,6 +26,7 @@ const config: Config = {
         "muted-foreground": "hsl(var(--muted-foreground))",
         border: "hsl(var(--border))",
         input: "hsl(var(--input))",
+        ring: "hsl(var(--ring))",
         primary: {
           DEFAULT: "hsl(var(--primary))",
           foreground: "hsl(var(--primary-foreground))",
@@ -39,7 +49,11 @@ const config: Config = {
         },
       },
       boxShadow: {
-        panel: "0 24px 60px rgba(50, 35, 16, 0.16)",
+        /* Design system inset (buttons on light fill) */
+        "btn-inset":
+          "rgba(255,255,255,0.1) 0px 0.5px 0px 0px inset, rgba(0,0,0,0.45) 0px 0px 0px 0.5px inset, rgba(0,0,0,0.25) 0px 1px 2px 0px",
+        panel: "0 4px 24px rgba(0, 0, 0, 0.35)",
+        "focus-soft": "0 4px 12px rgba(0, 0, 0, 0.3)",
       },
     },
   },

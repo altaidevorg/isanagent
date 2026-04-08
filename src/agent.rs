@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
 
 use crate::bus::{BusMessage, LogEvent, OutboundMessage, TelemetryEvent};
@@ -13,6 +13,8 @@ use crate::tool_activity::SharedToolExecutionActivity;
 use crate::tools::ToolRegistry;
 use crate::traits::{Memory, Provider, Tool};
 use crate::{ActorError, ActorLogic};
+
+static REDACTED_THINKING_STRIP_RE: OnceLock<Regex> = OnceLock::new();
 
 /// The central logic for an autonomous Agent running inside an ActorNode.
 /// It holds a LLM Provider, a persistent Memory context, and available Tools.
@@ -180,7 +182,13 @@ impl ActorLogic<BusMessage> for AgentLogic {
             .map(|t| format!(", thread: '{}'", t))
             .unwrap_or_default();
         let now = chrono::Local::now().to_rfc3339();
-        let runtime_context = format!("[RUNTIME CONTEXT] Current time is {}. You are navigating and responding in channel: '{}', with chat ID: '{}'{}.\n\n", now, inbound.channel, inbound.chat_id, thread_info);
+        let runtime_context = format!(
+            "[RUNTIME CONTEXT] Current time is {}. You are navigating and responding in channel: '{}', with chat ID: '{}'{}.",
+            now,
+            inbound.channel,
+            inbound.chat_id,
+            thread_info
+        ) + crate::utils::RUNTIME_CONTEXT_END_SUFFIX;
 
         let contextualized_content = format!("{}{}", runtime_context, inbound.content);
 
@@ -347,8 +355,11 @@ impl ActorLogic<BusMessage> for AgentLogic {
             }
 
             if !tool_invoked {
-                // Done reasoning. Strip <think>...</think> tags out of final output to user.
-                let re = Regex::new(r"(?s)<think>.*?</think>\n*").unwrap();
+                // Final outbound text: strip blocks matched by `REDACTED_THINKING_STRIP_PATTERN`.
+                let re = REDACTED_THINKING_STRIP_RE.get_or_init(|| {
+                    Regex::new(crate::utils::REDACTED_THINKING_STRIP_PATTERN)
+                        .expect("redacted thinking strip regex")
+                });
                 let clean_response = re.replace_all(&response_text, "").to_string();
 
                 // Emit outbound response payload.

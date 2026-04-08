@@ -1,12 +1,13 @@
 use async_trait::async_trait;
 use log::debug;
-use rusqlite::{Connection, params};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use tokio::sync::oneshot;
 
 use crate::{ActorLogic, ActorError};
 use crate::utils::{ChatMessage, ContentPart, MessageContent};
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 pub struct SharedReply<T>(pub Arc<Mutex<Option<oneshot::Sender<T>>>>);
 
@@ -36,6 +37,43 @@ impl<T> SharedReply<T> {
     }
 }
 
+/// Stored `messages.content`: JSON array of [`ContentPart`] or legacy plain text.
+fn message_content_from_stored(s: String) -> MessageContent {
+    if s.trim_start().starts_with('[') {
+        match serde_json::from_str::<Vec<ContentPart>>(&s) {
+            Ok(parts) => MessageContent::Parts(parts),
+            Err(_) => {
+                debug!("SqliteMemoryActor: failed to parse content as ContentPart array, treating as plain text");
+                MessageContent::Text(s)
+            }
+        }
+    } else {
+        MessageContent::Text(s)
+    }
+}
+
+fn first_user_preview_from_content(s: String) -> Option<String> {
+    let message_content = message_content_from_stored(s);
+    if let MessageContent::Parts(parts) = &message_content {
+        let has_text = parts.iter().any(|p| {
+            matches!(p, ContentPart::Text { text } if !text.trim().is_empty())
+        });
+        let has_image = parts
+            .iter()
+            .any(|p| matches!(p, ContentPart::ImageUrl { .. }));
+        if !has_text && has_image {
+            return Some("Image".to_string());
+        }
+    }
+    let text = message_content.text_content();
+    let t = text.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
 /// Messages sent to the SqliteMemoryActor
 #[derive(Clone, Debug)]
 pub enum MemoryMessage {
@@ -47,6 +85,16 @@ pub enum MemoryMessage {
     GetContext {
         session_id: String,
         reply: SharedReply<Result<Vec<ChatMessage>, String>>,
+    },
+    /// Plain-text preview from the earliest user turn (for session list titles).
+    FirstUserMessagePreview {
+        session_id: String,
+        reply: SharedReply<Result<Option<String>, String>>,
+    },
+    /// Batch variant: one SQLite round-trip for many `session_id`s (same order as input).
+    FirstUserMessagePreviewsBatch {
+        session_ids: Vec<String>,
+        reply: SharedReply<Result<Vec<Option<String>>, String>>,
     },
     Clear {
         session_id: String,
@@ -136,6 +184,11 @@ impl SqliteMemoryActor {
             [],
         )?;
 
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_session_role_id ON messages (session_id, role, id)",
+            [],
+        )?;
+
         // Create the session_summaries table for reflections
         conn.execute(
             "CREATE TABLE IF NOT EXISTS session_summaries (
@@ -179,6 +232,13 @@ impl SqliteMemoryActor {
             "CREATE TRIGGER IF NOT EXISTS session_summaries_ai AFTER INSERT ON session_summaries BEGIN
                 INSERT INTO session_summaries_fts(rowid, session_id, summary, key_info, knowledge_gaps)
                 VALUES (new.id, new.session_id, new.summary, new.key_info, new.knowledge_gaps);
+            END;",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS session_summaries_ad AFTER DELETE ON session_summaries BEGIN
+                DELETE FROM session_summaries_fts WHERE rowid = old.id;
             END;",
             [],
         )?;
@@ -232,21 +292,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                         let tool_calls_str: Option<String> = row.get(3)?;
                         let tool_calls = tool_calls_str.and_then(|s| serde_json::from_str(&s).ok());
                         let content_raw: Option<String> = row.get(1)?;
-                        let content = content_raw.map(|s| {
-                            // Try to parse as a JSON array of ContentPart (multimodal).
-                            // Fall back to treating the raw string as plain text (legacy format).
-                            if s.trim_start().starts_with('[') {
-                                match serde_json::from_str::<Vec<ContentPart>>(&s) {
-                                    Ok(parts) => MessageContent::Parts(parts),
-                                    Err(_) => {
-                                        debug!("SqliteMemoryActor: failed to parse content as ContentPart array, treating as plain text");
-                                        MessageContent::Text(s)
-                                    }
-                                }
-                            } else {
-                                MessageContent::Text(s)
-                            }
-                        });
+                        let content = content_raw.map(message_content_from_stored);
                         Ok(ChatMessage {
                             role: row.get(0)?,
                             content,
@@ -268,12 +314,88 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
 
                 let _ = reply.send(res);
             }
+            MemoryMessage::FirstUserMessagePreview { session_id, reply } => {
+                let res = (|| -> Result<Option<String>, String> {
+                    let mut stmt = self
+                        .conn
+                        .prepare(
+                            "SELECT content FROM messages WHERE session_id = ?1 AND role = 'user' ORDER BY id ASC LIMIT 1",
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let content_raw: Option<String> = stmt
+                        .query_row(params![session_id], |row| row.get(0))
+                        .optional()
+                        .map_err(|e| e.to_string())?;
+                    let Some(s) = content_raw else {
+                        return Ok(None);
+                    };
+                    Ok(first_user_preview_from_content(s))
+                })();
+
+                let _ = reply.send(res);
+            }
+            MemoryMessage::FirstUserMessagePreviewsBatch {
+                session_ids,
+                reply,
+            } => {
+                let res = (|| -> Result<Vec<Option<String>>, String> {
+                    if session_ids.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    let placeholders = session_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                    let sql = format!(
+                        "SELECT m.session_id, m.content FROM messages m
+                         INNER JOIN (
+                             SELECT session_id, MIN(id) AS min_id
+                             FROM messages
+                             WHERE role = 'user' AND session_id IN ({placeholders})
+                             GROUP BY session_id
+                         ) t ON m.session_id = t.session_id AND m.id = t.min_id AND m.role = 'user'"
+                    );
+                    let mut stmt = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
+                    let mut rows = stmt
+                        .query(params_from_iter(session_ids.iter()))
+                        .map_err(|e| e.to_string())?;
+
+                    let mut map: HashMap<String, Option<String>> = HashMap::new();
+                    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                        let sid: String = row.get(0).map_err(|e| e.to_string())?;
+                        let content: String = row.get(1).map_err(|e| e.to_string())?;
+                        map.insert(sid, first_user_preview_from_content(content));
+                    }
+
+                    Ok(session_ids
+                        .iter()
+                        .map(|id| match map.get(id.as_str()) {
+                            None => None,
+                            Some(preview) => preview.clone(),
+                        })
+                        .collect())
+                })();
+
+                let _ = reply.send(res);
+            }
             MemoryMessage::Clear { session_id, reply } => {
-                let res = self.conn.execute(
-                    "DELETE FROM messages WHERE session_id = ?1",
-                    params![session_id],
-                ).map_err(|e| e.to_string()).map(|_| ());
-                
+                let res = (|| -> Result<(), String> {
+                    let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+                    tx.execute(
+                        "DELETE FROM session_summaries WHERE session_id = ?1",
+                        params![session_id],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    tx.execute(
+                        "DELETE FROM session_metadata WHERE session_id = ?1",
+                        params![session_id],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    tx.execute(
+                        "DELETE FROM messages WHERE session_id = ?1",
+                        params![session_id],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    tx.commit().map_err(|e| e.to_string())?;
+                    Ok(())
+                })();
                 let _ = reply.send(res);
             }
             MemoryMessage::AddSummary { session_id, summary, key_info, knowledge_gaps, reply } => {

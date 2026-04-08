@@ -15,6 +15,15 @@ pub(super) struct StoredResponse {
     pub(super) model: String,
 }
 
+/// One row per distinct conversation for a given API user (`sender_id`).
+#[derive(Clone, Debug)]
+pub(super) struct SessionListRow {
+    pub(super) internal_chat_id: String,
+    pub(super) updated_at: i64,
+    /// Most recent `response_id` for `POST /v1/responses` chaining.
+    pub(super) latest_response_id: String,
+}
+
 #[derive(Clone, Debug)]
 enum ApiStoreMessage {
     InsertResponse {
@@ -27,6 +36,16 @@ enum ApiStoreMessage {
     GetResponse {
         response_id: String,
         reply: SharedReply<Result<Option<StoredResponse>, String>>,
+    },
+    ListSessionsBySender {
+        sender_id: String,
+        limit: u32,
+        reply: SharedReply<Result<Vec<SessionListRow>, String>>,
+    },
+    DeleteSessionResponses {
+        internal_chat_id: String,
+        sender_id: String,
+        reply: SharedReply<Result<usize, String>>,
     },
 }
 
@@ -135,6 +154,69 @@ impl ActorLogic<ApiStoreMessage> for SqliteApiResponseStoreActor {
                     .map_err(|e| format!("Failed to load response state: {}", e));
                 let _ = reply.send(result);
             }
+            ApiStoreMessage::ListSessionsBySender {
+                sender_id,
+                limit,
+                reply,
+            } => {
+                let result = (|| -> Result<Vec<SessionListRow>, String> {
+                    let limit_i64 = i64::from(limit);
+                    let mut stmt = self
+                        .conn
+                        .prepare(
+                            "WITH RankedResponses AS (
+                                SELECT
+                                    internal_chat_id,
+                                    response_id,
+                                    created_at,
+                                    ROW_NUMBER() OVER (
+                                        PARTITION BY internal_chat_id ORDER BY created_at DESC
+                                    ) AS rn
+                                FROM api_responses
+                                WHERE sender_id = ?1
+                            )
+                            SELECT
+                                internal_chat_id,
+                                created_at AS updated_at,
+                                response_id AS latest_response_id
+                            FROM RankedResponses
+                            WHERE rn = 1
+                            ORDER BY updated_at DESC
+                            LIMIT ?2",
+                        )
+                        .map_err(|e| format!("Failed to list sessions: {}", e))?;
+                    let rows = stmt
+                        .query_map(params![sender_id, limit_i64], |row| {
+                            Ok(SessionListRow {
+                                internal_chat_id: row.get(0)?,
+                                updated_at: row.get(1)?,
+                                latest_response_id: row.get(2)?,
+                            })
+                        })
+                        .map_err(|e| format!("Failed to list sessions: {}", e))?;
+                    let mut out = Vec::new();
+                    for r in rows {
+                        out.push(r.map_err(|e| format!("Failed to read session row: {}", e))?);
+                    }
+                    Ok(out)
+                })();
+                let _ = reply.send(result);
+            }
+            ApiStoreMessage::DeleteSessionResponses {
+                internal_chat_id,
+                sender_id,
+                reply,
+            } => {
+                let result = self
+                    .conn
+                    .execute(
+                        "DELETE FROM api_responses
+                         WHERE internal_chat_id = ?1 AND sender_id = ?2",
+                        params![internal_chat_id, sender_id],
+                    )
+                    .map_err(|e| format!("Failed to delete session responses: {}", e));
+                let _ = reply.send(result);
+            }
         }
 
         Ok(None)
@@ -185,6 +267,45 @@ impl ResponseStore {
             .send_packet(msg)
             .await
             .map_err(|e| format!("Failed to send response store get request: {}", e))?;
+        rx.await
+            .map_err(|_| "API response store actor channel closed".to_string())?
+    }
+
+    pub(super) async fn list_sessions_by_sender(
+        &self,
+        sender_id: &str,
+        limit: u32,
+    ) -> Result<Vec<SessionListRow>, String> {
+        let (tx, rx) = oneshot::channel();
+        let msg = ApiStoreMessage::ListSessionsBySender {
+            sender_id: sender_id.to_string(),
+            limit,
+            reply: SharedReply::new(tx),
+        };
+        self.node
+            .send_packet(msg)
+            .await
+            .map_err(|e| format!("Failed to send list sessions request: {}", e))?;
+        rx.await
+            .map_err(|_| "API response store actor channel closed".to_string())?
+    }
+
+    /// Deletes persisted response-chain rows for this conversation and sender. Returns rows removed.
+    pub(super) async fn delete_session_responses(
+        &self,
+        internal_chat_id: &str,
+        sender_id: &str,
+    ) -> Result<usize, String> {
+        let (tx, rx) = oneshot::channel();
+        let msg = ApiStoreMessage::DeleteSessionResponses {
+            internal_chat_id: internal_chat_id.to_string(),
+            sender_id: sender_id.to_string(),
+            reply: SharedReply::new(tx),
+        };
+        self.node
+            .send_packet(msg)
+            .await
+            .map_err(|e| format!("Failed to send delete session request: {}", e))?;
         rx.await
             .map_err(|_| "API response store actor channel closed".to_string())?
     }

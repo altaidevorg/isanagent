@@ -3,6 +3,15 @@ use serde_json::json;
 use std::time::Duration;
 use log::{info, debug};
 
+/// Suffix after the human-readable runtime context line on user messages (see `agent` injection).
+/// API and previews strip through this marker so wording inside the `[RUNTIME CONTEXT]` line can evolve.
+pub const RUNTIME_CONTEXT_END_SUFFIX: &str = "\n---ISANAGENT_RUNTIME_CONTEXT_END---\n\n";
+
+/// Regex pattern for stripping `<redacted_thinking>...</redacted_thinking>` from model output.
+/// Shared by the agent (outbound cleanup) and the HTTP API transcript builder.
+pub const REDACTED_THINKING_STRIP_PATTERN: &str =
+    r"(?s)<redacted_thinking>.*?</redacted_thinking>\s*";
+
 // --- Multimodal Content Types ---
 
 /// A single part within a multimodal message content array.

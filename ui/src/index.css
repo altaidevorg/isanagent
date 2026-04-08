@@ -2,25 +2,62 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Lovable-inspired themes — :root = light, .dark = dark */
 @layer base {
   :root {
-    --background: 36 55% 97%;
-    --foreground: 28 24% 16%;
-    --muted: 35 32% 92%;
-    --muted-foreground: 28 14% 42%;
-    --border: 28 28% 82%;
-    --input: 28 28% 82%;
-    --primary: 17 82% 42%;
-    --primary-foreground: 32 100% 98%;
-    --secondary: 146 28% 90%;
-    --secondary-foreground: 158 44% 20%;
-    --accent: 42 100% 89%;
-    --accent-foreground: 26 40% 22%;
+    color-scheme: light;
+    /* #f7f4ed cream page */
+    --background: 48 33% 95%;
+    /* #1c1c1c charcoal text */
+    --foreground: 0 0% 11%;
+    /* Elevated surface */
+    --muted: 43 25% 92%;
+    /* #5f5f5d */
+    --muted-foreground: 60 2% 37%;
+    /* #eceae4 borders */
+    --border: 40 18% 90%;
+    --input: 40 18% 90%;
+    /* Primary = dark control (charcoal fill) */
+    --primary: 0 0% 11%;
+    --primary-foreground: 40 45% 98%;
+    --secondary: 43 22% 94%;
+    --secondary-foreground: 0 0% 11%;
+    --accent: 43 28% 93%;
+    --accent-foreground: 0 0% 11%;
     --card: 0 0% 100%;
-    --card-foreground: 28 24% 16%;
-    --destructive: 0 77% 44%;
-    --destructive-foreground: 0 0% 100%;
-    --radius: 1rem;
+    --card-foreground: 0 0% 11%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 98%;
+    --ring: 217 91% 60%;
+    --radius: 0.75rem;
+    /* Ghost / dashed borders (charcoal at ~35%) */
+    --ghost-border: rgba(28, 28, 28, 0.35);
+    --ghost-fill: rgba(28, 28, 28, 0.06);
+    --ghost-fill-strong: rgba(28, 28, 28, 0.04);
+  }
+
+  .dark {
+    color-scheme: dark;
+    --background: 48 8% 9%;
+    --foreground: 43 14% 89%;
+    --muted: 43 7% 13%;
+    --muted-foreground: 60 2% 60%;
+    --border: 40 7% 17%;
+    --input: 40 7% 17%;
+    --primary: 43 14% 89%;
+    --primary-foreground: 48 8% 9%;
+    --secondary: 43 6% 14%;
+    --secondary-foreground: 43 14% 89%;
+    --accent: 43 10% 16%;
+    --accent-foreground: 43 14% 89%;
+    --card: 48 8% 11%;
+    --card-foreground: 43 14% 89%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 98%;
+    --ring: 217 91% 60%;
+    --ghost-border: rgba(232, 229, 222, 0.35);
+    --ghost-fill: rgba(232, 229, 222, 0.06);
+    --ghost-fill-strong: rgba(232, 229, 222, 0.04);
   }
 
   * {
@@ -28,17 +65,17 @@
   }
 
   body {
-    @apply bg-background text-foreground antialiased;
-    background-image:
-      radial-gradient(circle at top left, rgba(244, 140, 6, 0.12), transparent 28%),
-      radial-gradient(circle at top right, rgba(46, 125, 50, 0.12), transparent 28%),
-      linear-gradient(180deg, #fffaf2 0%, #f7f2ea 100%);
+    @apply min-h-dvh bg-background text-foreground antialiased;
     font-family:
-      "IBM Plex Sans",
-      "Avenir Next",
-      "Segoe UI",
+      "DM Sans",
+      ui-sans-serif,
+      system-ui,
+      -apple-system,
       sans-serif;
-    min-height: 100dvh;
+    font-size: 16px;
+    font-weight: 400;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
   }
 
   #root {
