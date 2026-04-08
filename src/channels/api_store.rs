@@ -215,7 +215,7 @@ impl ActorLogic<ApiStoreMessage> for SqliteApiResponseStoreActor {
                         params![internal_chat_id, sender_id],
                     )
                     .map_err(|e| format!("Failed to delete session responses: {}", e));
-                let _ = reply.send(result.map(|n| n));
+                let _ = reply.send(result);
             }
         }
 

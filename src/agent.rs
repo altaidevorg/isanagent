@@ -354,7 +354,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
 
             if !tool_invoked {
                 // Done reasoning. Strip <think>...</think> tags out of final output to user.
-                let re = Regex::new(r"(?s)<think>.*?</think>\n*").unwrap();
+                let re = Regex::new(crate::utils::REDACTED_THINKING_STRIP_PATTERN).unwrap();
                 let clean_response = re.replace_all(&response_text, "").to_string();
 
                 // Emit outbound response payload.

@@ -498,11 +498,16 @@ export default function App() {
         `/v1/sessions/${encodeURIComponent(entry.internal_chat_id)}?${q.toString()}`,
         { method: "DELETE" },
       );
+      const payload = (await response.json().catch(() => null)) as
+        | { deleted?: boolean; error?: { message?: string } }
+        | null;
       if (!response.ok) {
-        const payload = (await response.json().catch(() => null)) as
-          | { error?: { message?: string } }
-          | null;
         throw new Error(payload?.error?.message || `Delete failed (${response.status}).`);
+      }
+      if (!payload?.deleted) {
+        throw new Error(
+          "This conversation was not deleted (not found or not allowed for this user).",
+        );
       }
       setSessions((prev) => prev.filter((s) => s.internal_chat_id !== entry.internal_chat_id));
       setSidebarHints((prev) => {

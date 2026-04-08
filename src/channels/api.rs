@@ -34,7 +34,10 @@ use crate::NodeHandle;
 use crate::scheduler::{
     CronWebhookError, MultiTenantEdgeCronScheduler, PendingCronTriggerFinalize,
 };
-use crate::utils::{ContentPart, ImageUrl, MessageContent, RUNTIME_CONTEXT_END_SUFFIX};
+use crate::utils::{
+    ContentPart, ImageUrl, MessageContent, REDACTED_THINKING_STRIP_PATTERN,
+    RUNTIME_CONTEXT_END_SUFFIX,
+};
 
 const AGENT_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_API_USER: &str = "api_user";
@@ -978,8 +981,7 @@ fn runtime_context_prefix_re() -> &'static Regex {
 fn redacted_thinking_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"(?s)<redacted_thinking>.*?</redacted_thinking>\s*")
-            .expect("redacted thinking strip regex")
+        Regex::new(REDACTED_THINKING_STRIP_PATTERN).expect("redacted thinking strip regex")
     })
 }
 
@@ -1243,27 +1245,34 @@ async fn handle_delete_session(
         .find(|s| !s.is_empty())
         .unwrap_or(session_id);
 
-    // Clear workspace memory first so we never orphan transcripts if the API store step fails.
-    // If memory succeeds but response rows fail to delete, the client still sees the session and can retry.
-    let memory_session_id = resolve_memory_session_id(&state, session_id);
-    if let Err(message) =
-        memory_clear_session(&state.memory_node, memory_session_id.as_ref()).await
-    {
-        return ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "memory_unavailable",
-            message,
-        )
-        .into_response();
-    }
-
+    // Verify ownership via the API store before touching memory: `delete` only removes rows
+    // where `internal_chat_id` and `sender_id` match, so `removed == 0` means no access.
     match state
         .response_store
         .delete_session_responses(bare_id, user)
         .await
     {
+        Ok(removed) if removed > 0 => {
+            let memory_session_id = resolve_memory_session_id(&state, session_id);
+            if let Err(message) =
+                memory_clear_session(&state.memory_node, memory_session_id.as_ref()).await
+            {
+                return ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "memory_unavailable",
+                    message,
+                )
+                .into_response();
+            }
+            Json(serde_json::json!({
+                "deleted": true,
+                "responses_removed": removed,
+                "internal_chat_id": bare_id,
+            }))
+            .into_response()
+        }
         Ok(removed) => Json(serde_json::json!({
-            "deleted": true,
+            "deleted": false,
             "responses_removed": removed,
             "internal_chat_id": bare_id,
         }))
