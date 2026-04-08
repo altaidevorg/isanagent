@@ -110,6 +110,15 @@ struct SessionHistoryMessage {
 #[derive(Debug, Deserialize)]
 struct SessionsQueryParams {
     user: String,
+    /// Max sessions to return (default 100, clamped 1–500).
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+fn clamp_session_list_limit(raw: Option<u32>) -> u32 {
+    const DEFAULT: u32 = 100;
+    const MAX: u32 = 500;
+    raw.unwrap_or(DEFAULT).clamp(1, MAX)
 }
 
 #[derive(Serialize)]
@@ -1139,28 +1148,47 @@ async fn handle_list_sessions(
         )
         .into_response();
     }
-    match state.response_store.list_sessions_by_sender(user).await {
+    let limit = clamp_session_list_limit(params.limit);
+    match state
+        .response_store
+        .list_sessions_by_sender(user, limit)
+        .await
+    {
         Ok(rows) => {
-            let mut body = Vec::with_capacity(rows.len());
-            for row in rows {
-                let memory_sid = resolve_memory_session_id(&state, &row.internal_chat_id);
-                let preview_raw = memory_first_user_preview(&state.memory_node, memory_sid.as_ref())
-                    .await
-                    .ok()
-                    .flatten();
-                let preview = preview_raw
-                    .as_deref()
-                    .map(strip_runtime_context_prefix)
-                    .map(|s| truncate_chat_preview(&s))
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_default();
-                body.push(SessionListEntry {
-                    internal_chat_id: row.internal_chat_id,
-                    updated_at: row.updated_at,
-                    latest_response_id: row.latest_response_id,
-                    preview,
-                });
-            }
+            let memory = state.memory_node.clone();
+            let preview_tasks: Vec<_> = rows
+                .iter()
+                .map(|row| {
+                    let memory_sid =
+                        resolve_memory_session_id(&state, &row.internal_chat_id).into_owned();
+                    let node = memory.clone();
+                    async move {
+                        memory_first_user_preview(&node, &memory_sid)
+                            .await
+                            .ok()
+                            .flatten()
+                    }
+                })
+                .collect();
+            let previews = futures::future::join_all(preview_tasks).await;
+            let body: Vec<SessionListEntry> = rows
+                .into_iter()
+                .zip(previews)
+                .map(|(row, preview_raw)| {
+                    let preview = preview_raw
+                        .as_deref()
+                        .map(strip_runtime_context_prefix)
+                        .map(|s| truncate_chat_preview(&s))
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_default();
+                    SessionListEntry {
+                        internal_chat_id: row.internal_chat_id,
+                        updated_at: row.updated_at,
+                        latest_response_id: row.latest_response_id,
+                        preview,
+                    }
+                })
+                .collect();
             Json(body).into_response()
         }
         Err(message) => ApiError::new(

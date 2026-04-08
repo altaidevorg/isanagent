@@ -36,6 +36,21 @@ impl<T> SharedReply<T> {
     }
 }
 
+/// Stored `messages.content`: JSON array of [`ContentPart`] or legacy plain text.
+fn message_content_from_stored(s: String) -> MessageContent {
+    if s.trim_start().starts_with('[') {
+        match serde_json::from_str::<Vec<ContentPart>>(&s) {
+            Ok(parts) => MessageContent::Parts(parts),
+            Err(_) => {
+                debug!("SqliteMemoryActor: failed to parse content as ContentPart array, treating as plain text");
+                MessageContent::Text(s)
+            }
+        }
+    } else {
+        MessageContent::Text(s)
+    }
+}
+
 /// Messages sent to the SqliteMemoryActor
 #[derive(Clone, Debug)]
 pub enum MemoryMessage {
@@ -188,6 +203,13 @@ impl SqliteMemoryActor {
             [],
         )?;
 
+        conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS session_summaries_ad AFTER DELETE ON session_summaries BEGIN
+                DELETE FROM session_summaries_fts WHERE rowid = old.id;
+            END;",
+            [],
+        )?;
+
         // global_metadata table (moved here from reflection.rs)
         conn.execute(
             "CREATE TABLE IF NOT EXISTS global_metadata (
@@ -237,21 +259,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                         let tool_calls_str: Option<String> = row.get(3)?;
                         let tool_calls = tool_calls_str.and_then(|s| serde_json::from_str(&s).ok());
                         let content_raw: Option<String> = row.get(1)?;
-                        let content = content_raw.map(|s| {
-                            // Try to parse as a JSON array of ContentPart (multimodal).
-                            // Fall back to treating the raw string as plain text (legacy format).
-                            if s.trim_start().starts_with('[') {
-                                match serde_json::from_str::<Vec<ContentPart>>(&s) {
-                                    Ok(parts) => MessageContent::Parts(parts),
-                                    Err(_) => {
-                                        debug!("SqliteMemoryActor: failed to parse content as ContentPart array, treating as plain text");
-                                        MessageContent::Text(s)
-                                    }
-                                }
-                            } else {
-                                MessageContent::Text(s)
-                            }
-                        });
+                        let content = content_raw.map(message_content_from_stored);
                         Ok(ChatMessage {
                             role: row.get(0)?,
                             content,
@@ -288,14 +296,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     let Some(s) = content_raw else {
                         return Ok(None);
                     };
-                    let message_content = if s.trim_start().starts_with('[') {
-                        match serde_json::from_str::<Vec<ContentPart>>(&s) {
-                            Ok(parts) => MessageContent::Parts(parts),
-                            Err(_) => MessageContent::Text(s),
-                        }
-                    } else {
-                        MessageContent::Text(s)
-                    };
+                    let message_content = message_content_from_stored(s);
                     if let MessageContent::Parts(parts) = &message_content {
                         let has_text = parts.iter().any(|p| {
                             matches!(p, ContentPart::Text { text } if !text.trim().is_empty())
@@ -319,11 +320,26 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 let _ = reply.send(res);
             }
             MemoryMessage::Clear { session_id, reply } => {
-                let res = self.conn.execute(
-                    "DELETE FROM messages WHERE session_id = ?1",
-                    params![session_id],
-                ).map_err(|e| e.to_string()).map(|_| ());
-                
+                let res = (|| -> Result<(), String> {
+                    let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+                    tx.execute(
+                        "DELETE FROM session_summaries WHERE session_id = ?1",
+                        params![session_id],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    tx.execute(
+                        "DELETE FROM session_metadata WHERE session_id = ?1",
+                        params![session_id],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    tx.execute(
+                        "DELETE FROM messages WHERE session_id = ?1",
+                        params![session_id],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    tx.commit().map_err(|e| e.to_string())?;
+                    Ok(())
+                })();
                 let _ = reply.send(res);
             }
             MemoryMessage::AddSummary { session_id, summary, key_info, knowledge_gaps, reply } => {

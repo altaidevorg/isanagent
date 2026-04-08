@@ -399,6 +399,7 @@ export default function App() {
   const [sessionsLoading, setSessionsLoading] = useState(false);
   const [sessions, setSessions] = useState<SessionListEntry[]>([]);
   const [sidebarHints, setSidebarHints] = useState<Record<string, string>>(loadSidebarHints);
+  const [sessionToDelete, setSessionToDelete] = useState<SessionListEntry | null>(null);
   const [, startTransition] = useTransition();
   const endOfMessagesRef = useRef<HTMLDivElement | null>(null);
   const requestUserId = useMemo(() => apiUserId(), []);
@@ -406,7 +407,7 @@ export default function App() {
   const loadSessions = useCallback(async () => {
     setSessionsLoading(true);
     try {
-      const q = new URLSearchParams({ user: requestUserId });
+      const q = new URLSearchParams({ user: requestUserId, limit: "100" });
       const response = await fetch(`/v1/sessions?${q.toString()}`);
       if (!response.ok) {
         const payload = (await response.json().catch(() => null)) as
@@ -479,11 +480,17 @@ export default function App() {
     });
   };
 
-  const deleteSession = async (entry: SessionListEntry, event: MouseEvent<HTMLButtonElement>) => {
+  const requestDeleteSession = (entry: SessionListEntry, event: MouseEvent<HTMLButtonElement>) => {
     event.stopPropagation();
-    if (!window.confirm("Delete this conversation from the server? This cannot be undone.")) {
+    setSessionToDelete(entry);
+  };
+
+  const confirmDeleteSession = async () => {
+    const entry = sessionToDelete;
+    if (!entry) {
       return;
     }
+    setSessionToDelete(null);
     setErrorMessage(null);
     try {
       const q = new URLSearchParams({ user: requestUserId });
@@ -574,16 +581,20 @@ export default function App() {
         });
 
         const bodyText = await response.text();
-        let payload: ApiErrorPayload = null;
+        let parsedBody: unknown = null;
+        let bodyParseOk = false;
         if (bodyText.length > 0) {
           try {
-            payload = JSON.parse(bodyText) as ApiErrorPayload;
+            parsedBody = JSON.parse(bodyText) as unknown;
+            bodyParseOk = true;
           } catch {
-            payload = null;
+            parsedBody = null;
+            bodyParseOk = false;
           }
         }
 
         if (!response.ok) {
+          const payload = parsedBody as ApiErrorPayload;
           if (
             attempt === 0 &&
             previousResponseId &&
@@ -601,7 +612,14 @@ export default function App() {
           );
         }
 
-        responseBody = JSON.parse(bodyText) as unknown;
+        if (!bodyParseOk) {
+          throw new Error(
+            bodyText.length === 0
+              ? "Empty response body."
+              : "Invalid JSON in response body.",
+          );
+        }
+        responseBody = parsedBody;
         break;
       }
 
@@ -656,6 +674,41 @@ export default function App() {
 
   return (
     <div className="flex h-dvh overflow-hidden bg-background font-sans">
+      {sessionToDelete ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="delete-session-title"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) {
+              setSessionToDelete(null);
+            }
+          }}
+        >
+          <div className="w-full max-w-md rounded-xl border border-border bg-card p-5 shadow-lg">
+            <h2 id="delete-session-title" className="text-lg font-semibold tracking-[-0.02em] text-foreground">
+              Delete conversation?
+            </h2>
+            <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
+              This removes the conversation from the server. It cannot be undone.
+            </p>
+            <div className="mt-5 flex justify-end gap-2">
+              <Button type="button" variant="outline" size="sm" onClick={() => setSessionToDelete(null)}>
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                className="bg-destructive text-destructive-foreground hover:opacity-90"
+                onClick={() => void confirmDeleteSession()}
+              >
+                Delete
+              </Button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       <aside className="flex w-64 shrink-0 flex-col border-r border-border bg-background/90 backdrop-blur-md">
         <div className="border-b border-border p-3">
           <div className="flex items-center justify-between gap-2">
@@ -707,7 +760,7 @@ export default function App() {
                         className="shrink-0 rounded-lg p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-destructive/15 hover:text-destructive group-hover:opacity-100"
                         title="Delete conversation"
                         type="button"
-                        onClick={(e) => void deleteSession(s, e)}
+                        onClick={(e) => requestDeleteSession(s, e)}
                       >
                         <span className="sr-only">Delete</span>
                         <TrashIcon />

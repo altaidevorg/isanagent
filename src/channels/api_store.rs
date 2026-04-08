@@ -39,6 +39,7 @@ enum ApiStoreMessage {
     },
     ListSessionsBySender {
         sender_id: String,
+        limit: u32,
         reply: SharedReply<Result<Vec<SessionListRow>, String>>,
     },
     DeleteSessionResponses {
@@ -155,25 +156,37 @@ impl ActorLogic<ApiStoreMessage> for SqliteApiResponseStoreActor {
             }
             ApiStoreMessage::ListSessionsBySender {
                 sender_id,
+                limit,
                 reply,
             } => {
                 let result = (|| -> Result<Vec<SessionListRow>, String> {
+                    let limit_i64 = i64::from(limit);
                     let mut stmt = self
                         .conn
                         .prepare(
-                            "SELECT ar.internal_chat_id,
-                                    MAX(ar.created_at) AS updated_at,
-                                    (SELECT response_id FROM api_responses y
-                                     WHERE y.sender_id = ?1 AND y.internal_chat_id = ar.internal_chat_id
-                                     ORDER BY y.created_at DESC LIMIT 1) AS latest_response_id
-                             FROM api_responses ar
-                             WHERE ar.sender_id = ?1
-                             GROUP BY ar.internal_chat_id
-                             ORDER BY updated_at DESC",
+                            "WITH RankedResponses AS (
+                                SELECT
+                                    internal_chat_id,
+                                    response_id,
+                                    created_at,
+                                    ROW_NUMBER() OVER (
+                                        PARTITION BY internal_chat_id ORDER BY created_at DESC
+                                    ) AS rn
+                                FROM api_responses
+                                WHERE sender_id = ?1
+                            )
+                            SELECT
+                                internal_chat_id,
+                                created_at AS updated_at,
+                                response_id AS latest_response_id
+                            FROM RankedResponses
+                            WHERE rn = 1
+                            ORDER BY updated_at DESC
+                            LIMIT ?2",
                         )
                         .map_err(|e| format!("Failed to list sessions: {}", e))?;
                     let rows = stmt
-                        .query_map(params![sender_id], |row| {
+                        .query_map(params![sender_id, limit_i64], |row| {
                             Ok(SessionListRow {
                                 internal_chat_id: row.get(0)?,
                                 updated_at: row.get(1)?,
@@ -261,10 +274,12 @@ impl ResponseStore {
     pub(super) async fn list_sessions_by_sender(
         &self,
         sender_id: &str,
+        limit: u32,
     ) -> Result<Vec<SessionListRow>, String> {
         let (tx, rx) = oneshot::channel();
         let msg = ApiStoreMessage::ListSessionsBySender {
             sender_id: sender_id.to_string(),
+            limit,
             reply: SharedReply::new(tx),
         };
         self.node
