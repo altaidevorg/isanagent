@@ -180,7 +180,13 @@ impl ActorLogic<BusMessage> for AgentLogic {
             .map(|t| format!(", thread: '{}'", t))
             .unwrap_or_default();
         let now = chrono::Local::now().to_rfc3339();
-        let runtime_context = format!("[RUNTIME CONTEXT] Current time is {}. You are navigating and responding in channel: '{}', with chat ID: '{}'{}.\n\n", now, inbound.channel, inbound.chat_id, thread_info);
+        let runtime_context = format!(
+            "[RUNTIME CONTEXT] Current time is {}. You are navigating and responding in channel: '{}', with chat ID: '{}'{}.",
+            now,
+            inbound.channel,
+            inbound.chat_id,
+            thread_info
+        ) + crate::utils::RUNTIME_CONTEXT_END_SUFFIX;
 
         let contextualized_content = format!("{}{}", runtime_context, inbound.content);
 

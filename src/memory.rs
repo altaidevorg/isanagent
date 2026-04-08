@@ -1,12 +1,13 @@
 use async_trait::async_trait;
 use log::debug;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use tokio::sync::oneshot;
 
 use crate::{ActorLogic, ActorError};
 use crate::utils::{ChatMessage, ContentPart, MessageContent};
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 pub struct SharedReply<T>(pub Arc<Mutex<Option<oneshot::Sender<T>>>>);
 
@@ -51,6 +52,28 @@ fn message_content_from_stored(s: String) -> MessageContent {
     }
 }
 
+fn first_user_preview_from_content(s: String) -> Option<String> {
+    let message_content = message_content_from_stored(s);
+    if let MessageContent::Parts(parts) = &message_content {
+        let has_text = parts.iter().any(|p| {
+            matches!(p, ContentPart::Text { text } if !text.trim().is_empty())
+        });
+        let has_image = parts
+            .iter()
+            .any(|p| matches!(p, ContentPart::ImageUrl { .. }));
+        if !has_text && has_image {
+            return Some("Image".to_string());
+        }
+    }
+    let text = message_content.text_content();
+    let t = text.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
 /// Messages sent to the SqliteMemoryActor
 #[derive(Clone, Debug)]
 pub enum MemoryMessage {
@@ -67,6 +90,11 @@ pub enum MemoryMessage {
     FirstUserMessagePreview {
         session_id: String,
         reply: SharedReply<Result<Option<String>, String>>,
+    },
+    /// Batch variant: one SQLite round-trip for many `session_id`s (same order as input).
+    FirstUserMessagePreviewsBatch {
+        session_ids: Vec<String>,
+        reply: SharedReply<Result<Vec<Option<String>>, String>>,
     },
     Clear {
         session_id: String,
@@ -153,6 +181,11 @@ impl SqliteMemoryActor {
         // Create an index to quickly filter by session_id
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_session_id ON messages (session_id)",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_session_role_id ON messages (session_id, role, id)",
             [],
         )?;
 
@@ -296,25 +329,48 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     let Some(s) = content_raw else {
                         return Ok(None);
                     };
-                    let message_content = message_content_from_stored(s);
-                    if let MessageContent::Parts(parts) = &message_content {
-                        let has_text = parts.iter().any(|p| {
-                            matches!(p, ContentPart::Text { text } if !text.trim().is_empty())
-                        });
-                        let has_image = parts
-                            .iter()
-                            .any(|p| matches!(p, ContentPart::ImageUrl { .. }));
-                        if !has_text && has_image {
-                            return Ok(Some("Image".to_string()));
-                        }
+                    Ok(first_user_preview_from_content(s))
+                })();
+
+                let _ = reply.send(res);
+            }
+            MemoryMessage::FirstUserMessagePreviewsBatch {
+                session_ids,
+                reply,
+            } => {
+                let res = (|| -> Result<Vec<Option<String>>, String> {
+                    if session_ids.is_empty() {
+                        return Ok(Vec::new());
                     }
-                    let text = message_content.text_content();
-                    let t = text.trim();
-                    if t.is_empty() {
-                        Ok(None)
-                    } else {
-                        Ok(Some(t.to_string()))
+                    let placeholders = session_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                    let sql = format!(
+                        "SELECT m.session_id, m.content FROM messages m
+                         INNER JOIN (
+                             SELECT session_id, MIN(id) AS min_id
+                             FROM messages
+                             WHERE role = 'user' AND session_id IN ({placeholders})
+                             GROUP BY session_id
+                         ) t ON m.session_id = t.session_id AND m.id = t.min_id AND m.role = 'user'"
+                    );
+                    let mut stmt = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
+                    let mut rows = stmt
+                        .query(params_from_iter(session_ids.iter()))
+                        .map_err(|e| e.to_string())?;
+
+                    let mut map: HashMap<String, Option<String>> = HashMap::new();
+                    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                        let sid: String = row.get(0).map_err(|e| e.to_string())?;
+                        let content: String = row.get(1).map_err(|e| e.to_string())?;
+                        map.insert(sid, first_user_preview_from_content(content));
                     }
+
+                    Ok(session_ids
+                        .iter()
+                        .map(|id| match map.get(id.as_str()) {
+                            None => None,
+                            Some(preview) => preview.clone(),
+                        })
+                        .collect())
                 })();
 
                 let _ = reply.send(res);

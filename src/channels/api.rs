@@ -34,7 +34,7 @@ use crate::NodeHandle;
 use crate::scheduler::{
     CronWebhookError, MultiTenantEdgeCronScheduler, PendingCronTriggerFinalize,
 };
-use crate::utils::{ContentPart, ImageUrl, MessageContent};
+use crate::utils::{ContentPart, ImageUrl, MessageContent, RUNTIME_CONTEXT_END_SUFFIX};
 
 const AGENT_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_API_USER: &str = "api_user";
@@ -984,6 +984,12 @@ fn redacted_thinking_re() -> &'static Regex {
 }
 
 fn strip_runtime_context_prefix(text: &str) -> String {
+    if let Some(idx) = text.find(RUNTIME_CONTEXT_END_SUFFIX) {
+        return text[idx + RUNTIME_CONTEXT_END_SUFFIX.len()..]
+            .trim_start()
+            .to_string();
+    }
+    // Legacy rows persisted before the stable end marker existed.
     runtime_context_prefix_re()
         .replace(text, "")
         .trim_start()
@@ -1104,13 +1110,16 @@ async fn memory_get_context(
         .map_err(|_| "Memory actor channel closed".to_string())?
 }
 
-async fn memory_first_user_preview(
+async fn memory_first_user_previews_batch(
     memory_node: &NodeHandle<MemoryMessage>,
-    session_id: &str,
-) -> Result<Option<String>, String> {
+    session_ids: Vec<String>,
+) -> Result<Vec<Option<String>>, String> {
+    if session_ids.is_empty() {
+        return Ok(Vec::new());
+    }
     let (tx, rx) = oneshot::channel();
-    let msg = MemoryMessage::FirstUserMessagePreview {
-        session_id: session_id.to_string(),
+    let msg = MemoryMessage::FirstUserMessagePreviewsBatch {
+        session_ids,
         reply: SharedReply::new(tx),
     };
     memory_node.send_packet(msg).await.map_err(|e| e.to_string())?;
@@ -1155,25 +1164,30 @@ async fn handle_list_sessions(
         .await
     {
         Ok(rows) => {
-            let memory = state.memory_node.clone();
-            let preview_tasks: Vec<_> = rows
+            let session_ids: Vec<String> = rows
                 .iter()
-                .map(|row| {
-                    let memory_sid =
-                        resolve_memory_session_id(&state, &row.internal_chat_id).into_owned();
-                    let node = memory.clone();
-                    async move {
-                        memory_first_user_preview(&node, &memory_sid)
-                            .await
-                            .ok()
-                            .flatten()
-                    }
-                })
+                .map(|row| resolve_memory_session_id(&state, &row.internal_chat_id).into_owned())
                 .collect();
-            let previews = futures::future::join_all(preview_tasks).await;
+            let preview_opts = match memory_first_user_previews_batch(&state.memory_node, session_ids)
+                .await
+            {
+                Ok(v) if v.len() == rows.len() => v,
+                Ok(v) => {
+                    error!(
+                        "session list preview batch length mismatch: got {} want {}",
+                        v.len(),
+                        rows.len()
+                    );
+                    vec![None; rows.len()]
+                }
+                Err(e) => {
+                    error!("session list preview batch failed: {}", e);
+                    vec![None; rows.len()]
+                }
+            };
             let body: Vec<SessionListEntry> = rows
                 .into_iter()
-                .zip(previews)
+                .zip(preview_opts)
                 .map(|(row, preview_raw)| {
                     let preview = preview_raw
                         .as_deref()
@@ -1229,30 +1243,31 @@ async fn handle_delete_session(
         .find(|s| !s.is_empty())
         .unwrap_or(session_id);
 
+    // Clear workspace memory first so we never orphan transcripts if the API store step fails.
+    // If memory succeeds but response rows fail to delete, the client still sees the session and can retry.
+    let memory_session_id = resolve_memory_session_id(&state, session_id);
+    if let Err(message) =
+        memory_clear_session(&state.memory_node, memory_session_id.as_ref()).await
+    {
+        return ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "memory_unavailable",
+            message,
+        )
+        .into_response();
+    }
+
     match state
         .response_store
         .delete_session_responses(bare_id, user)
         .await
     {
-        Ok(removed) => {
-            let memory_session_id = resolve_memory_session_id(&state, session_id);
-            if let Err(message) =
-                memory_clear_session(&state.memory_node, memory_session_id.as_ref()).await
-            {
-                return ApiError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "memory_unavailable",
-                    message,
-                )
-                .into_response();
-            }
-            Json(serde_json::json!({
-                "deleted": true,
-                "responses_removed": removed,
-                "internal_chat_id": bare_id,
-            }))
-            .into_response()
-        }
+        Ok(removed) => Json(serde_json::json!({
+            "deleted": true,
+            "responses_removed": removed,
+            "internal_chat_id": bare_id,
+        }))
+        .into_response(),
         Err(message) => ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "session_delete_unavailable",
