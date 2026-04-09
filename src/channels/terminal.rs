@@ -4,11 +4,85 @@ use crate::bus::{InboundMessage, OutboundMessage, BusMessage, LogEvent};
 use crate::logging::LoggerHandle;
 use crate::utils::{ContentPart, ImageUrl, resolve_path};
 use tokio::sync::mpsc::Sender;
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use log::error;
 use colored::Colorize;
 use crossterm::{cursor, terminal::{Clear, ClearType}, execute};
+use serde_json::json;
+
+const ISANAGENT_TOOL_NOTIFY: &str = "isanagent_tool_notify";
+const ISANAGENT_TOOL_PHASE: &str = "isanagent_tool_phase";
+
+fn truncate_display(s: &str, max_chars: usize) -> String {
+    let t = s.trim();
+    let n = t.chars().count();
+    if n <= max_chars {
+        return t.to_string();
+    }
+    let shortened: String = t.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{shortened}…")
+}
+
+fn summarize_tool_result_for_terminal(result: &str) -> String {
+    let t = result.trim();
+    if t.is_empty() {
+        return "(empty output)".to_string();
+    }
+    if t.starts_with("Error:") {
+        let line = t.lines().next().unwrap_or(t);
+        return truncate_display(line, 160);
+    }
+    if t.chars().count() <= 120 {
+        return t.to_string();
+    }
+    format!("{} chars", t.chars().count())
+}
+
+/// Live terminal line when a tool is invoked (mirrors telemetry, user-visible).
+pub fn build_tool_call_terminal_notice(
+    chat_id: &str,
+    tool_name: &str,
+    args: &str,
+) -> OutboundMessage {
+    let detail = truncate_display(args, 220);
+    let content = if detail.is_empty() {
+        tool_name.to_string()
+    } else {
+        format!("{tool_name} {detail}")
+    };
+    let mut metadata = HashMap::new();
+    metadata.insert(ISANAGENT_TOOL_NOTIFY.to_string(), json!(true));
+    metadata.insert(ISANAGENT_TOOL_PHASE.to_string(), json!("call"));
+    OutboundMessage {
+        channel: "terminal".to_string(),
+        chat_id: chat_id.to_string(),
+        thread_id: None,
+        content,
+        metadata,
+    }
+}
+
+/// Live terminal line when a tool finishes (short summary; avoids flooding the TTY).
+pub fn build_tool_result_terminal_notice(
+    chat_id: &str,
+    tool_name: &str,
+    result: &str,
+) -> OutboundMessage {
+    let summary = summarize_tool_result_for_terminal(result);
+    let content = format!("{tool_name} → {summary}");
+    let mut metadata = HashMap::new();
+    metadata.insert(ISANAGENT_TOOL_NOTIFY.to_string(), json!(true));
+    metadata.insert(ISANAGENT_TOOL_PHASE.to_string(), json!("result"));
+    OutboundMessage {
+        channel: "terminal".to_string(),
+        chat_id: chat_id.to_string(),
+        thread_id: None,
+        content,
+        metadata,
+    }
+}
 
 /// A Channel implementation that reads from standard input and writes to standard output.
 pub struct TerminalChannel {
@@ -243,12 +317,32 @@ impl Channel for TerminalChannel {
             Clear(ClearType::CurrentLine)
         );
 
-        let header = "[Agent]:".cyan().bold();
-        let content = msg.content.green();
-        
-        println!("{} {}", header, content);
-        
-        // Reprint the prompt marker 
+        let tool_notify = msg
+            .metadata
+            .get(ISANAGENT_TOOL_NOTIFY)
+            .and_then(|v| v.as_bool())
+            == Some(true);
+        let phase = msg
+            .metadata
+            .get(ISANAGENT_TOOL_PHASE)
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if tool_notify {
+            match phase {
+                "call" => println!("{} {}", "[Tool]".yellow().bold(), msg.content),
+                "result" => println!(
+                    "{} {}",
+                    "[Tool done]".yellow().bold(),
+                    msg.content.green()
+                ),
+                _ => println!("{} {}", "[Tool]".yellow().bold(), msg.content),
+            }
+        } else {
+            println!("{} {}", "[Agent]:".cyan().bold(), msg.content.green());
+        }
+
+        // Reprint the prompt marker (flush so tool/agent lines appear before the next await).
         print!("{}", "> ".bold().green());
         let _ = stdout.flush();
         Ok(())

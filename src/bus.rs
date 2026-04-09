@@ -32,11 +32,16 @@ pub struct OutboundMessage {
 pub enum TelemetryEvent {
     ToolCall {
         chat_id: String,
+        /// Originating channel (`terminal`, `api`, …) for routing live notifications.
+        #[serde(default)]
+        channel: String,
         tool_name: String,
         args: String,
     },
     ToolResult {
         chat_id: String,
+        #[serde(default)]
+        channel: String,
         tool_name: String,
         result: String,
     },

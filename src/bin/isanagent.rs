@@ -4,9 +4,12 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
 use isanagent::agent::AgentLogic;
-use isanagent::bus::{BusMessage, LoggerControlMessage};
+use isanagent::bus::{BusMessage, LoggerControlMessage, TelemetryEvent};
 use isanagent::channels::{
     api::ApiChannel, email::EmailChannel, slack::SlackChannel, terminal::TerminalChannel, Channel,
+};
+use isanagent::channels::terminal::{
+    build_tool_call_terminal_notice, build_tool_result_terminal_notice,
 };
 use isanagent::logging::{
     create_logger_channel, create_logging_actor_or_fallback, init_runtime_logger,
@@ -527,18 +530,59 @@ async fn run_isanagent(
     let delivery_channels = out_channels.clone();
     tokio::spawn(async move {
         while let Some(msg) = global_outbound_rx.recv().await {
-            let _ = logger_tx_outbound.send(msg.clone());
-            if let BusMessage::Outbound(out) = msg {
-                if let Some(chan) = delivery_channels.get(&out.channel) {
-                    if let Err(e) = chan.send(out).await {
-                        log::error!(
-                            "Failed to deliver message via channel [{}]: {}",
-                            chan.name(),
-                            e
-                        );
+            // Deliver user-visible terminal traffic first. `LoggerHandle::send` uses a blocking
+            // `sync_channel::send`; doing it before channel delivery can stall this task and make
+            // tool-call lines and agent replies appear only after the run finishes.
+            match &msg {
+                BusMessage::Outbound(out) => {
+                    if let Some(chan) = delivery_channels.get(&out.channel) {
+                        if let Err(e) = chan.send(out.clone()).await {
+                            log::error!(
+                                "Failed to deliver message via channel [{}]: {}",
+                                chan.name(),
+                                e
+                            );
+                        }
                     }
                 }
+                BusMessage::Telemetry(TelemetryEvent::ToolCall {
+                    channel,
+                    chat_id,
+                    tool_name,
+                    args,
+                }) if channel == "terminal" => {
+                    let notice =
+                        build_tool_call_terminal_notice(chat_id, tool_name, args);
+                    if let Some(chan) = delivery_channels.get("terminal") {
+                        if let Err(e) = chan.send(notice).await {
+                            log::error!(
+                                "Failed to deliver tool-call notice to terminal: {}",
+                                e
+                            );
+                        }
+                    }
+                }
+                BusMessage::Telemetry(TelemetryEvent::ToolResult {
+                    channel,
+                    chat_id,
+                    tool_name,
+                    result,
+                }) if channel == "terminal" => {
+                    let notice =
+                        build_tool_result_terminal_notice(chat_id, tool_name, result);
+                    if let Some(chan) = delivery_channels.get("terminal") {
+                        if let Err(e) = chan.send(notice).await {
+                            log::error!(
+                                "Failed to deliver tool-result notice to terminal: {}",
+                                e
+                            );
+                        }
+                    }
+                }
+                _ => {}
             }
+
+            let _ = logger_tx_outbound.send(msg.clone());
         }
     });
 
