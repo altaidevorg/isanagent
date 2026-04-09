@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   useTransition,
@@ -13,8 +14,7 @@ import { cn } from "@/lib/utils";
 
 const SESSION_CHAT_KEY = "isanagent_internal_chat_id";
 const SESSION_RESPONSE_KEY = "isanagent_latest_response_id";
-/** Single-tenant UI: one shared identity for `/v1/responses` and `/v1/sessions` (matches server `DEFAULT_API_USER`). */
-const UI_API_USER = "api_user";
+const SESSION_USER_KEY = "isanagent_api_user_id";
 const THEME_STORAGE_KEY = "isanagent-theme";
 const SIDEBAR_HINTS_KEY = "isanagent_sidebar_hints";
 
@@ -195,6 +195,18 @@ function persistSessionPointers(internalChatId: string, latestResponseId: string
 function clearSessionPointers() {
   sessionStorage.removeItem(SESSION_CHAT_KEY);
   sessionStorage.removeItem(SESSION_RESPONSE_KEY);
+}
+
+function apiUserId(): string {
+  if (typeof window === "undefined") {
+    return "ui_anon";
+  }
+  let id = sessionStorage.getItem(SESSION_USER_KEY);
+  if (!id || id.length === 0) {
+    id = `ui_${createId()}`;
+    sessionStorage.setItem(SESSION_USER_KEY, id);
+  }
+  return id;
 }
 
 function buildErrorMessage(error: unknown) {
@@ -391,10 +403,12 @@ export default function App() {
   const [, startTransition] = useTransition();
   const endOfMessagesRef = useRef<HTMLDivElement | null>(null);
 
+  const requestUserId = useMemo(() => apiUserId(), []);
+
   const loadSessions = useCallback(async () => {
     setSessionsLoading(true);
     try {
-      const q = new URLSearchParams({ user: UI_API_USER, limit: "100" });
+      const q = new URLSearchParams({ user: requestUserId, limit: "100" });
       const response = await fetch(`/v1/sessions?${q.toString()}`);
       if (!response.ok) {
         const payload = (await response.json().catch(() => null)) as
@@ -410,7 +424,7 @@ export default function App() {
     } finally {
       setSessionsLoading(false);
     }
-  }, []);
+  }, [requestUserId]);
 
   useEffect(() => {
     void loadSessions();
@@ -480,7 +494,7 @@ export default function App() {
     setSessionToDelete(null);
     setErrorMessage(null);
     try {
-      const q = new URLSearchParams({ user: UI_API_USER });
+      const q = new URLSearchParams({ user: requestUserId });
       const response = await fetch(
         `/v1/sessions/${encodeURIComponent(entry.internal_chat_id)}?${q.toString()}`,
         { method: "DELETE" },
@@ -492,7 +506,9 @@ export default function App() {
         throw new Error(payload?.error?.message || `Delete failed (${response.status}).`);
       }
       if (!payload?.deleted) {
-        throw new Error("This conversation was not deleted (not found on server).");
+        throw new Error(
+          "This conversation was not deleted (not found or not allowed for this user).",
+        );
       }
       setSessions((prev) => prev.filter((s) => s.internal_chat_id !== entry.internal_chat_id));
       setSidebarHints((prev) => {
@@ -566,7 +582,7 @@ export default function App() {
             input: buildResponsesInput(text, imageDataUrls),
             previous_response_id: previousResponseId,
             store: true,
-            user: UI_API_USER,
+            user: requestUserId,
           }),
         });
 
@@ -772,6 +788,9 @@ export default function App() {
                 Chat
               </p>
               <h1 className="mt-1 text-xl font-semibold tracking-[-0.02em] text-foreground">isanagent</h1>
+              <p className="mt-1 max-w-xl text-sm leading-relaxed text-muted-foreground">
+                Workspace-backed memory, multimodal input, and session list for this browser profile.
+              </p>
             </div>
             <span className="shrink-0 rounded-full border border-[color:var(--ghost-border)] bg-muted px-3 py-1 text-xs font-medium text-muted-foreground">
               {pending || historyLoading ? "Syncing…" : internalChatId ? "In session" : "New session"}
@@ -819,9 +838,20 @@ export default function App() {
             ) : (
               <div className="mx-auto flex min-h-full max-w-2xl flex-col justify-center">
                 <div className="rounded-xl border border-dashed border-[color:var(--ghost-border)] bg-[color:var(--ghost-fill-strong)] p-8 text-center">
-                  <h2 className="text-2xl font-semibold tracking-[-0.02em] text-foreground">
+                  <p className="text-xs font-medium uppercase tracking-[0.05em] text-muted-foreground">
+                    Workspace memory
+                  </p>
+                  <h2 className="mt-3 text-2xl font-semibold tracking-[-0.02em] text-foreground">
                     Start a conversation
                   </h2>
+                  <p className="mx-auto mt-3 text-sm leading-relaxed text-muted-foreground">
+                    Messages are stored in the workspace database. This tab keeps session ids in{" "}
+                    <span className="font-mono text-xs">sessionStorage</span>. Use the sidebar to switch or
+                    delete past chats.
+                  </p>
+                  <Button className="mt-6" onClick={startNewConversation} variant="secondary">
+                    New chat
+                  </Button>
                 </div>
               </div>
             )}
