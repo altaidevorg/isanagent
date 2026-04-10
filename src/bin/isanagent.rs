@@ -15,7 +15,7 @@ use isanagent::logging::{
     create_logger_channel, create_logging_actor_or_fallback, init_runtime_logger,
     LOGGER_QUEUE_CAPACITY,
 };
-use isanagent::onboarding::{onboard_workspace, BootstrapReport};
+use isanagent::onboarding::{onboard_workspace, BootstrapReport, OnboardOptions};
 use isanagent::provider::OpenAIProvider;
 use isanagent::scheduler::{
     validate_multi_tenant_edge_runtime, CronActor, CronSchedulingMode, CronTriggerPayload,
@@ -56,6 +56,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Create workspace layout and starter files; optional flags override generated config.toml
     Onboard(OnboardArgs),
 }
 
@@ -64,6 +65,9 @@ struct OnboardArgs {
     /// Optional explicit path to the workspace directory. Defaults to ~/.isanagent
     #[arg(short, long)]
     workspace: Option<String>,
+    /// Override embedded defaults for `config.toml` (see `isanagent onboard --help`)
+    #[command(flatten)]
+    options: OnboardOptions,
 }
 
 #[tokio::main]
@@ -71,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Onboard(args)) => run_onboard(args.workspace.or(cli.workspace)).await,
+        Some(Commands::Onboard(args)) => run_onboard(cli.workspace, args).await,
         None => run_isanagent(cli.workspace, cli.config).await,
     }
 }
@@ -653,18 +657,24 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     Ok(())
 }
 
-async fn run_onboard(workspace_arg: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_onboard(
+    global_workspace: Option<String>,
+    args: OnboardArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let workspace_arg = args.workspace.or(global_workspace);
+    let options = args.options;
+    let config_overrides_used = options.has_overrides();
     let report = tokio::task::spawn_blocking(move || {
         let workspace_root = resolve_workspace_root(workspace_arg.as_deref());
-        onboard_workspace(&workspace_root)
+        onboard_workspace(&workspace_root, &options)
     })
     .await?
     .map_err(std::io::Error::other)?;
-    print_onboarding_report(&report);
+    print_onboarding_report(&report, config_overrides_used);
     Ok(())
 }
 
-fn print_onboarding_report(report: &BootstrapReport) {
+fn print_onboarding_report(report: &BootstrapReport, config_overrides_used: bool) {
     println!("Workspace onboarded at {}", report.root.display());
     println!();
 
@@ -684,8 +694,15 @@ fn print_onboarding_report(report: &BootstrapReport) {
         println!();
     }
 
+    if config_overrides_used {
+        println!(
+            "Note: config.toml was generated from merged settings (template comments were omitted)."
+        );
+        println!();
+    }
+
     println!("Next steps:");
-    println!("1. Set GEMINI_API_KEY");
+    println!("1. Set GEMINI_API_KEY (or the env named in provider.api_key_env)");
     println!("2. Update <changethis> placeholders or disable unused channels in config.toml");
     println!("3. Run: isanagent --workspace {}", report.root.display());
 }
