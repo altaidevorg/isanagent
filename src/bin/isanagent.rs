@@ -123,6 +123,14 @@ async fn run_isanagent(
     println!("Loading Altbot workspace at: {:?}", workspace.dir);
     log::info!("Loading Altbot workspace at {:?}", workspace.dir);
 
+    if !workspace.config.terminal_enabled() && !workspace.config.has_non_terminal_inbound_channel() {
+        return Err(std::io::Error::other(
+            "Invalid config: [terminal] enable = false requires at least one other inbound channel. \
+Enable [api], [slack], or [email] (with enabled = true) so the agent can receive messages without stdin.",
+        )
+        .into());
+    }
+
     // 1. Setup SqliteMemoryActor and SessionManager
     let db_path = workspace
         .dir
@@ -349,19 +357,25 @@ async fn run_isanagent(
     // 8. Wrap Agent in NodeHandle
     let agent_node = NodeHandle::<BusMessage>::new(agent_logic, 100, 3, Duration::from_millis(50));
 
-    // 10. Setup Terminal Channel
+    // 10. Setup channels (terminal is optional for headless / Docker API-only runs)
     let (inbound_tx, mut inbound_rx) = mpsc::channel(100);
     let mut out_channels: HashMap<String, Arc<dyn Channel>> = HashMap::new();
 
-    let terminal_chat_id = uuid::Uuid::new_v4().to_string();
-    let terminal = Arc::new(TerminalChannel::new(
-        &terminal_chat_id,
-        logger_bus_tx.clone(),
-        shutdown_tx.clone(),
-        workspace.sandbox_dir.clone(),
-    ));
-    terminal.start(inbound_tx.clone()).await?;
-    out_channels.insert(terminal.name().to_string(), terminal);
+    let terminal_chat_id = if workspace.config.terminal_enabled() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let terminal = Arc::new(TerminalChannel::new(
+            &id,
+            logger_bus_tx.clone(),
+            shutdown_tx.clone(),
+            workspace.sandbox_dir.clone(),
+        ));
+        terminal.start(inbound_tx.clone()).await?;
+        out_channels.insert(terminal.name().to_string(), terminal);
+        Some(id)
+    } else {
+        log::info!("Terminal channel disabled via config; stdin will not be read.");
+        None
+    };
 
     // 11. Setup Slack Channel
     if let Some(slack_cfg) = workspace.config.slack.clone() {
@@ -417,7 +431,11 @@ async fn run_isanagent(
         "=============================================".blue()
     );
     println!("isanagent Version: {}", env!("CARGO_PKG_VERSION").green());
-    println!("Terminal Session ID: {}", terminal_chat_id.dimmed());
+    if let Some(id) = terminal_chat_id.as_ref() {
+        println!("Terminal Session ID: {}", id.dimmed());
+    } else {
+        println!("{}", "Terminal channel: disabled (headless mode)".dimmed());
+    }
     if let Some(url) = &api_local_url {
         println!(
             "HTTP API (Vite UI proxies here): {}",
@@ -436,14 +454,25 @@ async fn run_isanagent(
     );
     println!("{}", "=============================================".blue());
     println!("\n{}", "Agent System is Running.".bold().green());
-    println!(
-        "{}",
-        "Available actions: type a message in the terminal or on active chat channels.".cyan()
-    );
-    println!(
-        "{}",
-        "Tip: Type '/exit' to securely shut down the engine.\n".dimmed()
-    );
+    if terminal_chat_id.is_some() {
+        println!(
+            "{}",
+            "Available actions: type a message in the terminal or on active chat channels.".cyan()
+        );
+        println!(
+            "{}",
+            "Tip: Type '/exit' to securely shut down the engine.\n".dimmed()
+        );
+    } else {
+        println!(
+            "{}",
+            "Terminal input is disabled; use your enabled channel(s) (API, Slack, or Email).".cyan()
+        );
+        println!(
+            "{}",
+            "Tip: Press Ctrl+C to shut down the engine.\n".dimmed()
+        );
+    }
 
     // Route inbound messages from all channels into the agent and logger
     let agent_tx = agent_node.clone();
@@ -588,7 +617,7 @@ async fn run_isanagent(
 
     tokio::select! {
         _ = shutdown_rx.recv() => {
-            log::info!("Shutdown requested from terminal.");
+            log::info!("Shutdown requested (terminal /exit or internal signal).");
         }
         _ = tokio::signal::ctrl_c() => {
             log::info!("Shutdown requested via Ctrl+C.");

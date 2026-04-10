@@ -1,4 +1,9 @@
 restrict_to_workspace = true
+
+# Local stdin/stdout chat. Set enable = false for API-only or headless runs (requires another channel).
+[terminal]
+enable = true
+
 max_iterations = 50
 max_tool_output_chars = 10000
 # max_web_tool_output_chars = 50000  # optional cap for web_search / web_fetch (default 50000)

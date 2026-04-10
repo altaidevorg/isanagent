@@ -5,9 +5,9 @@ use crate::logging::LoggerHandle;
 use crate::utils::{ContentPart, ImageUrl, resolve_path};
 use tokio::sync::mpsc::Sender;
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
-use log::error;
+use log::{error, info};
 use colored::Colorize;
 use crossterm::{cursor, terminal::{Clear, ClearType}, execute};
 use serde_json::json;
@@ -235,6 +235,7 @@ impl Channel for TerminalChannel {
         
         tokio::task::spawn_blocking(move || {
             let stdin = io::stdin();
+            let stdin_is_tty = stdin.is_terminal();
             let mut input = String::new();
 
             loop {
@@ -242,9 +243,26 @@ impl Channel for TerminalChannel {
                 print!("{}", "> ".bold().green());
                 let _ = io::stdout().flush();
                 input.clear();
-                
+
                 // blocking wait on stdin
                 match stdin.read_line(&mut input) {
+                    Ok(0) => {
+                        // `Ok(0)` is EOF with no bytes read. If we treated it like an empty line we
+                        // would `continue` forever when stdin is closed/non-interactive (e.g. Docker
+                        // without `-i`).
+                        let msg = if !stdin_is_tty {
+                            "Terminal channel: exiting stdin loop after EOF while stdin is not a TTY \
+(non-interactive). Stops repeated empty reads; for API-only runs prefer `[terminal] enable = false` in config.toml."
+                        } else {
+                            "Terminal channel: stdin EOF; closing terminal input loop."
+                        };
+                        let _ = logger_tx.send(BusMessage::Log(LogEvent::info(
+                            "TerminalChannel",
+                            msg,
+                        )));
+                        info!("{}", msg);
+                        break;
+                    }
                     Ok(_) => {
                         let text = input.trim();
                         if text.is_empty() {
