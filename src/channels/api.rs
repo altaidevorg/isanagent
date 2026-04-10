@@ -17,8 +17,8 @@ use dashmap::{mapref::entry::Entry, DashMap};
 use log::{error, info};
 use moka::policy::EvictionPolicy;
 use moka::sync::Cache;
-use serde::{Deserialize, Serialize};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
@@ -29,15 +29,15 @@ use crate::channels::Channel;
 use crate::config::ApiConfig;
 use crate::logging::LoggerHandle;
 use crate::memory::{MemoryMessage, SharedReply};
-use crate::utils::ChatMessage;
-use crate::NodeHandle;
 use crate::scheduler::{
     CronWebhookError, MultiTenantEdgeCronScheduler, PendingCronTriggerFinalize,
 };
+use crate::utils::ChatMessage;
 use crate::utils::{
     ContentPart, ImageUrl, MessageContent, REDACTED_THINKING_STRIP_PATTERN,
     RUNTIME_CONTEXT_END_SUFFIX,
 };
+use crate::NodeHandle;
 
 const AGENT_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_API_USER: &str = "api_user";
@@ -854,7 +854,10 @@ fn parse_chat_message_value(value: &Value) -> Result<ParsedChatInput, String> {
             if content.is_empty() && attachments.is_empty() {
                 return Err("Chat message did not contain any text or image content.".to_string());
             }
-            Ok(ParsedChatInput { content, attachments })
+            Ok(ParsedChatInput {
+                content,
+                attachments,
+            })
         }
         _ => Err("Chat message must be a string or an array of content parts.".to_string()),
     }
@@ -876,7 +879,10 @@ fn normalize_responses_input(input: &Value) -> Result<ParsedChatInput, String> {
         return Err("Responses input did not contain any text or image content.".to_string());
     }
 
-    Ok(ParsedChatInput { content, attachments })
+    Ok(ParsedChatInput {
+        content,
+        attachments,
+    })
 }
 
 /// Collects text segments and image attachments from an OpenAI content part object or array.
@@ -1107,7 +1113,10 @@ async fn memory_get_context(
         session_id: session_id.to_string(),
         reply: SharedReply::new(tx),
     };
-    memory_node.send_packet(msg).await.map_err(|e| e.to_string())?;
+    memory_node
+        .send_packet(msg)
+        .await
+        .map_err(|e| e.to_string())?;
     rx.await
         .map_err(|_| "Memory actor channel closed".to_string())?
 }
@@ -1124,7 +1133,10 @@ async fn memory_first_user_previews_batch(
         session_ids,
         reply: SharedReply::new(tx),
     };
-    memory_node.send_packet(msg).await.map_err(|e| e.to_string())?;
+    memory_node
+        .send_packet(msg)
+        .await
+        .map_err(|e| e.to_string())?;
     rx.await
         .map_err(|_| "Memory actor channel closed".to_string())?
 }
@@ -1170,23 +1182,22 @@ async fn handle_list_sessions(
                 .iter()
                 .map(|row| resolve_memory_session_id(&state, &row.internal_chat_id).into_owned())
                 .collect();
-            let preview_opts = match memory_first_user_previews_batch(&state.memory_node, session_ids)
-                .await
-            {
-                Ok(v) if v.len() == rows.len() => v,
-                Ok(v) => {
-                    error!(
-                        "session list preview batch length mismatch: got {} want {}",
-                        v.len(),
-                        rows.len()
-                    );
-                    vec![None; rows.len()]
-                }
-                Err(e) => {
-                    error!("session list preview batch failed: {}", e);
-                    vec![None; rows.len()]
-                }
-            };
+            let preview_opts =
+                match memory_first_user_previews_batch(&state.memory_node, session_ids).await {
+                    Ok(v) if v.len() == rows.len() => v,
+                    Ok(v) => {
+                        error!(
+                            "session list preview batch length mismatch: got {} want {}",
+                            v.len(),
+                            rows.len()
+                        );
+                        vec![None; rows.len()]
+                    }
+                    Err(e) => {
+                        error!("session list preview batch failed: {}", e);
+                        vec![None; rows.len()]
+                    }
+                };
             let body: Vec<SessionListEntry> = rows
                 .into_iter()
                 .zip(preview_opts)
@@ -1326,9 +1337,9 @@ mod tests {
     use crate::config::ApiConfig;
     use crate::logging::create_logger_channel;
     use crate::memory::{MemoryMessage, SharedReply, SqliteMemoryActor};
-    use crate::utils::ChatMessage;
     use crate::multi_tenant_edge::{CronRegistrationClient, CronRule, CronTransport};
     use crate::scheduler::{ActiveJob, CronStore, MultiTenantEdgeCronScheduler, ScheduleKind};
+    use crate::utils::ChatMessage;
     use crate::NodeHandle;
     use async_trait::async_trait;
     use axum::body::{to_bytes, Body};
@@ -1417,12 +1428,8 @@ mod tests {
         let (logger_tx, _logger_rx) = create_logger_channel(32);
         let memory_actor =
             SqliteMemoryActor::new(db_path.to_str().expect("utf8 db path")).expect("memory actor");
-        let memory_node = NodeHandle::<MemoryMessage>::new(
-            memory_actor,
-            100,
-            1,
-            Duration::from_millis(5),
-        );
+        let memory_node =
+            NodeHandle::<MemoryMessage>::new(memory_actor, 100, 1, Duration::from_millis(5));
         ApiState {
             inbound_tx,
             pending_requests: Arc::new(dashmap::DashMap::<
@@ -1628,12 +1635,10 @@ bind_address = "127.0.0.1"
         let rows: Vec<Value> = serde_json::from_slice(&body).expect("json array");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["role"], Value::String("user".to_string()));
-        assert!(
-            rows[0]["content"]
-                .as_str()
-                .expect("content string")
-                .contains("hello from test")
-        );
+        assert!(rows[0]["content"]
+            .as_str()
+            .expect("content string")
+            .contains("hello from test"));
     }
 
     #[tokio::test]
@@ -1666,14 +1671,10 @@ bind_address = "127.0.0.1"
         let (logger_tx, _logger_rx) = create_logger_channel(32);
         let response_store = Arc::new(ResponseStore::new(temp.db_path()).expect("response store"));
         let (inbound_tx, mut inbound_rx) = mpsc::channel(4);
-        let memory_actor = SqliteMemoryActor::new(temp.db_path().to_str().expect("utf8"))
-            .expect("memory actor");
-        let memory_node = NodeHandle::<MemoryMessage>::new(
-            memory_actor,
-            100,
-            1,
-            Duration::from_millis(5),
-        );
+        let memory_actor =
+            SqliteMemoryActor::new(temp.db_path().to_str().expect("utf8")).expect("memory actor");
+        let memory_node =
+            NodeHandle::<MemoryMessage>::new(memory_actor, 100, 1, Duration::from_millis(5));
         let state = ApiState {
             inbound_tx,
             pending_requests: pending_requests.clone(),

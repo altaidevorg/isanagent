@@ -92,7 +92,8 @@ impl Tool for ReadFileTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
-        let path_str = args.get("path")
+        let path_str = args
+            .get("path")
             .and_then(|v| v.as_str())
             .ok_or("Missing or invalid 'path' argument")?;
 
@@ -135,18 +136,21 @@ impl Tool for WriteFileTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
-        let path_str = args.get("path")
+        let path_str = args
+            .get("path")
             .and_then(|v| v.as_str())
             .ok_or("Missing 'path' argument")?;
 
-        let content = args.get("content")
+        let content = args
+            .get("content")
             .and_then(|v| v.as_str())
             .ok_or("Missing 'content' argument")?;
 
         let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
 
         if let Some(parent) = actual_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("Failed to create parent directories: {}", e))?;
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create parent directories: {}", e))?;
         }
 
         fs::write(&actual_path, content)
@@ -192,30 +196,39 @@ impl Tool for EditFileTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
-        let path_str = args.get("path")
+        let path_str = args
+            .get("path")
             .and_then(|v| v.as_str())
             .ok_or("Missing 'path' argument")?;
 
-        let old_text = args.get("old_text")
+        let old_text = args
+            .get("old_text")
             .and_then(|v| v.as_str())
             .ok_or("Missing 'old_text' argument")?;
 
-        let new_text = args.get("new_text")
+        let new_text = args
+            .get("new_text")
             .and_then(|v| v.as_str())
             .ok_or("Missing 'new_text' argument")?;
 
         let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
 
-        let content = fs::read_to_string(&actual_path)
-            .map_err(|e| format!("Error reading file: {}", e))?;
+        let content =
+            fs::read_to_string(&actual_path).map_err(|e| format!("Error reading file: {}", e))?;
 
         if !content.contains(old_text) {
-            return Ok(format!("Error: old_text not found in {:?}", actual_path.display()));
+            return Ok(format!(
+                "Error: old_text not found in {:?}",
+                actual_path.display()
+            ));
         }
 
         let count = content.matches(old_text).count();
         if count > 1 {
-            return Ok(format!("Error: old_text appears {} times. Please provide more context to make it unique.", count));
+            return Ok(format!(
+                "Error: old_text appears {} times. Please provide more context to make it unique.",
+                count
+            ));
         }
 
         let new_content = content.replacen(old_text, new_text, 1);
@@ -254,14 +267,18 @@ impl Tool for ListDirTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
-        let path_str = args.get("path")
+        let path_str = args
+            .get("path")
             .and_then(|v| v.as_str())
             .ok_or("Missing 'path' argument")?;
 
         let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
 
         if !actual_path.is_dir() {
-            return Ok(format!("Error: Not a directory: {:?}", actual_path.display()));
+            return Ok(format!(
+                "Error: Not a directory: {:?}",
+                actual_path.display()
+            ));
         }
 
         let mut entries = match fs::read_dir(&actual_path) {
@@ -273,7 +290,11 @@ impl Tool for ListDirTool {
         while let Some(Ok(entry)) = entries.next() {
             let metadata = entry.metadata().map_err(|e| e.to_string())?;
             let prefix = if metadata.is_dir() { "📁" } else { "📄" };
-            items.push(format!("{} {}", prefix, entry.file_name().to_string_lossy()));
+            items.push(format!(
+                "{} {}",
+                prefix,
+                entry.file_name().to_string_lossy()
+            ));
         }
 
         items.sort();
@@ -296,14 +317,28 @@ impl ShellExecTool {
         let lower_cmd = command.to_lowercase();
         // Mimic Nanobot destructive safety guards
         let blocked_patterns = [
-            "rm -rf", "rm -fr", "del /f", "del /q", "rmdir /s",
-            "format ", "mkfs", "diskpart", "dd if=", "> /dev/sd",
-            "shutdown", "reboot", "poweroff", ":(){ :|:& };:"
+            "rm -rf",
+            "rm -fr",
+            "del /f",
+            "del /q",
+            "rmdir /s",
+            "format ",
+            "mkfs",
+            "diskpart",
+            "dd if=",
+            "> /dev/sd",
+            "shutdown",
+            "reboot",
+            "poweroff",
+            ":(){ :|:& };:",
         ];
 
         for pattern in blocked_patterns.iter() {
             if lower_cmd.contains(pattern) {
-                return Err(format!("Command blocked by safety guard (detected dangerous pattern: {})", pattern));
+                return Err(format!(
+                    "Command blocked by safety guard (detected dangerous pattern: {})",
+                    pattern
+                ));
             }
         }
         Ok(())
@@ -338,13 +373,15 @@ impl Tool for ShellExecTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
-        let command = args.get("command")
+        let command = args
+            .get("command")
             .and_then(|v| v.as_str())
             .ok_or("Missing 'command' argument")?;
 
         Self::check_safety_guards(command)?;
 
-        let cwd_str = args.get("working_dir")
+        let cwd_str = args
+            .get("working_dir")
             .and_then(|v| v.as_str())
             .unwrap_or(".");
 
@@ -374,12 +411,17 @@ impl Tool for ShellExecTool {
 
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 if !stderr.trim().is_empty() {
-                    if !result.is_empty() { result.push_str("\nSTDERR:\n"); }
+                    if !result.is_empty() {
+                        result.push_str("\nSTDERR:\n");
+                    }
                     result.push_str(&stderr);
                 }
 
                 if !output.status.success() {
-                    result.push_str(&format!("\nExit code: {}", output.status.code().unwrap_or(-1)));
+                    result.push_str(&format!(
+                        "\nExit code: {}",
+                        output.status.code().unwrap_or(-1)
+                    ));
                 }
 
                 if result.is_empty() {
@@ -387,12 +429,16 @@ impl Tool for ShellExecTool {
                 } else {
                     // Truncate if massive
                     if result.len() > 10000 {
-                        Ok(format!("{}\n... (truncated, {} more chars)", &result[..10000], result.len() - 10000))
+                        Ok(format!(
+                            "{}\n... (truncated, {} more chars)",
+                            &result[..10000],
+                            result.len() - 10000
+                        ))
                     } else {
                         Ok(result)
                     }
                 }
-            },
+            }
             Ok(Err(e)) => Err(format!("Failed to execute command: {}", e)),
             Err(_) => Err("Command timed out after 60 seconds".to_string()),
         }
@@ -462,12 +508,24 @@ async fn web_search_duckduckgo(query: &str, max_output_chars: usize) -> Result<S
     let titles: Vec<_> = document.select(&title_selector).take(5).collect();
     let snippets: Vec<_> = document.select(&snippet_selector).take(5).collect();
 
-    for (i, (title_elem, snippet_elem)) in titles.into_iter().zip(snippets.into_iter()).enumerate() {
+    for (i, (title_elem, snippet_elem)) in titles.into_iter().zip(snippets.into_iter()).enumerate()
+    {
         let title = title_elem.text().collect::<Vec<_>>().join(" ");
         let link = title_elem.value().attr("href").unwrap_or("");
-        let snippet = snippet_elem.text().collect::<Vec<_>>().join(" ").trim().to_string();
+        let snippet = snippet_elem
+            .text()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim()
+            .to_string();
 
-        results.push_str(&format!("{}. [{}]({})\n   {}\n\n", i + 1, title, link, snippet));
+        results.push_str(&format!(
+            "{}. [{}]({})\n   {}\n\n",
+            i + 1,
+            title,
+            link,
+            snippet
+        ));
     }
 
     if results.is_empty() {
@@ -517,7 +575,10 @@ async fn web_fetch_direct(url: &str, max_output_chars: usize) -> Result<String, 
         .unwrap_or("");
 
     if content_type.contains("application/json") {
-        let json_body: Value = res.json().await.map_err(|e| format!("Invalid JSON: {}", e))?;
+        let json_body: Value = res
+            .json()
+            .await
+            .map_err(|e| format!("Invalid JSON: {}", e))?;
         let s = serde_json::to_string_pretty(&json_body).unwrap_or_default();
         return Ok(truncate_web_output(s, max_output_chars));
     }
@@ -533,7 +594,9 @@ async fn web_fetch_direct(url: &str, max_output_chars: usize) -> Result<String, 
     // Heuristic HTML→text for direct fetches: skip non-content tags (scripts, chrome, SVG) and
     // treat block-level tags as line breaks / light markdown markers. Not configurable; Jina path
     // avoids this entirely.
-    let elements_to_ignore = ["script", "style", "noscript", "svg", "nav", "footer", "header"];
+    let elements_to_ignore = [
+        "script", "style", "noscript", "svg", "nav", "footer", "header",
+    ];
     let block_elements = [
         "p", "div", "section", "article", "h1", "h2", "h3", "h4", "h5", "h6", "li", "br",
     ];
@@ -616,7 +679,10 @@ async fn web_fetch_jina(
         .unwrap_or("");
 
     if content_type.contains("application/json") {
-        let json_body: Value = res.json().await.map_err(|e| format!("Invalid JSON: {}", e))?;
+        let json_body: Value = res
+            .json()
+            .await
+            .map_err(|e| format!("Invalid JSON: {}", e))?;
         let s = serde_json::to_string_pretty(&json_body).unwrap_or_default();
         return Ok(truncate_web_output(s, max_output_chars));
     }
@@ -785,7 +851,10 @@ impl Tool for CronTool {
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("add");
 
         if action == "remove" {
-            let job_id = args.get("job_id").and_then(|v| v.as_str()).ok_or("Missing 'job_id' for remove action")?;
+            let job_id = args
+                .get("job_id")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing 'job_id' for remove action")?;
             if let Some(scheduler) = self.mte_cron_scheduler.as_ref() {
                 let removed = scheduler.remove_job(job_id, Utc::now()).await?;
                 return if removed {
@@ -794,16 +863,30 @@ impl Tool for CronTool {
                     Ok(format!("Job {} was not found", job_id))
                 };
             }
-            let cmd = crate::scheduler::CronCommand::Remove { id: job_id.to_string() };
+            let cmd = crate::scheduler::CronCommand::Remove {
+                id: job_id.to_string(),
+            };
             let json_str = serde_json::to_string(&cmd).map_err(|e| e.to_string())?;
-            self.cron_node.send_packet(json_str).await.map_err(|e| e.to_string())?;
+            self.cron_node
+                .send_packet(json_str)
+                .await
+                .map_err(|e| e.to_string())?;
             return Ok(format!("Requested removal of job {}", job_id));
         }
 
         if action == "add" {
-            let message = args.get("message").and_then(|v| v.as_str()).ok_or("Missing 'message' for add action")?;
-            let chat_id = args.get("chat_id").and_then(|v| v.as_str()).ok_or("Missing 'chat_id' for add action")?;
-            let channel = args.get("channel").and_then(|v| v.as_str()).ok_or("Missing 'channel' for add action")?;
+            let message = args
+                .get("message")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing 'message' for add action")?;
+            let chat_id = args
+                .get("chat_id")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing 'chat_id' for add action")?;
+            let channel = args
+                .get("channel")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing 'channel' for add action")?;
             let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
             let specified_schedule_count = [
                 args.get("every_seconds").is_some(),
@@ -821,20 +904,28 @@ impl Tool for CronTool {
                 if self.multi_tenant_edge_cron_enabled {
                     return Err("every_seconds is not supported when [multi_tenant_edge].cron_scheduling_enabled = true".to_string());
                 }
-                crate::scheduler::ScheduleKind::Every { every_ms: secs * 1000 }
+                crate::scheduler::ScheduleKind::Every {
+                    every_ms: secs * 1000,
+                }
             } else if let Some(at) = args.get("at").and_then(|v| v.as_str()) {
                 let dt = chrono::DateTime::parse_from_rfc3339(at).map_err(|_| "Invalid ISO format for 'at'. Make sure you include the proper UTC offset as provided in context.")?;
-                let schedule = crate::scheduler::ScheduleKind::At { at_ms: dt.timestamp_millis() };
+                let schedule = crate::scheduler::ScheduleKind::At {
+                    at_ms: dt.timestamp_millis(),
+                };
                 if self.multi_tenant_edge_cron_enabled {
                     crate::scheduler::validate_multi_tenant_edge_schedule(&schedule, Utc::now())?;
                 }
                 schedule
             } else if let Some(expr) = args.get("cron_expr").and_then(|v| v.as_str()) {
                 crate::scheduler::validate_cron_expression(expr)?;
-                if self.multi_tenant_edge_cron_enabled && !crate::scheduler::is_six_field_cron_expr(expr) {
+                if self.multi_tenant_edge_cron_enabled
+                    && !crate::scheduler::is_six_field_cron_expr(expr)
+                {
                     return Err("cron_expr must be a 6-field UTC cron expression when [multi_tenant_edge].cron_scheduling_enabled = true".to_string());
                 }
-                crate::scheduler::ScheduleKind::Cron { cron_expr: expr.to_string() }
+                crate::scheduler::ScheduleKind::Cron {
+                    cron_expr: expr.to_string(),
+                }
             } else {
                 unreachable!("Exactly one schedule type is guaranteed by the check above.");
             };
@@ -854,7 +945,10 @@ impl Tool for CronTool {
                         Utc::now(),
                     )
                     .await?;
-                return Ok(format!("Successfully scheduled job {} with action '{}'", id, message));
+                return Ok(format!(
+                    "Successfully scheduled job {} with action '{}'",
+                    id, message
+                ));
             }
 
             let cmd = crate::scheduler::CronCommand::Add {
@@ -866,8 +960,14 @@ impl Tool for CronTool {
             };
 
             let json_str = serde_json::to_string(&cmd).map_err(|e| e.to_string())?;
-            self.cron_node.send_packet(json_str).await.map_err(|e| e.to_string())?;
-            return Ok(format!("Successfully scheduled job {} with action '{}'", id, message));
+            self.cron_node
+                .send_packet(json_str)
+                .await
+                .map_err(|e| e.to_string())?;
+            return Ok(format!(
+                "Successfully scheduled job {} with action '{}'",
+                id, message
+            ));
         }
 
         Err(format!("Unknown action '{}'", action))
@@ -916,10 +1016,22 @@ impl Tool for MessageTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
-        let content = args.get("content").and_then(|v| v.as_str()).ok_or("Missing 'content'")?;
-        let channel = args.get("channel").and_then(|v| v.as_str()).ok_or("Missing 'channel'")?;
-        let chat_id = args.get("chat_id").and_then(|v| v.as_str()).ok_or("Missing 'chat_id'")?;
-        let thread_id = args.get("thread_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let content = args
+            .get("content")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'content'")?;
+        let channel = args
+            .get("channel")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'channel'")?;
+        let chat_id = args
+            .get("chat_id")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'chat_id'")?;
+        let thread_id = args
+            .get("thread_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
         let msg = crate::bus::BusMessage::Outbound(crate::bus::OutboundMessage {
             channel: channel.to_string(),
@@ -964,7 +1076,10 @@ impl Tool for SearchMemoryTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
-        let query = args.get("query").and_then(|v| v.as_str()).ok_or("Missing 'query'")?;
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'query'")?;
 
         // Use oneshot channel to await the reply from the MemoryActor
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -973,14 +1088,23 @@ impl Tool for SearchMemoryTool {
             reply: crate::memory::SharedReply::new(tx),
         };
 
-        self.memory_node.send_packet(msg).await.map_err(|e| e.to_string())?;
+        self.memory_node
+            .send_packet(msg)
+            .await
+            .map_err(|e| e.to_string())?;
 
-        let results = rx.await.map_err(|_| "Memory Actor Channel Closed")?.map_err(|e| e)?;
+        let results = rx
+            .await
+            .map_err(|_| "Memory Actor Channel Closed")?
+            .map_err(|e| e)?;
 
         if results.is_empty() {
             Ok(format!("No memory results found for '{}'.", query))
         } else {
-            Ok(format!("Memory Search Results:\n\n{}", results.join("\n\n---\n\n")))
+            Ok(format!(
+                "Memory Search Results:\n\n{}",
+                results.join("\n\n---\n\n")
+            ))
         }
     }
 }
@@ -1017,7 +1141,10 @@ impl Tool for FetchMemoryByDateTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
-        let days_ago = args.get("days_ago").and_then(|v| v.as_u64()).ok_or("Missing or invalid 'days_ago'")?;
+        let days_ago = args
+            .get("days_ago")
+            .and_then(|v| v.as_u64())
+            .ok_or("Missing or invalid 'days_ago'")?;
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
 
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1027,14 +1154,27 @@ impl Tool for FetchMemoryByDateTool {
             reply: crate::memory::SharedReply::new(tx),
         };
 
-        self.memory_node.send_packet(msg).await.map_err(|e| e.to_string())?;
+        self.memory_node
+            .send_packet(msg)
+            .await
+            .map_err(|e| e.to_string())?;
 
-        let results = rx.await.map_err(|_| "Memory Actor Channel Closed")?.map_err(|e| e)?;
+        let results = rx
+            .await
+            .map_err(|_| "Memory Actor Channel Closed")?
+            .map_err(|e| e)?;
 
         if results.is_empty() {
-            Ok(format!("No memory results found in the last {} days.", days_ago))
+            Ok(format!(
+                "No memory results found in the last {} days.",
+                days_ago
+            ))
         } else {
-            Ok(format!("Memory Results (Last {} days):\n\n{}", days_ago, results.join("\n\n---\n\n")))
+            Ok(format!(
+                "Memory Results (Last {} days):\n\n{}",
+                days_ago,
+                results.join("\n\n---\n\n")
+            ))
         }
     }
 }

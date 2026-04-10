@@ -1,10 +1,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use clap::Args;
 use crate::config::{AppConfig, SlackMode};
 use crate::skills::SkillRegistry;
 use crate::workspace::{ensure_workspace_layout, WorkspaceLayout};
+use clap::Args;
 
 const CONFIG_TEMPLATE: &str = include_str!("../assets/onboarding/config.toml");
 const AGENTS_TEMPLATE: &str = include_str!("../assets/onboarding/AGENTS.md");
@@ -132,9 +132,7 @@ fn apply_onboard_options(cfg: &mut AppConfig, opts: &OnboardOptions) {
     }
 
     if let Some(v) = opts.terminal_enable {
-        cfg.terminal
-            .get_or_insert_with(Default::default)
-            .enable = Some(v);
+        cfg.terminal.get_or_insert_with(Default::default).enable = Some(v);
     }
 
     if let Some(p) = cfg.provider.as_mut() {
@@ -180,22 +178,16 @@ fn apply_onboard_options(cfg: &mut AppConfig, opts: &OnboardOptions) {
     }
 
     if let Some(v) = opts.jina_enabled {
-        cfg.jina
-            .get_or_insert_with(Default::default)
-            .enabled = Some(v);
+        cfg.jina.get_or_insert_with(Default::default).enabled = Some(v);
     }
 
     if let Some(v) = opts.memory_enabled {
-        cfg.memory
-            .get_or_insert_with(Default::default)
-            .enabled = Some(v);
+        cfg.memory.get_or_insert_with(Default::default).enabled = Some(v);
     }
 
     if opts.multi_tenant_activity_heartbeat.is_some() || opts.multi_tenant_cron_scheduling.is_some()
     {
-        let m = cfg
-            .multi_tenant_edge
-            .get_or_insert_with(Default::default);
+        let m = cfg.multi_tenant_edge.get_or_insert_with(Default::default);
         if let Some(v) = opts.multi_tenant_activity_heartbeat {
             m.activity_heartbeat_enabled = Some(v);
         }
@@ -207,7 +199,10 @@ fn apply_onboard_options(cfg: &mut AppConfig, opts: &OnboardOptions) {
 
 fn build_config_toml(options: &OnboardOptions) -> Result<String, String> {
     let mut cfg: AppConfig = toml::from_str(CONFIG_TEMPLATE).map_err(|e| {
-        format!("Internal error: embedded config template is invalid TOML: {}", e)
+        format!(
+            "Internal error: embedded config template is invalid TOML: {}",
+            e
+        )
     })?;
     apply_onboard_options(&mut cfg, options);
     toml::to_string_pretty(&cfg).map_err(|e| format!("Failed to serialize config.toml: {}", e))

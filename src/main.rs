@@ -1,5 +1,5 @@
-use isanagent::{ActorLogic, NodeHandle, ActorError};
 use async_trait::async_trait;
+use isanagent::{ActorError, ActorLogic, NodeHandle};
 use tokio::time::{sleep, Duration};
 
 // --- Basic Message Type ---

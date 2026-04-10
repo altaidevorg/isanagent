@@ -1,8 +1,8 @@
-use async_trait::async_trait;
 use crate::memory::{MemoryMessage, SharedReply};
 use crate::traits::Memory;
 use crate::utils::ChatMessage;
 use crate::NodeHandle;
+use async_trait::async_trait;
 use tokio::sync::oneshot;
 
 /// Manages dynamic instantiation of `SessionProxy` interfaces.
@@ -24,15 +24,24 @@ impl SessionManager {
         self.memory_node.clone()
     }
 
-    pub async fn get_recent_summaries(&self, session_prefix: &str, limit: usize) -> Result<Vec<String>, String> {
+    pub async fn get_recent_summaries(
+        &self,
+        session_prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, String> {
         let (tx, rx) = oneshot::channel();
         let msg = MemoryMessage::GetRecentSummaries {
             session_id: session_prefix.to_string(),
             limit,
             reply: SharedReply::new(tx),
         };
-        self.memory_node.send_packet(msg).await.map_err(|e| e.to_string())?;
-        rx.await.map_err(|_| "Memory Actor Channel Closed".to_string())?.map_err(|e| e)
+        self.memory_node
+            .send_packet(msg)
+            .await
+            .map_err(|e| e.to_string())?;
+        rx.await
+            .map_err(|_| "Memory Actor Channel Closed".to_string())?
+            .map_err(|e| e)
     }
 }
 
@@ -62,8 +71,12 @@ impl Memory for SessionProxy {
             message,
             reply: SharedReply::new(tx),
         };
-        self.memory_node.send_packet(msg).await.map_err(|e| e.to_string())?;
-        rx.await.map_err(|_| "Memory Actor Channel Closed".to_string())?
+        self.memory_node
+            .send_packet(msg)
+            .await
+            .map_err(|e| e.to_string())?;
+        rx.await
+            .map_err(|_| "Memory Actor Channel Closed".to_string())?
     }
 
     async fn get_context(&self) -> Result<Vec<ChatMessage>, String> {
@@ -72,8 +85,12 @@ impl Memory for SessionProxy {
             session_id: self.session_id.clone(),
             reply: SharedReply::new(tx),
         };
-        self.memory_node.send_packet(msg).await.map_err(|e| e.to_string())?;
-        rx.await.map_err(|_| "Memory Actor Channel Closed".to_string())?
+        self.memory_node
+            .send_packet(msg)
+            .await
+            .map_err(|e| e.to_string())?;
+        rx.await
+            .map_err(|_| "Memory Actor Channel Closed".to_string())?
     }
 
     async fn clear(&mut self) -> Result<(), String> {
@@ -82,7 +99,11 @@ impl Memory for SessionProxy {
             session_id: self.session_id.clone(),
             reply: SharedReply::new(tx),
         };
-        self.memory_node.send_packet(msg).await.map_err(|e| e.to_string())?;
-        rx.await.map_err(|_| "Memory Actor Channel Closed".to_string())?
+        self.memory_node
+            .send_packet(msg)
+            .await
+            .map_err(|e| e.to_string())?;
+        rx.await
+            .map_err(|_| "Memory Actor Channel Closed".to_string())?
     }
 }

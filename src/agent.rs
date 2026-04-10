@@ -196,7 +196,10 @@ impl ActorLogic<BusMessage> for AgentLogic {
         let user_msg = if inbound.attachments.is_empty() {
             crate::utils::ChatMessage::user(&contextualized_content)
         } else {
-            crate::utils::ChatMessage::user_multimodal(&contextualized_content, &inbound.attachments)
+            crate::utils::ChatMessage::user_multimodal(
+                &contextualized_content,
+                &inbound.attachments,
+            )
         };
         mem.add_message(user_msg)
             .await

@@ -1,6 +1,6 @@
-use std::collections::HashMap;
-use serde_json::Value;
 use crate::traits::Tool;
+use serde_json::Value;
+use std::collections::HashMap;
 
 pub mod builtin;
 
@@ -29,16 +29,19 @@ impl ToolRegistry {
     }
 
     pub fn list_tools(&self) -> Vec<Value> {
-        self.tools.values().map(|t| {
-            serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": t.name(),
-                    "description": t.description(),
-                    "parameters": t.parameters(),
-                }
+        self.tools
+            .values()
+            .map(|t| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name(),
+                        "description": t.description(),
+                        "parameters": t.parameters(),
+                    }
+                })
             })
-        }).collect()
+            .collect()
     }
 
     pub async fn execute_tool(&self, name: &str, args: Value) -> Result<String, String> {

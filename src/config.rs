@@ -137,17 +137,7 @@ pub struct ProviderConfig {
     pub base_url: String,
 }
 
-#[derive(
-    Debug,
-    Deserialize,
-    Serialize,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Default,
-    clap::ValueEnum,
-)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lower")]
 pub enum SlackMode {

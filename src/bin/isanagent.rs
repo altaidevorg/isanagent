@@ -3,13 +3,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
+use clap::{Args as ClapArgs, Parser, Subcommand};
+use colored::Colorize;
 use isanagent::agent::AgentLogic;
 use isanagent::bus::{BusMessage, LoggerControlMessage, TelemetryEvent};
-use isanagent::channels::{
-    api::ApiChannel, email::EmailChannel, slack::SlackChannel, terminal::TerminalChannel, Channel,
-};
 use isanagent::channels::terminal::{
     build_tool_call_terminal_notice, build_tool_result_terminal_notice,
+};
+use isanagent::channels::{
+    api::ApiChannel, email::EmailChannel, slack::SlackChannel, terminal::TerminalChannel, Channel,
 };
 use isanagent::logging::{
     create_logger_channel, create_logging_actor_or_fallback, init_runtime_logger,
@@ -30,8 +32,6 @@ use isanagent::tools::builtin::{
 use isanagent::tools::ToolRegistry;
 use isanagent::workspace::{resolve_workspace_root, IsanagentWorkspace};
 use isanagent::{NodeHandle, Supervisor, SupervisorPolicy};
-use clap::{Args as ClapArgs, Parser, Subcommand};
-use colored::Colorize;
 
 const DEFAULT_PROVIDER_MODEL_NAME: &str = "gemini-2.5-flash";
 const DEFAULT_PROVIDER_API_KEY_ENV: &str = "GEMINI_API_KEY";
@@ -127,7 +127,8 @@ async fn run_isanagent(
     println!("Loading Altbot workspace at: {:?}", workspace.dir);
     log::info!("Loading Altbot workspace at {:?}", workspace.dir);
 
-    if !workspace.config.terminal_enabled() && !workspace.config.has_non_terminal_inbound_channel() {
+    if !workspace.config.terminal_enabled() && !workspace.config.has_non_terminal_inbound_channel()
+    {
         return Err(std::io::Error::other(
             "Invalid config: [terminal] enable = false requires at least one other inbound channel. \
 Enable [api], [slack], or [email] (with enabled = true) so the agent can receive messages without stdin.",
@@ -183,14 +184,18 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         let client = isanagent::multi_tenant_edge::CronRegistrationClient::from_env()
             .map_err(std::io::Error::other)?;
         let scheduler = Arc::new(
-            MultiTenantEdgeCronScheduler::new(db_path_str, client).map_err(std::io::Error::other)?,
+            MultiTenantEdgeCronScheduler::new(db_path_str, client)
+                .map_err(std::io::Error::other)?,
         );
-        scheduler.sync_all(chrono::Utc::now()).await.map_err(|error| {
-            std::io::Error::other(format!(
-                "Failed to sync cron jobs to multi-tenant-edge on startup: {}",
-                error
-            ))
-        })?;
+        scheduler
+            .sync_all(chrono::Utc::now())
+            .await
+            .map_err(|error| {
+                std::io::Error::other(format!(
+                    "Failed to sync cron jobs to multi-tenant-edge on startup: {}",
+                    error
+                ))
+            })?;
         Some(scheduler)
     } else {
         None
@@ -441,10 +446,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         println!("{}", "Terminal channel: disabled (headless mode)".dimmed());
     }
     if let Some(url) = &api_local_url {
-        println!(
-            "HTTP API (Vite UI proxies here): {}",
-            url.green()
-        );
+        println!("HTTP API (Vite UI proxies here): {}", url.green());
     }
     println!(
         "Loaded Skills ({}): {}",
@@ -470,7 +472,8 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     } else {
         println!(
             "{}",
-            "Terminal input is disabled; use your enabled channel(s) (API, Slack, or Email).".cyan()
+            "Terminal input is disabled; use your enabled channel(s) (API, Slack, or Email)."
+                .cyan()
         );
         println!(
             "{}",
@@ -584,14 +587,10 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                     tool_name,
                     args,
                 }) if channel == "terminal" => {
-                    let notice =
-                        build_tool_call_terminal_notice(chat_id, tool_name, args);
+                    let notice = build_tool_call_terminal_notice(chat_id, tool_name, args);
                     if let Some(chan) = delivery_channels.get("terminal") {
                         if let Err(e) = chan.send(notice).await {
-                            log::error!(
-                                "Failed to deliver tool-call notice to terminal: {}",
-                                e
-                            );
+                            log::error!("Failed to deliver tool-call notice to terminal: {}", e);
                         }
                     }
                 }
@@ -601,14 +600,10 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                     tool_name,
                     result,
                 }) if channel == "terminal" => {
-                    let notice =
-                        build_tool_result_terminal_notice(chat_id, tool_name, result);
+                    let notice = build_tool_result_terminal_notice(chat_id, tool_name, result);
                     if let Some(chan) = delivery_channels.get("terminal") {
                         if let Err(e) = chan.send(notice).await {
-                            log::error!(
-                                "Failed to deliver tool-result notice to terminal: {}",
-                                e
-                            );
+                            log::error!("Failed to deliver tool-result notice to terminal: {}", e);
                         }
                     }
                 }

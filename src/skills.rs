@@ -1,8 +1,8 @@
-use std::path::PathBuf;
-use std::fs;
-use serde::Deserialize;
 use log::{info, warn};
+use serde::Deserialize;
 use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
 
 /// Represents a parsed Anthropic Agent Skill
 #[derive(Debug, Clone)]
@@ -77,7 +77,7 @@ impl SkillRegistry {
     /// Parses a SKILL.md file extracting YAML frontmatter and the Markdown body.
     fn parse_skill_md(path: &PathBuf) -> Option<SkillDefinition> {
         let content = fs::read_to_string(path).ok()?;
-        
+
         let lines: Vec<&str> = content.lines().collect();
         if lines.is_empty() {
             return None;
@@ -85,7 +85,10 @@ impl SkillRegistry {
 
         // Extremely basic frontmatter parsing: looks for --- ... ---
         if lines[0] != "---" {
-            warn!("Skipping {:?}: No YAML frontmatter found (must start with '---')", path);
+            warn!(
+                "Skipping {:?}: No YAML frontmatter found (must start with '---')",
+                path
+            );
             return None;
         }
 
@@ -132,7 +135,11 @@ impl SkillRegistry {
                 let final_desc = if available {
                     metadata.description
                 } else {
-                    format!("{} [❌ UNAVAILABLE - {}]", metadata.description, missing_reasons.join(", "))
+                    format!(
+                        "{} [❌ UNAVAILABLE - {}]",
+                        metadata.description,
+                        missing_reasons.join(", ")
+                    )
                 };
 
                 Some(SkillDefinition {
@@ -143,7 +150,7 @@ impl SkillRegistry {
                     always: metadata.always.unwrap_or(false),
                     available,
                 })
-            },
+            }
             Err(e) => {
                 warn!("Failed to parse YAML frontmatter for {:?}: {}", path, e);
                 None
@@ -162,13 +169,16 @@ impl SkillRegistry {
 
         for skill in self.skills.values() {
             if skill.always && skill.available {
-                always_blocks.push_str(&format!("\n--- SKILL AUTOMATICALLY LOADED: {} ---\n{}\n", skill.name, skill.instructions));
+                always_blocks.push_str(&format!(
+                    "\n--- SKILL AUTOMATICALLY LOADED: {} ---\n{}\n",
+                    skill.name, skill.instructions
+                ));
             } else {
                 summary.push_str(&format!("- **{}**: {}\n", skill.name, skill.description));
             }
         }
         summary.push_str("\nTo execute a skill, use the 'load_skill_instructions' tool with the skill's name to learn how to use it contextually.\n");
-        
+
         format!("{}{}", summary, always_blocks)
     }
 
@@ -176,10 +186,13 @@ impl SkillRegistry {
         match self.skills.get(name) {
             Some(skill) => {
                 if !skill.available {
-                    return Err(format!("Skill '{}' cannot be loaded because it is missing dependencies: {}", name, skill.description));
+                    return Err(format!(
+                        "Skill '{}' cannot be loaded because it is missing dependencies: {}",
+                        name, skill.description
+                    ));
                 }
                 Ok(skill.instructions.clone())
-            },
+            }
             None => Err(format!("Skill '{}' not found", name)),
         }
     }

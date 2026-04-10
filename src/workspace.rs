@@ -1,8 +1,8 @@
-use std::path::{Path, PathBuf};
-use std::fs;
+use crate::config::AppConfig;
 use log::{info, warn};
 use shellexpand;
-use crate::config::AppConfig;
+use std::fs;
+use std::path::{Path, PathBuf};
 use toml;
 
 #[derive(Clone, Debug)]
@@ -24,7 +24,8 @@ pub fn ensure_workspace_layout(root: &Path) -> Result<WorkspaceLayout, String> {
     fs::create_dir_all(root).map_err(|e| format!("Failed to create workspace dir: {}", e))?;
 
     let system_dir = root.join(".system_generated");
-    fs::create_dir_all(&system_dir).map_err(|e| format!("Failed to create .system_generated dir: {}", e))?;
+    fs::create_dir_all(&system_dir)
+        .map_err(|e| format!("Failed to create .system_generated dir: {}", e))?;
 
     let sandbox_dir = root.join("workspace");
     fs::create_dir_all(&sandbox_dir).map_err(|e| format!("Failed to create sandbox dir: {}", e))?;
@@ -63,13 +64,16 @@ impl IsanagentWorkspace {
         let config = if config_path.exists() {
             let toml_str = fs::read_to_string(&config_path)
                 .map_err(|e| format!("Failed to read config.toml: {}", e))?;
-            toml::from_str(&toml_str)
-                .map_err(|e| format!("Failed to parse config.toml: {}", e))?
+            toml::from_str(&toml_str).map_err(|e| format!("Failed to parse config.toml: {}", e))?
         } else {
             AppConfig::default()
         };
 
-        Ok(Self { dir: layout.root, sandbox_dir: layout.sandbox_dir, config })
+        Ok(Self {
+            dir: layout.root,
+            sandbox_dir: layout.sandbox_dir,
+            config,
+        })
     }
 
     pub fn db_path(&self) -> PathBuf {
