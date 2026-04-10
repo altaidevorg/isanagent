@@ -56,6 +56,16 @@ pub enum TelemetryEvent {
         completion_tokens: u32,
         total_tokens: u32,
     },
+    ToolCallStarted {
+        chat_id: String,
+        tool_name: String,
+        args: String,
+    },
+    ToolCallFinished {
+        chat_id: String,
+        tool_name: String,
+        result: String,
+    },
     CronTrigger {
         job_id: String,
         message: String,

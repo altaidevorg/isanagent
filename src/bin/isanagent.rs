@@ -607,6 +607,13 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                         }
                     }
                 }
+                BusMessage::Telemetry(tel) => {
+                    if let Some(api_chan) = delivery_channels.get("api") {
+                        if let Some(api_chan) = api_chan.as_any().downcast_ref::<ApiChannel>() {
+                            api_chan.handle_telemetry(tel.clone()).await;
+                        }
+                    }
+                }
                 _ => {}
             }
 

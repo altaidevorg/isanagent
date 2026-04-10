@@ -686,6 +686,10 @@ impl Channel for SlackChannel {
         })
         .await
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 fn build_post_message_body(msg: &OutboundMessage) -> Value {

@@ -141,6 +141,10 @@ impl Channel for EmailChannel {
         .await
         .map_err(|e| format!("SMTP task panicked: {}", e))?
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 fn poll_inbox_once(config: EmailConfig, tx: Sender<InboundMessage>) -> Result<(), String> {

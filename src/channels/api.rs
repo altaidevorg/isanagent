@@ -9,7 +9,7 @@ use axum::{
     body::{Body, Bytes},
     extract::{OriginalUri, Path as AxumPath, Query, State},
     http::{header, HeaderValue, StatusCode},
-    response::{IntoResponse, Response},
+    response::{sse::Event, sse::Sse, IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -20,7 +20,7 @@ use moka::sync::Cache;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::oneshot;
 
 use crate::bus::{BusMessage, InboundMessage, LogEvent, OutboundMessage, TelemetryEvent};
@@ -49,13 +49,42 @@ include!(concat!(env!("OUT_DIR"), "/ui_assets.rs"));
 #[derive(Clone)]
 struct ApiState {
     inbound_tx: Sender<InboundMessage>,
-    pending_requests: std::sync::Arc<DashMap<String, oneshot::Sender<OutboundMessage>>>,
+    pending_requests: std::sync::Arc<DashMap<String, PendingRequest>>,
     responses_cache: Cache<String, StoredResponse>,
     response_store: std::sync::Arc<ResponseStore>,
     mte_cron_scheduler: Option<std::sync::Arc<MultiTenantEdgeCronScheduler>>,
     channel_name: String,
     logger_tx: LoggerHandle,
     memory_node: NodeHandle<MemoryMessage>,
+}
+
+enum PendingRequest {
+    Sync(oneshot::Sender<OutboundMessage>),
+    Stream(mpsc::Sender<StreamEvent>),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum StreamEvent {
+    ToolCallStarted {
+        tool_name: String,
+        args: String,
+    },
+    ToolCallFinished {
+        tool_name: String,
+        result: String,
+    },
+    AgentThought {
+        thought: String,
+    },
+    Completion {
+        content: String,
+        internal_chat_id: String,
+        response_id: String,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// A parsed and normalised chat request: plain text plus optional image attachments.
@@ -86,6 +115,7 @@ struct ResponsesRequest {
     previous_response_id: Option<String>,
     store: Option<bool>,
     user: Option<String>,
+    stream: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -196,7 +226,7 @@ pub struct ApiChannel {
     port: u16,
     bind_address: Option<String>,
     serve_ui: bool,
-    pending_requests: std::sync::Arc<DashMap<String, oneshot::Sender<OutboundMessage>>>,
+    pending_requests: std::sync::Arc<DashMap<String, PendingRequest>>,
     responses_cache: Cache<String, StoredResponse>,
     response_store: std::sync::Arc<ResponseStore>,
     mte_cron_scheduler: Option<std::sync::Arc<MultiTenantEdgeCronScheduler>>,
@@ -327,8 +357,22 @@ impl Channel for ApiChannel {
 
     async fn send(&self, msg: OutboundMessage) -> Result<(), String> {
         let chat_id = &msg.chat_id;
-        if let Some((_, sender)) = self.pending_requests.remove(chat_id) {
-            let _ = sender.send(msg);
+        if let Some((_, pending)) = self.pending_requests.remove(chat_id) {
+            match pending {
+                PendingRequest::Sync(sender) => {
+                    let _ = sender.send(msg);
+                }
+                PendingRequest::Stream(sender) => {
+                    let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
+                    if let Err(e) = sender.try_send(StreamEvent::Completion {
+                        content: msg.content,
+                        internal_chat_id: msg.chat_id,
+                        response_id,
+                    }) {
+                        error!("Failed to send completion to stream: {}", e);
+                    }
+                }
+            }
         } else {
             error!(
                 "ApiChannel: No pending request found for chat_id: {}",
@@ -336,6 +380,66 @@ impl Channel for ApiChannel {
             );
         }
         Ok(())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl ApiChannel {
+    pub async fn handle_telemetry(&self, event: TelemetryEvent) {
+        match event {
+            TelemetryEvent::ToolCallStarted {
+                chat_id,
+                tool_name,
+                args,
+            } => {
+                if let Some(pending) = self.pending_requests.get(&chat_id) {
+                    match pending.value() {
+                        PendingRequest::Stream(sender) => {
+                            if let Err(e) =
+                                sender.try_send(StreamEvent::ToolCallStarted { tool_name, args })
+                            {
+                                error!("Failed to send tool_call_started to stream: {}", e);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            TelemetryEvent::ToolCallFinished {
+                chat_id,
+                tool_name,
+                result,
+            } => {
+                if let Some(pending) = self.pending_requests.get(&chat_id) {
+                    match pending.value() {
+                        PendingRequest::Stream(sender) => {
+                            if let Err(e) =
+                                sender.try_send(StreamEvent::ToolCallFinished { tool_name, result })
+                            {
+                                error!("Failed to send tool_call_finished to stream: {}", e);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            TelemetryEvent::AgentThought { chat_id, thought } => {
+                if let Some(pending) = self.pending_requests.get(&chat_id) {
+                    match pending.value() {
+                        PendingRequest::Stream(sender) => {
+                            if let Err(e) = sender.try_send(StreamEvent::AgentThought { thought }) {
+                                error!("Failed to send agent_thought to stream: {}", e);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -605,6 +709,8 @@ async fn handle_responses(
     let store_response = payload.store.unwrap_or(true);
     let now = chrono::Utc::now().timestamp();
 
+    let stream_requested = payload.stream.unwrap_or(false);
+
     let (internal_chat_id, sender_id, model, previous_response_id) =
         match payload.previous_response_id.as_deref() {
             Some(previous_response_id) => {
@@ -683,6 +789,58 @@ async fn handle_responses(
                 None,
             ),
         };
+
+    if stream_requested {
+        let (stream_tx, mut stream_rx) = mpsc::channel(100);
+        match state.pending_requests.entry(internal_chat_id.clone()) {
+            Entry::Occupied(_) => {
+                return ApiError::new(
+                    StatusCode::CONFLICT,
+                    "conversation_busy",
+                    "A request is already in-flight for this conversation.",
+                )
+                .into_response();
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(PendingRequest::Stream(stream_tx));
+            }
+        }
+
+        let inbound = InboundMessage {
+            channel: state.channel_name.clone(),
+            sender_id: sender_id.clone(),
+            chat_id: internal_chat_id.clone(),
+            thread_id: None,
+            content: input.content,
+            attachments: input.attachments,
+            metadata: Default::default(),
+        };
+
+        if let Err(e) = state.inbound_tx.send(inbound).await {
+            state.pending_requests.remove(&internal_chat_id);
+            return ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "agent_queue_unavailable",
+                format!("Failed to enqueue request: {}", e),
+            )
+            .into_response();
+        }
+
+        let stream = async_stream::stream! {
+            while let Some(event) = stream_rx.recv().await {
+                match serde_json::to_string(&event) {
+                    Ok(json) => yield Ok::<Event, std::convert::Infallible>(Event::default().data(json)),
+                    Err(e) => {
+                        error!("Failed to serialize stream event: {}", e);
+                    }
+                }
+            }
+        };
+
+        return Sse::new(stream)
+            .keep_alive(axum::response::sse::KeepAlive::default())
+            .into_response();
+    }
 
     let outbound =
         match dispatch_agent_turn(&state, sender_id.clone(), internal_chat_id.clone(), input).await
@@ -771,7 +929,7 @@ async fn dispatch_agent_turn(
             ));
         }
         Entry::Vacant(entry) => {
-            entry.insert(tx);
+            entry.insert(PendingRequest::Sync(tx));
         }
     }
 

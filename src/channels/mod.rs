@@ -2,6 +2,8 @@ use crate::bus::{InboundMessage, OutboundMessage};
 use async_trait::async_trait;
 use tokio::sync::mpsc::Sender;
 
+use std::any::Any;
+
 /// Abstract base trait for chat channel implementations.
 #[async_trait]
 pub trait Channel: Send + Sync {
@@ -17,6 +19,9 @@ pub trait Channel: Send + Sync {
 
     /// Send a message out through this channel.
     async fn send(&self, msg: OutboundMessage) -> Result<(), String>;
+
+    /// Downcast to concrete type if needed.
+    fn as_any(&self) -> &dyn Any;
 }
 
 pub mod api;

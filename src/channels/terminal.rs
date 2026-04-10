@@ -377,6 +377,10 @@ impl Channel for TerminalChannel {
         let _ = stdout.flush();
         Ok(())
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[cfg(test)]

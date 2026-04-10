@@ -99,7 +99,21 @@ type Message = {
   role: string;
   content: string;
   imageUrls?: string[];
+  toolCalls?: ToolCall[];
 };
+
+type ToolCall = {
+  tool_name: string;
+  args: string;
+  result?: string;
+};
+
+type StreamEvent =
+  | { type: "tool_call_started"; tool_name: string; args: string }
+  | { type: "tool_call_finished"; tool_name: string; result: string }
+  | { type: "agent_thought"; thought: string }
+  | { type: "completion"; content: string; internal_chat_id: string; response_id: string }
+  | { type: "error"; message: string };
 
 type HistoryRow = {
   role: string;
@@ -247,26 +261,73 @@ function bubbleStyle(role: string) {
   return "mx-auto max-w-[90%] border border-dashed border-[color:var(--ghost-border)] bg-muted text-foreground";
 }
 
-function TypingIndicator() {
+function TypingIndicator({ step }: { step: string | null }) {
   return (
-    <div
-      aria-label="Assistant is typing"
-      className="mr-auto flex max-w-[82%] items-center rounded-xl border border-border bg-card px-5 py-4"
-    >
-      <div className="flex items-center gap-1.5">
-        <span
-          className="inline-block h-2 w-2 animate-bounce rounded-full bg-muted-foreground/80"
-          style={{ animationDuration: "0.55s", animationDelay: "0ms" }}
-        />
-        <span
-          className="inline-block h-2 w-2 animate-bounce rounded-full bg-muted-foreground/80"
-          style={{ animationDuration: "0.55s", animationDelay: "0.12s" }}
-        />
-        <span
-          className="inline-block h-2 w-2 animate-bounce rounded-full bg-muted-foreground/80"
-          style={{ animationDuration: "0.55s", animationDelay: "0.24s" }}
-        />
+    <div className="mr-auto flex max-w-[82%] flex-col gap-2">
+      <div
+        aria-label="Assistant is typing"
+        className="flex items-center gap-3 rounded-xl border border-border bg-card px-5 py-4"
+      >
+        <div className="flex items-center gap-1.5">
+          <span
+            className="inline-block h-2 w-2 animate-bounce rounded-full bg-muted-foreground/80"
+            style={{ animationDuration: "0.55s", animationDelay: "0ms" }}
+          />
+          <span
+            className="inline-block h-2 w-2 animate-bounce rounded-full bg-muted-foreground/80"
+            style={{ animationDuration: "0.55s", animationDelay: "0.12s" }}
+          />
+          <span
+            className="inline-block h-2 w-2 animate-bounce rounded-full bg-muted-foreground/80"
+            style={{ animationDuration: "0.55s", animationDelay: "0.24s" }}
+          />
+        </div>
+        {step && <span className="text-sm text-muted-foreground animate-pulse">{step}</span>}
       </div>
+    </div>
+  );
+}
+
+function ToolAccordion({ toolCalls }: { toolCalls: ToolCall[] }) {
+  const [isOpen, setIsOpen] = useState(false);
+
+  if (toolCalls.length === 0) return null;
+
+  return (
+    <div className="mt-4 border-t border-border pt-4">
+      <button
+        onClick={() => setIsOpen(!isOpen)}
+        className="flex items-center gap-2 text-xs font-medium text-muted-foreground hover:text-foreground transition-colors"
+      >
+        <svg
+          className={cn("h-3 w-3 transition-transform", isOpen && "rotate-90")}
+          fill="none"
+          stroke="currentColor"
+          viewBox="0 0 24 24"
+        >
+          <path d="M9 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} />
+        </svg>
+        {isOpen ? "Hide tool calls" : `Show ${toolCalls.length} tool calls`}
+      </button>
+      {isOpen && (
+        <div className="mt-3 flex flex-col gap-3">
+          {toolCalls.map((tc, i) => (
+            <div key={i} className="rounded-lg border border-border bg-muted/30 p-3 text-xs">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-semibold text-yellow-600 dark:text-yellow-400">{tc.tool_name}</span>
+              </div>
+              <div className="mt-2 font-mono text-[11px] opacity-70 break-all">
+                <span className="font-semibold">Args:</span> {tc.args}
+              </div>
+              {tc.result && (
+                <div className="mt-2 font-mono text-[11px] opacity-70 break-all">
+                  <span className="font-semibold">Result:</span> {tc.result.length > 500 ? `${tc.result.slice(0, 500)}...` : tc.result}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -285,14 +346,14 @@ type ComposerProps = {
   onSubmit: (payload: { text: string; imageDataUrls: string[] }) => Promise<void>;
 };
 
-function Composer({ disabled, onSubmit }: ComposerProps) {
+function Composer({ disabled: streamingResponse, onSubmit }: ComposerProps) {
   const [draft, setDraft] = useState("");
   const [attachments, setAttachments] = useState<{ id: string; url: string; name: string }[]>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const submit = async () => {
     const trimmed = draft.trim();
-    if ((!trimmed && attachments.length === 0) || disabled) {
+    if ((!trimmed && attachments.length === 0) || streamingResponse) {
       return;
     }
     const urls = attachments.map((a) => a.url);
@@ -302,7 +363,7 @@ function Composer({ disabled, onSubmit }: ComposerProps) {
   };
 
   const onPickFiles = async (list: FileList | null) => {
-    if (!list?.length) {
+    if (!list?.length || streamingResponse) {
       return;
     }
     const imageFiles = Array.from(list).filter((f) => f.type.startsWith("image/"));
@@ -333,6 +394,7 @@ function Composer({ disabled, onSubmit }: ComposerProps) {
               <img alt="" className="h-full w-full object-cover" src={a.url} />
               <button
                 className="absolute right-0.5 top-0.5 rounded bg-background/90 px-1 text-[10px] font-medium text-foreground shadow"
+                disabled={streamingResponse}
                 type="button"
                 onClick={() => setAttachments((prev) => prev.filter((x) => x.id !== a.id))}
               >
@@ -344,7 +406,6 @@ function Composer({ disabled, onSubmit }: ComposerProps) {
       ) : null}
       <Textarea
         className="min-h-[116px] resize-none border-0 bg-transparent p-0 text-[15px] shadow-none focus-visible:ring-0"
-        disabled={disabled}
         onChange={(event) => setDraft(event.target.value)}
         onKeyDown={(event) => {
           if (event.key === "Enter" && !event.shiftKey) {
@@ -366,7 +427,7 @@ function Composer({ disabled, onSubmit }: ComposerProps) {
             onChange={(e) => void onPickFiles(e.target.files)}
           />
           <Button
-            disabled={disabled}
+            disabled={streamingResponse}
             size="sm"
             type="button"
             variant="outline"
@@ -375,14 +436,14 @@ function Composer({ disabled, onSubmit }: ComposerProps) {
             Add images
           </Button>
           <p className="text-xs text-muted-foreground">
-            {disabled ? "Waiting for response…" : "JPEG, PNG, GIF, WebP · up to 8"}
+            {streamingResponse ? "Waiting for response…" : "JPEG, PNG, GIF, WebP · up to 8"}
           </p>
         </div>
         <Button
-          disabled={disabled || (draft.trim().length === 0 && attachments.length === 0)}
+          disabled={streamingResponse || (draft.trim().length === 0 && attachments.length === 0)}
           onClick={() => void submit()}
         >
-          {disabled ? "Working…" : "Send"}
+          {streamingResponse ? "Working…" : "Send"}
         </Button>
       </div>
     </div>
@@ -395,6 +456,8 @@ export default function App() {
   const [latestResponseId, setLatestResponseId] = useState<string | null>(() => readSessionResponseId());
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
+  const [currentStep, setCurrentStep] = useState<string | null>(null);
+  const [currentToolCalls, setCurrentToolCalls] = useState<ToolCall[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [sessionsLoading, setSessionsLoading] = useState(false);
   const [sessions, setSessions] = useState<SessionListEntry[]>([]);
@@ -565,108 +628,117 @@ export default function App() {
     setErrorMessage(null);
     setMessages((prev) => [...prev, optimisticUser]);
     setPending(true);
+    setCurrentStep(null);
+    setCurrentToolCalls([]);
 
     let previousResponseId: string | undefined = latestResponseId ?? undefined;
-    let usedStaleRecovery = false;
 
     try {
-      let responseBody: unknown;
+      const response = await fetch("/v1/responses", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          input: buildResponsesInput(text, imageDataUrls),
+          previous_response_id: previousResponseId,
+          store: true,
+          user: requestUserId,
+          stream: true,
+        }),
+      });
 
-      for (let attempt = 0; attempt < 2; attempt++) {
-        const response = await fetch("/v1/responses", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            input: buildResponsesInput(text, imageDataUrls),
-            previous_response_id: previousResponseId,
-            store: true,
-            user: requestUserId,
-          }),
-        });
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as ApiErrorPayload;
+        throw new Error(payload?.error?.message || `Request failed with ${response.status}.`);
+      }
 
-        const bodyText = await response.text();
-        let parsedBody: unknown = null;
-        let bodyParseOk = false;
-        if (bodyText.length > 0) {
+      const reader = response.body?.getReader();
+      if (!reader) {
+        throw new Error("Response body is not readable.");
+      }
+
+      let decoder = new TextDecoder();
+      let assistantContent = "";
+      let toolCalls: ToolCall[] = [];
+      let currentToolCall: ToolCall | null = null;
+      let finalChatId: string | null = null;
+      let finalResponseId: string | null = null;
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        // Keep the last partial line in the buffer
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          const trimmedLine = line.trim();
+          if (!trimmedLine || !trimmedLine.startsWith("data: ")) continue;
+
+          const data = trimmedLine.slice(6);
           try {
-            parsedBody = JSON.parse(bodyText) as unknown;
-            bodyParseOk = true;
-          } catch {
-            parsedBody = null;
-            bodyParseOk = false;
+            const event = JSON.parse(data) as StreamEvent;
+            switch (event.type) {
+              case "agent_thought":
+                setCurrentStep(`Thinking: ${event.thought}`);
+                break;
+              case "tool_call_started":
+                currentToolCall = { tool_name: event.tool_name, args: event.args };
+                setCurrentStep(`Using tool: ${event.tool_name}`);
+                break;
+              case "tool_call_finished":
+                if (currentToolCall && currentToolCall.tool_name === event.tool_name) {
+                  currentToolCall.result = event.result;
+                  toolCalls.push({ ...currentToolCall });
+                  setCurrentToolCalls([...toolCalls]);
+                  currentToolCall = null;
+                }
+                // Don't set currentStep to null here, let the next event (thought or next tool) replace it
+                // This prevents the indicator from flickering or disappearing between steps
+                break;
+              case "completion":
+                assistantContent = event.content;
+                finalChatId = event.internal_chat_id;
+                finalResponseId = event.response_id;
+                setCurrentStep(null); // Clear step when completion arrives
+                break;
+              case "error":
+                throw new Error(event.message);
+            }
+          } catch (e) {
+            console.error("Failed to parse SSE event", e, "Line:", trimmedLine);
           }
         }
-
-        if (!response.ok) {
-          const payload = parsedBody as ApiErrorPayload;
-          if (
-            attempt === 0 &&
-            previousResponseId &&
-            isStalePreviousResponseError(response.status, payload)
-          ) {
-            previousResponseId = undefined;
-            usedStaleRecovery = true;
-            clearSessionPointers();
-            setLatestResponseId(null);
-            setInternalChatId(null);
-            continue;
-          }
-          throw new Error(
-            payload?.error?.message || `Request failed with ${response.status}.`,
-          );
-        }
-
-        if (!bodyParseOk) {
-          throw new Error(
-            bodyText.length === 0
-              ? "Empty response body."
-              : "Invalid JSON in response body.",
-          );
-        }
-        responseBody = parsedBody;
-        break;
       }
 
-      const raw = responseBody as unknown;
-      const responseId = pickResponseId(raw);
-      if (!responseId) {
-        throw new Error("Invalid API response: missing id.");
-      }
+      const assistantId = createId();
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: assistantId,
+          role: "assistant",
+          content: assistantContent,
+          toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+        },
+      ]);
 
-      const chatId = pickInternalChatId(raw);
-      const assistantText = extractOutputText(raw);
+      if (finalChatId && finalResponseId) {
+        persistSessionPointers(finalChatId, finalResponseId);
+        setInternalChatId(finalChatId);
+        setLatestResponseId(finalResponseId);
 
-      if (chatId) {
-        persistSessionPointers(chatId, responseId);
-        setInternalChatId(chatId);
-        setLatestResponseId(responseId);
-        if (usedStaleRecovery) {
-          await loadHistory(chatId);
-        } else {
-          setMessages((prev) => [
-            ...prev,
-            { id: createId(), role: "assistant", content: assistantText },
-          ]);
-        }
         const titleHint = truncateSidebarTitle(userDisplayText);
         if (titleHint.length > 0) {
           setSidebarHints((prev) => {
-            const next = { ...prev, [chatId]: titleHint };
+            const next = { ...prev, [finalChatId!]: titleHint };
             persistSidebarHints(next);
             return next;
           });
         }
-      } else {
-        sessionStorage.setItem(SESSION_RESPONSE_KEY, responseId);
-        sessionStorage.removeItem(SESSION_CHAT_KEY);
-        setLatestResponseId(responseId);
-        setInternalChatId(null);
-        setMessages((prev) => [
-          ...prev,
-          { id: createId(), role: "assistant", content: assistantText },
-        ]);
       }
 
       void loadSessions();
@@ -675,6 +747,8 @@ export default function App() {
       setErrorMessage(buildErrorMessage(error));
     } finally {
       setPending(false);
+      setCurrentStep(null);
+      setCurrentToolCalls([]);
     }
   };
 
@@ -816,6 +890,7 @@ export default function App() {
                     {message.content ? (
                       <p className="mt-2 whitespace-pre-wrap text-sm leading-7">{message.content}</p>
                     ) : null}
+                    {message.toolCalls && <ToolAccordion toolCalls={message.toolCalls} />}
                     {message.imageUrls?.length ? (
                       <div className="mt-2 flex flex-col gap-2">
                         {message.imageUrls.map((url, idx) => (
@@ -831,7 +906,7 @@ export default function App() {
                   </article>
                 ))}
 
-                {pending ? <TypingIndicator /> : null}
+                {pending ? <TypingIndicator step={currentStep} /> : null}
 
                 <div ref={endOfMessagesRef} />
               </div>
@@ -844,11 +919,6 @@ export default function App() {
                   <h2 className="mt-3 text-2xl font-semibold tracking-[-0.02em] text-foreground">
                     Start a conversation
                   </h2>
-                  <p className="mx-auto mt-3 text-sm leading-relaxed text-muted-foreground">
-                    Messages are stored in the workspace database. This tab keeps session ids in{" "}
-                    <span className="font-mono text-xs">sessionStorage</span>. Use the sidebar to switch or
-                    delete past chats.
-                  </p>
                   <Button className="mt-6" onClick={startNewConversation} variant="secondary">
                     New chat
                   </Button>

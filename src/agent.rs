@@ -319,6 +319,14 @@ impl ActorLogic<BusMessage> for AgentLogic {
                             args: args_str.clone(),
                         }))
                         .await;
+                    let _ = self
+                        .outbound_tx
+                        .send(BusMessage::Telemetry(TelemetryEvent::ToolCallStarted {
+                            chat_id: inbound.chat_id.clone(),
+                            tool_name: tool_name.to_string(),
+                            args: args_str.clone(),
+                        }))
+                        .await;
 
                     let tool_result = match self
                         .execute_tool_call(&inbound.chat_id, tool_name, args)
@@ -341,6 +349,14 @@ impl ActorLogic<BusMessage> for AgentLogic {
                         .send(BusMessage::Telemetry(TelemetryEvent::ToolResult {
                             chat_id: inbound.chat_id.clone(),
                             channel: inbound.channel.clone(),
+                            tool_name: tool_name.to_string(),
+                            result: tool_result.clone(),
+                        }))
+                        .await;
+                    let _ = self
+                        .outbound_tx
+                        .send(BusMessage::Telemetry(TelemetryEvent::ToolCallFinished {
+                            chat_id: inbound.chat_id.clone(),
                             tool_name: tool_name.to_string(),
                             result: tool_result.clone(),
                         }))

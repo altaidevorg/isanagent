@@ -356,6 +356,28 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
                 message.len()
             ),
         ),
+        TelemetryEvent::ToolCallStarted {
+            chat_id,
+            tool_name,
+            args,
+        } => LogEvent::debug(
+            "Telemetry",
+            &format!("ToolCallStarted tool={} args_len={}", tool_name, args.len()),
+        )
+        .with_chat_id(chat_id),
+        TelemetryEvent::ToolCallFinished {
+            chat_id,
+            tool_name,
+            result,
+        } => LogEvent::debug(
+            "Telemetry",
+            &format!(
+                "ToolCallFinished tool={} result_len={}",
+                tool_name,
+                result.len()
+            ),
+        )
+        .with_chat_id(chat_id),
     }
 }
 
