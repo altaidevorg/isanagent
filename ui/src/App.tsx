@@ -402,6 +402,7 @@ export default function App() {
   const [sessionToDelete, setSessionToDelete] = useState<SessionListEntry | null>(null);
   const [, startTransition] = useTransition();
   const endOfMessagesRef = useRef<HTMLDivElement | null>(null);
+
   const requestUserId = useMemo(() => apiUserId(), []);
 
   const loadSessions = useCallback(async () => {

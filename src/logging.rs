@@ -289,20 +289,32 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
     match telemetry {
         TelemetryEvent::ToolCall {
             chat_id,
+            channel,
             tool_name,
             args,
         } => LogEvent::info(
             "Telemetry",
-            &format!("ToolCall tool={} args_len={}", tool_name, args.len()),
+            &format!(
+                "ToolCall channel={} tool={} args_len={}",
+                channel,
+                tool_name,
+                args.len()
+            ),
         )
         .with_chat_id(chat_id),
         TelemetryEvent::ToolResult {
             chat_id,
+            channel,
             tool_name,
             result,
         } => LogEvent::info(
             "Telemetry",
-            &format!("ToolResult tool={} result_len={}", tool_name, result.len()),
+            &format!(
+                "ToolResult channel={} tool={} result_len={}",
+                channel,
+                tool_name,
+                result.len()
+            ),
         )
         .with_chat_id(chat_id),
         TelemetryEvent::AgentThought { chat_id, thought } => LogEvent::debug(
