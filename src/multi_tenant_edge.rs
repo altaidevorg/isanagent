@@ -14,8 +14,8 @@ use crate::tool_activity::{
     ToolExecutionActivity, ToolExecutionActivityHandle, ToolExecutionActivityHandleFuture,
 };
 
-const ACTIVITY_PATH: &str = "/_internal/activity";
-const CRONS_PATH: &str = "/_internal/crons";
+const ACTIVITY_PATH: &str = "/agent-dorm/activity";
+const CRONS_PATH: &str = "/agent-dorm/crons";
 const DEFAULT_HEARTBEAT_TTL_MS: u64 = 30_000;
 const MAX_HEARTBEAT_INTERVAL_MS: u64 = 30_000;
 const MIN_HEARTBEAT_INTERVAL_MS: u64 = 1_000;
