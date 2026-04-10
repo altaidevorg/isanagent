@@ -582,7 +582,7 @@ async fn run_isanagent(
                 _ => {}
             }
 
-            let _ = logger_tx_outbound.send(msg.clone());
+            let _ = logger_tx_outbound.send(msg);
         }
     });
 
