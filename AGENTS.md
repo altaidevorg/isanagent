@@ -96,3 +96,15 @@ If you add a new metric or LLM analytics block, format it explicitly as a `BusMe
 The memory system has two distinct phases operating under the Actor loop:
 1. **Active Auto-Compaction** (`src/agent.rs`): If an active chat exceeds token/turn limits, a blocking summarization request is made, saved out to `SqliteMemoryActor` safely, and the raw history buffers are cleared to protect context limits.
 2. **Idle Background Reflection** (`src/reflection.rs`): An asynchronous supervisor checks idle sessions on an interval. When a predefined threshold of SQLite summaries is reached, it spawns a task converting them into a single `MEMORY.md` file saved physically to the `workspace_dir`.
+
+
+## Development workflow
+After implementing a feature, follow this exact workflow to deliver high-quality code.
+
+1. Review your code for performance-oriented move semantics, graceful handling of errors and options, and correct async usage. As a rule of thumb, avoid `.unwrap()` and `.expect()` that can cause panics at runtime.
+2. Run `cargo clippy` and keep your clippy happy --it's your best friend.
+3. Run `cargo fmt` so that it's always well-formatted, avoiding unnecessary diffs that simply come from formatting.
+4. This is a living document --keep this document up-to-date as you introduce new features and/or architectures.
+
+## Note for Windows
+On windows, building the project in debug mode causes a PDB-related linker error. Build the project in release mode on Windows instead.

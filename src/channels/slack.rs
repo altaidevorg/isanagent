@@ -333,11 +333,7 @@ impl SlackRuntimeState {
     /// and returns it as an OpenAI-compatible `ContentPart::ImageUrl` with a
     /// base64 data URI.  Returns `None` when the file is not a supported image
     /// type or when the download fails.
-    async fn download_slack_file(
-        &self,
-        file: &Value,
-        bot_token: &str,
-    ) -> Option<ContentPart> {
+    async fn download_slack_file(&self, file: &Value, bot_token: &str) -> Option<ContentPart> {
         let mime = file["mimetype"].as_str()?;
         if !mime.starts_with("image/") {
             return None;
@@ -426,9 +422,7 @@ impl SlackRuntimeState {
         // Download any image files attached to the Slack message
         if let Some(files) = event.get("files").and_then(Value::as_array) {
             for file in files {
-                if let Some(attachment) =
-                    self.download_slack_file(file, &config.bot_token).await
-                {
+                if let Some(attachment) = self.download_slack_file(file, &config.bot_token).await {
                     dispatch.inbound.attachments.push(attachment);
                 }
             }

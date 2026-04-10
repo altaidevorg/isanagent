@@ -3,19 +3,21 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
+use clap::{Args as ClapArgs, Parser, Subcommand};
+use colored::Colorize;
 use isanagent::agent::AgentLogic;
 use isanagent::bus::{BusMessage, LoggerControlMessage, TelemetryEvent};
-use isanagent::channels::{
-    api::ApiChannel, email::EmailChannel, slack::SlackChannel, terminal::TerminalChannel, Channel,
-};
 use isanagent::channels::terminal::{
     build_tool_call_terminal_notice, build_tool_result_terminal_notice,
+};
+use isanagent::channels::{
+    api::ApiChannel, email::EmailChannel, slack::SlackChannel, terminal::TerminalChannel, Channel,
 };
 use isanagent::logging::{
     create_logger_channel, create_logging_actor_or_fallback, init_runtime_logger,
     LOGGER_QUEUE_CAPACITY,
 };
-use isanagent::onboarding::{onboard_workspace, BootstrapReport};
+use isanagent::onboarding::{onboard_workspace, BootstrapReport, OnboardOptions};
 use isanagent::provider::OpenAIProvider;
 use isanagent::scheduler::{
     validate_multi_tenant_edge_runtime, CronActor, CronSchedulingMode, CronTriggerPayload,
@@ -30,8 +32,6 @@ use isanagent::tools::builtin::{
 use isanagent::tools::ToolRegistry;
 use isanagent::workspace::{resolve_workspace_root, IsanagentWorkspace};
 use isanagent::{NodeHandle, Supervisor, SupervisorPolicy};
-use clap::{Args as ClapArgs, Parser, Subcommand};
-use colored::Colorize;
 
 const DEFAULT_PROVIDER_MODEL_NAME: &str = "gemini-2.5-flash";
 const DEFAULT_PROVIDER_API_KEY_ENV: &str = "GEMINI_API_KEY";
@@ -56,6 +56,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Create workspace layout and starter files; optional flags override generated config.toml
     Onboard(OnboardArgs),
 }
 
@@ -64,6 +65,9 @@ struct OnboardArgs {
     /// Optional explicit path to the workspace directory. Defaults to ~/.isanagent
     #[arg(short, long)]
     workspace: Option<String>,
+    /// Override embedded defaults for `config.toml` (see `isanagent onboard --help`)
+    #[command(flatten)]
+    options: OnboardOptions,
 }
 
 #[tokio::main]
@@ -71,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Onboard(args)) => run_onboard(args.workspace.or(cli.workspace)).await,
+        Some(Commands::Onboard(args)) => run_onboard(cli.workspace, args).await,
         None => run_isanagent(cli.workspace, cli.config).await,
     }
 }
@@ -123,6 +127,15 @@ async fn run_isanagent(
     println!("Loading Altbot workspace at: {:?}", workspace.dir);
     log::info!("Loading Altbot workspace at {:?}", workspace.dir);
 
+    if !workspace.config.terminal_enabled() && !workspace.config.has_non_terminal_inbound_channel()
+    {
+        return Err(std::io::Error::other(
+            "Invalid config: [terminal] enable = false requires at least one other inbound channel. \
+Enable [api], [slack], or [email] (with enabled = true) so the agent can receive messages without stdin.",
+        )
+        .into());
+    }
+
     // 1. Setup SqliteMemoryActor and SessionManager
     let db_path = workspace
         .dir
@@ -171,14 +184,18 @@ async fn run_isanagent(
         let client = isanagent::multi_tenant_edge::CronRegistrationClient::from_env()
             .map_err(std::io::Error::other)?;
         let scheduler = Arc::new(
-            MultiTenantEdgeCronScheduler::new(db_path_str, client).map_err(std::io::Error::other)?,
+            MultiTenantEdgeCronScheduler::new(db_path_str, client)
+                .map_err(std::io::Error::other)?,
         );
-        scheduler.sync_all(chrono::Utc::now()).await.map_err(|error| {
-            std::io::Error::other(format!(
-                "Failed to sync cron jobs to multi-tenant-edge on startup: {}",
-                error
-            ))
-        })?;
+        scheduler
+            .sync_all(chrono::Utc::now())
+            .await
+            .map_err(|error| {
+                std::io::Error::other(format!(
+                    "Failed to sync cron jobs to multi-tenant-edge on startup: {}",
+                    error
+                ))
+            })?;
         Some(scheduler)
     } else {
         None
@@ -349,19 +366,25 @@ async fn run_isanagent(
     // 8. Wrap Agent in NodeHandle
     let agent_node = NodeHandle::<BusMessage>::new(agent_logic, 100, 3, Duration::from_millis(50));
 
-    // 10. Setup Terminal Channel
+    // 10. Setup channels (terminal is optional for headless / Docker API-only runs)
     let (inbound_tx, mut inbound_rx) = mpsc::channel(100);
     let mut out_channels: HashMap<String, Arc<dyn Channel>> = HashMap::new();
 
-    let terminal_chat_id = uuid::Uuid::new_v4().to_string();
-    let terminal = Arc::new(TerminalChannel::new(
-        &terminal_chat_id,
-        logger_bus_tx.clone(),
-        shutdown_tx.clone(),
-        workspace.sandbox_dir.clone(),
-    ));
-    terminal.start(inbound_tx.clone()).await?;
-    out_channels.insert(terminal.name().to_string(), terminal);
+    let terminal_chat_id = if workspace.config.terminal_enabled() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let terminal = Arc::new(TerminalChannel::new(
+            &id,
+            logger_bus_tx.clone(),
+            shutdown_tx.clone(),
+            workspace.sandbox_dir.clone(),
+        ));
+        terminal.start(inbound_tx.clone()).await?;
+        out_channels.insert(terminal.name().to_string(), terminal);
+        Some(id)
+    } else {
+        log::info!("Terminal channel disabled via config; stdin will not be read.");
+        None
+    };
 
     // 11. Setup Slack Channel
     if let Some(slack_cfg) = workspace.config.slack.clone() {
@@ -417,12 +440,13 @@ async fn run_isanagent(
         "=============================================".blue()
     );
     println!("isanagent Version: {}", env!("CARGO_PKG_VERSION").green());
-    println!("Terminal Session ID: {}", terminal_chat_id.dimmed());
+    if let Some(id) = terminal_chat_id.as_ref() {
+        println!("Terminal Session ID: {}", id.dimmed());
+    } else {
+        println!("{}", "Terminal channel: disabled (headless mode)".dimmed());
+    }
     if let Some(url) = &api_local_url {
-        println!(
-            "HTTP API (Vite UI proxies here): {}",
-            url.green()
-        );
+        println!("HTTP API (Vite UI proxies here): {}", url.green());
     }
     println!(
         "Loaded Skills ({}): {}",
@@ -436,14 +460,26 @@ async fn run_isanagent(
     );
     println!("{}", "=============================================".blue());
     println!("\n{}", "Agent System is Running.".bold().green());
-    println!(
-        "{}",
-        "Available actions: type a message in the terminal or on active chat channels.".cyan()
-    );
-    println!(
-        "{}",
-        "Tip: Type '/exit' to securely shut down the engine.\n".dimmed()
-    );
+    if terminal_chat_id.is_some() {
+        println!(
+            "{}",
+            "Available actions: type a message in the terminal or on active chat channels.".cyan()
+        );
+        println!(
+            "{}",
+            "Tip: Type '/exit' to securely shut down the engine.\n".dimmed()
+        );
+    } else {
+        println!(
+            "{}",
+            "Terminal input is disabled; use your enabled channel(s) (API, Slack, or Email)."
+                .cyan()
+        );
+        println!(
+            "{}",
+            "Tip: Press Ctrl+C to shut down the engine.\n".dimmed()
+        );
+    }
 
     // Route inbound messages from all channels into the agent and logger
     let agent_tx = agent_node.clone();
@@ -551,14 +587,10 @@ async fn run_isanagent(
                     tool_name,
                     args,
                 }) if channel == "terminal" => {
-                    let notice =
-                        build_tool_call_terminal_notice(chat_id, tool_name, args);
+                    let notice = build_tool_call_terminal_notice(chat_id, tool_name, args);
                     if let Some(chan) = delivery_channels.get("terminal") {
                         if let Err(e) = chan.send(notice).await {
-                            log::error!(
-                                "Failed to deliver tool-call notice to terminal: {}",
-                                e
-                            );
+                            log::error!("Failed to deliver tool-call notice to terminal: {}", e);
                         }
                     }
                 }
@@ -568,14 +600,10 @@ async fn run_isanagent(
                     tool_name,
                     result,
                 }) if channel == "terminal" => {
-                    let notice =
-                        build_tool_result_terminal_notice(chat_id, tool_name, result);
+                    let notice = build_tool_result_terminal_notice(chat_id, tool_name, result);
                     if let Some(chan) = delivery_channels.get("terminal") {
                         if let Err(e) = chan.send(notice).await {
-                            log::error!(
-                                "Failed to deliver tool-result notice to terminal: {}",
-                                e
-                            );
+                            log::error!("Failed to deliver tool-result notice to terminal: {}", e);
                         }
                     }
                 }
@@ -588,7 +616,7 @@ async fn run_isanagent(
 
     tokio::select! {
         _ = shutdown_rx.recv() => {
-            log::info!("Shutdown requested from terminal.");
+            log::info!("Shutdown requested (terminal /exit or internal signal).");
         }
         _ = tokio::signal::ctrl_c() => {
             log::info!("Shutdown requested via Ctrl+C.");
@@ -624,18 +652,24 @@ async fn run_isanagent(
     Ok(())
 }
 
-async fn run_onboard(workspace_arg: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_onboard(
+    global_workspace: Option<String>,
+    args: OnboardArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let workspace_arg = args.workspace.or(global_workspace);
+    let options = args.options;
+    let config_overrides_used = options.has_overrides();
     let report = tokio::task::spawn_blocking(move || {
         let workspace_root = resolve_workspace_root(workspace_arg.as_deref());
-        onboard_workspace(&workspace_root)
+        onboard_workspace(&workspace_root, &options)
     })
     .await?
     .map_err(std::io::Error::other)?;
-    print_onboarding_report(&report);
+    print_onboarding_report(&report, config_overrides_used);
     Ok(())
 }
 
-fn print_onboarding_report(report: &BootstrapReport) {
+fn print_onboarding_report(report: &BootstrapReport, config_overrides_used: bool) {
     println!("Workspace onboarded at {}", report.root.display());
     println!();
 
@@ -655,8 +689,15 @@ fn print_onboarding_report(report: &BootstrapReport) {
         println!();
     }
 
+    if config_overrides_used {
+        println!(
+            "Note: config.toml was generated from merged settings (template comments were omitted)."
+        );
+        println!();
+    }
+
     println!("Next steps:");
-    println!("1. Set GEMINI_API_KEY");
+    println!("1. Set GEMINI_API_KEY (or the env named in provider.api_key_env)");
     println!("2. Update <changethis> placeholders or disable unused channels in config.toml");
     println!("3. Run: isanagent --workspace {}", report.root.display());
 }

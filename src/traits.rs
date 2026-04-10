@@ -7,9 +7,13 @@ use serde_json::Value;
 #[async_trait]
 pub trait Provider: Send + Sync {
     /// Send a chat completion request with a list of messages.
-    /// Messages are defined in the specific Provider implementation, 
+    /// Messages are defined in the specific Provider implementation,
     /// or we can use a generic `crate::utils::ChatMessage`.
-    async fn chat(&self, messages: &[crate::utils::ChatMessage], tools: Option<serde_json::Value>) -> Result<crate::utils::LLMResponse, crate::utils::LLMError>;
+    async fn chat(
+        &self,
+        messages: &[crate::utils::ChatMessage],
+        tools: Option<serde_json::Value>,
+    ) -> Result<crate::utils::LLMResponse, crate::utils::LLMError>;
 }
 
 /// A Memory abstracts the context storage capabilities of an Agent.

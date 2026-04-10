@@ -1,7 +1,10 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc::{sync_channel, Receiver, SyncSender}, OnceLock};
+use std::sync::{
+    mpsc::{sync_channel, Receiver, SyncSender},
+    OnceLock,
+};
 
 use async_trait::async_trait;
 use log::{Level, LevelFilter, Log, Metadata, Record, SetLoggerError};
@@ -127,15 +130,18 @@ fn sanitize_message(message: &str) -> String {
     static GEMINI_KEY_RE: OnceLock<Regex> = OnceLock::new();
     static EMAIL_RE: OnceLock<Regex> = OnceLock::new();
 
-    let bearer_re = BEARER_RE.get_or_init(|| Regex::new(r"Bearer\s+[A-Za-z0-9._\-]+").expect("valid bearer regex"));
-    let gemini_key_re = GEMINI_KEY_RE.get_or_init(|| Regex::new(r"AIza[0-9A-Za-z\-_]{20,}").expect("valid api key regex"));
-    let email_re = EMAIL_RE.get_or_init(|| Regex::new(r"\b([A-Za-z0-9._%+\-])([A-Za-z0-9._%+\-]*?)@([A-Za-z0-9.\-]+\.[A-Za-z]{2,})\b").expect("valid email regex"));
+    let bearer_re = BEARER_RE
+        .get_or_init(|| Regex::new(r"Bearer\s+[A-Za-z0-9._\-]+").expect("valid bearer regex"));
+    let gemini_key_re = GEMINI_KEY_RE
+        .get_or_init(|| Regex::new(r"AIza[0-9A-Za-z\-_]{20,}").expect("valid api key regex"));
+    let email_re = EMAIL_RE.get_or_init(|| {
+        Regex::new(r"\b([A-Za-z0-9._%+\-])([A-Za-z0-9._%+\-]*?)@([A-Za-z0-9.\-]+\.[A-Za-z]{2,})\b")
+            .expect("valid email regex")
+    });
 
     let redacted = bearer_re.replace_all(message, "Bearer [REDACTED]");
     let redacted = gemini_key_re.replace_all(&redacted, "[REDACTED_API_KEY]");
-    email_re
-        .replace_all(&redacted, "$1***@$3")
-        .into_owned()
+    email_re.replace_all(&redacted, "$1***@$3").into_owned()
 }
 
 #[cfg(test)]
@@ -157,8 +163,14 @@ mod tests {
     fn should_capture_filters_external_noise() {
         assert!(should_capture("isanagent::utils", Level::Debug));
         assert!(should_capture("SlackChannel", Level::Info));
-        assert!(!should_capture("hyper_util::client::legacy::pool", Level::Info));
-        assert!(should_capture("hyper_util::client::legacy::pool", Level::Warn));
+        assert!(!should_capture(
+            "hyper_util::client::legacy::pool",
+            Level::Info
+        ));
+        assert!(should_capture(
+            "hyper_util::client::legacy::pool",
+            Level::Warn
+        ));
     }
 }
 
@@ -338,7 +350,11 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
         .with_chat_id(chat_id),
         TelemetryEvent::CronTrigger { job_id, message } => LogEvent::info(
             "Telemetry",
-            &format!("CronTrigger job_id={} message_len={}", job_id, message.len()),
+            &format!(
+                "CronTrigger job_id={} message_len={}",
+                job_id,
+                message.len()
+            ),
         ),
     }
 }
@@ -358,7 +374,10 @@ impl ActorLogic<BusMessage> for LoggingActor {
         Ok(None)
     }
 
-    async fn process(&mut self, packet: BusMessage) -> Result<Option<(String, BusMessage)>, ActorError> {
+    async fn process(
+        &mut self,
+        packet: BusMessage,
+    ) -> Result<Option<(String, BusMessage)>, ActorError> {
         match &packet {
             BusMessage::LoggerControl(LoggerControlMessage::Flush) => {
                 self.flush_all()?;

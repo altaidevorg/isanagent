@@ -3,8 +3,8 @@ use log::debug;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use tokio::sync::oneshot;
 
-use crate::{ActorLogic, ActorError};
 use crate::utils::{ChatMessage, ContentPart, MessageContent};
+use crate::{ActorError, ActorLogic};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -55,9 +55,9 @@ fn message_content_from_stored(s: String) -> MessageContent {
 fn first_user_preview_from_content(s: String) -> Option<String> {
     let message_content = message_content_from_stored(s);
     if let MessageContent::Parts(parts) = &message_content {
-        let has_text = parts.iter().any(|p| {
-            matches!(p, ContentPart::Text { text } if !text.trim().is_empty())
-        });
+        let has_text = parts
+            .iter()
+            .any(|p| matches!(p, ContentPart::Text { text } if !text.trim().is_empty()));
         let has_image = parts
             .iter()
             .any(|p| matches!(p, ContentPart::ImageUrl { .. }));
@@ -172,7 +172,7 @@ impl SqliteMemoryActor {
             [],
         )?;
 
-        // Try adding the native tool calling schema columns dynamically. 
+        // Try adding the native tool calling schema columns dynamically.
         // Failures here are expected on existing databases after the first run.
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN name TEXT", []);
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN tool_calls TEXT", []);
@@ -252,9 +252,7 @@ impl SqliteMemoryActor {
             [],
         )?;
 
-        Ok(Self {
-            conn,
-        })
+        Ok(Self { conn })
     }
 }
 
@@ -264,22 +262,29 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
         "SqliteMemoryActor".to_string()
     }
 
-    async fn process(&mut self, packet: MemoryMessage) -> Result<Option<(String, MemoryMessage)>, ActorError> {
+    async fn process(
+        &mut self,
+        packet: MemoryMessage,
+    ) -> Result<Option<(String, MemoryMessage)>, ActorError> {
         match packet {
-            MemoryMessage::AddMessage { session_id, message, reply } => {
+            MemoryMessage::AddMessage {
+                session_id,
+                message,
+                reply,
+            } => {
                 let content_str = match &message.content {
                     Some(MessageContent::Text(s)) => Some(s.clone()),
-                    Some(MessageContent::Parts(parts)) => {
-                        serde_json::to_string(parts).ok()
-                    }
+                    Some(MessageContent::Parts(parts)) => serde_json::to_string(parts).ok(),
                     None => None,
                 };
-                let tool_calls_str = message.tool_calls.map(|tc| serde_json::to_string(&tc).unwrap_or_default());
+                let tool_calls_str = message
+                    .tool_calls
+                    .map(|tc| serde_json::to_string(&tc).unwrap_or_default());
                 let res = self.conn.execute(
                     "INSERT INTO messages (session_id, role, content, name, tool_calls, tool_call_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![session_id, message.role, content_str, message.name, tool_calls_str, message.tool_call_id],
                 ).map_err(|e| e.to_string()).map(|_| ());
-                
+
                 let _ = reply.send(res);
             }
             MemoryMessage::GetContext { session_id, reply } => {
@@ -288,19 +293,22 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                         "SELECT role, content, name, tool_calls, tool_call_id FROM messages WHERE session_id = ?1 ORDER BY created_at ASC"
                     ).map_err(|e| e.to_string())?;
 
-                    let message_iter = stmt.query_map(params![session_id], |row| {
-                        let tool_calls_str: Option<String> = row.get(3)?;
-                        let tool_calls = tool_calls_str.and_then(|s| serde_json::from_str(&s).ok());
-                        let content_raw: Option<String> = row.get(1)?;
-                        let content = content_raw.map(message_content_from_stored);
-                        Ok(ChatMessage {
-                            role: row.get(0)?,
-                            content,
-                            name: row.get(2)?,
-                            tool_calls,
-                            tool_call_id: row.get(4)?,
+                    let message_iter = stmt
+                        .query_map(params![session_id], |row| {
+                            let tool_calls_str: Option<String> = row.get(3)?;
+                            let tool_calls =
+                                tool_calls_str.and_then(|s| serde_json::from_str(&s).ok());
+                            let content_raw: Option<String> = row.get(1)?;
+                            let content = content_raw.map(message_content_from_stored);
+                            Ok(ChatMessage {
+                                role: row.get(0)?,
+                                content,
+                                name: row.get(2)?,
+                                tool_calls,
+                                tool_call_id: row.get(4)?,
+                            })
                         })
-                    }).map_err(|e| e.to_string())?;
+                        .map_err(|e| e.to_string())?;
 
                     let mut messages = Vec::new();
                     for msg_result in message_iter {
@@ -334,15 +342,16 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
 
                 let _ = reply.send(res);
             }
-            MemoryMessage::FirstUserMessagePreviewsBatch {
-                session_ids,
-                reply,
-            } => {
+            MemoryMessage::FirstUserMessagePreviewsBatch { session_ids, reply } => {
                 let res = (|| -> Result<Vec<Option<String>>, String> {
                     if session_ids.is_empty() {
                         return Ok(Vec::new());
                     }
-                    let placeholders = session_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                    let placeholders = session_ids
+                        .iter()
+                        .map(|_| "?")
+                        .collect::<Vec<_>>()
+                        .join(",");
                     let sql = format!(
                         "SELECT m.session_id, m.content FROM messages m
                          INNER JOIN (
@@ -398,15 +407,25 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 })();
                 let _ = reply.send(res);
             }
-            MemoryMessage::AddSummary { session_id, summary, key_info, knowledge_gaps, reply } => {
+            MemoryMessage::AddSummary {
+                session_id,
+                summary,
+                key_info,
+                knowledge_gaps,
+                reply,
+            } => {
                 let res = self.conn.execute(
                     "INSERT INTO session_summaries (session_id, summary, key_info, knowledge_gaps) VALUES (?1, ?2, ?3, ?4)",
                     params![session_id, summary, key_info, knowledge_gaps],
                 ).map_err(|e| e.to_string()).map(|_| ());
-                
+
                 let _ = reply.send(res);
             }
-            MemoryMessage::GetRecentSummaries { session_id, limit, reply } => {
+            MemoryMessage::GetRecentSummaries {
+                session_id,
+                limit,
+                reply,
+            } => {
                 let res = (|| -> Result<Vec<String>, String> {
                     let mut stmt = self.conn.prepare(
                         "SELECT summary, key_info, knowledge_gaps, created_at FROM session_summaries 
@@ -415,13 +434,18 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
 
                     let pattern = format!("{}%", session_id);
                     let limit_i64 = limit as i64;
-                    let rows = stmt.query_map(params![pattern, limit_i64], |row| {
-                        let summary: String = row.get(0)?;
-                        let key_info: String = row.get(1)?;
-                        let knowledge_gaps: String = row.get(2)?;
-                        let created_at: String = row.get(3)?;
-                        Ok(format!("[{}] Summary: {}\nKey Info: {}\nGaps: {}", created_at, summary, key_info, knowledge_gaps))
-                    }).map_err(|e| e.to_string())?;
+                    let rows = stmt
+                        .query_map(params![pattern, limit_i64], |row| {
+                            let summary: String = row.get(0)?;
+                            let key_info: String = row.get(1)?;
+                            let knowledge_gaps: String = row.get(2)?;
+                            let created_at: String = row.get(3)?;
+                            Ok(format!(
+                                "[{}] Summary: {}\nKey Info: {}\nGaps: {}",
+                                created_at, summary, key_info, knowledge_gaps
+                            ))
+                        })
+                        .map_err(|e| e.to_string())?;
 
                     let mut summaries = Vec::new();
                     for s in rows {
@@ -431,7 +455,11 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 })();
                 let _ = reply.send(res);
             }
-            MemoryMessage::UpdateSessionMetadata { session_id, last_reflection_msg_id, reply } => {
+            MemoryMessage::UpdateSessionMetadata {
+                session_id,
+                last_reflection_msg_id,
+                reply,
+            } => {
                 let res = self.conn.execute(
                     "INSERT INTO session_metadata (session_id, last_reflection_msg_id, last_reflection_time) 
                      VALUES (?1, ?2, CURRENT_TIMESTAMP) 
@@ -447,7 +475,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     let mut stmt = self.conn.prepare(
                         "SELECT last_reflection_msg_id, last_reflection_time FROM session_metadata WHERE session_id = ?1"
                     ).map_err(|e| e.to_string())?;
-                    
+
                     let result = stmt.query_row(params![session_id], |row| {
                         let msg_id: Option<i64> = row.get(0)?;
                         let time: String = row.get(1)?;
@@ -456,14 +484,16 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
 
                     match result {
                         Ok(data) => Ok(data),
-                        Err(rusqlite::Error::QueryReturnedNoRows) => Ok((None, "Never".to_string())),
-                        Err(e) => Err(e.to_string())
+                        Err(rusqlite::Error::QueryReturnedNoRows) => {
+                            Ok((None, "Never".to_string()))
+                        }
+                        Err(e) => Err(e.to_string()),
                     }
                 })();
                 let _ = reply.send(res);
             }
             MemoryMessage::SearchSummaries { query, reply } => {
-                 let res = (|| -> Result<Vec<String>, String> {
+                let res = (|| -> Result<Vec<String>, String> {
                     let mut stmt = self.conn.prepare(
                         "SELECT session_summaries.session_id, session_summaries.summary, session_summaries.key_info 
                          FROM session_summaries 
@@ -474,13 +504,15 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
 
                     // Escape quotes for FTS
                     let search_pattern = format!("\"{}\"", query.replace("\"", "\"\""));
-                    
-                    let rows = stmt.query_map(params![search_pattern], |row| {
-                        let sid: String = row.get(0)?;
-                        let sum: String = row.get(1)?;
-                        let key: String = row.get(2)?;
-                        Ok(format!("Session [{}]: {}\nKey Info: {}", sid, sum, key))
-                    }).map_err(|e| e.to_string())?;
+
+                    let rows = stmt
+                        .query_map(params![search_pattern], |row| {
+                            let sid: String = row.get(0)?;
+                            let sum: String = row.get(1)?;
+                            let key: String = row.get(2)?;
+                            Ok(format!("Session [{}]: {}\nKey Info: {}", sid, sum, key))
+                        })
+                        .map_err(|e| e.to_string())?;
 
                     let mut results = Vec::new();
                     for s in rows {
@@ -490,8 +522,12 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 })();
                 let _ = reply.send(res);
             }
-            MemoryMessage::FetchSummariesByTimeRange { days_ago, limit, reply } => {
-                 let res = (|| -> Result<Vec<String>, String> {
+            MemoryMessage::FetchSummariesByTimeRange {
+                days_ago,
+                limit,
+                reply,
+            } => {
+                let res = (|| -> Result<Vec<String>, String> {
                     let mut stmt = self.conn.prepare(
                         "SELECT session_id, summary, key_info, created_at FROM session_summaries 
                          WHERE created_at >= datetime('now', '-' || ?1 || ' days')
@@ -500,13 +536,18 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
 
                     let days_str = days_ago.to_string();
                     let limit_i64 = limit as i64;
-                    let rows = stmt.query_map(params![days_str, limit_i64], |row| {
-                        let sid: String = row.get(0)?;
-                        let sum: String = row.get(1)?;
-                        let key: String = row.get(2)?;
-                        let created_at: String = row.get(3)?;
-                        Ok(format!("[{}] Session: {}\nSummary: {}\nKey Info: {}", created_at, sid, sum, key))
-                    }).map_err(|e| e.to_string())?;
+                    let rows = stmt
+                        .query_map(params![days_str, limit_i64], |row| {
+                            let sid: String = row.get(0)?;
+                            let sum: String = row.get(1)?;
+                            let key: String = row.get(2)?;
+                            let created_at: String = row.get(3)?;
+                            Ok(format!(
+                                "[{}] Session: {}\nSummary: {}\nKey Info: {}",
+                                created_at, sid, sum, key
+                            ))
+                        })
+                        .map_err(|e| e.to_string())?;
 
                     let mut results = Vec::new();
                     for s in rows {
@@ -516,7 +557,10 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 })();
                 let _ = reply.send(res);
             }
-            MemoryMessage::GetSessionsNeedingReflection { threshold_mins, reply } => {
+            MemoryMessage::GetSessionsNeedingReflection {
+                threshold_mins,
+                reply,
+            } => {
                 let res = (|| -> Result<Vec<String>, String> {
                     let mut stmt = self.conn.prepare(
                         "SELECT latest.session_id FROM (
@@ -529,7 +573,9 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     ).map_err(|e| e.to_string())?;
 
                     let threshold_f64 = threshold_mins as f64;
-                    let ids_iter = stmt.query_map(params![threshold_f64], |row| row.get(0)).map_err(|e| e.to_string())?;
+                    let ids_iter = stmt
+                        .query_map(params![threshold_f64], |row| row.get(0))
+                        .map_err(|e| e.to_string())?;
                     let mut ids = Vec::new();
                     for id_res in ids_iter {
                         match id_res {
@@ -553,12 +599,14 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                         "SELECT id, role, content FROM messages WHERE session_id = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id ASC"
                     ).map_err(|e| e.to_string())?;
 
-                    let messages_iter = msg_stmt.query_map(params![session_id, last_msg_id], |row| {
-                        let id: i64 = row.get(0)?;
-                        let role: String = row.get(1)?;
-                        let content: String = row.get(2)?;
-                        Ok((id, role, content))
-                    }).map_err(|e| e.to_string())?;
+                    let messages_iter = msg_stmt
+                        .query_map(params![session_id, last_msg_id], |row| {
+                            let id: i64 = row.get(0)?;
+                            let role: String = row.get(1)?;
+                            let content: String = row.get(2)?;
+                            Ok((id, role, content))
+                        })
+                        .map_err(|e| e.to_string())?;
 
                     let mut msgs = Vec::new();
                     for msg_res in messages_iter {
@@ -583,13 +631,16 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     let mut last_id = 0;
                     if let Some(time_str) = last_lt_time {
                         last_id = time_str.parse::<i64>().unwrap_or(0);
-                        
-                        let count: i64 = self.conn.query_row(
-                            "SELECT COUNT(*) FROM session_summaries WHERE id > ?1",
-                            params![last_id],
-                            |row| row.get(0)
-                        ).map_err(|e| e.to_string())?;
-                        
+
+                        let count: i64 = self
+                            .conn
+                            .query_row(
+                                "SELECT COUNT(*) FROM session_summaries WHERE id > ?1",
+                                params![last_id],
+                                |row| row.get(0),
+                            )
+                            .map_err(|e| e.to_string())?;
+
                         if count > threshold as i64 {
                             should_run = true;
                         }
@@ -602,18 +653,21 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     }
 
                     let mut stmt = self.conn.prepare("SELECT id, summary, key_info FROM session_summaries WHERE id > ?1 ORDER BY id ASC").map_err(|e| e.to_string())?;
-                    let rows = stmt.query_map(params![last_id], |row| {
-                        let id: i64 = row.get(0)?;
-                        let sum: String = row.get(1)?;
-                        let key: String = row.get(2)?;
-                        Ok((id, sum, key))
-                    }).map_err(|e| e.to_string())?;
+                    let rows = stmt
+                        .query_map(params![last_id], |row| {
+                            let id: i64 = row.get(0)?;
+                            let sum: String = row.get(1)?;
+                            let key: String = row.get(2)?;
+                            Ok((id, sum, key))
+                        })
+                        .map_err(|e| e.to_string())?;
 
                     let mut summaries_content = String::new();
                     let mut max_id = last_id;
                     for row in rows {
                         if let Ok((id, sum, key)) = row {
-                            summaries_content.push_str(&format!("Summary:\n{}\nKey Info:\n{}\n\n", sum, key));
+                            summaries_content
+                                .push_str(&format!("Summary:\n{}\nKey Info:\n{}\n\n", sum, key));
                             max_id = id;
                         }
                     }

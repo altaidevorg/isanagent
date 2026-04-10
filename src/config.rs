@@ -1,5 +1,11 @@
 use serde::{Deserialize, Serialize};
 
+/// Local stdin/stdout chat. When `enable` is omitted, defaults to `true` (legacy behavior).
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct TerminalConfig {
+    pub enable: Option<bool>,
+}
+
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct AppConfig {
     pub restrict_to_workspace: Option<bool>,
@@ -7,6 +13,7 @@ pub struct AppConfig {
     pub api: Option<ApiConfig>,
     pub slack: Option<SlackConfig>,
     pub email: Option<EmailConfig>,
+    pub terminal: Option<TerminalConfig>,
     pub max_iterations: Option<usize>,
     pub max_tool_output_chars: Option<usize>,
     /// Max characters returned by `web_search` / `web_fetch` (default 50_000). Separate from
@@ -52,6 +59,31 @@ fn jina_api_key_looks_like_placeholder(s: &str) -> bool {
 }
 
 impl AppConfig {
+    /// Whether the stdin/stdout terminal channel is active (`[terminal].enable`, default `true`).
+    pub fn terminal_enabled(&self) -> bool {
+        self.terminal
+            .as_ref()
+            .and_then(|t| t.enable)
+            .unwrap_or(true)
+    }
+
+    /// At least one inbound channel other than terminal (API, Slack, or Email).
+    pub fn has_non_terminal_inbound_channel(&self) -> bool {
+        let api_on = self
+            .api
+            .as_ref()
+            .is_some_and(|a| a.enabled.unwrap_or(false));
+        let slack_on = self
+            .slack
+            .as_ref()
+            .is_some_and(|s| s.enabled.unwrap_or(false));
+        let email_on = self
+            .email
+            .as_ref()
+            .is_some_and(|e| e.enabled.unwrap_or(false));
+        api_on || slack_on || email_on
+    }
+
     /// Returns `Some` when `[jina].enabled` is true so tools should call r.jina.ai / s.jina.ai.
     pub fn jina_web_backend(&self) -> Option<JinaWebBackend> {
         let j = self.jina.as_ref()?;
@@ -105,8 +137,9 @@ pub struct ProviderConfig {
     pub base_url: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
+#[clap(rename_all = "lower")]
 pub enum SlackMode {
     #[default]
     Webhook,

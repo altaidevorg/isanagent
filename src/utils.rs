@@ -1,7 +1,7 @@
+use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::time::Duration;
-use log::{info, debug};
 
 /// Suffix after the human-readable runtime context line on user messages (see `agent` injection).
 /// API and previews strip through this marker so wording inside the `[RUNTIME CONTEXT]` line can evolve.
@@ -58,7 +58,7 @@ impl MessageContent {
                     ContentPart::ImageUrl { .. } => None,
                 })
                 .collect::<Vec<_>>()
-                .join("\n\n")
+                .join("\n\n"),
         }
     }
 }
@@ -132,7 +132,9 @@ impl ChatMessage {
         if attachments.is_empty() {
             return Self::user(text);
         }
-        let mut parts = vec![ContentPart::Text { text: text.to_string() }];
+        let mut parts = vec![ContentPart::Text {
+            text: text.to_string(),
+        }];
         parts.extend_from_slice(attachments);
         Self {
             role: "user".to_string(),
@@ -212,7 +214,7 @@ impl LLMClient {
     pub fn new_openai_compatible(base_url: &str, api_key: &str, model: &str) -> Self {
         // Ensure base_url ends with slash if needed, or handle path joining correctly
         // For simplicity, we assume user gives enough of the path or we append standardized paths.
-        // However, OpenAI-compatible APIs often vary in suffix. 
+        // However, OpenAI-compatible APIs often vary in suffix.
         // We'll treat `base_url` as the full endpoint URL for completions for maximum flexibility,
         // OR we can default to adding "/chat/completions" if the user provided base domain.
         // Let's go with robust: User provides full endpoint or we construct.
@@ -240,8 +242,16 @@ impl LLMClient {
     }
 
     /// Send a chat completion request with history.
-    pub async fn chat(&self, messages: &[ChatMessage], tools: Option<serde_json::Value>) -> Result<LLMResponse, LLMError> {
-        debug!("Sending chat request to {} with {} messages", self.model, messages.len());
+    pub async fn chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<serde_json::Value>,
+    ) -> Result<LLMResponse, LLMError> {
+        debug!(
+            "Sending chat request to {} with {} messages",
+            self.model,
+            messages.len()
+        );
 
         // Construct body for OpenAI-compatible
         let mut body = json!({
@@ -258,13 +268,15 @@ impl LLMClient {
         }
 
         // Normally "openai compatible" implies base_url is something like https://api.openai.com/v1
-        // and we append /chat/completions. 
-        // But some services give you the exact endpoint. 
+        // and we append /chat/completions.
+        // But some services give you the exact endpoint.
         // We'll look for "completions" in the URL. If missing, we append /chat/completions?
         // Let's stick to the convention in the example: The URL passed IS the endpoint.
         let url = &self.base_url;
 
-        let res = self.client.post(url)
+        let res = self
+            .client
+            .post(url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
             .timeout(self.timeout)
@@ -278,9 +290,13 @@ impl LLMClient {
             return Err(LLMError::ApiError(format!("Status {}: {}", status, text)));
         }
 
-        let raw_text = res.text().await.map_err(|e| LLMError::ApiError(e.to_string()))?;
-        let json_resp: serde_json::Value = serde_json::from_str(&raw_text).map_err(LLMError::ParseError)?;
-        
+        let raw_text = res
+            .text()
+            .await
+            .map_err(|e| LLMError::ApiError(e.to_string()))?;
+        let json_resp: serde_json::Value =
+            serde_json::from_str(&raw_text).map_err(LLMError::ParseError)?;
+
         let content_val = &json_resp["choices"][0]["message"]["content"];
         let content = if content_val.is_null() {
             "".to_string()
@@ -315,7 +331,12 @@ impl LLMClient {
             .unwrap_or("unknown")
             .to_string();
 
-        if usage.as_ref().map(|u| u.completion_tokens == 0).unwrap_or(false) || content.trim().is_empty() {
+        if usage
+            .as_ref()
+            .map(|u| u.completion_tokens == 0)
+            .unwrap_or(false)
+            || content.trim().is_empty()
+        {
             debug!(
                 "LLM returned empty content or zero completion tokens. finish_reason={} raw_response_len={}",
                 finish_reason,
@@ -323,10 +344,11 @@ impl LLMClient {
             );
         }
 
-        info!("LLM Response received ({} chars content, tool_calls: {}, reasoning: {}, usage: {})", 
-            content.len(), 
+        info!(
+            "LLM Response received ({} chars content, tool_calls: {}, reasoning: {}, usage: {})",
+            content.len(),
             tool_calls.as_ref().map(|v| v.len()).unwrap_or(0),
-            reasoning_content.is_some(), 
+            reasoning_content.is_some(),
             usage.is_some()
         );
 
@@ -346,10 +368,7 @@ impl LLMClient {
 
     /// One-shot with system instruction.
     pub async fn ask_with_system(&self, system: &str, user: &str) -> Result<LLMResponse, LLMError> {
-        let messages = vec![
-            ChatMessage::system(system),
-            ChatMessage::user(user)
-        ];
+        let messages = vec![ChatMessage::system(system), ChatMessage::user(user)];
         self.chat(&messages, None).await
     }
 }
@@ -388,7 +407,7 @@ pub fn resolve_path(sandbox_dir: &std::path::Path, agent_path: &str) -> Option<s
 }
 
 /// Robustly extracts a JSON object from a raw LLM text response.
-/// Intended to handle markdown formatting (` ```json ... ``` `) 
+/// Intended to handle markdown formatting (` ```json ... ``` `)
 /// or conversational wrappers around the core `{ ... }` payload.
 pub fn extract_json_from_llm_response(text: &str) -> Option<serde_json::Value> {
     // Attempt 1: Look for explicit markdown JSON blocks

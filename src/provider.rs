@@ -1,6 +1,6 @@
-use async_trait::async_trait;
 use crate::traits::Provider;
-use crate::utils::{ChatMessage, LLMError, LLMClient, LLMResponse};
+use crate::utils::{ChatMessage, LLMClient, LLMError, LLMResponse};
+use async_trait::async_trait;
 
 /// A Provider implementation that wraps the existing LLMClient
 pub struct OpenAIProvider {
@@ -15,7 +15,11 @@ impl OpenAIProvider {
 
 #[async_trait]
 impl Provider for OpenAIProvider {
-    async fn chat(&self, messages: &[ChatMessage], tools: Option<serde_json::Value>) -> Result<LLMResponse, LLMError> {
+    async fn chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<serde_json::Value>,
+    ) -> Result<LLMResponse, LLMError> {
         self.client.chat(messages, tools).await
     }
 }

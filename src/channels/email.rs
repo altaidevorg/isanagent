@@ -1,8 +1,8 @@
-use async_trait::async_trait;
 use crate::bus::{InboundMessage, OutboundMessage};
 use crate::channels::Channel;
 use crate::config::EmailConfig;
 use crate::logging::LoggerHandle;
+use async_trait::async_trait;
 use lettre::{transport::smtp::authentication::Credentials, Message, SmtpTransport, Transport};
 use log::{error, info};
 use native_tls::TlsConnector;
@@ -36,10 +36,12 @@ impl Channel for EmailChannel {
     }
 
     async fn start(&self, inbound_tx: Sender<InboundMessage>) -> Result<(), String> {
-        let _ = self.logger_tx.send(crate::bus::BusMessage::Log(crate::bus::LogEvent::info(
-            "EmailChannel",
-            "Starting Email channel...",
-        )));
+        let _ = self
+            .logger_tx
+            .send(crate::bus::BusMessage::Log(crate::bus::LogEvent::info(
+                "EmailChannel",
+                "Starting Email channel...",
+            )));
         let config = self.config.clone();
         let logger_tx = self.logger_tx.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -111,11 +113,9 @@ impl Channel for EmailChannel {
                         .parse()
                         .map_err(|e| format!("Invalid from address: {}", e))?,
                 )
-                .to(
-                    to_address
-                        .parse()
-                        .map_err(|e| format!("Invalid to address: {}", e))?,
-                )
+                .to(to_address
+                    .parse()
+                    .map_err(|e| format!("Invalid to address: {}", e))?)
                 .subject(if subject.starts_with("Re:") {
                     subject.clone()
                 } else {
@@ -124,7 +124,8 @@ impl Channel for EmailChannel {
                 .body(msg.content.clone())
                 .map_err(|e| e.to_string())?;
 
-            let creds = Credentials::new(config.imap_username.clone(), config.imap_password.clone());
+            let creds =
+                Credentials::new(config.imap_username.clone(), config.imap_password.clone());
 
             let mailer = SmtpTransport::relay(&config.smtp_host)
                 .map_err(|e| format!("Invalid SMTP host: {}", e))?
@@ -144,8 +145,12 @@ impl Channel for EmailChannel {
 
 fn poll_inbox_once(config: EmailConfig, tx: Sender<InboundMessage>) -> Result<(), String> {
     let tls = TlsConnector::builder().build().map_err(|e| e.to_string())?;
-    let client = imap::connect((&config.imap_host as &str, config.imap_port), &config.imap_host, &tls)
-        .map_err(|e| e.to_string())?;
+    let client = imap::connect(
+        (&config.imap_host as &str, config.imap_port),
+        &config.imap_host,
+        &tls,
+    )
+    .map_err(|e| e.to_string())?;
 
     let mut session = client
         .login(&config.imap_username, &config.imap_password)

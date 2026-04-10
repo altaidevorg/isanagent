@@ -1,14 +1,14 @@
-use std::path::PathBuf;
-use tokio::time::{sleep, Duration};
+use crate::bus::{BusMessage, LogEvent};
 use crate::config::MemoryConfig;
+use crate::logging::LoggerHandle;
+use crate::memory::{MemoryMessage, SharedReply};
 use crate::traits::Provider;
 use crate::utils::ChatMessage;
 use crate::NodeHandle;
-use crate::memory::{MemoryMessage, SharedReply};
-use crate::bus::{BusMessage, LogEvent};
-use crate::logging::LoggerHandle;
 use std::fs;
+use std::path::PathBuf;
 use tokio::sync::watch;
+use tokio::time::{sleep, Duration};
 
 pub struct ReflectionEngine {
     memory_node: NodeHandle<MemoryMessage>,
@@ -28,18 +28,31 @@ impl ReflectionEngine {
         logger_tx: LoggerHandle,
         shutdown_rx: watch::Receiver<bool>,
     ) -> Self {
-        Self { memory_node, workspace_dir, provider, config, logger_tx, shutdown_rx }
+        Self {
+            memory_node,
+            workspace_dir,
+            provider,
+            config,
+            logger_tx,
+            shutdown_rx,
+        }
     }
 
     pub fn start(self) -> tokio::task::JoinHandle<()> {
-        let _ = self.logger_tx.send(BusMessage::Log(LogEvent::info("ReflectionEngine", "ReflectionEngine starting...")));
+        let _ = self.logger_tx.send(BusMessage::Log(LogEvent::info(
+            "ReflectionEngine",
+            "ReflectionEngine starting...",
+        )));
         tokio::spawn(async move {
             self.run_loop().await;
         })
     }
 
     async fn run_loop(mut self) {
-        let _ = self.logger_tx.send(BusMessage::Log(LogEvent::info("ReflectionEngine", "ReflectionEngine run loop started.")));
+        let _ = self.logger_tx.send(BusMessage::Log(LogEvent::info(
+            "ReflectionEngine",
+            "ReflectionEngine run loop started.",
+        )));
         loop {
             tokio::select! {
                 _ = sleep(Duration::from_secs(60)) => {}
@@ -56,30 +69,44 @@ impl ReflectionEngine {
             }
 
             if let Err(e) = self.run_short_term_reflection().await {
-                let _ = self.logger_tx.send(BusMessage::Log(LogEvent::error("ReflectionEngine", &format!("Short-term reflection failed: {}", e))));
+                let _ = self.logger_tx.send(BusMessage::Log(LogEvent::error(
+                    "ReflectionEngine",
+                    &format!("Short-term reflection failed: {}", e),
+                )));
             }
 
             if let Err(e) = self.run_long_term_reflection().await {
-                let _ = self.logger_tx.send(BusMessage::Log(LogEvent::error("ReflectionEngine", &format!("Long-term reflection failed: {}", e))));
+                let _ = self.logger_tx.send(BusMessage::Log(LogEvent::error(
+                    "ReflectionEngine",
+                    &format!("Long-term reflection failed: {}", e),
+                )));
             }
         }
     }
 
-    async fn run_short_term_reflection(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn run_short_term_reflection(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.memory_node.send_packet(MemoryMessage::GetSessionsNeedingReflection {
-            threshold_mins: self.config.short_term_threshold_mins.unwrap_or(3),
-            reply: SharedReply::new(tx),
-        }).await.map_err(|e| e.to_string())?;
-        
+        self.memory_node
+            .send_packet(MemoryMessage::GetSessionsNeedingReflection {
+                threshold_mins: self.config.short_term_threshold_mins.unwrap_or(3),
+                reply: SharedReply::new(tx),
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+
         let session_ids = rx.await??;
 
         for session_id in session_ids {
             let (tx, rx) = tokio::sync::oneshot::channel();
-            self.memory_node.send_packet(MemoryMessage::GetMessagesSinceReflection {
-                session_id: session_id.clone(),
-                reply: SharedReply::new(tx),
-            }).await.map_err(|e| e.to_string())?;
+            self.memory_node
+                .send_packet(MemoryMessage::GetMessagesSinceReflection {
+                    session_id: session_id.clone(),
+                    reply: SharedReply::new(tx),
+                })
+                .await
+                .map_err(|e| e.to_string())?;
 
             let (new_messages, _last_msg_id) = rx.await??;
 
@@ -88,8 +115,14 @@ impl ReflectionEngine {
             }
 
             let _ = self.logger_tx.send(BusMessage::Log(
-                LogEvent::debug("ReflectionEngine", &format!("Session {} reached short-term reflection threshold (idle)", session_id))
-                .with_chat_id(&session_id)
+                LogEvent::debug(
+                    "ReflectionEngine",
+                    &format!(
+                        "Session {} reached short-term reflection threshold (idle)",
+                        session_id
+                    ),
+                )
+                .with_chat_id(&session_id),
             ));
             // Trigger summary
             let mut transcript = String::new();
@@ -97,71 +130,100 @@ impl ReflectionEngine {
                 transcript.push_str(&format!("{}: {}\n\n", role, content));
             }
 
-                let prompt = format!(
+            let prompt = format!(
                     "Summarize the following conversation. Extract key information, facts and any potential knowledge gaps.\n\
                     Format your response EXACTLY as a JSON object with these keys: \"summary\", \"key_info\", \"knowledge_gaps\".\n\n\
                     Conversation:\n{}", transcript
                 );
 
-                let context = vec![ChatMessage::user(&prompt)];
-                match self.provider.chat(&context, None).await {
-                    Ok(response) => {
-                        let text = response.content;
-                        // Use robust JSON extractor
-                        if let Some(val) = crate::utils::extract_json_from_llm_response(&text) {
-                            let summary = val.get("summary").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            let key_info = val.get("key_info").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            let knowledge_gaps = val.get("knowledge_gaps").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let context = vec![ChatMessage::user(&prompt)];
+            match self.provider.chat(&context, None).await {
+                Ok(response) => {
+                    let text = response.content;
+                    // Use robust JSON extractor
+                    if let Some(val) = crate::utils::extract_json_from_llm_response(&text) {
+                        let summary = val
+                            .get("summary")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let key_info = val
+                            .get("key_info")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let knowledge_gaps = val
+                            .get("knowledge_gaps")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
 
-                                    let (tx, rx) = tokio::sync::oneshot::channel();
-                                    self.memory_node.send_packet(MemoryMessage::AddSummary {
-                                        session_id: session_id.clone(),
-                                        summary,
-                                        key_info,
-                                        knowledge_gaps,
-                                        reply: SharedReply::new(tx),
-                                    }).await.map_err(|e| e.to_string())?;
-                                    rx.await??;
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        self.memory_node
+                            .send_packet(MemoryMessage::AddSummary {
+                                session_id: session_id.clone(),
+                                summary,
+                                key_info,
+                                knowledge_gaps,
+                                reply: SharedReply::new(tx),
+                            })
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        rx.await??;
 
-                                    let highest_id = new_messages.last().unwrap().0;
-                                    let (tx, rx) = tokio::sync::oneshot::channel();
-                                    self.memory_node.send_packet(MemoryMessage::UpdateSessionMetadata {
-                                        session_id: session_id.clone(),
-                                        last_reflection_msg_id: Some(highest_id),
-                                        reply: SharedReply::new(tx),
-                                    }).await.map_err(|e| e.to_string())?;
-                                    rx.await??;
-                                    
-                                    let _ = self.logger_tx.send(BusMessage::Log(
-                                        LogEvent::info("ReflectionEngine", &format!("Generated short-term summary for session {}", session_id))
-                                        .with_chat_id(&session_id)
-                                    ));
-                                }
-                    }
-                    Err(e) => {
+                        let highest_id = new_messages.last().unwrap().0;
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        self.memory_node
+                            .send_packet(MemoryMessage::UpdateSessionMetadata {
+                                session_id: session_id.clone(),
+                                last_reflection_msg_id: Some(highest_id),
+                                reply: SharedReply::new(tx),
+                            })
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        rx.await??;
+
                         let _ = self.logger_tx.send(BusMessage::Log(
-                            LogEvent::error("ReflectionEngine", &format!("Failed to call provider for reflection: {}", e))
-                            .with_chat_id(&session_id)
+                            LogEvent::info(
+                                "ReflectionEngine",
+                                &format!("Generated short-term summary for session {}", session_id),
+                            )
+                            .with_chat_id(&session_id),
                         ));
                     }
                 }
+                Err(e) => {
+                    let _ = self.logger_tx.send(BusMessage::Log(
+                        LogEvent::error(
+                            "ReflectionEngine",
+                            &format!("Failed to call provider for reflection: {}", e),
+                        )
+                        .with_chat_id(&session_id),
+                    ));
+                }
+            }
         }
         Ok(())
     }
 
-    async fn run_long_term_reflection(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn run_long_term_reflection(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let memory_md_path = self.workspace_dir.join("MEMORY.md");
-        
+
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.memory_node.send_packet(MemoryMessage::GetLongTermReflectionState {
-            threshold: self.config.long_term_threshold_summaries.unwrap_or(5),
-            reply: SharedReply::new(tx),
-        }).await.map_err(|e| e.to_string())?;
-        
+        self.memory_node
+            .send_packet(MemoryMessage::GetLongTermReflectionState {
+                threshold: self.config.long_term_threshold_summaries.unwrap_or(5),
+                reply: SharedReply::new(tx),
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+
         let (should_run, summaries_content, max_id) = rx.await??;
 
         if !should_run || summaries_content.is_empty() {
-             return Ok(());
+            return Ok(());
         }
 
         let current_memory = if memory_md_path.exists() {
@@ -182,24 +244,28 @@ impl ReflectionEngine {
         if let Ok(response) = self.provider.chat(&context, None).await {
             let mut answer = response.content;
             if let Some(start) = answer.find("```markdown") {
-                if let Some(end) = answer[start+11..].find("```") {
-                    answer = answer[start+11..start+11+end].to_string();
+                if let Some(end) = answer[start + 11..].find("```") {
+                    answer = answer[start + 11..start + 11 + end].to_string();
                 }
             }
             fs::write(&memory_md_path, answer.trim())?;
-            
+
             let (tx, rx) = tokio::sync::oneshot::channel();
-            self.memory_node.send_packet(MemoryMessage::SetLongTermReflectionState {
-                max_id,
-                reply: SharedReply::new(tx),
-            }).await.map_err(|e| e.to_string())?;
+            self.memory_node
+                .send_packet(MemoryMessage::SetLongTermReflectionState {
+                    max_id,
+                    reply: SharedReply::new(tx),
+                })
+                .await
+                .map_err(|e| e.to_string())?;
             rx.await??;
-            
-            let _ = self.logger_tx.send(BusMessage::Log(
-                LogEvent::info("ReflectionEngine", "Generated long-term memory update")
-            ));
+
+            let _ = self.logger_tx.send(BusMessage::Log(LogEvent::info(
+                "ReflectionEngine",
+                "Generated long-term memory update",
+            )));
         }
-        
+
         Ok(())
     }
 }

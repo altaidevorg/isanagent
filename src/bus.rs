@@ -1,6 +1,6 @@
-use serde::{Serialize, Deserialize};
-use std::collections::HashMap;
 use crate::utils::ContentPart;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// An inbound message received from a Channel (e.g. Slack, Email).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,7 +59,7 @@ pub enum TelemetryEvent {
     CronTrigger {
         job_id: String,
         message: String,
-    }
+    },
 }
 
 /// Log severity levels for verbose diagnostics.
@@ -77,8 +77,8 @@ impl std::fmt::Display for LogLevel {
         match self {
             LogLevel::Trace => write!(f, "TRACE"),
             LogLevel::Debug => write!(f, "DEBUG"),
-            LogLevel::Info  => write!(f, "INFO"),
-            LogLevel::Warn  => write!(f, "WARN"),
+            LogLevel::Info => write!(f, "INFO"),
+            LogLevel::Warn => write!(f, "WARN"),
             LogLevel::Error => write!(f, "ERROR"),
         }
     }
@@ -136,11 +136,21 @@ impl LogEvent {
         }
     }
 
-    pub fn trace(source: &str, message: &str) -> Self { Self::new(LogLevel::Trace, source, message) }
-    pub fn debug(source: &str, message: &str) -> Self { Self::new(LogLevel::Debug, source, message) }
-    pub fn info(source: &str, message: &str) -> Self { Self::new(LogLevel::Info, source, message) }
-    pub fn warn(source: &str, message: &str) -> Self { Self::new(LogLevel::Warn, source, message) }
-    pub fn error(source: &str, message: &str) -> Self { Self::new(LogLevel::Error, source, message) }
+    pub fn trace(source: &str, message: &str) -> Self {
+        Self::new(LogLevel::Trace, source, message)
+    }
+    pub fn debug(source: &str, message: &str) -> Self {
+        Self::new(LogLevel::Debug, source, message)
+    }
+    pub fn info(source: &str, message: &str) -> Self {
+        Self::new(LogLevel::Info, source, message)
+    }
+    pub fn warn(source: &str, message: &str) -> Self {
+        Self::new(LogLevel::Warn, source, message)
+    }
+    pub fn error(source: &str, message: &str) -> Self {
+        Self::new(LogLevel::Error, source, message)
+    }
 
     /// Attach a chat_id for session-level tracing.
     pub fn with_chat_id(mut self, chat_id: &str) -> Self {
@@ -169,10 +179,14 @@ impl LogEvent {
 
     /// Format as a single human-readable log line for the verbose log file.
     pub fn format_line(&self) -> String {
-        let chat_part = self.chat_id.as_deref()
+        let chat_part = self
+            .chat_id
+            .as_deref()
             .map(|id| format!(" [chat:{}]", redact_chat_id(id)))
             .unwrap_or_default();
-        let target_part = self.target.as_deref()
+        let target_part = self
+            .target
+            .as_deref()
             .map(|target| format!(" [target:{}]", target))
             .unwrap_or_default();
         let location_part = match (self.file.as_deref(), self.line) {
@@ -180,7 +194,9 @@ impl LogEvent {
             (Some(file), None) => format!(" [{}]", file),
             _ => String::new(),
         };
-        let meta_part = self.metadata.as_ref()
+        let meta_part = self
+            .metadata
+            .as_ref()
             .map(|m| format!(" {}", m))
             .unwrap_or_default();
         format!(

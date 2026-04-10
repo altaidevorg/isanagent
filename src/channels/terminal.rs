@@ -1,16 +1,19 @@
-use async_trait::async_trait;
+use crate::bus::{BusMessage, InboundMessage, LogEvent, OutboundMessage};
 use crate::channels::Channel;
-use crate::bus::{InboundMessage, OutboundMessage, BusMessage, LogEvent};
 use crate::logging::LoggerHandle;
-use crate::utils::{ContentPart, ImageUrl, resolve_path};
-use tokio::sync::mpsc::Sender;
-use std::collections::HashMap;
-use std::io::{self, Write};
-use std::path::PathBuf;
-use log::error;
+use crate::utils::{resolve_path, ContentPart, ImageUrl};
+use async_trait::async_trait;
 use colored::Colorize;
-use crossterm::{cursor, terminal::{Clear, ClearType}, execute};
+use crossterm::{
+    cursor, execute,
+    terminal::{Clear, ClearType},
+};
+use log::{error, info};
 use serde_json::json;
+use std::collections::HashMap;
+use std::io::{self, IsTerminal, Write};
+use std::path::PathBuf;
+use tokio::sync::mpsc::Sender;
 
 const ISANAGENT_TOOL_NOTIFY: &str = "isanagent_tool_notify";
 const ISANAGENT_TOOL_PHASE: &str = "isanagent_tool_phase";
@@ -138,7 +141,10 @@ fn image_mime_from_extension(path: &std::path::Path) -> Option<&'static str> {
 /// silently skipped.  Unsupported file types and unreadable files are also
 /// silently skipped (a warning is printed to stderr instead of aborting the
 /// whole message).
-fn parse_terminal_attachments(input: &str, sandbox_dir: &std::path::Path) -> (String, Vec<ContentPart>) {
+fn parse_terminal_attachments(
+    input: &str,
+    sandbox_dir: &std::path::Path,
+) -> (String, Vec<ContentPart>) {
     use base64::Engine as _;
     let engine = base64::engine::general_purpose::STANDARD;
 
@@ -170,8 +176,7 @@ fn parse_terminal_attachments(input: &str, sandbox_dir: &std::path::Path) -> (St
 
             // Resolve and sandbox-check the path.
             let expanded_path = std::path::Path::new(&expanded);
-            let path_exists = expanded_path.exists()
-                || sandbox_dir.join(expanded_path).exists();
+            let path_exists = expanded_path.exists() || sandbox_dir.join(expanded_path).exists();
             match resolve_path(sandbox_dir, &expanded) {
                 None if path_exists => {
                     eprintln!("Warning: @<path> is outside the sandbox boundary, skipping.");
@@ -179,29 +184,26 @@ fn parse_terminal_attachments(input: &str, sandbox_dir: &std::path::Path) -> (St
                 None => {
                     eprintln!("Warning: @<path> does not exist or is not accessible, skipping.");
                 }
-                Some(file_path) => {
-                    match image_mime_from_extension(&file_path) {
-                        None => {
-                            eprintln!("Warning: @<path> is not a supported image type (jpeg/png/gif/webp), skipping.");
-                        }
-                        Some(mime) => {
-                            match std::fs::read(&file_path) {
-                                Err(_) => {
-                                    eprintln!("Warning: could not read @<path>, skipping.");
-                                }
-                                Ok(bytes) => {
-                                    let data_uri = format!("data:{};base64,{}", mime, engine.encode(&bytes));
-                                    attachments.push(ContentPart::ImageUrl {
-                                        image_url: ImageUrl {
-                                            url: data_uri,
-                                            detail: None,
-                                        },
-                                    });
-                                }
-                            }
-                        }
+                Some(file_path) => match image_mime_from_extension(&file_path) {
+                    None => {
+                        eprintln!("Warning: @<path> is not a supported image type (jpeg/png/gif/webp), skipping.");
                     }
-                }
+                    Some(mime) => match std::fs::read(&file_path) {
+                        Err(_) => {
+                            eprintln!("Warning: could not read @<path>, skipping.");
+                        }
+                        Ok(bytes) => {
+                            let data_uri =
+                                format!("data:{};base64,{}", mime, engine.encode(&bytes));
+                            attachments.push(ContentPart::ImageUrl {
+                                image_url: ImageUrl {
+                                    url: data_uri,
+                                    detail: None,
+                                },
+                            });
+                        }
+                    },
+                },
             }
 
             last_end = path_end;
@@ -230,11 +232,15 @@ impl Channel for TerminalChannel {
         let logger_tx = self.logger_tx.clone();
         let shutdown_tx = self.shutdown_tx.clone();
         let sandbox_dir = self.sandbox_dir.clone();
-        
-        let _ = logger_tx.send(BusMessage::Log(LogEvent::info("TerminalChannel", "Starting Terminal channel...")));
-        
+
+        let _ = logger_tx.send(BusMessage::Log(LogEvent::info(
+            "TerminalChannel",
+            "Starting Terminal channel...",
+        )));
+
         tokio::task::spawn_blocking(move || {
             let stdin = io::stdin();
+            let stdin_is_tty = stdin.is_terminal();
             let mut input = String::new();
 
             loop {
@@ -242,9 +248,24 @@ impl Channel for TerminalChannel {
                 print!("{}", "> ".bold().green());
                 let _ = io::stdout().flush();
                 input.clear();
-                
+
                 // blocking wait on stdin
                 match stdin.read_line(&mut input) {
+                    Ok(0) => {
+                        // `Ok(0)` is EOF with no bytes read. If we treated it like an empty line we
+                        // would `continue` forever when stdin is closed/non-interactive (e.g. Docker
+                        // without `-i`).
+                        let msg = if !stdin_is_tty {
+                            "Terminal channel: exiting stdin loop after EOF while stdin is not a TTY \
+(non-interactive). Stops repeated empty reads; for API-only runs prefer `[terminal] enable = false` in config.toml."
+                        } else {
+                            "Terminal channel: stdin EOF; closing terminal input loop."
+                        };
+                        let _ =
+                            logger_tx.send(BusMessage::Log(LogEvent::info("TerminalChannel", msg)));
+                        info!("{}", msg);
+                        break;
+                    }
                     Ok(_) => {
                         let text = input.trim();
                         if text.is_empty() {
@@ -253,8 +274,13 @@ impl Channel for TerminalChannel {
 
                         // Handle terminal-specific slash commands
                         if text.starts_with('/') {
-                            if text.eq_ignore_ascii_case("/exit") || text.eq_ignore_ascii_case("/quit") {
-                                println!("{}", "Safely shutting down Advanced isanagent System...".yellow());
+                            if text.eq_ignore_ascii_case("/exit")
+                                || text.eq_ignore_ascii_case("/quit")
+                            {
+                                println!(
+                                    "{}",
+                                    "Safely shutting down Advanced isanagent System...".yellow()
+                                );
                                 let _ = shutdown_tx.send(());
                                 break;
                             }
@@ -263,19 +289,27 @@ impl Channel for TerminalChannel {
                                 println!("{}", "Created a fresh new session!".green());
                                 continue;
                             }
-                            println!("{}", "Unknown slash command. Try /exit to quit, or /new to start fresh.".red());
+                            println!(
+                                "{}",
+                                "Unknown slash command. Try /exit to quit, or /new to start fresh."
+                                    .red()
+                            );
                             continue;
                         }
 
                         // Handle legacy exit variants for user convenience
                         if text.eq_ignore_ascii_case("exit") || text.eq_ignore_ascii_case("quit") {
-                            println!("{}", "Safely shutting down Advanced isanagent System...".yellow());
+                            println!(
+                                "{}",
+                                "Safely shutting down Advanced isanagent System...".yellow()
+                            );
                             let _ = shutdown_tx.send(());
                             break;
                         }
 
                         // Parse @filepath references into multimodal attachments
-                        let (clean_text, attachments) = parse_terminal_attachments(text, &sandbox_dir);
+                        let (clean_text, attachments) =
+                            parse_terminal_attachments(text, &sandbox_dir);
 
                         let msg = InboundMessage {
                             channel: channel_name.clone(),
@@ -331,11 +365,7 @@ impl Channel for TerminalChannel {
         if tool_notify {
             match phase {
                 "call" => println!("{} {}", "[Tool]".yellow().bold(), msg.content),
-                "result" => println!(
-                    "{} {}",
-                    "[Tool done]".yellow().bold(),
-                    msg.content.green()
-                ),
+                "result" => println!("{} {}", "[Tool done]".yellow().bold(), msg.content.green()),
                 _ => println!("{} {}", "[Tool]".yellow().bold(), msg.content),
             }
         } else {
@@ -385,7 +415,10 @@ mod tests {
         let input = format!("see @{} thanks", path.display());
         let (text, attachments) = parse_terminal_attachments(&input, &sandbox);
         assert!(!text.contains('@'));
-        assert!(attachments.is_empty(), "missing file must be skipped gracefully");
+        assert!(
+            attachments.is_empty(),
+            "missing file must be skipped gracefully"
+        );
     }
 
     #[test]
@@ -405,7 +438,10 @@ mod tests {
 
         let input = format!("describe @{} please", outside.display());
         let (_text, attachments) = parse_terminal_attachments(&input, &sandbox);
-        assert!(attachments.is_empty(), "file outside sandbox must be rejected");
+        assert!(
+            attachments.is_empty(),
+            "file outside sandbox must be rejected"
+        );
 
         let _ = std::fs::remove_file(&outside);
         let _ = std::fs::remove_dir_all(&sandbox);

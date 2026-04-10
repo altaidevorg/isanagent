@@ -514,9 +514,11 @@ impl PendingCronTrigger {
                 job_id,
                 claim_token,
                 ..
-            } => scheduler
-                .store
-                .mark_pending_trigger_delivered(job_id, claim_token, delivered_at_ms),
+            } => {
+                scheduler
+                    .store
+                    .mark_pending_trigger_delivered(job_id, claim_token, delivered_at_ms)
+            }
         }
     }
 
