@@ -219,8 +219,6 @@ where
     }
 
     /// Optional: Return a duration for periodic ticking.
-
-    /// Optional: Return a duration for periodic ticking.
     fn tick_interval(&self) -> Option<Duration> {
         None
     }
@@ -272,11 +270,7 @@ where
         info!("Actor '{}' started.", self.name);
 
         let tick_dur = self.logic.tick_interval();
-        let mut interval = if let Some(dur) = tick_dur {
-            Some(tokio::time::interval(dur))
-        } else {
-            None
-        };
+        let mut interval = tick_dur.map(tokio::time::interval);
 
         loop {
             // We use tokio::select! to listen to both channel and ticker (if present)
@@ -294,12 +288,10 @@ where
                                     if let Some(sender) = successor {
                                         info!("Actor '{}' transitioning with action '{}'.", self.name, action);
                                         let _ = sender.send(Message::Packet(new_data)).await;
+                                    } else if !self.successors.is_empty() {
+                                        warn!("Actor '{}' has no successor for action '{}'. Dropping packet.", self.name, action);
                                     } else {
-                                        if !self.successors.is_empty() {
-                                            warn!("Actor '{}' has no successor for action '{}'. Dropping packet.", self.name, action);
-                                        } else {
-                                            info!("Actor '{}' finished chain (no successors).", self.name);
-                                        }
+                                        info!("Actor '{}' finished chain (no successors).", self.name);
                                     }
                                     break;
                                 }
@@ -361,15 +353,13 @@ where
                                             self.name, action
                                         );
                                         let _ = sender.send(Message::Packet(new_data)).await;
+                                    } else if !self.successors.is_empty() {
+                                        warn!("Actor '{}' has no successor for action '{}'. Dropping packet.", self.name, action);
                                     } else {
-                                        if !self.successors.is_empty() {
-                                            warn!("Actor '{}' has no successor for action '{}'. Dropping packet.", self.name, action);
-                                        } else {
-                                            info!(
-                                                "Actor '{}' finished chain (no successors).",
-                                                self.name
-                                            );
-                                        }
+                                        info!(
+                                            "Actor '{}' finished chain (no successors).",
+                                            self.name
+                                        );
                                     }
                                     break; // Success
                                 }
@@ -601,7 +591,7 @@ where
 
 // Implement Sub for &NodeHandle ( &node - "action" )
 // The output Connector owns a CLONE of the handle, so we don't need lifetimes in Connector itself.
-impl<'a, T, S> Sub<S> for &'a NodeHandle<T>
+impl<T, S> Sub<S> for &NodeHandle<T>
 where
     T: Debug + Send + Sync + Clone + 'static,
     S: Into<String>,
@@ -618,13 +608,13 @@ where
 
 // Implement Shr for Connector ( connector >> &node )
 // Accepts a reference to the target node, removing the need for explicit clones by the user.
-impl<'a, T> Shr<&'a NodeHandle<T>> for Connector<T>
+impl<T> Shr<&NodeHandle<T>> for Connector<T>
 where
     T: Debug + Send + Sync + Clone + 'static,
 {
     type Output = NodeHandle<T>;
 
-    fn shr(self, rhs: &'a NodeHandle<T>) -> Self::Output {
+    fn shr(self, rhs: &NodeHandle<T>) -> Self::Output {
         // We need to send a message to self.source to add rhs as successor
         let action = self.action;
         let source_sender = self.source.sender.clone(); // Clone sender for the task

@@ -144,36 +144,6 @@ fn sanitize_message(message: &str) -> String {
     email_re.replace_all(&redacted, "$1***@$3").into_owned()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{sanitize_message, should_capture};
-    use log::Level;
-
-    #[test]
-    fn sanitize_message_masks_secrets_and_emails() {
-        let message = "Bearer abc.def ghi myawesomesecret umut@altai.dev";
-        let sanitized = sanitize_message(message);
-        assert!(sanitized.contains("Bearer [REDACTED]"));
-        assert!(sanitized.contains("[REDACTED_API_KEY]"));
-        assert!(sanitized.contains("u***@altai.dev"));
-        assert!(!sanitized.contains("myawesomesecret"));
-    }
-
-    #[test]
-    fn should_capture_filters_external_noise() {
-        assert!(should_capture("isanagent::utils", Level::Debug));
-        assert!(should_capture("SlackChannel", Level::Info));
-        assert!(!should_capture(
-            "hyper_util::client::legacy::pool",
-            Level::Info
-        ));
-        assert!(should_capture(
-            "hyper_util::client::legacy::pool",
-            Level::Warn
-        ));
-    }
-}
-
 /// The sole component responsible for writing workspace log files.
 pub struct LoggingActor {
     conversation_writer: BufWriter<File>,
@@ -445,5 +415,35 @@ impl ActorLogic<BusMessage> for LoggingFallbackActor {
             ))),
             _ => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sanitize_message, should_capture};
+    use log::Level;
+
+    #[test]
+    fn sanitize_message_masks_secrets_and_emails() {
+        let message = "Bearer abc.def ghi myawesomesecret umut@altai.dev";
+        let sanitized = sanitize_message(message);
+        assert!(sanitized.contains("Bearer [REDACTED]"));
+        assert!(sanitized.contains("[REDACTED_API_KEY]"));
+        assert!(sanitized.contains("u***@altai.dev"));
+        assert!(!sanitized.contains("myawesomesecret"));
+    }
+
+    #[test]
+    fn should_capture_filters_external_noise() {
+        assert!(should_capture("isanagent::utils", Level::Debug));
+        assert!(should_capture("SlackChannel", Level::Info));
+        assert!(!should_capture(
+            "hyper_util::client::legacy::pool",
+            Level::Info
+        ));
+        assert!(should_capture(
+            "hyper_util::client::legacy::pool",
+            Level::Warn
+        ));
     }
 }

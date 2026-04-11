@@ -14,6 +14,7 @@ import { cn } from "@/lib/utils";
 
 const SESSION_CHAT_KEY = "isanagent_internal_chat_id";
 const SESSION_RESPONSE_KEY = "isanagent_latest_response_id";
+/** Stable API `user` / sender_id: localStorage (shared across tabs). Session list keys off this. */
 const SESSION_USER_KEY = "isanagent_api_user_id";
 const THEME_STORAGE_KEY = "isanagent-theme";
 const SIDEBAR_HINTS_KEY = "isanagent_sidebar_hints";
@@ -215,10 +216,53 @@ function apiUserId(): string {
   if (typeof window === "undefined") {
     return "ui_anon";
   }
-  let id = sessionStorage.getItem(SESSION_USER_KEY);
-  if (!id || id.length === 0) {
-    id = `ui_${createId()}`;
-    sessionStorage.setItem(SESSION_USER_KEY, id);
+  const key = SESSION_USER_KEY;
+
+  const readLocal = (): string | null => {
+    try {
+      const v = localStorage.getItem(key);
+      return v && v.length > 0 ? v : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const writeLocal = (value: string) => {
+    try {
+      localStorage.setItem(key, value);
+    } catch {
+      /* private mode / blocked */
+    }
+  };
+
+  let id = readLocal();
+  if (id) {
+    return id;
+  }
+
+  // Migrate from older builds that stored the API user only in sessionStorage (per-tab).
+  try {
+    const legacy = sessionStorage.getItem(key);
+    if (legacy && legacy.length > 0) {
+      writeLocal(legacy);
+      sessionStorage.removeItem(key);
+      return legacy;
+    }
+  } catch {
+    /* ignore */
+  }
+
+  id = `ui_${createId()}`;
+  writeLocal(id);
+  if (readLocal() === id) {
+    return id;
+  }
+
+  // localStorage unavailable: same-tab-only fallback (session list will not match other tabs).
+  try {
+    sessionStorage.setItem(key, id);
+  } catch {
+    /* ignore */
   }
   return id;
 }
