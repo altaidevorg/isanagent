@@ -74,6 +74,10 @@ fn first_user_preview_from_content(s: String) -> Option<String> {
     }
 }
 
+type SessionMessageSinceReflectionRow = (i64, String, String);
+type GetMessagesSinceReflectionResult =
+    Result<(Vec<SessionMessageSinceReflectionRow>, Option<i64>), String>;
+
 /// Messages sent to the SqliteMemoryActor
 #[derive(Clone, Debug)]
 pub enum MemoryMessage {
@@ -137,7 +141,7 @@ pub enum MemoryMessage {
     },
     GetMessagesSinceReflection {
         session_id: String,
-        reply: SharedReply<Result<(Vec<(i64, String, String)>, Option<i64>), String>>,
+        reply: SharedReply<GetMessagesSinceReflectionResult>,
     },
     GetLongTermReflectionState {
         threshold: usize,
@@ -664,12 +668,10 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
 
                     let mut summaries_content = String::new();
                     let mut max_id = last_id;
-                    for row in rows {
-                        if let Ok((id, sum, key)) = row {
-                            summaries_content
-                                .push_str(&format!("Summary:\n{}\nKey Info:\n{}\n\n", sum, key));
-                            max_id = id;
-                        }
+                    for (id, sum, key) in rows.filter_map(Result::ok) {
+                        summaries_content
+                            .push_str(&format!("Summary:\n{}\nKey Info:\n{}\n\n", sum, key));
+                        max_id = id;
                     }
                     Ok((should_run, summaries_content, max_id))
                 })();

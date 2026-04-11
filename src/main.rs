@@ -59,9 +59,9 @@ async fn main() {
     let ponger = NodeHandle::new(PongActor, 10, 3, Duration::from_millis(100));
 
     // Wire them: Ping - "pong" >> Pong
-    let _ = &pinger - "pong" >> &ponger;
+    let _ = (&pinger - "pong") >> &ponger;
     // Wire: Pong - "ping" >> Ping
-    let _ = &ponger - "ping" >> &pinger;
+    let _ = (&ponger - "ping") >> &pinger;
 
     // Wait for wiring
     sleep(Duration::from_millis(50)).await;

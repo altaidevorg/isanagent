@@ -36,6 +36,7 @@ pub struct AgentLogic {
 }
 
 impl AgentLogic {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: &str,
         provider: Box<dyn Provider>,
@@ -173,7 +174,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
             .session_manager
             .get_session(&session_key)
             .await
-            .map_err(|e| ActorError::from(e))?;
+            .map_err(ActorError::from)?;
 
         // 1. Build runtime context and prepend to User message before adding to memory
         let thread_info = inbound
@@ -201,9 +202,12 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 &inbound.attachments,
             )
         };
-        mem.add_message(user_msg)
-            .await
-            .map_err(|e| ActorError::from(e))?;
+        mem.add_message(user_msg).await.map_err(ActorError::from)?;
+
+        let thinking_strip_re = REDACTED_THINKING_STRIP_RE.get_or_init(|| {
+            Regex::new(crate::utils::REDACTED_THINKING_STRIP_PATTERN)
+                .expect("redacted thinking strip regex")
+        });
 
         // 2. Loop until no more tool calls or max iterations reached
         let mut iterations = 0;
@@ -213,7 +217,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
             iterations += 1;
 
             // Fetch context
-            let mut context = mem.get_context().await.map_err(|e| ActorError::from(e))?;
+            let mut context = mem.get_context().await.map_err(ActorError::from)?;
 
             // Strip any legacy static system prompts that SQLite may have persisted
             context.retain(|msg| msg.role != "system");
@@ -297,7 +301,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 };
                 mem.add_message(assistant_msg)
                     .await
-                    .map_err(|e| ActorError::from(e))?;
+                    .map_err(ActorError::from)?;
 
                 for tc in tool_calls {
                     let tool_name = &tc.function.name;
@@ -365,23 +369,21 @@ impl ActorLogic<BusMessage> for AgentLogic {
                     // Add the tool execution back as a tool role message natively
                     mem.add_message(crate::utils::ChatMessage::tool(&tool_result, &tc.id))
                         .await
-                        .map_err(|e| ActorError::from(e))?;
+                        .map_err(ActorError::from)?;
                     tool_invoked = true;
                 }
             } else {
                 // Add vanilla assistant response to memory
                 mem.add_message(crate::utils::ChatMessage::assistant(&response_text))
                     .await
-                    .map_err(|e| ActorError::from(e))?;
+                    .map_err(ActorError::from)?;
             }
 
             if !tool_invoked {
                 // Final outbound text: strip blocks matched by `REDACTED_THINKING_STRIP_PATTERN`.
-                let re = REDACTED_THINKING_STRIP_RE.get_or_init(|| {
-                    Regex::new(crate::utils::REDACTED_THINKING_STRIP_PATTERN)
-                        .expect("redacted thinking strip regex")
-                });
-                let clean_response = re.replace_all(&response_text, "").to_string();
+                let clean_response = thinking_strip_re
+                    .replace_all(&response_text, "")
+                    .to_string();
 
                 // Emit outbound response payload.
                 let outbound = OutboundMessage {
@@ -393,7 +395,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 };
 
                 // Auto-compaction check
-                let current_context = mem.get_context().await.map_err(|e| ActorError::from(e))?;
+                let current_context = mem.get_context().await.map_err(ActorError::from)?;
                 let turns = current_context.len();
                 let approx_tokens: usize = current_context
                     .iter()

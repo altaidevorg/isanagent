@@ -1045,7 +1045,8 @@ mod tests {
                 cron_expr: "0 15 9 * * *".to_string(),
             },
         );
-        let rules = build_multi_tenant_edge_cron_rules(&[job.clone()], Utc::now()).expect("rules");
+        let rules = build_multi_tenant_edge_cron_rules(std::slice::from_ref(&job), Utc::now())
+            .expect("rules");
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].schedule, "0 15 9 * * *");
         assert_eq!(

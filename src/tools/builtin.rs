@@ -1095,8 +1095,7 @@ impl Tool for SearchMemoryTool {
 
         let results = rx
             .await
-            .map_err(|_| "Memory Actor Channel Closed")?
-            .map_err(|e| e)?;
+            .map_err(|_| "Memory Actor Channel Closed".to_string())??;
 
         if results.is_empty() {
             Ok(format!("No memory results found for '{}'.", query))
@@ -1161,8 +1160,7 @@ impl Tool for FetchMemoryByDateTool {
 
         let results = rx
             .await
-            .map_err(|_| "Memory Actor Channel Closed")?
-            .map_err(|e| e)?;
+            .map_err(|_| "Memory Actor Channel Closed".to_string())??;
 
         if results.is_empty() {
             Ok(format!(

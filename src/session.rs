@@ -41,7 +41,6 @@ impl SessionManager {
             .map_err(|e| e.to_string())?;
         rx.await
             .map_err(|_| "Memory Actor Channel Closed".to_string())?
-            .map_err(|e| e)
     }
 }
 

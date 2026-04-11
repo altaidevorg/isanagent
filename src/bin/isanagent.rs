@@ -494,11 +494,11 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     // Listen for Outbound reasoning chunks and route back to the appropriate channel and logger
     let (listener_node, mut agent_rx) =
         NodeHandle::<BusMessage>::create_listener("completion", 100);
-    let _ = &agent_node - "completion" >> &listener_node;
+    let _ = (&agent_node - "completion") >> &listener_node;
 
     // Listen to cron triggers
     let (cron_listener_node, mut cron_rx) = NodeHandle::<String>::create_listener("trigger", 100);
-    let _ = &cron_node - "trigger" >> &cron_listener_node;
+    let _ = (&cron_node - "trigger") >> &cron_listener_node;
 
     let cron_inbound_tx = inbound_tx.clone();
     let cron_logger_tx = logger_bus_tx.clone();

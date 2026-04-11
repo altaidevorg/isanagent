@@ -1111,10 +1111,12 @@ fn normalize_slack_event(
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
 
-    if thread_ts.is_none() && config.reply_in_thread.unwrap_or(false) && !chat_id.starts_with('D') {
-        if !ts.is_empty() {
-            thread_ts = Some(ts.clone());
-        }
+    if thread_ts.is_none()
+        && config.reply_in_thread.unwrap_or(false)
+        && !chat_id.starts_with('D')
+        && !ts.is_empty()
+    {
+        thread_ts = Some(ts.clone());
     }
 
     let stripped_text = strip_bot_mention(&text, bot_user_id);

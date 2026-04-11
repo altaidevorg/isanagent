@@ -361,16 +361,18 @@ mod tests {
 
     #[test]
     fn build_config_toml_merge_api_and_terminal() {
-        let mut o = OnboardOptions::default();
-        o.api_enabled = Some(true);
-        o.api_port = Some(9090);
-        o.terminal_enable = Some(false);
+        let o = OnboardOptions {
+            api_enabled: Some(true),
+            api_port: Some(9090),
+            terminal_enable: Some(false),
+            ..Default::default()
+        };
         let s = build_config_toml(&o).expect("toml");
         let cfg: AppConfig = toml::from_str(&s).expect("parse back");
         let api = cfg.api.as_ref().expect("api section");
         assert_eq!(api.enabled, Some(true));
         assert_eq!(api.port, 9090);
-        assert_eq!(cfg.terminal_enabled(), false);
+        assert!(!cfg.terminal_enabled());
     }
 
     #[test]

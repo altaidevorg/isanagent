@@ -316,15 +316,11 @@ impl LLMClient {
             .as_str()
             .map(|s| s.to_string());
 
-        let usage = if let Some(usage_obj) = json_resp.get("usage") {
-            Some(TokenUsage {
-                prompt_tokens: usage_obj["prompt_tokens"].as_u64().unwrap_or(0) as u32,
-                completion_tokens: usage_obj["completion_tokens"].as_u64().unwrap_or(0) as u32,
-                total_tokens: usage_obj["total_tokens"].as_u64().unwrap_or(0) as u32,
-            })
-        } else {
-            None
-        };
+        let usage = json_resp.get("usage").map(|usage_obj| TokenUsage {
+            prompt_tokens: usage_obj["prompt_tokens"].as_u64().unwrap_or(0) as u32,
+            completion_tokens: usage_obj["completion_tokens"].as_u64().unwrap_or(0) as u32,
+            total_tokens: usage_obj["total_tokens"].as_u64().unwrap_or(0) as u32,
+        });
 
         let finish_reason = json_resp["choices"][0]["finish_reason"]
             .as_str()

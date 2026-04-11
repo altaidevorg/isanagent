@@ -457,16 +457,13 @@ impl ApiChannel {
                 args,
             } => {
                 if let Some(pending) = self.pending_requests.get(&chat_id) {
-                    match pending.value() {
-                        PendingRequest::Stream(pending) => {
-                            if let Err(e) = pending
-                                .stream_tx
-                                .try_send(StreamEvent::ToolCallStarted { tool_name, args })
-                            {
-                                error!("Failed to send tool_call_started to stream: {}", e);
-                            }
+                    if let PendingRequest::Stream(pending) = pending.value() {
+                        if let Err(e) = pending
+                            .stream_tx
+                            .try_send(StreamEvent::ToolCallStarted { tool_name, args })
+                        {
+                            error!("Failed to send tool_call_started to stream: {}", e);
                         }
-                        _ => {}
                     }
                 }
             }
@@ -476,31 +473,25 @@ impl ApiChannel {
                 result,
             } => {
                 if let Some(pending) = self.pending_requests.get(&chat_id) {
-                    match pending.value() {
-                        PendingRequest::Stream(pending) => {
-                            if let Err(e) = pending
-                                .stream_tx
-                                .try_send(StreamEvent::ToolCallFinished { tool_name, result })
-                            {
-                                error!("Failed to send tool_call_finished to stream: {}", e);
-                            }
+                    if let PendingRequest::Stream(pending) = pending.value() {
+                        if let Err(e) = pending
+                            .stream_tx
+                            .try_send(StreamEvent::ToolCallFinished { tool_name, result })
+                        {
+                            error!("Failed to send tool_call_finished to stream: {}", e);
                         }
-                        _ => {}
                     }
                 }
             }
             TelemetryEvent::AgentThought { chat_id, thought } => {
                 if let Some(pending) = self.pending_requests.get(&chat_id) {
-                    match pending.value() {
-                        PendingRequest::Stream(pending) => {
-                            if let Err(e) = pending
-                                .stream_tx
-                                .try_send(StreamEvent::AgentThought { thought })
-                            {
-                                error!("Failed to send agent_thought to stream: {}", e);
-                            }
+                    if let PendingRequest::Stream(pending) = pending.value() {
+                        if let Err(e) = pending
+                            .stream_tx
+                            .try_send(StreamEvent::AgentThought { thought })
+                        {
+                            error!("Failed to send agent_thought to stream: {}", e);
                         }
-                        _ => {}
                     }
                 }
             }
