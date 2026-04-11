@@ -530,12 +530,12 @@ mod tests {
     fn normalize_activity_url_appends_activity_path_once() {
         assert_eq!(
             normalize_activity_url("https://edge.example.com").expect("normalized url"),
-            "https://edge.example.com/_internal/activity"
+            "https://edge.example.com/agent-dorm/activity"
         );
         assert_eq!(
-            normalize_activity_url("https://edge.example.com/_internal/activity")
+            normalize_activity_url("https://edge.example.com/agent-dorm/activity")
                 .expect("normalized url"),
-            "https://edge.example.com/_internal/activity"
+            "https://edge.example.com/agent-dorm/activity"
         );
     }
 
@@ -543,12 +543,12 @@ mod tests {
     fn normalize_crons_url_appends_crons_path_once() {
         assert_eq!(
             normalize_crons_url("https://edge.example.com").expect("normalized url"),
-            "https://edge.example.com/_internal/crons"
+            "https://edge.example.com/agent-dorm/crons"
         );
         assert_eq!(
-            normalize_crons_url("https://edge.example.com/_internal/crons")
+            normalize_crons_url("https://edge.example.com/agent-dorm/crons")
                 .expect("normalized url"),
-            "https://edge.example.com/_internal/crons"
+            "https://edge.example.com/agent-dorm/crons"
         );
     }
 
@@ -597,7 +597,7 @@ mod tests {
     async fn cron_sync_uses_bearer_auth_and_expected_body() {
         let records = Arc::new(Mutex::new(Vec::new()));
         let client = CronRegistrationClient::new_with_transport(
-            "https://edge.example.com/_internal/crons".to_string(),
+            "https://edge.example.com/agent-dorm/crons".to_string(),
             "cron-token".to_string(),
             Arc::new(RecordingCronTransport {
                 records: records.clone(),
@@ -616,7 +616,7 @@ mod tests {
 
         let records = records.lock().unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].url, "https://edge.example.com/_internal/crons");
+        assert_eq!(records[0].url, "https://edge.example.com/agent-dorm/crons");
         assert_eq!(records[0].authorization, "Bearer cron-token");
         assert_eq!(records[0].cron_rules, cron_rules);
     }

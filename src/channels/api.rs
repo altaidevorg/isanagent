@@ -60,7 +60,16 @@ struct ApiState {
 
 enum PendingRequest {
     Sync(oneshot::Sender<OutboundMessage>),
-    Stream(mpsc::Sender<StreamEvent>),
+    Stream(StreamingResponsePending),
+}
+
+/// Context for a streaming `/v1/responses` turn: SSE sender plus fields needed to persist like the sync path.
+struct StreamingResponsePending {
+    stream_tx: mpsc::Sender<StreamEvent>,
+    sender_id: String,
+    model: String,
+    previous_response_id: Option<String>,
+    store_response: bool,
 }
 
 #[derive(Serialize)]
@@ -362,11 +371,63 @@ impl Channel for ApiChannel {
                 PendingRequest::Sync(sender) => {
                     let _ = sender.send(msg);
                 }
-                PendingRequest::Stream(sender) => {
+                PendingRequest::Stream(pending) => {
                     let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
-                    if let Err(e) = sender.try_send(StreamEvent::Completion {
+                    let internal_chat_id = msg.chat_id.clone();
+                    if pending.store_response {
+                        let now = chrono::Utc::now().timestamp();
+                        let stored = StoredResponse {
+                            internal_chat_id: internal_chat_id.clone(),
+                            sender_id: pending.sender_id.clone(),
+                            model: pending.model.clone(),
+                        };
+                        if let Err(e) = self
+                            .response_store
+                            .insert(
+                                &response_id,
+                                pending.previous_response_id.as_deref(),
+                                &stored,
+                                now,
+                            )
+                            .await
+                        {
+                            log_api(
+                                &self.logger_tx,
+                                LogEvent::error(
+                                    "ApiChannel",
+                                    &format!(
+                                        "Failed to persist streaming response {}: {}",
+                                        response_id, e
+                                    ),
+                                )
+                                .with_chat_id(&internal_chat_id),
+                            );
+                            if let Err(send_err) = pending.stream_tx.try_send(StreamEvent::Error {
+                                message: "Failed to persist response state.".to_string(),
+                            }) {
+                                error!(
+                                    "Failed to send stream error after persist failure: {}",
+                                    send_err
+                                );
+                            }
+                            return Ok(());
+                        }
+                        self.responses_cache.insert(response_id.clone(), stored);
+                    }
+                    log_api(
+                        &self.logger_tx,
+                        LogEvent::info(
+                            "ApiChannel",
+                            &format!(
+                                "Streaming responses request completed with response_id {}",
+                                response_id
+                            ),
+                        )
+                        .with_chat_id(&internal_chat_id),
+                    );
+                    if let Err(e) = pending.stream_tx.try_send(StreamEvent::Completion {
                         content: msg.content,
-                        internal_chat_id: msg.chat_id,
+                        internal_chat_id,
                         response_id,
                     }) {
                         error!("Failed to send completion to stream: {}", e);
@@ -397,9 +458,10 @@ impl ApiChannel {
             } => {
                 if let Some(pending) = self.pending_requests.get(&chat_id) {
                     match pending.value() {
-                        PendingRequest::Stream(sender) => {
-                            if let Err(e) =
-                                sender.try_send(StreamEvent::ToolCallStarted { tool_name, args })
+                        PendingRequest::Stream(pending) => {
+                            if let Err(e) = pending
+                                .stream_tx
+                                .try_send(StreamEvent::ToolCallStarted { tool_name, args })
                             {
                                 error!("Failed to send tool_call_started to stream: {}", e);
                             }
@@ -415,9 +477,10 @@ impl ApiChannel {
             } => {
                 if let Some(pending) = self.pending_requests.get(&chat_id) {
                     match pending.value() {
-                        PendingRequest::Stream(sender) => {
-                            if let Err(e) =
-                                sender.try_send(StreamEvent::ToolCallFinished { tool_name, result })
+                        PendingRequest::Stream(pending) => {
+                            if let Err(e) = pending
+                                .stream_tx
+                                .try_send(StreamEvent::ToolCallFinished { tool_name, result })
                             {
                                 error!("Failed to send tool_call_finished to stream: {}", e);
                             }
@@ -429,8 +492,11 @@ impl ApiChannel {
             TelemetryEvent::AgentThought { chat_id, thought } => {
                 if let Some(pending) = self.pending_requests.get(&chat_id) {
                     match pending.value() {
-                        PendingRequest::Stream(sender) => {
-                            if let Err(e) = sender.try_send(StreamEvent::AgentThought { thought }) {
+                        PendingRequest::Stream(pending) => {
+                            if let Err(e) = pending
+                                .stream_tx
+                                .try_send(StreamEvent::AgentThought { thought })
+                            {
                                 error!("Failed to send agent_thought to stream: {}", e);
                             }
                         }
@@ -802,7 +868,13 @@ async fn handle_responses(
                 .into_response();
             }
             Entry::Vacant(entry) => {
-                entry.insert(PendingRequest::Stream(stream_tx));
+                entry.insert(PendingRequest::Stream(StreamingResponsePending {
+                    stream_tx,
+                    sender_id: sender_id.clone(),
+                    model: model.clone(),
+                    previous_response_id: previous_response_id.clone(),
+                    store_response,
+                }));
             }
         }
 
@@ -1489,7 +1561,7 @@ fn log_api(logger_tx: &LoggerHandle, event: LogEvent) {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_router, ApiState, EMBEDDED_UI_ASSETS};
+    use super::{build_router, ApiState, PendingRequest, EMBEDDED_UI_ASSETS};
     use crate::bus::OutboundMessage;
     use crate::channels::api_store::ResponseStore;
     use crate::config::ApiConfig;
@@ -1590,10 +1662,7 @@ mod tests {
             NodeHandle::<MemoryMessage>::new(memory_actor, 100, 1, Duration::from_millis(5));
         ApiState {
             inbound_tx,
-            pending_requests: Arc::new(dashmap::DashMap::<
-                String,
-                oneshot::Sender<crate::bus::OutboundMessage>,
-            >::new()),
+            pending_requests: Arc::new(dashmap::DashMap::<String, PendingRequest>::new()),
             responses_cache: moka::sync::Cache::builder().max_capacity(16).build(),
             response_store: Arc::new(ResponseStore::new(db_path).expect("response store")),
             mte_cron_scheduler: scheduler,
@@ -1822,10 +1891,7 @@ bind_address = "127.0.0.1"
     #[tokio::test]
     async fn responses_route_still_works_when_ui_is_enabled() {
         let temp = LocalTempDir::new();
-        let pending_requests = Arc::new(dashmap::DashMap::<
-            String,
-            oneshot::Sender<crate::bus::OutboundMessage>,
-        >::new());
+        let pending_requests = Arc::new(dashmap::DashMap::<String, PendingRequest>::new());
         let (logger_tx, _logger_rx) = create_logger_channel(32);
         let response_store = Arc::new(ResponseStore::new(temp.db_path()).expect("response store"));
         let (inbound_tx, mut inbound_rx) = mpsc::channel(4);
@@ -1854,10 +1920,15 @@ bind_address = "127.0.0.1"
                 content: "UI path still reaches responses.".to_string(),
                 metadata: HashMap::new(),
             };
-            let (_, sender) = pending_requests
+            let (_, pending) = pending_requests
                 .remove(&inbound.chat_id)
                 .expect("pending request sender");
-            let _ = sender.send(outbound);
+            match pending {
+                PendingRequest::Sync(sender) => {
+                    let _ = sender.send(outbound);
+                }
+                PendingRequest::Stream(_) => panic!("unexpected stream pending"),
+            }
         });
 
         let response = app
