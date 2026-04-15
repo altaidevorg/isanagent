@@ -24,9 +24,11 @@ pub struct LoggerHandle {
 
 impl LoggerHandle {
     pub fn send(&self, msg: BusMessage) -> Result<(), String> {
+        // Use try_send to avoid blocking the caller if the logger is backed up.
+        // For system logs, it's better to drop a log than to dead-lock the entire agent.
         self.sender
-            .send(msg)
-            .map_err(|_| "logger channel disconnected".to_string())
+            .try_send(msg)
+            .map_err(|e| format!("logger error: {}", e))
     }
 }
 
@@ -190,6 +192,7 @@ impl LoggingActor {
             BusMessage::Telemetry(tel) => serde_json::to_string(tel),
             BusMessage::Log(_) => return Ok(()),
             BusMessage::LoggerControl(_) => return Ok(()),
+            BusMessage::Cancel(_) => return Ok(()),
         }
         .map_err(|e| ActorError::from(format!("Failed to serialize conversation event: {}", e)))?;
 
@@ -236,6 +239,11 @@ impl LoggingActor {
             BusMessage::Telemetry(telemetry) => telemetry_to_log_event(telemetry),
             BusMessage::Log(_) => return Ok(()),
             BusMessage::LoggerControl(_) => return Ok(()),
+            BusMessage::Cancel(chat_id) => LogEvent::info(
+                "BusMessage",
+                &format!("Cancel reasoning loop for chat_id={}", chat_id),
+            )
+            .with_chat_id(chat_id),
         };
 
         self.write_runtime_event(&event)

@@ -48,7 +48,7 @@ include!(concat!(env!("OUT_DIR"), "/ui_assets.rs"));
 
 #[derive(Clone)]
 struct ApiState {
-    inbound_tx: Sender<InboundMessage>,
+    bus_tx: Sender<BusMessage>,
     pending_requests: std::sync::Arc<DashMap<String, PendingRequest>>,
     responses_cache: Cache<String, StoredResponse>,
     response_store: std::sync::Arc<ResponseStore>,
@@ -125,6 +125,13 @@ struct ResponsesRequest {
     store: Option<bool>,
     user: Option<String>,
     stream: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateSummaryRequest {
+    summary: String,
+    key_info: String,
+    knowledge_gaps: String,
 }
 
 #[derive(Serialize)]
@@ -300,11 +307,11 @@ impl Channel for ApiChannel {
         "api"
     }
 
-    async fn start(&self, inbound_tx: Sender<InboundMessage>) -> Result<(), String> {
+    async fn start(&self, bus_tx: Sender<BusMessage>) -> Result<(), String> {
         let port = self.port;
         let serve_ui = self.serve_ui;
         let state = ApiState {
-            inbound_tx,
+            bus_tx,
             pending_requests: self.pending_requests.clone(),
             responses_cache: self.responses_cache.clone(),
             response_store: self.response_store.clone(),
@@ -509,7 +516,15 @@ fn build_router(state: ApiState, serve_ui: bool) -> Router {
             "/v1/sessions/{session_id}/messages",
             get(handle_session_messages),
         )
-        .route("/v1/sessions/{session_id}", delete(handle_delete_session));
+        .route("/v1/sessions/{session_id}", delete(handle_delete_session))
+        .route(
+            "/v1/sessions/{session_id}/summaries",
+            get(handle_get_summaries),
+        )
+        .route("/v1/summaries", get(handle_get_all_summaries))
+        .route("/v1/summaries/{id}", post(handle_update_summary))
+        .route("/v1/summaries/{id}", delete(handle_delete_summary))
+        .route("/v1/chat/cancel/{chat_id}", post(handle_cancel_chat));
 
     if state.mte_cron_scheduler.is_some() {
         app = app.route("/_mte/cron/{job_id}/{token}", get(handle_mte_cron_webhook));
@@ -665,7 +680,7 @@ async fn handle_mte_cron_webhook(
         metadata,
     };
 
-    if let Err(error) = state.inbound_tx.send(inbound).await {
+    if let Err(error) = state.bus_tx.send(BusMessage::Inbound(inbound)).await {
         if let Err(rollback_error) = pending_trigger.rollback().await {
             log_api(
                 &state.logger_tx,
@@ -860,7 +875,7 @@ async fn handle_responses(
             }
             Entry::Vacant(entry) => {
                 entry.insert(PendingRequest::Stream(StreamingResponsePending {
-                    stream_tx,
+                    stream_tx: stream_tx.clone(),
                     sender_id: sender_id.clone(),
                     model: model.clone(),
                     previous_response_id: previous_response_id.clone(),
@@ -868,6 +883,13 @@ async fn handle_responses(
                 }));
             }
         }
+
+        // Send an initial event with the internal_chat_id so the client can cancel even before completion
+        let _ = stream_tx.try_send(StreamEvent::Completion {
+            content: String::new(),
+            internal_chat_id: internal_chat_id.clone(),
+            response_id: String::new(),
+        });
 
         let inbound = InboundMessage {
             channel: state.channel_name.clone(),
@@ -879,15 +901,15 @@ async fn handle_responses(
             metadata: Default::default(),
         };
 
-        if let Err(e) = state.inbound_tx.send(inbound).await {
-            state.pending_requests.remove(&internal_chat_id);
-            return ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "agent_queue_unavailable",
-                format!("Failed to enqueue request: {}", e),
-            )
-            .into_response();
-        }
+    if let Err(e) = state.bus_tx.send(BusMessage::Inbound(inbound)).await {
+        state.pending_requests.remove(&internal_chat_id);
+        return ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "agent_queue_unavailable",
+            format!("Failed to enqueue request: {}", e),
+        )
+        .into_response();
+    }
 
         let stream = async_stream::stream! {
             while let Some(event) = stream_rx.recv().await {
@@ -1006,7 +1028,7 @@ async fn dispatch_agent_turn(
         metadata: Default::default(),
     };
 
-    if let Err(e) = state.inbound_tx.send(msg).await {
+    if let Err(e) = state.bus_tx.send(BusMessage::Inbound(msg)).await {
         state.pending_requests.remove(&chat_id);
         log_api(
             &state.logger_tx,
@@ -1369,6 +1391,7 @@ async fn memory_clear_session(
     let (tx, rx) = oneshot::channel();
     let msg = MemoryMessage::Clear {
         session_id: memory_session_id.to_string(),
+        keep_last: 0,
         reply: SharedReply::new(tx),
     };
     memory_node
@@ -1544,6 +1567,156 @@ async fn handle_session_messages(
         )
         .into_response(),
     }
+}
+
+async fn handle_get_summaries(
+    State(state): State<ApiState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Response {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_session",
+            "Empty session id.",
+        )
+        .into_response();
+    }
+    let memory_session_id = resolve_memory_session_id(&state, session_id);
+    let (tx, rx) = oneshot::channel();
+    let msg = MemoryMessage::GetSummaries {
+        session_id: memory_session_id.to_string(),
+        limit: 50,
+        reply: SharedReply::new(tx),
+    };
+    if let Err(e) = state.memory_node.send_packet(msg).await {
+        return ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "memory_unavailable",
+            e.to_string(),
+        )
+        .into_response();
+    }
+    match rx.await {
+        Ok(Ok(summaries)) => Json(summaries).into_response(),
+        Ok(Err(e)) => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "memory_error", e).into_response(),
+        Err(_) => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "memory_unavailable",
+            "Memory actor channel closed",
+        )
+        .into_response(),
+    }
+}
+
+async fn handle_update_summary(
+    State(state): State<ApiState>,
+    AxumPath(id): AxumPath<i64>,
+    Json(payload): Json<UpdateSummaryRequest>,
+) -> Response {
+    let (tx, rx) = oneshot::channel();
+    let msg = MemoryMessage::UpdateSummary {
+        id,
+        summary: payload.summary,
+        key_info: payload.key_info,
+        knowledge_gaps: payload.knowledge_gaps,
+        reply: SharedReply::new(tx),
+    };
+    if let Err(e) = state.memory_node.send_packet(msg).await {
+        return ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "memory_unavailable",
+            e.to_string(),
+        )
+        .into_response();
+    }
+    match rx.await {
+        Ok(Ok(())) => StatusCode::OK.into_response(),
+        Ok(Err(e)) => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "memory_error", e).into_response(),
+        Err(_) => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "memory_unavailable",
+            "Memory actor channel closed",
+        )
+        .into_response(),
+    }
+}
+
+async fn handle_get_all_summaries(State(state): State<ApiState>) -> Response {
+    let (tx, rx) = oneshot::channel();
+    let msg = MemoryMessage::GetSummaries {
+        session_id: String::new(), // Empty string means get all
+        limit: 100,
+        reply: SharedReply::new(tx),
+    };
+    if let Err(e) = state.memory_node.send_packet(msg).await {
+        return ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "memory_unavailable",
+            e.to_string(),
+        )
+        .into_response();
+    }
+    match rx.await {
+        Ok(Ok(summaries)) => Json(summaries).into_response(),
+        Ok(Err(e)) => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "memory_error", e).into_response(),
+        Err(_) => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "memory_unavailable",
+            "Memory actor channel closed",
+        )
+        .into_response(),
+    }
+}
+
+async fn handle_delete_summary(
+    State(state): State<ApiState>,
+    AxumPath(id): AxumPath<i64>,
+) -> Response {
+    let (tx, rx) = oneshot::channel();
+    let msg = MemoryMessage::DeleteSummary {
+        id,
+        reply: SharedReply::new(tx),
+    };
+    if let Err(e) = state.memory_node.send_packet(msg).await {
+        return ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "memory_unavailable",
+            e.to_string(),
+        )
+        .into_response();
+    }
+    match rx.await {
+        Ok(Ok(())) => StatusCode::OK.into_response(),
+        Ok(Err(e)) => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "memory_error", e).into_response(),
+        Err(_) => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "memory_unavailable",
+            "Memory actor channel closed",
+        )
+        .into_response(),
+    }
+}
+
+async fn handle_cancel_chat(
+    State(state): State<ApiState>,
+    AxumPath(chat_id): AxumPath<String>,
+) -> Response {
+    // 1. Signal the agent to stop reasoning
+    let msg = BusMessage::Cancel(chat_id.clone());
+    if let Err(e) = state.bus_tx.send(msg).await {
+        return ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "agent_unavailable",
+            e.to_string(),
+        )
+        .into_response();
+    }
+
+    // 2. Clear the pending request lock so the user can send a new message immediately
+    state.pending_requests.remove(&chat_id);
+
+    StatusCode::OK.into_response()
 }
 
 fn log_api(logger_tx: &LoggerHandle, event: LogEvent) {

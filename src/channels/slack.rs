@@ -70,7 +70,7 @@ struct SlackRuntimeState {
 #[derive(Clone)]
 struct SlackWebhookState {
     shared: Arc<SlackRuntimeState>,
-    inbound_tx: Sender<InboundMessage>,
+    bus_tx: Sender<BusMessage>,
     config: SlackConfig,
     signing_secret: String,
     timestamp_tolerance_secs: i64,
@@ -389,7 +389,7 @@ impl SlackRuntimeState {
         self: &Arc<Self>,
         envelope: Value,
         ingress: SlackIngressMode,
-        inbound_tx: Sender<InboundMessage>,
+        bus_tx: Sender<BusMessage>,
         config: &SlackConfig,
     ) {
         let Some(event) = envelope.get("event") else {
@@ -430,7 +430,7 @@ impl SlackRuntimeState {
 
         let reaction = dispatch.reaction.clone();
         let chat_id = dispatch.inbound.chat_id.clone();
-        if let Err(e) = inbound_tx.send(dispatch.inbound).await {
+        if let Err(e) = bus_tx.send(BusMessage::Inbound(dispatch.inbound)).await {
             warn!("Failed to route InboundMessage from Slack: {}", e);
             return;
         }
@@ -568,7 +568,7 @@ impl Channel for SlackChannel {
         SLACK_CHANNEL_NAME
     }
 
-    async fn start(&self, inbound_tx: Sender<InboundMessage>) -> Result<(), String> {
+    async fn start(&self, bus_tx: Sender<BusMessage>) -> Result<(), String> {
         log_slack(
             &self.shared.logger_tx,
             LogEvent::info("SlackChannel", "Starting Slack channel..."),
@@ -585,7 +585,7 @@ impl Channel for SlackChannel {
                 let config = self.config.clone();
                 let mut shutdown_rx = self.shutdown_tx.subscribe();
                 let handle = tokio::spawn(async move {
-                    run_socket_mode(shared, config, app_token, inbound_tx, &mut shutdown_rx).await;
+                    run_socket_mode(shared, config, app_token, bus_tx, &mut shutdown_rx).await;
                 });
                 self.store_task_handle(handle).await?;
             }
@@ -608,7 +608,7 @@ impl Channel for SlackChannel {
 
                 let state = SlackWebhookState {
                     shared: self.shared.clone(),
-                    inbound_tx,
+                    bus_tx,
                     config: self.config.clone(),
                     signing_secret,
                     timestamp_tolerance_secs: self.timestamp_tolerance_secs,
@@ -872,11 +872,11 @@ async fn handle_slack_webhook(
             state.shared.webhook_dedupe.insert(event_id, true);
 
             let shared = state.shared.clone();
-            let inbound_tx = state.inbound_tx.clone();
+            let bus_tx = state.bus_tx.clone();
             let config = state.config.clone();
             tokio::spawn(async move {
                 shared
-                    .process_event_callback(payload, SlackIngressMode::Webhook, inbound_tx, &config)
+                    .process_event_callback(payload, SlackIngressMode::Webhook, bus_tx, &config)
                     .await;
             });
             StatusCode::OK.into_response()
@@ -889,7 +889,7 @@ async fn run_socket_mode(
     shared: Arc<SlackRuntimeState>,
     config: SlackConfig,
     app_token: String,
-    inbound_tx: Sender<InboundMessage>,
+    bus_tx: Sender<BusMessage>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) {
     let mut backoff_secs = DEFAULT_INITIAL_BACKOFF_SECS;
@@ -1046,7 +1046,7 @@ async fn run_socket_mode(
                     .process_event_callback(
                         event_payload,
                         SlackIngressMode::Socket,
-                        inbound_tx.clone(),
+                        bus_tx.clone(),
                         &config,
                     )
                     .await;
@@ -1675,7 +1675,7 @@ mod tests {
 
     fn test_webhook_state_with_channel() -> (
         SlackWebhookState,
-        tokio::sync::mpsc::Receiver<InboundMessage>,
+        tokio::sync::mpsc::Receiver<BusMessage>,
     ) {
         let (logger_tx, _logger_rx) = create_logger_channel(8);
         let shared = Arc::new(SlackRuntimeState::new(
@@ -1683,16 +1683,16 @@ mod tests {
             "http://localhost".into(),
             Arc::new(SlackUserProfileStore::new(":memory:").unwrap()),
         ));
-        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(8);
+        let (bus_tx, bus_rx) = tokio::sync::mpsc::channel(8);
         (
             SlackWebhookState {
                 shared,
-                inbound_tx,
+                bus_tx,
                 config: test_slack_config(),
                 signing_secret: "secret".into(),
                 timestamp_tolerance_secs: DEFAULT_TIMESTAMP_TOLERANCE_SECS,
             },
-            inbound_rx,
+            bus_rx,
         )
     }
 

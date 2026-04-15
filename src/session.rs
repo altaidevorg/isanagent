@@ -92,10 +92,65 @@ impl Memory for SessionProxy {
             .map_err(|_| "Memory Actor Channel Closed".to_string())?
     }
 
+    async fn get_context_since_reflection(&self) -> Result<Vec<ChatMessage>, String> {
+        let (tx, rx) = oneshot::channel();
+        let msg = MemoryMessage::GetMessagesSinceReflection {
+            session_id: self.session_id.clone(),
+            reply: SharedReply::new(tx),
+        };
+        self.memory_node
+            .send_packet(msg)
+            .await
+            .map_err(|e| e.to_string())?;
+        let (rows, _) = rx
+            .await
+            .map_err(|_| "Memory Actor Channel Closed".to_string())??;
+
+        let mut messages = Vec::new();
+        for (_id, role, content_raw) in rows {
+            // We need to parse the content_raw which is stored as JSON or plain text
+            // Reusing the logic from memory.rs would be good but it's private there.
+            // For now, we'll do a simple check.
+            let content = if content_raw.trim_start().starts_with('[') {
+                match serde_json::from_str(&content_raw) {
+                    Ok(parts) => crate::utils::MessageContent::Parts(parts),
+                    Err(_) => crate::utils::MessageContent::Text(content_raw),
+                }
+            } else {
+                crate::utils::MessageContent::Text(content_raw)
+            };
+
+            messages.push(ChatMessage {
+                role,
+                content: Some(content),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
+        Ok(messages)
+    }
+
     async fn clear(&mut self) -> Result<(), String> {
         let (tx, rx) = oneshot::channel();
         let msg = MemoryMessage::Clear {
             session_id: self.session_id.clone(),
+            keep_last: 0,
+            reply: SharedReply::new(tx),
+        };
+        self.memory_node
+            .send_packet(msg)
+            .await
+            .map_err(|e| e.to_string())?;
+        rx.await
+            .map_err(|_| "Memory Actor Channel Closed".to_string())?
+    }
+
+    async fn clear_keep_last(&mut self, keep_last: usize) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        let msg = MemoryMessage::Clear {
+            session_id: self.session_id.clone(),
+            keep_last,
             reply: SharedReply::new(tx),
         };
         self.memory_node

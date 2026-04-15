@@ -264,4 +264,6 @@ pub enum BusMessage {
     Log(LogEvent),
     /// Internal control flow for deterministic logger flush/shutdown.
     LoggerControl(LoggerControlMessage),
+    /// Signal to interrupt an active reasoning loop for a specific chat.
+    Cancel(String),
 }
