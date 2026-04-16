@@ -422,33 +422,40 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 reply,
             } => {
                 let res = (|| -> Result<(), String> {
-                    // We no longer delete messages here to allow the UI to show full history.
-                    // Instead, we just ensure metadata is updated if needed.
-                    // If keep_last is 0, it means the user explicitly deleted the chat, so we DO delete.
+                    let tx = self.conn.transaction().map_err(|e| e.to_string())?;
                     if keep_last == 0 {
-                        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
-                        // Delete messages
+                        // Full session delete (explicit chat removal).
                         tx.execute(
                             "DELETE FROM messages WHERE session_id = ?1",
                             params![session_id],
                         )
                         .map_err(|e| e.to_string())?;
-
-                        // Delete summary
                         tx.execute(
                             "DELETE FROM session_summaries WHERE session_id = ?1",
                             params![session_id],
                         )
                         .map_err(|e| e.to_string())?;
-
-                        // Delete metadata
                         tx.execute(
                             "DELETE FROM session_metadata WHERE session_id = ?1",
                             params![session_id],
                         )
                         .map_err(|e| e.to_string())?;
-                        tx.commit().map_err(|e| e.to_string())?;
+                    } else {
+                        // Trim to the last `keep_last` messages by id (see Memory::clear_keep_last).
+                        let keep = i64::try_from(keep_last).map_err(|_| {
+                            "keep_last is too large for the backing store".to_string()
+                        })?;
+                        tx.execute(
+                            "DELETE FROM messages WHERE session_id = ?1 AND id NOT IN (
+                                SELECT id FROM (
+                                    SELECT id FROM messages WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2
+                                )
+                            )",
+                            params![session_id, keep],
+                        )
+                        .map_err(|e| e.to_string())?;
                     }
+                    tx.commit().map_err(|e| e.to_string())?;
                     Ok(())
                 })();
                 let _ = reply.send(res);

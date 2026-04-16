@@ -106,7 +106,7 @@ pub struct AgentLogic {
     tool_execution_activity: Option<SharedToolExecutionActivity>,
     outbound_tx: mpsc::Sender<BusMessage>,
     logger_tx: LoggerHandle,
-    cancellation_tokens: Arc<dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
+    cancellation_tokens: Arc<dashmap::DashMap<String, Arc<tokio_util::sync::CancellationToken>>>,
 }
 
 impl AgentLogic {
@@ -243,11 +243,12 @@ impl ActorLogic<BusMessage> for AgentLogic {
                     ));
                 }
 
-                let cancel_token = tokio_util::sync::CancellationToken::new();
+                let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
                 self.cancellation_tokens
                     .insert(chat_id.clone(), cancel_token.clone());
 
                 // Clone necessary components for the task
+                let cancellation_tokens = self.cancellation_tokens.clone();
                 let name = self.name.clone();
                 let provider = dyn_clone::clone_box(&*self.provider);
                 let session_manager = self.session_manager.clone();
@@ -265,7 +266,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
 
                 tokio::spawn(async move {
                     let task_chat_id = chat_id.clone();
-                    let task_cancel_token = cancel_token.clone();
+                    let task_token_arc = cancel_token.clone();
 
                     let agent_name = name.clone();
                     let _ = logger_tx.send(BusMessage::Log(
@@ -292,7 +293,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                         outbound_tx: outbound_tx.clone(),
                         logger_tx: logger_tx.clone(),
                         inbound,
-                        cancel_token: task_cancel_token.clone(),
+                        cancel_token: task_token_arc.as_ref().clone(),
                     })
                     .await;
 
@@ -307,7 +308,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                             )
                             .with_chat_id(&task_chat_id),
                         ));
-                    } else if task_cancel_token.is_cancelled() {
+                    } else if task_token_arc.is_cancelled() {
                         let _ = logger_tx.send(BusMessage::Log(
                             LogEvent::info(
                                 &agent_name,
@@ -331,8 +332,10 @@ impl ActorLogic<BusMessage> for AgentLogic {
                         ));
                     }
 
-                    // Removed: cancellation_tokens.remove(&task_chat_id);
-                    // We let the next Inbound or Cancel message handle removal.
+                    // Drop our entry only if this task still owns the map slot (avoids races with a newer task).
+                    let _ = cancellation_tokens.remove_if(&task_chat_id, |_key, stored| {
+                        Arc::ptr_eq(stored, &task_token_arc)
+                    });
                 });
 
                 Ok(None)
