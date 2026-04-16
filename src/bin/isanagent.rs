@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, watch};
 
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use colored::Colorize;
-use isanagent::agent::AgentLogic;
+use isanagent::agent::{AgentLogic, AgentLogicParams};
 use isanagent::bus::{BusMessage, LoggerControlMessage, TelemetryEvent};
 use isanagent::channels::terminal::{
     build_tool_call_terminal_notice, build_tool_result_terminal_notice,
@@ -342,21 +342,21 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         None
     };
 
-    let agent_logic = AgentLogic::new(
-        "Altbot",
+    let agent_logic = AgentLogic::new(AgentLogicParams {
+        name: "Altbot".to_string(),
         provider,
         session_manager,
         tools,
         skills,
-        &system_prompt,
+        system_prompt,
         max_iterations,
         max_tool_output_chars,
         max_recent_summaries,
         short_term_threshold_turns,
         short_term_threshold_tokens,
-        global_outbound_tx.clone(),
-        logger_bus_tx.clone(),
-    );
+        outbound_tx: global_outbound_tx.clone(),
+        logger_tx: logger_bus_tx.clone(),
+    });
     let agent_logic = if let Some(tool_execution_activity) = tool_execution_activity {
         agent_logic.with_tool_execution_activity(tool_execution_activity)
     } else {

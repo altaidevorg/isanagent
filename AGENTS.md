@@ -102,7 +102,7 @@ The memory system has two distinct phases operating under the Actor loop:
 After implementing a feature, follow this exact workflow to deliver high-quality code.
 
 1. Review your code for performance-oriented move semantics, graceful handling of errors and options, and correct async usage. As a rule of thumb, avoid `.unwrap()` and `.expect()` that can cause panics at runtime.
-2. Run `cargo clippy` and keep your clippy happy --it's your best friend.
+2. Run `cargo clippy` and keep your clippy happy --it's your best friend. No Allow() macro allowed to suppress clippy warnings.
 3. Run `cargo fmt` so that it's always well-formatted, avoiding unnecessary diffs that simply come from formatting.
 4. This is a living document --keep this document up-to-date as you introduce new features and/or architectures.
 

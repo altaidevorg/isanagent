@@ -416,7 +416,11 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
 
                 let _ = reply.send(res);
             }
-            MemoryMessage::Clear { session_id, keep_last, reply } => {
+            MemoryMessage::Clear {
+                session_id,
+                keep_last,
+                reply,
+            } => {
                 let res = (|| -> Result<(), String> {
                     // We no longer delete messages here to allow the UI to show full history.
                     // Instead, we just ensure metadata is updated if needed.
@@ -429,7 +433,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                             params![session_id],
                         )
                         .map_err(|e| e.to_string())?;
-                        
+
                         // Delete summary
                         tx.execute(
                             "DELETE FROM session_summaries WHERE session_id = ?1",
@@ -548,14 +552,18 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     };
 
                     let summaries = if session_id.is_empty() {
-                        let rows = stmt.query_map(params![limit_i64], summary_mapper)
+                        let rows = stmt
+                            .query_map(params![limit_i64], summary_mapper)
                             .map_err(|e| e.to_string())?;
-                        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+                        rows.collect::<Result<Vec<_>, _>>()
+                            .map_err(|e| e.to_string())?
                     } else {
                         let pattern = format!("{}%", session_id);
-                        let rows = stmt.query_map(params![pattern, limit_i64], summary_mapper)
+                        let rows = stmt
+                            .query_map(params![pattern, limit_i64], summary_mapper)
                             .map_err(|e| e.to_string())?;
-                        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+                        rows.collect::<Result<Vec<_>, _>>()
+                            .map_err(|e| e.to_string())?
                     };
 
                     Ok(summaries)
@@ -563,10 +571,11 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 let _ = reply.send(res);
             }
             MemoryMessage::DeleteSummary { id, reply } => {
-                let res = self.conn.execute(
-                    "DELETE FROM session_summaries WHERE id = ?1",
-                    params![id],
-                ).map_err(|e| e.to_string()).map(|_| ());
+                let res = self
+                    .conn
+                    .execute("DELETE FROM session_summaries WHERE id = ?1", params![id])
+                    .map_err(|e| e.to_string())
+                    .map(|_| ());
                 let _ = reply.send(res);
             }
             MemoryMessage::UpdateSessionMetadata {
