@@ -1521,10 +1521,13 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(duplicate.status(), StatusCode::OK);
 
-        let inbound = tokio::time::timeout(Duration::from_millis(200), inbound_rx.recv())
+        let msg = tokio::time::timeout(Duration::from_millis(200), inbound_rx.recv())
             .await
             .unwrap()
             .unwrap();
+        let crate::bus::BusMessage::Inbound(inbound) = msg else {
+            panic!("expected BusMessage::Inbound");
+        };
         assert_eq!(inbound.metadata["slack_event_id"], "Ev123");
         assert!(
             tokio::time::timeout(Duration::from_millis(100), inbound_rx.recv())
@@ -1673,10 +1676,8 @@ mod tests {
         state
     }
 
-    fn test_webhook_state_with_channel() -> (
-        SlackWebhookState,
-        tokio::sync::mpsc::Receiver<BusMessage>,
-    ) {
+    fn test_webhook_state_with_channel(
+    ) -> (SlackWebhookState, tokio::sync::mpsc::Receiver<BusMessage>) {
         let (logger_tx, _logger_rx) = create_logger_channel(8);
         let shared = Arc::new(SlackRuntimeState::new(
             logger_tx,
