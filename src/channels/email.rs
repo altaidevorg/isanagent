@@ -1,4 +1,4 @@
-use crate::bus::{InboundMessage, OutboundMessage};
+use crate::bus::{BusMessage, InboundMessage, OutboundMessage};
 use crate::channels::Channel;
 use crate::config::EmailConfig;
 use crate::logging::LoggerHandle;
@@ -35,7 +35,7 @@ impl Channel for EmailChannel {
         "email"
     }
 
-    async fn start(&self, inbound_tx: Sender<InboundMessage>) -> Result<(), String> {
+    async fn start(&self, bus_tx: Sender<BusMessage>) -> Result<(), String> {
         let _ = self
             .logger_tx
             .send(crate::bus::BusMessage::Log(crate::bus::LogEvent::info(
@@ -58,7 +58,7 @@ impl Channel for EmailChannel {
                 }
 
                 let cfg = config.clone();
-                let tx = inbound_tx.clone();
+                let tx = bus_tx.clone();
                 let res = tokio::task::spawn_blocking(move || poll_inbox_once(cfg, tx)).await;
 
                 if let Err(e) = res {
@@ -147,7 +147,7 @@ impl Channel for EmailChannel {
     }
 }
 
-fn poll_inbox_once(config: EmailConfig, tx: Sender<InboundMessage>) -> Result<(), String> {
+fn poll_inbox_once(config: EmailConfig, bus_tx: Sender<BusMessage>) -> Result<(), String> {
     let tls = TlsConnector::builder().build().map_err(|e| e.to_string())?;
     let client = imap::connect(
         (&config.imap_host as &str, config.imap_port),
@@ -204,7 +204,7 @@ fn poll_inbox_once(config: EmailConfig, tx: Sender<InboundMessage>) -> Result<()
                     metadata: std::collections::HashMap::new(),
                 };
 
-                if let Err(e) = tx.blocking_send(inbound) {
+                if let Err(e) = bus_tx.blocking_send(BusMessage::Inbound(inbound)) {
                     error!("Failed to route email to agent bus: {}", e);
                 }
             }

@@ -5,7 +5,7 @@ use serde_json::Value;
 
 /// A Provider abstracts the generation capabilities of an LLM.
 #[async_trait]
-pub trait Provider: Send + Sync {
+pub trait Provider: Send + Sync + dyn_clone::DynClone {
     /// Send a chat completion request with a list of messages.
     /// Messages are defined in the specific Provider implementation,
     /// or we can use a generic `crate::utils::ChatMessage`.
@@ -16,6 +16,8 @@ pub trait Provider: Send + Sync {
     ) -> Result<crate::utils::LLMResponse, crate::utils::LLMError>;
 }
 
+dyn_clone::clone_trait_object!(Provider);
+
 /// A Memory abstracts the context storage capabilities of an Agent.
 #[async_trait]
 pub trait Memory: Send + Sync {
@@ -25,8 +27,14 @@ pub trait Memory: Send + Sync {
     /// Retrieve the recent context as a list of messages.
     async fn get_context(&self) -> Result<Vec<crate::utils::ChatMessage>, String>;
 
+    /// Retrieve the context since the last reflection/summary.
+    async fn get_context_since_reflection(&self) -> Result<Vec<crate::utils::ChatMessage>, String>;
+
     /// Clear the current memory context
     async fn clear(&mut self) -> Result<(), String>;
+
+    /// Clear the current memory context, keeping the most recent N messages.
+    async fn clear_keep_last(&mut self, keep_last: usize) -> Result<(), String>;
 }
 
 /// A Tool definition that can be executed by the Agent.

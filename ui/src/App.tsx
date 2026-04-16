@@ -130,6 +130,15 @@ type SessionListEntry = {
   preview?: string;
 };
 
+type SummaryEntry = {
+  id: number;
+  session_id: string;
+  summary: string;
+  key_info: string;
+  knowledge_gaps: string;
+  created_at: string;
+};
+
 type ApiErrorPayload = { error?: { code?: string; message?: string } } | null;
 
 function pickResponseId(raw: unknown): string | null {
@@ -387,10 +396,12 @@ function fileToDataUrl(file: File): Promise<string> {
 
 type ComposerProps = {
   disabled: boolean;
+  pending: boolean;
+  onStop: () => void;
   onSubmit: (payload: { text: string; imageDataUrls: string[] }) => Promise<void>;
 };
 
-function Composer({ disabled: streamingResponse, onSubmit }: ComposerProps) {
+function Composer({ disabled: streamingResponse, pending, onStop, onSubmit }: ComposerProps) {
   const [draft, setDraft] = useState("");
   const [attachments, setAttachments] = useState<{ id: string; url: string; name: string }[]>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -483,12 +494,23 @@ function Composer({ disabled: streamingResponse, onSubmit }: ComposerProps) {
             {streamingResponse ? "Waiting for response…" : "JPEG, PNG, GIF, WebP · up to 8"}
           </p>
         </div>
-        <Button
-          disabled={streamingResponse || (draft.trim().length === 0 && attachments.length === 0)}
-          onClick={() => void submit()}
-        >
-          {streamingResponse ? "Working…" : "Send"}
-        </Button>
+        <div className="flex gap-2">
+          {pending && (
+            <Button
+              variant="outline"
+              className="text-destructive border-destructive hover:bg-destructive/10"
+              onClick={onStop}
+            >
+              Stop
+            </Button>
+          )}
+          <Button
+            disabled={streamingResponse || (draft.trim().length === 0 && attachments.length === 0)}
+            onClick={() => void submit()}
+          >
+            {streamingResponse ? "Working…" : "Send"}
+          </Button>
+        </div>
       </div>
     </div>
   );
@@ -507,10 +529,67 @@ export default function App() {
   const [sessions, setSessions] = useState<SessionListEntry[]>([]);
   const [sidebarHints, setSidebarHints] = useState<Record<string, string>>(loadSidebarHints);
   const [sessionToDelete, setSessionToDelete] = useState<SessionListEntry | null>(null);
+  const [showSummaries, setShowSummaries] = useState(false);
+  const [summaries, setSummaries] = useState<SummaryEntry[]>([]);
+  const [summariesLoading, setSummariesLoading] = useState(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
   const [, startTransition] = useTransition();
   const endOfMessagesRef = useRef<HTMLDivElement | null>(null);
 
   const requestUserId = useMemo(() => apiUserId(), []);
+
+  const loadSummaries = useCallback(async (sessionId: string | null) => {
+    setSummariesLoading(true);
+    try {
+      const url = sessionId 
+        ? `/v1/sessions/${encodeURIComponent(sessionId)}/summaries`
+        : `/v1/summaries`;
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`Failed to load summaries (${response.status})`);
+      }
+      const data = (await response.json()) as SummaryEntry[];
+      setSummaries(data);
+    } catch (error) {
+      console.error(error);
+      setErrorMessage(buildErrorMessage(error));
+    } finally {
+      setSummariesLoading(false);
+    }
+  }, []);
+
+  const updateSummary = async (id: number, updated: Partial<SummaryEntry>) => {
+    try {
+      const response = await fetch(`/v1/summaries/${id}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(updated),
+      });
+      if (!response.ok) {
+        throw new Error(`Failed to update summary (${response.status})`);
+      }
+      setSummaries((prev) => prev.map((s) => (s.id === id ? { ...s, ...updated } : s)));
+    } catch (error) {
+      console.error(error);
+      setErrorMessage(buildErrorMessage(error));
+    }
+  };
+
+  const deleteSummary = async (id: number) => {
+    if (!confirm("Are you sure you want to delete this summary?")) return;
+    try {
+      const response = await fetch(`/v1/summaries/${id}`, {
+        method: "DELETE",
+      });
+      if (!response.ok) {
+        throw new Error(`Failed to delete summary (${response.status})`);
+      }
+      setSummaries((prev) => prev.filter((s) => s.id !== id));
+    } catch (error) {
+      console.error(error);
+      setErrorMessage(buildErrorMessage(error));
+    }
+  };
 
   const loadSessions = useCallback(async () => {
     setSessionsLoading(true);
@@ -561,8 +640,9 @@ export default function App() {
     const id = readSessionChatId();
     if (id) {
       void loadHistory(id);
+      void loadSummaries(id);
     }
-  }, [loadHistory]);
+  }, [loadHistory, loadSummaries]);
 
   useEffect(() => {
     endOfMessagesRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -574,6 +654,7 @@ export default function App() {
       setInternalChatId(null);
       setLatestResponseId(null);
       setMessages([]);
+      setSummaries([]);
       setErrorMessage(null);
     });
   };
@@ -585,6 +666,7 @@ export default function App() {
       setInternalChatId(entry.internal_chat_id);
       setLatestResponseId(entry.latest_response_id);
       void loadHistory(entry.internal_chat_id);
+      void loadSummaries(entry.internal_chat_id);
     });
   };
 
@@ -652,6 +734,33 @@ export default function App() {
     return parts;
   };
 
+  const stopGeneration = async () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+
+    if (!internalChatId) {
+      setPending(false);
+      setCurrentStep(null);
+      setCurrentToolCalls([]);
+      return;
+    }
+
+    try {
+      setPending(false);
+      setCurrentStep(null);
+      setCurrentToolCalls([]);
+      
+      // Notify the server about the cancellation
+      await fetch(`/v1/chat/cancel/${encodeURIComponent(internalChatId)}`, {
+        method: "POST",
+      });
+    } catch (error) {
+      console.error("Failed to notify server about cancellation:", error);
+    }
+  };
+
   const submitMessage = async ({ text, imageDataUrls }: { text: string; imageDataUrls: string[] }) => {
     if (pending) {
       return;
@@ -675,6 +784,9 @@ export default function App() {
     setCurrentStep(null);
     setCurrentToolCalls([]);
 
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     let previousResponseId: string | undefined = latestResponseId ?? undefined;
 
     try {
@@ -690,6 +802,7 @@ export default function App() {
           user: requestUserId,
           stream: true,
         }),
+        signal: controller.signal,
       });
 
       if (!response.ok) {
@@ -745,6 +858,13 @@ export default function App() {
                 // This prevents the indicator from flickering or disappearing between steps
                 break;
               case "completion":
+                if (event.content === "" && event.response_id === "") {
+                  // Initial ID hint: allows cancellation before reasoning finishes
+                  if (event.internal_chat_id && !internalChatId) {
+                    setInternalChatId(event.internal_chat_id);
+                  }
+                  break;
+                }
                 assistantContent = event.content;
                 finalChatId = event.internal_chat_id;
                 finalResponseId = event.response_id;
@@ -787,9 +907,15 @@ export default function App() {
 
       void loadSessions();
     } catch (error) {
+      if (error instanceof Error && (error.name === "AbortError" || error.message.includes("aborted"))) {
+        return;
+      }
       setMessages((prev) => prev.filter((m) => m.id !== optimisticId));
       setErrorMessage(buildErrorMessage(error));
     } finally {
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null;
+      }
       setPending(false);
       setCurrentStep(null);
       setCurrentToolCalls([]);
@@ -841,6 +967,18 @@ export default function App() {
           </div>
           <Button className="mt-2 w-full" size="sm" onClick={startNewConversation}>
             New chat
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="mt-2 w-full"
+            onClick={() => {
+              setShowSummaries(true);
+              void loadSummaries(null); // Load all summaries
+            }}
+            disabled={summariesLoading}
+          >
+            {summariesLoading ? "Loading…" : "Summaries"}
           </Button>
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto p-2">
@@ -910,14 +1048,48 @@ export default function App() {
                 Workspace-backed memory, multimodal input, and session list for this browser profile.
               </p>
             </div>
-            <span className="shrink-0 rounded-full border border-[color:var(--ghost-border)] bg-muted px-3 py-1 text-xs font-medium text-muted-foreground">
-              {pending || historyLoading ? "Syncing…" : internalChatId ? "In session" : "New session"}
-            </span>
+            <div className="flex items-center gap-3">
+              <span className="shrink-0 rounded-full border border-[color:var(--ghost-border)] bg-muted px-3 py-1 text-xs font-medium text-muted-foreground">
+                {pending || historyLoading ? "Syncing…" : internalChatId ? "In session" : "New session"}
+              </span>
+            </div>
           </div>
 
+          {showSummaries && (
+            <SummaryList
+              summaries={summaries}
+              onUpdate={updateSummary}
+              onDelete={deleteSummary}
+              onClose={() => setShowSummaries(false)}
+            />
+          )}
+
           <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4 sm:px-6">
-            {messages.length > 0 || pending ? (
+            {(messages.length > 0 || summaries.length > 0 || pending) ? (
               <div className="mx-auto flex min-h-full w-full max-w-3xl flex-col gap-4">
+                {summaries.length > 0 && (
+                  <div className="space-y-4">
+                    {/* Only show the most recent summary (which is now the ONLY summary) */}
+                    {(() => {
+                      const s = summaries[0];
+                      return (
+                        <div key={`msg-sum-${s.id}`} className="rounded-xl border border-border bg-muted/10 p-4 shadow-sm">
+                          <div className="flex items-center gap-2 mb-2">
+                            <span className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">Session Summary</span>
+                            <div className="h-px flex-1 bg-border/50"></div>
+                          </div>
+                          <p className="text-sm leading-relaxed text-foreground/80">{s.summary}</p>
+                          {s.key_info && (
+                            <div className="mt-3 pt-3 border-t border-border/30">
+                              <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground mb-1">Key Knowledge</p>
+                              <p className="text-xs text-foreground/70 italic">{s.key_info}</p>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()}
+                  </div>
+                )}
                 {messages.map((message) => (
                   <article
                     className={cn(
@@ -978,7 +1150,12 @@ export default function App() {
                   {errorMessage}
                 </div>
               ) : null}
-              <Composer disabled={pending || historyLoading} onSubmit={submitMessage} />
+              <Composer 
+                disabled={pending || historyLoading} 
+                pending={pending}
+                onStop={stopGeneration}
+                onSubmit={submitMessage} 
+              />
             </div>
           </div>
         </div>
@@ -1047,5 +1224,131 @@ function TrashIcon() {
         strokeWidth={2}
       />
     </svg>
+  );
+}
+
+function SummaryList({
+  summaries,
+  onUpdate,
+  onDelete,
+  onClose,
+}: {
+  summaries: SummaryEntry[];
+  onUpdate: (id: number, updated: Partial<SummaryEntry>) => Promise<void>;
+  onDelete: (id: number) => Promise<void>;
+  onClose: () => void;
+}) {
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [editForm, setEditForm] = useState<Partial<SummaryEntry>>({});
+
+  useEffect(() => {
+    if (editingId !== null) {
+      const s = summaries.find((x) => x.id === editingId);
+      if (s) {
+        setEditForm({
+          summary: s.summary,
+          key_info: s.key_info,
+          knowledge_gaps: s.knowledge_gaps,
+        });
+      }
+    }
+  }, [editingId, summaries]);
+
+  const save = async () => {
+    if (editingId !== null) {
+      await onUpdate(editingId, editForm);
+      setEditingId(null);
+    }
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div className="flex h-full max-h-[90vh] w-full max-w-2xl flex-col rounded-xl border border-border bg-card shadow-lg overflow-hidden">
+        <div className="flex items-center justify-between border-b border-border p-4">
+          <h2 className="text-lg font-semibold text-foreground">Memory Store</h2>
+          <Button variant="ghost" size="sm" onClick={onClose}>
+            Close
+          </Button>
+        </div>
+        <div className="flex-1 overflow-y-auto p-6 space-y-6">
+          {summaries.length === 0 ? (
+            <p className="text-center text-muted-foreground py-10">No memory entries found.</p>
+          ) : (
+            <div className="space-y-8">
+              {summaries.map((s) => (
+                <div key={s.id} className="space-y-4 border-b border-border pb-8 last:border-0">
+                  <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
+                    <span>Session: {s.session_id.split(":")[1] || s.session_id}</span>
+                    <span>{new Date(s.created_at).toLocaleString()}</span>
+                  </div>
+
+                  {editingId === s.id ? (
+                    <div className="space-y-4 rounded-lg bg-muted/20 p-4 border border-border">
+                      <div className="space-y-2">
+                        <label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                          Summary
+                        </label>
+                        <Textarea
+                          value={editForm.summary}
+                          onChange={(e) => setEditForm({ ...editForm, summary: e.target.value })}
+                          className="min-h-[120px] leading-relaxed"
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                          Key Knowledge
+                        </label>
+                        <Textarea
+                          value={editForm.key_info}
+                          onChange={(e) => setEditForm({ ...editForm, key_info: e.target.value })}
+                          className="min-h-[80px] leading-relaxed"
+                        />
+                      </div>
+                      <div className="flex justify-end gap-2 pt-2">
+                        <Button variant="outline" size="sm" onClick={() => setEditingId(null)}>
+                          Cancel
+                        </Button>
+                        <Button size="sm" onClick={save}>
+                          Save
+                        </Button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="space-y-4">
+                      <div className="space-y-2">
+                        <p className="text-xs font-bold uppercase tracking-widest text-muted-foreground">Summary</p>
+                        <p className="text-sm leading-relaxed text-foreground/90">{s.summary}</p>
+                      </div>
+                      <div className="space-y-2">
+                        <p className="text-xs font-bold uppercase tracking-widest text-muted-foreground">Key Knowledge</p>
+                        <p className="text-sm leading-relaxed text-foreground/90">{s.key_info}</p>
+                      </div>
+                      <div className="flex justify-end gap-2 pt-2">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="text-destructive hover:bg-destructive/10"
+                          onClick={() => void onDelete(s.id)}
+                        >
+                          Delete
+                        </Button>
+                        <Button variant="outline" size="sm" onClick={() => setEditingId(s.id)}>
+                          Edit
+                        </Button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
   );
 }

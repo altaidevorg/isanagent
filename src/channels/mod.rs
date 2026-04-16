@@ -1,4 +1,4 @@
-use crate::bus::{InboundMessage, OutboundMessage};
+use crate::bus::{BusMessage, OutboundMessage};
 use async_trait::async_trait;
 use tokio::sync::mpsc::Sender;
 
@@ -11,8 +11,8 @@ pub trait Channel: Send + Sync {
     fn name(&self) -> &str;
 
     /// Start the channel and begin listening for messages.
-    /// Messages received should be sent to the `inbound_tx` channel.
-    async fn start(&self, inbound_tx: Sender<InboundMessage>) -> Result<(), String>;
+    /// Messages received should be sent to the `bus_tx` channel.
+    async fn start(&self, bus_tx: Sender<BusMessage>) -> Result<(), String>;
 
     /// Stop the channel and clean up resources.
     async fn stop(&self) -> Result<(), String>;

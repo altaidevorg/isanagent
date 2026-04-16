@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use log::debug;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::utils::{ChatMessage, ContentPart, MessageContent};
@@ -78,6 +79,16 @@ type SessionMessageSinceReflectionRow = (i64, String, String);
 type GetMessagesSinceReflectionResult =
     Result<(Vec<SessionMessageSinceReflectionRow>, Option<i64>), String>;
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SummaryEntry {
+    pub id: i64,
+    pub session_id: String,
+    pub summary: String,
+    pub key_info: String,
+    pub knowledge_gaps: String,
+    pub created_at: String,
+}
+
 /// Messages sent to the SqliteMemoryActor
 #[derive(Clone, Debug)]
 pub enum MemoryMessage {
@@ -102,6 +113,7 @@ pub enum MemoryMessage {
     },
     Clear {
         session_id: String,
+        keep_last: usize,
         reply: SharedReply<Result<(), String>>,
     },
     // --- Reflection and Summary Messages ---
@@ -112,10 +124,26 @@ pub enum MemoryMessage {
         knowledge_gaps: String,
         reply: SharedReply<Result<(), String>>,
     },
+    UpdateSummary {
+        id: i64,
+        summary: String,
+        key_info: String,
+        knowledge_gaps: String,
+        reply: SharedReply<Result<(), String>>,
+    },
     GetRecentSummaries {
         session_id: String,
         limit: usize,
         reply: SharedReply<Result<Vec<String>, String>>,
+    },
+    GetSummaries {
+        session_id: String,
+        limit: usize,
+        reply: SharedReply<Result<Vec<SummaryEntry>, String>>,
+    },
+    DeleteSummary {
+        id: i64,
+        reply: SharedReply<Result<(), String>>,
     },
     UpdateSessionMetadata {
         session_id: String,
@@ -197,7 +225,7 @@ impl SqliteMemoryActor {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS session_summaries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
+                session_id TEXT NOT NULL UNIQUE,
                 summary TEXT NOT NULL,
                 key_info TEXT NOT NULL,
                 knowledge_gaps TEXT NOT NULL,
@@ -388,24 +416,45 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
 
                 let _ = reply.send(res);
             }
-            MemoryMessage::Clear { session_id, reply } => {
+            MemoryMessage::Clear {
+                session_id,
+                keep_last,
+                reply,
+            } => {
                 let res = (|| -> Result<(), String> {
                     let tx = self.conn.transaction().map_err(|e| e.to_string())?;
-                    tx.execute(
-                        "DELETE FROM session_summaries WHERE session_id = ?1",
-                        params![session_id],
-                    )
-                    .map_err(|e| e.to_string())?;
-                    tx.execute(
-                        "DELETE FROM session_metadata WHERE session_id = ?1",
-                        params![session_id],
-                    )
-                    .map_err(|e| e.to_string())?;
-                    tx.execute(
-                        "DELETE FROM messages WHERE session_id = ?1",
-                        params![session_id],
-                    )
-                    .map_err(|e| e.to_string())?;
+                    if keep_last == 0 {
+                        // Full session delete (explicit chat removal).
+                        tx.execute(
+                            "DELETE FROM messages WHERE session_id = ?1",
+                            params![session_id],
+                        )
+                        .map_err(|e| e.to_string())?;
+                        tx.execute(
+                            "DELETE FROM session_summaries WHERE session_id = ?1",
+                            params![session_id],
+                        )
+                        .map_err(|e| e.to_string())?;
+                        tx.execute(
+                            "DELETE FROM session_metadata WHERE session_id = ?1",
+                            params![session_id],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    } else {
+                        // Trim to the last `keep_last` messages by id (see Memory::clear_keep_last).
+                        let keep = i64::try_from(keep_last).map_err(|_| {
+                            "keep_last is too large for the backing store".to_string()
+                        })?;
+                        tx.execute(
+                            "DELETE FROM messages WHERE session_id = ?1 AND id NOT IN (
+                                SELECT id FROM (
+                                    SELECT id FROM messages WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2
+                                )
+                            )",
+                            params![session_id, keep],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
                     tx.commit().map_err(|e| e.to_string())?;
                     Ok(())
                 })();
@@ -419,8 +468,28 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 reply,
             } => {
                 let res = self.conn.execute(
-                    "INSERT INTO session_summaries (session_id, summary, key_info, knowledge_gaps) VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT INTO session_summaries (session_id, summary, key_info, knowledge_gaps) 
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(session_id) DO UPDATE SET 
+                        summary=excluded.summary, 
+                        key_info=excluded.key_info, 
+                        knowledge_gaps=excluded.knowledge_gaps,
+                        created_at=CURRENT_TIMESTAMP",
                     params![session_id, summary, key_info, knowledge_gaps],
+                ).map_err(|e| e.to_string()).map(|_| ());
+
+                let _ = reply.send(res);
+            }
+            MemoryMessage::UpdateSummary {
+                id,
+                summary,
+                key_info,
+                knowledge_gaps,
+                reply,
+            } => {
+                let res = self.conn.execute(
+                    "UPDATE session_summaries SET summary = ?1, key_info = ?2, knowledge_gaps = ?3 WHERE id = ?4",
+                    params![summary, key_info, knowledge_gaps, id],
                 ).map_err(|e| e.to_string()).map(|_| ());
 
                 let _ = reply.send(res);
@@ -457,6 +526,63 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     }
                     Ok(summaries)
                 })();
+                let _ = reply.send(res);
+            }
+            MemoryMessage::GetSummaries {
+                session_id,
+                limit,
+                reply,
+            } => {
+                let res = (|| -> Result<Vec<SummaryEntry>, String> {
+                    let mut stmt = if session_id.is_empty() {
+                        self.conn.prepare(
+                            "SELECT id, session_id, summary, key_info, knowledge_gaps, created_at FROM session_summaries 
+                             ORDER BY created_at DESC LIMIT ?1"
+                        ).map_err(|e| e.to_string())?
+                    } else {
+                        self.conn.prepare(
+                            "SELECT id, session_id, summary, key_info, knowledge_gaps, created_at FROM session_summaries 
+                             WHERE session_id LIKE ?1 ORDER BY created_at DESC LIMIT ?2"
+                        ).map_err(|e| e.to_string())?
+                    };
+
+                    let limit_i64 = limit as i64;
+                    let summary_mapper = |row: &rusqlite::Row| {
+                        Ok(SummaryEntry {
+                            id: row.get(0)?,
+                            session_id: row.get(1)?,
+                            summary: row.get(2)?,
+                            key_info: row.get(3)?,
+                            knowledge_gaps: row.get(4)?,
+                            created_at: row.get(5)?,
+                        })
+                    };
+
+                    let summaries = if session_id.is_empty() {
+                        let rows = stmt
+                            .query_map(params![limit_i64], summary_mapper)
+                            .map_err(|e| e.to_string())?;
+                        rows.collect::<Result<Vec<_>, _>>()
+                            .map_err(|e| e.to_string())?
+                    } else {
+                        let pattern = format!("{}%", session_id);
+                        let rows = stmt
+                            .query_map(params![pattern, limit_i64], summary_mapper)
+                            .map_err(|e| e.to_string())?;
+                        rows.collect::<Result<Vec<_>, _>>()
+                            .map_err(|e| e.to_string())?
+                    };
+
+                    Ok(summaries)
+                })();
+                let _ = reply.send(res);
+            }
+            MemoryMessage::DeleteSummary { id, reply } => {
+                let res = self
+                    .conn
+                    .execute("DELETE FROM session_summaries WHERE id = ?1", params![id])
+                    .map_err(|e| e.to_string())
+                    .map(|_| ());
                 let _ = reply.send(res);
             }
             MemoryMessage::UpdateSessionMetadata {

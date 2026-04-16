@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, watch};
 
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use colored::Colorize;
-use isanagent::agent::AgentLogic;
+use isanagent::agent::{AgentLogic, AgentLogicParams};
 use isanagent::bus::{BusMessage, LoggerControlMessage, TelemetryEvent};
 use isanagent::channels::terminal::{
     build_tool_call_terminal_notice, build_tool_result_terminal_notice,
@@ -342,21 +342,21 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         None
     };
 
-    let agent_logic = AgentLogic::new(
-        "Altbot",
+    let agent_logic = AgentLogic::new(AgentLogicParams {
+        name: "Altbot".to_string(),
         provider,
         session_manager,
         tools,
         skills,
-        &system_prompt,
+        system_prompt,
         max_iterations,
         max_tool_output_chars,
         max_recent_summaries,
         short_term_threshold_turns,
         short_term_threshold_tokens,
-        global_outbound_tx.clone(),
-        logger_bus_tx.clone(),
-    );
+        outbound_tx: global_outbound_tx.clone(),
+        logger_tx: logger_bus_tx.clone(),
+    });
     let agent_logic = if let Some(tool_execution_activity) = tool_execution_activity {
         agent_logic.with_tool_execution_activity(tool_execution_activity)
     } else {
@@ -367,7 +367,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     let agent_node = NodeHandle::<BusMessage>::new(agent_logic, 100, 3, Duration::from_millis(50));
 
     // 10. Setup channels (terminal is optional for headless / Docker API-only runs)
-    let (inbound_tx, mut inbound_rx) = mpsc::channel(100);
+    let (bus_tx, mut bus_rx) = mpsc::channel(100);
     let mut out_channels: HashMap<String, Arc<dyn Channel>> = HashMap::new();
 
     let terminal_chat_id = if workspace.config.terminal_enabled() {
@@ -378,7 +378,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             shutdown_tx.clone(),
             workspace.sandbox_dir.clone(),
         ));
-        terminal.start(inbound_tx.clone()).await?;
+        terminal.start(bus_tx.clone()).await?;
         out_channels.insert(terminal.name().to_string(), terminal);
         Some(id)
     } else {
@@ -394,7 +394,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                 &db_path,
                 logger_bus_tx.clone(),
             )?);
-            slack.start(inbound_tx.clone()).await?;
+            slack.start(bus_tx.clone()).await?;
             out_channels.insert(slack.name().to_string(), slack);
         }
     }
@@ -415,7 +415,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                 api
             };
             let api = Arc::new(api);
-            api.start(inbound_tx.clone()).await?;
+            api.start(bus_tx.clone()).await?;
             out_channels.insert(api.name().to_string(), api);
             Some(format!("http://127.0.0.1:{api_port}/"))
         } else {
@@ -429,7 +429,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     if let Some(email_cfg) = workspace.config.email.clone() {
         if email_cfg.enabled.unwrap_or(false) {
             let email_ch = Arc::new(EmailChannel::new(email_cfg, logger_bus_tx.clone()));
-            email_ch.start(inbound_tx.clone()).await?;
+            email_ch.start(bus_tx.clone()).await?;
             out_channels.insert(email_ch.name().to_string(), email_ch);
         }
     }
@@ -485,9 +485,13 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     let agent_tx = agent_node.clone();
     let logger_tx = logger_bus_tx.clone();
     tokio::spawn(async move {
-        while let Some(msg) = inbound_rx.recv().await {
-            let _ = logger_tx.send(BusMessage::Inbound(msg.clone()));
-            let _ = agent_tx.send_packet(BusMessage::Inbound(msg)).await;
+        while let Some(msg) = bus_rx.recv().await {
+            let _ = logger_tx.send(msg.clone());
+            // Only route Inbound and Cancel messages to the agent logic.
+            // This prevents the agent from being flooded with its own telemetry or other system messages.
+            if matches!(msg, BusMessage::Inbound(_) | BusMessage::Cancel(_)) {
+                let _ = agent_tx.send_packet(msg).await;
+            }
         }
     });
 
@@ -500,7 +504,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     let (cron_listener_node, mut cron_rx) = NodeHandle::<String>::create_listener("trigger", 100);
     let _ = (&cron_node - "trigger") >> &cron_listener_node;
 
-    let cron_inbound_tx = inbound_tx.clone();
+    let cron_bus_tx = bus_tx.clone();
     let cron_logger_tx = logger_bus_tx.clone();
     tokio::spawn(async move {
         while let Some(msg) = cron_rx.recv().await {
@@ -540,7 +544,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                 let _ = cron_logger_tx.send(BusMessage::Telemetry(tel));
 
                 // Fire into the agent
-                let _ = cron_inbound_tx.send(inbound).await;
+                let _ = cron_bus_tx.send(BusMessage::Inbound(inbound)).await;
             }
         }
     });

@@ -226,7 +226,7 @@ impl Channel for TerminalChannel {
         "terminal"
     }
 
-    async fn start(&self, inbound_tx: Sender<InboundMessage>) -> Result<(), String> {
+    async fn start(&self, bus_tx: Sender<BusMessage>) -> Result<(), String> {
         let channel_name = self.name().to_string();
         let mut chat_id = self.chat_id.clone();
         let logger_tx = self.logger_tx.clone();
@@ -321,7 +321,7 @@ impl Channel for TerminalChannel {
                             metadata: Default::default(),
                         };
 
-                        if let Err(e) = inbound_tx.blocking_send(msg) {
+                        if let Err(e) = bus_tx.blocking_send(BusMessage::Inbound(msg)) {
                             error!("Terminal channel failed to send InboundMessage: {}", e);
                             break;
                         }

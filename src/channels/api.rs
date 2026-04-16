@@ -48,7 +48,7 @@ include!(concat!(env!("OUT_DIR"), "/ui_assets.rs"));
 
 #[derive(Clone)]
 struct ApiState {
-    inbound_tx: Sender<InboundMessage>,
+    bus_tx: Sender<BusMessage>,
     pending_requests: std::sync::Arc<DashMap<String, PendingRequest>>,
     responses_cache: Cache<String, StoredResponse>,
     response_store: std::sync::Arc<ResponseStore>,
@@ -125,6 +125,13 @@ struct ResponsesRequest {
     store: Option<bool>,
     user: Option<String>,
     stream: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateSummaryRequest {
+    summary: String,
+    key_info: String,
+    knowledge_gaps: String,
 }
 
 #[derive(Serialize)]
@@ -300,11 +307,11 @@ impl Channel for ApiChannel {
         "api"
     }
 
-    async fn start(&self, inbound_tx: Sender<InboundMessage>) -> Result<(), String> {
+    async fn start(&self, bus_tx: Sender<BusMessage>) -> Result<(), String> {
         let port = self.port;
         let serve_ui = self.serve_ui;
         let state = ApiState {
-            inbound_tx,
+            bus_tx,
             pending_requests: self.pending_requests.clone(),
             responses_cache: self.responses_cache.clone(),
             response_store: self.response_store.clone(),
@@ -509,7 +516,15 @@ fn build_router(state: ApiState, serve_ui: bool) -> Router {
             "/v1/sessions/{session_id}/messages",
             get(handle_session_messages),
         )
-        .route("/v1/sessions/{session_id}", delete(handle_delete_session));
+        .route("/v1/sessions/{session_id}", delete(handle_delete_session))
+        .route(
+            "/v1/sessions/{session_id}/summaries",
+            get(handle_get_summaries),
+        )
+        .route("/v1/summaries", get(handle_get_all_summaries))
+        .route("/v1/summaries/{id}", post(handle_update_summary))
+        .route("/v1/summaries/{id}", delete(handle_delete_summary))
+        .route("/v1/chat/cancel/{chat_id}", post(handle_cancel_chat));
 
     if state.mte_cron_scheduler.is_some() {
         app = app.route("/_mte/cron/{job_id}/{token}", get(handle_mte_cron_webhook));
@@ -665,7 +680,7 @@ async fn handle_mte_cron_webhook(
         metadata,
     };
 
-    if let Err(error) = state.inbound_tx.send(inbound).await {
+    if let Err(error) = state.bus_tx.send(BusMessage::Inbound(inbound)).await {
         if let Err(rollback_error) = pending_trigger.rollback().await {
             log_api(
                 &state.logger_tx,
@@ -860,7 +875,7 @@ async fn handle_responses(
             }
             Entry::Vacant(entry) => {
                 entry.insert(PendingRequest::Stream(StreamingResponsePending {
-                    stream_tx,
+                    stream_tx: stream_tx.clone(),
                     sender_id: sender_id.clone(),
                     model: model.clone(),
                     previous_response_id: previous_response_id.clone(),
@@ -868,6 +883,13 @@ async fn handle_responses(
                 }));
             }
         }
+
+        // Send an initial event with the internal_chat_id so the client can cancel even before completion
+        let _ = stream_tx.try_send(StreamEvent::Completion {
+            content: String::new(),
+            internal_chat_id: internal_chat_id.clone(),
+            response_id: String::new(),
+        });
 
         let inbound = InboundMessage {
             channel: state.channel_name.clone(),
@@ -879,7 +901,7 @@ async fn handle_responses(
             metadata: Default::default(),
         };
 
-        if let Err(e) = state.inbound_tx.send(inbound).await {
+        if let Err(e) = state.bus_tx.send(BusMessage::Inbound(inbound)).await {
             state.pending_requests.remove(&internal_chat_id);
             return ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1006,7 +1028,7 @@ async fn dispatch_agent_turn(
         metadata: Default::default(),
     };
 
-    if let Err(e) = state.inbound_tx.send(msg).await {
+    if let Err(e) = state.bus_tx.send(BusMessage::Inbound(msg)).await {
         state.pending_requests.remove(&chat_id);
         log_api(
             &state.logger_tx,
@@ -1369,6 +1391,7 @@ async fn memory_clear_session(
     let (tx, rx) = oneshot::channel();
     let msg = MemoryMessage::Clear {
         session_id: memory_session_id.to_string(),
+        keep_last: 0,
         reply: SharedReply::new(tx),
     };
     memory_node
@@ -1546,6 +1569,164 @@ async fn handle_session_messages(
     }
 }
 
+async fn handle_get_summaries(
+    State(state): State<ApiState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Response {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_session",
+            "Empty session id.",
+        )
+        .into_response();
+    }
+    let memory_session_id = resolve_memory_session_id(&state, session_id);
+    let (tx, rx) = oneshot::channel();
+    let msg = MemoryMessage::GetSummaries {
+        session_id: memory_session_id.to_string(),
+        limit: 50,
+        reply: SharedReply::new(tx),
+    };
+    if let Err(e) = state.memory_node.send_packet(msg).await {
+        return ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "memory_unavailable",
+            e.to_string(),
+        )
+        .into_response();
+    }
+    match rx.await {
+        Ok(Ok(summaries)) => Json(summaries).into_response(),
+        Ok(Err(e)) => {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "memory_error", e).into_response()
+        }
+        Err(_) => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "memory_unavailable",
+            "Memory actor channel closed",
+        )
+        .into_response(),
+    }
+}
+
+async fn handle_update_summary(
+    State(state): State<ApiState>,
+    AxumPath(id): AxumPath<i64>,
+    Json(payload): Json<UpdateSummaryRequest>,
+) -> Response {
+    let (tx, rx) = oneshot::channel();
+    let msg = MemoryMessage::UpdateSummary {
+        id,
+        summary: payload.summary,
+        key_info: payload.key_info,
+        knowledge_gaps: payload.knowledge_gaps,
+        reply: SharedReply::new(tx),
+    };
+    if let Err(e) = state.memory_node.send_packet(msg).await {
+        return ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "memory_unavailable",
+            e.to_string(),
+        )
+        .into_response();
+    }
+    match rx.await {
+        Ok(Ok(())) => StatusCode::OK.into_response(),
+        Ok(Err(e)) => {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "memory_error", e).into_response()
+        }
+        Err(_) => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "memory_unavailable",
+            "Memory actor channel closed",
+        )
+        .into_response(),
+    }
+}
+
+async fn handle_get_all_summaries(State(state): State<ApiState>) -> Response {
+    let (tx, rx) = oneshot::channel();
+    let msg = MemoryMessage::GetSummaries {
+        session_id: String::new(), // Empty string means get all
+        limit: 100,
+        reply: SharedReply::new(tx),
+    };
+    if let Err(e) = state.memory_node.send_packet(msg).await {
+        return ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "memory_unavailable",
+            e.to_string(),
+        )
+        .into_response();
+    }
+    match rx.await {
+        Ok(Ok(summaries)) => Json(summaries).into_response(),
+        Ok(Err(e)) => {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "memory_error", e).into_response()
+        }
+        Err(_) => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "memory_unavailable",
+            "Memory actor channel closed",
+        )
+        .into_response(),
+    }
+}
+
+async fn handle_delete_summary(
+    State(state): State<ApiState>,
+    AxumPath(id): AxumPath<i64>,
+) -> Response {
+    let (tx, rx) = oneshot::channel();
+    let msg = MemoryMessage::DeleteSummary {
+        id,
+        reply: SharedReply::new(tx),
+    };
+    if let Err(e) = state.memory_node.send_packet(msg).await {
+        return ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "memory_unavailable",
+            e.to_string(),
+        )
+        .into_response();
+    }
+    match rx.await {
+        Ok(Ok(())) => StatusCode::OK.into_response(),
+        Ok(Err(e)) => {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "memory_error", e).into_response()
+        }
+        Err(_) => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "memory_unavailable",
+            "Memory actor channel closed",
+        )
+        .into_response(),
+    }
+}
+
+async fn handle_cancel_chat(
+    State(state): State<ApiState>,
+    AxumPath(chat_id): AxumPath<String>,
+) -> Response {
+    // 1. Signal the agent to stop reasoning
+    let msg = BusMessage::Cancel(chat_id.clone());
+    if let Err(e) = state.bus_tx.send(msg).await {
+        return ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "agent_unavailable",
+            e.to_string(),
+        )
+        .into_response();
+    }
+
+    // 2. Clear the pending request lock so the user can send a new message immediately
+    state.pending_requests.remove(&chat_id);
+
+    StatusCode::OK.into_response()
+}
+
 fn log_api(logger_tx: &LoggerHandle, event: LogEvent) {
     let _ = logger_tx.send(BusMessage::Log(event));
 }
@@ -1553,7 +1734,7 @@ fn log_api(logger_tx: &LoggerHandle, event: LogEvent) {
 #[cfg(test)]
 mod tests {
     use super::{build_router, ApiState, PendingRequest, EMBEDDED_UI_ASSETS};
-    use crate::bus::OutboundMessage;
+    use crate::bus::{BusMessage, OutboundMessage};
     use crate::channels::api_store::ResponseStore;
     use crate::config::ApiConfig;
     use crate::logging::create_logger_channel;
@@ -1643,7 +1824,7 @@ mod tests {
 
     fn build_state(
         db_path: &std::path::Path,
-        inbound_tx: mpsc::Sender<crate::bus::InboundMessage>,
+        bus_tx: mpsc::Sender<BusMessage>,
         scheduler: Option<Arc<MultiTenantEdgeCronScheduler>>,
     ) -> ApiState {
         let (logger_tx, _logger_rx) = create_logger_channel(32);
@@ -1652,7 +1833,7 @@ mod tests {
         let memory_node =
             NodeHandle::<MemoryMessage>::new(memory_actor, 100, 1, Duration::from_millis(5));
         ApiState {
-            inbound_tx,
+            bus_tx,
             pending_requests: Arc::new(dashmap::DashMap::<String, PendingRequest>::new()),
             responses_cache: moka::sync::Cache::builder().max_capacity(16).build(),
             response_store: Arc::new(ResponseStore::new(db_path).expect("response store")),
@@ -1684,8 +1865,8 @@ bind_address = "127.0.0.1"
     #[tokio::test]
     async fn ui_root_is_not_served_when_disabled() {
         let temp = LocalTempDir::new();
-        let (inbound_tx, _inbound_rx) = mpsc::channel(4);
-        let app = build_router(build_state(&temp.db_path(), inbound_tx, None), false);
+        let (bus_tx, _bus_rx) = mpsc::channel(4);
+        let app = build_router(build_state(&temp.db_path(), bus_tx, None), false);
 
         let response = app
             .oneshot(
@@ -1704,8 +1885,8 @@ bind_address = "127.0.0.1"
     #[tokio::test]
     async fn ui_root_serves_embedded_index_when_enabled() {
         let temp = LocalTempDir::new();
-        let (inbound_tx, _inbound_rx) = mpsc::channel(4);
-        let app = build_router(build_state(&temp.db_path(), inbound_tx, None), true);
+        let (bus_tx, _bus_rx) = mpsc::channel(4);
+        let app = build_router(build_state(&temp.db_path(), bus_tx, None), true);
 
         let response = app
             .oneshot(
@@ -1749,8 +1930,8 @@ bind_address = "127.0.0.1"
             .find(|candidate| candidate.path.starts_with("assets/"))
             .expect("built ui asset");
         let temp = LocalTempDir::new();
-        let (inbound_tx, _inbound_rx) = mpsc::channel(4);
-        let app = build_router(build_state(&temp.db_path(), inbound_tx, None), true);
+        let (bus_tx, _bus_rx) = mpsc::channel(4);
+        let app = build_router(build_state(&temp.db_path(), bus_tx, None), true);
 
         let response = app
             .oneshot(
@@ -1789,8 +1970,8 @@ bind_address = "127.0.0.1"
     #[tokio::test]
     async fn ui_fallback_serves_index_for_client_routes() {
         let temp = LocalTempDir::new();
-        let (inbound_tx, _inbound_rx) = mpsc::channel(4);
-        let app = build_router(build_state(&temp.db_path(), inbound_tx, None), true);
+        let (bus_tx, _bus_rx) = mpsc::channel(4);
+        let app = build_router(build_state(&temp.db_path(), bus_tx, None), true);
 
         let response = app
             .oneshot(
@@ -1818,8 +1999,8 @@ bind_address = "127.0.0.1"
     async fn session_messages_qualifies_bare_chat_id_with_api_channel_prefix() {
         let temp = LocalTempDir::new();
         let db_path = temp.db_path();
-        let (inbound_tx, _inbound_rx) = mpsc::channel(4);
-        let state = build_state(&db_path, inbound_tx, None);
+        let (bus_tx, _bus_rx) = mpsc::channel(4);
+        let state = build_state(&db_path, bus_tx, None);
         let chat_suffix = "list-me-123e4567-e89b-12d3-a456-426614174000";
         let memory_key = format!("api:{}:", chat_suffix);
         let (tx, rx) = oneshot::channel();
@@ -1862,8 +2043,8 @@ bind_address = "127.0.0.1"
     #[tokio::test]
     async fn ui_fallback_does_not_intercept_unknown_api_paths() {
         let temp = LocalTempDir::new();
-        let (inbound_tx, _inbound_rx) = mpsc::channel(4);
-        let app = build_router(build_state(&temp.db_path(), inbound_tx, None), true);
+        let (bus_tx, _bus_rx) = mpsc::channel(4);
+        let app = build_router(build_state(&temp.db_path(), bus_tx, None), true);
 
         let response = app
             .oneshot(
@@ -1885,13 +2066,13 @@ bind_address = "127.0.0.1"
         let pending_requests = Arc::new(dashmap::DashMap::<String, PendingRequest>::new());
         let (logger_tx, _logger_rx) = create_logger_channel(32);
         let response_store = Arc::new(ResponseStore::new(temp.db_path()).expect("response store"));
-        let (inbound_tx, mut inbound_rx) = mpsc::channel(4);
+        let (bus_tx, mut bus_rx) = mpsc::channel(4);
         let memory_actor =
             SqliteMemoryActor::new(temp.db_path().to_str().expect("utf8")).expect("memory actor");
         let memory_node =
             NodeHandle::<MemoryMessage>::new(memory_actor, 100, 1, Duration::from_millis(5));
         let state = ApiState {
-            inbound_tx,
+            bus_tx,
             pending_requests: pending_requests.clone(),
             responses_cache: moka::sync::Cache::builder().max_capacity(16).build(),
             response_store,
@@ -1903,7 +2084,10 @@ bind_address = "127.0.0.1"
         let app = build_router(state, true);
 
         tokio::spawn(async move {
-            let inbound = inbound_rx.recv().await.expect("inbound message");
+            let msg = bus_rx.recv().await.expect("bus message");
+            let BusMessage::Inbound(inbound) = msg else {
+                panic!("expected BusMessage::Inbound");
+            };
             let outbound = OutboundMessage {
                 channel: "api".to_string(),
                 chat_id: inbound.chat_id.clone(),
@@ -1979,11 +2163,8 @@ bind_address = "127.0.0.1"
             )
             .expect("scheduler"),
         );
-        let (inbound_tx, mut inbound_rx) = mpsc::channel(4);
-        let app = build_router(
-            build_state(&temp.db_path(), inbound_tx, Some(scheduler)),
-            false,
-        );
+        let (bus_tx, mut bus_rx) = mpsc::channel(4);
+        let app = build_router(build_state(&temp.db_path(), bus_tx, Some(scheduler)), false);
 
         let response = app
             .oneshot(
@@ -1997,7 +2178,10 @@ bind_address = "127.0.0.1"
             .expect("request succeeds");
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        let inbound = inbound_rx.recv().await.expect("cron inbound");
+        let msg = bus_rx.recv().await.expect("cron bus message");
+        let BusMessage::Inbound(inbound) = msg else {
+            panic!("expected BusMessage::Inbound");
+        };
         assert_eq!(inbound.channel, "terminal");
         assert_eq!(inbound.chat_id, "chat-123");
         assert_eq!(inbound.content, "wake up");
@@ -2035,11 +2219,8 @@ bind_address = "127.0.0.1"
             )
             .expect("scheduler"),
         );
-        let (inbound_tx, mut inbound_rx) = mpsc::channel(4);
-        let app = build_router(
-            build_state(&temp.db_path(), inbound_tx, Some(scheduler)),
-            false,
-        );
+        let (bus_tx, mut bus_rx) = mpsc::channel(4);
+        let app = build_router(build_state(&temp.db_path(), bus_tx, Some(scheduler)), false);
 
         let response = app
             .oneshot(
@@ -2053,7 +2234,7 @@ bind_address = "127.0.0.1"
             .expect("request succeeds");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert!(inbound_rx.try_recv().is_err());
+        assert!(bus_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -2085,11 +2266,8 @@ bind_address = "127.0.0.1"
             )
             .expect("scheduler"),
         );
-        let (inbound_tx, _inbound_rx) = mpsc::channel(4);
-        let app = build_router(
-            build_state(&temp.db_path(), inbound_tx, Some(scheduler)),
-            false,
-        );
+        let (bus_tx, _bus_rx) = mpsc::channel(4);
+        let app = build_router(build_state(&temp.db_path(), bus_tx, Some(scheduler)), false);
 
         let first = app
             .clone()
@@ -2151,12 +2329,9 @@ bind_address = "127.0.0.1"
             )
             .expect("scheduler"),
         );
-        let (inbound_tx, inbound_rx) = mpsc::channel(1);
-        drop(inbound_rx);
-        let app = build_router(
-            build_state(&temp.db_path(), inbound_tx, Some(scheduler)),
-            false,
-        );
+        let (bus_tx, bus_rx) = mpsc::channel(1);
+        drop(bus_rx);
+        let app = build_router(build_state(&temp.db_path(), bus_tx, Some(scheduler)), false);
 
         let response = app
             .oneshot(
@@ -2212,12 +2387,9 @@ bind_address = "127.0.0.1"
             )
             .expect("scheduler"),
         );
-        let (inbound_tx, inbound_rx) = mpsc::channel(1);
-        drop(inbound_rx);
-        let app = build_router(
-            build_state(&temp.db_path(), inbound_tx, Some(scheduler)),
-            false,
-        );
+        let (bus_tx, bus_rx) = mpsc::channel(1);
+        drop(bus_rx);
+        let app = build_router(build_state(&temp.db_path(), bus_tx, Some(scheduler)), false);
 
         let response = app
             .oneshot(

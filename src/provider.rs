@@ -3,6 +3,7 @@ use crate::utils::{ChatMessage, LLMClient, LLMError, LLMResponse};
 use async_trait::async_trait;
 
 /// A Provider implementation that wraps the existing LLMClient
+#[derive(Clone)]
 pub struct OpenAIProvider {
     client: LLMClient,
 }
