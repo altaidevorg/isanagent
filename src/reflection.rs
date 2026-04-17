@@ -126,8 +126,17 @@ impl ReflectionEngine {
             ));
             // Trigger summary
             let mut transcript = String::new();
-            for (_, role, content) in &new_messages {
-                transcript.push_str(&format!("{}: {}\n\n", role, content));
+            for (_, msg) in &new_messages {
+                let body = msg
+                    .content
+                    .as_ref()
+                    .map(|c| c.text_content())
+                    .unwrap_or_default();
+                let tools = msg.tool_calls.as_ref().map_or(String::new(), |tcs| {
+                    let names: Vec<&str> = tcs.iter().map(|tc| tc.function.name.as_str()).collect();
+                    format!(" [tool_calls: {}]", names.join(", "))
+                });
+                transcript.push_str(&format!("{}: {}{}\n\n", msg.role, body, tools));
             }
 
             let prompt = format!(

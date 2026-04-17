@@ -106,29 +106,7 @@ impl Memory for SessionProxy {
             .await
             .map_err(|_| "Memory Actor Channel Closed".to_string())??;
 
-        let mut messages = Vec::new();
-        for (_id, role, content_raw) in rows {
-            // We need to parse the content_raw which is stored as JSON or plain text
-            // Reusing the logic from memory.rs would be good but it's private there.
-            // For now, we'll do a simple check.
-            let content = if content_raw.trim_start().starts_with('[') {
-                match serde_json::from_str(&content_raw) {
-                    Ok(parts) => crate::utils::MessageContent::Parts(parts),
-                    Err(_) => crate::utils::MessageContent::Text(content_raw),
-                }
-            } else {
-                crate::utils::MessageContent::Text(content_raw)
-            };
-
-            messages.push(ChatMessage {
-                role,
-                content: Some(content),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-            });
-        }
-        Ok(messages)
+        Ok(rows.into_iter().map(|(_, msg)| msg).collect())
     }
 
     async fn clear(&mut self) -> Result<(), String> {

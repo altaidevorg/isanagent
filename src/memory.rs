@@ -75,7 +75,7 @@ fn first_user_preview_from_content(s: String) -> Option<String> {
     }
 }
 
-type SessionMessageSinceReflectionRow = (i64, String, String);
+type SessionMessageSinceReflectionRow = (i64, ChatMessage);
 type GetMessagesSinceReflectionResult =
     Result<(Vec<SessionMessageSinceReflectionRow>, Option<i64>), String>;
 
@@ -718,7 +718,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 let _ = reply.send(res);
             }
             MemoryMessage::GetMessagesSinceReflection { session_id, reply } => {
-                let res = (|| -> Result<(Vec<(i64, String, String)>, Option<i64>), String> {
+                let res = (|| -> GetMessagesSinceReflectionResult {
                     let last_msg_id: Option<i64> = self.conn.query_row(
                         "SELECT last_reflection_msg_id FROM session_metadata WHERE session_id = ?1",
                         params![session_id],
@@ -726,15 +726,30 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     ).unwrap_or(None);
 
                     let mut msg_stmt = self.conn.prepare(
-                        "SELECT id, role, content FROM messages WHERE session_id = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id ASC"
+                        "SELECT id, role, content, name, tool_calls, tool_call_id FROM messages WHERE session_id = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id ASC"
                     ).map_err(|e| e.to_string())?;
 
                     let messages_iter = msg_stmt
                         .query_map(params![session_id, last_msg_id], |row| {
                             let id: i64 = row.get(0)?;
                             let role: String = row.get(1)?;
-                            let content: String = row.get(2)?;
-                            Ok((id, role, content))
+                            let content_raw: Option<String> = row.get(2)?;
+                            let content = content_raw.map(message_content_from_stored);
+                            let name: Option<String> = row.get(3)?;
+                            let tool_calls_str: Option<String> = row.get(4)?;
+                            let tool_calls =
+                                tool_calls_str.and_then(|s| serde_json::from_str(&s).ok());
+                            let tool_call_id: Option<String> = row.get(5)?;
+                            Ok((
+                                id,
+                                ChatMessage {
+                                    role,
+                                    content,
+                                    name,
+                                    tool_calls,
+                                    tool_call_id,
+                                },
+                            ))
                         })
                         .map_err(|e| e.to_string())?;
 
