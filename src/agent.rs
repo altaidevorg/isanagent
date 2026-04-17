@@ -735,7 +735,7 @@ impl AgentLogic {
                             };
                             if let Ok(_) = memory_node.send_packet(msg).await {
                                 if let Ok(Ok((rows, _))) = rx.await {
-                                    if let Some((last_id, _, _)) = rows.last() {
+                                    if let Some((last_id, _)) = rows.last() {
                                         let (tx, rx) = tokio::sync::oneshot::channel();
                                         let _ = memory_node.send_packet(crate::memory::MemoryMessage::UpdateSessionMetadata {
                                             session_id: session_key.clone(),
