@@ -286,14 +286,11 @@ mod scoped_tools_tests {
     #[tokio::test]
     async fn execute_scoped_denies_nested_spawn_in_subagent() {
         let mut r = ToolRegistry::new();
-        r.register(Box::new(NamedTool { n: "subagent_spawn" }));
+        r.register(Box::new(NamedTool {
+            n: "subagent_spawn",
+        }));
         let err = r
-            .execute_tool_scoped(
-                "subagent_spawn",
-                Value::Null,
-                None,
-                true,
-            )
+            .execute_tool_scoped("subagent_spawn", Value::Null, None, true)
             .await
             .unwrap_err();
         assert!(err.contains("not available"));
@@ -303,7 +300,9 @@ mod scoped_tools_tests {
     fn list_scoped_filters_allowlist_and_nested_tools() {
         let mut r = ToolRegistry::new();
         r.register(Box::new(NamedTool { n: "read_file" }));
-        r.register(Box::new(NamedTool { n: "subagent_spawn" }));
+        r.register(Box::new(NamedTool {
+            n: "subagent_spawn",
+        }));
         let allow: HashSet<String> = ["read_file".to_string()].into_iter().collect();
         let listed = r.list_tools_scoped(Some(&allow), true);
         let names: Vec<_> = listed
