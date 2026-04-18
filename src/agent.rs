@@ -255,9 +255,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
             }
             BusMessage::Inbound(inbound) => {
                 let chat_id = inbound.chat_id.clone();
-                let thread_part = inbound.thread_id.as_deref().unwrap_or("");
-                let session_key =
-                    format!("{}:{}:{}", inbound.channel, inbound.chat_id, thread_part);
+                let session_key = inbound.clarification_session_key();
                 if self
                     .clarification_hub
                     .try_deliver_reply(&session_key, inbound.content.clone())
@@ -324,6 +322,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                     inbound.thread_id.clone(),
                 );
                 let inbound_channel = inbound.channel.clone();
+                let inbound_thread_id = inbound.thread_id.clone();
 
                 tokio::spawn(async move {
                     let task_chat_id = chat_id.clone();
@@ -371,13 +370,13 @@ impl ActorLogic<BusMessage> for AgentLogic {
                             )
                             .with_chat_id(&task_chat_id),
                         ));
-                        if inbound_channel == "terminal" {
-                            let notice = crate::channels::terminal::build_terminal_error_notice(
-                                &task_chat_id,
-                                &e,
-                            );
-                            let _ = outbound_tx.send(BusMessage::Outbound(notice)).await;
-                        }
+                        let notice = crate::channels::terminal::build_channel_error_notice(
+                            &inbound_channel,
+                            &task_chat_id,
+                            inbound_thread_id.as_deref(),
+                            &e,
+                        );
+                        let _ = outbound_tx.send(BusMessage::Outbound(notice)).await;
                     } else if task_token_arc.is_cancelled() {
                         let _ = logger_tx.send(BusMessage::Log(
                             LogEvent::info(
@@ -1136,7 +1135,7 @@ mod tests {
         tool_execution_activity: Option<SharedToolExecutionActivity>,
         tool_delay: Duration,
     ) -> AgentLogic {
-        let memory_actor = SqliteMemoryActor::new(":memory:").expect("memory actor");
+        let memory_actor = SqliteMemoryActor::new(":memory:", None).expect("memory actor");
         let memory_node = NodeHandle::new(memory_actor, 16, 1, Duration::from_millis(1));
         let session_manager = SessionManager::new(memory_node);
 

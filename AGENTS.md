@@ -24,7 +24,7 @@ The agent is explicitly designed to run inside a sandbox. `IsanagentWorkspace` m
 
 If you are writing a new `Tool` that mutates the disk or reads files, **DO NOT** let the Agent pass absolute system paths cleanly. You MUST wrap the injection using `crate::utils::resolve_path(&sandbox_dir, &agent_path`). Doing so naturally bounds all agent `../` directory escapes to the sandbox boundary.
 
-Harness todo lists (`todo_write`) are stored in the workspace SQLite DB (same file as session memory: `<workspace_dir>/.system_generated/agent_memory.db`, table `harness_todos`). A legacy `<workspace_dir>/todos/*.json` folder from older builds is imported once on startup and then those files are removed.
+Harness todo lists (`todo_write`) are stored in the workspace SQLite DB (same file as session memory: `<workspace_dir>/.system_generated/agent_memory.db`, table `harness_todos`). Reads and writes go through `MemoryMessage::ReplaceHarnessTodos` and `MemoryMessage::LoadHarnessTodos` on the same `SqliteMemoryActor` as session memory—never a separate mutex-wrapped connection. A legacy `<workspace_dir>/todos/*.json` folder from older builds is imported once when the memory actor opens the DB, then those files are removed.
 
 User clarification (`ask_user`) sends an outbound message tagged with metadata `isanagent_clarification` and blocks the tool until the **next inbound** on the same session (`channel`, `chat_id`, optional `thread_id`). The agent routes that inbound to the waiting tool instead of starting a new reasoning task, so the model receives the reply as the tool result and continues the same turn.
 

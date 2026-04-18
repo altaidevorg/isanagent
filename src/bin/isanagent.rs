@@ -31,7 +31,7 @@ use isanagent::tools::builtin::{
     CronTool, EditFileTool, GlobFilesTool, ListDirTool, MessageTool, ReadFileTool, SearchTextTool,
     ShellExecTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
-use isanagent::tools::workflow::{AskUserTool, TodoStore, TodoWriteTool, ToolSearchTool};
+use isanagent::tools::workflow::{AskUserTool, TodoWriteTool, ToolSearchTool};
 use isanagent::tools::ToolRegistry;
 use isanagent::workspace::{resolve_workspace_root, IsanagentWorkspace};
 use isanagent::{NodeHandle, Supervisor, SupervisorPolicy};
@@ -150,8 +150,12 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     let db_path_str = db_path
         .to_str()
         .ok_or_else(|| std::io::Error::other("workspace DB path is not valid UTF-8"))?;
-    let memory_actor = isanagent::memory::SqliteMemoryActor::new(db_path_str).map_err(|e| {
-        std::io::Error::other(format!("Failed to initialize SqliteMemoryActor: {:?}", e))
+    let memory_actor = isanagent::memory::SqliteMemoryActor::new(
+        db_path_str,
+        Some(workspace.dir.join("todos").as_path()),
+    )
+    .map_err(|e| {
+        std::io::Error::other(format!("Failed to initialize SqliteMemoryActor: {}", e))
     })?;
     let memory_node = NodeHandle::<isanagent::memory::MemoryMessage>::new(
         memory_actor,
@@ -243,6 +247,9 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     tools.register(Box::new(SearchTextTool {
         workspace_dir: workspace.sandbox_dir.clone(),
         restrict_to_workspace: restrict,
+        ripgrep_timeout_secs: workspace
+            .config
+            .effective_search_text_ripgrep_timeout_secs(),
     }));
     tools.register(Box::new(ShellExecTool {
         workspace_dir: workspace.sandbox_dir.clone(),
@@ -277,9 +284,9 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         memory_node: memory_node.clone(),
     }));
 
-    let todo_store = TodoStore::try_new(workspace.db_path(), Some(workspace.dir.join("todos")))
-        .map_err(std::io::Error::other)?;
-    tools.register(Box::new(TodoWriteTool { store: todo_store }));
+    tools.register(Box::new(TodoWriteTool {
+        memory_node: memory_node.clone(),
+    }));
     let tool_catalog = tools.catalog_handle();
     tools.register(Box::new(ToolSearchTool {
         catalog: tool_catalog,

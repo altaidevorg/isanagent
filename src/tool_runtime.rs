@@ -2,6 +2,7 @@
 //!
 //! Set by the agent around each tool invocation via [`with_tool_exec_scope`].
 
+use crate::bus::clarification_session_key;
 use std::cell::RefCell;
 use std::future::Future;
 
@@ -22,8 +23,7 @@ impl ToolExecCtx {
     ) -> Self {
         let channel = channel.into();
         let chat_id = chat_id.into();
-        let thread_part = thread_id.as_deref().unwrap_or("");
-        let session_key = format!("{}:{}:{}", channel, chat_id, thread_part);
+        let session_key = clarification_session_key(&channel, &chat_id, thread_id.as_deref());
         Self {
             session_key,
             channel,

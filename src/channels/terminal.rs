@@ -115,17 +115,27 @@ pub fn build_tool_result_terminal_notice(
     }
 }
 
-/// Transcript cell for reasoning / provider failures (styled error rail).
-pub fn build_terminal_error_notice(chat_id: &str, message: &str) -> OutboundMessage {
+/// User-visible error notice for reasoning / provider failures, routed to `channel`.
+///
+/// Terminal UI metadata (`isanagent_terminal_error`) is attached only when `channel` is
+/// `"terminal"` so other channels are not mis-tagged.
+pub fn build_channel_error_notice(
+    channel: &str,
+    chat_id: &str,
+    thread_id: Option<&str>,
+    message: &str,
+) -> OutboundMessage {
     let mut metadata = HashMap::new();
-    metadata.insert(
-        crate::channels::terminal_ui::protocol::ISANAGENT_TERMINAL_ERROR.to_string(),
-        json!(true),
-    );
+    if channel == "terminal" {
+        metadata.insert(
+            crate::channels::terminal_ui::protocol::ISANAGENT_TERMINAL_ERROR.to_string(),
+            json!(true),
+        );
+    }
     OutboundMessage {
-        channel: "terminal".to_string(),
+        channel: channel.to_string(),
         chat_id: chat_id.to_string(),
-        thread_id: None,
+        thread_id: thread_id.map(|s| s.to_string()),
         content: message.to_string(),
         metadata,
     }

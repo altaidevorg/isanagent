@@ -502,6 +502,8 @@ impl Tool for GlobFilesTool {
 pub struct SearchTextTool {
     pub workspace_dir: PathBuf,
     pub restrict_to_workspace: bool,
+    /// Default ripgrep subprocess timeout (seconds); per-call `timeout_secs` in tool args overrides when set.
+    pub ripgrep_timeout_secs: u64,
 }
 
 async fn search_text_ripgrep(
@@ -511,6 +513,7 @@ async fn search_text_ripgrep(
     output_mode: &str,
     case_insensitive: bool,
     context_lines: u32,
+    timeout_secs: u64,
 ) -> Result<String, String> {
     let mut cmd = tokio::process::Command::new("rg");
     cmd.arg("--no-heading");
@@ -541,9 +544,9 @@ async fn search_text_ripgrep(
     cmd.arg(search_path);
 
     let fut = cmd.output();
-    let output = tokio::time::timeout(std::time::Duration::from_secs(30), fut)
+    let output = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut)
         .await
-        .map_err(|_| "Search timed out after 30 seconds.".to_string())?
+        .map_err(|_| format!("Search timed out after {} seconds.", timeout_secs))?
         .map_err(|e| format!("Failed to run ripgrep: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -720,6 +723,10 @@ impl Tool for SearchTextTool {
                 "context_lines": {
                     "type": "integer",
                     "description": "Lines of context around matches when output_mode is content (requires ripgrep when > 0)"
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "description": "Ripgrep subprocess timeout in seconds (1–3600; overrides workspace default when set)"
                 }
             },
             "required": ["pattern"]
@@ -748,6 +755,12 @@ impl Tool for SearchTextTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
 
+        const RG_TIMEOUT_MAX: u64 = 3600;
+        let ripgrep_timeout_secs = match args.get("timeout_secs").and_then(|v| v.as_u64()) {
+            Some(t) => t.clamp(1, RG_TIMEOUT_MAX),
+            None => self.ripgrep_timeout_secs.clamp(1, RG_TIMEOUT_MAX),
+        };
+
         let resolved = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
 
         if !resolved.exists() {
@@ -765,6 +778,7 @@ impl Tool for SearchTextTool {
                 output_mode,
                 case_insensitive,
                 context_lines,
+                ripgrep_timeout_secs,
             )
             .await;
         }

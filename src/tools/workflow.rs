@@ -1,14 +1,8 @@
 //! Session-scoped workflow tools (todos, tool discovery, user clarification).
 
 use async_trait::async_trait;
-use chrono::Utc;
-use log::info;
-use rusqlite::{params, Connection, OptionalExtension};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 
@@ -16,154 +10,20 @@ use crate::bus::{BusMessage, OutboundMessage};
 use crate::clarification::{
     ClarificationHub, METADATA_CLARIFICATION, METADATA_CLARIFICATION_CHOICES,
 };
-use crate::memory::{configure_agent_sqlite_connection, ensure_harness_todos_schema};
+use crate::memory::{MemoryMessage, SharedReply};
 use crate::tool_runtime::current_tool_exec_ctx;
 use crate::traits::Tool;
+use crate::NodeHandle;
 
 use super::search_tool_index;
 
-/// One row in a session todo list.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct TodoRow {
-    pub content: String,
-    pub status: String,
-}
-
-/// Legacy JSON file shape (`<workspace>/todos/<sha>.json`) for one-time migration into SQLite.
-#[derive(Debug, Deserialize, Serialize)]
-struct TodoFile {
-    chat_id: String,
-    items: Vec<TodoRow>,
-}
-
-fn todo_replace_sqlite(db_path: &Path, chat_id: &str, items: &[TodoRow]) -> Result<(), String> {
-    let conn =
-        Connection::open(db_path).map_err(|e| format!("open SQLite {:?}: {}", db_path, e))?;
-    configure_agent_sqlite_connection(&conn).map_err(|e| format!("SQLite busy_timeout: {}", e))?;
-    ensure_harness_todos_schema(&conn).map_err(|e| format!("harness_todos schema: {}", e))?;
-    let json = serde_json::to_string(items).map_err(|e| format!("serialize todo items: {}", e))?;
-    let now = Utc::now().timestamp_millis();
-    conn.execute(
-        "INSERT INTO harness_todos (chat_id, items_json, updated_at_ms) VALUES (?1, ?2, ?3)
-         ON CONFLICT(chat_id) DO UPDATE SET
-           items_json = excluded.items_json,
-           updated_at_ms = excluded.updated_at_ms",
-        params![chat_id, json, now],
-    )
-    .map_err(|e| format!("upsert harness_todos: {}", e))?;
-    Ok(())
-}
-
-fn todo_load_sqlite(db_path: &Path, chat_id: &str) -> Result<Option<Vec<TodoRow>>, String> {
-    let conn =
-        Connection::open(db_path).map_err(|e| format!("open SQLite {:?}: {}", db_path, e))?;
-    configure_agent_sqlite_connection(&conn).map_err(|e| format!("SQLite busy_timeout: {}", e))?;
-    ensure_harness_todos_schema(&conn).map_err(|e| format!("harness_todos schema: {}", e))?;
-    let out: Option<String> = conn
-        .query_row(
-            "SELECT items_json FROM harness_todos WHERE chat_id = ?1",
-            params![chat_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|e| format!("select harness_todos: {}", e))?;
-    match out {
-        None => Ok(None),
-        Some(s) => {
-            let items: Vec<TodoRow> =
-                serde_json::from_str(&s).map_err(|e| format!("parse todo items: {}", e))?;
-            Ok(Some(items))
-        }
-    }
-}
-
-/// Import `*.json` from a legacy directory (hashed filenames) into `harness_todos`, then remove each file.
-fn migrate_legacy_json_todos(conn: &Connection, legacy_dir: &Path) -> Result<u32, String> {
-    if !legacy_dir.is_dir() {
-        return Ok(0);
-    }
-    let mut migrated = 0u32;
-    let entries = fs::read_dir(legacy_dir)
-        .map_err(|e| format!("read legacy todos dir {:?}: {}", legacy_dir, e))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("legacy todos entry: {}", e))?;
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
-            continue;
-        }
-        let raw = fs::read_to_string(&path).map_err(|e| format!("read {:?}: {}", path, e))?;
-        let file: TodoFile = match serde_json::from_str(&raw) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        let items_json =
-            serde_json::to_string(&file.items).map_err(|e| format!("serialize items: {}", e))?;
-        let now = Utc::now().timestamp_millis();
-        conn.execute(
-            "INSERT INTO harness_todos (chat_id, items_json, updated_at_ms) VALUES (?1, ?2, ?3)
-             ON CONFLICT(chat_id) DO UPDATE SET
-               items_json = excluded.items_json,
-               updated_at_ms = excluded.updated_at_ms",
-            params![file.chat_id, items_json, now],
-        )
-        .map_err(|e| format!("migrate upsert: {}", e))?;
-        fs::remove_file(&path).map_err(|e| format!("remove migrated {:?}: {}", path, e))?;
-        migrated += 1;
-    }
-    Ok(migrated)
-}
-
-/// Persists todo lists per `chat_id` in the agent SQLite DB (`harness_todos` table).
-#[derive(Clone)]
-pub struct TodoStore {
-    db_path: PathBuf,
-}
-
-impl TodoStore {
-    /// Opens the DB at `db_path` (same file as [`crate::memory::SqliteMemoryActor`]), ensures schema, and optionally migrates legacy `<workspace>/todos/*.json` files.
-    pub fn try_new(db_path: PathBuf, legacy_json_dir: Option<PathBuf>) -> Result<Self, String> {
-        if let Some(parent) = db_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("create DB parent {:?}: {}", parent, e))?;
-        }
-        let conn =
-            Connection::open(&db_path).map_err(|e| format!("open SQLite {:?}: {}", db_path, e))?;
-        configure_agent_sqlite_connection(&conn)
-            .map_err(|e| format!("SQLite busy_timeout: {}", e))?;
-        ensure_harness_todos_schema(&conn).map_err(|e| format!("harness_todos schema: {}", e))?;
-        if let Some(ref dir) = legacy_json_dir {
-            let n = migrate_legacy_json_todos(&conn, dir)?;
-            if n > 0 {
-                info!(
-                    "Migrated {} todo file(s) from {:?} into {}",
-                    n,
-                    dir,
-                    db_path.display()
-                );
-            }
-        }
-        drop(conn);
-        Ok(Self { db_path })
-    }
-
-    pub fn db_path(&self) -> &Path {
-        &self.db_path
-    }
-
-    pub fn replace(&self, chat_id: &str, items: Vec<TodoRow>) -> Result<(), String> {
-        todo_replace_sqlite(&self.db_path, chat_id, &items)
-    }
-
-    pub fn load(&self, chat_id: &str) -> Result<Option<Vec<TodoRow>>, String> {
-        todo_load_sqlite(&self.db_path, chat_id)
-    }
-}
+pub use crate::memory::TodoRow;
 
 const MAX_TODO_ITEMS: usize = 200;
 
-/// Replace the structured todo list for this chat session.
+/// Replace the structured todo list for this chat session (persists via [`SqliteMemoryActor`]).
 pub struct TodoWriteTool {
-    pub store: TodoStore,
+    pub memory_node: NodeHandle<MemoryMessage>,
 }
 
 fn normalize_todo_status(s: &str) -> Result<(), String> {
@@ -281,14 +141,20 @@ impl Tool for TodoWriteTool {
             });
         }
 
-        let db_path = self.store.db_path().to_path_buf();
-        let chat = chat_id.to_string();
-        let rows_clone = rows.clone();
-        tokio::task::spawn_blocking(move || todo_replace_sqlite(&db_path, &chat, &rows_clone))
+        let summary = format_todo_list(chat_id, &rows);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.memory_node
+            .send_packet(MemoryMessage::ReplaceHarnessTodos {
+                chat_id: chat_id.to_string(),
+                items: rows,
+                reply: SharedReply::new(tx),
+            })
             .await
-            .map_err(|e| format!("todo_write task: {}", e))?
+            .map_err(|e| format!("todo_write: memory actor: {}", e))?;
+        rx.await
+            .map_err(|_| "Memory actor channel closed".to_string())?
             .map_err(|e| format!("Failed to save todos: {}", e))?;
-        Ok(format_todo_list(chat_id, &rows))
+        Ok(summary)
     }
 }
 
@@ -595,9 +461,36 @@ mod tests {
     use super::*;
     use crate::bus::BusMessage;
     use crate::clarification::METADATA_CLARIFICATION_CHOICES;
+    use crate::memory::{MemoryMessage, SharedReply, SqliteMemoryActor};
     use crate::tool_runtime::{with_tool_exec_scope, ToolExecCtx};
+    use crate::NodeHandle;
     use serde_json::json;
+    use std::fs;
     use std::path::PathBuf;
+    use std::time::Duration;
+
+    fn spawn_memory_node(db: &PathBuf) -> NodeHandle<MemoryMessage> {
+        let actor =
+            SqliteMemoryActor::new(db.to_str().expect("utf8 db path"), None).expect("memory actor");
+        NodeHandle::new(actor, 100, 1, Duration::from_millis(5))
+    }
+
+    async fn load_todos(node: &NodeHandle<MemoryMessage>, chat_id: &str) -> Option<Vec<TodoRow>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.send_packet(MemoryMessage::LoadHarnessTodos {
+            chat_id: chat_id.to_string(),
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .expect("send LoadHarnessTodos");
+        rx.await.expect("LoadHarnessTodos reply").expect("sqlite")
+    }
+
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
+    struct TodoFile {
+        chat_id: String,
+        items: Vec<TodoRow>,
+    }
 
     #[tokio::test]
     async fn ask_user_outbound_and_reply() {
@@ -700,9 +593,9 @@ mod tests {
     #[tokio::test]
     async fn todo_write_isolated_per_chat_id() {
         let db = temp_todo_db("isolate");
-        let store = TodoStore::try_new(db.clone(), None).unwrap();
+        let memory_node = spawn_memory_node(&db);
         let tool = TodoWriteTool {
-            store: store.clone(),
+            memory_node: memory_node.clone(),
         };
 
         tool.execute(json!({
@@ -722,12 +615,12 @@ mod tests {
         .await
         .unwrap();
 
-        let a = store.load("chat-a").unwrap().expect("chat-a");
+        let a = load_todos(&memory_node, "chat-a").await.expect("chat-a");
         assert_eq!(a.len(), 2);
         assert_eq!(a[0].content, "A1");
         assert_eq!(a[1].status, "completed");
 
-        let b = store.load("chat-b").unwrap().expect("chat-b");
+        let b = load_todos(&memory_node, "chat-b").await.expect("chat-b");
         assert_eq!(b.len(), 1);
         assert_eq!(b[0].content, "B1");
 
@@ -738,8 +631,10 @@ mod tests {
     async fn todo_persists_across_new_store() {
         let db = temp_todo_db("persist");
         {
-            let store = TodoStore::try_new(db.clone(), None).unwrap();
-            let tool = TodoWriteTool { store };
+            let memory_node = spawn_memory_node(&db);
+            let tool = TodoWriteTool {
+                memory_node: memory_node.clone(),
+            };
             tool.execute(json!({
                 "chat_id": "session-xyz",
                 "items": [{"content": "survive restart", "status": "pending"}]
@@ -748,8 +643,10 @@ mod tests {
             .unwrap();
         }
 
-        let store2 = TodoStore::try_new(db.clone(), None).unwrap();
-        let loaded = store2.load("session-xyz").unwrap().expect("sqlite");
+        let memory_node2 = spawn_memory_node(&db);
+        let loaded = load_todos(&memory_node2, "session-xyz")
+            .await
+            .expect("sqlite");
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].content, "survive restart");
 
@@ -776,13 +673,17 @@ mod tests {
         )
         .unwrap();
 
-        let store = TodoStore::try_new(db.clone(), Some(legacy.clone())).unwrap();
+        let actor = SqliteMemoryActor::new(db.to_str().expect("utf8"), Some(legacy.as_path()))
+            .expect("memory with legacy migrate");
+        let memory_node = NodeHandle::new(actor, 100, 1, Duration::from_millis(5));
         assert!(
             !legacy_file.exists(),
             "legacy file should be removed after migrate"
         );
 
-        let rows = store.load("migrated-chat").unwrap().expect("rows");
+        let rows = load_todos(&memory_node, "migrated-chat")
+            .await
+            .expect("rows");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].content, "from json");
 
@@ -794,7 +695,7 @@ mod tests {
     async fn todo_write_rejects_bad_status() {
         let db = temp_todo_db("badstatus");
         let tool = TodoWriteTool {
-            store: TodoStore::try_new(db.clone(), None).unwrap(),
+            memory_node: spawn_memory_node(&db),
         };
         let err = tool
             .execute(json!({

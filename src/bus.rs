@@ -17,6 +17,29 @@ pub struct InboundMessage {
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
+/// Session key for clarification routing and tool execution context ([`crate::tool_runtime::ToolExecCtx`]).
+///
+/// Format must stay aligned with [`crate::tool_runtime::ToolExecCtx`]: `channel:chat_id:thread`,
+/// using an empty thread segment when `thread_id` is missing.
+pub fn clarification_session_key(
+    channel: &str,
+    chat_id: &str,
+    thread_id: Option<&str>,
+) -> String {
+    let thread_part = thread_id.unwrap_or("");
+    format!("{}:{}:{}", channel, chat_id, thread_part)
+}
+
+impl InboundMessage {
+    pub fn clarification_session_key(&self) -> String {
+        clarification_session_key(
+            &self.channel,
+            &self.chat_id,
+            self.thread_id.as_deref(),
+        )
+    }
+}
+
 /// An outbound message from the Agent to a Channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboundMessage {
@@ -232,7 +255,32 @@ fn redact_chat_id(chat_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{LogEvent, LogLevel};
+    use super::{clarification_session_key, InboundMessage, LogEvent, LogLevel};
+    use crate::tool_runtime::ToolExecCtx;
+
+    #[test]
+    fn clarification_session_key_matches_tool_exec_ctx() {
+        let k = clarification_session_key("slack", "C123", Some("t1"));
+        assert_eq!(
+            k,
+            ToolExecCtx::new("slack", "C123", Some("t1".to_string())).session_key
+        );
+        let k2 = clarification_session_key("terminal", "u1", None);
+        assert_eq!(
+            k2,
+            ToolExecCtx::new("terminal", "u1", None).session_key
+        );
+        let inbound = InboundMessage {
+            channel: "api".to_string(),
+            sender_id: "s".to_string(),
+            chat_id: "x".to_string(),
+            thread_id: None,
+            content: "".to_string(),
+            attachments: vec![],
+            metadata: Default::default(),
+        };
+        assert_eq!(inbound.clarification_session_key(), "api:x:");
+    }
 
     #[test]
     fn format_line_masks_email_chat_ids() {
