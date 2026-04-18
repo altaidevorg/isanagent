@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use std::time::{Duration, Instant};
+
 use ratatui::layout::Rect;
 
 /// High-level UI mode for the terminal front-end.
@@ -52,6 +54,20 @@ pub enum Cell {
     },
 }
 
+/// Ephemeral status-strip message (e.g. copy confirmation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToastKind {
+    Ok,
+    Err,
+}
+
+#[derive(Debug, Clone)]
+pub struct Toast {
+    pub kind: ToastKind,
+    pub message: String,
+    pub until: Instant,
+}
+
 /// Mutable TUI application state: transcript, single-line input, scroll, streaming buffers.
 #[derive(Debug, Clone)]
 pub struct App {
@@ -73,6 +89,8 @@ pub struct App {
     pub thinking: bool,
     /// Last drawn transcript widget area (for mouse wheel hit-testing).
     pub last_transcript_rect: Option<Rect>,
+    /// Short-lived message shown in the status strip (not stored in the transcript).
+    pub toast: Option<Toast>,
 }
 
 impl Default for App {
@@ -98,7 +116,35 @@ impl App {
             should_quit: false,
             thinking: false,
             last_transcript_rect: None,
+            toast: None,
         }
+    }
+
+    pub fn set_toast(&mut self, kind: ToastKind, message: String, visible_for: Duration) {
+        self.toast = Some(Toast {
+            kind,
+            message,
+            until: Instant::now() + visible_for,
+        });
+    }
+
+    pub fn clear_expired_toast(&mut self) {
+        if let Some(t) = &self.toast {
+            if Instant::now() >= t.until {
+                self.toast = None;
+            }
+        }
+    }
+
+    /// Text and style for the status line when the toast is still active.
+    pub fn active_toast(&self) -> Option<(&str, ToastKind)> {
+        self.toast.as_ref().and_then(|t| {
+            if Instant::now() < t.until {
+                Some((t.message.as_str(), t.kind))
+            } else {
+                None
+            }
+        })
     }
 
     pub fn following_tail(&self) -> bool {

@@ -1,59 +1,95 @@
 #![allow(dead_code)]
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use ratatui::style::{Color, Modifier, Style};
 
-/// Default palette for the TUI (tuned for dark terminals; respects plain `Style` fallbacks).
+static USE_ANSI_COLOR: AtomicBool = AtomicBool::new(true);
+
+/// Read [`NO_COLOR`](https://no-color.org/) and store whether to emit ANSI colors. Call once from the Ratatui entry before the first draw.
+pub fn init_from_env() {
+    let allow = match std::env::var_os("NO_COLOR") {
+        Some(s) if !s.is_empty() => false,
+        _ => true,
+    };
+    USE_ANSI_COLOR.store(allow, Ordering::Relaxed);
+}
+
+#[inline]
+fn ansi_color() -> bool {
+    USE_ANSI_COLOR.load(Ordering::Relaxed)
+}
+
+/// Whether the TUI will emit ANSI foreground colors (false after [`init_from_env`] when `NO_COLOR` is set).
+#[inline]
+pub fn uses_ansi_color() -> bool {
+    ansi_color()
+}
+
+#[inline]
+fn fg(c: Color) -> Style {
+    if ansi_color() {
+        Style::default().fg(c)
+    } else {
+        Style::default()
+    }
+}
+
+#[inline]
+fn fg_mod(c: Color, m: Modifier) -> Style {
+    if ansi_color() {
+        Style::default().fg(c).add_modifier(m)
+    } else {
+        Style::default().add_modifier(m)
+    }
+}
+
+/// Default palette for the TUI (tuned for dark terminals). Honors `NO_COLOR` (no foreground colors; modifiers kept for structure).
 #[derive(Debug, Clone, Copy)]
 pub struct Theme;
 
 impl Theme {
     pub fn text() -> Style {
-        Style::default().fg(Color::White)
+        fg(Color::White)
     }
 
     pub fn dim() -> Style {
-        Style::default().fg(Color::DarkGray)
+        fg(Color::DarkGray)
     }
 
     pub fn user_prefix() -> Style {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
+        fg_mod(Color::Cyan, Modifier::BOLD)
     }
 
     pub fn assistant_bullet() -> Style {
-        Style::default().fg(Color::DarkGray)
+        fg(Color::DarkGray)
     }
 
     pub fn thinking() -> Style {
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::ITALIC)
+        fg_mod(Color::DarkGray, Modifier::ITALIC)
     }
 
     pub fn tool_call() -> Style {
-        Style::default().fg(Color::Yellow)
+        fg(Color::Yellow)
     }
 
     pub fn tool_done() -> Style {
-        Style::default().fg(Color::Green)
+        fg(Color::Green)
     }
 
     pub fn clarification() -> Style {
-        Style::default().fg(Color::Magenta)
+        fg(Color::Magenta)
     }
 
     pub fn error() -> Style {
-        Style::default().fg(Color::Red)
+        fg(Color::Red)
     }
 
     pub fn status_bar() -> Style {
-        Style::default().fg(Color::Gray)
+        fg(Color::Gray)
     }
 
     pub fn input_prompt() -> Style {
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD)
+        fg_mod(Color::Green, Modifier::BOLD)
     }
 }

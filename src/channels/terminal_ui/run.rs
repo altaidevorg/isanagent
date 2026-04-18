@@ -23,13 +23,35 @@ use crate::bus::{BusMessage, InboundMessage, OutboundMessage};
 use crate::channels::terminal_ui::attachments::parse_terminal_attachments;
 use crate::channels::terminal_ui::markdown;
 use crate::channels::terminal_ui::protocol::{ISANAGENT_AGENT_THOUGHT, ISANAGENT_TERMINAL_ERROR};
-use crate::channels::terminal_ui::{App, Cell, Theme, ToolNoticePhase};
+use crate::channels::terminal_ui::{
+    init_from_env, uses_ansi_color, App, Cell, Theme, ToastKind, ToolNoticePhase,
+};
 use crate::clarification::{METADATA_CLARIFICATION, METADATA_CLARIFICATION_CHOICES};
 
 const ISANAGENT_TOOL_NOTIFY: &str = "isanagent_tool_notify";
 const ISANAGENT_TOOL_PHASE: &str = "isanagent_tool_phase";
 /// Lines to scroll per mouse wheel notch over the transcript.
 const MOUSE_SCROLL_LINES: u16 = 3;
+const TOAST_COPY_OK_SECS: u64 = 3;
+const TOAST_COPY_ERR_SECS: u64 = 5;
+
+const TERMINAL_HELP: &str = r#"Commands (leading slash):
+  /exit, /quit   Quit and restore the terminal
+  /new           Start a new session (new chat id)
+  /copy          Copy the last assistant reply to the clipboard
+  /help, /?      Show this help
+
+Keys:
+  Enter             Send the compose line
+  PgUp / PgDn       Scroll the transcript
+  Mouse wheel       Scroll when the pointer is over the transcript (horizontal wheel scrolls too)
+  Ctrl+Shift+Y      Copy last assistant reply
+  Ctrl+W / Ctrl+U   Delete word / clear line
+  Ctrl+C            Exit (same idea as /exit)
+
+Environment:
+  NO_COLOR          If set to a non-empty value, ANSI foreground colors in the TUI are disabled.
+"#;
 
 /// Coalesce consecutive model-thought lines into one cell (streaming-style UX).
 fn append_cell_merging_thought(cells: &mut Vec<Cell>, cell: Cell) {
@@ -389,7 +411,7 @@ fn build_title_line(max_width: usize) -> Line<'static> {
             dim,
         )],
         vec![Span::styled(
-            "· /exit · /new · /copy · ↑↓ · wheel · PgUp/PgDn",
+            "· /exit · /new · /copy · /help · ↑↓ · wheel · PgUp/PgDn",
             dim,
         )],
     ];
@@ -402,6 +424,7 @@ fn build_status_line(
     thinking: bool,
     chat_id: &str,
     cell_count: usize,
+    toast: Option<(&str, ToastKind)>,
 ) -> Line<'static> {
     let dim = Theme::dim();
     let (activity_label, activity_style) = if thinking {
@@ -410,8 +433,12 @@ fn build_status_line(
         ("idle", Theme::dim())
     };
     let sid = &chat_id[..8.min(chat_id.len())];
-    let groups = vec![
-        vec![Span::styled(status_model.to_string(), Theme::text())],
+    let mut first_row = vec![Span::styled(status_model.to_string(), Theme::text())];
+    if !uses_ansi_color() {
+        first_row.push(Span::styled(" [plain]", Theme::dim()));
+    }
+    let mut groups: Vec<Vec<Span<'static>>> = vec![
+        first_row,
         vec![
             Span::styled(" · ", dim),
             Span::styled(activity_label, activity_style),
@@ -432,6 +459,14 @@ fn build_status_line(
             ),
         ],
     ];
+    if let Some((msg, kind)) = toast {
+        let style = match kind {
+            ToastKind::Ok => Theme::tool_done(),
+            ToastKind::Err => Theme::error(),
+        };
+        let t = truncate_chars_display(msg, max_width.max(12).min(120));
+        groups.insert(0, vec![Span::styled(t, style), Span::styled(" · ", dim)]);
+    }
     line_from_chunk_groups(groups, max_width)
 }
 
@@ -517,6 +552,8 @@ pub(crate) fn run_ratatui_main(
     session_banner: String,
     status_model: String,
 ) -> io::Result<()> {
+    init_from_env();
+
     let mut stdout = stdout();
     enable_raw_mode()?;
     execute!(stdout, EnterAlternateScreen, crossterm::cursor::Hide)?;
@@ -536,6 +573,8 @@ pub(crate) fn run_ratatui_main(
     let max_scroll_holder = std::cell::Cell::new(0u16);
 
     loop {
+        app.clear_expired_toast();
+
         while let Ok(msg) = outbound_rx.try_recv() {
             if outbound_clears_thinking(&msg) {
                 app.thinking = false;
@@ -572,6 +611,7 @@ pub(crate) fn run_ratatui_main(
                 app.thinking,
                 &chat_id,
                 app.cells.len(),
+                app.active_toast(),
             );
             let status_w = Paragraph::new(status_line);
             f.render_widget(status_w, ch[2]);
@@ -644,22 +684,30 @@ pub(crate) fn run_ratatui_main(
                         if text.eq_ignore_ascii_case("/copy") {
                             match copy_last_assistant_to_clipboard(&app.cells) {
                                 Ok(n) => {
-                                    app.cells.push(Cell::System {
-                                        message: format!(
-                                            "Copied last assistant reply to clipboard ({n} chars)."
-                                        ),
-                                    });
+                                    app.set_toast(
+                                        ToastKind::Ok,
+                                        format!("Copied last reply ({n} chars)"),
+                                        Duration::from_secs(TOAST_COPY_OK_SECS),
+                                    );
                                 }
                                 Err(e) => {
-                                    app.cells.push(Cell::System {
-                                        message: format!("Could not copy: {e}"),
-                                    });
+                                    app.set_toast(
+                                        ToastKind::Err,
+                                        format!("Copy failed: {e}"),
+                                        Duration::from_secs(TOAST_COPY_ERR_SECS),
+                                    );
                                 }
                             }
                             continue;
                         }
+                        if text.eq_ignore_ascii_case("/help") || text.eq_ignore_ascii_case("/?") {
+                            app.cells.push(Cell::System {
+                                message: TERMINAL_HELP.trim().to_string(),
+                            });
+                            continue;
+                        }
                         app.cells.push(Cell::System {
-                            message: "Unknown command. Try /exit, /new, /copy.".into(),
+                            message: "Unknown command. Try /help, /exit, /new, /copy.".into(),
                         });
                         continue;
                     }
@@ -707,19 +755,21 @@ pub(crate) fn run_ratatui_main(
                 {
                     match copy_last_assistant_to_clipboard(&app.cells) {
                         Ok(n) => {
-                            app.cells.push(Cell::System {
-                                message: format!(
-                                    "Copied last assistant reply to clipboard ({n} chars)."
-                                ),
-                            });
+                            app.set_toast(
+                                ToastKind::Ok,
+                                format!("Copied last reply ({n} chars)"),
+                                Duration::from_secs(TOAST_COPY_OK_SECS),
+                            );
                             if app.following_tail() {
                                 app.scroll_offset = 0;
                             }
                         }
                         Err(e) => {
-                            app.cells.push(Cell::System {
-                                message: format!("Could not copy: {e}"),
-                            });
+                            app.set_toast(
+                                ToastKind::Err,
+                                format!("Copy failed: {e}"),
+                                Duration::from_secs(TOAST_COPY_ERR_SECS),
+                            );
                         }
                     }
                 }
@@ -735,6 +785,9 @@ pub(crate) fn run_ratatui_main(
                     match me.kind {
                         MouseEventKind::ScrollUp => app.scroll_up(MOUSE_SCROLL_LINES),
                         MouseEventKind::ScrollDown => app.scroll_down(MOUSE_SCROLL_LINES),
+                        // Trackpads: horizontal wheel maps to vertical transcript scroll.
+                        MouseEventKind::ScrollLeft => app.scroll_up(MOUSE_SCROLL_LINES),
+                        MouseEventKind::ScrollRight => app.scroll_down(MOUSE_SCROLL_LINES),
                         _ => {}
                     }
                 }
@@ -781,7 +834,7 @@ mod width_fit_tests {
 
     #[test]
     fn status_drops_low_priority_when_narrow() {
-        let line = build_status_line(26, "gemini-2.5-flash", false, "uuid-here-ok", 3);
+        let line = build_status_line(26, "gemini-2.5-flash", false, "uuid-here-ok", 3, None);
         let t = flat(&line);
         assert!(t.contains("gemini"));
         assert!(t.contains("idle"));
