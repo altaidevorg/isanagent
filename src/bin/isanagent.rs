@@ -154,9 +154,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         db_path_str,
         Some(workspace.dir.join("todos").as_path()),
     )
-    .map_err(|e| {
-        std::io::Error::other(format!("Failed to initialize SqliteMemoryActor: {}", e))
-    })?;
+    .map_err(|e| std::io::Error::other(format!("Failed to initialize SqliteMemoryActor: {}", e)))?;
     let memory_node = NodeHandle::<isanagent::memory::MemoryMessage>::new(
         memory_actor,
         100,

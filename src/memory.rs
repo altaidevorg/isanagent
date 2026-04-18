@@ -118,7 +118,11 @@ struct TodoFile {
     items: Vec<TodoRow>,
 }
 
-fn todo_replace_sqlite_conn(conn: &Connection, chat_id: &str, items: &[TodoRow]) -> Result<(), String> {
+fn todo_replace_sqlite_conn(
+    conn: &Connection,
+    chat_id: &str,
+    items: &[TodoRow],
+) -> Result<(), String> {
     let json = serde_json::to_string(items).map_err(|e| format!("serialize todo items: {}", e))?;
     let now = Utc::now().timestamp_millis();
     conn.execute(
@@ -157,8 +161,8 @@ fn migrate_legacy_json_todos(conn: &Connection, legacy_dir: &Path) -> Result<u32
         return Ok(0);
     }
     let mut migrated = 0u32;
-    let entries =
-        fs::read_dir(legacy_dir).map_err(|e| format!("read legacy todos dir {:?}: {}", legacy_dir, e))?;
+    let entries = fs::read_dir(legacy_dir)
+        .map_err(|e| format!("read legacy todos dir {:?}: {}", legacy_dir, e))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("legacy todos entry: {}", e))?;
         let path = entry.path();
@@ -420,9 +424,7 @@ impl SqliteMemoryActor {
             if n > 0 {
                 info!(
                     "Migrated {} todo file(s) from {:?} into {}",
-                    n,
-                    dir,
-                    db_path
+                    n, dir, db_path
                 );
             }
         }

@@ -21,22 +21,14 @@ pub struct InboundMessage {
 ///
 /// Format must stay aligned with [`crate::tool_runtime::ToolExecCtx`]: `channel:chat_id:thread`,
 /// using an empty thread segment when `thread_id` is missing.
-pub fn clarification_session_key(
-    channel: &str,
-    chat_id: &str,
-    thread_id: Option<&str>,
-) -> String {
+pub fn clarification_session_key(channel: &str, chat_id: &str, thread_id: Option<&str>) -> String {
     let thread_part = thread_id.unwrap_or("");
     format!("{}:{}:{}", channel, chat_id, thread_part)
 }
 
 impl InboundMessage {
     pub fn clarification_session_key(&self) -> String {
-        clarification_session_key(
-            &self.channel,
-            &self.chat_id,
-            self.thread_id.as_deref(),
-        )
+        clarification_session_key(&self.channel, &self.chat_id, self.thread_id.as_deref())
     }
 }
 
@@ -266,10 +258,7 @@ mod tests {
             ToolExecCtx::new("slack", "C123", Some("t1".to_string())).session_key
         );
         let k2 = clarification_session_key("terminal", "u1", None);
-        assert_eq!(
-            k2,
-            ToolExecCtx::new("terminal", "u1", None).session_key
-        );
+        assert_eq!(k2, ToolExecCtx::new("terminal", "u1", None).session_key);
         let inbound = InboundMessage {
             channel: "api".to_string(),
             sender_id: "s".to_string(),
