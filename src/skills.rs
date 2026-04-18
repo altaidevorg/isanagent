@@ -266,7 +266,7 @@ mod skill_metadata_tests {
             .lines()
             .find_map(|l| {
                 l.strip_prefix("Instruction length:")
-                    .and_then(|s| s.trim().split_whitespace().next())
+                    .and_then(|s| s.split_whitespace().next())
                     .and_then(|n| n.parse().ok())
             })
             .expect("instruction length line");

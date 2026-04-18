@@ -7,12 +7,15 @@ use std::cell::RefCell;
 use std::future::Future;
 
 /// Identity for the session executing a tool (matches `AgentLogic` memory key format).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ToolExecCtx {
     pub session_key: String,
     pub channel: String,
     pub chat_id: String,
     pub thread_id: Option<String>,
+    /// Cancellation token for the **current** reasoning loop (parent or sub-agent), when set.
+    /// Used by harness tools to link child work to parent cancellation policy.
+    pub reasoning_cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl ToolExecCtx {
@@ -29,7 +32,13 @@ impl ToolExecCtx {
             channel,
             chat_id,
             thread_id,
+            reasoning_cancel: None,
         }
+    }
+
+    pub fn with_reasoning_cancel(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.reasoning_cancel = Some(token);
+        self
     }
 }
 

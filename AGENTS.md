@@ -28,6 +28,10 @@ Harness todo lists (`todo_write`) are stored in the workspace SQLite DB (same fi
 
 User clarification (`ask_user`) sends an outbound message tagged with metadata `isanagent_clarification` and blocks the tool until the **next inbound** on the same session (`channel`, `chat_id`, optional `thread_id`). The agent routes that inbound to the waiting tool instead of starting a new reasoning task, so the model receives the reply as the tool result and continues the same turn.
 
+Git worktrees (`git_worktree`): **off by default**. Set `[harness.git_worktree] enabled = true` in `config.toml` to register the tool. Worktree paths use the same `resolve_path` sandbox rules as other filesystem tools unless `allow_path_outside_sandbox = true`, which permits canonical paths outside the sandbox (for example a host temp directory). See `docs/harness-implementation-plan.md` Phase 4.
+
+Sub-agents (`subagent_spawn`, `task_*`, `subagent_plan_execute`): **off by default** via `[harness.subagents] enabled = true`. Sub-agents run a second `run_reasoning_loop` with a synthetic chat id (`subagent-…`) and optional tool allowlist. `cancel_children_on_parent_cancel` (default true) controls whether cancelling or superseding the parent chat’s reasoning also cancels those child tasks. See `docs/harness-implementation-plan.md` Phase 5.
+
 ### Structured LLM Extraction
 If you are asking the LLM to yield a structured JSON payload internally (e.g. for reflection or summarization outside of the standard `ToolCall` registry):
 **DO NOT** use brittle string matching like `text.find('{')`. 
@@ -98,7 +102,7 @@ If you add a new metric or LLM analytics block, format it explicitly as a `BusMe
 ## 🧠 Memory & Reflection Pipelines
 
 The memory system has two distinct phases operating under the Actor loop:
-1. **Active Auto-Compaction** (`src/agent.rs`): If an active chat exceeds token/turn limits, a blocking summarization request is made, saved out to `SqliteMemoryActor` safely, and the raw history buffers are cleared to protect context limits.
+1. **Active Auto-Compaction** (`src/agent/mod.rs`): If an active chat exceeds token/turn limits, a blocking summarization request is made, saved out to `SqliteMemoryActor` safely, and the raw history buffers are cleared to protect context limits.
 2. **Idle Background Reflection** (`src/reflection.rs`): An asynchronous supervisor checks idle sessions on an interval. When a predefined threshold of SQLite summaries is reached, it spawns a task converting them into a single `MEMORY.md` file saved physically to the `workspace_dir`.
 
 
@@ -106,7 +110,7 @@ The memory system has two distinct phases operating under the Actor loop:
 After implementing a feature, follow this exact workflow to deliver high-quality code.
 
 1. Review your code for performance-oriented move semantics, graceful handling of errors and options, and correct async usage. As a rule of thumb, avoid `.unwrap()` and `.expect()` that can cause panics at runtime.
-2. Run `cargo clippy` and keep your clippy happy --it's your best friend. No Allow() macro allowed to suppress clippy warnings.
+2. Run `cargo clippy --release -p isanagent --all-targets` (or `cargo clippy --all-targets` in debug where supported) and keep Clippy clean. Do not use `#[allow(clippy::…)]` or `allow()` to suppress warnings.
 3. Run `cargo fmt` so that it's always well-formatted, avoiding unnecessary diffs that simply come from formatting.
 4. This is a living document --keep this document up-to-date as you introduce new features and/or architectures.
 

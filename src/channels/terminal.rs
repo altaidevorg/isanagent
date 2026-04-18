@@ -228,14 +228,16 @@ For headless or piped runs, set [terminal] enable = false in config.toml (requir
             .name("isanagent-terminal-tui".into())
             .spawn(move || {
                 let res = crate::channels::terminal_ui::run_ratatui_main(
-                    bus_tx_clone,
-                    rx,
-                    shutdown_clone,
-                    sandbox_clone,
-                    chat_id_clone,
-                    channel_name,
-                    session_banner,
-                    status_model,
+                    crate::channels::terminal_ui::RatatuiMainConfig {
+                        bus_tx: bus_tx_clone,
+                        outbound_rx: rx,
+                        shutdown_tx: shutdown_clone,
+                        sandbox_dir: sandbox_clone,
+                        chat_id: chat_id_clone,
+                        channel_name,
+                        session_banner,
+                        status_model,
+                    },
                 );
                 if let Ok(mut g) = bridge.lock() {
                     *g = None;

@@ -283,7 +283,9 @@ When enough short-term summaries accumulate, a background reflection engine cons
 isanagent supports dual-layer extensibility: Built-in strict Rust Tools, and dynamic `Markdown` LLM Skills.
 
 ### Built-in Tools
-Tools like `web_scrape`, `shell_exec`, `list_dir`, `read_file` are mapped natively in `src/tools/builtin.rs`. If `restrict_to_workspace` is true, isanagent heavily validates file-system calls preventing the AI from path traversing outside the active workspace directory or manipulating system state.
+Tools like `web_search`, `web_fetch`, `exec` (shell), `list_dir`, `read_file`, `write_file`, `edit_file`, `glob_files`, and `search_text` are implemented in `src/tools/builtin.rs`. Workflow tools (`todo_write`, `search_tools`, `ask_user`, …) live in `src/tools/workflow.rs`. If `restrict_to_workspace` is true, filesystem tools validate paths so the model cannot traverse outside the workspace sandbox.
+
+Optional **harness** features are config-gated under `[harness.*]` in `config.toml` (for example `git_worktree` and `subagents`). Behaviour, acceptance checks, and Phase 6 roadmap are documented in [`docs/harness-implementation-plan.md`](./docs/harness-implementation-plan.md). Architecture notes for tools, memory, and sandboxing are in [`AGENTS.md`](./AGENTS.md).
 
 ### Markdown Skills (`/workspace/skills/`)
 Skills provide complex workflows, templates, or instructions natively to the Agent without recompiling Rust code.
@@ -305,7 +307,17 @@ When asked to containerize this app, you MUST use cargo-chef and multi-stage bui
 The Agent will see the capability in its system prompt and can dynamically call `load_skill_instructions(name: "create_dockerfile")` to inject this explicitly when needed.
 
 ## 🤝 Development Guide
-For specific guidance on developing new Tools, Skills, or contributing to the architecture as an automated agent yourself, please refer to the dedicated [`GEMINI.md`](./GEMINI.md) blueprint document.
+For specific guidance on developing new Tools, Skills, or contributing to the architecture as an automated agent yourself, please refer to the dedicated [`GEMINI.md`](./GEMINI.md) blueprint document and [`AGENTS.md`](./AGENTS.md).
+
+Before opening a PR, from the repo root:
+
+```bash
+cargo fmt
+cargo clippy --release -p isanagent --all-targets
+cargo test --release -p isanagent
+```
+
+On Windows, prefer `--release` for builds and tests if you hit PDB linker issues in debug mode (see `AGENTS.md`).
 
 ## 📄 License
 This project is licensed under the MIT License - see the LICENSE file for details.

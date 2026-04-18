@@ -53,13 +53,39 @@ This document tracks expanding the built-in tool surface toward a strong **code-
 - `timeout_secs` is clamped between 10 and 86400 (default 1800); cooperative cancellation clears the pending wait.
 - Optional `choices` (≤8) are shown with the prompt; a reply that does not exactly match a listed choice (after trim) is still returned to the model with a note.
 
-### Phase 4 — Git worktrees
+### Phase 4 — Git worktrees (implemented)
 
-- Optional `git worktree` helpers with explicit policy for paths outside the sandbox (config-gated).
+| Piece | Implementation |
+|--------|----------------|
+| `git_worktree` tool | `action`: `list`, `add` (new branch via `git worktree add -b`), `remove` (resolves primary repo via `git-common-dir`). 60s subprocess timeout; output capped like `exec`. Paths passed to `git` are made relative to the repo when possible so Windows canonical `\\?\` paths do not break Git for Windows. |
+| Config gate | `[harness.git_worktree]` in `config.toml`: `enabled = true` registers the tool (default off). |
+| Paths outside sandbox | `allow_path_outside_sandbox = true` disables the usual `restrict_to_workspace` check **only for worktree path arguments** (and `base_path`), after canonical resolution. |
 
-### Phase 5 — Sub-agents and plans
+**Tests:** `tools::builtin::git_worktree_path_tests` (path policy + optional git roundtrip when `git` is on `PATH`).
 
-- Background tasks, cancellation, optional typed agent presets, and multi-step plans executed with dependency ordering. This touches `AgentLogic`, session scope, and likely a small runtime type—not only new `Tool` impls.
+### Phase 4 acceptance
+
+- With `enabled = false`, `git_worktree` is not registered.
+- With `enabled = true`, `list` / `add` / `remove` invoke `git` from a resolved `base_path` or worktree path; invalid `action` or missing `path` for add/remove returns a clear error.
+- Unless `allow_path_outside_sandbox` is set, worktree paths must stay inside the agent sandbox when `restrict_to_workspace` is true.
+
+### Phase 5 — Sub-agents and plans (implemented)
+
+| Piece | Implementation |
+|--------|----------------|
+| Config | `[harness.subagents]`: `enabled`, `cancel_children_on_parent_cancel` (default **true**), `allowed_tools` (optional allowlist), `max_tasks` (1–256, default 32), `max_wait_secs` for blocking `wait` (10–3600, default 300). |
+| Harness | `SubagentHarness` in `src/agent/subagent.rs`; `OnceLock` bind to `Arc<ToolRegistry>` after registration; spawn runs `AgentLogic::run_reasoning_loop` with `is_subagent: true` and synthetic `InboundMessage` (`chat_id` `subagent-…`). |
+| Parent cancel | When `cancel_children_on_parent_cancel` is true: `BusMessage::Cancel` and auto-cancel on new inbound both call `cancel_children_for_parent` before cancelling the parent reasoning token. When **false**, child tasks keep their own `CancellationToken` (no `child_token` link). |
+| Tools | `subagent_spawn`, `task_list`, `task_get`, `task_cancel`, `subagent_plan_execute` (JSON plan, topological rounds, each step `wait=true`). Nested `subagent_spawn` / `subagent_plan_execute` denied inside sub-agents. Typed agent presets deferred. |
+| Tool scope | `ToolRegistry::list_tools_scoped` / `execute_tool_scoped`; `ToolExecCtx::reasoning_cancel` set on the main loop for `subagent_spawn` linking. |
+
+**Tests:** existing suite; add focused tests later if desired.
+
+### Phase 5 acceptance
+
+- With `enabled = false`, no sub-agent tools are registered and `AgentLogicParams.subagent` is `None`.
+- With `enabled = true`, spawn/list/get/cancel/plan operate; allowlist empty omits restriction; non-empty allowlist restricts sub-agent tool calls only.
+- `cancel_children_on_parent_cancel = false` leaves background sub-agents running when the parent chat’s reasoning is cancelled or superseded by a new message.
 
 ### Phase 6 — Notebook, LSP, MCP, remote
 

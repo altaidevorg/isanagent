@@ -1,15 +1,17 @@
-# Handover — harness work (Phases 1–3) + SQLite todos
+# Handover — harness work (Phases 1–5) + SQLite todos
 
 ## Summary
 
-This branch delivers the harness **Phase 1** (discovery / edit), **Phase 2** (todos in shared SQLite, tool search, skill list/metadata), **SQLite `busy_timeout`** on the agent DB, and **Phase 3** (`ask_user` with `ClarificationHub` + inbound routing so the next user message completes the tool without spawning a second agent task). Phases **4–6** in `docs/harness-implementation-plan.md` are **not** implemented. You are pausing here to land **another PR** first; resume harness from Phase 4 when you return.
+This branch delivers harness **Phases 1–5** (through sub-agents / plans under `[harness.subagents]`). **Phase 6** in `docs/harness-implementation-plan.md` is **not** implemented.
 
 ## What Was Done
 
 - **Phase 1:** `glob_files`, `search_text` (rg or fallback), `edit_file` (`replace_all`, diff snippet); glob root/canonicalize fix for Windows `\\?\` paths (`src/tools/builtin.rs`).
-- **Phase 2:** `todo_write` → table `harness_todos` in `agent_memory.db`; legacy `<workspace>/todos/*.json` migrated once; `search_tools` + registration-order catalog; `load_skill_instructions` list/metadata (`src/tools/workflow.rs`, `src/tools.rs`, `src/agent.rs`, `src/skills.rs`, `src/memory.rs`, `src/bin/isanagent.rs`).
+- **Phase 2:** `todo_write` → table `harness_todos` in `agent_memory.db`; legacy `<workspace>/todos/*.json` migrated once; `search_tools` + registration-order catalog; `load_skill_instructions` list/metadata (`src/tools/workflow.rs`, `src/tools.rs`, `src/agent/mod.rs`, `src/skills.rs`, `src/memory.rs`, `src/bin/isanagent.rs`).
 - **Concurrency:** `configure_agent_sqlite_connection` + `AGENT_SQLITE_BUSY_TIMEOUT_MS` on memory + todo connections (`src/memory.rs`, `src/tools/workflow.rs`).
-- **Phase 3:** `ClarificationHub` (`src/clarification.rs`), `ToolExecCtx` task-local (`src/tool_runtime.rs`), `AskUserTool` (`src/tools/workflow.rs`), `AgentLogic` inbound **early** `try_deliver_reply` before cancel/spawn, `ToolCallRuntime` + scoped tool execution (`src/agent.rs`), terminal `[Question]` for `isanagent_clarification` metadata (`src/channels/terminal.rs`), registration in `src/bin/isanagent.rs`.
+- **Phase 3:** `ClarificationHub` (`src/clarification.rs`), `ToolExecCtx` task-local (`src/tool_runtime.rs`), `AskUserTool` (`src/tools/workflow.rs`), `AgentLogic` inbound **early** `try_deliver_reply` before cancel/spawn, `ToolCallRuntime` + scoped tool execution (`src/agent/mod.rs`), terminal `[Question]` for `isanagent_clarification` metadata (`src/channels/terminal.rs`), registration in `src/bin/isanagent.rs`.
+- **Phase 4:** `GitWorktreeTool` (`src/tools/builtin.rs`), `[harness.git_worktree]` in `src/config.rs`, conditional registration in `src/bin/isanagent.rs`.
+- **Phase 5:** `SubagentHarness` + tools in `src/agent/subagent.rs`; `ReasoningLoopCtx` / scoped tool execution; `[harness.subagents]` (`cancel_children_on_parent_cancel`, `allowed_tools`, `max_tasks`, `max_wait_secs`); agent split `src/agent/mod.rs`.
 - **Docs:** `docs/harness-implementation-plan.md`, `AGENTS.md` updated for the above.
 
 ## What We Tried / What Didn’t Work
@@ -33,13 +35,13 @@ This branch delivers the harness **Phase 1** (discovery / edit), **Phase 2** (to
 
 - **`ask_user` outside agent tool scope:** Fails with a clear error if `ToolExecCtx` is not set (e.g. calling the tool without the agent’s scoped execution).
 - **Cancellation is still keyed by `chat_id` only** for `BusMessage::Cancel` / `cancellation_tokens` (pre-existing); clarification matching uses full **session key** including channel and thread — keep them consistent when adding channels.
-- **Clippy:** One pre-existing warning in `agent.rs` (~803): `redundant_pattern_matching` on `memory_node.send_packet` — not introduced by this work.
+- **Clippy:** Run `cargo clippy --release -p isanagent --all-targets` before merge; keep the tree warning-free without `allow()` suppressions.
 - **Windows:** Prefer `cargo build/test --release` (see `AGENTS.md`).
 
 ## Next Steps
 
 - [ ] Merge or park this branch; open the **other PR** as planned.
-- [ ] When resuming harness: **Phase 4** (git worktrees, config-gated), then Phase 5 / 6 per `docs/harness-implementation-plan.md`.
+- [ ] When resuming harness: **Phase 6** (notebook, LSP, MCP, remote) per `docs/harness-implementation-plan.md`.
 - [ ] Optional hardening: API/UI explicitly handle `isanagent_clarification` in SSE or REST responses (currently same as other outbounds + metadata).
 - [ ] Optional: remove empty `todos/` dir after legacy migration; metrics when migration count &gt; 0.
 
@@ -48,12 +50,14 @@ This branch delivers the harness **Phase 1** (discovery / edit), **Phase 2** (to
 | Path | Purpose |
 |------|---------|
 | `docs/harness-implementation-plan.md` | Phase checklist and acceptance criteria |
+| `src/config.rs` | `AppConfig`, optional `[harness.git_worktree]` |
 | `AGENTS.md` | Architecture, sandbox, todos DB, `ask_user` behavior |
 | `src/clarification.rs` | `ClarificationHub`, `METADATA_CLARIFICATION` |
 | `src/tool_runtime.rs` | `ToolExecCtx`, task-local scope for tools |
-| `src/agent.rs` | Inbound clarification routing; `ToolCallRuntime`; `execute_tool_call_with_activity` |
+| `src/agent/mod.rs` | Inbound clarification routing; `ToolCallRuntime`; `execute_tool_call_with_activity`; `ReasoningLoopCtx` |
+| `src/agent/subagent.rs` | `SubagentHarness`, spawn/plan/task tools |
 | `src/tools/workflow.rs` | `todo_write`, `search_tools`, `AskUserTool`, todo SQLite helpers |
-| `src/tools/builtin.rs` | Glob/search/edit/message/shell/web/memory tools |
+| `src/tools/builtin.rs` | Glob/search/edit/message/shell/web/memory/`git_worktree` tools |
 | `src/tools.rs` | `ToolRegistry`, catalog, `search_tool_index` |
 | `src/memory.rs` | Memory actor, `harness_todos` schema, SQLite busy_timeout helper |
 | `src/channels/terminal.rs` | `[Question]` styling for clarification outbounds |
@@ -64,6 +68,6 @@ This branch delivers the harness **Phase 1** (discovery / edit), **Phase 2** (to
 ```powershell
 cd C:\Users\Yusuf\agent-rs
 cargo fmt
+cargo clippy --release -p isanagent --all-targets
 cargo test --release -p isanagent
-cargo clippy --release -p isanagent --lib
 ```

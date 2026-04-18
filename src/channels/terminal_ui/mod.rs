@@ -14,7 +14,7 @@ pub use app::{App, Cell, TerminalUiMode, ToastKind, ToolNoticePhase};
 pub use theme::{init_from_env, uses_ansi_color, Theme};
 
 pub(crate) use attachments::parse_terminal_attachments;
-pub(crate) use run::run_ratatui_main;
+pub(crate) use run::{run_ratatui_main, RatatuiMainConfig};
 
 use unicode_width::UnicodeWidthStr;
 

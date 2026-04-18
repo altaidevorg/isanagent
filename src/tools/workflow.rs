@@ -466,10 +466,10 @@ mod tests {
     use crate::NodeHandle;
     use serde_json::json;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    fn spawn_memory_node(db: &PathBuf) -> NodeHandle<MemoryMessage> {
+    fn spawn_memory_node(db: &Path) -> NodeHandle<MemoryMessage> {
         let actor =
             SqliteMemoryActor::new(db.to_str().expect("utf8 db path"), None).expect("memory actor");
         NodeHandle::new(actor, 100, 1, Duration::from_millis(5))
