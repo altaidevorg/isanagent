@@ -6,6 +6,23 @@ pub struct TerminalConfig {
     pub enable: Option<bool>,
 }
 
+/// Optional harness features (see `docs/harness-implementation-plan.md`).
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HarnessConfig {
+    pub git_worktree: Option<GitWorktreeConfig>,
+}
+
+/// Git worktree helpers (`git_worktree` tool). Disabled unless `[harness.git_worktree] enabled = true`.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct GitWorktreeConfig {
+    /// Register the `git_worktree` tool when true (default: false).
+    pub enabled: Option<bool>,
+    /// When false (default), worktree paths must satisfy the same sandbox boundary as other tools
+    /// whenever `restrict_to_workspace` is true. When true, worktree paths may resolve outside the
+    /// sandbox (e.g. a host temp directory) after canonicalization.
+    pub allow_path_outside_sandbox: Option<bool>,
+}
+
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct AppConfig {
     pub restrict_to_workspace: Option<bool>,
@@ -25,6 +42,7 @@ pub struct AppConfig {
     pub multi_tenant_edge: Option<MultiTenantEdgeConfig>,
     /// When `enabled`, `web_search` / `web_fetch` use [Jina Reader](https://r.jina.ai/) and search (`s.jina.ai`).
     pub jina: Option<JinaConfig>,
+    pub harness: Option<HarnessConfig>,
 }
 
 /// Optional Jina Reader / Search backend for web tools (see https://jina.ai/reader ).
@@ -114,6 +132,24 @@ impl AppConfig {
         self.search_text_ripgrep_timeout_secs
             .unwrap_or(DEFAULT)
             .clamp(MIN, MAX)
+    }
+
+    /// When true, `git_worktree` is registered (see `[harness.git_worktree]` in config).
+    pub fn git_worktree_tool_enabled(&self) -> bool {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.git_worktree.as_ref())
+            .and_then(|g| g.enabled)
+            .unwrap_or(false)
+    }
+
+    /// When true with `git_worktree_tool_enabled`, worktree paths may lie outside the sandbox.
+    pub fn git_worktree_allow_path_outside_sandbox(&self) -> bool {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.git_worktree.as_ref())
+            .and_then(|g| g.allow_path_outside_sandbox)
+            .unwrap_or(false)
     }
 }
 

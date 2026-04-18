@@ -1,8 +1,8 @@
-# Handover — harness work (Phases 1–3) + SQLite todos
+# Handover — harness work (Phases 1–4) + SQLite todos
 
 ## Summary
 
-This branch delivers the harness **Phase 1** (discovery / edit), **Phase 2** (todos in shared SQLite, tool search, skill list/metadata), **SQLite `busy_timeout`** on the agent DB, and **Phase 3** (`ask_user` with `ClarificationHub` + inbound routing so the next user message completes the tool without spawning a second agent task). Phases **4–6** in `docs/harness-implementation-plan.md` are **not** implemented. You are pausing here to land **another PR** first; resume harness from Phase 4 when you return.
+This branch delivers the harness **Phase 1** (discovery / edit), **Phase 2** (todos in shared SQLite, tool search, skill list/metadata), **SQLite `busy_timeout`** on the agent DB, **Phase 3** (`ask_user` with `ClarificationHub` + inbound routing), and **Phase 4** (`git_worktree` tool, config-gated under `[harness.git_worktree]`). Phases **5–6** in `docs/harness-implementation-plan.md` are **not** implemented.
 
 ## What Was Done
 
@@ -10,6 +10,7 @@ This branch delivers the harness **Phase 1** (discovery / edit), **Phase 2** (to
 - **Phase 2:** `todo_write` → table `harness_todos` in `agent_memory.db`; legacy `<workspace>/todos/*.json` migrated once; `search_tools` + registration-order catalog; `load_skill_instructions` list/metadata (`src/tools/workflow.rs`, `src/tools.rs`, `src/agent.rs`, `src/skills.rs`, `src/memory.rs`, `src/bin/isanagent.rs`).
 - **Concurrency:** `configure_agent_sqlite_connection` + `AGENT_SQLITE_BUSY_TIMEOUT_MS` on memory + todo connections (`src/memory.rs`, `src/tools/workflow.rs`).
 - **Phase 3:** `ClarificationHub` (`src/clarification.rs`), `ToolExecCtx` task-local (`src/tool_runtime.rs`), `AskUserTool` (`src/tools/workflow.rs`), `AgentLogic` inbound **early** `try_deliver_reply` before cancel/spawn, `ToolCallRuntime` + scoped tool execution (`src/agent.rs`), terminal `[Question]` for `isanagent_clarification` metadata (`src/channels/terminal.rs`), registration in `src/bin/isanagent.rs`.
+- **Phase 4:** `GitWorktreeTool` (`src/tools/builtin.rs`), `[harness.git_worktree]` in `src/config.rs`, conditional registration in `src/bin/isanagent.rs`.
 - **Docs:** `docs/harness-implementation-plan.md`, `AGENTS.md` updated for the above.
 
 ## What We Tried / What Didn’t Work
@@ -39,7 +40,7 @@ This branch delivers the harness **Phase 1** (discovery / edit), **Phase 2** (to
 ## Next Steps
 
 - [ ] Merge or park this branch; open the **other PR** as planned.
-- [ ] When resuming harness: **Phase 4** (git worktrees, config-gated), then Phase 5 / 6 per `docs/harness-implementation-plan.md`.
+- [ ] When resuming harness: **Phase 5** (sub-agents / plans), then Phase 6 per `docs/harness-implementation-plan.md`.
 - [ ] Optional hardening: API/UI explicitly handle `isanagent_clarification` in SSE or REST responses (currently same as other outbounds + metadata).
 - [ ] Optional: remove empty `todos/` dir after legacy migration; metrics when migration count &gt; 0.
 
@@ -48,12 +49,13 @@ This branch delivers the harness **Phase 1** (discovery / edit), **Phase 2** (to
 | Path | Purpose |
 |------|---------|
 | `docs/harness-implementation-plan.md` | Phase checklist and acceptance criteria |
+| `src/config.rs` | `AppConfig`, optional `[harness.git_worktree]` |
 | `AGENTS.md` | Architecture, sandbox, todos DB, `ask_user` behavior |
 | `src/clarification.rs` | `ClarificationHub`, `METADATA_CLARIFICATION` |
 | `src/tool_runtime.rs` | `ToolExecCtx`, task-local scope for tools |
 | `src/agent.rs` | Inbound clarification routing; `ToolCallRuntime`; `execute_tool_call_with_activity` |
 | `src/tools/workflow.rs` | `todo_write`, `search_tools`, `AskUserTool`, todo SQLite helpers |
-| `src/tools/builtin.rs` | Glob/search/edit/message/shell/web/memory tools |
+| `src/tools/builtin.rs` | Glob/search/edit/message/shell/web/memory/`git_worktree` tools |
 | `src/tools.rs` | `ToolRegistry`, catalog, `search_tool_index` |
 | `src/memory.rs` | Memory actor, `harness_todos` schema, SQLite busy_timeout helper |
 | `src/channels/terminal.rs` | `[Question]` styling for clarification outbounds |

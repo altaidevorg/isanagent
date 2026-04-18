@@ -4,6 +4,7 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+use tokio::time::{timeout, Duration};
 use walkdir::WalkDir;
 
 use crate::config::JinaWebBackend;
@@ -1554,6 +1555,384 @@ impl Tool for MessageTool {
     }
 }
 
+/// Wall-clock limit for each `git` subprocess invoked by [`GitWorktreeTool`].
+const GIT_WORKTREE_CMD_TIMEOUT_SECS: u64 = 60;
+const GIT_WORKTREE_OUTPUT_MAX_CHARS: usize = 10_000;
+
+fn resolve_git_worktree_agent_path(
+    path_str: &str,
+    workspace_dir: &Path,
+    restrict_to_workspace: bool,
+    allow_path_outside_sandbox: bool,
+) -> Result<PathBuf, String> {
+    let enforce_sandbox = restrict_to_workspace && !allow_path_outside_sandbox;
+    resolve_path(path_str, workspace_dir, enforce_sandbox)
+}
+
+fn validate_optional_branch_name(branch: &str) -> Result<(), String> {
+    if branch.is_empty() {
+        return Ok(());
+    }
+    if branch.len() > 244 {
+        return Err("branch name is too long (max 244 characters)".to_string());
+    }
+    if !branch
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+    {
+        return Err(
+            "branch name may only contain ASCII letters, digits, '-', '_', '.', or '/'".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn truncate_git_worktree_output(mut s: String) -> String {
+    if s.len() <= GIT_WORKTREE_OUTPUT_MAX_CHARS {
+        return s;
+    }
+    let mut end = GIT_WORKTREE_OUTPUT_MAX_CHARS;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let rest = s.len() - end;
+    s.truncate(end);
+    s.push_str(&format!("\n... (truncated, {} more chars)", rest));
+    s
+}
+
+async fn run_git_output(
+    cwd: &Path,
+    args: &[String],
+    timeout_secs: u64,
+) -> Result<std::process::Output, String> {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.current_dir(cwd);
+    for a in args {
+        cmd.arg(a);
+    }
+    let fut = cmd.output();
+    match timeout(Duration::from_secs(timeout_secs), fut).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => Err(format!("failed to spawn git: {}", e)),
+        Err(_) => Err(format!("git command timed out after {}s", timeout_secs)),
+    }
+}
+
+async fn run_git_checked(cwd: &Path, args: &[String], timeout_secs: u64) -> Result<String, String> {
+    let output = run_git_output(cwd, args, timeout_secs).await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if !stderr.trim().is_empty() {
+            stderr.to_string()
+        } else {
+            stdout.to_string()
+        };
+        return Err(format!(
+            "git {} failed (exit {}): {}",
+            args.join(" "),
+            output.status.code().unwrap_or(-1),
+            detail.trim()
+        ));
+    }
+    let mut s = String::from_utf8_lossy(&output.stdout).to_string();
+    let e = String::from_utf8_lossy(&output.stderr);
+    if !e.trim().is_empty() {
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str(&e);
+    }
+    Ok(s)
+}
+
+async fn git_rev_parse_show_toplevel(cwd: &Path) -> Result<PathBuf, String> {
+    let out = run_git_checked(
+        cwd,
+        &["rev-parse".into(), "--show-toplevel".into()],
+        GIT_WORKTREE_CMD_TIMEOUT_SECS,
+    )
+    .await?;
+    let line = out.lines().next().unwrap_or("").trim();
+    if line.is_empty() {
+        return Err("git rev-parse --show-toplevel returned empty output".to_string());
+    }
+    let p = PathBuf::from(line);
+    fs::canonicalize(&p).map_err(|e| format!("could not canonicalize git root: {}", e))
+}
+
+async fn git_common_dir_abs(wt_path: &Path) -> Result<PathBuf, String> {
+    let out_abs = run_git_output(
+        wt_path,
+        &[
+            "rev-parse".into(),
+            "--path-format=absolute".into(),
+            "--git-common-dir".into(),
+        ],
+        GIT_WORKTREE_CMD_TIMEOUT_SECS,
+    )
+    .await;
+
+    if let Ok(output) = out_abs {
+        if output.status.success() {
+            let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !line.is_empty() {
+                let p = PathBuf::from(line);
+                if let Ok(c) = fs::canonicalize(&p) {
+                    return Ok(c);
+                }
+            }
+        }
+    }
+
+    let out = run_git_checked(
+        wt_path,
+        &["rev-parse".into(), "--git-common-dir".into()],
+        GIT_WORKTREE_CMD_TIMEOUT_SECS,
+    )
+    .await?;
+    let line = out.trim();
+    if line.is_empty() {
+        return Err("git rev-parse --git-common-dir returned empty output".to_string());
+    }
+    let p = if Path::new(line).is_absolute() {
+        PathBuf::from(line)
+    } else {
+        wt_path.join(line)
+    };
+    fs::canonicalize(p).map_err(|e| format!("could not canonicalize git common dir: {}", e))
+}
+
+fn main_repo_dir_from_common_git_dir(common_dir: &Path) -> PathBuf {
+    if common_dir.file_name().and_then(|n| n.to_str()) == Some(".git") && common_dir.is_dir() {
+        common_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| common_dir.to_path_buf())
+    } else {
+        common_dir.to_path_buf()
+    }
+}
+
+/// Path string passed to `git worktree`. Uses a path relative to `git_root` when possible so
+/// Git for Windows is not given `\\?\`-prefixed absolutes (those often fail with "Invalid argument").
+fn git_worktree_path_argument(git_root: &Path, wt: &Path) -> String {
+    let forward = |p: &Path| p.to_string_lossy().replace('\\', "/");
+    if let Ok(r) = wt.strip_prefix(git_root) {
+        return forward(r);
+    }
+    if let Some(parent) = git_root.parent() {
+        if let Ok(tail) = wt.strip_prefix(parent) {
+            return format!("../{}", forward(tail));
+        }
+    }
+    forward(&strip_windows_extended_path_prefix(wt))
+}
+
+fn strip_windows_extended_path_prefix(path: &Path) -> PathBuf {
+    #[cfg(not(windows))]
+    {
+        return path.to_path_buf();
+    }
+    #[cfg(windows)]
+    {
+        let s = path.to_string_lossy();
+        if let Some(rest) = s.strip_prefix("\\\\?\\") {
+            if let Some(unc) = rest.strip_prefix("UNC\\") {
+                return PathBuf::from(format!("\\\\{}", unc.replace('/', "\\")));
+            }
+            return PathBuf::from(rest.to_string());
+        }
+        path.to_path_buf()
+    }
+}
+
+/// Config-gated `git worktree` helpers (`add`, `remove`, `list`). Paths respect `resolve_path` and
+/// optional sandbox relaxation via config (`allow_path_outside_sandbox`).
+pub struct GitWorktreeTool {
+    pub workspace_dir: PathBuf,
+    pub restrict_to_workspace: bool,
+    pub allow_path_outside_sandbox: bool,
+}
+
+impl GitWorktreeTool {
+    async fn action_list(&self, base_path: &str) -> Result<String, String> {
+        let base = resolve_git_worktree_agent_path(
+            base_path,
+            &self.workspace_dir,
+            self.restrict_to_workspace,
+            self.allow_path_outside_sandbox,
+        )?;
+        if !base.is_dir() {
+            return Err(format!(
+                "base_path is not a directory: {:?}",
+                base.display()
+            ));
+        }
+        let out = run_git_checked(
+            &base,
+            &["worktree".into(), "list".into()],
+            GIT_WORKTREE_CMD_TIMEOUT_SECS,
+        )
+        .await?;
+        Ok(truncate_git_worktree_output(out))
+    }
+
+    async fn action_add(
+        &self,
+        base_path: &str,
+        worktree_path: &str,
+        branch: Option<&str>,
+    ) -> Result<String, String> {
+        let base = resolve_git_worktree_agent_path(
+            base_path,
+            &self.workspace_dir,
+            self.restrict_to_workspace,
+            self.allow_path_outside_sandbox,
+        )?;
+        if !base.is_dir() {
+            return Err(format!(
+                "base_path is not a directory: {:?}",
+                base.display()
+            ));
+        }
+        let git_root = git_rev_parse_show_toplevel(&base).await?;
+        let wt = resolve_git_worktree_agent_path(
+            worktree_path,
+            &self.workspace_dir,
+            self.restrict_to_workspace,
+            self.allow_path_outside_sandbox,
+        )?;
+        if wt == git_root {
+            return Err("worktree path must not be the same as the repository root".to_string());
+        }
+        if let Some(parent) = wt.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create parent directories: {}", e))?;
+        }
+        let branch_name = if let Some(b) = branch.filter(|s| !s.is_empty()) {
+            validate_optional_branch_name(b)?;
+            b.to_string()
+        } else {
+            format!("isanagent-wt-{}", uuid::Uuid::new_v4().simple())
+        };
+        let wt_arg = git_worktree_path_argument(&git_root, &wt);
+        let args = vec![
+            "worktree".into(),
+            "add".into(),
+            "-b".into(),
+            branch_name.clone(),
+            wt_arg,
+        ];
+        run_git_checked(&git_root, &args, GIT_WORKTREE_CMD_TIMEOUT_SECS).await?;
+        let wt_canon = fs::canonicalize(&wt).unwrap_or(wt);
+        Ok(format!(
+            "Created git worktree.\n  Path: {}\n  Branch: {}\n  Git root: {}",
+            wt_canon.display(),
+            branch_name,
+            git_root.display()
+        ))
+    }
+
+    async fn action_remove(&self, worktree_path: &str, force: bool) -> Result<String, String> {
+        let wt = resolve_git_worktree_agent_path(
+            worktree_path,
+            &self.workspace_dir,
+            self.restrict_to_workspace,
+            self.allow_path_outside_sandbox,
+        )?;
+        if !wt.exists() {
+            return Err(format!("worktree path does not exist: {:?}", wt.display()));
+        }
+        let wt_canon = fs::canonicalize(&wt).map_err(|e| e.to_string())?;
+        let common = git_common_dir_abs(&wt_canon).await?;
+        let main_repo = main_repo_dir_from_common_git_dir(&common);
+        let mut args = vec!["worktree".into(), "remove".into()];
+        if force {
+            args.push("--force".into());
+        }
+        args.push(git_worktree_path_argument(&main_repo, &wt_canon));
+        run_git_checked(&main_repo, &args, GIT_WORKTREE_CMD_TIMEOUT_SECS).await?;
+        Ok(format!("Removed git worktree at {}", wt_canon.display()))
+    }
+}
+
+#[async_trait]
+impl Tool for GitWorktreeTool {
+    fn name(&self) -> &str {
+        "git_worktree"
+    }
+
+    fn description(&self) -> &str {
+        "Manage git worktrees: list linked worktrees, add a new worktree on a fresh branch, or remove one. Requires git on PATH. Only available when enabled in config ([harness.git_worktree]). Worktree paths follow the same sandbox rules as other filesystem tools unless allow_path_outside_sandbox is set there."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "One of: list, add, remove",
+                    "enum": ["list", "add", "remove"]
+                },
+                "base_path": {
+                    "type": "string",
+                    "description": "Directory inside the repo for git commands (list, add). Defaults to \".\"."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "For add: filesystem path for the new worktree. For remove: path of the worktree to remove."
+                },
+                "branch": {
+                    "type": "string",
+                    "description": "For add only: new branch name. If omitted, a unique name is generated (isanagent-wt-<hex>)."
+                },
+                "force": {
+                    "type": "boolean",
+                    "description": "For remove only: pass --force to git worktree remove."
+                }
+            },
+            "required": ["action"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, String> {
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing or invalid 'action'")?;
+        let base_path = args
+            .get("base_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or(".");
+        match action {
+            "list" => self.action_list(base_path).await,
+            "add" => {
+                let path = args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or("add requires 'path'")?;
+                let branch = args.get("branch").and_then(|v| v.as_str());
+                self.action_add(base_path, path, branch).await
+            }
+            "remove" => {
+                let path = args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or("remove requires 'path'")?;
+                let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+                self.action_remove(path, force).await
+            }
+            _ => Err(format!(
+                "Unknown action {:?}; expected list, add, or remove",
+                action
+            )),
+        }
+    }
+}
+
 pub struct SearchMemoryTool {
     pub memory_node: NodeHandle<crate::memory::MemoryMessage>,
 }
@@ -1719,5 +2098,109 @@ mod glob_files_tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod git_worktree_path_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn outside_absolute_rejected_when_restrict_without_allow() {
+        let sandbox =
+            std::env::temp_dir().join(format!("isanagent_gwt_s_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&sandbox).unwrap();
+        let outside =
+            std::env::temp_dir().join(format!("isanagent_gwt_o_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&outside).unwrap();
+        let abs = outside.join("wt").to_string_lossy().to_string();
+        let res = resolve_git_worktree_agent_path(&abs, &sandbox, true, false);
+        assert!(res.is_err(), "expected err, got {:?}", res);
+        let _ = fs::remove_dir_all(&sandbox);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn outside_absolute_ok_when_allow_outside() {
+        let sandbox =
+            std::env::temp_dir().join(format!("isanagent_gwt_s2_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&sandbox).unwrap();
+        let outside =
+            std::env::temp_dir().join(format!("isanagent_gwt_o2_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&outside).unwrap();
+        let abs = outside.join("wt").to_string_lossy().to_string();
+        let res = resolve_git_worktree_agent_path(&abs, &sandbox, true, true);
+        assert!(res.is_ok(), "{:?}", res);
+        let _ = fs::remove_dir_all(&sandbox);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[tokio::test]
+    async fn git_worktree_roundtrip_under_sandbox() {
+        if which::which("git").is_err() {
+            return;
+        }
+        let sandbox =
+            std::env::temp_dir().join(format!("isanagent_gwt_git_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(sandbox.join("repo")).unwrap();
+        let repo = sandbox.join("repo");
+        assert!(std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+        assert!(
+            std::process::Command::new("git")
+                .args(["commit", "--allow-empty", "-m", "init"])
+                .current_dir(&repo)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .status()
+                .unwrap()
+                .success(),
+            "git commit failed"
+        );
+
+        let tool = GitWorktreeTool {
+            workspace_dir: sandbox.clone(),
+            restrict_to_workspace: true,
+            allow_path_outside_sandbox: false,
+        };
+        let list1 = tool
+            .execute(json!({ "action": "list", "base_path": "repo" }))
+            .await
+            .expect("list");
+        assert!(!list1.trim().is_empty(), "list: {}", list1);
+
+        tool.execute(json!({
+            "action": "add",
+            "base_path": "repo",
+            "path": "wt-side",
+            "branch": "wt-branch-test"
+        }))
+        .await
+        .expect("add");
+
+        let wt_path = sandbox.join("wt-side");
+        assert!(wt_path.is_dir(), "worktree dir missing");
+
+        let list2 = tool
+            .execute(json!({ "action": "list", "base_path": "repo" }))
+            .await
+            .expect("list2");
+        assert!(
+            list2.contains("wt-side") || list2.contains("wt-branch"),
+            "list2: {}",
+            list2
+        );
+
+        tool.execute(json!({ "action": "remove", "path": "wt-side" }))
+            .await
+            .expect("remove");
+        let _ = fs::remove_dir_all(&sandbox);
     }
 }

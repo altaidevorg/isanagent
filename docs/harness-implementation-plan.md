@@ -53,9 +53,21 @@ This document tracks expanding the built-in tool surface toward a strong **code-
 - `timeout_secs` is clamped between 10 and 86400 (default 1800); cooperative cancellation clears the pending wait.
 - Optional `choices` (≤8) are shown with the prompt; a reply that does not exactly match a listed choice (after trim) is still returned to the model with a note.
 
-### Phase 4 — Git worktrees
+### Phase 4 — Git worktrees (implemented)
 
-- Optional `git worktree` helpers with explicit policy for paths outside the sandbox (config-gated).
+| Piece | Implementation |
+|--------|----------------|
+| `git_worktree` tool | `action`: `list`, `add` (new branch via `git worktree add -b`), `remove` (resolves primary repo via `git-common-dir`). 60s subprocess timeout; output capped like `exec`. Paths passed to `git` are made relative to the repo when possible so Windows canonical `\\?\` paths do not break Git for Windows. |
+| Config gate | `[harness.git_worktree]` in `config.toml`: `enabled = true` registers the tool (default off). |
+| Paths outside sandbox | `allow_path_outside_sandbox = true` disables the usual `restrict_to_workspace` check **only for worktree path arguments** (and `base_path`), after canonical resolution. |
+
+**Tests:** `tools::builtin::git_worktree_path_tests` (path policy + optional git roundtrip when `git` is on `PATH`).
+
+### Phase 4 acceptance
+
+- With `enabled = false`, `git_worktree` is not registered.
+- With `enabled = true`, `list` / `add` / `remove` invoke `git` from a resolved `base_path` or worktree path; invalid `action` or missing `path` for add/remove returns a clear error.
+- Unless `allow_path_outside_sandbox` is set, worktree paths must stay inside the agent sandbox when `restrict_to_workspace` is true.
 
 ### Phase 5 — Sub-agents and plans
 

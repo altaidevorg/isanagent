@@ -28,8 +28,8 @@ use isanagent::scheduler::{
 use isanagent::session::SessionManager;
 use isanagent::skills::SkillRegistry;
 use isanagent::tools::builtin::{
-    CronTool, EditFileTool, GlobFilesTool, ListDirTool, MessageTool, ReadFileTool, SearchTextTool,
-    ShellExecTool, WebFetchTool, WebSearchTool, WriteFileTool,
+    CronTool, EditFileTool, GitWorktreeTool, GlobFilesTool, ListDirTool, MessageTool, ReadFileTool,
+    SearchTextTool, ShellExecTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use isanagent::tools::workflow::{AskUserTool, TodoWriteTool, ToolSearchTool};
 use isanagent::tools::ToolRegistry;
@@ -253,6 +253,13 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         workspace_dir: workspace.sandbox_dir.clone(),
         restrict_to_workspace: restrict,
     }));
+    if workspace.config.git_worktree_tool_enabled() {
+        tools.register(Box::new(GitWorktreeTool {
+            workspace_dir: workspace.sandbox_dir.clone(),
+            restrict_to_workspace: restrict,
+            allow_path_outside_sandbox: workspace.config.git_worktree_allow_path_outside_sandbox(),
+        }));
+    }
     let jina = workspace.config.jina_web_backend();
     let max_web_output_chars = workspace.config.effective_max_web_tool_output_chars();
     tools.register(Box::new(WebSearchTool {
