@@ -1,5 +1,6 @@
 use crate::bus::{BusMessage, InboundMessage, LogEvent, OutboundMessage};
 use crate::channels::Channel;
+use crate::clarification::METADATA_CLARIFICATION;
 use crate::logging::LoggerHandle;
 use crate::utils::{resolve_path, ContentPart, ImageUrl};
 use async_trait::async_trait;
@@ -356,6 +357,11 @@ impl Channel for TerminalChannel {
             .get(ISANAGENT_TOOL_NOTIFY)
             .and_then(|v| v.as_bool())
             == Some(true);
+        let clarification = msg
+            .metadata
+            .get(METADATA_CLARIFICATION)
+            .and_then(|v| v.as_bool())
+            == Some(true);
         let phase = msg
             .metadata
             .get(ISANAGENT_TOOL_PHASE)
@@ -368,6 +374,8 @@ impl Channel for TerminalChannel {
                 "result" => println!("{} {}", "[Tool done]".yellow().bold(), msg.content.green()),
                 _ => println!("{} {}", "[Tool]".yellow().bold(), msg.content),
             }
+        } else if clarification {
+            println!("{} {}", "[Question]".magenta().bold(), msg.content.white());
         } else {
             println!("{} {}", "[Agent]:".cyan().bold(), msg.content.green());
         }

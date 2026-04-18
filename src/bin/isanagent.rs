@@ -13,6 +13,7 @@ use isanagent::channels::terminal::{
 use isanagent::channels::{
     api::ApiChannel, email::EmailChannel, slack::SlackChannel, terminal::TerminalChannel, Channel,
 };
+use isanagent::clarification::ClarificationHub;
 use isanagent::logging::{
     create_logger_channel, create_logging_actor_or_fallback, init_runtime_logger,
     LOGGER_QUEUE_CAPACITY,
@@ -29,7 +30,7 @@ use isanagent::tools::builtin::{
     CronTool, EditFileTool, GlobFilesTool, ListDirTool, MessageTool, ReadFileTool, SearchTextTool,
     ShellExecTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
-use isanagent::tools::workflow::{TodoStore, TodoWriteTool, ToolSearchTool};
+use isanagent::tools::workflow::{AskUserTool, TodoStore, TodoWriteTool, ToolSearchTool};
 use isanagent::tools::ToolRegistry;
 use isanagent::workspace::{resolve_workspace_root, IsanagentWorkspace};
 use isanagent::{NodeHandle, Supervisor, SupervisorPolicy};
@@ -162,6 +163,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
 
     // 4. Setup Tools
     let (global_outbound_tx, mut global_outbound_rx) = mpsc::channel(100);
+    let clarification_hub = ClarificationHub::shared();
 
     // 2. Setup Skills
     let skills = SkillRegistry::new(workspace.skills_path());
@@ -263,6 +265,10 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     tools.register(Box::new(MessageTool {
         outbound_tx: global_outbound_tx.clone(),
     }));
+    tools.register(Box::new(AskUserTool {
+        clarification_hub: clarification_hub.clone(),
+        outbound_tx: global_outbound_tx.clone(),
+    }));
     tools.register(Box::new(isanagent::tools::builtin::SearchMemoryTool {
         memory_node: memory_node.clone(),
     }));
@@ -270,11 +276,8 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         memory_node: memory_node.clone(),
     }));
 
-    let todo_store = TodoStore::try_new(
-        workspace.db_path(),
-        Some(workspace.dir.join("todos")),
-    )
-    .map_err(std::io::Error::other)?;
+    let todo_store = TodoStore::try_new(workspace.db_path(), Some(workspace.dir.join("todos")))
+        .map_err(std::io::Error::other)?;
     tools.register(Box::new(TodoWriteTool { store: todo_store }));
     let tool_catalog = tools.catalog_handle();
     tools.register(Box::new(ToolSearchTool {
@@ -376,6 +379,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         short_term_threshold_tokens,
         outbound_tx: global_outbound_tx.clone(),
         logger_tx: logger_bus_tx.clone(),
+        clarification_hub,
     });
     let agent_logic = if let Some(tool_execution_activity) = tool_execution_activity {
         agent_logic.with_tool_execution_activity(tool_execution_activity)

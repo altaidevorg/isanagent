@@ -1,4 +1,4 @@
-//! Session-scoped workflow tools (todos, tool discovery).
+//! Session-scoped workflow tools (todos, tool discovery, user clarification).
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -6,11 +6,16 @@ use log::info;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use tokio::sync::mpsc;
 
+use crate::bus::{BusMessage, OutboundMessage};
+use crate::clarification::{ClarificationHub, METADATA_CLARIFICATION};
 use crate::memory::{configure_agent_sqlite_connection, ensure_harness_todos_schema};
+use crate::tool_runtime::current_tool_exec_ctx;
 use crate::traits::Tool;
 
 use super::search_tool_index;
@@ -30,8 +35,8 @@ struct TodoFile {
 }
 
 fn todo_replace_sqlite(db_path: &Path, chat_id: &str, items: &[TodoRow]) -> Result<(), String> {
-    let conn = Connection::open(db_path)
-        .map_err(|e| format!("open SQLite {:?}: {}", db_path, e))?;
+    let conn =
+        Connection::open(db_path).map_err(|e| format!("open SQLite {:?}: {}", db_path, e))?;
     configure_agent_sqlite_connection(&conn).map_err(|e| format!("SQLite busy_timeout: {}", e))?;
     ensure_harness_todos_schema(&conn).map_err(|e| format!("harness_todos schema: {}", e))?;
     let json = serde_json::to_string(items).map_err(|e| format!("serialize todo items: {}", e))?;
@@ -48,8 +53,8 @@ fn todo_replace_sqlite(db_path: &Path, chat_id: &str, items: &[TodoRow]) -> Resu
 }
 
 fn todo_load_sqlite(db_path: &Path, chat_id: &str) -> Result<Option<Vec<TodoRow>>, String> {
-    let conn = Connection::open(db_path)
-        .map_err(|e| format!("open SQLite {:?}: {}", db_path, e))?;
+    let conn =
+        Connection::open(db_path).map_err(|e| format!("open SQLite {:?}: {}", db_path, e))?;
     configure_agent_sqlite_connection(&conn).map_err(|e| format!("SQLite busy_timeout: {}", e))?;
     ensure_harness_todos_schema(&conn).map_err(|e| format!("harness_todos schema: {}", e))?;
     let out: Option<String> = conn
@@ -119,9 +124,10 @@ impl TodoStore {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("create DB parent {:?}: {}", parent, e))?;
         }
-        let conn = Connection::open(&db_path)
-            .map_err(|e| format!("open SQLite {:?}: {}", db_path, e))?;
-        configure_agent_sqlite_connection(&conn).map_err(|e| format!("SQLite busy_timeout: {}", e))?;
+        let conn =
+            Connection::open(&db_path).map_err(|e| format!("open SQLite {:?}: {}", db_path, e))?;
+        configure_agent_sqlite_connection(&conn)
+            .map_err(|e| format!("SQLite busy_timeout: {}", e))?;
         ensure_harness_todos_schema(&conn).map_err(|e| format!("harness_todos schema: {}", e))?;
         if let Some(ref dir) = legacy_json_dir {
             let n = migrate_legacy_json_todos(&conn, dir)?;
@@ -357,11 +363,253 @@ impl Tool for ToolSearchTool {
     }
 }
 
+struct ClarificationSlotGuard {
+    hub: Arc<ClarificationHub>,
+    session_key: String,
+    armed: bool,
+}
+
+impl ClarificationSlotGuard {
+    fn new(hub: Arc<ClarificationHub>, session_key: String) -> Self {
+        Self {
+            hub,
+            session_key,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ClarificationSlotGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.hub.cancel_wait(&self.session_key);
+        }
+    }
+}
+
+/// Block until the user sends the next message in this session, then return it as the tool result.
+///
+/// Requires the agent to wrap tool execution with a [`crate::tool_runtime::ToolExecCtx`]. The
+/// channel delivers an [`OutboundMessage`] tagged with [`METADATA_CLARIFICATION`] so terminals and
+/// API clients can style the prompt; the following inbound on the same session completes the wait.
+pub struct AskUserTool {
+    pub clarification_hub: Arc<ClarificationHub>,
+    pub outbound_tx: mpsc::Sender<BusMessage>,
+}
+
+const ASK_USER_TIMEOUT_SECS_MIN: u64 = 10;
+const ASK_USER_TIMEOUT_SECS_MAX: u64 = 86_400;
+const ASK_USER_TIMEOUT_SECS_DEFAULT: u64 = 1_800;
+const ASK_USER_MAX_CHOICES: usize = 8;
+
+#[async_trait]
+impl Tool for AskUserTool {
+    fn name(&self) -> &str {
+        "ask_user"
+    }
+
+    fn description(&self) -> &str {
+        "Ask the human a focused question and wait for their next reply in this chat. Use when you need a decision, missing detail, or confirmation before continuing. The user’s following message becomes this tool’s return value (not a new agent turn). Works in terminal and API channels when inbound messages reach the same session."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "Clear question for the user (plain text)."
+                },
+                "choices": {
+                    "type": "array",
+                    "description": "Optional short list of allowed answers (max 8); shown with the prompt.",
+                    "items": { "type": "string" },
+                    "maxItems": 8
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "description": "Max seconds to wait (10–86400, default 1800)."
+                },
+                "allow_empty": {
+                    "type": "boolean",
+                    "description": "If false (default), treat whitespace-only replies as invalid and keep waiting until timeout."
+                }
+            },
+            "required": ["prompt"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, String> {
+        let ctx = current_tool_exec_ctx().ok_or_else(|| {
+            "ask_user is only available during a live agent turn (missing tool runtime context)."
+                .to_string()
+        })?;
+
+        let prompt = args
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'prompt'".to_string())?
+            .trim();
+        if prompt.is_empty() {
+            return Err("prompt must be non-empty".to_string());
+        }
+
+        let allow_empty = args
+            .get("allow_empty")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let timeout_secs = args
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(ASK_USER_TIMEOUT_SECS_DEFAULT)
+            .clamp(ASK_USER_TIMEOUT_SECS_MIN, ASK_USER_TIMEOUT_SECS_MAX);
+
+        let mut choices: Vec<String> = Vec::new();
+        if let Some(arr) = args.get("choices").and_then(|v| v.as_array()) {
+            if arr.len() > ASK_USER_MAX_CHOICES {
+                return Err(format!(
+                    "At most {} choices allowed (got {}).",
+                    ASK_USER_MAX_CHOICES,
+                    arr.len()
+                ));
+            }
+            for (i, v) in arr.iter().enumerate() {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| format!("choices[{}]: expected string", i))?
+                    .trim();
+                if s.is_empty() {
+                    return Err(format!("choices[{}]: must be non-empty", i));
+                }
+                choices.push(s.to_string());
+            }
+        }
+
+        let rx = self
+            .clarification_hub
+            .begin_wait(&ctx.session_key)
+            .map_err(|e| e.to_string())?;
+
+        let mut guard = ClarificationSlotGuard::new(
+            Arc::clone(&self.clarification_hub),
+            ctx.session_key.clone(),
+        );
+
+        let mut body = String::from("The agent needs your input:\n\n");
+        body.push_str(prompt);
+        if !choices.is_empty() {
+            body.push_str("\n\nOptions:\n");
+            for c in &choices {
+                body.push_str(&format!("- {}\n", c));
+            }
+        }
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            METADATA_CLARIFICATION.to_string(),
+            serde_json::Value::Bool(true),
+        );
+
+        let outbound = OutboundMessage {
+            channel: ctx.channel.clone(),
+            chat_id: ctx.chat_id.clone(),
+            thread_id: ctx.thread_id.clone(),
+            content: body,
+            metadata,
+        };
+
+        self.outbound_tx
+            .send(BusMessage::Outbound(outbound))
+            .await
+            .map_err(|e| format!("failed to send clarification prompt: {}", e))?;
+
+        let wait = tokio::time::Duration::from_secs(timeout_secs);
+        let reply = match tokio::time::timeout(wait, rx).await {
+            Err(_) => {
+                return Err(format!(
+                    "Timed out after {}s waiting for a user reply to ask_user.",
+                    timeout_secs
+                ));
+            }
+            Ok(Err(_)) => {
+                return Err(
+                    "Clarification wait ended without a reply (session cancelled or reset)."
+                        .to_string(),
+                );
+            }
+            Ok(Ok(text)) => text,
+        };
+
+        guard.disarm();
+
+        let trimmed = reply.trim();
+        if !allow_empty && trimmed.is_empty() {
+            return Err(
+                "User reply was empty (allow_empty is false). Call ask_user again if you still need input."
+                    .to_string(),
+            );
+        }
+
+        if !choices.is_empty() && !choices.iter().any(|c| c.as_str() == trimmed) {
+            return Ok(format!(
+                "User reply (not among listed choices): {}\n\nListed options were: {:?}",
+                reply, choices
+            ));
+        }
+
+        Ok(format!("User reply:\n{}", reply))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bus::BusMessage;
+    use crate::tool_runtime::{with_tool_exec_scope, ToolExecCtx};
     use serde_json::json;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn ask_user_outbound_and_reply() {
+        let hub = Arc::new(ClarificationHub::new());
+        let (ob_tx, mut ob_rx) = mpsc::channel(8);
+        let tool = AskUserTool {
+            clarification_hub: hub.clone(),
+            outbound_tx: ob_tx,
+        };
+        let hub_signal = hub.clone();
+        let join = tokio::spawn(async move {
+            with_tool_exec_scope(ToolExecCtx::new("terminal", "u1", None), async move {
+                tool.execute(json!({
+                    "prompt": "Which?",
+                    "timeout_secs": 30,
+                    "allow_empty": true
+                }))
+                .await
+            })
+            .await
+        });
+
+        let ob = ob_rx.recv().await.expect("outbound");
+        match ob {
+            BusMessage::Outbound(out) => {
+                assert_eq!(
+                    out.metadata.get(METADATA_CLARIFICATION),
+                    Some(&serde_json::Value::Bool(true))
+                );
+                assert!(out.content.contains("Which?"));
+            }
+            _ => panic!("expected Outbound"),
+        }
+        assert!(hub_signal.try_deliver_reply("terminal:u1:", "blue".into()));
+        let answer = join.await.expect("join").expect("tool ok");
+        assert!(answer.contains("blue"));
+    }
 
     fn temp_todo_db(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -433,10 +681,8 @@ mod tests {
     #[tokio::test]
     async fn legacy_json_migrates_into_sqlite() {
         let db = temp_todo_db("migrate");
-        let legacy = std::env::temp_dir().join(format!(
-            "isanagent_legacy_todos_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let legacy =
+            std::env::temp_dir().join(format!("isanagent_legacy_todos_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&legacy).unwrap();
         let legacy_file = legacy.join("abc.json");
         let payload = TodoFile {
@@ -453,7 +699,10 @@ mod tests {
         .unwrap();
 
         let store = TodoStore::try_new(db.clone(), Some(legacy.clone())).unwrap();
-        assert!(!legacy_file.exists(), "legacy file should be removed after migrate");
+        assert!(
+            !legacy_file.exists(),
+            "legacy file should be removed after migrate"
+        );
 
         let rows = store.load("migrated-chat").unwrap().expect("rows");
         assert_eq!(rows.len(), 1);

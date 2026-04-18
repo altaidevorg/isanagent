@@ -34,9 +34,24 @@ This document tracks expanding the built-in tool surface toward a strong **code-
 - `search_tools` returns scored hits from the live catalog; `limit` clamped 1–40.
 - `load_skill_instructions` with `action: "list"` returns a directory; with `detail: "metadata"` returns stats without the instruction body; default load still returns full instructions for available skills.
 
-### Phase 3 — User clarification
+### Phase 3 — User clarification (implemented)
 
-- Structured “question the user” path that maps to real channel behavior (terminal vs API), including how replies re-enter the agent loop.
+| Piece | Implementation |
+|--------|----------------|
+| `ask_user` tool | Registers a one-shot wait on `ClarificationHub` keyed by session (`channel:chat_id:thread`), sends an `OutboundMessage` with metadata `isanagent_clarification`, then awaits the user’s **next** inbound on that session. |
+| Re-entry | `AgentLogic` handles `InboundMessage` **before** cancelling an in-flight turn: if `try_deliver_reply` succeeds, the text is forwarded to the blocked tool and the existing reasoning loop continues (no new spawn). |
+| Tool context | `tool_runtime` installs a `TaskLocal` `ToolExecCtx` around each tool invocation. |
+| Terminal | `TerminalChannel::send` prints clarification lines as `[Question]` when metadata is set. |
+| API | Same outbound payload and metadata; clients show the prompt and POST the next user message on the same `chat_id` / `thread_id` as usual. |
+| Cancellation | Cooperative cancel clears the hub slot; `ask_user` returns an error if the wait is dropped. |
+
+**Tests:** `clarification::tests`, `tools::workflow::tests::ask_user_outbound_and_reply`.
+
+### Phase 3 acceptance
+
+- `ask_user` emits a user-visible outbound prompt on the active channel with `isanagent_clarification` metadata; the following user message on the same session becomes the tool return value and does not start a second agent task.
+- `timeout_secs` is clamped between 10 and 86400 (default 1800); cooperative cancellation clears the pending wait.
+- Optional `choices` (≤8) are shown with the prompt; a reply that does not exactly match a listed choice (after trim) is still returned to the model with a note.
 
 ### Phase 4 — Git worktrees
 

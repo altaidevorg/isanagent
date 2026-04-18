@@ -84,7 +84,9 @@ pub const AGENT_SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
 
 /// PRAGMAs for file-backed agent DB handles (`SqliteMemoryActor`, [`crate::tools::workflow::TodoStore`]).
 pub fn configure_agent_sqlite_connection(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.busy_timeout(std::time::Duration::from_millis(AGENT_SQLITE_BUSY_TIMEOUT_MS))
+    conn.busy_timeout(std::time::Duration::from_millis(
+        AGENT_SQLITE_BUSY_TIMEOUT_MS,
+    ))
 }
 
 /// Schema for [`crate::tools::workflow::TodoStore`] (same DB as agent memory).

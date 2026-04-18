@@ -5,6 +5,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
 
+use crate::clarification::ClarificationHub;
+use crate::tool_runtime::ToolExecCtx;
+
 use crate::bus::{BusMessage, LogEvent, OutboundMessage, TelemetryEvent};
 use crate::logging::LoggerHandle;
 use crate::session::SessionManager;
@@ -21,35 +24,59 @@ enum ToolExecutionFinished {
     Cancelled,
 }
 
+/// Session-scoped wiring for tools that need the active chat (e.g. `ask_user`).
+#[derive(Clone)]
+struct ToolCallRuntime {
+    session: ToolExecCtx,
+    hub: Arc<ClarificationHub>,
+}
+
 /// Runs a tool with optional per-call activity heartbeats and optional cooperative cancellation.
 async fn execute_tool_call_with_activity(
     tools: &Arc<ToolRegistry>,
-    tool_execution_activity: Option<&SharedToolExecutionActivity>,
+    tool_execution_activity: Option<SharedToolExecutionActivity>,
     chat_id: &str,
     tool_name: &str,
     args: Value,
     cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    runtime: ToolCallRuntime,
 ) -> ToolExecutionFinished {
-    let activity_handle = tool_execution_activity.map(|a| a.start(chat_id, tool_name));
+    let session_key = runtime.session.session_key.clone();
+    let hub = Arc::clone(&runtime.hub);
+    let tool_exec_ctx = runtime.session;
+    let chat_id = chat_id.to_string();
+    let tool_name = tool_name.to_string();
+    let tools = Arc::clone(tools);
+    let cancel_owned = cancel_token.cloned();
 
-    let completed = match cancel_token {
-        None => Some(tools.execute_tool(tool_name, args).await),
-        Some(token) => {
-            tokio::select! {
-                res = tools.execute_tool(tool_name, args) => Some(res),
-                _ = token.cancelled() => None,
+    crate::tool_runtime::with_tool_exec_scope(tool_exec_ctx, async move {
+        let activity_handle = tool_execution_activity
+            .as_ref()
+            .map(|a| a.start(chat_id.as_str(), tool_name.as_str()));
+
+        let completed = match cancel_owned.as_ref() {
+            None => Some(tools.execute_tool(&tool_name, args).await),
+            Some(token) => {
+                tokio::select! {
+                    res = tools.execute_tool(&tool_name, args) => Some(res),
+                    _ = token.cancelled() => None,
+                }
+            }
+        };
+
+        if let Some(handle) = activity_handle {
+            handle.stop().await;
+        }
+
+        match completed {
+            Some(res) => ToolExecutionFinished::Completed(res),
+            None => {
+                hub.cancel_wait(&session_key);
+                ToolExecutionFinished::Cancelled
             }
         }
-    };
-
-    if let Some(handle) = activity_handle {
-        handle.stop().await;
-    }
-
-    match completed {
-        Some(res) => ToolExecutionFinished::Completed(res),
-        None => ToolExecutionFinished::Cancelled,
-    }
+    })
+    .await
 }
 
 /// Bundles everything needed to run one inbound reasoning task (spawned from `AgentLogic::process`).
@@ -70,6 +97,8 @@ struct ReasoningLoopCtx {
     logger_tx: LoggerHandle,
     inbound: crate::bus::InboundMessage,
     cancel_token: tokio_util::sync::CancellationToken,
+    clarification_hub: Arc<ClarificationHub>,
+    tool_exec_ctx: ToolExecCtx,
 }
 
 /// Constructor arguments for [`AgentLogic`], grouped to keep call sites readable.
@@ -87,6 +116,7 @@ pub struct AgentLogicParams {
     pub short_term_threshold_tokens: usize,
     pub outbound_tx: mpsc::Sender<BusMessage>,
     pub logger_tx: LoggerHandle,
+    pub clarification_hub: Arc<ClarificationHub>,
 }
 
 /// The central logic for an autonomous Agent running inside an ActorNode.
@@ -107,6 +137,7 @@ pub struct AgentLogic {
     outbound_tx: mpsc::Sender<BusMessage>,
     logger_tx: LoggerHandle,
     cancellation_tokens: Arc<dashmap::DashMap<String, Arc<tokio_util::sync::CancellationToken>>>,
+    clarification_hub: Arc<ClarificationHub>,
 }
 
 impl AgentLogic {
@@ -125,6 +156,7 @@ impl AgentLogic {
             short_term_threshold_tokens,
             outbound_tx,
             logger_tx,
+            clarification_hub,
         } = params;
 
         let mut agent = Self {
@@ -143,6 +175,7 @@ impl AgentLogic {
             outbound_tx,
             logger_tx,
             cancellation_tokens: Arc::new(dashmap::DashMap::new()),
+            clarification_hub,
         };
 
         // Inject the skill loader tool automatically
@@ -174,11 +207,15 @@ impl AgentLogic {
     ) -> Result<String, String> {
         match execute_tool_call_with_activity(
             &self.tools,
-            self.tool_execution_activity.as_ref(),
+            self.tool_execution_activity.clone(),
             chat_id,
             tool_name,
             args,
             None,
+            ToolCallRuntime {
+                session: ToolExecCtx::new("test", chat_id, None),
+                hub: self.clarification_hub.clone(),
+            },
         )
         .await
         {
@@ -218,6 +255,23 @@ impl ActorLogic<BusMessage> for AgentLogic {
             }
             BusMessage::Inbound(inbound) => {
                 let chat_id = inbound.chat_id.clone();
+                let thread_part = inbound.thread_id.as_deref().unwrap_or("");
+                let session_key =
+                    format!("{}:{}:{}", inbound.channel, inbound.chat_id, thread_part);
+                if self
+                    .clarification_hub
+                    .try_deliver_reply(&session_key, inbound.content.clone())
+                {
+                    let _ = self.logger_tx.send(BusMessage::Log(
+                        LogEvent::debug(
+                            &self.name,
+                            "Inbound delivered as ask_user clarification reply (same session).",
+                        )
+                        .with_chat_id(&chat_id),
+                    ));
+                    return Ok(None);
+                }
+
                 let _ = self.logger_tx.send(BusMessage::Log(
                     LogEvent::info(
                         &self.name,
@@ -263,6 +317,12 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 let tool_execution_activity = self.tool_execution_activity.clone();
                 let outbound_tx = self.outbound_tx.clone();
                 let logger_tx = self.logger_tx.clone();
+                let clarification_hub = self.clarification_hub.clone();
+                let tool_exec_ctx = ToolExecCtx::new(
+                    inbound.channel.clone(),
+                    inbound.chat_id.clone(),
+                    inbound.thread_id.clone(),
+                );
 
                 tokio::spawn(async move {
                     let task_chat_id = chat_id.clone();
@@ -294,6 +354,8 @@ impl ActorLogic<BusMessage> for AgentLogic {
                         logger_tx: logger_tx.clone(),
                         inbound,
                         cancel_token: task_token_arc.as_ref().clone(),
+                        clarification_hub,
+                        tool_exec_ctx,
                     })
                     .await;
 
@@ -367,10 +429,11 @@ impl AgentLogic {
             logger_tx,
             inbound,
             cancel_token,
+            clarification_hub,
+            tool_exec_ctx,
         } = ctx;
 
-        let thread_part = inbound.thread_id.as_deref().unwrap_or("");
-        let session_key = format!("{}:{}:{}", inbound.channel, inbound.chat_id, thread_part);
+        let session_key = tool_exec_ctx.session_key.clone();
 
         let mut mem = session_manager.get_session(&session_key).await?;
 
@@ -574,11 +637,15 @@ impl AgentLogic {
 
                     let tool_result = match execute_tool_call_with_activity(
                         &tools,
-                        tool_execution_activity.as_ref(),
+                        tool_execution_activity.clone(),
                         &inbound.chat_id,
                         tool_name,
                         args,
                         Some(&cancel_token),
+                        ToolCallRuntime {
+                            session: tool_exec_ctx.clone(),
+                            hub: clarification_hub.clone(),
+                        },
                     )
                     .await
                     {
@@ -853,6 +920,7 @@ mod tests {
     use tower::util::ServiceExt;
 
     use crate::bus::BusMessage;
+    use crate::clarification::ClarificationHub;
     use crate::logging::create_logger_channel;
     use crate::memory::SqliteMemoryActor;
     use crate::multi_tenant_edge::{ActivityHeartbeatClient, HeartbeatTransport};
@@ -1090,6 +1158,7 @@ mod tests {
             short_term_threshold_tokens: 10_000,
             outbound_tx,
             logger_tx,
+            clarification_hub: ClarificationHub::shared(),
         });
 
         if let Some(tool_execution_activity) = tool_execution_activity {

@@ -26,6 +26,8 @@ If you are writing a new `Tool` that mutates the disk or reads files, **DO NOT**
 
 Harness todo lists (`todo_write`) are stored in the workspace SQLite DB (same file as session memory: `<workspace_dir>/.system_generated/agent_memory.db`, table `harness_todos`). A legacy `<workspace_dir>/todos/*.json` folder from older builds is imported once on startup and then those files are removed.
 
+User clarification (`ask_user`) sends an outbound message tagged with metadata `isanagent_clarification` and blocks the tool until the **next inbound** on the same session (`channel`, `chat_id`, optional `thread_id`). The agent routes that inbound to the waiting tool instead of starting a new reasoning task, so the model receives the reply as the tool result and continues the same turn.
+
 ### Structured LLM Extraction
 If you are asking the LLM to yield a structured JSON payload internally (e.g. for reflection or summarization outside of the standard `ToolCall` registry):
 **DO NOT** use brittle string matching like `text.find('{')`. 
@@ -35,7 +37,7 @@ If you are asking the LLM to yield a structured JSON payload internally (e.g. fo
 
 Tools act as the fundamental abilities the Agent uses via JSON schema during its core sequential processing loop inside `AgentLogic`.
 
-1. **Implement `Tool`**: Create a struct in `src/tools/builtin.rs` (filesystem / web / shell) or `src/tools/workflow.rs` (session todos, tool search, etc.) and implement the `async_trait` `Tool`.
+1. **Implement `Tool`**: Create a struct in `src/tools/builtin.rs` (filesystem / web / shell) or `src/tools/workflow.rs` (session todos, tool search, `ask_user`, etc.) and implement the `async_trait` `Tool`.
    - `name`: Strict string representing the tool call name.
    - `description`: The prompt instruction to the LLM on *how* to use it.
    - `input_schema`: Use `serde_json::json!` to define a rigid JSON schema the LLM must map arguments to.
