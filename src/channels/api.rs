@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use axum::{
     body::{Body, Bytes},
     extract::{OriginalUri, Path as AxumPath, Query, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderName, HeaderValue, StatusCode},
     response::{sse::Event, sse::Sse, IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
@@ -37,6 +37,7 @@ use crate::utils::{
     ContentPart, ImageUrl, MessageContent, REDACTED_THINKING_STRIP_PATTERN,
     RUNTIME_CONTEXT_END_SUFFIX,
 };
+use crate::tools::builtin::resolve_path;
 use crate::NodeHandle;
 
 const AGENT_TIMEOUT_SECS: u64 = 60;
@@ -56,6 +57,8 @@ struct ApiState {
     channel_name: String,
     logger_tx: LoggerHandle,
     memory_node: NodeHandle<MemoryMessage>,
+    /// Agent sandbox (`<workspace>/workspace`); same root as filesystem tools.
+    workspace_sandbox: std::path::PathBuf,
 }
 
 enum PendingRequest {
@@ -125,6 +128,8 @@ struct ResponsesRequest {
     store: Option<bool>,
     user: Option<String>,
     stream: Option<bool>,
+    /// When starting a new chain (no `previous_response_id`), the UI may supply a UUID so cancel works before any SSE is read.
+    internal_chat_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -242,6 +247,7 @@ pub struct ApiChannel {
     port: u16,
     bind_address: Option<String>,
     serve_ui: bool,
+    workspace_sandbox: std::path::PathBuf,
     pending_requests: std::sync::Arc<DashMap<String, PendingRequest>>,
     responses_cache: Cache<String, StoredResponse>,
     response_store: std::sync::Arc<ResponseStore>,
@@ -258,6 +264,7 @@ impl ApiChannel {
         db_path: impl AsRef<Path>,
         logger_tx: LoggerHandle,
         memory_node: NodeHandle<MemoryMessage>,
+        workspace_sandbox: impl AsRef<Path>,
     ) -> Result<Self, String> {
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let bind_address = config
@@ -268,6 +275,7 @@ impl ApiChannel {
             port: config.port,
             bind_address,
             serve_ui: config.serve_ui.unwrap_or(false),
+            workspace_sandbox: workspace_sandbox.as_ref().to_path_buf(),
             pending_requests: std::sync::Arc::new(DashMap::new()),
             responses_cache: Cache::builder()
                 .max_capacity(MAX_RESPONSE_CACHE_ENTRIES)
@@ -319,6 +327,7 @@ impl Channel for ApiChannel {
             channel_name: self.name().to_string(),
             logger_tx: self.logger_tx.clone(),
             memory_node: self.memory_node.clone(),
+            workspace_sandbox: self.workspace_sandbox.clone(),
         };
 
         let logger_tx = self.logger_tx.clone();
@@ -524,7 +533,12 @@ fn build_router(state: ApiState, serve_ui: bool) -> Router {
         .route("/v1/summaries", get(handle_get_all_summaries))
         .route("/v1/summaries/{id}", post(handle_update_summary))
         .route("/v1/summaries/{id}", delete(handle_delete_summary))
-        .route("/v1/chat/cancel/{chat_id}", post(handle_cancel_chat));
+        .route("/v1/chat/cancel/{chat_id}", post(handle_cancel_chat))
+        .route("/v1/workspace/list", get(handle_workspace_list))
+        .route("/v1/workspace/file", get(handle_workspace_file))
+        // POST on a distinct path so clients are not blocked by proxies or older builds that only registered GET on `/v1/workspace/file`.
+        .route("/v1/workspace/file/save", post(handle_workspace_file_put))
+        .route("/v1/workspace/rename", post(handle_workspace_rename));
 
     if state.mte_cron_scheduler.is_some() {
         app = app.route("/_mte/cron/{job_id}/{token}", get(handle_mte_cron_webhook));
@@ -852,14 +866,40 @@ async fn handle_responses(
                     Some(previous_response_id.to_string()),
                 )
             }
-            None => (
-                uuid::Uuid::new_v4().to_string(),
-                payload.user.unwrap_or_else(|| DEFAULT_API_USER.to_string()),
-                payload
-                    .model
-                    .unwrap_or_else(|| DEFAULT_RESPONSE_MODEL.to_string()),
-                None,
-            ),
+            None => {
+                let internal_chat_id = if let Some(ref raw) = payload.internal_chat_id {
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        return ApiError::new(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_internal_chat_id",
+                            "internal_chat_id must be a non-empty UUID when provided.",
+                        )
+                        .into_response();
+                    }
+                    match uuid::Uuid::parse_str(trimmed) {
+                        Ok(u) => u.to_string(),
+                        Err(_) => {
+                            return ApiError::new(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_internal_chat_id",
+                                "internal_chat_id must be a valid UUID.",
+                            )
+                            .into_response();
+                        }
+                    }
+                } else {
+                    uuid::Uuid::new_v4().to_string()
+                };
+                (
+                    internal_chat_id,
+                    payload.user.unwrap_or_else(|| DEFAULT_API_USER.to_string()),
+                    payload
+                        .model
+                        .unwrap_or_else(|| DEFAULT_RESPONSE_MODEL.to_string()),
+                    None,
+                )
+            }
         };
 
     if stream_requested {
@@ -922,9 +962,15 @@ async fn handle_responses(
             }
         };
 
-        return Sse::new(stream)
+        let mut sse_response = Sse::new(stream)
             .keep_alive(axum::response::sse::KeepAlive::default())
             .into_response();
+        if let Ok(hv) = HeaderValue::from_str(&internal_chat_id) {
+            sse_response
+                .headers_mut()
+                .insert(HeaderName::from_static("x-internal-chat-id"), hv);
+        }
+        return sse_response;
     }
 
     let outbound =
@@ -1706,6 +1752,338 @@ async fn handle_delete_summary(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct WorkspaceListQuery {
+    #[serde(default)]
+    path: String,
+}
+
+#[derive(Serialize)]
+struct WorkspaceEntryDto {
+    name: String,
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct WorkspaceListBody {
+    path: String,
+    entries: Vec<WorkspaceEntryDto>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceFileQuery {
+    path: String,
+}
+
+#[derive(Serialize)]
+struct WorkspaceFileBody {
+    path: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceFilePutBody {
+    path: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceRenameBody {
+    from: String,
+    to: String,
+}
+
+#[derive(Serialize)]
+struct WorkspaceRenameResponse {
+    path: String,
+}
+
+/// Matches a generous UI preview cap (binary files are rejected earlier).
+const WORKSPACE_FILE_MAX_BYTES: usize = 2_000_000;
+
+async fn handle_workspace_list(
+    State(state): State<ApiState>,
+    Query(q): Query<WorkspaceListQuery>,
+) -> Response {
+    let trimmed = q.path.trim();
+    let rel_for_resolve = if trimmed.is_empty() { "." } else { trimmed };
+    let dir = match resolve_path(rel_for_resolve, &state.workspace_sandbox, true) {
+        Ok(p) => p,
+        Err(e) => return ApiError::new(StatusCode::BAD_REQUEST, "invalid_path", e).into_response(),
+    };
+    if !dir.is_dir() {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "not_a_directory",
+            "Path is not a directory",
+        )
+        .into_response();
+    }
+
+    let mut entries: Vec<WorkspaceEntryDto> = match std::fs::read_dir(&dir) {
+        Ok(iter) => iter
+            .filter_map(|e| e.ok())
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let meta = entry.metadata().ok()?;
+                let kind = if meta.is_dir() {
+                    "dir".to_string()
+                } else if meta.is_file() {
+                    "file".to_string()
+                } else {
+                    return None;
+                };
+                let size = if meta.is_file() { Some(meta.len()) } else { None };
+                Some(WorkspaceEntryDto { name, kind, size })
+            })
+            .collect(),
+        Err(e) => {
+            return ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "read_dir_failed",
+                e.to_string(),
+            )
+            .into_response()
+        }
+    };
+
+    entries.sort_by(|a, b| match (a.kind.as_str(), b.kind.as_str()) {
+        ("dir", "file") => std::cmp::Ordering::Less,
+        ("file", "dir") => std::cmp::Ordering::Greater,
+        _ => a
+            .name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase()),
+    });
+
+    let display_path = if trimmed.is_empty() {
+        String::new()
+    } else {
+        trimmed.to_string()
+    };
+
+    Json(WorkspaceListBody {
+        path: display_path,
+        entries,
+    })
+    .into_response()
+}
+
+async fn handle_workspace_file(
+    State(state): State<ApiState>,
+    Query(q): Query<WorkspaceFileQuery>,
+) -> Response {
+    let trimmed = q.path.trim();
+    if trimmed.is_empty() {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "missing_path",
+            "Query parameter `path` is required",
+        )
+        .into_response();
+    }
+    let path = match resolve_path(trimmed, &state.workspace_sandbox, true) {
+        Ok(p) => p,
+        Err(e) => return ApiError::new(StatusCode::BAD_REQUEST, "invalid_path", e).into_response(),
+    };
+    if !path.is_file() {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "not_a_file",
+            "Path is not a regular file",
+        )
+        .into_response();
+    }
+    let len = match path.metadata() {
+        Ok(m) => m.len() as usize,
+        Err(e) => {
+            return ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "metadata_failed",
+                e.to_string(),
+            )
+            .into_response()
+        }
+    };
+    if len > WORKSPACE_FILE_MAX_BYTES {
+        return ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "file_too_large",
+            format!(
+                "File is {len} bytes (max {}).",
+                WORKSPACE_FILE_MAX_BYTES
+            ),
+        )
+        .into_response();
+    }
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            return ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "read_failed",
+                e.to_string(),
+            )
+            .into_response()
+        }
+    };
+    let content = match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            return ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "not_utf8",
+                "File is not valid UTF-8 text.",
+            )
+            .into_response()
+        }
+    };
+    Json(WorkspaceFileBody {
+        path: trimmed.to_string(),
+        content,
+    })
+    .into_response()
+}
+
+async fn handle_workspace_file_put(
+    State(state): State<ApiState>,
+    Json(body): Json<WorkspaceFilePutBody>,
+) -> Response {
+    let trimmed = body.path.trim();
+    if trimmed.is_empty() {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "missing_path",
+            "Field `path` is required",
+        )
+        .into_response();
+    }
+    if body.content.len() > WORKSPACE_FILE_MAX_BYTES {
+        return ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "content_too_large",
+            format!(
+                "Content is {} bytes (max {}).",
+                body.content.len(),
+                WORKSPACE_FILE_MAX_BYTES
+            ),
+        )
+        .into_response();
+    }
+    let path = match resolve_path(trimmed, &state.workspace_sandbox, true) {
+        Ok(p) => p,
+        Err(e) => return ApiError::new(StatusCode::BAD_REQUEST, "invalid_path", e).into_response(),
+    };
+    if path.is_dir() {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "is_directory",
+            "Path is a directory, not a file",
+        )
+        .into_response();
+    }
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "create_dir_failed",
+                e.to_string(),
+            )
+            .into_response();
+        }
+    }
+    if let Err(e) = std::fs::write(&path, body.content.as_bytes()) {
+        return ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "write_failed",
+            e.to_string(),
+        )
+        .into_response();
+    }
+    Json(WorkspaceFileBody {
+        path: trimmed.to_string(),
+        content: body.content,
+    })
+    .into_response()
+}
+
+async fn handle_workspace_rename(
+    State(state): State<ApiState>,
+    Json(body): Json<WorkspaceRenameBody>,
+) -> Response {
+    let from_trim = body.from.trim();
+    let to_trim = body.to.trim();
+    if from_trim.is_empty() || to_trim.is_empty() {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "missing_path",
+            "Fields `from` and `to` are required",
+        )
+        .into_response();
+    }
+    if from_trim == to_trim {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "same_path",
+            "Source and destination are the same",
+        )
+        .into_response();
+    }
+
+    let from_path = match resolve_path(from_trim, &state.workspace_sandbox, true) {
+        Ok(p) => p,
+        Err(e) => return ApiError::new(StatusCode::BAD_REQUEST, "invalid_path", e).into_response(),
+    };
+    if !from_path.exists() {
+        return ApiError::new(
+            StatusCode::NOT_FOUND,
+            "source_not_found",
+            "Source path does not exist",
+        )
+        .into_response();
+    }
+
+    let to_path = match resolve_path(to_trim, &state.workspace_sandbox, true) {
+        Ok(p) => p,
+        Err(e) => return ApiError::new(StatusCode::BAD_REQUEST, "invalid_path", e).into_response(),
+    };
+    if to_path.exists() {
+        return ApiError::new(
+            StatusCode::CONFLICT,
+            "destination_exists",
+            "A file or folder already exists at the destination path",
+        )
+        .into_response();
+    }
+
+    if let Some(parent) = to_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "create_dir_failed",
+                e.to_string(),
+            )
+            .into_response();
+        }
+    }
+
+    if let Err(e) = std::fs::rename(&from_path, &to_path) {
+        return ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "rename_failed",
+            e.to_string(),
+        )
+        .into_response();
+    }
+
+    Json(WorkspaceRenameResponse {
+        path: to_trim.to_string(),
+    })
+    .into_response()
+}
+
 async fn handle_cancel_chat(
     State(state): State<ApiState>,
     AxumPath(chat_id): AxumPath<String>,
@@ -1832,6 +2210,11 @@ mod tests {
             SqliteMemoryActor::new(db_path.to_str().expect("utf8 db path")).expect("memory actor");
         let memory_node =
             NodeHandle::<MemoryMessage>::new(memory_actor, 100, 1, Duration::from_millis(5));
+        let workspace_sandbox = db_path
+            .parent()
+            .expect("db path parent")
+            .join("workspace");
+        std::fs::create_dir_all(&workspace_sandbox).expect("workspace sandbox");
         ApiState {
             bus_tx,
             pending_requests: Arc::new(dashmap::DashMap::<String, PendingRequest>::new()),
@@ -1841,6 +2224,7 @@ mod tests {
             channel_name: "api".to_string(),
             logger_tx,
             memory_node,
+            workspace_sandbox,
         }
     }
 
@@ -2071,6 +2455,10 @@ bind_address = "127.0.0.1"
             SqliteMemoryActor::new(temp.db_path().to_str().expect("utf8")).expect("memory actor");
         let memory_node =
             NodeHandle::<MemoryMessage>::new(memory_actor, 100, 1, Duration::from_millis(5));
+        let workspace_sandbox = temp
+            .path
+            .join("workspace");
+        std::fs::create_dir_all(&workspace_sandbox).expect("workspace sandbox");
         let state = ApiState {
             bus_tx,
             pending_requests: pending_requests.clone(),
@@ -2080,6 +2468,7 @@ bind_address = "127.0.0.1"
             channel_name: "api".to_string(),
             logger_tx,
             memory_node,
+            workspace_sandbox,
         };
         let app = build_router(state, true);
 
