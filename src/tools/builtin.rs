@@ -1,12 +1,21 @@
 use async_trait::async_trait;
 use chrono::Utc;
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
 
 use crate::config::JinaWebBackend;
 use crate::traits::Tool;
 use crate::NodeHandle;
+
+/// Maximum paths returned by `glob_files`.
+const MAX_GLOB_RESULTS: usize = 500;
+/// Maximum characters returned by `search_text`.
+const MAX_SEARCH_TEXT_CHARS: usize = 20_000;
+/// Maximum unified-diff lines included in `edit_file` output.
+const MAX_DIFF_OUTPUT_LINES: usize = 80;
 
 /// Resolves a path against the workspace and enforces boundary restrictions.
 pub fn resolve_path(path: &str, workspace_dir: &Path, restrict: bool) -> Result<PathBuf, String> {
@@ -61,6 +70,47 @@ pub fn resolve_path(path: &str, workspace_dir: &Path, restrict: bool) -> Result<
     }
 
     Ok(canonical)
+}
+
+/// Relative path from `base` to `path` using `/` separators, for glob matching.
+///
+/// `WalkDir` paths may not prefix-strip cleanly against a canonical `base` on Windows
+/// (e.g. `\\?\`-prefixed vs non-verbatim paths). Normalize with [`fs::canonicalize`] when needed.
+fn path_for_glob_match(base: &Path, path: &Path) -> Option<String> {
+    fn rel_after_strip(base: &Path, path: &Path) -> Option<String> {
+        let rel = path.strip_prefix(base).ok()?;
+        let s = rel.to_string_lossy().replace('\\', "/");
+        Some(if s.is_empty() { ".".to_string() } else { s })
+    }
+
+    if let Some(s) = rel_after_strip(base, path) {
+        return Some(s);
+    }
+    let base_can = fs::canonicalize(base).ok()?;
+    let path_can = fs::canonicalize(path).ok()?;
+    rel_after_strip(&base_can, &path_can)
+}
+
+fn truncate_diff_output(diff: String) -> String {
+    let lines: Vec<&str> = diff.lines().collect();
+    if lines.len() <= MAX_DIFF_OUTPUT_LINES {
+        return diff;
+    }
+    let head: Vec<_> = lines.iter().take(MAX_DIFF_OUTPUT_LINES).copied().collect();
+    format!(
+        "{}\n... ({} more diff lines omitted)",
+        head.join("\n"),
+        lines.len() - MAX_DIFF_OUTPUT_LINES
+    )
+}
+
+fn unified_diff_snippet(old: &str, new: &str) -> String {
+    let patch = diffy::create_patch(old, new);
+    truncate_diff_output(patch.to_string())
+}
+
+fn ripgrep_available() -> bool {
+    which::which("rg").is_ok()
 }
 
 pub struct ReadFileTool {
@@ -171,7 +221,7 @@ impl Tool for EditFileTool {
     }
 
     fn description(&self) -> &str {
-        "Edit a file by replacing old_text with new_text. The old_text must match exactly."
+        "Edit a file by replacing old_text with new_text. The old_text must appear exactly once unless replace_all is true. Returns a truncated unified diff of the change."
     }
 
     fn parameters(&self) -> Value {
@@ -189,6 +239,10 @@ impl Tool for EditFileTool {
                 "new_text": {
                     "type": "string",
                     "description": "Text to replace it with"
+                },
+                "replace_all": {
+                    "type": "boolean",
+                    "description": "If true, replace every occurrence of old_text. If false (default), old_text must be unique in the file."
                 }
             },
             "required": ["path", "old_text", "new_text"]
@@ -211,30 +265,49 @@ impl Tool for EditFileTool {
             .and_then(|v| v.as_str())
             .ok_or("Missing 'new_text' argument")?;
 
+        let replace_all = args
+            .get("replace_all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if old_text == new_text {
+            return Ok("Error: old_text and new_text are identical.".to_string());
+        }
+
         let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
 
         let content =
             fs::read_to_string(&actual_path).map_err(|e| format!("Error reading file: {}", e))?;
 
         if !content.contains(old_text) {
-            return Ok(format!(
-                "Error: old_text not found in {:?}",
-                actual_path.display()
-            ));
+            return Ok("Error: old_text not found in file.".to_string());
         }
 
         let count = content.matches(old_text).count();
-        if count > 1 {
+        if count > 1 && !replace_all {
             return Ok(format!(
-                "Error: old_text appears {} times. Please provide more context to make it unique.",
+                "Error: old_text appears {} times. Provide more surrounding context to make it unique, or set replace_all to true.",
                 count
             ));
         }
 
-        let new_content = content.replacen(old_text, new_text, 1);
-        fs::write(&actual_path, new_content)
-            .map(|_| format!("Successfully edited {}", actual_path.display()))
-            .map_err(|e| format!("Error saving edits: {}", e))
+        let old_content = content.clone();
+        let new_content = if replace_all {
+            content.replace(old_text, new_text)
+        } else {
+            content.replacen(old_text, new_text, 1)
+        };
+
+        fs::write(&actual_path, &new_content).map_err(|e| format!("Error saving edits: {}", e))?;
+
+        let diff = unified_diff_snippet(&old_content, &new_content);
+        let replacements = if replace_all { count } else { 1 };
+        Ok(format!(
+            "Applied {} replacement(s) to {}:\n\n{}",
+            replacements,
+            actual_path.display(),
+            diff
+        ))
     }
 }
 
@@ -304,6 +377,439 @@ impl Tool for ListDirTool {
         }
 
         Ok(items.join("\n"))
+    }
+}
+
+/// Discover files under a directory using a glob pattern (e.g. `**/*.rs`, `src/**/*.toml`).
+pub struct GlobFilesTool {
+    pub workspace_dir: PathBuf,
+    pub restrict_to_workspace: bool,
+}
+
+fn compile_glob_single(pattern: &str) -> Result<GlobSet, String> {
+    let glob = GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .build()
+        .map_err(|e| format!("Invalid glob pattern: {}", e))?;
+    let mut builder = GlobSetBuilder::new();
+    builder.add(glob);
+    builder
+        .build()
+        .map_err(|e| format!("Invalid glob pattern: {}", e))
+}
+
+#[async_trait]
+impl Tool for GlobFilesTool {
+    fn name(&self) -> &str {
+        "glob_files"
+    }
+
+    fn description(&self) -> &str {
+        "Find files under a base directory matching a glob pattern. Returns sorted paths (capped). Use ** for recursive patterns."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Glob pattern. Use ** for recursion (e.g. **/*.md matches markdown anywhere under the base). A bare *.md only matches files directly in the base directory, not in subfolders."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Base directory to search from (relative to workspace). Defaults to '.'"
+                }
+            },
+            "required": ["pattern"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, String> {
+        let pattern = args
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'pattern' argument")?;
+
+        let path_str = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+
+        let base = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
+        if !base.exists() {
+            return Ok(format!("Error: path not found: {:?}", base.display()));
+        }
+        if !base.is_dir() {
+            return Ok(format!(
+                "Error: base path is not a directory: {:?}",
+                base.display()
+            ));
+        }
+
+        // Align with WalkDir output so `strip_prefix` works on all platforms (notably Windows).
+        let walk_root = fs::canonicalize(&base)
+            .map_err(|e| format!("Could not canonicalize search base {:?}: {}", base, e))?;
+
+        let matcher = compile_glob_single(pattern)?;
+        let mut matches: Vec<PathBuf> = Vec::new();
+        let mut truncated = false;
+
+        for entry in WalkDir::new(&walk_root).follow_links(false) {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(rel) = path_for_glob_match(&walk_root, path) else {
+                continue;
+            };
+            if !matcher.is_match(&rel) {
+                continue;
+            }
+            matches.push(path.to_path_buf());
+            if matches.len() >= MAX_GLOB_RESULTS {
+                truncated = true;
+                break;
+            }
+        }
+
+        matches.sort();
+        matches.dedup();
+
+        if matches.is_empty() {
+            return Ok("No files matched.".to_string());
+        }
+
+        let mut out = matches
+            .into_iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if truncated {
+            out.push_str(&format!(
+                "\n... (glob results capped at {} paths; refine the pattern or base path)",
+                MAX_GLOB_RESULTS
+            ));
+        }
+
+        Ok(out)
+    }
+}
+
+/// Regex search across files under the workspace (ripgrep when available, otherwise a built-in walker).
+pub struct SearchTextTool {
+    pub workspace_dir: PathBuf,
+    pub restrict_to_workspace: bool,
+    /// Default ripgrep subprocess timeout (seconds); per-call `timeout_secs` in tool args overrides when set.
+    pub ripgrep_timeout_secs: u64,
+}
+
+async fn search_text_ripgrep(
+    pattern: &str,
+    search_path: &Path,
+    file_glob: Option<&str>,
+    output_mode: &str,
+    case_insensitive: bool,
+    context_lines: u32,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    let mut cmd = tokio::process::Command::new("rg");
+    cmd.arg("--no-heading");
+    if case_insensitive {
+        cmd.arg("-i");
+    }
+    match output_mode {
+        "files_with_matches" => {
+            cmd.arg("-l");
+        }
+        "count" => {
+            cmd.arg("-c");
+        }
+        _ => {
+            cmd.arg("-n");
+            if context_lines > 0 {
+                cmd.arg("-C");
+                cmd.arg(context_lines.to_string());
+            }
+        }
+    }
+    if let Some(g) = file_glob {
+        cmd.arg("--glob");
+        cmd.arg(g);
+    }
+    cmd.arg("--");
+    cmd.arg(pattern);
+    cmd.arg(search_path);
+
+    let fut = cmd.output();
+    let output = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut)
+        .await
+        .map_err(|_| format!("Search timed out after {} seconds.", timeout_secs))?
+        .map_err(|e| format!("Failed to run ripgrep: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let code = output.status.code();
+
+    if code == Some(1) && stdout.is_empty() {
+        return Ok("No matches found.".to_string());
+    }
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            return Ok("No matches found.".to_string());
+        }
+        return Err(format!("ripgrep error: {}", stderr));
+    }
+
+    if stdout.is_empty() {
+        return Ok("No matches found.".to_string());
+    }
+
+    Ok(truncate_search_output(stdout))
+}
+
+fn truncate_search_output(mut s: String) -> String {
+    if s.len() <= MAX_SEARCH_TEXT_CHARS {
+        return s;
+    }
+    let mut end = MAX_SEARCH_TEXT_CHARS;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    s.push_str(&format!(
+        "\n... (truncated, output exceeded {} characters)",
+        MAX_SEARCH_TEXT_CHARS
+    ));
+    s
+}
+
+fn search_text_native(
+    regex: &regex::Regex,
+    search_root: &Path,
+    file_glob: Option<&GlobSet>,
+    output_mode: &str,
+) -> Result<String, String> {
+    let mut lines_out: Vec<String> = Vec::new();
+    let mut count_rows: Vec<String> = Vec::new();
+
+    let mut visit_file = |abs: &Path, rel_key: &str| -> Result<(), String> {
+        if let Some(gs) = file_glob {
+            if !gs.is_match(rel_key) {
+                return Ok(());
+            }
+        }
+        let meta = match fs::metadata(abs) {
+            Ok(m) => m,
+            Err(_) => return Ok(()),
+        };
+        if !meta.is_file() || meta.len() > 2 * 1024 * 1024 {
+            return Ok(());
+        }
+        let text = match fs::read_to_string(abs) {
+            Ok(t) => t,
+            Err(_) => return Ok(()),
+        };
+
+        match output_mode {
+            "files_with_matches" => {
+                if regex.is_match(&text) {
+                    lines_out.push(abs.display().to_string());
+                }
+            }
+            "count" => {
+                let mut n: usize = 0;
+                for line in text.lines() {
+                    n += regex.find_iter(line).count();
+                }
+                if n > 0 {
+                    count_rows.push(format!("{}:{}", abs.display(), n));
+                }
+            }
+            _ => {
+                for (i, line) in text.lines().enumerate() {
+                    let line_no = i + 1;
+                    if regex.is_match(line) {
+                        lines_out.push(format!("{}:{}:{}", abs.display(), line_no, line));
+                    }
+                }
+            }
+        }
+        Ok(())
+    };
+
+    if search_root.is_file() {
+        let rel_key = search_root
+            .file_name()
+            .map(|s| s.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        visit_file(search_root, &rel_key)?;
+    } else {
+        for entry in WalkDir::new(search_root).follow_links(false) {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(rel) = path_for_glob_match(search_root, path) else {
+                continue;
+            };
+            visit_file(path, &rel)?;
+        }
+    }
+
+    let mut result = match output_mode {
+        "count" => {
+            if count_rows.is_empty() {
+                return Ok("No matches found.".to_string());
+            }
+            count_rows.sort();
+            count_rows.join("\n")
+        }
+        _ => {
+            if lines_out.is_empty() {
+                return Ok("No matches found.".to_string());
+            }
+            lines_out.sort();
+            lines_out.join("\n")
+        }
+    };
+
+    result = truncate_search_output(result);
+    Ok(result)
+}
+
+#[async_trait]
+impl Tool for SearchTextTool {
+    fn name(&self) -> &str {
+        "search_text"
+    }
+
+    fn description(&self) -> &str {
+        "Search file contents with a Rust regex. Uses ripgrep when installed for speed and features (e.g. context lines); otherwise scans files under the search path (skips very large files in fallback mode)."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Rust regex pattern to search for"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Directory or file to search (relative to workspace). Defaults to '.'"
+                },
+                "glob": {
+                    "type": "string",
+                    "description": "Optional glob filter for paths (e.g. *.rs, *.{ts,tsx})"
+                },
+                "output_mode": {
+                    "type": "string",
+                    "description": "One of: files_with_matches (default), content, count",
+                    "enum": ["files_with_matches", "content", "count"]
+                },
+                "case_insensitive": {
+                    "type": "boolean",
+                    "description": "Case-insensitive matching (default false)"
+                },
+                "context_lines": {
+                    "type": "integer",
+                    "description": "Lines of context around matches when output_mode is content (requires ripgrep when > 0)"
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "description": "Ripgrep subprocess timeout in seconds (1–3600; overrides workspace default when set)"
+                }
+            },
+            "required": ["pattern"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, String> {
+        let pattern = args
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'pattern' argument")?;
+
+        let path_str = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+
+        let file_glob = args.get("glob").and_then(|v| v.as_str());
+        let output_mode = args
+            .get("output_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("files_with_matches");
+        let case_insensitive = args
+            .get("case_insensitive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let context_lines = args
+            .get("context_lines")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+
+        const RG_TIMEOUT_MAX: u64 = 3600;
+        let ripgrep_timeout_secs = match args.get("timeout_secs").and_then(|v| v.as_u64()) {
+            Some(t) => t.clamp(1, RG_TIMEOUT_MAX),
+            None => self.ripgrep_timeout_secs.clamp(1, RG_TIMEOUT_MAX),
+        };
+
+        let resolved = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
+
+        if !resolved.exists() {
+            return Ok(format!("Error: path not found: {:?}", resolved.display()));
+        }
+
+        let search_target = fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
+
+        if ripgrep_available() {
+            let glob_arg = file_glob;
+            return search_text_ripgrep(
+                pattern,
+                &search_target,
+                glob_arg,
+                output_mode,
+                case_insensitive,
+                context_lines,
+                ripgrep_timeout_secs,
+            )
+            .await;
+        }
+
+        if context_lines > 0 && output_mode == "content" {
+            return Err(
+                "context_lines requires ripgrep (rg) on PATH for this host; install ripgrep or use context_lines 0."
+                    .to_string(),
+            );
+        }
+
+        let file_glob_set = if let Some(g) = file_glob {
+            Some(compile_glob_single(g)?)
+        } else {
+            None
+        };
+
+        let regex = regex::RegexBuilder::new(pattern)
+            .case_insensitive(case_insensitive)
+            .build()
+            .map_err(|e| format!("Invalid regex: {}", e))?;
+
+        let search_root = search_target;
+        let mode = output_mode.to_string();
+        let glob_set = file_glob_set;
+        let regex_owned = regex;
+        tokio::task::spawn_blocking(move || {
+            search_text_native(&regex_owned, &search_root, glob_set.as_ref(), &mode)
+        })
+        .await
+        .map_err(|e| format!("search task failed: {}", e))?
     }
 }
 
@@ -1174,5 +1680,44 @@ impl Tool for FetchMemoryByDateTool {
                 results.join("\n\n---\n\n")
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod glob_files_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn glob_files_finds_nested_markdown() {
+        let root = std::env::temp_dir().join(format!("isanagent_glob_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("skills").join("cron")).unwrap();
+        fs::write(root.join("skills").join("cron").join("SKILL.md"), "# skill").unwrap();
+
+        let tool = GlobFilesTool {
+            workspace_dir: root.clone(),
+            restrict_to_workspace: false,
+        };
+
+        let out = tool
+            .execute(json!({ "pattern": "**/*.md", "path": "." }))
+            .await
+            .unwrap();
+        assert!(
+            out.contains("SKILL.md"),
+            "expected SKILL.md in output, got:\n{}",
+            out
+        );
+
+        let flat = tool
+            .execute(json!({ "pattern": "*.md", "path": "." }))
+            .await
+            .unwrap();
+        assert_eq!(
+            flat, "No files matched.",
+            "*.md should not match nested files"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

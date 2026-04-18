@@ -5,6 +5,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
 
+use crate::clarification::ClarificationHub;
+use crate::tool_runtime::ToolExecCtx;
+
 use crate::bus::{BusMessage, LogEvent, OutboundMessage, TelemetryEvent};
 use crate::logging::LoggerHandle;
 use crate::session::SessionManager;
@@ -21,35 +24,59 @@ enum ToolExecutionFinished {
     Cancelled,
 }
 
+/// Session-scoped wiring for tools that need the active chat (e.g. `ask_user`).
+#[derive(Clone)]
+struct ToolCallRuntime {
+    session: ToolExecCtx,
+    hub: Arc<ClarificationHub>,
+}
+
 /// Runs a tool with optional per-call activity heartbeats and optional cooperative cancellation.
 async fn execute_tool_call_with_activity(
     tools: &Arc<ToolRegistry>,
-    tool_execution_activity: Option<&SharedToolExecutionActivity>,
+    tool_execution_activity: Option<SharedToolExecutionActivity>,
     chat_id: &str,
     tool_name: &str,
     args: Value,
     cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    runtime: ToolCallRuntime,
 ) -> ToolExecutionFinished {
-    let activity_handle = tool_execution_activity.map(|a| a.start(chat_id, tool_name));
+    let session_key = runtime.session.session_key.clone();
+    let hub = Arc::clone(&runtime.hub);
+    let tool_exec_ctx = runtime.session;
+    let chat_id = chat_id.to_string();
+    let tool_name = tool_name.to_string();
+    let tools = Arc::clone(tools);
+    let cancel_owned = cancel_token.cloned();
 
-    let completed = match cancel_token {
-        None => Some(tools.execute_tool(tool_name, args).await),
-        Some(token) => {
-            tokio::select! {
-                res = tools.execute_tool(tool_name, args) => Some(res),
-                _ = token.cancelled() => None,
+    crate::tool_runtime::with_tool_exec_scope(tool_exec_ctx, async move {
+        let activity_handle = tool_execution_activity
+            .as_ref()
+            .map(|a| a.start(chat_id.as_str(), tool_name.as_str()));
+
+        let completed = match cancel_owned.as_ref() {
+            None => Some(tools.execute_tool(&tool_name, args).await),
+            Some(token) => {
+                tokio::select! {
+                    res = tools.execute_tool(&tool_name, args) => Some(res),
+                    _ = token.cancelled() => None,
+                }
+            }
+        };
+
+        if let Some(handle) = activity_handle {
+            handle.stop().await;
+        }
+
+        match completed {
+            Some(res) => ToolExecutionFinished::Completed(res),
+            None => {
+                hub.cancel_wait(&session_key);
+                ToolExecutionFinished::Cancelled
             }
         }
-    };
-
-    if let Some(handle) = activity_handle {
-        handle.stop().await;
-    }
-
-    match completed {
-        Some(res) => ToolExecutionFinished::Completed(res),
-        None => ToolExecutionFinished::Cancelled,
-    }
+    })
+    .await
 }
 
 /// Bundles everything needed to run one inbound reasoning task (spawned from `AgentLogic::process`).
@@ -70,6 +97,8 @@ struct ReasoningLoopCtx {
     logger_tx: LoggerHandle,
     inbound: crate::bus::InboundMessage,
     cancel_token: tokio_util::sync::CancellationToken,
+    clarification_hub: Arc<ClarificationHub>,
+    tool_exec_ctx: ToolExecCtx,
 }
 
 /// Constructor arguments for [`AgentLogic`], grouped to keep call sites readable.
@@ -87,6 +116,7 @@ pub struct AgentLogicParams {
     pub short_term_threshold_tokens: usize,
     pub outbound_tx: mpsc::Sender<BusMessage>,
     pub logger_tx: LoggerHandle,
+    pub clarification_hub: Arc<ClarificationHub>,
 }
 
 /// The central logic for an autonomous Agent running inside an ActorNode.
@@ -107,6 +137,7 @@ pub struct AgentLogic {
     outbound_tx: mpsc::Sender<BusMessage>,
     logger_tx: LoggerHandle,
     cancellation_tokens: Arc<dashmap::DashMap<String, Arc<tokio_util::sync::CancellationToken>>>,
+    clarification_hub: Arc<ClarificationHub>,
 }
 
 impl AgentLogic {
@@ -125,6 +156,7 @@ impl AgentLogic {
             short_term_threshold_tokens,
             outbound_tx,
             logger_tx,
+            clarification_hub,
         } = params;
 
         let mut agent = Self {
@@ -143,6 +175,7 @@ impl AgentLogic {
             outbound_tx,
             logger_tx,
             cancellation_tokens: Arc::new(dashmap::DashMap::new()),
+            clarification_hub,
         };
 
         // Inject the skill loader tool automatically
@@ -174,11 +207,15 @@ impl AgentLogic {
     ) -> Result<String, String> {
         match execute_tool_call_with_activity(
             &self.tools,
-            self.tool_execution_activity.as_ref(),
+            self.tool_execution_activity.clone(),
             chat_id,
             tool_name,
             args,
             None,
+            ToolCallRuntime {
+                session: ToolExecCtx::new("test", chat_id, None),
+                hub: self.clarification_hub.clone(),
+            },
         )
         .await
         {
@@ -218,6 +255,21 @@ impl ActorLogic<BusMessage> for AgentLogic {
             }
             BusMessage::Inbound(inbound) => {
                 let chat_id = inbound.chat_id.clone();
+                let session_key = inbound.clarification_session_key();
+                if self
+                    .clarification_hub
+                    .try_deliver_reply(&session_key, inbound.content.clone())
+                {
+                    let _ = self.logger_tx.send(BusMessage::Log(
+                        LogEvent::debug(
+                            &self.name,
+                            "Inbound delivered as ask_user clarification reply (same session).",
+                        )
+                        .with_chat_id(&chat_id),
+                    ));
+                    return Ok(None);
+                }
+
                 let _ = self.logger_tx.send(BusMessage::Log(
                     LogEvent::info(
                         &self.name,
@@ -263,6 +315,14 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 let tool_execution_activity = self.tool_execution_activity.clone();
                 let outbound_tx = self.outbound_tx.clone();
                 let logger_tx = self.logger_tx.clone();
+                let clarification_hub = self.clarification_hub.clone();
+                let tool_exec_ctx = ToolExecCtx::new(
+                    inbound.channel.clone(),
+                    inbound.chat_id.clone(),
+                    inbound.thread_id.clone(),
+                );
+                let inbound_channel = inbound.channel.clone();
+                let inbound_thread_id = inbound.thread_id.clone();
 
                 tokio::spawn(async move {
                     let task_chat_id = chat_id.clone();
@@ -294,6 +354,8 @@ impl ActorLogic<BusMessage> for AgentLogic {
                         logger_tx: logger_tx.clone(),
                         inbound,
                         cancel_token: task_token_arc.as_ref().clone(),
+                        clarification_hub,
+                        tool_exec_ctx,
                     })
                     .await;
 
@@ -308,6 +370,13 @@ impl ActorLogic<BusMessage> for AgentLogic {
                             )
                             .with_chat_id(&task_chat_id),
                         ));
+                        let notice = crate::channels::terminal::build_channel_error_notice(
+                            &inbound_channel,
+                            &task_chat_id,
+                            inbound_thread_id.as_deref(),
+                            &e,
+                        );
+                        let _ = outbound_tx.send(BusMessage::Outbound(notice)).await;
                     } else if task_token_arc.is_cancelled() {
                         let _ = logger_tx.send(BusMessage::Log(
                             LogEvent::info(
@@ -367,10 +436,11 @@ impl AgentLogic {
             logger_tx,
             inbound,
             cancel_token,
+            clarification_hub,
+            tool_exec_ctx,
         } = ctx;
 
-        let thread_part = inbound.thread_id.as_deref().unwrap_or("");
-        let session_key = format!("{}:{}:{}", inbound.channel, inbound.chat_id, thread_part);
+        let session_key = tool_exec_ctx.session_key.clone();
 
         let mut mem = session_manager.get_session(&session_key).await?;
 
@@ -574,11 +644,15 @@ impl AgentLogic {
 
                     let tool_result = match execute_tool_call_with_activity(
                         &tools,
-                        tool_execution_activity.as_ref(),
+                        tool_execution_activity.clone(),
                         &inbound.chat_id,
                         tool_name,
                         args,
                         Some(&cancel_token),
+                        ToolCallRuntime {
+                            session: tool_exec_ctx.clone(),
+                            hub: clarification_hub.clone(),
+                        },
                     )
                     .await
                     {
@@ -787,20 +861,47 @@ impl Tool for LoadSkillTool {
         serde_json::json!({
             "type": "object",
             "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["load", "list"],
+                    "description": "Use 'list' to enumerate discovered skills. Use 'load' (default) to fetch one skill by name."
+                },
                 "skill_name": {
                     "type": "string",
-                    "description": "The exact name of the skill to load (e.g. 'tweet-author', 'code-reviewer')."
+                    "description": "Exact skill name when action is load (e.g. 'code_review')."
+                },
+                "detail": {
+                    "type": "string",
+                    "enum": ["full", "metadata"],
+                    "description": "When action is load: 'full' returns instruction body (default). 'metadata' returns name, availability, description, and body length without the full body."
                 }
-            },
-            "required": ["skill_name"]
+            }
         })
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("load");
+
+        if action == "list" {
+            return Ok(self.registry.format_skill_directory());
+        }
+
         let skill_name = args
             .get("skill_name")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| "Missing required parameter 'skill_name'".to_string())?;
+            .ok_or_else(|| "Missing 'skill_name' when action is load (default).".to_string())?;
+
+        let detail = args
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or("full");
+
+        if detail == "metadata" {
+            return self.registry.get_skill_metadata(skill_name);
+        }
 
         self.registry.get_skill_instructions(skill_name)
     }
@@ -826,6 +927,7 @@ mod tests {
     use tower::util::ServiceExt;
 
     use crate::bus::BusMessage;
+    use crate::clarification::ClarificationHub;
     use crate::logging::create_logger_channel;
     use crate::memory::SqliteMemoryActor;
     use crate::multi_tenant_edge::{ActivityHeartbeatClient, HeartbeatTransport};
@@ -1033,7 +1135,7 @@ mod tests {
         tool_execution_activity: Option<SharedToolExecutionActivity>,
         tool_delay: Duration,
     ) -> AgentLogic {
-        let memory_actor = SqliteMemoryActor::new(":memory:").expect("memory actor");
+        let memory_actor = SqliteMemoryActor::new(":memory:", None).expect("memory actor");
         let memory_node = NodeHandle::new(memory_actor, 16, 1, Duration::from_millis(1));
         let session_manager = SessionManager::new(memory_node);
 
@@ -1063,6 +1165,7 @@ mod tests {
             short_term_threshold_tokens: 10_000,
             outbound_tx,
             logger_tx,
+            clarification_hub: ClarificationHub::shared(),
         });
 
         if let Some(tool_execution_activity) = tool_execution_activity {
@@ -1211,5 +1314,43 @@ mod tests {
         .expect("tool result");
 
         assert_eq!(result, "tool complete");
+    }
+
+    #[tokio::test]
+    async fn load_skill_tool_supports_list_and_metadata() {
+        let root = LocalTempDir::new();
+        let skills_root = root.path().join("skills");
+        let skill_dir = skills_root.join("lint_skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: lint_skill\ndescription: Lint helper\n---\n\ndo things\n",
+        )
+        .unwrap();
+        let reg = Arc::new(SkillRegistry::new(skills_root));
+        let tool = super::LoadSkillTool {
+            registry: reg.clone(),
+        };
+        let listed = tool
+            .execute(serde_json::json!({ "action": "list" }))
+            .await
+            .unwrap();
+        assert!(listed.contains("lint_skill"), "{}", listed);
+
+        let meta = tool
+            .execute(serde_json::json!({
+                "skill_name": "lint_skill",
+                "detail": "metadata"
+            }))
+            .await
+            .unwrap();
+        assert!(meta.contains("Instruction length:"));
+        assert!(meta.contains("Available: true"));
+
+        let full = tool
+            .execute(serde_json::json!({ "skill_name": "lint_skill", "detail": "full" }))
+            .await
+            .unwrap();
+        assert!(full.contains("do things"));
     }
 }

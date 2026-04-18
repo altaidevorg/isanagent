@@ -19,6 +19,8 @@ pub struct AppConfig {
     /// Max characters returned by `web_search` / `web_fetch` (default 50_000). Separate from
     /// `max_tool_output_chars`, which caps tool output when passed to the model.
     pub max_web_tool_output_chars: Option<usize>,
+    /// Wall-clock limit in seconds for the `search_text` ripgrep subprocess (default 30, clamped 1–3600).
+    pub search_text_ripgrep_timeout_secs: Option<u64>,
     pub memory: Option<MemoryConfig>,
     pub multi_tenant_edge: Option<MultiTenantEdgeConfig>,
     /// When `enabled`, `web_search` / `web_fetch` use [Jina Reader](https://r.jina.ai/) and search (`s.jina.ai`).
@@ -102,6 +104,16 @@ impl AppConfig {
     pub fn effective_max_web_tool_output_chars(&self) -> usize {
         const DEFAULT: usize = 50_000;
         self.max_web_tool_output_chars.unwrap_or(DEFAULT)
+    }
+
+    /// Timeout for `search_text` when using ripgrep (workspace default; per-call override in tool args).
+    pub fn effective_search_text_ripgrep_timeout_secs(&self) -> u64 {
+        const DEFAULT: u64 = 30;
+        const MIN: u64 = 1;
+        const MAX: u64 = 3600;
+        self.search_text_ripgrep_timeout_secs
+            .unwrap_or(DEFAULT)
+            .clamp(MIN, MAX)
     }
 }
 

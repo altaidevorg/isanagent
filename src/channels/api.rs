@@ -1828,8 +1828,8 @@ mod tests {
         scheduler: Option<Arc<MultiTenantEdgeCronScheduler>>,
     ) -> ApiState {
         let (logger_tx, _logger_rx) = create_logger_channel(32);
-        let memory_actor =
-            SqliteMemoryActor::new(db_path.to_str().expect("utf8 db path")).expect("memory actor");
+        let memory_actor = SqliteMemoryActor::new(db_path.to_str().expect("utf8 db path"), None)
+            .expect("memory actor");
         let memory_node =
             NodeHandle::<MemoryMessage>::new(memory_actor, 100, 1, Duration::from_millis(5));
         ApiState {
@@ -2067,8 +2067,8 @@ bind_address = "127.0.0.1"
         let (logger_tx, _logger_rx) = create_logger_channel(32);
         let response_store = Arc::new(ResponseStore::new(temp.db_path()).expect("response store"));
         let (bus_tx, mut bus_rx) = mpsc::channel(4);
-        let memory_actor =
-            SqliteMemoryActor::new(temp.db_path().to_str().expect("utf8")).expect("memory actor");
+        let memory_actor = SqliteMemoryActor::new(temp.db_path().to_str().expect("utf8"), None)
+            .expect("memory actor");
         let memory_node =
             NodeHandle::<MemoryMessage>::new(memory_actor, 100, 1, Duration::from_millis(5));
         let state = ApiState {

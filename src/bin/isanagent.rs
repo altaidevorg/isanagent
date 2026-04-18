@@ -8,11 +8,13 @@ use colored::Colorize;
 use isanagent::agent::{AgentLogic, AgentLogicParams};
 use isanagent::bus::{BusMessage, LoggerControlMessage, TelemetryEvent};
 use isanagent::channels::terminal::{
-    build_tool_call_terminal_notice, build_tool_result_terminal_notice,
+    build_agent_thought_terminal_notice, build_tool_call_terminal_notice,
+    build_tool_result_terminal_notice, terminal_startup_suppresses_plain_banner,
 };
 use isanagent::channels::{
     api::ApiChannel, email::EmailChannel, slack::SlackChannel, terminal::TerminalChannel, Channel,
 };
+use isanagent::clarification::ClarificationHub;
 use isanagent::logging::{
     create_logger_channel, create_logging_actor_or_fallback, init_runtime_logger,
     LOGGER_QUEUE_CAPACITY,
@@ -26,9 +28,10 @@ use isanagent::scheduler::{
 use isanagent::session::SessionManager;
 use isanagent::skills::SkillRegistry;
 use isanagent::tools::builtin::{
-    CronTool, EditFileTool, ListDirTool, MessageTool, ReadFileTool, ShellExecTool, WebFetchTool,
-    WebSearchTool, WriteFileTool,
+    CronTool, EditFileTool, GlobFilesTool, ListDirTool, MessageTool, ReadFileTool, SearchTextTool,
+    ShellExecTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
+use isanagent::tools::workflow::{AskUserTool, TodoWriteTool, ToolSearchTool};
 use isanagent::tools::ToolRegistry;
 use isanagent::workspace::{resolve_workspace_root, IsanagentWorkspace};
 use isanagent::{NodeHandle, Supervisor, SupervisorPolicy};
@@ -147,9 +150,11 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     let db_path_str = db_path
         .to_str()
         .ok_or_else(|| std::io::Error::other("workspace DB path is not valid UTF-8"))?;
-    let memory_actor = isanagent::memory::SqliteMemoryActor::new(db_path_str).map_err(|e| {
-        std::io::Error::other(format!("Failed to initialize SqliteMemoryActor: {:?}", e))
-    })?;
+    let memory_actor = isanagent::memory::SqliteMemoryActor::new(
+        db_path_str,
+        Some(workspace.dir.join("todos").as_path()),
+    )
+    .map_err(|e| std::io::Error::other(format!("Failed to initialize SqliteMemoryActor: {}", e)))?;
     let memory_node = NodeHandle::<isanagent::memory::MemoryMessage>::new(
         memory_actor,
         100,
@@ -161,6 +166,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
 
     // 4. Setup Tools
     let (global_outbound_tx, mut global_outbound_rx) = mpsc::channel(100);
+    let clarification_hub = ClarificationHub::shared();
 
     // 2. Setup Skills
     let skills = SkillRegistry::new(workspace.skills_path());
@@ -232,6 +238,17 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         workspace_dir: workspace.sandbox_dir.clone(),
         restrict_to_workspace: restrict,
     }));
+    tools.register(Box::new(GlobFilesTool {
+        workspace_dir: workspace.sandbox_dir.clone(),
+        restrict_to_workspace: restrict,
+    }));
+    tools.register(Box::new(SearchTextTool {
+        workspace_dir: workspace.sandbox_dir.clone(),
+        restrict_to_workspace: restrict,
+        ripgrep_timeout_secs: workspace
+            .config
+            .effective_search_text_ripgrep_timeout_secs(),
+    }));
     tools.register(Box::new(ShellExecTool {
         workspace_dir: workspace.sandbox_dir.clone(),
         restrict_to_workspace: restrict,
@@ -254,11 +271,23 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     tools.register(Box::new(MessageTool {
         outbound_tx: global_outbound_tx.clone(),
     }));
+    tools.register(Box::new(AskUserTool {
+        clarification_hub: clarification_hub.clone(),
+        outbound_tx: global_outbound_tx.clone(),
+    }));
     tools.register(Box::new(isanagent::tools::builtin::SearchMemoryTool {
         memory_node: memory_node.clone(),
     }));
     tools.register(Box::new(isanagent::tools::builtin::FetchMemoryByDateTool {
         memory_node: memory_node.clone(),
+    }));
+
+    tools.register(Box::new(TodoWriteTool {
+        memory_node: memory_node.clone(),
+    }));
+    let tool_catalog = tools.catalog_handle();
+    tools.register(Box::new(ToolSearchTool {
+        catalog: tool_catalog,
     }));
 
     // 5. Setup Provider (Dynamic from config)
@@ -356,6 +385,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         short_term_threshold_tokens,
         outbound_tx: global_outbound_tx.clone(),
         logger_tx: logger_bus_tx.clone(),
+        clarification_hub,
     });
     let agent_logic = if let Some(tool_execution_activity) = tool_execution_activity {
         agent_logic.with_tool_execution_activity(tool_execution_activity)
@@ -377,6 +407,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             logger_bus_tx.clone(),
             shutdown_tx.clone(),
             workspace.sandbox_dir.clone(),
+            model_name.clone(),
         ));
         terminal.start(bus_tx.clone()).await?;
         out_channels.insert(terminal.name().to_string(), terminal);
@@ -434,51 +465,54 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         }
     }
 
-    // 14. Print clean startup banner
-    println!(
-        "\n{}",
-        "=============================================".blue()
-    );
-    println!("isanagent Version: {}", env!("CARGO_PKG_VERSION").green());
-    if let Some(id) = terminal_chat_id.as_ref() {
-        println!("Terminal Session ID: {}", id.dimmed());
-    } else {
-        println!("{}", "Terminal channel: disabled (headless mode)".dimmed());
-    }
-    if let Some(url) = &api_local_url {
-        println!("HTTP API (Vite UI proxies here): {}", url.green());
-    }
-    println!(
-        "Loaded Skills ({}): {}",
-        skill_count.to_string().cyan(),
-        skill_names
-    );
-    println!(
-        "Loaded Tools ({}): {}",
-        tool_count.to_string().yellow(),
-        tool_names
-    );
-    println!("{}", "=============================================".blue());
-    println!("\n{}", "Agent System is Running.".bold().green());
-    if terminal_chat_id.is_some() {
+    // 14. Print clean startup banner (skipped when Ratatui owns the alternate screen)
+    if !terminal_startup_suppresses_plain_banner(&workspace.config) {
         println!(
-            "{}",
-            "Available actions: type a message in the terminal or on active chat channels.".cyan()
+            "\n{}",
+            "=============================================".blue()
+        );
+        println!("isanagent Version: {}", env!("CARGO_PKG_VERSION").green());
+        if let Some(id) = terminal_chat_id.as_ref() {
+            println!("Terminal Session ID: {}", id.dimmed());
+        } else {
+            println!("{}", "Terminal channel: disabled (headless mode)".dimmed());
+        }
+        if let Some(url) = &api_local_url {
+            println!("HTTP API (Vite UI proxies here): {}", url.green());
+        }
+        println!(
+            "Loaded Skills ({}): {}",
+            skill_count.to_string().cyan(),
+            skill_names
         );
         println!(
-            "{}",
-            "Tip: Type '/exit' to securely shut down the engine.\n".dimmed()
+            "Loaded Tools ({}): {}",
+            tool_count.to_string().yellow(),
+            tool_names
         );
-    } else {
-        println!(
-            "{}",
-            "Terminal input is disabled; use your enabled channel(s) (API, Slack, or Email)."
-                .cyan()
-        );
-        println!(
-            "{}",
-            "Tip: Press Ctrl+C to shut down the engine.\n".dimmed()
-        );
+        println!("{}", "=============================================".blue());
+        println!("\n{}", "Agent System is Running.".bold().green());
+        if terminal_chat_id.is_some() {
+            println!(
+                "{}",
+                "Available actions: type a message in the terminal or on active chat channels."
+                    .cyan()
+            );
+            println!(
+                "{}",
+                "Tip: Type '/exit' to securely shut down the engine.\n".dimmed()
+            );
+        } else {
+            println!(
+                "{}",
+                "Terminal input is disabled; use your enabled channel(s) (API, Slack, or Email)."
+                    .cyan()
+            );
+            println!(
+                "{}",
+                "Tip: Press Ctrl+C to shut down the engine.\n".dimmed()
+            );
+        }
     }
 
     // Route inbound messages from all channels into the agent and logger
@@ -568,6 +602,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
 
     let logger_tx_outbound = logger_bus_tx.clone();
     let delivery_channels = out_channels.clone();
+    let terminal_session_for_telemetry = terminal_chat_id.clone();
     tokio::spawn(async move {
         while let Some(msg) = global_outbound_rx.recv().await {
             // Deliver user-visible terminal traffic first. `LoggerHandle::send` uses a blocking
@@ -582,6 +617,26 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                                 chan.name(),
                                 e
                             );
+                        }
+                    }
+                }
+                BusMessage::Telemetry(TelemetryEvent::AgentThought { chat_id, thought }) => {
+                    if terminal_session_for_telemetry.as_deref() == Some(chat_id.as_str()) {
+                        let notice = build_agent_thought_terminal_notice(chat_id, thought);
+                        if let Some(chan) = delivery_channels.get("terminal") {
+                            if let Err(e) = chan.send(notice).await {
+                                log::error!("Failed to deliver AgentThought to terminal: {}", e);
+                            }
+                        }
+                    }
+                    if let Some(api_chan) = delivery_channels.get("api") {
+                        if let Some(api_chan) = api_chan.as_any().downcast_ref::<ApiChannel>() {
+                            api_chan
+                                .handle_telemetry(TelemetryEvent::AgentThought {
+                                    chat_id: chat_id.clone(),
+                                    thought: thought.clone(),
+                                })
+                                .await;
                         }
                     }
                 }
