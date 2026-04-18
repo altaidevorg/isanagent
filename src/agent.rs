@@ -787,20 +787,47 @@ impl Tool for LoadSkillTool {
         serde_json::json!({
             "type": "object",
             "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["load", "list"],
+                    "description": "Use 'list' to enumerate discovered skills. Use 'load' (default) to fetch one skill by name."
+                },
                 "skill_name": {
                     "type": "string",
-                    "description": "The exact name of the skill to load (e.g. 'tweet-author', 'code-reviewer')."
+                    "description": "Exact skill name when action is load (e.g. 'code_review')."
+                },
+                "detail": {
+                    "type": "string",
+                    "enum": ["full", "metadata"],
+                    "description": "When action is load: 'full' returns instruction body (default). 'metadata' returns name, availability, description, and body length without the full body."
                 }
-            },
-            "required": ["skill_name"]
+            }
         })
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("load");
+
+        if action == "list" {
+            return Ok(self.registry.format_skill_directory());
+        }
+
         let skill_name = args
             .get("skill_name")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| "Missing required parameter 'skill_name'".to_string())?;
+            .ok_or_else(|| "Missing 'skill_name' when action is load (default).".to_string())?;
+
+        let detail = args
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or("full");
+
+        if detail == "metadata" {
+            return self.registry.get_skill_metadata(skill_name);
+        }
 
         self.registry.get_skill_instructions(skill_name)
     }
@@ -1211,5 +1238,43 @@ mod tests {
         .expect("tool result");
 
         assert_eq!(result, "tool complete");
+    }
+
+    #[tokio::test]
+    async fn load_skill_tool_supports_list_and_metadata() {
+        let root = LocalTempDir::new();
+        let skills_root = root.path().join("skills");
+        let skill_dir = skills_root.join("lint_skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: lint_skill\ndescription: Lint helper\n---\n\ndo things\n",
+        )
+        .unwrap();
+        let reg = Arc::new(SkillRegistry::new(skills_root));
+        let tool = super::LoadSkillTool {
+            registry: reg.clone(),
+        };
+        let listed = tool
+            .execute(serde_json::json!({ "action": "list" }))
+            .await
+            .unwrap();
+        assert!(listed.contains("lint_skill"), "{}", listed);
+
+        let meta = tool
+            .execute(serde_json::json!({
+                "skill_name": "lint_skill",
+                "detail": "metadata"
+            }))
+            .await
+            .unwrap();
+        assert!(meta.contains("Instruction length:"));
+        assert!(meta.contains("Available: true"));
+
+        let full = tool
+            .execute(serde_json::json!({ "skill_name": "lint_skill", "detail": "full" }))
+            .await
+            .unwrap();
+        assert!(full.contains("do things"));
     }
 }

@@ -29,6 +29,7 @@ use isanagent::tools::builtin::{
     CronTool, EditFileTool, GlobFilesTool, ListDirTool, MessageTool, ReadFileTool, SearchTextTool,
     ShellExecTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
+use isanagent::tools::workflow::{TodoStore, TodoWriteTool, ToolSearchTool};
 use isanagent::tools::ToolRegistry;
 use isanagent::workspace::{resolve_workspace_root, IsanagentWorkspace};
 use isanagent::{NodeHandle, Supervisor, SupervisorPolicy};
@@ -267,6 +268,17 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     }));
     tools.register(Box::new(isanagent::tools::builtin::FetchMemoryByDateTool {
         memory_node: memory_node.clone(),
+    }));
+
+    let todo_store = TodoStore::try_new(
+        workspace.db_path(),
+        Some(workspace.dir.join("todos")),
+    )
+    .map_err(std::io::Error::other)?;
+    tools.register(Box::new(TodoWriteTool { store: todo_store }));
+    let tool_catalog = tools.catalog_handle();
+    tools.register(Box::new(ToolSearchTool {
+        catalog: tool_catalog,
     }));
 
     // 5. Setup Provider (Dynamic from config)

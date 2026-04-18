@@ -22,7 +22,9 @@ The agent is explicitly designed to run inside a sandbox. `IsanagentWorkspace` m
 1. `workspace_dir` (Outer Rim): Holds `config.toml`, generated logs, and `.system_generated` internal sqlite caches.
 2. `sandbox_dir` (Inner Rim): This is the designated execution field, usually `workspace_dir/.agents`. This is where the Agent expects to load `AGENTS.md` and read `skills/`.
 
-If you are writing a new `Tool` that mutates the disk or reads files, **DO NOT** let the Agent pass absolute system paths cleanly. You MUST wrap the injection using `crate::utils::resolve_path(&sandbox_dir, &agent_path)`. Doing so naturally bounds all agent `../` directory escapes to the sandbox boundary.
+If you are writing a new `Tool` that mutates the disk or reads files, **DO NOT** let the Agent pass absolute system paths cleanly. You MUST wrap the injection using `crate::utils::resolve_path(&sandbox_dir, &agent_path`). Doing so naturally bounds all agent `../` directory escapes to the sandbox boundary.
+
+Harness todo lists (`todo_write`) are stored in the workspace SQLite DB (same file as session memory: `<workspace_dir>/.system_generated/agent_memory.db`, table `harness_todos`). A legacy `<workspace_dir>/todos/*.json` folder from older builds is imported once on startup and then those files are removed.
 
 ### Structured LLM Extraction
 If you are asking the LLM to yield a structured JSON payload internally (e.g. for reflection or summarization outside of the standard `ToolCall` registry):
@@ -33,7 +35,7 @@ If you are asking the LLM to yield a structured JSON payload internally (e.g. fo
 
 Tools act as the fundamental abilities the Agent uses via JSON schema during its core sequential processing loop inside `AgentLogic`.
 
-1. **Implement `Tool`**: Create a struct in `src/tools/builtin.rs` and implement the `async_trait` `Tool`.
+1. **Implement `Tool`**: Create a struct in `src/tools/builtin.rs` (filesystem / web / shell) or `src/tools/workflow.rs` (session todos, tool search, etc.) and implement the `async_trait` `Tool`.
    - `name`: Strict string representing the tool call name.
    - `description`: The prompt instruction to the LLM on *how* to use it.
    - `input_schema`: Use `serde_json::json!` to define a rigid JSON schema the LLM must map arguments to.

@@ -18,11 +18,21 @@ This document tracks expanding the built-in tool surface toward a strong **code-
 | `search_text` | Regex search across files: ripgrep when available, Rust fallback otherwise. |
 | `edit_file` (extended) | Optional `replace_all`; unified diff snippet in the result. |
 
-### Phase 2 — Workflow
+### Phase 2 — Workflow (implemented)
 
-- Structured todo list tool keyed by session (`chat_id`), not a process-global buffer.
-- Lightweight search over registered tool names/descriptions for large tool sets.
-- Skill loading: align optional “invoke” or preview behavior with existing `load_skill_instructions` where useful.
+| Piece | Implementation |
+|--------|----------------|
+| Session todos | `todo_write` with `chat_id` + `items[]`; persisted in `agent_memory.db` (`harness_todos`). Legacy `todos/*.json` is migrated once if present. |
+| Tool discovery | `search_tools` over a live catalog mirrored on each `ToolRegistry::register`; `list_tools` follows registration order. |
+| Skills | `load_skill_instructions`: `action: list`, `detail: metadata` vs full body; `SkillRegistry::format_skill_directory` / `get_skill_metadata`. |
+
+**Tests:** `tools::registry_tests`, `tools::tool_index_tests`, `tools::workflow::tests`, `skills::skill_metadata_tests`, `agent::tests::load_skill_tool_supports_list_and_metadata`.
+
+## Phase 2 acceptance
+
+- `todo_write` replaces the list for a given `chat_id`; other chats are unchanged; at most 200 items; statuses validated; survives process restart (SQLite `harness_todos`).
+- `search_tools` returns scored hits from the live catalog; `limit` clamped 1–40.
+- `load_skill_instructions` with `action: "list"` returns a directory; with `detail: "metadata"` returns stats without the instruction body; default load still returns full instructions for available skills.
 
 ### Phase 3 — User clarification
 

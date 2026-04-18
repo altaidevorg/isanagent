@@ -79,6 +79,27 @@ type SessionMessageSinceReflectionRow = (i64, ChatMessage);
 type GetMessagesSinceReflectionResult =
     Result<(Vec<SessionMessageSinceReflectionRow>, Option<i64>), String>;
 
+/// How long SQLite waits on `SQLITE_BUSY` before failing (memory + `harness_todos` share one file).
+pub const AGENT_SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
+
+/// PRAGMAs for file-backed agent DB handles (`SqliteMemoryActor`, [`crate::tools::workflow::TodoStore`]).
+pub fn configure_agent_sqlite_connection(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.busy_timeout(std::time::Duration::from_millis(AGENT_SQLITE_BUSY_TIMEOUT_MS))
+}
+
+/// Schema for [`crate::tools::workflow::TodoStore`] (same DB as agent memory).
+pub fn ensure_harness_todos_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS harness_todos (
+            chat_id TEXT PRIMARY KEY NOT NULL,
+            items_json TEXT NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SummaryEntry {
     pub id: i64,
@@ -191,6 +212,7 @@ impl SqliteMemoryActor {
     /// `db_path`: Path to the SQLite DB file. Use ":memory:" for in-memory.
     pub fn new(db_path: &str) -> Result<Self, rusqlite::Error> {
         let conn = Connection::open(db_path)?;
+        configure_agent_sqlite_connection(&conn)?;
 
         // Create the messages table if it doesn't exist
         conn.execute(
@@ -283,6 +305,8 @@ impl SqliteMemoryActor {
             )",
             [],
         )?;
+
+        ensure_harness_todos_schema(&conn)?;
 
         Ok(Self { conn })
     }
