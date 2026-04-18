@@ -30,6 +30,8 @@ User clarification (`ask_user`) sends an outbound message tagged with metadata `
 
 Git worktrees (`git_worktree`): **off by default**. Set `[harness.git_worktree] enabled = true` in `config.toml` to register the tool. Worktree paths use the same `resolve_path` sandbox rules as other filesystem tools unless `allow_path_outside_sandbox = true`, which permits canonical paths outside the sandbox (for example a host temp directory). See `docs/harness-implementation-plan.md` Phase 4.
 
+Sub-agents (`subagent_spawn`, `task_*`, `subagent_plan_execute`): **off by default** via `[harness.subagents] enabled = true`. Sub-agents run a second `run_reasoning_loop` with a synthetic chat id (`subagent-…`) and optional tool allowlist. `cancel_children_on_parent_cancel` (default true) controls whether cancelling or superseding the parent chat’s reasoning also cancels those child tasks. See `docs/harness-implementation-plan.md` Phase 5.
+
 ### Structured LLM Extraction
 If you are asking the LLM to yield a structured JSON payload internally (e.g. for reflection or summarization outside of the standard `ToolCall` registry):
 **DO NOT** use brittle string matching like `text.find('{')`. 
@@ -100,7 +102,7 @@ If you add a new metric or LLM analytics block, format it explicitly as a `BusMe
 ## 🧠 Memory & Reflection Pipelines
 
 The memory system has two distinct phases operating under the Actor loop:
-1. **Active Auto-Compaction** (`src/agent.rs`): If an active chat exceeds token/turn limits, a blocking summarization request is made, saved out to `SqliteMemoryActor` safely, and the raw history buffers are cleared to protect context limits.
+1. **Active Auto-Compaction** (`src/agent/mod.rs`): If an active chat exceeds token/turn limits, a blocking summarization request is made, saved out to `SqliteMemoryActor` safely, and the raw history buffers are cleared to protect context limits.
 2. **Idle Background Reflection** (`src/reflection.rs`): An asynchronous supervisor checks idle sessions on an interval. When a predefined threshold of SQLite summaries is reached, it spawns a task converting them into a single `MEMORY.md` file saved physically to the `workspace_dir`.
 
 

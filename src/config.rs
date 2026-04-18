@@ -10,6 +10,23 @@ pub struct TerminalConfig {
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct HarnessConfig {
     pub git_worktree: Option<GitWorktreeConfig>,
+    /// Background sub-agents, task tools, and optional plan execution (Phase 5).
+    pub subagents: Option<SubagentHarnessConfig>,
+}
+
+/// Sub-agent / task harness. Disabled unless `[harness.subagents] enabled = true`.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct SubagentHarnessConfig {
+    pub enabled: Option<bool>,
+    /// When true (default), cancelling the parent chat's reasoning (new inbound or `Cancel`) also
+    /// cancels in-flight sub-agent tasks that were spawned from that chat.
+    pub cancel_children_on_parent_cancel: Option<bool>,
+    /// If set and non-empty, sub-agents may only call these tool names (main chat is unaffected).
+    pub allowed_tools: Option<Vec<String>>,
+    /// Max concurrent tasks per process (default 32, clamped 1–256).
+    pub max_tasks: Option<usize>,
+    /// Max seconds `subagent_spawn` may block when `wait` is true (default 300, clamped 10–3600).
+    pub max_wait_secs: Option<u64>,
 }
 
 /// Git worktree helpers (`git_worktree` tool). Disabled unless `[harness.git_worktree] enabled = true`.
@@ -150,6 +167,60 @@ impl AppConfig {
             .and_then(|h| h.git_worktree.as_ref())
             .and_then(|g| g.allow_path_outside_sandbox)
             .unwrap_or(false)
+    }
+
+    /// `[harness.subagents] enabled = true` registers task / spawn / plan tools.
+    pub fn subagent_harness_enabled(&self) -> bool {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.subagents.as_ref())
+            .and_then(|s| s.enabled)
+            .unwrap_or(false)
+    }
+
+    /// Default true: parent chat cancel also cancels that chat's sub-agent tasks.
+    pub fn subagent_cancel_children_on_parent_cancel(&self) -> bool {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.subagents.as_ref())
+            .and_then(|s| s.cancel_children_on_parent_cancel)
+            .unwrap_or(true)
+    }
+
+    pub fn subagent_allowed_tools_set(&self) -> Option<std::collections::HashSet<String>> {
+        let v = self
+            .harness
+            .as_ref()
+            .and_then(|h| h.subagents.as_ref())
+            .and_then(|s| s.allowed_tools.as_ref())?;
+        if v.is_empty() {
+            return None;
+        }
+        Some(v.iter().cloned().collect())
+    }
+
+    pub fn subagent_max_tasks(&self) -> usize {
+        const DEFAULT: usize = 32;
+        const MIN: usize = 1;
+        const MAX: usize = 256;
+        self.harness
+            .as_ref()
+            .and_then(|h| h.subagents.as_ref())
+            .and_then(|s| s.max_tasks)
+            .unwrap_or(DEFAULT)
+            .clamp(MIN, MAX)
+    }
+
+    pub fn subagent_max_wait_secs(&self) -> u64 {
+        const DEFAULT: u64 = 300;
+        const MIN: u64 = 10;
+        const MAX: u64 = 3600;
+        self.harness
+            .as_ref()
+            .and_then(|h| h.subagents.as_ref())
+            .and_then(|s| s.max_wait_secs)
+            .unwrap_or(DEFAULT)
+            .clamp(MIN, MAX)
     }
 }
 

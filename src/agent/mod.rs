@@ -1,9 +1,12 @@
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
+
+mod subagent;
+pub use subagent::SubagentHarness;
 
 use crate::clarification::ClarificationHub;
 use crate::tool_runtime::ToolExecCtx;
@@ -29,6 +32,8 @@ enum ToolExecutionFinished {
 struct ToolCallRuntime {
     session: ToolExecCtx,
     hub: Arc<ClarificationHub>,
+    is_subagent: bool,
+    subagent_allowlist: Option<Arc<HashSet<String>>>,
 }
 
 /// Runs a tool with optional per-call activity heartbeats and optional cooperative cancellation.
@@ -54,11 +59,22 @@ async fn execute_tool_call_with_activity(
             .as_ref()
             .map(|a| a.start(chat_id.as_str(), tool_name.as_str()));
 
+        let is_subagent = runtime.is_subagent;
+        let allow = runtime.subagent_allowlist.clone();
         let completed = match cancel_owned.as_ref() {
-            None => Some(tools.execute_tool(&tool_name, args).await),
+            None => Some(
+                tools
+                    .execute_tool_scoped(&tool_name, args, allow.as_deref(), is_subagent)
+                    .await,
+            ),
             Some(token) => {
                 tokio::select! {
-                    res = tools.execute_tool(&tool_name, args) => Some(res),
+                    res = tools.execute_tool_scoped(
+                        &tool_name,
+                        args,
+                        allow.as_deref(),
+                        is_subagent,
+                    ) => Some(res),
                     _ = token.cancelled() => None,
                 }
             }
@@ -80,25 +96,28 @@ async fn execute_tool_call_with_activity(
 }
 
 /// Bundles everything needed to run one inbound reasoning task (spawned from `AgentLogic::process`).
-struct ReasoningLoopCtx {
-    name: String,
-    provider: Box<dyn Provider>,
-    session_manager: Arc<SessionManager>,
-    tools: Arc<ToolRegistry>,
-    skills: Arc<SkillRegistry>,
-    system_prompt: String,
-    max_iterations: usize,
-    max_tool_output_chars: usize,
-    max_recent_summaries: usize,
-    short_term_threshold_turns: usize,
-    short_term_threshold_tokens: usize,
-    tool_execution_activity: Option<SharedToolExecutionActivity>,
-    outbound_tx: mpsc::Sender<BusMessage>,
-    logger_tx: LoggerHandle,
-    inbound: crate::bus::InboundMessage,
-    cancel_token: tokio_util::sync::CancellationToken,
-    clarification_hub: Arc<ClarificationHub>,
-    tool_exec_ctx: ToolExecCtx,
+pub(crate) struct ReasoningLoopCtx {
+    pub(crate) name: String,
+    pub(crate) provider: Box<dyn Provider>,
+    pub(crate) session_manager: Arc<SessionManager>,
+    pub(crate) tools: Arc<ToolRegistry>,
+    pub(crate) skills: Arc<SkillRegistry>,
+    pub(crate) system_prompt: String,
+    pub(crate) max_iterations: usize,
+    pub(crate) max_tool_output_chars: usize,
+    pub(crate) max_recent_summaries: usize,
+    pub(crate) short_term_threshold_turns: usize,
+    pub(crate) short_term_threshold_tokens: usize,
+    pub(crate) tool_execution_activity: Option<SharedToolExecutionActivity>,
+    pub(crate) outbound_tx: mpsc::Sender<BusMessage>,
+    pub(crate) logger_tx: LoggerHandle,
+    pub(crate) inbound: crate::bus::InboundMessage,
+    pub(crate) cancel_token: tokio_util::sync::CancellationToken,
+    pub(crate) clarification_hub: Arc<ClarificationHub>,
+    pub(crate) tool_exec_ctx: ToolExecCtx,
+    /// When true, tool list / execution use sub-agent allowlist and deny nested spawn/plan tools.
+    pub(crate) is_subagent: bool,
+    pub(crate) subagent_allowlist: Option<Arc<HashSet<String>>>,
 }
 
 /// Constructor arguments for [`AgentLogic`], grouped to keep call sites readable.
@@ -117,6 +136,17 @@ pub struct AgentLogicParams {
     pub outbound_tx: mpsc::Sender<BusMessage>,
     pub logger_tx: LoggerHandle,
     pub clarification_hub: Arc<ClarificationHub>,
+    /// When set, registers `subagent_*` / `task_*` tools and wires [`SubagentHarness`].
+    pub subagent: Option<SubagentHarnessParams>,
+}
+
+/// Build-time options for the Phase 5 sub-agent harness (see `[harness.subagents]`).
+#[derive(Clone, Debug)]
+pub struct SubagentHarnessParams {
+    pub cancel_children_on_parent_cancel: bool,
+    pub allowed_tools: Option<Arc<HashSet<String>>>,
+    pub max_tasks: usize,
+    pub max_wait_secs: u64,
 }
 
 /// The central logic for an autonomous Agent running inside an ActorNode.
@@ -138,6 +168,7 @@ pub struct AgentLogic {
     logger_tx: LoggerHandle,
     cancellation_tokens: Arc<dashmap::DashMap<String, Arc<tokio_util::sync::CancellationToken>>>,
     clarification_hub: Arc<ClarificationHub>,
+    subagent_harness: Option<Arc<SubagentHarness>>,
 }
 
 impl AgentLogic {
@@ -157,14 +188,42 @@ impl AgentLogic {
             outbound_tx,
             logger_tx,
             clarification_hub,
+            subagent,
         } = params;
+
+        let session_manager = Arc::new(session_manager);
+        let skills = Arc::new(skills);
+        let tools = Arc::new(tools);
+
+        let subagent_harness = subagent.map(|p| {
+            Arc::new(SubagentHarness::new(subagent::SubagentSpawnDeps {
+                agent_name: name.clone(),
+                provider_template: dyn_clone::clone_box(&*provider),
+                session_manager: session_manager.clone(),
+                skills: skills.clone(),
+                system_prompt: system_prompt.clone(),
+                max_iterations,
+                max_tool_output_chars,
+                max_recent_summaries,
+                short_term_threshold_turns,
+                short_term_threshold_tokens,
+                tool_execution_activity: None,
+                outbound_tx: outbound_tx.clone(),
+                logger_tx: logger_tx.clone(),
+                clarification_hub: clarification_hub.clone(),
+                cancel_children_on_parent_cancel: p.cancel_children_on_parent_cancel,
+                default_allowlist: p.allowed_tools.clone(),
+                max_tasks: p.max_tasks,
+                max_wait_secs: p.max_wait_secs,
+            }))
+        });
 
         let mut agent = Self {
             name,
             provider,
-            session_manager: Arc::new(session_manager),
-            tools: Arc::new(tools),
-            skills: Arc::new(skills),
+            session_manager,
+            tools,
+            skills,
             system_prompt,
             max_iterations,
             max_tool_output_chars,
@@ -176,16 +235,24 @@ impl AgentLogic {
             logger_tx,
             cancellation_tokens: Arc::new(dashmap::DashMap::new()),
             clarification_hub,
+            subagent_harness: subagent_harness.clone(),
         };
 
-        // Inject the skill loader tool automatically
+        let tools_mut = Arc::get_mut(&mut agent.tools)
+            .expect("expected unique ownership of tools registry during initialization");
+        if let Some(ref h) = subagent_harness {
+            subagent::register_subagent_tools(tools_mut, h.clone());
+        }
         let skill_reg = agent.skills.clone();
         let loader_tool = LoadSkillTool {
             registry: skill_reg,
         };
-        let tools_mut = Arc::get_mut(&mut agent.tools)
-            .expect("expected unique ownership of tools registry during initialization");
         tools_mut.register(Box::new(loader_tool));
+
+        if let Some(ref h) = subagent_harness {
+            h.bind_tools(agent.tools.clone())
+                .expect("subagent bind_tools after unique registry init");
+        }
 
         agent
     }
@@ -215,6 +282,8 @@ impl AgentLogic {
             ToolCallRuntime {
                 session: ToolExecCtx::new("test", chat_id, None),
                 hub: self.clarification_hub.clone(),
+                is_subagent: false,
+                subagent_allowlist: None,
             },
         )
         .await
@@ -241,6 +310,11 @@ impl ActorLogic<BusMessage> for AgentLogic {
     ) -> Result<Option<(String, BusMessage)>, ActorError> {
         match packet {
             BusMessage::Cancel(chat_id) => {
+                if let Some(h) = &self.subagent_harness {
+                    if h.cancel_children_on_parent_cancel() {
+                        h.cancel_children_for_parent(&chat_id);
+                    }
+                }
                 if let Some((_, token)) = self.cancellation_tokens.remove(&chat_id) {
                     token.cancel();
                     let _ = self.logger_tx.send(BusMessage::Log(
@@ -285,6 +359,11 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 // 1. If there's an existing reasoning loop for this chat, cancel it first.
                 // This ensures only one active reasoning task per conversation.
                 if let Some((_, old_token)) = self.cancellation_tokens.remove(&chat_id) {
+                    if let Some(h) = &self.subagent_harness {
+                        if h.cancel_children_on_parent_cancel() {
+                            h.cancel_children_for_parent(&chat_id);
+                        }
+                    }
                     old_token.cancel();
                     let _ = self.logger_tx.send(BusMessage::Log(
                         LogEvent::debug(
@@ -320,7 +399,8 @@ impl ActorLogic<BusMessage> for AgentLogic {
                     inbound.channel.clone(),
                     inbound.chat_id.clone(),
                     inbound.thread_id.clone(),
-                );
+                )
+                .with_reasoning_cancel(cancel_token.as_ref().clone());
                 let inbound_channel = inbound.channel.clone();
                 let inbound_thread_id = inbound.thread_id.clone();
 
@@ -356,6 +436,8 @@ impl ActorLogic<BusMessage> for AgentLogic {
                         cancel_token: task_token_arc.as_ref().clone(),
                         clarification_hub,
                         tool_exec_ctx,
+                        is_subagent: false,
+                        subagent_allowlist: None,
                     })
                     .await;
 
@@ -418,7 +500,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
 }
 
 impl AgentLogic {
-    async fn run_reasoning_loop(ctx: ReasoningLoopCtx) -> Result<(), String> {
+    pub(crate) async fn run_reasoning_loop(ctx: ReasoningLoopCtx) -> Result<(), String> {
         let ReasoningLoopCtx {
             name,
             provider,
@@ -438,6 +520,8 @@ impl AgentLogic {
             cancel_token,
             clarification_hub,
             tool_exec_ctx,
+            is_subagent,
+            subagent_allowlist,
         } = ctx;
 
         let session_key = tool_exec_ctx.session_key.clone();
@@ -550,7 +634,9 @@ impl AgentLogic {
             ));
 
             // Call Provider
-            let tools_payload = Some(serde_json::json!(tools.list_tools()));
+            let tools_payload = Some(serde_json::json!(
+                tools.list_tools_scoped(subagent_allowlist.as_deref(), is_subagent)
+            ));
 
             // Call Provider with cancellation support
             let response = tokio::select! {
@@ -652,6 +738,8 @@ impl AgentLogic {
                         ToolCallRuntime {
                             session: tool_exec_ctx.clone(),
                             hub: clarification_hub.clone(),
+                            is_subagent,
+                            subagent_allowlist: subagent_allowlist.clone(),
                         },
                     )
                     .await
@@ -1166,6 +1254,7 @@ mod tests {
             outbound_tx,
             logger_tx,
             clarification_hub: ClarificationHub::shared(),
+            subagent: None,
         });
 
         if let Some(tool_execution_activity) = tool_execution_activity {

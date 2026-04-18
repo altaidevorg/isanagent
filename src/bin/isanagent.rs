@@ -378,6 +378,22 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         None
     };
 
+    let subagent = if workspace.config.subagent_harness_enabled() {
+        Some(isanagent::agent::SubagentHarnessParams {
+            cancel_children_on_parent_cancel: workspace
+                .config
+                .subagent_cancel_children_on_parent_cancel(),
+            allowed_tools: workspace
+                .config
+                .subagent_allowed_tools_set()
+                .map(std::sync::Arc::new),
+            max_tasks: workspace.config.subagent_max_tasks(),
+            max_wait_secs: workspace.config.subagent_max_wait_secs(),
+        })
+    } else {
+        None
+    };
+
     let agent_logic = AgentLogic::new(AgentLogicParams {
         name: "Altbot".to_string(),
         provider,
@@ -393,6 +409,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         outbound_tx: global_outbound_tx.clone(),
         logger_tx: logger_bus_tx.clone(),
         clarification_hub,
+        subagent,
     });
     let agent_logic = if let Some(tool_execution_activity) = tool_execution_activity {
         agent_logic.with_tool_execution_activity(tool_execution_activity)
