@@ -59,6 +59,7 @@ tokio-util = "0.7.18"
 ratatui = "0.29"
 pulldown-cmark = "0.12"
 unicode-width = "0.2"
+arboard = { version = "3.4", default-features = false }
 
 [profile.dev]
 debug = false

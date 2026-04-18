@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use ratatui::layout::Rect;
+
 /// High-level UI mode for the terminal front-end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TerminalUiMode {
@@ -14,6 +16,8 @@ pub enum TerminalUiMode {
 pub enum ToolNoticePhase {
     Call,
     Result,
+    /// Tool returned an error string (e.g. `Error: …`).
+    Failed,
     Other,
 }
 
@@ -36,8 +40,14 @@ pub enum Cell {
     },
     Clarification {
         text: String,
+        /// From `ask_user` when provided; shown as a numbered list in the terminal.
+        choices: Vec<String>,
     },
     System {
+        message: String,
+    },
+    /// Agent / provider failure surfaced in-session (not only logs).
+    Error {
         message: String,
     },
 }
@@ -59,6 +69,10 @@ pub struct App {
     /// Upper bound on `scroll_offset`, set by the renderer from wrapped line counts.
     pub max_scroll: u16,
     pub should_quit: bool,
+    /// LLM loop active for this session (cleared on assistant reply, error, or clarification).
+    pub thinking: bool,
+    /// Last drawn transcript widget area (for mouse wheel hit-testing).
+    pub last_transcript_rect: Option<Rect>,
 }
 
 impl Default for App {
@@ -82,6 +96,8 @@ impl App {
             scroll_offset: 0,
             max_scroll: 0,
             should_quit: false,
+            thinking: false,
+            last_transcript_rect: None,
         }
     }
 

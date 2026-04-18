@@ -30,6 +30,11 @@ fn truncate_display(s: &str, max_chars: usize) -> String {
     format!("{shortened}…")
 }
 
+fn tool_result_looks_like_failure(result: &str) -> bool {
+    let t = result.trim_start();
+    t.starts_with("Error:") || t.starts_with("error:")
+}
+
 fn summarize_tool_result_for_terminal(result: &str) -> String {
     let t = result.trim();
     if t.is_empty() {
@@ -95,12 +100,33 @@ pub fn build_tool_result_terminal_notice(
     let content = format!("{tool_name} → {summary}");
     let mut metadata = HashMap::new();
     metadata.insert(ISANAGENT_TOOL_NOTIFY.to_string(), json!(true));
-    metadata.insert(ISANAGENT_TOOL_PHASE.to_string(), json!("result"));
+    let phase = if tool_result_looks_like_failure(result) {
+        "fail"
+    } else {
+        "result"
+    };
+    metadata.insert(ISANAGENT_TOOL_PHASE.to_string(), json!(phase));
     OutboundMessage {
         channel: "terminal".to_string(),
         chat_id: chat_id.to_string(),
         thread_id: None,
         content,
+        metadata,
+    }
+}
+
+/// Transcript cell for reasoning / provider failures (styled error rail).
+pub fn build_terminal_error_notice(chat_id: &str, message: &str) -> OutboundMessage {
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        crate::channels::terminal_ui::protocol::ISANAGENT_TERMINAL_ERROR.to_string(),
+        json!(true),
+    );
+    OutboundMessage {
+        channel: "terminal".to_string(),
+        chat_id: chat_id.to_string(),
+        thread_id: None,
+        content: message.to_string(),
         metadata,
     }
 }
@@ -113,6 +139,8 @@ pub struct TerminalChannel {
     /// All user-supplied `@<filepath>` references are resolved relative to this
     /// directory.  Paths that escape the sandbox boundary are silently rejected.
     sandbox_dir: PathBuf,
+    /// Provider model id for the status line (e.g. from config).
+    status_model: String,
     /// Outbound messages for the Ratatui thread (set when `start` succeeds).
     outbound_ui_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<OutboundMessage>>>>,
 }
@@ -123,12 +151,14 @@ impl TerminalChannel {
         logger_tx: LoggerHandle,
         shutdown_tx: tokio::sync::mpsc::UnboundedSender<()>,
         sandbox_dir: PathBuf,
+        status_model: String,
     ) -> Self {
         Self {
             chat_id: chat_id.to_string(),
             logger_tx,
             shutdown_tx,
             sandbox_dir,
+            status_model,
             outbound_ui_tx: Arc::new(Mutex::new(None)),
         }
     }
@@ -153,6 +183,7 @@ For headless or piped runs, set [terminal] enable = false in config.toml (requir
 
         let channel_name = self.name().to_string();
         let chat_id_clone = self.chat_id.clone();
+        let status_model = self.status_model.clone();
         let logger_tx = self.logger_tx.clone();
         let shutdown_tx = self.shutdown_tx.clone();
         let sandbox_dir = self.sandbox_dir.clone();
@@ -194,6 +225,7 @@ For headless or piped runs, set [terminal] enable = false in config.toml (requir
                     chat_id_clone,
                     channel_name,
                     session_banner,
+                    status_model,
                 );
                 if let Ok(mut g) = bridge.lock() {
                     *g = None;

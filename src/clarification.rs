@@ -7,6 +7,8 @@ use tokio::sync::oneshot;
 
 /// Outbound [`crate::bus::OutboundMessage::metadata`] key: UI / terminal can style clarification prompts.
 pub const METADATA_CLARIFICATION: &str = "isanagent_clarification";
+/// Optional JSON array of strings (`ask_user` choices); UIs can render as a numbered list without parsing body text.
+pub const METADATA_CLARIFICATION_CHOICES: &str = "isanagent_clarification_choices";
 
 /// Routes the next inbound message for a session key to a pending `ask_user` tool call.
 #[derive(Debug, Default)]

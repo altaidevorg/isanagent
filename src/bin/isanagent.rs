@@ -402,6 +402,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             logger_bus_tx.clone(),
             shutdown_tx.clone(),
             workspace.sandbox_dir.clone(),
+            model_name.clone(),
         ));
         terminal.start(bus_tx.clone()).await?;
         out_channels.insert(terminal.name().to_string(), terminal);
@@ -507,15 +508,6 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                 "Tip: Press Ctrl+C to shut down the engine.\n".dimmed()
             );
         }
-    } else {
-        eprintln!(
-            "{}",
-            format!(
-                "isanagent {} — Ratatui terminal UI (alternate screen). Logs still go to the configured sink.",
-                env!("CARGO_PKG_VERSION")
-            )
-            .dimmed()
-        );
     }
 
     // Route inbound messages from all channels into the agent and logger

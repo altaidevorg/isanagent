@@ -13,7 +13,9 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 
 use crate::bus::{BusMessage, OutboundMessage};
-use crate::clarification::{ClarificationHub, METADATA_CLARIFICATION};
+use crate::clarification::{
+    ClarificationHub, METADATA_CLARIFICATION, METADATA_CLARIFICATION_CHOICES,
+};
 use crate::memory::{configure_agent_sqlite_connection, ensure_harness_todos_schema};
 use crate::tool_runtime::current_tool_exec_ctx;
 use crate::traits::Tool;
@@ -406,6 +408,21 @@ const ASK_USER_TIMEOUT_SECS_MAX: u64 = 86_400;
 const ASK_USER_TIMEOUT_SECS_DEFAULT: u64 = 1_800;
 const ASK_USER_MAX_CHOICES: usize = 8;
 
+/// Exact option text wins; otherwise `1`..=`choices.len()` selects by 1-based index.
+fn resolve_ask_user_choice(trimmed: &str, choices: &[String]) -> Option<String> {
+    if choices.is_empty() {
+        return None;
+    }
+    if choices.iter().any(|c| c.as_str() == trimmed) {
+        return Some(trimmed.to_string());
+    }
+    let n: usize = trimmed.parse().ok()?;
+    if n >= 1 && n <= choices.len() {
+        return Some(choices[n - 1].clone());
+    }
+    None
+}
+
 #[async_trait]
 impl Tool for AskUserTool {
     fn name(&self) -> &str {
@@ -413,7 +430,7 @@ impl Tool for AskUserTool {
     }
 
     fn description(&self) -> &str {
-        "Ask the human a focused question and wait for their next reply in this chat. Use when you need a decision, missing detail, or confirmation before continuing. The user’s following message becomes this tool’s return value (not a new agent turn). Works in terminal and API channels when inbound messages reach the same session."
+        "Ask the human a focused question and wait for their next reply in this chat. Use when you need a decision, missing detail, or confirmation before continuing. The user’s following message becomes this tool’s return value (not a new agent turn). Works in terminal and API channels when inbound messages reach the same session. When `choices` is set, the user may answer with the exact option text or a 1-based index (1 = first choice)."
     }
 
     fn parameters(&self) -> Value {
@@ -426,7 +443,7 @@ impl Tool for AskUserTool {
                 },
                 "choices": {
                     "type": "array",
-                    "description": "Optional short list of allowed answers (max 8); shown with the prompt.",
+                    "description": "Optional short list of allowed answers (max 8); UIs may show numbered options. The user may reply with exact text or 1-based index (1 = first item).",
                     "items": { "type": "string" },
                     "maxItems": 8
                 },
@@ -502,18 +519,18 @@ impl Tool for AskUserTool {
 
         let mut body = String::from("The agent needs your input:\n\n");
         body.push_str(prompt);
-        if !choices.is_empty() {
-            body.push_str("\n\nOptions:\n");
-            for c in &choices {
-                body.push_str(&format!("- {}\n", c));
-            }
-        }
 
         let mut metadata = HashMap::new();
         metadata.insert(
             METADATA_CLARIFICATION.to_string(),
             serde_json::Value::Bool(true),
         );
+        if !choices.is_empty() {
+            metadata.insert(
+                METADATA_CLARIFICATION_CHOICES.to_string(),
+                serde_json::json!(choices),
+            );
+        }
 
         let outbound = OutboundMessage {
             channel: ctx.channel.clone(),
@@ -555,14 +572,21 @@ impl Tool for AskUserTool {
             );
         }
 
-        if !choices.is_empty() && !choices.iter().any(|c| c.as_str() == trimmed) {
-            return Ok(format!(
-                "User reply (not among listed choices): {}\n\nListed options were: {:?}",
-                reply, choices
-            ));
-        }
+        let canonical_reply = if choices.is_empty() {
+            reply.clone()
+        } else {
+            match resolve_ask_user_choice(trimmed, &choices) {
+                Some(s) => s,
+                None => {
+                    return Ok(format!(
+                        "User reply (not among listed choices): {}\n\nListed options were: {:?}",
+                        reply, choices
+                    ));
+                }
+            }
+        };
 
-        Ok(format!("User reply:\n{}", reply))
+        Ok(format!("User reply:\n{}", canonical_reply))
     }
 }
 
@@ -570,6 +594,7 @@ impl Tool for AskUserTool {
 mod tests {
     use super::*;
     use crate::bus::BusMessage;
+    use crate::clarification::METADATA_CLARIFICATION_CHOICES;
     use crate::tool_runtime::{with_tool_exec_scope, ToolExecCtx};
     use serde_json::json;
     use std::path::PathBuf;
@@ -587,6 +612,7 @@ mod tests {
             with_tool_exec_scope(ToolExecCtx::new("terminal", "u1", None), async move {
                 tool.execute(json!({
                     "prompt": "Which?",
+                    "choices": ["Red", "Blue"],
                     "timeout_secs": 30,
                     "allow_empty": true
                 }))
@@ -602,13 +628,65 @@ mod tests {
                     out.metadata.get(METADATA_CLARIFICATION),
                     Some(&serde_json::Value::Bool(true))
                 );
+                assert_eq!(
+                    out.metadata.get(METADATA_CLARIFICATION_CHOICES),
+                    Some(&json!(["Red", "Blue"]))
+                );
                 assert!(out.content.contains("Which?"));
+                assert!(!out.content.contains("Options:"));
             }
             _ => panic!("expected Outbound"),
         }
-        assert!(hub_signal.try_deliver_reply("terminal:u1:", "blue".into()));
+        assert!(hub_signal.try_deliver_reply("terminal:u1:", "Red".into()));
         let answer = join.await.expect("join").expect("tool ok");
-        assert!(answer.contains("blue"));
+        assert!(answer.contains("Red"));
+    }
+
+    #[tokio::test]
+    async fn ask_user_accepts_numeric_choice_index() {
+        let hub = Arc::new(ClarificationHub::new());
+        let (ob_tx, mut ob_rx) = mpsc::channel(8);
+        let tool = AskUserTool {
+            clarification_hub: hub.clone(),
+            outbound_tx: ob_tx,
+        };
+        let hub_signal = hub.clone();
+        let join = tokio::spawn(async move {
+            with_tool_exec_scope(ToolExecCtx::new("terminal", "u2", None), async move {
+                tool.execute(json!({
+                    "prompt": "Pick",
+                    "choices": ["Red", "Blue"],
+                    "timeout_secs": 30,
+                    "allow_empty": true
+                }))
+                .await
+            })
+            .await
+        });
+
+        let _ = ob_rx.recv().await.expect("outbound");
+        assert!(hub_signal.try_deliver_reply("terminal:u2:", "2".into()));
+        let answer = join.await.expect("join").expect("tool ok");
+        assert!(answer.contains("Blue"), "{answer}");
+    }
+
+    #[test]
+    fn resolve_ask_user_choice_exact_wins_over_index() {
+        let c = vec!["1".into(), "Red".into()];
+        assert_eq!(resolve_ask_user_choice("1", &c), Some("1".into()));
+    }
+
+    #[test]
+    fn resolve_ask_user_choice_by_one_based_index() {
+        let c = vec!["Red".into(), "Blue".into()];
+        assert_eq!(resolve_ask_user_choice("2", &c), Some("Blue".into()));
+    }
+
+    #[test]
+    fn resolve_ask_user_choice_rejects_invalid_index() {
+        let c = vec!["A".into(), "B".into()];
+        assert!(resolve_ask_user_choice("3", &c).is_none());
+        assert!(resolve_ask_user_choice("0", &c).is_none());
     }
 
     fn temp_todo_db(name: &str) -> PathBuf {

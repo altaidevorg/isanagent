@@ -323,6 +323,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                     inbound.chat_id.clone(),
                     inbound.thread_id.clone(),
                 );
+                let inbound_channel = inbound.channel.clone();
 
                 tokio::spawn(async move {
                     let task_chat_id = chat_id.clone();
@@ -370,6 +371,13 @@ impl ActorLogic<BusMessage> for AgentLogic {
                             )
                             .with_chat_id(&task_chat_id),
                         ));
+                        if inbound_channel == "terminal" {
+                            let notice = crate::channels::terminal::build_terminal_error_notice(
+                                &task_chat_id,
+                                &e,
+                            );
+                            let _ = outbound_tx.send(BusMessage::Outbound(notice)).await;
+                        }
                     } else if task_token_arc.is_cancelled() {
                         let _ = logger_tx.send(BusMessage::Log(
                             LogEvent::info(
