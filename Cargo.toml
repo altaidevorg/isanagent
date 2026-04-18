@@ -39,7 +39,8 @@ uuid = { version = "1.21.0", features = ["v4"] }
 toml = "1.0.3"
 tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3.32"
-crossterm = "0.29.0"
+# Align with ratatui's crossterm backend (avoids duplicate crossterm versions).
+crossterm = "0.28"
 colored = "3.1.1"
 clap = { version = "4.5.60", features = ["derive"] }
 axum = "0.8.8"
@@ -55,6 +56,9 @@ hex = "0.4.3"
 base64 = "0.22.1"
 async-stream = "0.3"
 tokio-util = "0.7.18"
+ratatui = "0.29"
+pulldown-cmark = "0.12"
+unicode-width = "0.2"
 
 [profile.dev]
 debug = false
