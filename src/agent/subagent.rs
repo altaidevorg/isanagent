@@ -280,8 +280,10 @@ impl SubagentHarness {
                         .store(ST_FAILED, std::sync::atomic::Ordering::Release);
                 }
             }
-            rec.done.notify_waiters();
+            // Drop from the index before waking `wait=true` callers so `task_list` does not
+            // briefly show a finished task after a blocking spawn returns.
             tasks.remove(&tid);
+            rec.done.notify_waiters();
         });
 
         if wait {
@@ -451,7 +453,7 @@ impl Tool for TaskGetTool {
     }
 
     fn description(&self) -> &str {
-        "Get status snapshot JSON for a sub-agent task owned by the current chat."
+        "Get status snapshot JSON for a sub-agent task still listed for this chat. Completed tasks are dropped from the table quickly; use subagent_spawn with wait=true for the `result` text in the spawn response."
     }
 
     fn parameters(&self) -> Value {
