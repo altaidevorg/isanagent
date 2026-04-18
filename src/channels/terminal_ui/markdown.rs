@@ -337,7 +337,7 @@ mod tests {
         let md = "**AA** **BB**";
         let lines = assistant_markdown_lines(md, 8);
         assert!(
-            lines.len() >= 1,
+            !lines.is_empty(),
             "expected wrapped lines, got {:?}",
             lines.len()
         );

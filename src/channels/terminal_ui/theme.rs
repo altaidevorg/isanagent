@@ -8,10 +8,10 @@ static USE_ANSI_COLOR: AtomicBool = AtomicBool::new(true);
 
 /// Read [`NO_COLOR`](https://no-color.org/) and store whether to emit ANSI colors. Call once from the Ratatui entry before the first draw.
 pub fn init_from_env() {
-    let allow = match std::env::var_os("NO_COLOR") {
-        Some(s) if !s.is_empty() => false,
-        _ => true,
-    };
+    let allow = !matches!(
+        std::env::var_os("NO_COLOR"),
+        Some(s) if !s.is_empty()
+    );
     USE_ANSI_COLOR.store(allow, Ordering::Relaxed);
 }
 

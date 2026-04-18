@@ -464,7 +464,7 @@ fn build_status_line(
             ToastKind::Ok => Theme::tool_done(),
             ToastKind::Err => Theme::error(),
         };
-        let t = truncate_chars_display(msg, max_width.max(12).min(120));
+        let t = truncate_chars_display(msg, max_width.clamp(12, 120));
         groups.insert(0, vec![Span::styled(t, style), Span::styled(" · ", dim)]);
     }
     line_from_chunk_groups(groups, max_width)
@@ -541,17 +541,31 @@ fn copy_last_assistant_to_clipboard(cells: &[Cell]) -> Result<usize, String> {
     Ok(text.len())
 }
 
+/// Arguments for [`run_ratatui_main`].
+pub(crate) struct RatatuiMainConfig {
+    pub bus_tx: Sender<BusMessage>,
+    pub outbound_rx: std::sync::mpsc::Receiver<OutboundMessage>,
+    pub shutdown_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    pub sandbox_dir: PathBuf,
+    pub chat_id: String,
+    pub channel_name: String,
+    pub session_banner: String,
+    pub status_model: String,
+}
+
 /// Run until user quits. Restores terminal on exit.
-pub(crate) fn run_ratatui_main(
-    bus_tx: Sender<BusMessage>,
-    outbound_rx: std::sync::mpsc::Receiver<OutboundMessage>,
-    shutdown_tx: tokio::sync::mpsc::UnboundedSender<()>,
-    sandbox_dir: PathBuf,
-    mut chat_id: String,
-    channel_name: String,
-    session_banner: String,
-    status_model: String,
-) -> io::Result<()> {
+pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
+    let RatatuiMainConfig {
+        bus_tx,
+        outbound_rx,
+        shutdown_tx,
+        sandbox_dir,
+        mut chat_id,
+        channel_name,
+        session_banner,
+        status_model,
+    } = config;
+
     init_from_env();
 
     let mut stdout = stdout();

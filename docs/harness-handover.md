@@ -35,7 +35,7 @@ This branch delivers harness **Phases 1–5** (through sub-agents / plans under 
 
 - **`ask_user` outside agent tool scope:** Fails with a clear error if `ToolExecCtx` is not set (e.g. calling the tool without the agent’s scoped execution).
 - **Cancellation is still keyed by `chat_id` only** for `BusMessage::Cancel` / `cancellation_tokens` (pre-existing); clarification matching uses full **session key** including channel and thread — keep them consistent when adding channels.
-- **Clippy:** One pre-existing warning in `agent/mod.rs`: `redundant_pattern_matching` on `memory_node.send_packet` — not introduced by this work.
+- **Clippy:** Run `cargo clippy --release -p isanagent --all-targets` before merge; keep the tree warning-free without `allow()` suppressions.
 - **Windows:** Prefer `cargo build/test --release` (see `AGENTS.md`).
 
 ## Next Steps
@@ -68,6 +68,6 @@ This branch delivers harness **Phases 1–5** (through sub-agents / plans under 
 ```powershell
 cd C:\Users\Yusuf\agent-rs
 cargo fmt
+cargo clippy --release -p isanagent --all-targets
 cargo test --release -p isanagent
-cargo clippy --release -p isanagent --lib
 ```

@@ -895,7 +895,7 @@ impl AgentLogic {
                                 session_id: session_key.clone(),
                                 reply: crate::memory::SharedReply::new(tx),
                             };
-                            if let Ok(_) = memory_node.send_packet(msg).await {
+                            if memory_node.send_packet(msg).await.is_ok() {
                                 if let Ok(Ok((rows, _))) = rx.await {
                                     if let Some((last_id, _)) = rows.last() {
                                         let (tx, rx) = tokio::sync::oneshot::channel();
