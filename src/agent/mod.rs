@@ -500,7 +500,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
 }
 
 impl AgentLogic {
-    pub(crate) async fn run_reasoning_loop(ctx: ReasoningLoopCtx) -> Result<(), String> {
+    pub(crate) async fn run_reasoning_loop(ctx: ReasoningLoopCtx) -> Result<String, String> {
         let ReasoningLoopCtx {
             name,
             provider,
@@ -578,7 +578,7 @@ impl AgentLogic {
                     LogEvent::info(&name, "Reasoning loop cancelled before iteration start.")
                         .with_chat_id(&inbound.chat_id),
                 ));
-                return Ok(());
+                return Ok(String::new());
             }
             iterations += 1;
 
@@ -648,7 +648,7 @@ impl AgentLogic {
                         &name,
                         "Reasoning loop cancelled during LLM call.",
                     ).with_chat_id(&inbound.chat_id)));
-                    return Ok(());
+                    return Ok(String::new());
                 }
             };
 
@@ -699,7 +699,7 @@ impl AgentLogic {
 
                 for tc in tool_calls {
                     if cancel_token.is_cancelled() {
-                        return Ok(());
+                        return Ok(String::new());
                     }
 
                     let tool_name = &tc.function.name;
@@ -745,7 +745,7 @@ impl AgentLogic {
                     .await
                     {
                         ToolExecutionFinished::Completed(res) => res,
-                        ToolExecutionFinished::Cancelled => return Ok(()),
+                        ToolExecutionFinished::Cancelled => return Ok(String::new()),
                     };
 
                     let tool_result_text = match tool_result {
@@ -790,7 +790,7 @@ impl AgentLogic {
 
             if !tool_invoked {
                 // Final outbound text
-                let clean_response = thinking_strip_re
+                let final_response = thinking_strip_re
                     .replace_all(&response_text, "")
                     .to_string();
 
@@ -799,7 +799,7 @@ impl AgentLogic {
                     channel: inbound.channel.clone(),
                     chat_id: inbound.chat_id.clone(),
                     thread_id: inbound.thread_id.clone(),
-                    content: clean_response,
+                    content: final_response.clone(),
                     metadata: HashMap::new(),
                 };
 
@@ -853,7 +853,7 @@ impl AgentLogic {
                     let response = tokio::select! {
                         res = provider.chat(&summary_context, None) => res,
                         _ = cancel_token.cancelled() => {
-                            return Ok(());
+                            return Ok(String::new());
                         }
                     };
 
@@ -913,19 +913,20 @@ impl AgentLogic {
                 }
 
                 let _ = outbound_tx.send(BusMessage::Outbound(outbound)).await;
-                return Ok(());
+                return Ok(final_response);
             }
         }
 
+        let max_iter_msg = "Agent reached max reasoning iterations.".to_string();
         let fallback = OutboundMessage {
             channel: inbound.channel,
             chat_id: inbound.chat_id,
             thread_id: inbound.thread_id,
-            content: "Agent reached max reasoning iterations.".to_string(),
+            content: max_iter_msg.clone(),
             metadata: HashMap::new(),
         };
         let _ = outbound_tx.send(BusMessage::Outbound(fallback)).await;
-        Ok(())
+        Ok(max_iter_msg)
     }
 }
 

@@ -261,23 +261,23 @@ impl SubagentHarness {
         tokio::spawn(async move {
             let outcome = super::AgentLogic::run_reasoning_loop(ctx).await;
             match outcome {
-                Ok(()) => {
+                Ok(text) => {
                     if rec.cancel.is_cancelled() {
                         rec.status
                             .store(ST_CANCELLED, std::sync::atomic::Ordering::Release);
                     } else {
+                        {
+                            let mut r = rec.result.write().await;
+                            *r = Some(text);
+                        }
                         rec.status
                             .store(ST_COMPLETED, std::sync::atomic::Ordering::Release);
-                        let mut r = rec.result.write().await;
-                        *r = Some(
-                            "(completed — see session memory for this sub-agent chat)".to_string(),
-                        );
                     }
                 }
                 Err(e) => {
+                    *rec.error.write().await = Some(e);
                     rec.status
                         .store(ST_FAILED, std::sync::atomic::Ordering::Release);
-                    *rec.error.write().await = Some(e);
                 }
             }
             rec.done.notify_waiters();
@@ -287,11 +287,12 @@ impl SubagentHarness {
         if wait {
             let max_wait = self.inner.deps.max_wait_secs;
             let wait_fut = async {
-                while !record.is_terminal() {
-                    tokio::select! {
-                        _ = record.done.notified() => {}
-                        _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+                loop {
+                    let notified = record.done.notified();
+                    if record.is_terminal() {
+                        break;
                     }
+                    notified.await;
                 }
             };
             tokio::time::timeout(std::time::Duration::from_secs(max_wait), wait_fut)
@@ -302,12 +303,16 @@ impl SubagentHarness {
                 })?;
         }
 
-        Ok(serde_json::json!({
+        let mut body = serde_json::json!({
             "task_id": task_id,
             "child_chat_id": child_chat_id,
             "wait": wait,
-        })
-        .to_string())
+        });
+        if wait {
+            let result_text = record.result.read().await.clone().unwrap_or_default();
+            body["result"] = serde_json::Value::String(result_text);
+        }
+        Ok(body.to_string())
     }
 
     pub fn list_for_parent(&self, parent_chat_id: &str) -> String {
@@ -370,7 +375,7 @@ impl Tool for SubagentSpawnTool {
     }
 
     fn description(&self) -> &str {
-        "Spawn a background sub-agent that runs a separate reasoning loop with its own chat id (prefixed subagent-). Use wait=false for fire-and-forget; wait=true blocks until completion or timeout. Sub-agents inherit config allowlists and cannot spawn nested sub-agents."
+        "Spawn a background sub-agent that runs a separate reasoning loop with its own chat id (prefixed subagent-). Use wait=false for fire-and-forget; wait=true blocks until completion or timeout and includes the assistant-facing final text in the JSON field \"result\". Sub-agents inherit config allowlists and cannot spawn nested sub-agents."
     }
 
     fn parameters(&self) -> Value {
@@ -527,7 +532,7 @@ impl Tool for SubagentPlanTool {
     }
 
     fn description(&self) -> &str {
-        "Run a multi-step plan: JSON object {\"steps\":[{\"id\":\"1\",\"depends_on\":[],\"prompt\":\"...\"}, ...]}. Steps run in dependency order (sequential). Each step sees prior step results in its prompt prefix."
+        "Run a multi-step plan: JSON object {\"steps\":[{\"id\":\"1\",\"depends_on\":[],\"prompt\":\"...\"}, ...]}. Steps run in dependency order (sequential). Each step sees prior steps' assistant-facing final output (subagent_spawn result text) in its prompt prefix."
     }
 
     fn parameters(&self) -> Value {
@@ -593,7 +598,7 @@ impl Tool for SubagentPlanTool {
                 body.push_str(&prompts[&step_id]);
                 let (ch, parent_chat, thread, parent_cancel) = current_parent_ids()?;
                 let label = format!("plan-{}", step_id);
-                let json = self
+                let spawn_json = self
                     .harness
                     .spawn(SubagentSpawnSpec {
                         parent_channel: ch,
@@ -605,8 +610,16 @@ impl Tool for SubagentPlanTool {
                         display_name: Some(label),
                     })
                     .await?;
-                results.insert(step_id.clone(), json.clone());
-                out.push_str(&format!("## Step {}\n{}\n\n", step_id, json));
+                let step_output = serde_json::from_str::<serde_json::Value>(&spawn_json)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("result")
+                            .and_then(|r| r.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or(spawn_json.clone());
+                results.insert(step_id.clone(), step_output.clone());
+                out.push_str(&format!("## Step {}\n{}\n\n", step_id, step_output));
                 done.insert(step_id);
             }
         }
