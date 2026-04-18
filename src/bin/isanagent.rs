@@ -26,8 +26,8 @@ use isanagent::scheduler::{
 use isanagent::session::SessionManager;
 use isanagent::skills::SkillRegistry;
 use isanagent::tools::builtin::{
-    CronTool, EditFileTool, ListDirTool, MessageTool, ReadFileTool, ShellExecTool, WebFetchTool,
-    WebSearchTool, WriteFileTool,
+    CronTool, EditFileTool, GlobFilesTool, ListDirTool, MessageTool, ReadFileTool, SearchTextTool,
+    ShellExecTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use isanagent::tools::ToolRegistry;
 use isanagent::workspace::{resolve_workspace_root, IsanagentWorkspace};
@@ -229,6 +229,14 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         restrict_to_workspace: restrict,
     }));
     tools.register(Box::new(ListDirTool {
+        workspace_dir: workspace.sandbox_dir.clone(),
+        restrict_to_workspace: restrict,
+    }));
+    tools.register(Box::new(GlobFilesTool {
+        workspace_dir: workspace.sandbox_dir.clone(),
+        restrict_to_workspace: restrict,
+    }));
+    tools.register(Box::new(SearchTextTool {
         workspace_dir: workspace.sandbox_dir.clone(),
         restrict_to_workspace: restrict,
     }));
