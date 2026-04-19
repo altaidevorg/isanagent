@@ -32,12 +32,12 @@ use crate::memory::{MemoryMessage, SharedReply};
 use crate::scheduler::{
     CronWebhookError, MultiTenantEdgeCronScheduler, PendingCronTriggerFinalize,
 };
+use crate::tools::builtin::resolve_path;
 use crate::utils::ChatMessage;
 use crate::utils::{
     ContentPart, ImageUrl, MessageContent, REDACTED_THINKING_STRIP_PATTERN,
     RUNTIME_CONTEXT_END_SUFFIX,
 };
-use crate::tools::builtin::resolve_path;
 use crate::NodeHandle;
 
 const AGENT_TIMEOUT_SECS: u64 = 60;
@@ -1822,23 +1822,9 @@ async fn handle_workspace_list(
         .into_response();
     }
 
-    let mut entries: Vec<WorkspaceEntryDto> = match std::fs::read_dir(&dir) {
-        Ok(iter) => iter
-            .filter_map(|e| e.ok())
-            .filter_map(|entry| {
-                let name = entry.file_name().to_string_lossy().to_string();
-                let meta = entry.metadata().ok()?;
-                let kind = if meta.is_dir() {
-                    "dir".to_string()
-                } else if meta.is_file() {
-                    "file".to_string()
-                } else {
-                    return None;
-                };
-                let size = if meta.is_file() { Some(meta.len()) } else { None };
-                Some(WorkspaceEntryDto { name, kind, size })
-            })
-            .collect(),
+    let mut entries: Vec<WorkspaceEntryDto> = Vec::new();
+    let mut read_dir = match tokio::fs::read_dir(&dir).await {
+        Ok(rd) => rd,
         Err(e) => {
             return ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1849,13 +1835,46 @@ async fn handle_workspace_list(
         }
     };
 
+    loop {
+        let next = match read_dir.next_entry().await {
+            Ok(v) => v,
+            Err(e) => {
+                return ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "read_dir_failed",
+                    e.to_string(),
+                )
+                .into_response()
+            }
+        };
+
+        let Some(entry) = next else {
+            break;
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        let meta = match entry.metadata().await {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let kind = if meta.is_dir() {
+            "dir".to_string()
+        } else if meta.is_file() {
+            "file".to_string()
+        } else {
+            continue;
+        };
+        let size = if meta.is_file() {
+            Some(meta.len())
+        } else {
+            None
+        };
+        entries.push(WorkspaceEntryDto { name, kind, size });
+    }
+
     entries.sort_by(|a, b| match (a.kind.as_str(), b.kind.as_str()) {
         ("dir", "file") => std::cmp::Ordering::Less,
         ("file", "dir") => std::cmp::Ordering::Greater,
-        _ => a
-            .name
-            .to_lowercase()
-            .cmp(&b.name.to_lowercase()),
+        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
     });
 
     let display_path = if trimmed.is_empty() {
@@ -1896,8 +1915,8 @@ async fn handle_workspace_file(
         )
         .into_response();
     }
-    let len = match path.metadata() {
-        Ok(m) => m.len() as usize,
+    let metadata = match tokio::fs::metadata(&path).await {
+        Ok(m) => m,
         Err(e) => {
             return ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1907,18 +1926,16 @@ async fn handle_workspace_file(
             .into_response()
         }
     };
-    if len > WORKSPACE_FILE_MAX_BYTES {
+    let len = metadata.len();
+    if len > WORKSPACE_FILE_MAX_BYTES as u64 {
         return ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
             "file_too_large",
-            format!(
-                "File is {len} bytes (max {}).",
-                WORKSPACE_FILE_MAX_BYTES
-            ),
+            format!("File is {len} bytes (max {}).", WORKSPACE_FILE_MAX_BYTES),
         )
         .into_response();
     }
-    let bytes = match std::fs::read(&path) {
+    let bytes = match tokio::fs::read(&path).await {
         Ok(b) => b,
         Err(e) => {
             return ApiError::new(
@@ -2210,10 +2227,7 @@ mod tests {
             SqliteMemoryActor::new(db_path.to_str().expect("utf8 db path")).expect("memory actor");
         let memory_node =
             NodeHandle::<MemoryMessage>::new(memory_actor, 100, 1, Duration::from_millis(5));
-        let workspace_sandbox = db_path
-            .parent()
-            .expect("db path parent")
-            .join("workspace");
+        let workspace_sandbox = db_path.parent().expect("db path parent").join("workspace");
         std::fs::create_dir_all(&workspace_sandbox).expect("workspace sandbox");
         ApiState {
             bus_tx,
@@ -2455,9 +2469,7 @@ bind_address = "127.0.0.1"
             SqliteMemoryActor::new(temp.db_path().to_str().expect("utf8")).expect("memory actor");
         let memory_node =
             NodeHandle::<MemoryMessage>::new(memory_actor, 100, 1, Duration::from_millis(5));
-        let workspace_sandbox = temp
-            .path
-            .join("workspace");
+        let workspace_sandbox = temp.path.join("workspace");
         std::fs::create_dir_all(&workspace_sandbox).expect("workspace sandbox");
         let state = ApiState {
             bus_tx,
