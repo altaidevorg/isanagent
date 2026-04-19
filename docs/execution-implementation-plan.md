@@ -44,6 +44,8 @@ See `AGENTS.md` for workspace/sandbox rules, actor discipline, and telemetry con
 
 **Depends on:** nothing (design-only PR).
 
+**Status (implemented):** Rust module `src/execution/` (`error`, `ids`, `run`, `capabilities`, `provider`, `preflight`), exported as `isanagent::execution`. Unit tests cover capability JSON round-trip (unknown keys captured in `ProviderCapabilities.extensions`) and `allowed_optional_tool_tags`. See `execution::PREFLIGHT_MARKDOWN` for the operator-facing matrix.
+
 ---
 
 ## Phase 1 — Local provider (sandbox subprocess / REPL)

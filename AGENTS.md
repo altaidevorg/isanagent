@@ -32,6 +32,8 @@ Git worktrees (`git_worktree`): **off by default**. Set `[harness.git_worktree] 
 
 Sub-agents (`subagent_spawn`, `task_*`, `subagent_plan_execute`): **off by default** via `[harness.subagents] enabled = true`. Sub-agents run a second `run_reasoning_loop` with a synthetic chat id (`subagent-…`) and optional tool allowlist. `cancel_children_on_parent_cancel` (default true) controls whether cancelling or superseding the parent chat’s reasoning also cancels those child tasks. See `docs/harness-implementation-plan.md` Phase 5.
 
+**Execution plane** (reproducible code run: local / Jupyter / SSH / hosted—see `docs/execution-implementation-plan.md`): **Phase 0** adds only shared contracts in `crate::execution` (`ExecutionProvider`, `ExecutionError`, `RunSpec` / `RunResult`, `ProviderCapabilities` / `SessionCapabilities`, optional traits `SshRemoteShell` and `PackageOperations`, and `execution::preflight` for capability → tool guidance). There is no harness tool or actor wiring yet; later phases register gated tools and subprocess/kernel ownership under an execution actor.
+
 ### Structured LLM Extraction
 If you are asking the LLM to yield a structured JSON payload internally (e.g. for reflection or summarization outside of the standard `ToolCall` registry):
 **DO NOT** use brittle string matching like `text.find('{')`. 
