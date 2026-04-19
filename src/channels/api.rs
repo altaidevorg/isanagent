@@ -32,12 +32,12 @@ use crate::memory::{MemoryMessage, SharedReply};
 use crate::scheduler::{
     CronWebhookError, MultiTenantEdgeCronScheduler, PendingCronTriggerFinalize,
 };
+use crate::tools::builtin::resolve_path;
 use crate::utils::ChatMessage;
 use crate::utils::{
     ContentPart, ImageUrl, MessageContent, REDACTED_THINKING_STRIP_PATTERN,
     RUNTIME_CONTEXT_END_SUFFIX,
 };
-use crate::tools::builtin::resolve_path;
 use crate::NodeHandle;
 
 const AGENT_TIMEOUT_SECS: u64 = 60;
@@ -1863,17 +1863,18 @@ async fn handle_workspace_list(
         } else {
             continue;
         };
-        let size = if meta.is_file() { Some(meta.len()) } else { None };
+        let size = if meta.is_file() {
+            Some(meta.len())
+        } else {
+            None
+        };
         entries.push(WorkspaceEntryDto { name, kind, size });
     }
 
     entries.sort_by(|a, b| match (a.kind.as_str(), b.kind.as_str()) {
         ("dir", "file") => std::cmp::Ordering::Less,
         ("file", "dir") => std::cmp::Ordering::Greater,
-        _ => a
-            .name
-            .to_lowercase()
-            .cmp(&b.name.to_lowercase()),
+        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
     });
 
     let display_path = if trimmed.is_empty() {
@@ -1930,10 +1931,7 @@ async fn handle_workspace_file(
         return ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
             "file_too_large",
-            format!(
-                "File is {len} bytes (max {}).",
-                WORKSPACE_FILE_MAX_BYTES
-            ),
+            format!("File is {len} bytes (max {}).", WORKSPACE_FILE_MAX_BYTES),
         )
         .into_response();
     }
@@ -2229,10 +2227,7 @@ mod tests {
             SqliteMemoryActor::new(db_path.to_str().expect("utf8 db path")).expect("memory actor");
         let memory_node =
             NodeHandle::<MemoryMessage>::new(memory_actor, 100, 1, Duration::from_millis(5));
-        let workspace_sandbox = db_path
-            .parent()
-            .expect("db path parent")
-            .join("workspace");
+        let workspace_sandbox = db_path.parent().expect("db path parent").join("workspace");
         std::fs::create_dir_all(&workspace_sandbox).expect("workspace sandbox");
         ApiState {
             bus_tx,
@@ -2474,9 +2469,7 @@ bind_address = "127.0.0.1"
             SqliteMemoryActor::new(temp.db_path().to_str().expect("utf8")).expect("memory actor");
         let memory_node =
             NodeHandle::<MemoryMessage>::new(memory_actor, 100, 1, Duration::from_millis(5));
-        let workspace_sandbox = temp
-            .path
-            .join("workspace");
+        let workspace_sandbox = temp.path.join("workspace");
         std::fs::create_dir_all(&workspace_sandbox).expect("workspace sandbox");
         let state = ApiState {
             bus_tx,
