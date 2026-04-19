@@ -59,7 +59,7 @@ impl Tool for ExecutionSessionCreateTool {
     }
 
     fn description(&self) -> &str {
-        "Create an execution session (requires [harness.execution] enabled). Provider is [harness.execution] default_provider: local runs under the workspace sandbox; jupyter uses a configured Jupyter Server kernel. Returns session_id, session capabilities, and a short provider capability summary. Use execution_run to execute code; execution_session_close when done."
+        "Create an execution session (requires [harness.execution] enabled). Provider is [harness.execution] default_provider: local runs under the workspace sandbox; jupyter uses a configured Jupyter Server kernel; ssh runs each execution over SSH on a configured Linux-style host. Returns session_id, session capabilities, and a short provider capability summary. Use execution_run to execute code; execution_session_close when done."
     }
 
     fn parameters(&self) -> Value {
@@ -69,7 +69,7 @@ impl Tool for ExecutionSessionCreateTool {
                 "label": { "type": "string", "description": "Optional label for logs" },
                 "language": {
                     "type": "string",
-                    "description": "Optional language hint. Local: python, py, shell, sh, bash. Jupyter: python, py, r, R (ir kernel)."
+                    "description": "Optional language hint. Local: python, py, shell, sh, bash. Jupyter: python, py, r, R (ir kernel). SSH: python, py, shell, sh, bash (remote bash + base64 pipeline)."
                 }
             }
         })
@@ -256,7 +256,7 @@ impl Tool for ExecutionEnvInfoTool {
     }
 
     fn description(&self) -> &str {
-        "Return provider capability summary. For local execution, also runs python_executable -V on the agent host (best effort). For jupyter, that probe is still the host interpreter (sanity check only); the kernel Python environment is whatever the Jupyter server started for that kernelspec."
+        "Return provider capability summary. For local execution, also runs python_executable -V on the agent host (best effort). For jupyter, that probe is still the host interpreter (sanity check only); the kernel Python environment is whatever the Jupyter server started for that kernelspec. For ssh, the probe is still the agent host interpreter (not the remote remote_python)."
     }
 
     fn parameters(&self) -> Value {

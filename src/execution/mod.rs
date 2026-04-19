@@ -1,8 +1,7 @@
 //! Execution plane: Phase 0 contracts (errors, run specs, capabilities, provider trait),
-//! Phase 1 local subprocess provider ([`local::LocalExecutionProvider`]), and Phase 3
-//! Jupyter kernel provider ([`jupyter::JupyterExecutionProvider`]).
-//!
-//! SSH / other remotes are planned separately.
+//! Phase 1 local subprocess provider ([`local::LocalExecutionProvider`]), Phase 3
+//! Jupyter kernel provider ([`jupyter::JupyterExecutionProvider`]), and Phase 4
+//! SSH exec provider ([`ssh::SshExecutionProvider`]).
 //!
 //! ## Design: object-safe core + capability traits
 //!
@@ -20,6 +19,7 @@ mod local;
 mod preflight;
 mod provider;
 mod run;
+mod ssh;
 
 pub use capabilities::{
     NetworkPolicy, ProviderCapabilities, ProviderCapabilitiesSnapshot, SessionCapabilities,
@@ -34,3 +34,4 @@ pub use provider::{ExecutionProvider, PackageOperations, SshRemoteShell};
 pub use run::{
     CwdPolicy, RunAttachmentRef, RunResult, RunSpec, SessionCreateRequest, SessionHandle,
 };
+pub use ssh::{validate_remote_workdir, SshExecutionProvider, SshExecutionProviderConfig};

@@ -6,6 +6,27 @@ pub struct TerminalConfig {
     pub enable: Option<bool>,
 }
 
+/// OpenSSH-style remote exec over TCP (`default_provider = "ssh"`).
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct SshExecutionConfig {
+    /// Remote hostname or IP (required for `ssh`).
+    pub host: Option<String>,
+    /// TCP port (default 22).
+    pub port: Option<u16>,
+    /// Remote login name (required for `ssh`).
+    pub user: Option<String>,
+    /// Path to a private key file (OpenSSH PEM). Tilde expansion applied. Optional if
+    /// **`SSH_PASSWORD`** is set in the environment.
+    pub identity_file: Option<String>,
+    /// Absolute path on the **remote** host used as `cd` before running code (required).
+    pub remote_workdir: Option<String>,
+    /// Remote Python interpreter for `language: python` (default `python3`).
+    pub remote_python: Option<String>,
+    /// When true (default), `check_server_key` accepts any host key (**MITM risk**). When false,
+    /// host key verification fails until strict known-hosts support exists.
+    pub accept_unknown_host_keys: Option<bool>,
+}
+
 /// Jupyter Server / Lab HTTP + kernel WebSocket (`default_provider = "jupyter"`).
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct JupyterExecutionConfig {
@@ -22,7 +43,7 @@ pub struct JupyterExecutionConfig {
 pub struct ExecutionHarnessConfig {
     /// Register execution tools when true (default: false).
     pub enabled: Option<bool>,
-    /// Provider id: `local` (subprocess) or `jupyter` (remote kernel).
+    /// Provider id: `local` (subprocess), `jupyter` (remote kernel), or `ssh` (remote exec).
     pub default_provider: Option<String>,
     /// Max combined stdout+stderr bytes per run (default 262_144).
     pub max_output_bytes: Option<usize>,
@@ -36,6 +57,8 @@ pub struct ExecutionHarnessConfig {
     pub python_executable: Option<String>,
     /// Required when `default_provider = "jupyter"`.
     pub jupyter: Option<JupyterExecutionConfig>,
+    /// Required when `default_provider = "ssh"`.
+    pub ssh: Option<SshExecutionConfig>,
 }
 
 /// Sub-agent / task harness. Disabled unless `[harness.subagents] enabled = true`.
@@ -376,6 +399,85 @@ impl AppConfig {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "python3".to_string())
     }
+
+    pub fn execution_ssh_host(&self) -> Option<String> {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.ssh.as_ref())
+            .and_then(|s| s.host.as_ref())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn execution_ssh_port(&self) -> u16 {
+        const DEFAULT: u16 = 22;
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.ssh.as_ref())
+            .and_then(|s| s.port)
+            .unwrap_or(DEFAULT)
+    }
+
+    pub fn execution_ssh_user(&self) -> Option<String> {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.ssh.as_ref())
+            .and_then(|s| s.user.as_ref())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Expanded filesystem path to a private key, when configured.
+    pub fn execution_ssh_identity_file(&self) -> Option<String> {
+        let raw = self
+            .harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.ssh.as_ref())
+            .and_then(|s| s.identity_file.as_ref())?;
+        let t = raw.trim();
+        if t.is_empty() {
+            return None;
+        }
+        let expanded = shellexpand::tilde(t).into_owned();
+        if expanded.trim().is_empty() {
+            return None;
+        }
+        Some(expanded)
+    }
+
+    pub fn execution_ssh_remote_workdir(&self) -> Option<String> {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.ssh.as_ref())
+            .and_then(|s| s.remote_workdir.as_ref())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn execution_ssh_remote_python(&self) -> String {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.ssh.as_ref())
+            .and_then(|s| s.remote_python.as_ref())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "python3".to_string())
+    }
+
+    pub fn execution_ssh_accept_unknown_host_keys(&self) -> bool {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.ssh.as_ref())
+            .and_then(|s| s.accept_unknown_host_keys)
+            .unwrap_or(true)
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -495,5 +597,41 @@ kernel_name = "python3"
         );
         assert_eq!(c.execution_jupyter_token().as_deref(), Some("testtoken"));
         assert_eq!(c.execution_jupyter_kernel_name(), "python3");
+    }
+
+    #[test]
+    fn harness_execution_ssh_toml() {
+        let s = r#"
+[harness.execution]
+enabled = true
+default_provider = "ssh"
+allowed_providers = ["ssh", "local"]
+
+[harness.execution.ssh]
+host = "10.0.0.5"
+port = 2222
+user = "dev"
+identity_file = "~/.ssh/id_ed25519"
+remote_workdir = "/tmp/isanagent-exec"
+remote_python = "python3"
+accept_unknown_host_keys = false
+"#;
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        assert_eq!(c.execution_default_provider(), "ssh");
+        assert!(c.execution_provider_allowed("ssh"));
+        assert_eq!(c.execution_ssh_host().as_deref(), Some("10.0.0.5"));
+        assert_eq!(c.execution_ssh_port(), 2222);
+        assert_eq!(c.execution_ssh_user().as_deref(), Some("dev"));
+        assert!(c
+            .execution_ssh_identity_file()
+            .expect("identity")
+            .replace('\\', "/")
+            .ends_with("/.ssh/id_ed25519"));
+        assert_eq!(
+            c.execution_ssh_remote_workdir().as_deref(),
+            Some("/tmp/isanagent-exec")
+        );
+        assert_eq!(c.execution_ssh_remote_python(), "python3");
+        assert!(!c.execution_ssh_accept_unknown_host_keys());
     }
 }

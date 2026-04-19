@@ -117,9 +117,23 @@ See `AGENTS.md` for workspace/sandbox rules, actor discipline, and telemetry con
 
 ---
 
+## Deferred — Execution provisioners (allocation / credentials)
+
+**Status:** design only; **not implemented** here. Recorded so dynamic backends (Runpod, org control plane, “start Jupyter on host,” …) are not conflated with **`ExecutionProvider`** protocols.
+
+**Idea:** a **policy-gated execution provisioner** (pluggable, tenant/workspace–scoped) allocates or discovers a target, returns a **short-lived lease** (opaque id, expiry, teardown) plus **connection material** for an existing provider (`jupyter`, `ssh`, …). Secrets and raw URLs stay **out of conversation** / model-visible payloads where possible (opaque handle + non-secret hints).
+
+**Goals:** (1) provider-agnostic — provisioners **feed** `ExecutionProvider`; (2) extensible — Runpod, Lambda Labs, k8s, noop for local dev; (3) multi-tenant — quotas, allowlists, audit; cloud keys from **env / secret store**, not `config.toml`; (4) lifecycle — teardown, orphan GC, billing caps.
+
+**Depends on:** stable `execution_*` and remote providers; **does not block** config-only SSH/Jupyter.
+
+---
+
 ## Phase 4 — SSH provider + `SshShell` (or equivalent) capability trait
 
 **Objective:** Remote workstation/HPC flows with the **same** run/cancel API where possible; SSH-specific operations gated by trait + capability bits.
+
+**Status (MVP implemented):** `SshExecutionProvider` in `src/execution/ssh.rs`: each `execution_run` opens a new SSH session, authenticates (private key from `[harness.execution.ssh].identity_file` and/or **`SSH_PASSWORD`** env), `exec`s a `bash` pipeline (`base64`-decoded user code) under a configured absolute **`remote_workdir`**. **`supports_interrupt: false`** (cancel aborts the local SSH task only). **`accept_unknown_host_keys`** (default **true**, MITM risk) maps to `check_server_key`. Config: `[harness.execution.ssh]` + `default_provider = "ssh"`. Strict `known_hosts`, interactive `SshRemoteShell`, and sandbox→remote staging remain future work.
 
 **Deliverables**
 

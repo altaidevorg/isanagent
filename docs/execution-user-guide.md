@@ -14,12 +14,13 @@ When **`[harness.execution] enabled = true`**, the agent gains five tools:
 | **`execution_session_close`** | Tear down the session and release resources. |
 | **`execution_env_info`** | Show provider capabilities and (for local Python) try `python -V`. |
 
-Two providers are implemented today:
+Three providers are implemented today:
 
 - **`local`** — each session uses a working directory under your workspace sandbox and runs subprocesses (e.g. `python -u -c …`).
 - **`jupyter`** — each session is a **Jupyter Server** kernel you point at with `base_url` + token; runs use the kernel’s WebSocket execute channel (persistent variables, interrupt via server API).
+- **`ssh`** — each session is a **logical** session on the agent; each **`execution_run`** opens a new SSH connection to a Linux-style host, `cd` to a fixed absolute **`remote_workdir`**, and runs your code via **`bash`** and **`base64`** (Python unbuffered stdin or `bash -s` for shell). There is **no** persistent remote REPL across runs; **`execution_cancel`** only cancels the client wait (remote process may keep running). Use **`identity_file`** (OpenSSH private key) and/or host env **`SSH_PASSWORD`** (never commit passwords in `config.toml`).
 
-**SSH** and other remotes are planned separately.
+Other hosted remotes (Colab-shaped providers, policy-gated **provisioners** that allocate targets) are described in **`execution-implementation-plan.md`** and are not the same as this SSH provider.
 
 ## Enable the feature
 
@@ -34,12 +35,12 @@ Optional keys (defaults are sensible if omitted):
 
 | Key | Meaning |
 |-----|--------|
-| `default_provider` | **`local`** (subprocess) or **`jupyter`** (remote kernel). |
+| `default_provider` | **`local`** (subprocess), **`jupyter`** (remote kernel), or **`ssh`** (remote exec over SSH). |
 | `max_wall_secs` | Upper bound on each run’s `timeout_secs` (default 300, max 86400). |
 | `max_output_bytes` | Max combined stdout+stderr per run (default 256 KiB). |
 | `max_sessions` | Max concurrent sessions (default 32). |
-| `allowed_providers` | e.g. `["local"]` or `["jupyter"]`; if empty or omitted, any implemented provider is allowed. |
-| `python_executable` | Command for **local** Python runs and `execution_env_info` (default `python`). Ignored for Jupyter execution. |
+| `allowed_providers` | e.g. `["local"]`, `["jupyter"]`, `["ssh"]`; if empty or omitted, any implemented provider is allowed. |
+| `python_executable` | Command for **local** Python runs and `execution_env_info` (default `python`). Ignored for Jupyter execution. For **SSH**, the remote interpreter is **`[harness.execution.ssh].remote_python`** (default `python3`). |
 
 When `default_provider = "jupyter"`, add **`[harness.execution.jupyter]`**:
 
@@ -48,6 +49,18 @@ When `default_provider = "jupyter"`, add **`[harness.execution.jupyter]`**:
 | `base_url` | Jupyter Server root, e.g. `http://127.0.0.1:8888` (no `/lab` path). **Required** for Jupyter. |
 | `token` | Optional server token. Prefer host env **`JUPYTER_TOKEN`** (wins over this field) so secrets are not committed. |
 | `kernel_name` | Kernel spec name for `POST /api/kernels` when `language` is Python or unset (default **`python3`**). |
+
+When `default_provider = "ssh"`, add **`[harness.execution.ssh]`**:
+
+| Key | Meaning |
+|-----|--------|
+| `host` | Remote hostname or IP. **Required** for SSH. |
+| `port` | SSH port (default **22**). |
+| `user` | Remote login name. **Required** for SSH. |
+| `identity_file` | Path to an OpenSSH **private** key (optional if **`SSH_PASSWORD`** is set in the agent process environment). Tilde (`~`) expansion is applied. |
+| `remote_workdir` | **Absolute** path on the remote host (POSIX, e.g. `/home/you/isanagent-runs`). Only letters, digits, `/`, `_`, `-`, `.`; no `..`. **Required**. |
+| `remote_python` | Remote Python executable for `language: python` (default **`python3`**). |
+| `accept_unknown_host_keys` | Default **true**: accept any server host key (**vulnerable to MITM** on untrusted networks). Set **false** to fail closed until strict host-key verification exists. |
 
 Restart the agent after editing config.
 
@@ -63,14 +76,16 @@ Filesystem tools and execution share the same **sandbox boundary** when `restric
 1. **`execution_session_create`** — optional `label`, optional `language`.  
    - **`local`:** `python`, `py`, `shell`, `sh`, `bash`.  
    - **`jupyter`:** `python` / `py` / unset (uses `kernel_name`), or **`r`** / **`R`** (uses the **`ir`** kernel spec if installed).  
+   - **`ssh`:** `python` / `py` / unset, or `shell` / `sh` / `bash`.  
    - Response includes **`session_id`** and capability summaries — keep the `session_id` for the next steps.
 
 2. **`execution_run`** — required: `session_id`, `code`. Optional: `timeout_secs`, `cwd_mode` (`session_default` or `sandbox_relative`), and `cwd_relative` when using `sandbox_relative`.  
-   - **`jupyter`:** only **`session_default`** is supported for `cwd_mode` (no per-run sandbox cwd); use notebook magics such as `%cd` inside `code` if you must change directory on the server.
+   - **`jupyter`:** only **`session_default`** is supported for `cwd_mode` (no per-run sandbox cwd); use notebook magics such as `%cd` inside `code` if you must change directory on the server.  
+   - **`ssh`:** only **`session_default`** is supported; the remote working directory is always **`remote_workdir`** from config.
 
 3. When finished (or to free slots): **`execution_session_close`** with the same `session_id`.
 
-Use **`execution_cancel`** if a run is stuck and the provider reports **`supports_interrupt`** (true for **`local`** and **`jupyter`**).
+Use **`execution_cancel`** if a run is stuck and the provider reports **`supports_interrupt`** (true for **`local`** and **`jupyter`**; **false** for **`ssh`** in the current release).
 
 ## Python and virtual environments (local provider)
 

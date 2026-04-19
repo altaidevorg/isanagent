@@ -11,6 +11,7 @@ use super::error::ExecutionError;
 use super::jupyter::{JupyterExecutionProvider, JupyterExecutionProviderConfig};
 use super::local::{LocalExecutionConfig, LocalExecutionProvider};
 use super::provider::ExecutionProvider;
+use super::ssh::{SshExecutionProvider, SshExecutionProviderConfig};
 
 /// Owns the active [`ExecutionProvider`] and small bits of host config tools need (e.g. `-V` probe).
 pub struct ExecutionHarness {
@@ -101,8 +102,37 @@ pub fn build_execution_harness(
                 config.execution_python_executable(),
             )))
         }
+        "ssh" => {
+            let host = config.execution_ssh_host().ok_or_else(|| {
+                "[harness.execution.ssh].host is required when default_provider = \"ssh\"".to_string()
+            })?;
+            let user = config.execution_ssh_user().ok_or_else(|| {
+                "[harness.execution.ssh].user is required when default_provider = \"ssh\"".to_string()
+            })?;
+            let remote_workdir = config.execution_ssh_remote_workdir().ok_or_else(|| {
+                "[harness.execution.ssh].remote_workdir is required when default_provider = \"ssh\""
+                    .to_string()
+            })?;
+            let sc = SshExecutionProviderConfig {
+                host,
+                port: config.execution_ssh_port(),
+                user,
+                remote_workdir,
+                remote_python: config.execution_ssh_remote_python(),
+                identity_path: config.execution_ssh_identity_file(),
+                accept_unknown_host_keys: config.execution_ssh_accept_unknown_host_keys(),
+                max_run_timeout_secs: config.execution_max_wall_secs(),
+                max_output_bytes: config.execution_max_output_bytes(),
+                max_sessions: config.execution_max_sessions(),
+            };
+            let p = SshExecutionProvider::new(sc).map_err(|e: ExecutionError| e.to_string())?;
+            Ok(Arc::new(ExecutionHarness::new(
+                Arc::new(p),
+                config.execution_python_executable(),
+            )))
+        }
         other => Err(format!(
-            "unknown [harness.execution] default_provider: {other} (supported: \"local\", \"jupyter\")"
+            "unknown [harness.execution] default_provider: {other} (supported: \"local\", \"jupyter\", \"ssh\")"
         )),
     }
 }
