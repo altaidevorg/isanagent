@@ -62,7 +62,7 @@ This branch delivers harness **Phases 1–5** (through sub-agents / plans under 
 | `src/memory.rs` | Memory actor, `harness_todos` schema, SQLite busy_timeout helper |
 | `src/channels/terminal.rs` | `[Question]` styling for clarification outbounds |
 | `src/bin/isanagent.rs` | Tool registration, `ClarificationHub` + `AgentLogicParams` wiring |
-| `src/execution/` | Execution plane: **Phase 0** contracts + **Phase 1** `LocalExecutionProvider` (`local.rs`); harness tools / config still future (`docs/execution-implementation-plan.md`) |
+| `src/execution/` | Phases 0–2: contracts, `local.rs`, `harness.rs` + `build_execution_harness`; tools in `src/tools/execution.rs`; `[harness.execution]` in `config.rs` (`docs/execution-implementation-plan.md`) |
 
 ## Run/Test Commands
 

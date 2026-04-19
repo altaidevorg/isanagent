@@ -12,6 +12,7 @@
 
 mod capabilities;
 mod error;
+mod harness;
 mod ids;
 mod local;
 mod preflight;
@@ -22,6 +23,7 @@ pub use capabilities::{
     NetworkPolicy, ProviderCapabilities, ProviderCapabilitiesSnapshot, SessionCapabilities,
 };
 pub use error::ExecutionError;
+pub use harness::{build_execution_harness, ExecutionHarness};
 pub use ids::SessionId;
 pub use local::{LocalExecMode, LocalExecutionConfig, LocalExecutionProvider};
 pub use preflight::{allowed_optional_tool_tags, PREFLIGHT_MARKDOWN};

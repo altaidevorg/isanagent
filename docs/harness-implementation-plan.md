@@ -89,7 +89,7 @@ This document tracks expanding the built-in tool surface toward a strong **code-
 
 ### Phase 6 — Notebook, LSP, MCP, remote
 
-**Execution plane (primary direction for “run code”):** see **`docs/execution-implementation-plan.md`** — session-based execution, capability metadata + optional traits, local/Jupyter/SSH/hosted providers, and research-oriented artifacts. That roadmap **supersedes** “notebook” as mere `.ipynb` JSON editing for agent value; a file-level notebook tool may still be added later as optional sugar.
+**Execution plane (primary direction for “run code”):** see **`docs/execution-implementation-plan.md`** — session-based execution, capability metadata + optional traits, local/Jupyter/SSH/hosted providers, and research-oriented artifacts. That roadmap **supersedes** “notebook” as mere `.ipynb` JSON editing for agent value; a file-level notebook tool may still be added later as optional sugar. **Phase 2 harness tools** (`execution_*` when `[harness.execution] enabled = true`) are implemented there, not as extra bullets in this file.
 
 **Original Phase 6 tracks (deferrable vs execution):**
 

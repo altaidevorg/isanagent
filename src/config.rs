@@ -6,12 +6,23 @@ pub struct TerminalConfig {
     pub enable: Option<bool>,
 }
 
-/// Optional harness features (see `docs/harness-implementation-plan.md`).
+/// Code execution harness (`execution_*` tools). Disabled unless `[harness.execution] enabled = true`.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
-pub struct HarnessConfig {
-    pub git_worktree: Option<GitWorktreeConfig>,
-    /// Background sub-agents, task tools, and optional plan execution (Phase 5).
-    pub subagents: Option<SubagentHarnessConfig>,
+pub struct ExecutionHarnessConfig {
+    /// Register execution tools when true (default: false).
+    pub enabled: Option<bool>,
+    /// Provider id to construct (default `local`). Only `local` is implemented today.
+    pub default_provider: Option<String>,
+    /// Max combined stdout+stderr bytes per run (default 262_144).
+    pub max_output_bytes: Option<usize>,
+    /// Upper bound on per-run `timeout_secs` (default 300, clamped 1–86400).
+    pub max_wall_secs: Option<u64>,
+    /// Max concurrent sessions for the local provider (default 32, clamped 1–256).
+    pub max_sessions: Option<usize>,
+    /// If set and non-empty, only these provider ids may be constructed (e.g. `["local"]`).
+    pub allowed_providers: Option<Vec<String>>,
+    /// Interpreter for `language: python` (default `python`).
+    pub python_executable: Option<String>,
 }
 
 /// Sub-agent / task harness. Disabled unless `[harness.subagents] enabled = true`.
@@ -27,6 +38,16 @@ pub struct SubagentHarnessConfig {
     pub max_tasks: Option<usize>,
     /// Max seconds `subagent_spawn` may block when `wait` is true (default 300, clamped 10–3600).
     pub max_wait_secs: Option<u64>,
+}
+
+/// Optional harness features (see `docs/harness-implementation-plan.md`).
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HarnessConfig {
+    pub git_worktree: Option<GitWorktreeConfig>,
+    /// Background sub-agents, task tools, and optional plan execution (Phase 5).
+    pub subagents: Option<SubagentHarnessConfig>,
+    /// Local / future execution providers (`execution_*` tools). See `docs/execution-implementation-plan.md`.
+    pub execution: Option<ExecutionHarnessConfig>,
 }
 
 /// Git worktree helpers (`git_worktree` tool). Disabled unless `[harness.git_worktree] enabled = true`.
@@ -222,6 +243,87 @@ impl AppConfig {
             .unwrap_or(DEFAULT)
             .clamp(MIN, MAX)
     }
+
+    /// `[harness.execution] enabled = true` registers `execution_*` tools.
+    pub fn execution_harness_enabled(&self) -> bool {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.enabled)
+            .unwrap_or(false)
+    }
+
+    pub fn execution_default_provider(&self) -> String {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.default_provider.as_ref())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "local".to_string())
+    }
+
+    pub fn execution_max_output_bytes(&self) -> usize {
+        const DEFAULT: usize = 256 * 1024;
+        const MIN: usize = 4096;
+        const MAX: usize = 16 * 1024 * 1024;
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.max_output_bytes)
+            .unwrap_or(DEFAULT)
+            .clamp(MIN, MAX)
+    }
+
+    pub fn execution_max_wall_secs(&self) -> u64 {
+        const DEFAULT: u64 = 300;
+        const MIN: u64 = 1;
+        const MAX: u64 = 86400;
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.max_wall_secs)
+            .unwrap_or(DEFAULT)
+            .clamp(MIN, MAX)
+    }
+
+    pub fn execution_max_sessions(&self) -> usize {
+        const DEFAULT: usize = 32;
+        const MIN: usize = 1;
+        const MAX: usize = 256;
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.max_sessions)
+            .unwrap_or(DEFAULT)
+            .clamp(MIN, MAX)
+    }
+
+    pub fn execution_python_executable(&self) -> String {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.python_executable.as_ref())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "python".to_string())
+    }
+
+    /// When `allowed_providers` is missing or empty, any implemented provider id is allowed.
+    pub fn execution_provider_allowed(&self, provider_id: &str) -> bool {
+        let Some(list) = self
+            .harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.allowed_providers.as_ref())
+        else {
+            return true;
+        };
+        if list.is_empty() {
+            return true;
+        }
+        list.iter().any(|s| s == provider_id)
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -294,4 +396,28 @@ pub struct EmailConfig {
     pub smtp_host: String,
     pub smtp_port: u16,
     pub email_address: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn harness_execution_toml_roundtrip() {
+        let s = r#"
+[harness.execution]
+enabled = true
+max_wall_secs = 90
+max_output_bytes = 8192
+allowed_providers = ["local"]
+python_executable = "python3"
+"#;
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        assert!(c.execution_harness_enabled());
+        assert_eq!(c.execution_max_wall_secs(), 90);
+        assert_eq!(c.execution_max_output_bytes(), 8192);
+        assert!(c.execution_provider_allowed("local"));
+        assert!(!c.execution_provider_allowed("jupyter"));
+        assert_eq!(c.execution_python_executable(), "python3");
+    }
 }
