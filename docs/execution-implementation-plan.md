@@ -2,6 +2,8 @@
 
 This document describes how to add **reproducible code execution** to `isanagent`: a stable agent-facing API, **capability discovery** (metadata + optional traits), **executor preflight**, and **pluggable backends** (local, Jupyter, SSH, hosted). It complements `docs/harness-implementation-plan.md`: harness Phase 6’s original “notebook / LSP / MCP / remote” bullets are **orthogonal**; **execution** is the primary path for an “AI research and engineer” agent. LSP/MCP/remote triggers can follow later.
 
+**User-facing configuration and tool usage:** keep **`docs/execution-user-guide.md`** updated whenever you change defaults, tool names, or provider behavior that operators rely on.
+
 See `AGENTS.md` for workspace/sandbox rules, actor discipline, and telemetry conventions.
 
 ## Goals
@@ -110,6 +112,8 @@ See `AGENTS.md` for workspace/sandbox rules, actor discipline, and telemetry con
 - Clear errors when server unreachable or token missing.
 
 **Depends on:** Phase 0–2 (reuse actor + tools; add provider id in `execution_session_create`).
+
+**Status (implemented):** `JupyterExecutionProvider` in `src/execution/jupyter.rs`: `POST/DELETE /api/kernels`, `POST …/interrupt`, WebSocket to `/api/kernels/{id}/channels` with default binary wire encoding, `execute_request` on shell and `stream` / `execute_reply` / `error` on iopub/shell (parent `msg_id` correlation). Config: `[harness.execution.jupyter]` (`base_url`, optional `token`, optional `kernel_name`); token resolution prefers env **`JUPYTER_TOKEN`**. `build_execution_harness` selects **`jupyter`** when `default_provider = "jupyter"`. Unit tests cover WS frame encode/decode. End-to-end test against a live server is left to manual or opt-in CI.
 
 ---
 

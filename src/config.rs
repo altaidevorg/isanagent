@@ -6,23 +6,36 @@ pub struct TerminalConfig {
     pub enable: Option<bool>,
 }
 
+/// Jupyter Server / Lab HTTP + kernel WebSocket (`default_provider = "jupyter"`).
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct JupyterExecutionConfig {
+    /// e.g. `http://127.0.0.1:8888` (no trailing path).
+    pub base_url: Option<String>,
+    /// Optional token (prefer env `JUPYTER_TOKEN` in production; avoid committing secrets).
+    pub token: Option<String>,
+    /// Kernel spec name for `POST /api/kernels` (default `python3`).
+    pub kernel_name: Option<String>,
+}
+
 /// Code execution harness (`execution_*` tools). Disabled unless `[harness.execution] enabled = true`.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct ExecutionHarnessConfig {
     /// Register execution tools when true (default: false).
     pub enabled: Option<bool>,
-    /// Provider id to construct (default `local`). Only `local` is implemented today.
+    /// Provider id: `local` (subprocess) or `jupyter` (remote kernel).
     pub default_provider: Option<String>,
     /// Max combined stdout+stderr bytes per run (default 262_144).
     pub max_output_bytes: Option<usize>,
     /// Upper bound on per-run `timeout_secs` (default 300, clamped 1–86400).
     pub max_wall_secs: Option<u64>,
-    /// Max concurrent sessions for the local provider (default 32, clamped 1–256).
+    /// Max concurrent sessions (default 32, clamped 1–256).
     pub max_sessions: Option<usize>,
     /// If set and non-empty, only these provider ids may be constructed (e.g. `["local"]`).
     pub allowed_providers: Option<Vec<String>>,
-    /// Interpreter for `language: python` (default `python`).
+    /// Interpreter for `language: python` (default `python`) — local provider and `execution_env_info`.
     pub python_executable: Option<String>,
+    /// Required when `default_provider = "jupyter"`.
+    pub jupyter: Option<JupyterExecutionConfig>,
 }
 
 /// Sub-agent / task harness. Disabled unless `[harness.subagents] enabled = true`.
@@ -324,6 +337,45 @@ impl AppConfig {
         }
         list.iter().any(|s| s == provider_id)
     }
+
+    /// `JUPYTER_TOKEN` env wins over `[harness.execution.jupyter].token`.
+    pub fn execution_jupyter_token(&self) -> Option<String> {
+        let from_env = std::env::var("JUPYTER_TOKEN")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if from_env.is_some() {
+            return from_env;
+        }
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.jupyter.as_ref())
+            .and_then(|j| j.token.as_ref())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn execution_jupyter_base_url(&self) -> Option<String> {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.jupyter.as_ref())
+            .and_then(|j| j.base_url.as_ref())
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn execution_jupyter_kernel_name(&self) -> String {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.jupyter.as_ref())
+            .and_then(|j| j.kernel_name.as_ref())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "python3".to_string())
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -419,5 +471,29 @@ python_executable = "python3"
         assert!(c.execution_provider_allowed("local"));
         assert!(!c.execution_provider_allowed("jupyter"));
         assert_eq!(c.execution_python_executable(), "python3");
+    }
+
+    #[test]
+    fn harness_execution_jupyter_toml() {
+        let s = r#"
+[harness.execution]
+enabled = true
+default_provider = "jupyter"
+allowed_providers = ["jupyter", "local"]
+
+[harness.execution.jupyter]
+base_url = "http://127.0.0.1:8888"
+token = "testtoken"
+kernel_name = "python3"
+"#;
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        assert_eq!(c.execution_default_provider(), "jupyter");
+        assert!(c.execution_provider_allowed("jupyter"));
+        assert_eq!(
+            c.execution_jupyter_base_url().as_deref(),
+            Some("http://127.0.0.1:8888")
+        );
+        assert_eq!(c.execution_jupyter_token().as_deref(), Some("testtoken"));
+        assert_eq!(c.execution_jupyter_kernel_name(), "python3");
     }
 }

@@ -47,7 +47,7 @@ fn parse_cwd(args: &Value) -> Result<CwdPolicy, String> {
     }
 }
 
-/// Open a sandbox-scoped execution session (local subprocess provider).
+/// Open an execution session (local subprocess or Jupyter kernel per config).
 pub struct ExecutionSessionCreateTool {
     pub harness: Arc<ExecutionHarness>,
 }
@@ -59,7 +59,7 @@ impl Tool for ExecutionSessionCreateTool {
     }
 
     fn description(&self) -> &str {
-        "Create an execution session for running code under the agent sandbox (requires [harness.execution] enabled). Returns session_id, session capabilities, and a short provider capability summary. Use execution_run to execute code; execution_session_close when done."
+        "Create an execution session (requires [harness.execution] enabled). Provider is [harness.execution] default_provider: local runs under the workspace sandbox; jupyter uses a configured Jupyter Server kernel. Returns session_id, session capabilities, and a short provider capability summary. Use execution_run to execute code; execution_session_close when done."
     }
 
     fn parameters(&self) -> Value {
@@ -69,7 +69,7 @@ impl Tool for ExecutionSessionCreateTool {
                 "label": { "type": "string", "description": "Optional label for logs" },
                 "language": {
                     "type": "string",
-                    "description": "Optional: python (default), py, shell, sh, bash"
+                    "description": "Optional language hint. Local: python, py, shell, sh, bash. Jupyter: python, py, r, R (ir kernel)."
                 }
             }
         })
@@ -174,7 +174,7 @@ impl Tool for ExecutionCancelTool {
     }
 
     fn description(&self) -> &str {
-        "Cancel the in-flight run for a session (SIGKILL / taskkill best-effort on local provider). Preflight: only available when provider capabilities include supports_interrupt."
+        "Cancel the in-flight run for a session (local: SIGKILL / taskkill best-effort; jupyter: server interrupt + cooperative cancel). Preflight: only available when provider capabilities include supports_interrupt."
     }
 
     fn parameters(&self) -> Value {

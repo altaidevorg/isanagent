@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use crate::config::AppConfig;
 
 use super::error::ExecutionError;
+use super::jupyter::{JupyterExecutionProvider, JupyterExecutionProviderConfig};
 use super::local::{LocalExecutionConfig, LocalExecutionProvider};
 use super::provider::ExecutionProvider;
 
@@ -80,8 +81,28 @@ pub fn build_execution_harness(
                 config.execution_python_executable(),
             )))
         }
+        "jupyter" => {
+            let base_url = config.execution_jupyter_base_url().ok_or_else(|| {
+                "[harness.execution.jupyter].base_url is required when default_provider = \"jupyter\""
+                    .to_string()
+            })?;
+            let jc = JupyterExecutionProviderConfig {
+                base_url,
+                token: config.execution_jupyter_token(),
+                default_kernel_name: config.execution_jupyter_kernel_name(),
+                max_run_timeout_secs: config.execution_max_wall_secs(),
+                max_output_bytes: config.execution_max_output_bytes(),
+                max_sessions: config.execution_max_sessions(),
+            };
+            let p =
+                JupyterExecutionProvider::new(jc).map_err(|e: ExecutionError| e.to_string())?;
+            Ok(Arc::new(ExecutionHarness::new(
+                Arc::new(p),
+                config.execution_python_executable(),
+            )))
+        }
         other => Err(format!(
-            "unknown [harness.execution] default_provider: {other} (only \"local\" is supported)"
+            "unknown [harness.execution] default_provider: {other} (supported: \"local\", \"jupyter\")"
         )),
     }
 }
