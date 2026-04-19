@@ -1813,7 +1813,26 @@ async fn handle_workspace_list(
         Ok(p) => p,
         Err(e) => return ApiError::new(StatusCode::BAD_REQUEST, "invalid_path", e).into_response(),
     };
-    if !dir.is_dir() {
+    let dir_meta = match tokio::fs::metadata(&dir).await {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "not_a_directory",
+                "Path is not a directory",
+            )
+            .into_response();
+        }
+        Err(e) => {
+            return ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "metadata_failed",
+                e.to_string(),
+            )
+            .into_response()
+        }
+    };
+    if !dir_meta.is_dir() {
         return ApiError::new(
             StatusCode::BAD_REQUEST,
             "not_a_directory",
@@ -1907,14 +1926,6 @@ async fn handle_workspace_file(
         Ok(p) => p,
         Err(e) => return ApiError::new(StatusCode::BAD_REQUEST, "invalid_path", e).into_response(),
     };
-    if !path.is_file() {
-        return ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "not_a_file",
-            "Path is not a regular file",
-        )
-        .into_response();
-    }
     let metadata = match tokio::fs::metadata(&path).await {
         Ok(m) => m,
         Err(e) => {
@@ -1926,6 +1937,14 @@ async fn handle_workspace_file(
             .into_response()
         }
     };
+    if !metadata.is_file() {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "not_a_file",
+            "Path is not a regular file",
+        )
+        .into_response();
+    }
     let len = metadata.len();
     if len > WORKSPACE_FILE_MAX_BYTES as u64 {
         return ApiError::new(
@@ -1993,16 +2012,18 @@ async fn handle_workspace_file_put(
         Ok(p) => p,
         Err(e) => return ApiError::new(StatusCode::BAD_REQUEST, "invalid_path", e).into_response(),
     };
-    if path.is_dir() {
-        return ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "is_directory",
-            "Path is a directory, not a file",
-        )
-        .into_response();
+    if let Ok(meta) = tokio::fs::metadata(&path).await {
+        if meta.is_dir() {
+            return ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "is_directory",
+                "Path is a directory, not a file",
+            )
+            .into_response();
+        }
     }
     if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
             return ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "create_dir_failed",
@@ -2011,7 +2032,7 @@ async fn handle_workspace_file_put(
             .into_response();
         }
     }
-    if let Err(e) = std::fs::write(&path, body.content.as_bytes()) {
+    if let Err(e) = tokio::fs::write(&path, body.content.as_bytes()).await {
         return ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "write_failed",
@@ -2053,7 +2074,7 @@ async fn handle_workspace_rename(
         Ok(p) => p,
         Err(e) => return ApiError::new(StatusCode::BAD_REQUEST, "invalid_path", e).into_response(),
     };
-    if !from_path.exists() {
+    if !tokio::fs::try_exists(&from_path).await.unwrap_or(false) {
         return ApiError::new(
             StatusCode::NOT_FOUND,
             "source_not_found",
@@ -2066,7 +2087,7 @@ async fn handle_workspace_rename(
         Ok(p) => p,
         Err(e) => return ApiError::new(StatusCode::BAD_REQUEST, "invalid_path", e).into_response(),
     };
-    if to_path.exists() {
+    if tokio::fs::try_exists(&to_path).await.unwrap_or(false) {
         return ApiError::new(
             StatusCode::CONFLICT,
             "destination_exists",
@@ -2076,7 +2097,7 @@ async fn handle_workspace_rename(
     }
 
     if let Some(parent) = to_path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
             return ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "create_dir_failed",
@@ -2086,7 +2107,7 @@ async fn handle_workspace_rename(
         }
     }
 
-    if let Err(e) = std::fs::rename(&from_path, &to_path) {
+    if let Err(e) = tokio::fs::rename(&from_path, &to_path).await {
         return ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "rename_failed",
