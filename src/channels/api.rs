@@ -271,11 +271,18 @@ impl ApiChannel {
             .bind_address
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        let workspace_sandbox = std::fs::canonicalize(workspace_sandbox.as_ref()).map_err(|e| {
+            format!(
+                "Failed to canonicalize workspace sandbox {:?}: {}",
+                workspace_sandbox.as_ref(),
+                e
+            )
+        })?;
         Ok(Self {
             port: config.port,
             bind_address,
             serve_ui: config.serve_ui.unwrap_or(false),
-            workspace_sandbox: workspace_sandbox.as_ref().to_path_buf(),
+            workspace_sandbox,
             pending_requests: std::sync::Arc::new(DashMap::new()),
             responses_cache: Cache::builder()
                 .max_capacity(MAX_RESPONSE_CACHE_ENTRIES)
@@ -2102,16 +2109,14 @@ async fn handle_workspace_rename(
         Err(resp) => return resp,
     };
 
-    // Prevent renaming the sandbox root itself
-    if let Ok(sandbox_root) = tokio::fs::canonicalize(&state.workspace_sandbox).await {
-        if from_path == sandbox_root {
-            return ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "invalid_operation",
-                "Cannot rename or move the workspace root directory",
-            )
-            .into_response();
-        }
+    // Prevent renaming the sandbox root itself. `from_path` and `workspace_sandbox` are canonical.
+    if from_path == state.workspace_sandbox {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_operation",
+            "Cannot rename or move the workspace root directory",
+        )
+        .into_response();
     }
 
     if !tokio::fs::try_exists(&from_path).await.unwrap_or(false) {
@@ -2300,6 +2305,8 @@ mod tests {
             NodeHandle::<MemoryMessage>::new(memory_actor, 100, 1, Duration::from_millis(5));
         let workspace_sandbox = db_path.parent().expect("db path parent").join("workspace");
         std::fs::create_dir_all(&workspace_sandbox).expect("workspace sandbox");
+        let workspace_sandbox =
+            std::fs::canonicalize(&workspace_sandbox).expect("canonicalize workspace sandbox");
         ApiState {
             bus_tx,
             pending_requests: Arc::new(dashmap::DashMap::<String, PendingRequest>::new()),
@@ -2542,6 +2549,8 @@ bind_address = "127.0.0.1"
             NodeHandle::<MemoryMessage>::new(memory_actor, 100, 1, Duration::from_millis(5));
         let workspace_sandbox = temp.path.join("workspace");
         std::fs::create_dir_all(&workspace_sandbox).expect("workspace sandbox");
+        let workspace_sandbox =
+            std::fs::canonicalize(&workspace_sandbox).expect("canonicalize workspace sandbox");
         let state = ApiState {
             bus_tx,
             pending_requests: pending_requests.clone(),
