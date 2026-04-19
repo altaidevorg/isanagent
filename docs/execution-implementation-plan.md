@@ -66,6 +66,8 @@ See `AGENTS.md` for workspace/sandbox rules, actor discipline, and telemetry con
 
 **Depends on:** Phase 0.
 
+**Status (implemented):** `LocalExecutionProvider` + `LocalExecutionConfig` in `src/execution/local.rs`: sessions under `resolve_path` against `sandbox_dir`, Python (`-u -c`) or shell (`cmd /C` / `sh -c`), `wait_with_output` with per-stream byte caps, inner wall-clock timeout, overlapping runs rejected, `cancel` + PID-based `taskkill`/`kill` best-effort on Windows/Unix. Windows subprocesses use `CREATE_NO_WINDOW` on the std command. Unit tests use shell on Windows and Python on Unix for portability.
+
 ---
 
 ## Phase 2 — Execution actor + harness tools + config gate

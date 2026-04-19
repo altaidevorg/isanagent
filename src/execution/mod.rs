@@ -1,6 +1,7 @@
-//! Execution plane contracts (Phase 0): errors, run specs, capability snapshots, provider trait.
+//! Execution plane: Phase 0 contracts (errors, run specs, capabilities, provider trait) and
+//! Phase 1 local subprocess provider ([`local::LocalExecutionProvider`]).
 //!
-//! Runtime implementations (local subprocess, Jupyter, SSH, …) live in future phases.
+//! Jupyter / SSH / hosted adapters and harness tools land in later phases.
 //!
 //! ## Design: object-safe core + capability traits
 //!
@@ -12,6 +13,7 @@
 mod capabilities;
 mod error;
 mod ids;
+mod local;
 mod preflight;
 mod provider;
 mod run;
@@ -21,6 +23,7 @@ pub use capabilities::{
 };
 pub use error::ExecutionError;
 pub use ids::SessionId;
+pub use local::{LocalExecMode, LocalExecutionConfig, LocalExecutionProvider};
 pub use preflight::{allowed_optional_tool_tags, PREFLIGHT_MARKDOWN};
 pub use provider::{ExecutionProvider, PackageOperations, SshRemoteShell};
 pub use run::{
