@@ -41,7 +41,7 @@ This branch delivers harness **Phases 1–5** (through sub-agents / plans under 
 ## Next Steps
 
 - [ ] Merge or park this branch; open the **other PR** as planned.
-- [ ] When resuming harness: **Phase 6** (notebook, LSP, MCP, remote) per `docs/harness-implementation-plan.md`.
+- [ ] When resuming harness: **Phase 6** (notebook, LSP, MCP, remote) per `docs/harness-implementation-plan.md`; **execution plane** (sessions, providers, capabilities) per `docs/execution-implementation-plan.md`.
 - [ ] Optional hardening: API/UI explicitly handle `isanagent_clarification` in SSE or REST responses (currently same as other outbounds + metadata).
 - [ ] Optional: remove empty `todos/` dir after legacy migration; metrics when migration count &gt; 0.
 

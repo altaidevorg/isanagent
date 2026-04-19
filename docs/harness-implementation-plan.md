@@ -89,9 +89,13 @@ This document tracks expanding the built-in tool surface toward a strong **code-
 
 ### Phase 6 — Notebook, LSP, MCP, remote
 
-- Jupyter cell edits (JSON `.ipynb`).
+**Execution plane (primary direction for “run code”):** see **`docs/execution-implementation-plan.md`** — session-based execution, capability metadata + optional traits, local/Jupyter/SSH/hosted providers, and research-oriented artifacts. That roadmap **supersedes** “notebook” as mere `.ipynb` JSON editing for agent value; a file-level notebook tool may still be added later as optional sugar.
+
+**Original Phase 6 tracks (deferrable vs execution):**
+
+- Jupyter cell edits (JSON `.ipynb`) — optional convenience; not a substitute for kernel execution.
 - LSP: staged rollout (stub vs one language server vs full bridge).
-- MCP: optional feature, async-friendly bridge, strict capability review.
+- MCP: optional feature, async-friendly bridge, strict capability review (can later expose execution over MCP).
 - Remote triggers: align with existing channels/webhooks or keep as no-op until specified.
 
 ## Phase 1 acceptance
