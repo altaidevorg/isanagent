@@ -87,6 +87,37 @@ For **Jupyter**, pick the kernel environment by **`kernel_name`** and the kernel
 
 **Output capture:** the server may send `print()` output as **JSON text** WebSocket frames or as **binary v1** frames (depending on subprotocol). The agent collects **`stream`** (stdout/stderr), **`execute_result`** / **`display_data`** (`text/plain`), **`error`**, and **`execute_reply`**. Bare expressions (last line without `print`) appear via **`execute_result`**, not always as a `stream`.
 
+The client requests WebSocket subprotocol **`v1.kernel.websocket.jupyter.org`** when opening `/api/kernels/{id}/channels` (Jupyter Server’s preferred binary layout). If the handshake fails, it retries **without** that header so older or unusual proxies still work.
+
+### Jupyter: run a server locally (quick start)
+
+1. In the same environment where you want the kernel (e.g. your project venv), install Jupyter if needed: `pip install jupyterlab` (or `notebook`).
+2. Start the server without opening a browser, on a fixed port, for example:
+   ```bash
+   jupyter lab --no-browser --port=8888
+   ```
+3. Copy the **token** from the printed URL (or set a password in Jupyter config). On the **host** running isanagent, set:
+   ```bash
+   set JUPYTER_TOKEN=...your-token...
+   ```
+   (Unix: `export JUPYTER_TOKEN=...`) or put `token = "..."` under `[harness.execution.jupyter]` only for local experiments.
+4. In **`config.toml`**, set `default_provider = "jupyter"` and:
+   ```toml
+   [harness.execution.jupyter]
+   base_url = "http://127.0.0.1:8888"
+   ```
+   Use the **server root** (`http://…:port`), not the `/lab?token=…` page URL.
+5. Restart isanagent. You may see Jupyter log **`No session ID specified`** on first WebSocket traffic; that is a known server warning and does not block execution.
+
+### Jupyter: troubleshooting
+
+| Symptom | Things to check |
+|--------|------------------|
+| `401` / `403` on REST or WS | Token: **`JUPYTER_TOKEN`** env vs `[harness.execution.jupyter].token`; URL must match the server you started. |
+| `unknown kernel` / kernel start fails | **`kernel_name`** must match an installed kernelspec (`jupyter kernelspec list` on the server host). |
+| Empty `stdout` on older builds | Upgrade to a build that handles **text JSON** and **v1 binary** server messages (see “Output capture” above). |
+| Wrong Python / packages | The kernel uses the **server’s** environment, not the agent sandbox; install packages in that env or pick another kernelspec. |
+
 ## Working directory for a run
 
 - **`cwd_mode`: `session_default`** (default) — run in the session’s root (sandbox root).  

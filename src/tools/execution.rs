@@ -152,10 +152,14 @@ impl Tool for ExecutionRunTool {
             .run(&sid, spec)
             .await
             .map_err(exec_err)?;
+        let prov = self.harness.provider().provider_id();
         info!(
-            "execution_run session={} exit={:?} duration_ms={}",
+            "execution_run provider={} session={} exit={:?} stdout_len={} stderr_len={} duration_ms={}",
+            prov,
             sid,
             result.exit_code,
+            result.stdout.len(),
+            result.stderr.len(),
             started.elapsed().as_millis()
         );
         serde_json::to_string_pretty(&result).map_err(|e| e.to_string())
@@ -252,7 +256,7 @@ impl Tool for ExecutionEnvInfoTool {
     }
 
     fn description(&self) -> &str {
-        "Return provider capability summary and, for the local provider, the output of `python_executable -V` when that binary exists (best effort)."
+        "Return provider capability summary. For local execution, also runs python_executable -V on the agent host (best effort). For jupyter, that probe is still the host interpreter (sanity check only); the kernel Python environment is whatever the Jupyter server started for that kernelspec."
     }
 
     fn parameters(&self) -> Value {

@@ -9,6 +9,7 @@ use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
+use tokio_tungstenite::tungstenite::http::Request;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
@@ -228,11 +229,49 @@ impl JupyterExecutionProvider {
             return Ok(());
         }
         let url = self.ws_channels_url(&session.kernel_id)?;
-        let (ws, _) = connect_async(&url)
-            .await
-            .map_err(|e| ExecutionError::Provider(format!("jupyter websocket connect: {e}")))?;
+        let ws = connect_kernel_channels_ws(&url).await?;
         *slot = Some(ws);
         Ok(())
+    }
+}
+
+/// Preferred Jupyter Server kernel WebSocket subprotocol (binary v1 layout); matches Lab/Notebook 3.x.
+const JUPYTER_KERNEL_WS_SUBPROTOCOL: &str = "v1.kernel.websocket.jupyter.org";
+
+async fn connect_kernel_channels_ws(url: &str) -> Result<ExecWsStream, ExecutionError> {
+    let req = Request::builder()
+        .uri(url)
+        .header("Sec-WebSocket-Protocol", JUPYTER_KERNEL_WS_SUBPROTOCOL)
+        .body(())
+        .map_err(|e| ExecutionError::Provider(format!("jupyter websocket request build: {e}")))?;
+
+    match connect_async(req).await {
+        Ok((ws, resp)) => {
+            if log::log_enabled!(log::Level::Debug) {
+                if let Some(negotiated) = resp.headers().get("Sec-WebSocket-Protocol") {
+                    log::debug!(
+                        "jupyter kernel ws negotiated subprotocol: {}",
+                        negotiated.to_str().unwrap_or("non-utf8")
+                    );
+                } else {
+                    log::debug!("jupyter kernel ws: server did not echo Sec-WebSocket-Protocol");
+                }
+            }
+            Ok(ws)
+        }
+        Err(e1) => {
+            log::debug!(
+                "jupyter kernel ws connect with {} failed: {}; retrying without subprotocol",
+                JUPYTER_KERNEL_WS_SUBPROTOCOL,
+                e1
+            );
+            let (ws, _) = connect_async(url).await.map_err(|e2| {
+                ExecutionError::Provider(format!(
+                    "jupyter websocket connect: {e2} (after subprotocol attempt: {e1})"
+                ))
+            })?;
+            Ok(ws)
+        }
     }
 }
 
