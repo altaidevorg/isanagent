@@ -1817,9 +1817,9 @@ async fn handle_workspace_list(
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "not_a_directory",
-                "Path is not a directory",
+                StatusCode::NOT_FOUND,
+                "path_not_found",
+                "The specified path does not exist",
             )
             .into_response();
         }
@@ -2061,19 +2061,24 @@ async fn handle_workspace_rename(
         )
         .into_response();
     }
-    if from_trim == to_trim {
-        return ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "same_path",
-            "Source and destination are the same",
-        )
-        .into_response();
-    }
 
     let from_path = match resolve_path(from_trim, &state.workspace_sandbox, true) {
         Ok(p) => p,
         Err(e) => return ApiError::new(StatusCode::BAD_REQUEST, "invalid_path", e).into_response(),
     };
+
+    // Prevent renaming the sandbox root itself
+    if let Ok(sandbox_root) = tokio::fs::canonicalize(&state.workspace_sandbox).await {
+        if from_path == sandbox_root {
+            return ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_operation",
+                "Cannot rename or move the workspace root directory",
+            )
+            .into_response();
+        }
+    }
+
     if !tokio::fs::try_exists(&from_path).await.unwrap_or(false) {
         return ApiError::new(
             StatusCode::NOT_FOUND,
@@ -2087,6 +2092,16 @@ async fn handle_workspace_rename(
         Ok(p) => p,
         Err(e) => return ApiError::new(StatusCode::BAD_REQUEST, "invalid_path", e).into_response(),
     };
+
+    if from_path == to_path {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "same_path",
+            "Source and destination are the same",
+        )
+        .into_response();
+    }
+
     if tokio::fs::try_exists(&to_path).await.unwrap_or(false) {
         return ApiError::new(
             StatusCode::CONFLICT,

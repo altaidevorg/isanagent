@@ -1371,6 +1371,11 @@ function WorkspaceFilePane() {
       const qs = rel ? `?path=${encodeURIComponent(rel)}` : "";
       const response = await fetch(`/v1/workspace/list${qs}`);
       if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as ApiErrorPayload;
+        const apiMessage = payload?.error?.message?.trim();
+        if (apiMessage) {
+          throw new Error(apiMessage);
+        }
         const hint =
           response.status === 404
             ? " (is the API running on :8080? With Vite dev, the /v1 proxy targets 127.0.0.1:8080. Rebuild isanagent if you use the embedded UI.)"
