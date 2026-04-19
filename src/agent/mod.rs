@@ -1,9 +1,15 @@
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
+
+mod subagent;
+pub use subagent::SubagentHarness;
+
+use crate::clarification::ClarificationHub;
+use crate::tool_runtime::ToolExecCtx;
 
 use crate::bus::{BusMessage, LogEvent, OutboundMessage, TelemetryEvent};
 use crate::logging::LoggerHandle;
@@ -21,55 +27,97 @@ enum ToolExecutionFinished {
     Cancelled,
 }
 
+/// Session-scoped wiring for tools that need the active chat (e.g. `ask_user`).
+#[derive(Clone)]
+struct ToolCallRuntime {
+    session: ToolExecCtx,
+    hub: Arc<ClarificationHub>,
+    is_subagent: bool,
+    subagent_allowlist: Option<Arc<HashSet<String>>>,
+}
+
 /// Runs a tool with optional per-call activity heartbeats and optional cooperative cancellation.
 async fn execute_tool_call_with_activity(
     tools: &Arc<ToolRegistry>,
-    tool_execution_activity: Option<&SharedToolExecutionActivity>,
+    tool_execution_activity: Option<SharedToolExecutionActivity>,
     chat_id: &str,
     tool_name: &str,
     args: Value,
     cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    runtime: ToolCallRuntime,
 ) -> ToolExecutionFinished {
-    let activity_handle = tool_execution_activity.map(|a| a.start(chat_id, tool_name));
+    let session_key = runtime.session.session_key.clone();
+    let hub = Arc::clone(&runtime.hub);
+    let tool_exec_ctx = runtime.session;
+    let chat_id = chat_id.to_string();
+    let tool_name = tool_name.to_string();
+    let tools = Arc::clone(tools);
+    let cancel_owned = cancel_token.cloned();
 
-    let completed = match cancel_token {
-        None => Some(tools.execute_tool(tool_name, args).await),
-        Some(token) => {
-            tokio::select! {
-                res = tools.execute_tool(tool_name, args) => Some(res),
-                _ = token.cancelled() => None,
+    crate::tool_runtime::with_tool_exec_scope(tool_exec_ctx, async move {
+        let activity_handle = tool_execution_activity
+            .as_ref()
+            .map(|a| a.start(chat_id.as_str(), tool_name.as_str()));
+
+        let is_subagent = runtime.is_subagent;
+        let allow = runtime.subagent_allowlist.clone();
+        let completed = match cancel_owned.as_ref() {
+            None => Some(
+                tools
+                    .execute_tool_scoped(&tool_name, args, allow.as_deref(), is_subagent)
+                    .await,
+            ),
+            Some(token) => {
+                tokio::select! {
+                    res = tools.execute_tool_scoped(
+                        &tool_name,
+                        args,
+                        allow.as_deref(),
+                        is_subagent,
+                    ) => Some(res),
+                    _ = token.cancelled() => None,
+                }
+            }
+        };
+
+        if let Some(handle) = activity_handle {
+            handle.stop().await;
+        }
+
+        match completed {
+            Some(res) => ToolExecutionFinished::Completed(res),
+            None => {
+                hub.cancel_wait(&session_key);
+                ToolExecutionFinished::Cancelled
             }
         }
-    };
-
-    if let Some(handle) = activity_handle {
-        handle.stop().await;
-    }
-
-    match completed {
-        Some(res) => ToolExecutionFinished::Completed(res),
-        None => ToolExecutionFinished::Cancelled,
-    }
+    })
+    .await
 }
 
 /// Bundles everything needed to run one inbound reasoning task (spawned from `AgentLogic::process`).
-struct ReasoningLoopCtx {
-    name: String,
-    provider: Box<dyn Provider>,
-    session_manager: Arc<SessionManager>,
-    tools: Arc<ToolRegistry>,
-    skills: Arc<SkillRegistry>,
-    system_prompt: String,
-    max_iterations: usize,
-    max_tool_output_chars: usize,
-    max_recent_summaries: usize,
-    short_term_threshold_turns: usize,
-    short_term_threshold_tokens: usize,
-    tool_execution_activity: Option<SharedToolExecutionActivity>,
-    outbound_tx: mpsc::Sender<BusMessage>,
-    logger_tx: LoggerHandle,
-    inbound: crate::bus::InboundMessage,
-    cancel_token: tokio_util::sync::CancellationToken,
+pub(crate) struct ReasoningLoopCtx {
+    pub(crate) name: String,
+    pub(crate) provider: Box<dyn Provider>,
+    pub(crate) session_manager: Arc<SessionManager>,
+    pub(crate) tools: Arc<ToolRegistry>,
+    pub(crate) skills: Arc<SkillRegistry>,
+    pub(crate) system_prompt: String,
+    pub(crate) max_iterations: usize,
+    pub(crate) max_tool_output_chars: usize,
+    pub(crate) max_recent_summaries: usize,
+    pub(crate) short_term_threshold_turns: usize,
+    pub(crate) short_term_threshold_tokens: usize,
+    pub(crate) tool_execution_activity: Option<SharedToolExecutionActivity>,
+    pub(crate) outbound_tx: mpsc::Sender<BusMessage>,
+    pub(crate) logger_tx: LoggerHandle,
+    pub(crate) inbound: crate::bus::InboundMessage,
+    pub(crate) cancel_token: tokio_util::sync::CancellationToken,
+    pub(crate) clarification_hub: Arc<ClarificationHub>,
+    pub(crate) tool_exec_ctx: ToolExecCtx,
+    /// When true, tool list / execution use sub-agent allowlist and deny nested spawn/plan tools.
+    pub(crate) is_subagent: bool,
+    pub(crate) subagent_allowlist: Option<Arc<HashSet<String>>>,
 }
 
 /// Constructor arguments for [`AgentLogic`], grouped to keep call sites readable.
@@ -87,6 +135,18 @@ pub struct AgentLogicParams {
     pub short_term_threshold_tokens: usize,
     pub outbound_tx: mpsc::Sender<BusMessage>,
     pub logger_tx: LoggerHandle,
+    pub clarification_hub: Arc<ClarificationHub>,
+    /// When set, registers `subagent_*` / `task_*` tools and wires [`SubagentHarness`].
+    pub subagent: Option<SubagentHarnessParams>,
+}
+
+/// Build-time options for the Phase 5 sub-agent harness (see `[harness.subagents]`).
+#[derive(Clone, Debug)]
+pub struct SubagentHarnessParams {
+    pub cancel_children_on_parent_cancel: bool,
+    pub allowed_tools: Option<Arc<HashSet<String>>>,
+    pub max_tasks: usize,
+    pub max_wait_secs: u64,
 }
 
 /// The central logic for an autonomous Agent running inside an ActorNode.
@@ -107,6 +167,8 @@ pub struct AgentLogic {
     outbound_tx: mpsc::Sender<BusMessage>,
     logger_tx: LoggerHandle,
     cancellation_tokens: Arc<dashmap::DashMap<String, Arc<tokio_util::sync::CancellationToken>>>,
+    clarification_hub: Arc<ClarificationHub>,
+    subagent_harness: Option<Arc<SubagentHarness>>,
 }
 
 impl AgentLogic {
@@ -125,14 +187,43 @@ impl AgentLogic {
             short_term_threshold_tokens,
             outbound_tx,
             logger_tx,
+            clarification_hub,
+            subagent,
         } = params;
+
+        let session_manager = Arc::new(session_manager);
+        let skills = Arc::new(skills);
+        let tools = Arc::new(tools);
+
+        let subagent_harness = subagent.map(|p| {
+            Arc::new(SubagentHarness::new(subagent::SubagentSpawnDeps {
+                agent_name: name.clone(),
+                provider_template: dyn_clone::clone_box(&*provider),
+                session_manager: session_manager.clone(),
+                skills: skills.clone(),
+                system_prompt: system_prompt.clone(),
+                max_iterations,
+                max_tool_output_chars,
+                max_recent_summaries,
+                short_term_threshold_turns,
+                short_term_threshold_tokens,
+                tool_execution_activity: None,
+                outbound_tx: outbound_tx.clone(),
+                logger_tx: logger_tx.clone(),
+                clarification_hub: clarification_hub.clone(),
+                cancel_children_on_parent_cancel: p.cancel_children_on_parent_cancel,
+                default_allowlist: p.allowed_tools.clone(),
+                max_tasks: p.max_tasks,
+                max_wait_secs: p.max_wait_secs,
+            }))
+        });
 
         let mut agent = Self {
             name,
             provider,
-            session_manager: Arc::new(session_manager),
-            tools: Arc::new(tools),
-            skills: Arc::new(skills),
+            session_manager,
+            tools,
+            skills,
             system_prompt,
             max_iterations,
             max_tool_output_chars,
@@ -143,16 +234,25 @@ impl AgentLogic {
             outbound_tx,
             logger_tx,
             cancellation_tokens: Arc::new(dashmap::DashMap::new()),
+            clarification_hub,
+            subagent_harness: subagent_harness.clone(),
         };
 
-        // Inject the skill loader tool automatically
+        let tools_mut = Arc::get_mut(&mut agent.tools)
+            .expect("expected unique ownership of tools registry during initialization");
+        if let Some(ref h) = subagent_harness {
+            subagent::register_subagent_tools(tools_mut, h.clone());
+        }
         let skill_reg = agent.skills.clone();
         let loader_tool = LoadSkillTool {
             registry: skill_reg,
         };
-        let tools_mut = Arc::get_mut(&mut agent.tools)
-            .expect("expected unique ownership of tools registry during initialization");
         tools_mut.register(Box::new(loader_tool));
+
+        if let Some(ref h) = subagent_harness {
+            h.bind_tools(agent.tools.clone())
+                .expect("subagent bind_tools after unique registry init");
+        }
 
         agent
     }
@@ -174,11 +274,17 @@ impl AgentLogic {
     ) -> Result<String, String> {
         match execute_tool_call_with_activity(
             &self.tools,
-            self.tool_execution_activity.as_ref(),
+            self.tool_execution_activity.clone(),
             chat_id,
             tool_name,
             args,
             None,
+            ToolCallRuntime {
+                session: ToolExecCtx::new("test", chat_id, None),
+                hub: self.clarification_hub.clone(),
+                is_subagent: false,
+                subagent_allowlist: None,
+            },
         )
         .await
         {
@@ -204,6 +310,11 @@ impl ActorLogic<BusMessage> for AgentLogic {
     ) -> Result<Option<(String, BusMessage)>, ActorError> {
         match packet {
             BusMessage::Cancel(chat_id) => {
+                if let Some(h) = &self.subagent_harness {
+                    if h.cancel_children_on_parent_cancel() {
+                        h.cancel_children_for_parent(&chat_id);
+                    }
+                }
                 if let Some((_, token)) = self.cancellation_tokens.remove(&chat_id) {
                     token.cancel();
                     let _ = self.logger_tx.send(BusMessage::Log(
@@ -218,6 +329,21 @@ impl ActorLogic<BusMessage> for AgentLogic {
             }
             BusMessage::Inbound(inbound) => {
                 let chat_id = inbound.chat_id.clone();
+                let session_key = inbound.clarification_session_key();
+                if self
+                    .clarification_hub
+                    .try_deliver_reply(&session_key, inbound.content.clone())
+                {
+                    let _ = self.logger_tx.send(BusMessage::Log(
+                        LogEvent::debug(
+                            &self.name,
+                            "Inbound delivered as ask_user clarification reply (same session).",
+                        )
+                        .with_chat_id(&chat_id),
+                    ));
+                    return Ok(None);
+                }
+
                 let _ = self.logger_tx.send(BusMessage::Log(
                     LogEvent::info(
                         &self.name,
@@ -233,6 +359,11 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 // 1. If there's an existing reasoning loop for this chat, cancel it first.
                 // This ensures only one active reasoning task per conversation.
                 if let Some((_, old_token)) = self.cancellation_tokens.remove(&chat_id) {
+                    if let Some(h) = &self.subagent_harness {
+                        if h.cancel_children_on_parent_cancel() {
+                            h.cancel_children_for_parent(&chat_id);
+                        }
+                    }
                     old_token.cancel();
                     let _ = self.logger_tx.send(BusMessage::Log(
                         LogEvent::debug(
@@ -263,6 +394,15 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 let tool_execution_activity = self.tool_execution_activity.clone();
                 let outbound_tx = self.outbound_tx.clone();
                 let logger_tx = self.logger_tx.clone();
+                let clarification_hub = self.clarification_hub.clone();
+                let tool_exec_ctx = ToolExecCtx::new(
+                    inbound.channel.clone(),
+                    inbound.chat_id.clone(),
+                    inbound.thread_id.clone(),
+                )
+                .with_reasoning_cancel(cancel_token.as_ref().clone());
+                let inbound_channel = inbound.channel.clone();
+                let inbound_thread_id = inbound.thread_id.clone();
 
                 tokio::spawn(async move {
                     let task_chat_id = chat_id.clone();
@@ -294,6 +434,10 @@ impl ActorLogic<BusMessage> for AgentLogic {
                         logger_tx: logger_tx.clone(),
                         inbound,
                         cancel_token: task_token_arc.as_ref().clone(),
+                        clarification_hub,
+                        tool_exec_ctx,
+                        is_subagent: false,
+                        subagent_allowlist: None,
                     })
                     .await;
 
@@ -308,6 +452,13 @@ impl ActorLogic<BusMessage> for AgentLogic {
                             )
                             .with_chat_id(&task_chat_id),
                         ));
+                        let notice = crate::channels::terminal::build_channel_error_notice(
+                            &inbound_channel,
+                            &task_chat_id,
+                            inbound_thread_id.as_deref(),
+                            &e,
+                        );
+                        let _ = outbound_tx.send(BusMessage::Outbound(notice)).await;
                     } else if task_token_arc.is_cancelled() {
                         let _ = logger_tx.send(BusMessage::Log(
                             LogEvent::info(
@@ -349,7 +500,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
 }
 
 impl AgentLogic {
-    async fn run_reasoning_loop(ctx: ReasoningLoopCtx) -> Result<(), String> {
+    pub(crate) async fn run_reasoning_loop(ctx: ReasoningLoopCtx) -> Result<String, String> {
         let ReasoningLoopCtx {
             name,
             provider,
@@ -367,10 +518,13 @@ impl AgentLogic {
             logger_tx,
             inbound,
             cancel_token,
+            clarification_hub,
+            tool_exec_ctx,
+            is_subagent,
+            subagent_allowlist,
         } = ctx;
 
-        let thread_part = inbound.thread_id.as_deref().unwrap_or("");
-        let session_key = format!("{}:{}:{}", inbound.channel, inbound.chat_id, thread_part);
+        let session_key = tool_exec_ctx.session_key.clone();
 
         let mut mem = session_manager.get_session(&session_key).await?;
 
@@ -424,7 +578,7 @@ impl AgentLogic {
                     LogEvent::info(&name, "Reasoning loop cancelled before iteration start.")
                         .with_chat_id(&inbound.chat_id),
                 ));
-                return Ok(());
+                return Ok(String::new());
             }
             iterations += 1;
 
@@ -480,7 +634,9 @@ impl AgentLogic {
             ));
 
             // Call Provider
-            let tools_payload = Some(serde_json::json!(tools.list_tools()));
+            let tools_payload = Some(serde_json::json!(
+                tools.list_tools_scoped(subagent_allowlist.as_deref(), is_subagent)
+            ));
 
             // Call Provider with cancellation support
             let response = tokio::select! {
@@ -492,7 +648,7 @@ impl AgentLogic {
                         &name,
                         "Reasoning loop cancelled during LLM call.",
                     ).with_chat_id(&inbound.chat_id)));
-                    return Ok(());
+                    return Ok(String::new());
                 }
             };
 
@@ -543,7 +699,7 @@ impl AgentLogic {
 
                 for tc in tool_calls {
                     if cancel_token.is_cancelled() {
-                        return Ok(());
+                        return Ok(String::new());
                     }
 
                     let tool_name = &tc.function.name;
@@ -574,16 +730,22 @@ impl AgentLogic {
 
                     let tool_result = match execute_tool_call_with_activity(
                         &tools,
-                        tool_execution_activity.as_ref(),
+                        tool_execution_activity.clone(),
                         &inbound.chat_id,
                         tool_name,
                         args,
                         Some(&cancel_token),
+                        ToolCallRuntime {
+                            session: tool_exec_ctx.clone(),
+                            hub: clarification_hub.clone(),
+                            is_subagent,
+                            subagent_allowlist: subagent_allowlist.clone(),
+                        },
                     )
                     .await
                     {
                         ToolExecutionFinished::Completed(res) => res,
-                        ToolExecutionFinished::Cancelled => return Ok(()),
+                        ToolExecutionFinished::Cancelled => return Ok(String::new()),
                     };
 
                     let tool_result_text = match tool_result {
@@ -628,7 +790,7 @@ impl AgentLogic {
 
             if !tool_invoked {
                 // Final outbound text
-                let clean_response = thinking_strip_re
+                let final_response = thinking_strip_re
                     .replace_all(&response_text, "")
                     .to_string();
 
@@ -637,7 +799,7 @@ impl AgentLogic {
                     channel: inbound.channel.clone(),
                     chat_id: inbound.chat_id.clone(),
                     thread_id: inbound.thread_id.clone(),
-                    content: clean_response,
+                    content: final_response.clone(),
                     metadata: HashMap::new(),
                 };
 
@@ -691,7 +853,7 @@ impl AgentLogic {
                     let response = tokio::select! {
                         res = provider.chat(&summary_context, None) => res,
                         _ = cancel_token.cancelled() => {
-                            return Ok(());
+                            return Ok(String::new());
                         }
                     };
 
@@ -733,7 +895,7 @@ impl AgentLogic {
                                 session_id: session_key.clone(),
                                 reply: crate::memory::SharedReply::new(tx),
                             };
-                            if let Ok(_) = memory_node.send_packet(msg).await {
+                            if memory_node.send_packet(msg).await.is_ok() {
                                 if let Ok(Ok((rows, _))) = rx.await {
                                     if let Some((last_id, _)) = rows.last() {
                                         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -751,19 +913,20 @@ impl AgentLogic {
                 }
 
                 let _ = outbound_tx.send(BusMessage::Outbound(outbound)).await;
-                return Ok(());
+                return Ok(final_response);
             }
         }
 
+        let max_iter_msg = "Agent reached max reasoning iterations.".to_string();
         let fallback = OutboundMessage {
             channel: inbound.channel,
             chat_id: inbound.chat_id,
             thread_id: inbound.thread_id,
-            content: "Agent reached max reasoning iterations.".to_string(),
+            content: max_iter_msg.clone(),
             metadata: HashMap::new(),
         };
         let _ = outbound_tx.send(BusMessage::Outbound(fallback)).await;
-        Ok(())
+        Ok(max_iter_msg)
     }
 }
 
@@ -787,20 +950,47 @@ impl Tool for LoadSkillTool {
         serde_json::json!({
             "type": "object",
             "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["load", "list"],
+                    "description": "Use 'list' to enumerate discovered skills. Use 'load' (default) to fetch one skill by name."
+                },
                 "skill_name": {
                     "type": "string",
-                    "description": "The exact name of the skill to load (e.g. 'tweet-author', 'code-reviewer')."
+                    "description": "Exact skill name when action is load (e.g. 'code_review')."
+                },
+                "detail": {
+                    "type": "string",
+                    "enum": ["full", "metadata"],
+                    "description": "When action is load: 'full' returns instruction body (default). 'metadata' returns name, availability, description, and body length without the full body."
                 }
-            },
-            "required": ["skill_name"]
+            }
         })
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("load");
+
+        if action == "list" {
+            return Ok(self.registry.format_skill_directory());
+        }
+
         let skill_name = args
             .get("skill_name")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| "Missing required parameter 'skill_name'".to_string())?;
+            .ok_or_else(|| "Missing 'skill_name' when action is load (default).".to_string())?;
+
+        let detail = args
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or("full");
+
+        if detail == "metadata" {
+            return self.registry.get_skill_metadata(skill_name);
+        }
 
         self.registry.get_skill_instructions(skill_name)
     }
@@ -826,6 +1016,7 @@ mod tests {
     use tower::util::ServiceExt;
 
     use crate::bus::BusMessage;
+    use crate::clarification::ClarificationHub;
     use crate::logging::create_logger_channel;
     use crate::memory::SqliteMemoryActor;
     use crate::multi_tenant_edge::{ActivityHeartbeatClient, HeartbeatTransport};
@@ -1033,7 +1224,7 @@ mod tests {
         tool_execution_activity: Option<SharedToolExecutionActivity>,
         tool_delay: Duration,
     ) -> AgentLogic {
-        let memory_actor = SqliteMemoryActor::new(":memory:").expect("memory actor");
+        let memory_actor = SqliteMemoryActor::new(":memory:", None).expect("memory actor");
         let memory_node = NodeHandle::new(memory_actor, 16, 1, Duration::from_millis(1));
         let session_manager = SessionManager::new(memory_node);
 
@@ -1063,6 +1254,8 @@ mod tests {
             short_term_threshold_tokens: 10_000,
             outbound_tx,
             logger_tx,
+            clarification_hub: ClarificationHub::shared(),
+            subagent: None,
         });
 
         if let Some(tool_execution_activity) = tool_execution_activity {
@@ -1211,5 +1404,43 @@ mod tests {
         .expect("tool result");
 
         assert_eq!(result, "tool complete");
+    }
+
+    #[tokio::test]
+    async fn load_skill_tool_supports_list_and_metadata() {
+        let root = LocalTempDir::new();
+        let skills_root = root.path().join("skills");
+        let skill_dir = skills_root.join("lint_skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: lint_skill\ndescription: Lint helper\n---\n\ndo things\n",
+        )
+        .unwrap();
+        let reg = Arc::new(SkillRegistry::new(skills_root));
+        let tool = super::LoadSkillTool {
+            registry: reg.clone(),
+        };
+        let listed = tool
+            .execute(serde_json::json!({ "action": "list" }))
+            .await
+            .unwrap();
+        assert!(listed.contains("lint_skill"), "{}", listed);
+
+        let meta = tool
+            .execute(serde_json::json!({
+                "skill_name": "lint_skill",
+                "detail": "metadata"
+            }))
+            .await
+            .unwrap();
+        assert!(meta.contains("Instruction length:"));
+        assert!(meta.contains("Available: true"));
+
+        let full = tool
+            .execute(serde_json::json!({ "skill_name": "lint_skill", "detail": "full" }))
+            .await
+            .unwrap();
+        assert!(full.contains("do things"));
     }
 }

@@ -200,4 +200,82 @@ impl SkillRegistry {
     pub fn get_skill_names(&self) -> Vec<String> {
         self.skills.keys().cloned().collect()
     }
+
+    /// One line per skill for quick discovery (includes unavailable entries with their reason).
+    pub fn format_skill_directory(&self) -> String {
+        if self.skills.is_empty() {
+            return "No skills discovered.".to_string();
+        }
+        let mut names: Vec<_> = self.skills.keys().cloned().collect();
+        names.sort();
+        let mut out = String::from("Available skills:\n\n");
+        for n in names {
+            if let Some(s) = self.skills.get(&n) {
+                out.push_str(&format!("- **{}**: {}\n", s.name, s.description));
+            }
+        }
+        out
+    }
+
+    /// Short metadata for a skill (no full instruction body).
+    pub fn get_skill_metadata(&self, name: &str) -> Result<String, String> {
+        let skill = self
+            .skills
+            .get(name)
+            .ok_or_else(|| format!("Skill '{}' not found", name))?;
+        Ok(format!(
+            "Skill: {}\nAvailable: {}\nDescription: {}\nInstruction length: {} characters\nPath: {}",
+            skill.name,
+            skill.available,
+            skill.description,
+            skill.instructions.len(),
+            skill.path.display()
+        ))
+    }
+}
+
+#[cfg(test)]
+mod skill_metadata_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn metadata_and_directory_without_loading_full_body() {
+        let dir = std::env::temp_dir().join(format!(
+            "skill_md_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let skill_dir = dir.join("demo_skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let md = skill_dir.join("SKILL.md");
+        let mut f = std::fs::File::create(&md).unwrap();
+        writeln!(
+            f,
+            "---\nname: demo_skill\ndescription: A demo\nrequires:\n  bins: [nonexistent_bin_xyz123]\n---\n\nBODY {}",
+            "x".repeat(500)
+        )
+        .unwrap();
+
+        let reg = SkillRegistry::new(dir.clone());
+        let meta = reg.get_skill_metadata("demo_skill").unwrap();
+        let n: usize = meta
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("Instruction length:")
+                    .and_then(|s| s.split_whitespace().next())
+                    .and_then(|n| n.parse().ok())
+            })
+            .expect("instruction length line");
+        assert!(n >= 500, "expected long body, got length {}", n);
+        assert!(meta.contains("Available: false"));
+
+        let dir_txt = reg.format_skill_directory();
+        assert!(dir_txt.contains("demo_skill"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

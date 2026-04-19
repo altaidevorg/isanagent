@@ -31,12 +31,16 @@ cron = "0.15.0"
 serde_yaml = "0.9.34"
 which = "6.0.1"
 regex = "1.10.6"
+globset = "0.4.15"
+walkdir = "2.5.0"
+diffy = "0.4.2"
 shellexpand = "3.1.2"
 uuid = { version = "1.21.0", features = ["v4"] }
 toml = "1.0.3"
 tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3.32"
-crossterm = "0.29.0"
+# Align with ratatui's crossterm backend (avoids duplicate crossterm versions).
+crossterm = "0.28"
 colored = "3.1.1"
 clap = { version = "4.5.60", features = ["derive"] }
 axum = "0.8.8"
@@ -52,6 +56,10 @@ hex = "0.4.3"
 base64 = "0.22.1"
 async-stream = "0.3"
 tokio-util = "0.7.18"
+ratatui = "0.29"
+pulldown-cmark = "0.12"
+unicode-width = "0.2"
+arboard = { version = "3.4", default-features = false }
 
 [profile.dev]
 debug = false

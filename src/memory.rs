@@ -1,5 +1,6 @@
 use async_trait::async_trait;
-use log::debug;
+use chrono::Utc;
+use log::{debug, info};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -8,6 +9,8 @@ use crate::utils::{ChatMessage, ContentPart, MessageContent};
 use crate::{ActorError, ActorLogic};
 use std::collections::HashMap;
 use std::fmt;
+use std::fs;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 pub struct SharedReply<T>(pub Arc<Mutex<Option<oneshot::Sender<T>>>>);
@@ -78,6 +81,115 @@ fn first_user_preview_from_content(s: String) -> Option<String> {
 type SessionMessageSinceReflectionRow = (i64, ChatMessage);
 type GetMessagesSinceReflectionResult =
     Result<(Vec<SessionMessageSinceReflectionRow>, Option<i64>), String>;
+
+/// How long SQLite waits on `SQLITE_BUSY` before failing (memory + `harness_todos` share one file).
+pub const AGENT_SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
+
+/// PRAGMAs for file-backed agent DB handles (`SqliteMemoryActor`, harness todos in the same file).
+pub fn configure_agent_sqlite_connection(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.busy_timeout(std::time::Duration::from_millis(
+        AGENT_SQLITE_BUSY_TIMEOUT_MS,
+    ))
+}
+
+/// Schema for `harness_todos` (same DB as agent memory; accessed only via [`MemoryMessage`] on [`SqliteMemoryActor`]).
+pub fn ensure_harness_todos_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS harness_todos (
+            chat_id TEXT PRIMARY KEY NOT NULL,
+            items_json TEXT NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+/// One row in a session todo list (`harness_todos`, via [`SqliteMemoryActor`]).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TodoRow {
+    pub content: String,
+    pub status: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct TodoFile {
+    chat_id: String,
+    items: Vec<TodoRow>,
+}
+
+fn todo_replace_sqlite_conn(
+    conn: &Connection,
+    chat_id: &str,
+    items: &[TodoRow],
+) -> Result<(), String> {
+    let json = serde_json::to_string(items).map_err(|e| format!("serialize todo items: {}", e))?;
+    let now = Utc::now().timestamp_millis();
+    conn.execute(
+        "INSERT INTO harness_todos (chat_id, items_json, updated_at_ms) VALUES (?1, ?2, ?3)
+         ON CONFLICT(chat_id) DO UPDATE SET
+           items_json = excluded.items_json,
+           updated_at_ms = excluded.updated_at_ms",
+        params![chat_id, json, now],
+    )
+    .map_err(|e| format!("upsert harness_todos: {}", e))?;
+    Ok(())
+}
+
+fn todo_load_sqlite_conn(conn: &Connection, chat_id: &str) -> Result<Option<Vec<TodoRow>>, String> {
+    let out: Option<String> = conn
+        .query_row(
+            "SELECT items_json FROM harness_todos WHERE chat_id = ?1",
+            params![chat_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("select harness_todos: {}", e))?;
+    match out {
+        None => Ok(None),
+        Some(s) => {
+            let items: Vec<TodoRow> =
+                serde_json::from_str(&s).map_err(|e| format!("parse todo items: {}", e))?;
+            Ok(Some(items))
+        }
+    }
+}
+
+/// Import `*.json` from a legacy directory into `harness_todos`, then remove each file.
+fn migrate_legacy_json_todos(conn: &Connection, legacy_dir: &Path) -> Result<u32, String> {
+    if !legacy_dir.is_dir() {
+        return Ok(0);
+    }
+    let mut migrated = 0u32;
+    let entries = fs::read_dir(legacy_dir)
+        .map_err(|e| format!("read legacy todos dir {:?}: {}", legacy_dir, e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("legacy todos entry: {}", e))?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let raw = fs::read_to_string(&path).map_err(|e| format!("read {:?}: {}", path, e))?;
+        let file: TodoFile = match serde_json::from_str(&raw) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let items_json =
+            serde_json::to_string(&file.items).map_err(|e| format!("serialize items: {}", e))?;
+        let now = Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO harness_todos (chat_id, items_json, updated_at_ms) VALUES (?1, ?2, ?3)
+             ON CONFLICT(chat_id) DO UPDATE SET
+               items_json = excluded.items_json,
+               updated_at_ms = excluded.updated_at_ms",
+            params![file.chat_id, items_json, now],
+        )
+        .map_err(|e| format!("migrate upsert: {}", e))?;
+        fs::remove_file(&path).map_err(|e| format!("remove migrated {:?}: {}", path, e))?;
+        migrated += 1;
+    }
+    Ok(migrated)
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SummaryEntry {
@@ -179,6 +291,17 @@ pub enum MemoryMessage {
         max_id: i64,
         reply: SharedReply<Result<(), String>>,
     },
+    /// Replace the structured todo list for `chat_id` (`harness_todos`).
+    ReplaceHarnessTodos {
+        chat_id: String,
+        items: Vec<TodoRow>,
+        reply: SharedReply<Result<(), String>>,
+    },
+    /// Load todos for `chat_id`, if any.
+    LoadHarnessTodos {
+        chat_id: String,
+        reply: SharedReply<Result<Option<Vec<TodoRow>>, String>>,
+    },
 }
 
 /// Persistent SQLite-based memory Actor for agents.
@@ -188,9 +311,15 @@ pub struct SqliteMemoryActor {
 
 impl SqliteMemoryActor {
     /// Create a new SqliteMemory.
-    /// `db_path`: Path to the SQLite DB file. Use ":memory:" for in-memory.
-    pub fn new(db_path: &str) -> Result<Self, rusqlite::Error> {
-        let conn = Connection::open(db_path)?;
+    ///
+    /// `db_path`: Path to the SQLite DB file. Use `:memory:` for in-memory.
+    /// `legacy_todo_json_dir`: If set and the path is a directory, `*.json` legacy todo files are
+    /// imported into `harness_todos` once and then removed (same behavior as the former standalone
+    /// todo store bootstrap).
+    pub fn new(db_path: &str, legacy_todo_json_dir: Option<&Path>) -> Result<Self, String> {
+        let conn = (|| -> Result<Connection, rusqlite::Error> {
+            let conn = Connection::open(db_path)?;
+            configure_agent_sqlite_connection(&conn)?;
 
         // Create the messages table if it doesn't exist
         conn.execute(
@@ -283,6 +412,22 @@ impl SqliteMemoryActor {
             )",
             [],
         )?;
+
+        ensure_harness_todos_schema(&conn)?;
+
+            Ok(conn)
+        })()
+        .map_err(|e| format!("SQLite init ({}): {}", db_path, e))?;
+
+        if let Some(dir) = legacy_todo_json_dir {
+            let n = migrate_legacy_json_todos(&conn, dir)?;
+            if n > 0 {
+                info!(
+                    "Migrated {} todo file(s) from {:?} into {}",
+                    n, dir, db_path
+                );
+            }
+        }
 
         Ok(Self { conn })
     }
@@ -824,6 +969,18 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                      ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     params![max_id.to_string()]
                 ).map_err(|e| e.to_string()).map(|_| ());
+                let _ = reply.send(res);
+            }
+            MemoryMessage::ReplaceHarnessTodos {
+                chat_id,
+                items,
+                reply,
+            } => {
+                let res = todo_replace_sqlite_conn(&self.conn, &chat_id, &items);
+                let _ = reply.send(res);
+            }
+            MemoryMessage::LoadHarnessTodos { chat_id, reply } => {
+                let res = todo_load_sqlite_conn(&self.conn, &chat_id);
                 let _ = reply.send(res);
             }
         }
