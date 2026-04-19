@@ -1531,7 +1531,7 @@ function WorkspaceFilePane() {
       {loading ? (
         <p className="mt-4 text-sm text-muted-foreground">Loading workspace…</p>
       ) : (
-        <ul className="mt-3 max-h-48 space-y-1 overflow-y-auto rounded-lg border border-border/50 bg-background/60 p-2">
+        <ul className="mt-3 max-h-80 space-y-1 overflow-y-auto rounded-lg border border-border/50 bg-background/60 p-2">
           {entries.length === 0 ? (
             <li className="px-2 py-1 text-sm text-muted-foreground">This folder is empty.</li>
           ) : (

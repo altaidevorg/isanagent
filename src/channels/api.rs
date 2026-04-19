@@ -1803,15 +1803,42 @@ struct WorkspaceRenameResponse {
 /// Matches a generous UI preview cap (binary files are rejected earlier).
 const WORKSPACE_FILE_MAX_BYTES: usize = 2_000_000;
 
+/// Caps workspace directory listing size (avoids huge allocations / slow UI).
+const WORKSPACE_LIST_MAX_ENTRIES: usize = 1000;
+
+/// Offloads `resolve_path` (blocking `std::fs::canonicalize`) from the async runtime.
+async fn spawn_workspace_resolve(
+    rel: String,
+    sandbox: std::path::PathBuf,
+) -> Result<std::path::PathBuf, Response> {
+    match tokio::task::spawn_blocking(move || resolve_path(&rel, &sandbox, true)).await {
+        Ok(Ok(path)) => Ok(path),
+        Ok(Err(message)) => {
+            Err(ApiError::new(StatusCode::BAD_REQUEST, "invalid_path", message).into_response())
+        }
+        Err(join_err) => Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "path_resolution_failed",
+            join_err.to_string(),
+        )
+        .into_response()),
+    }
+}
+
 async fn handle_workspace_list(
     State(state): State<ApiState>,
     Query(q): Query<WorkspaceListQuery>,
 ) -> Response {
     let trimmed = q.path.trim();
-    let rel_for_resolve = if trimmed.is_empty() { "." } else { trimmed };
-    let dir = match resolve_path(rel_for_resolve, &state.workspace_sandbox, true) {
+    let rel_for_resolve = if trimmed.is_empty() {
+        ".".to_string()
+    } else {
+        trimmed.to_string()
+    };
+    let dir = match spawn_workspace_resolve(rel_for_resolve, state.workspace_sandbox.clone()).await
+    {
         Ok(p) => p,
-        Err(e) => return ApiError::new(StatusCode::BAD_REQUEST, "invalid_path", e).into_response(),
+        Err(resp) => return resp,
     };
     let dir_meta = match tokio::fs::metadata(&dir).await {
         Ok(m) => m,
@@ -1854,6 +1881,7 @@ async fn handle_workspace_list(
         }
     };
 
+    let mut scanned: usize = 0;
     loop {
         let next = match read_dir.next_entry().await {
             Ok(v) => v,
@@ -1870,6 +1898,10 @@ async fn handle_workspace_list(
         let Some(entry) = next else {
             break;
         };
+        scanned += 1;
+        if scanned > WORKSPACE_LIST_MAX_ENTRIES {
+            break;
+        }
         let name = entry.file_name().to_string_lossy().to_string();
         let meta = match entry.metadata().await {
             Ok(m) => m,
@@ -1922,10 +1954,11 @@ async fn handle_workspace_file(
         )
         .into_response();
     }
-    let path = match resolve_path(trimmed, &state.workspace_sandbox, true) {
-        Ok(p) => p,
-        Err(e) => return ApiError::new(StatusCode::BAD_REQUEST, "invalid_path", e).into_response(),
-    };
+    let path =
+        match spawn_workspace_resolve(trimmed.to_string(), state.workspace_sandbox.clone()).await {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
     let metadata = match tokio::fs::metadata(&path).await {
         Ok(m) => m,
         Err(e) => {
@@ -2008,10 +2041,11 @@ async fn handle_workspace_file_put(
         )
         .into_response();
     }
-    let path = match resolve_path(trimmed, &state.workspace_sandbox, true) {
-        Ok(p) => p,
-        Err(e) => return ApiError::new(StatusCode::BAD_REQUEST, "invalid_path", e).into_response(),
-    };
+    let path =
+        match spawn_workspace_resolve(trimmed.to_string(), state.workspace_sandbox.clone()).await {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
     if let Ok(meta) = tokio::fs::metadata(&path).await {
         if meta.is_dir() {
             return ApiError::new(
@@ -2062,9 +2096,10 @@ async fn handle_workspace_rename(
         .into_response();
     }
 
-    let from_path = match resolve_path(from_trim, &state.workspace_sandbox, true) {
+    let sandbox = state.workspace_sandbox.clone();
+    let from_path = match spawn_workspace_resolve(from_trim.to_string(), sandbox.clone()).await {
         Ok(p) => p,
-        Err(e) => return ApiError::new(StatusCode::BAD_REQUEST, "invalid_path", e).into_response(),
+        Err(resp) => return resp,
     };
 
     // Prevent renaming the sandbox root itself
@@ -2088,9 +2123,9 @@ async fn handle_workspace_rename(
         .into_response();
     }
 
-    let to_path = match resolve_path(to_trim, &state.workspace_sandbox, true) {
+    let to_path = match spawn_workspace_resolve(to_trim.to_string(), sandbox).await {
         Ok(p) => p,
-        Err(e) => return ApiError::new(StatusCode::BAD_REQUEST, "invalid_path", e).into_response(),
+        Err(resp) => return resp,
     };
 
     if from_path == to_path {
