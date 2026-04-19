@@ -1822,23 +1822,9 @@ async fn handle_workspace_list(
         .into_response();
     }
 
-    let mut entries: Vec<WorkspaceEntryDto> = match std::fs::read_dir(&dir) {
-        Ok(iter) => iter
-            .filter_map(|e| e.ok())
-            .filter_map(|entry| {
-                let name = entry.file_name().to_string_lossy().to_string();
-                let meta = entry.metadata().ok()?;
-                let kind = if meta.is_dir() {
-                    "dir".to_string()
-                } else if meta.is_file() {
-                    "file".to_string()
-                } else {
-                    return None;
-                };
-                let size = if meta.is_file() { Some(meta.len()) } else { None };
-                Some(WorkspaceEntryDto { name, kind, size })
-            })
-            .collect(),
+    let mut entries: Vec<WorkspaceEntryDto> = Vec::new();
+    let mut read_dir = match tokio::fs::read_dir(&dir).await {
+        Ok(rd) => rd,
         Err(e) => {
             return ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1848,6 +1834,38 @@ async fn handle_workspace_list(
             .into_response()
         }
     };
+
+    loop {
+        let next = match read_dir.next_entry().await {
+            Ok(v) => v,
+            Err(e) => {
+                return ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "read_dir_failed",
+                    e.to_string(),
+                )
+                .into_response()
+            }
+        };
+
+        let Some(entry) = next else {
+            break;
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        let meta = match entry.metadata().await {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let kind = if meta.is_dir() {
+            "dir".to_string()
+        } else if meta.is_file() {
+            "file".to_string()
+        } else {
+            continue;
+        };
+        let size = if meta.is_file() { Some(meta.len()) } else { None };
+        entries.push(WorkspaceEntryDto { name, kind, size });
+    }
 
     entries.sort_by(|a, b| match (a.kind.as_str(), b.kind.as_str()) {
         ("dir", "file") => std::cmp::Ordering::Less,
@@ -1896,8 +1914,8 @@ async fn handle_workspace_file(
         )
         .into_response();
     }
-    let len = match path.metadata() {
-        Ok(m) => m.len() as usize,
+    let metadata = match tokio::fs::metadata(&path).await {
+        Ok(m) => m,
         Err(e) => {
             return ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1907,7 +1925,8 @@ async fn handle_workspace_file(
             .into_response()
         }
     };
-    if len > WORKSPACE_FILE_MAX_BYTES {
+    let len = metadata.len();
+    if len > WORKSPACE_FILE_MAX_BYTES as u64 {
         return ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
             "file_too_large",
@@ -1918,7 +1937,7 @@ async fn handle_workspace_file(
         )
         .into_response();
     }
-    let bytes = match std::fs::read(&path) {
+    let bytes = match tokio::fs::read(&path).await {
         Ok(b) => b,
         Err(e) => {
             return ApiError::new(
