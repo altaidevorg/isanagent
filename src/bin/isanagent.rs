@@ -463,6 +463,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                 &db_path,
                 logger_bus_tx.clone(),
                 memory_node.clone(),
+                workspace.sandbox_dir.clone(),
             )?;
             let api = if let Some(mte_cron_scheduler) = mte_cron_scheduler.clone() {
                 api.with_multi_tenant_edge_cron_scheduler(mte_cron_scheduler)
