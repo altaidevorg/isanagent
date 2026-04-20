@@ -31,6 +31,10 @@ use isanagent::tools::builtin::{
     CronTool, EditFileTool, GitWorktreeTool, GlobFilesTool, ListDirTool, MessageTool, ReadFileTool,
     SearchTextTool, ShellExecTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
+use isanagent::tools::execution::{
+    ExecutionCancelTool, ExecutionEnvInfoTool, ExecutionRunTool, ExecutionSessionCloseTool,
+    ExecutionSessionCreateTool,
+};
 use isanagent::tools::workflow::{AskUserTool, TodoWriteTool, ToolSearchTool};
 use isanagent::tools::ToolRegistry;
 use isanagent::workspace::{resolve_workspace_root, IsanagentWorkspace};
@@ -259,6 +263,27 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             restrict_to_workspace: restrict,
             allow_path_outside_sandbox: workspace.config.git_worktree_allow_path_outside_sandbox(),
         }));
+    }
+    if workspace.config.execution_harness_enabled() {
+        let harness = isanagent::execution::build_execution_harness(
+            workspace.sandbox_dir.clone(),
+            restrict,
+            &workspace.config,
+        )
+        .map_err(|e| std::io::Error::other(format!("execution harness: {e}")))?;
+        tools.register(Box::new(ExecutionSessionCreateTool {
+            harness: harness.clone(),
+        }));
+        tools.register(Box::new(ExecutionRunTool {
+            harness: harness.clone(),
+        }));
+        tools.register(Box::new(ExecutionCancelTool {
+            harness: harness.clone(),
+        }));
+        tools.register(Box::new(ExecutionSessionCloseTool {
+            harness: harness.clone(),
+        }));
+        tools.register(Box::new(ExecutionEnvInfoTool { harness }));
     }
     let jina = workspace.config.jina_web_backend();
     let max_web_output_chars = workspace.config.effective_max_web_tool_output_chars();

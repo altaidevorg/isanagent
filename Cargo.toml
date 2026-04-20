@@ -2,6 +2,8 @@
 name = "isanagent"
 version = "0.1.0"
 edition = "2021"
+# `russh` (SSH client) requires Rust 1.85+.
+rust-version = "1.85"
 
 [[bin]]
 name = "isanagent"
@@ -60,6 +62,10 @@ ratatui = "0.29"
 pulldown-cmark = "0.12"
 unicode-width = "0.2"
 arboard = { version = "3.4", default-features = false }
+russh = { version = "0.60", default-features = false, features = ["flate2", "ring", "rsa"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [profile.dev]
 debug = false

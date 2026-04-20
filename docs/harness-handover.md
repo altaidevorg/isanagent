@@ -41,7 +41,7 @@ This branch delivers harness **Phases 1–5** (through sub-agents / plans under 
 ## Next Steps
 
 - [ ] Merge or park this branch; open the **other PR** as planned.
-- [ ] When resuming harness: **Phase 6** (notebook, LSP, MCP, remote) per `docs/harness-implementation-plan.md`.
+- [ ] When resuming harness: **Phase 6** (notebook, LSP, MCP, remote) per `docs/harness-implementation-plan.md`; **execution plane** (sessions, providers, capabilities) per `docs/execution-implementation-plan.md`.
 - [ ] Optional hardening: API/UI explicitly handle `isanagent_clarification` in SSE or REST responses (currently same as other outbounds + metadata).
 - [ ] Optional: remove empty `todos/` dir after legacy migration; metrics when migration count &gt; 0.
 
@@ -62,6 +62,7 @@ This branch delivers harness **Phases 1–5** (through sub-agents / plans under 
 | `src/memory.rs` | Memory actor, `harness_todos` schema, SQLite busy_timeout helper |
 | `src/channels/terminal.rs` | `[Question]` styling for clarification outbounds |
 | `src/bin/isanagent.rs` | Tool registration, `ClarificationHub` + `AgentLogicParams` wiring |
+| `src/execution/` | Phases 0–2: contracts, `local.rs`, `harness.rs` + `build_execution_harness`; tools in `src/tools/execution.rs`; `[harness.execution]` in `config.rs` (`docs/execution-implementation-plan.md`) |
 
 ## Run/Test Commands
 

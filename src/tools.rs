@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 pub mod builtin;
+pub mod execution;
 pub mod workflow;
 
 /// Score `(name, description)` entries for a free-text `query`. Higher is better.

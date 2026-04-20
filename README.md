@@ -307,7 +307,7 @@ When asked to containerize this app, you MUST use cargo-chef and multi-stage bui
 The Agent will see the capability in its system prompt and can dynamically call `load_skill_instructions(name: "create_dockerfile")` to inject this explicitly when needed.
 
 ## 🤝 Development Guide
-For specific guidance on developing new Tools, Skills, or contributing to the architecture as an automated agent yourself, please refer to the dedicated [`GEMINI.md`](./GEMINI.md) blueprint document and [`AGENTS.md`](./AGENTS.md).
+For specific guidance on developing new Tools, Skills, or contributing to the architecture as an automated agent yourself, please refer to the dedicated [`AGENTS.md`](./AGENTS.md) blueprint document and [`AGENTS.md`](./AGENTS.md).
 
 Before opening a PR, from the repo root:
 

@@ -14,3 +14,4 @@ test_altbot2
 !ui/package-lock.json
 !ui/components.json
 !ui/tsconfig.json
+.venv
