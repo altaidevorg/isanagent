@@ -59,7 +59,7 @@ impl Tool for ExecutionSessionCreateTool {
     }
 
     fn description(&self) -> &str {
-        "Create an execution session (requires [harness.execution] enabled). Provider is [harness.execution] default_provider: local runs under the workspace sandbox; jupyter uses a configured Jupyter Server kernel; ssh runs each execution over SSH on a configured Linux-style host. Returns session_id, session capabilities, and a short provider capability summary. Use execution_run to execute code; execution_session_close when done."
+        "Create an execution session (requires [harness.execution] enabled). Provider is [harness.execution] default_provider: local runs under the workspace sandbox; jupyter uses a configured Jupyter Server kernel; ssh opens one SSH session to a configured host (reused until execution_session_close). Returns session_id, session capabilities, and a short provider capability summary. Use execution_run to execute code; execution_session_close when done."
     }
 
     fn parameters(&self) -> Value {
@@ -69,7 +69,7 @@ impl Tool for ExecutionSessionCreateTool {
                 "label": { "type": "string", "description": "Optional label for logs" },
                 "language": {
                     "type": "string",
-                    "description": "Optional language hint. Local: python, py, shell, sh, bash. Jupyter: python, py, r, R (ir kernel). SSH: python, py, shell, sh, bash (remote bash + base64 pipeline)."
+                    "description": "Optional language hint. Local: python, py, shell, sh, bash. Jupyter: python, py, r, R (ir kernel). SSH: python, py, shell, sh, bash (remote exec with code on stdin)."
                 }
             }
         })

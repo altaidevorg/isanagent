@@ -1,11 +1,12 @@
-//! SSH remote execution (Phase 4 MVP): one connection + exec per `run`; sessions track language only.
+//! SSH remote execution (Phase 4): one **TCP+SSH session per provider session** (connect on
+//! `create_session`); each `execution_run` opens a new channel, **`exec`**s a short fixed shell line,
+//! streams user code on **channel stdin** (no `ARG_MAX`-sized argv), then drains stdout/stderr.
 
+use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine;
 use dashmap::DashMap;
 use russh::client;
 use russh::keys::{self, PrivateKeyWithHashAlg};
@@ -64,9 +65,11 @@ enum SshExecMode {
 struct SshSession {
     mode: SshExecMode,
     run_cancel: Mutex<Option<CancellationToken>>,
+    /// One authenticated SSH session per execution session (reused across `run` calls).
+    handle: Arc<Mutex<Option<client::Handle<SshClientHandler>>>>,
 }
 
-/// SSH-backed [`ExecutionProvider`] (Linux-oriented remote: `bash` + `base64` + `python` / `bash -s`).
+/// SSH-backed [`ExecutionProvider`] (Linux-oriented remote: `bash` + stdin-fed `python` / `bash -s`).
 pub struct SshExecutionProvider {
     config: SshExecutionProviderConfig,
     private_key: Option<Arc<keys::PrivateKey>>,
@@ -166,48 +169,20 @@ impl SshExecutionProvider {
             extensions: Default::default(),
         }
     }
+}
 
-    fn build_remote_command(
-        &self,
-        mode: &SshExecMode,
-        code: &str,
-    ) -> Result<String, ExecutionError> {
-        let b64 = B64.encode(code.as_bytes());
-        if !b64
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
-        {
-            return Err(ExecutionError::InvalidArgument(
-                "ssh: internal base64 encoding produced unexpected characters".into(),
-            ));
-        }
-        let wd = &self.config.remote_workdir;
-        let py = &self.config.remote_python;
-        // Inner script uses single-quoted segments (paths are validation-restricted). Avoid
-        // `bash -lc '...'` nesting by double-encoding and using `bash -c "printf ..."`.
-        let inner_script = match mode {
-            SshExecMode::Python => {
-                format!("cd '{wd}' && printf '%s' '{b64}' | base64 -d | exec '{py}' -u -")
-            }
-            SshExecMode::Shell => {
-                format!("cd '{wd}' && printf '%s' '{b64}' | base64 -d | exec bash -s")
-            }
-        };
-        if inner_script.contains('"') || inner_script.contains('$') || inner_script.contains('`') {
-            return Err(ExecutionError::InvalidArgument(
-                "ssh: refused to build remote command with unexpected shell metacharacters".into(),
-            ));
-        }
-        let inner_b64 = B64.encode(inner_script.as_bytes());
-        if inner_b64.contains('\'') {
-            return Err(ExecutionError::InvalidArgument(
-                "ssh: inner script base64 unexpectedly contained a single quote".into(),
-            ));
-        }
-        Ok(format!(
-            "bash -c \"printf %s '{inner_b64}' | base64 -d | bash\""
-        ))
+/// Short `exec` line: `cd` + `exec` into interpreter; user source is written to session stdin.
+fn ssh_remote_exec_line(wd: &str, py: &str, mode: &SshExecMode) -> Result<String, ExecutionError> {
+    let line = match mode {
+        SshExecMode::Python => format!("cd '{wd}' && exec '{py}' -u -"),
+        SshExecMode::Shell => format!("cd '{wd}' && exec bash -s"),
+    };
+    if line.contains('"') || line.contains('$') || line.contains('`') {
+        return Err(ExecutionError::InvalidArgument(
+            "ssh: unexpected shell metacharacters in remote exec line".into(),
+        ));
     }
+    Ok(line)
 }
 
 /// Absolute POSIX path on the remote: `/` + safe characters only, no `..`.
@@ -350,13 +325,10 @@ async fn authenticate_session(
     ))
 }
 
-async fn run_ssh_exec(
-    config: SshExecutionProviderConfig,
-    private_key: Option<Arc<keys::PrivateKey>>,
-    remote_command: String,
-    max_output_bytes: usize,
-) -> Result<RunResult, ExecutionError> {
-    let max_each = (max_output_bytes / 2).max(1024);
+async fn open_ssh_handle(
+    config: &SshExecutionProviderConfig,
+    private_key: &Option<Arc<keys::PrivateKey>>,
+) -> Result<client::Handle<SshClientHandler>, ExecutionError> {
     let client_cfg = Arc::new(client::Config::default());
     let handler = SshClientHandler {
         accept_unknown_host_keys: config.accept_unknown_host_keys,
@@ -366,17 +338,36 @@ async fn run_ssh_exec(
         .await
         .map_err(|e| ExecutionError::Provider(format!("ssh: connect: {e}")))?;
 
-    authenticate_session(&private_key, &mut handle, &config.user).await?;
+    authenticate_session(private_key, &mut handle, &config.user).await?;
+    Ok(handle)
+}
 
+async fn run_ssh_channel_exec(
+    handle: &mut client::Handle<SshClientHandler>,
+    remote_exec_line: &str,
+    stdin_body: Vec<u8>,
+    max_output_bytes: usize,
+) -> Result<RunResult, ExecutionError> {
+    let max_each = (max_output_bytes / 2).max(1024);
     let mut channel = handle
         .channel_open_session()
         .await
         .map_err(|e| ExecutionError::Provider(format!("ssh: open session channel: {e}")))?;
 
     channel
-        .exec(true, remote_command)
+        .exec(true, remote_exec_line)
         .await
         .map_err(|e| ExecutionError::Provider(format!("ssh: exec: {e}")))?;
+
+    channel
+        .data(Cursor::new(stdin_body))
+        .await
+        .map_err(|e| ExecutionError::Provider(format!("ssh: stdin: {e}")))?;
+
+    channel
+        .eof()
+        .await
+        .map_err(|e| ExecutionError::Provider(format!("ssh: eof: {e}")))?;
 
     let mut stdout = Vec::<u8>::new();
     let mut stderr = Vec::<u8>::new();
@@ -406,8 +397,6 @@ async fn run_ssh_exec(
             _ => {}
         }
     }
-
-    let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
 
     Ok(RunResult::new(
         String::from_utf8_lossy(&stdout),
@@ -458,11 +447,13 @@ impl ExecutionProvider for SshExecutionProvider {
             ));
         }
         let mode = self.pick_mode(&req)?;
+        let handle = open_ssh_handle(&self.config, &self.private_key).await?;
         let id = SessionId::new(uuid::Uuid::new_v4().to_string());
         let caps = self.session_caps(&id, &mode);
         let session = Arc::new(SshSession {
             mode,
             run_cancel: Mutex::new(None),
+            handle: Arc::new(Mutex::new(Some(handle))),
         });
         self.sessions.insert(id.clone(), session);
         Ok(SessionHandle {
@@ -475,6 +466,9 @@ impl ExecutionProvider for SshExecutionProvider {
         if let Some((_, sess)) = self.sessions.remove(session_id) {
             if let Some(t) = sess.run_cancel.lock().await.take() {
                 t.cancel();
+            }
+            if let Some(h) = sess.handle.lock().await.take() {
+                let _ = h.disconnect(Disconnect::ByApplication, "", "").await;
             }
             return Ok(());
         }
@@ -517,12 +511,23 @@ impl ExecutionProvider for SshExecutionProvider {
             .min(self.config.max_run_timeout_secs)
             .max(1);
 
-        let remote_command = self.build_remote_command(&mode, &spec.code)?;
-        let cfg = self.config.clone();
-        let pk = self.private_key.clone();
+        let remote_line = ssh_remote_exec_line(
+            &self.config.remote_workdir,
+            &self.config.remote_python,
+            &mode,
+        )?;
+        let code_bytes = spec.code.into_bytes();
+        let handle_arc = session.handle.clone();
+        let sid = session_id.to_string();
         let max_out = self.config.max_output_bytes;
 
-        let work = async move { run_ssh_exec(cfg, pk, remote_command, max_out).await };
+        let work = async move {
+            let mut guard = handle_arc.lock().await;
+            let h = guard.as_mut().ok_or_else(|| {
+                ExecutionError::InvalidSession(format!("{sid} (ssh session is not connected)"))
+            })?;
+            run_ssh_channel_exec(h, &remote_line, code_bytes, max_out).await
+        };
 
         let mut jh = tokio::spawn(work);
         let sleep = tokio::time::sleep(Duration::from_secs(timeout_secs));
@@ -582,5 +587,13 @@ mod tests {
     #[test]
     fn validate_workdir_rejects_dotdot() {
         assert!(validate_remote_workdir("/tmp/../etc").is_err());
+    }
+
+    #[test]
+    fn remote_exec_line_python() {
+        let s = ssh_remote_exec_line("/tmp/w", "python3", &SshExecMode::Python).unwrap();
+        assert!(s.contains("cd '/tmp/w'"));
+        assert!(s.contains("python3"));
+        assert!(s.contains("-u -"));
     }
 }

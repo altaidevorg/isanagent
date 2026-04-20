@@ -133,7 +133,7 @@ See `AGENTS.md` for workspace/sandbox rules, actor discipline, and telemetry con
 
 **Objective:** Remote workstation/HPC flows with the **same** run/cancel API where possible; SSH-specific operations gated by trait + capability bits.
 
-**Status (MVP implemented):** `SshExecutionProvider` in `src/execution/ssh.rs`: each `execution_run` opens a new SSH session, authenticates (private key from `[harness.execution.ssh].identity_file` and/or **`SSH_PASSWORD`** env), `exec`s a `bash` pipeline (`base64`-decoded user code) under a configured absolute **`remote_workdir`**. **`supports_interrupt: false`** (cancel aborts the local SSH task only). **`accept_unknown_host_keys`** (default **true**, MITM risk) maps to `check_server_key`. Config: `[harness.execution.ssh]` + `default_provider = "ssh"`. Strict `known_hosts`, interactive `SshRemoteShell`, and sandbox→remote staging remain future work.
+**Status (MVP implemented):** `SshExecutionProvider` in `src/execution/ssh.rs`: `execution_session_create` connects and authenticates once (private key from `[harness.execution.ssh].identity_file` and/or **`SSH_PASSWORD`** env); each `execution_run` opens a new channel, **`exec`**s a short `cd … && exec python3 -u -` / `exec bash -s` line, and streams user code on **channel stdin** (no `base64` in argv). **`supports_interrupt: false`** (cancel aborts the local wait only). **`accept_unknown_host_keys`** (default **true**, MITM risk) maps to `check_server_key`. Config: `[harness.execution.ssh]` + `default_provider = "ssh"`. Strict `known_hosts`, interactive `SshRemoteShell`, and sandbox→remote staging remain future work.
 
 **Deliverables**
 

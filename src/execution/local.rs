@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -24,7 +24,7 @@ use crate::tools::builtin::resolve_path;
 /// How user code is executed for a session.
 #[derive(Debug, Clone)]
 pub enum LocalExecMode {
-    /// `python_executable -c <code>` (argv, no shell).
+    /// `python_executable -u -` with user source on **stdin** (avoids OS argv length limits).
     Python { executable: String },
     /// POSIX `sh -c` or Windows `cmd /C` (shell — use only with trusted prompts).
     Shell,
@@ -254,9 +254,13 @@ impl ExecutionProvider for LocalExecutionProvider {
         let timeout = Duration::from_secs(timeout_secs);
         let max_each = (self.config.max_output_bytes / 2).max(1024);
 
-        let mut cmd = build_command(&session.mode, &spec.code)?;
+        let (mut cmd, stdin_body) = build_command(&session.mode, &spec.code)?;
         cmd.current_dir(&cwd);
-        cmd.stdin(Stdio::null());
+        cmd.stdin(if stdin_body.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         #[cfg(unix)]
@@ -291,7 +295,9 @@ impl ExecutionProvider for LocalExecutionProvider {
         // Read stdout/stderr with per-pipe caps while the process runs so a runaway writer cannot
         // exhaust host RAM (unlike `wait_with_output`, which buffers unbounded until EOF).
         let work = async move {
-            match tokio::time::timeout(timeout, drain_child_pipes(child, max_each)).await {
+            match tokio::time::timeout(timeout, drain_child_pipes(child, max_each, stdin_body))
+                .await
+            {
                 Err(_) => {
                     if let Some(p) = pid {
                         kill_process_best_effort(p);
@@ -367,7 +373,11 @@ async fn read_pipe_limited(
     Ok(captured)
 }
 
-async fn drain_child_pipes(mut child: Child, max_each: usize) -> Result<RunResult, ExecutionError> {
+async fn drain_child_pipes(
+    mut child: Child,
+    max_each: usize,
+    stdin_body: Option<Vec<u8>>,
+) -> Result<RunResult, ExecutionError> {
     let stdout = child
         .stdout
         .take()
@@ -376,10 +386,26 @@ async fn drain_child_pipes(mut child: Child, max_each: usize) -> Result<RunResul
         .stderr
         .take()
         .ok_or_else(|| ExecutionError::Provider("local child missing stderr pipe".into()))?;
+    let stdin = child.stdin.take();
 
-    let (out, err, status) = tokio::try_join!(
+    let stdin_fut = async move {
+        match (stdin, stdin_body) {
+            (Some(mut s), Some(body)) => {
+                s.write_all(&body).await?;
+                s.shutdown().await?;
+            }
+            (None, Some(_)) => {
+                return Err(std::io::Error::other("local child missing stdin pipe"));
+            }
+            _ => {}
+        }
+        Ok::<(), std::io::Error>(())
+    };
+
+    let (out, err, _, status) = tokio::try_join!(
         read_pipe_limited(stdout, max_each),
         read_pipe_limited(stderr, max_each),
+        stdin_fut,
         child.wait(),
     )
     .map_err(|e| ExecutionError::Provider(e.to_string()))?;
@@ -403,32 +429,37 @@ fn string_from_utf8_lossy_trim_cap(bytes: Vec<u8>, max_chars: usize) -> String {
     s
 }
 
-fn build_command(mode: &LocalExecMode, code: &str) -> Result<Command, ExecutionError> {
-    let c = match mode {
+/// Returns the command and optional stdin payload (UTF-8 source) when the interpreter reads code
+/// from stdin instead of argv.
+fn build_command(
+    mode: &LocalExecMode,
+    code: &str,
+) -> Result<(Command, Option<Vec<u8>>), ExecutionError> {
+    let (c, stdin) = match mode {
         LocalExecMode::Python { executable } => {
             let mut c = Command::new(executable);
-            // Unbuffered so short-lived `print` reaches the pipe before exit (notably on Windows).
-            c.arg("-u").arg("-c").arg(code);
-            c
+            // Unbuffered; code is sent on stdin to avoid command-line length limits.
+            c.arg("-u").arg("-");
+            (c, Some(code.as_bytes().to_vec()))
         }
         LocalExecMode::Shell => {
             if cfg!(target_os = "windows") {
                 let mut c = Command::new("cmd");
                 c.arg("/C").arg(code);
-                c
+                (c, None)
             } else {
                 let mut c = Command::new("sh");
                 c.arg("-c").arg(code);
-                c
+                (c, None)
             }
         }
     };
-    Ok(c)
+    Ok((c, stdin))
 }
 
 #[cfg(windows)]
 fn kill_process_best_effort(pid: u32) {
-    if pid == 0 {
+    if pid <= 1 {
         return;
     }
     let _ = StdCommand::new("taskkill")
@@ -441,7 +472,8 @@ fn kill_process_best_effort(pid: u32) {
 
 #[cfg(unix)]
 fn kill_process_best_effort(pid: u32) {
-    if pid == 0 {
+    // `kill(-1, SIGKILL)` would target every signalable process for this user — never do that.
+    if pid <= 1 {
         return;
     }
     // Child runs in its own process group (`setpgid` in `pre_exec`); negative PID targets the group.
