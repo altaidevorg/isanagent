@@ -583,16 +583,18 @@ fn append_truncated(buf: &mut String, chunk: &str, budget: &mut usize) {
     }
 }
 
+/// Mutable state while folding Jupyter execute WebSocket messages for one `execute_request`.
+struct ExecuteFoldCtx<'a> {
+    stdout: &'a mut String,
+    stderr: &'a mut String,
+    budget: &'a mut usize,
+    exit_code: &'a mut Option<i32>,
+    got_execute_reply: &'a mut bool,
+    got_iopub_idle: &'a mut bool,
+}
+
 /// Apply one Jupyter message (decoded JSON envelope) to stdout/stderr / completion state.
-fn fold_execute_ws_message(
-    v: &Value,
-    exec_msg_id: &str,
-    stdout: &mut String,
-    stderr: &mut String,
-    budget: &mut usize,
-    exit_code: &mut Option<i32>,
-    got_reply: &mut bool,
-) {
+fn fold_execute_ws_message(v: &Value, exec_msg_id: &str, ctx: &mut ExecuteFoldCtx<'_>) {
     let msg_type = v["header"]["msg_type"].as_str().unwrap_or("");
     let parent_id = v["parent_header"]["msg_id"].as_str();
     let matches_parent = parent_id == Some(exec_msg_id);
@@ -604,15 +606,15 @@ fn fold_execute_ws_message(
             let name = v["content"]["name"].as_str().unwrap_or("stdout");
             let text = stream_text(&v["content"]);
             if name == "stderr" {
-                append_truncated(stderr, &text, budget);
+                append_truncated(ctx.stderr, &text, ctx.budget);
             } else {
-                append_truncated(stdout, &text, budget);
+                append_truncated(ctx.stdout, &text, ctx.budget);
             }
         }
         "execute_result" | "display_data" | "update_display_data" => {
             if let Some(data) = v["content"].get("data") {
                 if let Some(s) = text_plain_from_data(data) {
-                    append_truncated(stdout, &s, budget);
+                    append_truncated(ctx.stdout, &s, ctx.budget);
                 }
             }
         }
@@ -629,30 +631,36 @@ fn fold_execute_ws_message(
                 })
                 .unwrap_or_default();
             let block = format!("{ename}: {evalue}\n{trace}\n");
-            append_truncated(stderr, &block, budget);
-            *exit_code = Some(1);
+            append_truncated(ctx.stderr, &block, ctx.budget);
+            *ctx.exit_code = Some(1);
         }
         "execute_reply" => {
+            // Shell reply: sync status / exit only. Traceback belongs on iopub `error` to avoid duplicates.
             let status = v["content"]["status"].as_str().unwrap_or("");
-            if status == "error" {
-                *exit_code = Some(1);
-                let ename = v["content"]["ename"].as_str().unwrap_or("Error");
-                let evalue = v["content"]["evalue"].as_str().unwrap_or("");
-                let trace = v["content"]["traceback"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|x| x.as_str())
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                    .unwrap_or_default();
-                let block = format!("{ename}: {evalue}\n{trace}\n");
-                append_truncated(stderr, &block, budget);
-            } else if status == "abort" {
-                *exit_code = Some(130);
+            match status {
+                "error" => {
+                    if ctx.exit_code.is_none() || *ctx.exit_code == Some(0) {
+                        *ctx.exit_code = Some(1);
+                    }
+                }
+                "abort" => *ctx.exit_code = Some(130),
+                "ok" => {
+                    if ctx.exit_code.is_none() || *ctx.exit_code == Some(0) {
+                        *ctx.exit_code = Some(0);
+                    }
+                }
+                _ => {}
             }
-            *got_reply = true;
+            *ctx.got_execute_reply = true;
+        }
+        "status" => {
+            let parent_id = v["parent_header"]["msg_id"].as_str();
+            if parent_id == Some(exec_msg_id) {
+                let state = v["content"]["execution_state"].as_str().unwrap_or("");
+                if state == "idle" {
+                    *ctx.got_iopub_idle = true;
+                }
+            }
         }
         _ => {}
     }
@@ -669,10 +677,11 @@ async fn collect_execute_output(
     let mut stderr = String::new();
     let mut budget = max_output_bytes;
     let mut exit_code = Some(0i32);
-    let mut got_reply = false;
+    let mut got_execute_reply = false;
+    let mut got_iopub_idle = false;
 
     loop {
-        if got_reply {
+        if got_execute_reply && got_iopub_idle {
             break;
         }
         tokio::select! {
@@ -684,6 +693,10 @@ async fn collect_execute_output(
             next = ws.next() => {
                 let frame = match next {
                     None => {
+                        if got_execute_reply {
+                            // Connection closed before idle; return best-effort output.
+                            break;
+                        }
                         return Err(ExecutionError::Provider(
                             "jupyter websocket closed before execute_reply".into(),
                         ));
@@ -696,15 +709,15 @@ async fn collect_execute_output(
                 match frame {
                     Message::Binary(b) => {
                         let v = decode_incoming_ws_bytes(&b)?;
-                        fold_execute_ws_message(
-                            &v,
-                            exec_msg_id,
-                            &mut stdout,
-                            &mut stderr,
-                            &mut budget,
-                            &mut exit_code,
-                            &mut got_reply,
-                        );
+                        let mut ctx = ExecuteFoldCtx {
+                            stdout: &mut stdout,
+                            stderr: &mut stderr,
+                            budget: &mut budget,
+                            exit_code: &mut exit_code,
+                            got_execute_reply: &mut got_execute_reply,
+                            got_iopub_idle: &mut got_iopub_idle,
+                        };
+                        fold_execute_ws_message(&v, exec_msg_id, &mut ctx);
                     }
                     Message::Ping(p) => {
                         ws.send(Message::Pong(p)).await.map_err(|e| {
@@ -712,6 +725,9 @@ async fn collect_execute_output(
                         })?;
                     }
                     Message::Close(f) => {
+                        if got_execute_reply {
+                            break;
+                        }
                         return Err(ExecutionError::Provider(format!(
                             "jupyter websocket closed: {f:?}"
                         )));
@@ -719,15 +735,15 @@ async fn collect_execute_output(
                     Message::Pong(_) | Message::Frame(_) => {}
                     Message::Text(t) => {
                         if let Ok(v) = serde_json::from_str::<Value>(&t) {
-                            fold_execute_ws_message(
-                                &v,
-                                exec_msg_id,
-                                &mut stdout,
-                                &mut stderr,
-                                &mut budget,
-                                &mut exit_code,
-                                &mut got_reply,
-                            );
+                            let mut ctx = ExecuteFoldCtx {
+                                stdout: &mut stdout,
+                                stderr: &mut stderr,
+                                budget: &mut budget,
+                                exit_code: &mut exit_code,
+                                got_execute_reply: &mut got_execute_reply,
+                                got_iopub_idle: &mut got_iopub_idle,
+                            };
+                            fold_execute_ws_message(&v, exec_msg_id, &mut ctx);
                         }
                     }
                 }
@@ -819,18 +835,20 @@ mod tests {
         let mut stderr = String::new();
         let mut budget = 1000;
         let mut exit_code = Some(0i32);
-        let mut got_reply = false;
-        fold_execute_ws_message(
-            &v,
-            pid,
-            &mut stdout,
-            &mut stderr,
-            &mut budget,
-            &mut exit_code,
-            &mut got_reply,
-        );
+        let mut got_execute_reply = false;
+        let mut got_iopub_idle = false;
+        let mut ctx = ExecuteFoldCtx {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+            budget: &mut budget,
+            exit_code: &mut exit_code,
+            got_execute_reply: &mut got_execute_reply,
+            got_iopub_idle: &mut got_iopub_idle,
+        };
+        fold_execute_ws_message(&v, pid, &mut ctx);
         assert_eq!(stdout, "42");
-        assert!(!got_reply);
+        assert!(!got_execute_reply);
+        assert!(!got_iopub_idle);
     }
 
     #[test]
@@ -849,16 +867,112 @@ mod tests {
         let mut stderr = String::new();
         let mut budget = 1000;
         let mut exit_code = Some(0i32);
-        let mut got_reply = false;
-        fold_execute_ws_message(
-            &v,
-            "abc",
-            &mut stdout,
-            &mut stderr,
-            &mut budget,
-            &mut exit_code,
-            &mut got_reply,
-        );
+        let mut got_execute_reply = false;
+        let mut got_iopub_idle = false;
+        let mut ctx = ExecuteFoldCtx {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+            budget: &mut budget,
+            exit_code: &mut exit_code,
+            got_execute_reply: &mut got_execute_reply,
+            got_iopub_idle: &mut got_iopub_idle,
+        };
+        fold_execute_ws_message(&v, "abc", &mut ctx);
         assert_eq!(stdout, "hello");
+    }
+
+    #[test]
+    fn iopub_error_then_execute_reply_error_no_duplicate_stderr() {
+        let pid = "exec-1";
+        let err = serde_json::from_str::<Value>(&format!(
+            r#"{{
+            "channel":"iopub",
+            "header":{{"msg_type":"error"}},
+            "parent_header":{{"msg_id":"{pid}"}},
+            "content":{{
+                "ename":"ValueError",
+                "evalue":"bad",
+                "traceback":["line-A","line-B"]
+            }}
+        }}"#
+        ))
+        .unwrap();
+        let reply = serde_json::from_str::<Value>(&format!(
+            r#"{{
+            "channel":"shell",
+            "header":{{"msg_type":"execute_reply"}},
+            "parent_header":{{"msg_id":"{pid}"}},
+            "content":{{
+                "status":"error",
+                "ename":"ValueError",
+                "evalue":"bad",
+                "traceback":["line-A","line-B"]
+            }}
+        }}"#
+        ))
+        .unwrap();
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let mut budget = 10_000;
+        let mut exit_code = Some(0i32);
+        let mut got_execute_reply = false;
+        let mut got_iopub_idle = false;
+        let mut ctx = ExecuteFoldCtx {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+            budget: &mut budget,
+            exit_code: &mut exit_code,
+            got_execute_reply: &mut got_execute_reply,
+            got_iopub_idle: &mut got_iopub_idle,
+        };
+        fold_execute_ws_message(&err, pid, &mut ctx);
+        assert_eq!(exit_code, Some(1));
+        let after_error = stderr.clone();
+        let mut ctx = ExecuteFoldCtx {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+            budget: &mut budget,
+            exit_code: &mut exit_code,
+            got_execute_reply: &mut got_execute_reply,
+            got_iopub_idle: &mut got_iopub_idle,
+        };
+        fold_execute_ws_message(&reply, pid, &mut ctx);
+        assert_eq!(
+            stderr, after_error,
+            "execute_reply must not append a second traceback"
+        );
+        assert!(got_execute_reply);
+        assert!(!got_iopub_idle);
+    }
+
+    #[test]
+    fn fold_status_idle_marks_iopub_complete() {
+        let pid = "exec-2";
+        let idle: Value = serde_json::from_str(&format!(
+            r#"{{
+            "channel":"iopub",
+            "header":{{"msg_type":"status"}},
+            "parent_header":{{"msg_id":"{pid}"}},
+            "content":{{"execution_state":"idle"}}
+        }}"#
+        ))
+        .unwrap();
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let mut budget = 1000;
+        let mut exit_code = Some(0i32);
+        let mut got_execute_reply = false;
+        let mut got_iopub_idle = false;
+        let mut ctx = ExecuteFoldCtx {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+            budget: &mut budget,
+            exit_code: &mut exit_code,
+            got_execute_reply: &mut got_execute_reply,
+            got_iopub_idle: &mut got_iopub_idle,
+        };
+        fold_execute_ws_message(&idle, pid, &mut ctx);
+        assert!(got_iopub_idle);
+        assert!(!got_execute_reply);
     }
 }

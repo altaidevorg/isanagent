@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use tokio::process::Command;
+use tokio::io::AsyncReadExt;
+use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -258,6 +259,20 @@ impl ExecutionProvider for LocalExecutionProvider {
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: `pre_exec` runs in the child after `fork` and before `exec`; only async-signal-safe
+            // calls are allowed. `setpgid` establishes a new process group so we can kill the whole tree.
+            unsafe {
+                cmd.as_std_mut().pre_exec(|| {
+                    if libc::setpgid(0, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -273,21 +288,18 @@ impl ExecutionProvider for LocalExecutionProvider {
             *session.active_pid.lock().await = Some(pid);
         }
 
-        // `wait_with_output` is more reliable on Windows than manual `try_join` on pipes.
+        // Read stdout/stderr with per-pipe caps while the process runs so a runaway writer cannot
+        // exhaust host RAM (unlike `wait_with_output`, which buffers unbounded until EOF).
         let work = async move {
-            match tokio::time::timeout(timeout, child.wait_with_output()).await {
+            match tokio::time::timeout(timeout, drain_child_pipes(child, max_each)).await {
                 Err(_) => {
                     if let Some(p) = pid {
                         kill_process_best_effort(p);
                     }
                     Err(ExecutionError::Timeout { timeout_secs })
                 }
-                Ok(Err(e)) => Err(ExecutionError::Provider(e.to_string())),
-                Ok(Ok(out)) => {
-                    let stdout = truncate_utf8_bytes(out.stdout, max_each);
-                    let stderr = truncate_utf8_bytes(out.stderr, max_each);
-                    Ok(RunResult::new(stdout, stderr, out.status.code()))
-                }
+                Ok(Err(e)) => Err(e),
+                Ok(Ok(r)) => Ok(r),
             }
         };
 
@@ -333,6 +345,64 @@ impl ExecutionProvider for LocalExecutionProvider {
     }
 }
 
+/// Read from `reader` until EOF, retaining at most `max_capture` bytes in the returned buffer and
+/// discarding the rest so the peer pipe never fills indefinitely.
+async fn read_pipe_limited(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    max_capture: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut captured = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        if captured.len() < max_capture {
+            let room = max_capture.saturating_sub(captured.len());
+            let take = n.min(room);
+            captured.extend_from_slice(&buf[..take]);
+        }
+    }
+    Ok(captured)
+}
+
+async fn drain_child_pipes(mut child: Child, max_each: usize) -> Result<RunResult, ExecutionError> {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ExecutionError::Provider("local child missing stdout pipe".into()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| ExecutionError::Provider("local child missing stderr pipe".into()))?;
+
+    let (out, err, status) = tokio::try_join!(
+        read_pipe_limited(stdout, max_each),
+        read_pipe_limited(stderr, max_each),
+        child.wait(),
+    )
+    .map_err(|e| ExecutionError::Provider(e.to_string()))?;
+
+    let stdout = string_from_utf8_lossy_trim_cap(out, max_each);
+    let stderr = string_from_utf8_lossy_trim_cap(err, max_each);
+    Ok(RunResult::new(stdout, stderr, status.code()))
+}
+
+fn string_from_utf8_lossy_trim_cap(bytes: Vec<u8>, max_chars: usize) -> String {
+    let mut s = String::from_utf8_lossy(&bytes).into_owned();
+    if s.len() <= max_chars {
+        return s;
+    }
+    let mut end = max_chars;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    s.push_str("\n... (truncated)");
+    s
+}
+
 fn build_command(mode: &LocalExecMode, code: &str) -> Result<Command, ExecutionError> {
     let c = match mode {
         LocalExecMode::Python { executable } => {
@@ -356,38 +426,29 @@ fn build_command(mode: &LocalExecMode, code: &str) -> Result<Command, ExecutionE
     Ok(c)
 }
 
-fn truncate_utf8_bytes(bytes: Vec<u8>, max: usize) -> String {
-    let mut s = String::from_utf8_lossy(&bytes).into_owned();
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s.truncate(end);
-    s.push_str("\n... (truncated)");
-    s
-}
-
+#[cfg(windows)]
 fn kill_process_best_effort(pid: u32) {
     if pid == 0 {
         return;
     }
-    if cfg!(target_os = "windows") {
-        let _ = StdCommand::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    } else {
-        let _ = StdCommand::new("kill")
-            .args(["-9", "--", &pid.to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+    let _ = StdCommand::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(unix)]
+fn kill_process_best_effort(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    // Child runs in its own process group (`setpgid` in `pre_exec`); negative PID targets the group.
+    let pgid = -(pid as i32);
+    // SAFETY: `kill` from the parent after fork/exec is allowed here.
+    unsafe {
+        let _ = libc::kill(pgid, libc::SIGKILL);
     }
 }
 

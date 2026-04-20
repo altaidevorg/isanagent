@@ -16,7 +16,7 @@ When **`[harness.execution] enabled = true`**, the agent gains five tools:
 
 Three providers are implemented today:
 
-- **`local`** — each session uses a working directory under your workspace sandbox and runs subprocesses (e.g. `python -u -c …`).
+- **`local`** — each session uses a working directory under your workspace sandbox and runs subprocesses (e.g. `python -u -c …`). Stdout/stderr are read incrementally with the same byte caps as `max_output_bytes` (half per stream, minimum each side), so runaway output cannot exhaust RAM before the cap applies. On Unix the child is placed in its own process group and cancellation/timeout sends **SIGKILL** to that group (similar to Windows `taskkill /T`).
 - **`jupyter`** — each session is a **Jupyter Server** kernel you point at with `base_url` + token; runs use the kernel’s WebSocket execute channel (persistent variables, interrupt via server API).
 - **`ssh`** — each session is a **logical** session on the agent; each **`execution_run`** opens a new SSH connection to a Linux-style host, `cd` to a fixed absolute **`remote_workdir`**, and runs your code via **`bash`** and **`base64`** (Python unbuffered stdin or `bash -s` for shell). There is **no** persistent remote REPL across runs; **`execution_cancel`** only cancels the client wait (remote process may keep running). Use **`identity_file`** (OpenSSH private key) and/or host env **`SSH_PASSWORD`** (never commit passwords in `config.toml`).
 
@@ -100,7 +100,7 @@ For **Jupyter**, pick the kernel environment by **`kernel_name`** and the kernel
 
 **Notebook vs Lab:** both use **Jupyter Server**; the kernel WebSocket URL and message framing are the same. Use **`base_url`** as the server root (for example `http://127.0.0.1:8888`), not the `/lab?token=…` UI URL—put the token in **`JUPYTER_TOKEN`** or `[harness.execution.jupyter].token` instead.
 
-**Output capture:** the server may send `print()` output as **JSON text** WebSocket frames or as **binary v1** frames (depending on subprotocol). The agent collects **`stream`** (stdout/stderr), **`execute_result`** / **`display_data`** (`text/plain`), **`error`**, and **`execute_reply`**. Bare expressions (last line without `print`) appear via **`execute_result`**, not always as a `stream`.
+**Output capture:** the server may send `print()` output as **JSON text** WebSocket frames or as **binary v1** frames (depending on subprotocol). The agent collects **`stream`** (stdout/stderr), **`execute_result`** / **`display_data`** (`text/plain`), the iopub **`error`** message (traceback text goes to stderr once — **`execute_reply`** with `status: error` does not duplicate it), and **`execute_reply`** for exit status. A run finishes only after **`execute_reply`** and an iopub **`status`** `execution_state: idle` with the same parent `msg_id`, so trailing **`stream`** / **`execute_result`** frames are not dropped early. If the socket closes first, the client returns best-effort output after **`execute_reply`**. Bare expressions (last line without `print`) appear via **`execute_result`**, not always as a `stream`.
 
 The client requests WebSocket subprotocol **`v1.kernel.websocket.jupyter.org`** when opening `/api/kernels/{id}/channels` (Jupyter Server’s preferred binary layout). If the handshake fails, it retries **without** that header so older or unusual proxies still work.
 

@@ -2327,6 +2327,7 @@ dependencies = [
  "hmac 0.12.1",
  "imap",
  "lettre",
+ "libc",
  "log",
  "moka",
  "native-tls",
