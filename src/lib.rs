@@ -16,6 +16,7 @@ pub mod logging;
 pub mod memory;
 pub mod multi_tenant_edge;
 pub mod onboarding;
+pub mod onboarding_interactive;
 pub mod provider;
 pub mod reflection;
 pub mod scheduler;

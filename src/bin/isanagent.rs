@@ -20,6 +20,7 @@ use isanagent::logging::{
     LOGGER_QUEUE_CAPACITY,
 };
 use isanagent::onboarding::{onboard_workspace, BootstrapReport, OnboardOptions};
+use isanagent::onboarding_interactive;
 use isanagent::provider::OpenAIProvider;
 use isanagent::scheduler::{
     validate_multi_tenant_edge_runtime, CronActor, CronSchedulingMode, CronTriggerPayload,
@@ -72,6 +73,9 @@ struct OnboardArgs {
     /// Optional explicit path to the workspace directory. Defaults to ~/.isanagent
     #[arg(short, long)]
     workspace: Option<String>,
+    /// Textual wizard (ratatui): provider → optional base URL → API key env var name → pick model from /models
+    #[arg(long)]
+    interactive: bool,
     /// Override embedded defaults for `config.toml` (see `isanagent onboard --help`)
     #[command(flatten)]
     options: OnboardOptions,
@@ -773,19 +777,54 @@ async fn run_onboard(
     args: OnboardArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let workspace_arg = args.workspace.or(global_workspace);
-    let options = args.options;
+
+    if args.interactive && args.options.has_overrides() {
+        return Err(std::io::Error::other(
+            "Cannot combine --interactive with other config override flags; run `onboard --interactive` alone.",
+        )
+        .into());
+    }
+
+    let interactive_outcome = if args.interactive {
+        let handle = tokio::runtime::Handle::current();
+        Some(
+            tokio::task::spawn_blocking(move || {
+                onboarding_interactive::run_interactive_collect(&handle)
+            })
+            .await?
+            .map_err(std::io::Error::other)?,
+        )
+    } else {
+        None
+    };
+
+    let options = interactive_outcome
+        .as_ref()
+        .map(|o| o.options.clone())
+        .unwrap_or_else(|| args.options);
+
     let config_overrides_used = options.has_overrides();
+
+    let options_for_workspace = options.clone();
     let report = tokio::task::spawn_blocking(move || {
         let workspace_root = resolve_workspace_root(workspace_arg.as_deref());
-        onboard_workspace(&workspace_root, &options)
+        onboard_workspace(&workspace_root, &options_for_workspace)
     })
     .await?
     .map_err(std::io::Error::other)?;
-    print_onboarding_report(&report, config_overrides_used);
+
+    let env_name = interactive_outcome
+        .as_ref()
+        .and_then(|c| c.options.provider_api_key_env.clone());
+    print_onboarding_report(&report, config_overrides_used, env_name.as_deref());
     Ok(())
 }
 
-fn print_onboarding_report(report: &BootstrapReport, config_overrides_used: bool) {
+fn print_onboarding_report(
+    report: &BootstrapReport,
+    config_overrides_used: bool,
+    api_key_env: Option<&str>,
+) {
     println!("Workspace onboarded at {}", report.root.display());
     println!();
 
@@ -813,7 +852,17 @@ fn print_onboarding_report(report: &BootstrapReport, config_overrides_used: bool
     }
 
     println!("Next steps:");
-    println!("1. Set GEMINI_API_KEY (or the env named in provider.api_key_env)");
+    match api_key_env {
+        Some(env) => {
+            println!(
+                "1. Ensure {} is set in your environment (see config.toml provider.api_key_env)",
+                env
+            );
+        }
+        None => {
+            println!("1. Set GEMINI_API_KEY (or the env named in provider.api_key_env)");
+        }
+    }
     println!("2. Update <changethis> placeholders or disable unused channels in config.toml");
     println!("3. Run: isanagent --workspace {}", report.root.display());
 }
