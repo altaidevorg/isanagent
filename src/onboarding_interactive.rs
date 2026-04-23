@@ -1,4 +1,5 @@
-//! Ratatui-based interactive `isanagent onboard` flow (provider → optional URL → API key env name → models).
+//! Ratatui-based interactive `isanagent onboard` flow (provider → optional URL → API key env name
+//! → models → feature enable/disable toggles).
 
 use std::io::{self, stdout};
 use std::sync::mpsc;
@@ -15,6 +16,65 @@ use serde::Deserialize;
 use tokio::runtime::Handle;
 
 use crate::onboarding::OnboardOptions;
+
+/// Matches [`assets/onboarding/config.toml`] defaults for boolean-ish sections (harness absent = off).
+const FEATURE_TOGGLE_COUNT: usize = 12;
+const FEATURE_TOGGLE_LABELS: [&str; FEATURE_TOGGLE_COUNT] = [
+    "[terminal] stdin/stdout chat",
+    "[slack]",
+    "[email]",
+    "[api] HTTP channel",
+    "[api] serve_ui (browser UI on API port)",
+    "[multi_tenant_edge] activity heartbeat",
+    "[multi_tenant_edge] cron scheduling",
+    "[jina] web_search / web_fetch fallback",
+    "[memory]",
+    "[harness.git_worktree]",
+    "[harness.subagents]",
+    "[harness.execution]",
+];
+
+fn default_feature_toggle_values() -> [bool; FEATURE_TOGGLE_COUNT] {
+    [
+        true,  // terminal
+        true,  // slack
+        false, // email
+        false, // api
+        false, // serve_ui
+        false, // mte activity
+        false, // mte cron
+        false, // jina
+        true,  // memory
+        false, // harness git_worktree (template has no harness block)
+        false, // harness subagents
+        false, // harness execution
+    ]
+}
+
+fn build_onboard_options_with_toggles(
+    model_id: String,
+    chat_url: String,
+    api_key_env: String,
+    values: &[bool; FEATURE_TOGGLE_COUNT],
+) -> OnboardOptions {
+    let mut options = OnboardOptions::default();
+    options.provider_model = Some(model_id);
+    options.provider_base_url = Some(chat_url);
+    options.provider_api_key_env = Some(api_key_env);
+    options.terminal_enable = Some(values[0]);
+    options.slack_enabled = Some(values[1]);
+    options.email_enabled = Some(values[2]);
+    options.api_enabled = Some(values[3]);
+    options.api_serve_ui = Some(values[4]);
+    options.multi_tenant_activity_heartbeat = Some(values[5]);
+    options.multi_tenant_cron_scheduling = Some(values[6]);
+    options.jina_enabled = Some(values[7]);
+    options.memory_enabled = Some(values[8]);
+    options.harness_git_worktree_enabled = Some(values[9]);
+    options.harness_subagents_enabled = Some(values[10]);
+    options.harness_execution_enabled = Some(values[11]);
+    options
+}
 
 /// Outcome of the interactive wizard: merged CLI overrides for `onboard_workspace`.
 pub struct InteractiveOnboardOutcome {
@@ -174,6 +234,14 @@ enum Step {
         selected: usize,
         page: usize,
     },
+    FeatureToggles {
+        models: Vec<String>,
+        model_selected: usize,
+        model_page: usize,
+        selected: usize,
+        page: usize,
+        values: [bool; FEATURE_TOGGLE_COUNT],
+    },
 }
 
 struct UiState {
@@ -187,6 +255,8 @@ struct UiState {
     api_key_env_error: Option<String>,
     /// In-flight `/models` request; dropped on Esc to cancel (sender disconnects).
     fetch_rx: Option<mpsc::Receiver<Result<Vec<String>, String>>>,
+    /// Last feature-toggle row state when leaving the toggles step (e.g. ← to change model); reused on re-entry.
+    feature_toggle_values_cache: Option<[bool; FEATURE_TOGGLE_COUNT]>,
 }
 
 impl UiState {
@@ -200,6 +270,7 @@ impl UiState {
             custom_url_error: None,
             api_key_env_error: None,
             fetch_rx: None,
+            feature_toggle_values_cache: None,
         }
     }
 }
@@ -518,17 +589,95 @@ fn run_ui_loop(handle: &Handle) -> Result<InteractiveOnboardOutcome, String> {
                         *selected = (*page * per_page).min(n.saturating_sub(1));
                     }
                     KeyCode::Enter => {
-                        let id = models
-                            .get(*selected)
-                            .ok_or_else(|| "invalid selection".to_string())?
-                            .clone();
                         if state.provider.is_none() {
                             return Err("internal: missing provider".to_string());
                         }
-                        let mut options = OnboardOptions::default();
-                        options.provider_model = Some(id);
-                        options.provider_base_url = Some(state.chat_url.clone());
-                        options.provider_api_key_env = Some(state.pending_api_key_env.clone());
+                        if models.get(*selected).is_none() {
+                            return Err("invalid selection".to_string());
+                        }
+                        let values = state
+                            .feature_toggle_values_cache
+                            .unwrap_or_else(default_feature_toggle_values);
+                        state.step = Step::FeatureToggles {
+                            models: models.clone(),
+                            model_selected: *selected,
+                            model_page: *page,
+                            selected: 0,
+                            page: 0,
+                            values,
+                        };
+                    }
+                    _ => {}
+                }
+            }
+            Step::FeatureToggles {
+                models,
+                model_selected,
+                model_page,
+                selected,
+                page,
+                values,
+            } => {
+                let size = terminal.size().map_err(|e| format!("size: {}", e))?;
+                let area = Rect::new(0, 0, size.width, size.height);
+                let block = centered_rect(area, 85, 80);
+                let inner_h = block.height.saturating_sub(4) as usize;
+                let per_page = inner_h.max(2);
+                let n = FEATURE_TOGGLE_COUNT;
+                let total_pages = (n + per_page - 1) / per_page;
+
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => {
+                        return Err("Onboarding cancelled.".to_string());
+                    }
+                    KeyCode::Left => {
+                        state.feature_toggle_values_cache = Some(*values);
+                        state.step = Step::PickModel {
+                            models: models.clone(),
+                            selected: *model_selected,
+                            page: *model_page,
+                        };
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if *selected > 0 {
+                            *selected -= 1;
+                        }
+                        *page = *selected / per_page;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if *selected + 1 < n {
+                            *selected += 1;
+                        }
+                        *page = *selected / per_page;
+                    }
+                    KeyCode::Char('n') | KeyCode::PageDown => {
+                        let next_page = (*page + 1).min(total_pages.saturating_sub(1));
+                        *page = next_page;
+                        *selected = (*page * per_page).min(n.saturating_sub(1));
+                    }
+                    KeyCode::Char('p') | KeyCode::PageUp => {
+                        let prev_page = page.saturating_sub(1);
+                        *page = prev_page;
+                        *selected = (*page * per_page).min(n.saturating_sub(1));
+                    }
+                    KeyCode::Char(' ') => {
+                        values[*selected] = !values[*selected];
+                        state.feature_toggle_values_cache = Some(*values);
+                    }
+                    KeyCode::Enter => {
+                        if state.provider.is_none() {
+                            return Err("internal: missing provider".to_string());
+                        }
+                        let id = models
+                            .get(*model_selected)
+                            .ok_or_else(|| "invalid model selection".to_string())?
+                            .clone();
+                        let options = build_onboard_options_with_toggles(
+                            id,
+                            state.chat_url.clone(),
+                            state.pending_api_key_env.clone(),
+                            values,
+                        );
                         return Ok(InteractiveOnboardOutcome { options });
                     }
                     _ => {}
@@ -713,6 +862,62 @@ fn render(frame: &mut Frame, state: &UiState) {
             let hint = Paragraph::new(
                 "↑/↓ j/k move · n/p page · Enter confirm · ← back · Esc quit",
             )
+            .alignment(Alignment::Center);
+            frame.render_widget(hint, chunks[1]);
+        }
+        Step::FeatureToggles {
+            selected,
+            page,
+            values,
+            ..
+        } => {
+            let inner_h = block.height.saturating_sub(4) as usize;
+            let per_page = inner_h.max(2);
+            let n = FEATURE_TOGGLE_COUNT;
+            let total_pages = (n + per_page - 1) / per_page;
+            let page = (*page).min(total_pages.saturating_sub(1));
+            let start = page * per_page;
+            let end = (start + per_page).min(n);
+            let local_sel = selected.saturating_sub(start);
+
+            let items: Vec<ListItem> = (start..end)
+                .map(|i| {
+                    let on = values[i];
+                    let mark = if on { "[on] " } else { "[off]" };
+                    let text = format!("{} {}", mark, FEATURE_TOGGLE_LABELS[i]);
+                    let style = if i - start == local_sel {
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    ListItem::new(Line::from(text)).style(style)
+                })
+                .collect();
+
+            let title = format!(
+                "Enable / disable features (page {}/{}, {} items)",
+                page + 1,
+                total_pages.max(1),
+                n
+            );
+            let list = List::new(items).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .title_alignment(Alignment::Center),
+            );
+            frame.render_widget(list, block);
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(2)])
+                .split(block);
+            let hint = Paragraph::new(vec![
+                Line::from("↑/↓ j/k move · Space toggle · n/p page · Enter finish · ← back to models"),
+                Line::from("Esc or q quit"),
+            ])
             .alignment(Alignment::Center);
             frame.render_widget(hint, chunks[1]);
         }

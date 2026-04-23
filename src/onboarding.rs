@@ -5,6 +5,7 @@ use crate::config::{AppConfig, SlackMode};
 use crate::skills::SkillRegistry;
 use crate::workspace::{ensure_workspace_layout, WorkspaceLayout};
 use clap::Args;
+use toml_edit::{value, DocumentMut};
 
 const CONFIG_TEMPLATE: &str = include_str!("../assets/onboarding/config.toml");
 const AGENTS_TEMPLATE: &str = include_str!("../assets/onboarding/AGENTS.md");
@@ -39,9 +40,10 @@ impl BootstrapReport {
 /// Optional `config.toml` field overrides for [`onboard_workspace`].
 ///
 /// Derives [`clap::Args`] so the binary can `flatten` these into `onboard` for scripting.
-/// When any field is set, the written `config.toml` is produced by parse → merge → serialize
-/// (embedded template comments are omitted). With all fields unset, the embedded template
-/// file is copied verbatim (comments preserved).
+/// When any field is set, the written `config.toml` is normally produced by parse → merge →
+/// serialize (comments omitted). `onboard --interactive` uses [`build_interactive_config_toml`]
+/// instead so comments are kept. With all fields unset, the embedded template file is copied
+/// verbatim (comments preserved).
 #[derive(Debug, Clone, Default, Args)]
 #[command(next_help_heading = "config.toml overrides")]
 pub struct OnboardOptions {
@@ -90,6 +92,13 @@ pub struct OnboardOptions {
     pub multi_tenant_activity_heartbeat: Option<bool>,
     #[arg(long, help_heading = "Jina / memory / multi-tenant")]
     pub multi_tenant_cron_scheduling: Option<bool>,
+
+    #[arg(long, help_heading = "Harness")]
+    pub harness_git_worktree_enabled: Option<bool>,
+    #[arg(long, help_heading = "Harness")]
+    pub harness_subagents_enabled: Option<bool>,
+    #[arg(long, help_heading = "Harness")]
+    pub harness_execution_enabled: Option<bool>,
 }
 
 impl OnboardOptions {
@@ -114,6 +123,9 @@ impl OnboardOptions {
             || self.memory_enabled.is_some()
             || self.multi_tenant_activity_heartbeat.is_some()
             || self.multi_tenant_cron_scheduling.is_some()
+            || self.harness_git_worktree_enabled.is_some()
+            || self.harness_subagents_enabled.is_some()
+            || self.harness_execution_enabled.is_some()
     }
 }
 
@@ -195,6 +207,28 @@ fn apply_onboard_options(cfg: &mut AppConfig, opts: &OnboardOptions) {
             m.cron_scheduling_enabled = Some(v);
         }
     }
+
+    if opts.harness_git_worktree_enabled.is_some()
+        || opts.harness_subagents_enabled.is_some()
+        || opts.harness_execution_enabled.is_some()
+    {
+        let h = cfg.harness.get_or_insert_with(Default::default);
+        if let Some(v) = opts.harness_git_worktree_enabled {
+            h.git_worktree
+                .get_or_insert_with(Default::default)
+                .enabled = Some(v);
+        }
+        if let Some(v) = opts.harness_subagents_enabled {
+            h.subagents
+                .get_or_insert_with(Default::default)
+                .enabled = Some(v);
+        }
+        if let Some(v) = opts.harness_execution_enabled {
+            h.execution
+                .get_or_insert_with(Default::default)
+                .enabled = Some(v);
+        }
+    }
 }
 
 fn build_config_toml(options: &OnboardOptions) -> Result<String, String> {
@@ -208,13 +242,128 @@ fn build_config_toml(options: &OnboardOptions) -> Result<String, String> {
     toml::to_string_pretty(&cfg).map_err(|e| format!("Failed to serialize config.toml: {}", e))
 }
 
+/// Same overrides as [`apply_onboard_options`], applied in-place on the embedded template with
+/// `toml_edit` so **comments are preserved** (used for `onboard --interactive`).
+pub fn build_interactive_config_toml(options: &OnboardOptions) -> Result<String, String> {
+    let mut doc: DocumentMut = CONFIG_TEMPLATE
+        .parse()
+        .map_err(|e| format!("interactive config template parse (toml_edit): {}", e))?;
+
+    if let Some(v) = options.restrict_to_workspace {
+        doc["restrict_to_workspace"] = value(v);
+    }
+    if let Some(v) = options.max_iterations {
+        doc["max_iterations"] = value(
+            i64::try_from(v).map_err(|_| "max_iterations does not fit i64".to_string())?,
+        );
+    }
+    if let Some(v) = options.max_tool_output_chars {
+        doc["max_tool_output_chars"] = value(
+            i64::try_from(v).map_err(|_| "max_tool_output_chars does not fit i64".to_string())?,
+        );
+    }
+    if let Some(v) = options.max_web_tool_output_chars {
+        doc["max_web_tool_output_chars"] = value(
+            i64::try_from(v).map_err(|_| "max_web_tool_output_chars does not fit i64".to_string())?,
+        );
+    }
+
+    if let Some(v) = options.terminal_enable {
+        doc["terminal"]["enable"] = value(v);
+    }
+
+    if let Some(ref m) = options.provider_model {
+        doc["provider"]["model_name"] = value(m.as_str());
+    }
+    if let Some(ref e) = options.provider_api_key_env {
+        doc["provider"]["api_key_env"] = value(e.as_str());
+    }
+    if let Some(ref u) = options.provider_base_url {
+        doc["provider"]["base_url"] = value(u.as_str());
+    }
+
+    if let Some(v) = options.api_enabled {
+        doc["api"]["enabled"] = value(v);
+    }
+    if let Some(p) = options.api_port {
+        doc["api"]["port"] = value(i64::from(p));
+    }
+    if let Some(v) = options.api_serve_ui {
+        doc["api"]["serve_ui"] = value(v);
+    }
+    if let Some(ref addr) = options.api_bind_address {
+        doc["api"]["bind_address"] = value(addr.as_str());
+    }
+
+    if let Some(v) = options.slack_enabled {
+        doc["slack"]["enabled"] = value(v);
+    }
+    if let Some(m) = options.slack_mode {
+        let s = match m {
+            SlackMode::Webhook => "webhook",
+            SlackMode::Socket => "socket",
+        };
+        doc["slack"]["mode"] = value(s);
+    }
+
+    if let Some(v) = options.email_enabled {
+        doc["email"]["enabled"] = value(v);
+    }
+
+    if let Some(v) = options.jina_enabled {
+        doc["jina"]["enabled"] = value(v);
+    }
+
+    if let Some(v) = options.memory_enabled {
+        doc["memory"]["enabled"] = value(v);
+    }
+
+    if let Some(v) = options.multi_tenant_activity_heartbeat {
+        doc["multi_tenant_edge"]["activity_heartbeat_enabled"] = value(v);
+    }
+    if let Some(v) = options.multi_tenant_cron_scheduling {
+        doc["multi_tenant_edge"]["cron_scheduling_enabled"] = value(v);
+    }
+
+    if let Some(v) = options.harness_git_worktree_enabled {
+        doc["harness"]["git_worktree"]["enabled"] = value(v);
+    }
+    if let Some(v) = options.harness_subagents_enabled {
+        doc["harness"]["subagents"]["enabled"] = value(v);
+    }
+    if let Some(v) = options.harness_execution_enabled {
+        doc["harness"]["execution"]["enabled"] = value(v);
+    }
+
+    let out = doc.to_string();
+    let _: AppConfig = toml::from_str(&out).map_err(|e| {
+        format!(
+            "interactive merged config.toml failed AppConfig validation: {}",
+            e
+        )
+    })?;
+    Ok(out)
+}
+
 /// Bootstrap a workspace at `root`, optionally overriding embedded `config.toml` values.
-pub fn onboard_workspace(root: &Path, options: &OnboardOptions) -> Result<BootstrapReport, String> {
+///
+/// When `interactive_merged_config_toml` is `Some`, it is written as `config.toml` (instead of
+/// serde-pretty output) so template **comments stay**; used for `onboard --interactive`.
+pub fn onboard_workspace(
+    root: &Path,
+    options: &OnboardOptions,
+    interactive_merged_config_toml: Option<&str>,
+) -> Result<BootstrapReport, String> {
     let layout = ensure_workspace_layout(root)?;
     let report_root = fs::canonicalize(&layout.root).unwrap_or_else(|_| layout.root.clone());
     let mut report = BootstrapReport::new(report_root);
 
-    write_all_templates(&layout, options, &mut report)?;
+    write_all_templates(
+        &layout,
+        options,
+        interactive_merged_config_toml,
+        &mut report,
+    )?;
     if options.has_overrides()
         && report
             .skipped
@@ -266,11 +415,15 @@ fn embedded_templates() -> &'static [TemplateFile] {
 fn write_all_templates(
     layout: &WorkspaceLayout,
     options: &OnboardOptions,
+    interactive_merged_config_toml: Option<&str>,
     report: &mut BootstrapReport,
 ) -> Result<(), String> {
     for template in embedded_templates() {
         if template.relative_path == "config.toml" {
-            let body = if options.has_overrides() {
+            let body = if let Some(s) = interactive_merged_config_toml.filter(|_| options.has_overrides())
+            {
+                s.to_string()
+            } else if options.has_overrides() {
                 build_config_toml(options)?
             } else {
                 CONFIG_TEMPLATE.to_string()
@@ -378,5 +531,43 @@ mod tests {
     #[test]
     fn onboard_options_default_has_no_overrides() {
         assert!(!OnboardOptions::default().has_overrides());
+    }
+
+    #[test]
+    fn build_interactive_config_toml_preserves_template_comments() {
+        let mut o = OnboardOptions::default();
+        o.provider_model = Some("test-model".to_string());
+        o.provider_api_key_env = Some("GEMINI_API_KEY".to_string());
+        o.provider_base_url = Some("https://example.com/v1/chat/completions".to_string());
+        let s = build_interactive_config_toml(&o).expect("toml_edit merge");
+        assert!(
+            s.contains("# Local stdin/stdout chat"),
+            "expected terminal section comment from template"
+        );
+        assert!(
+            s.contains("# Optional: route web_search"),
+            "expected jina section comment from template"
+        );
+        assert!(
+            s.contains("# When default_provider = \"jupyter\""),
+            "expected harness jupyter comment from template"
+        );
+        assert!(
+            s.contains("# cancel_children_on_parent_cancel"),
+            "expected subagents optional key as comment"
+        );
+        assert!(
+            s.contains("# default_provider = \"local\""),
+            "expected execution default_provider as comment"
+        );
+        assert!(
+            s.contains("# max_wall_secs = 300"),
+            "expected execution max_wall_secs as comment"
+        );
+        assert!(
+            !s.contains("allow_path_outside_sandbox = false"),
+            "allow_path_outside_sandbox should not appear as an active key in template output"
+        );
+        assert!(s.contains("test-model"));
     }
 }

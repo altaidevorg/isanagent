@@ -1,12 +1,13 @@
 restrict_to_workspace = true
 
+# Root-level limits (must stay above [terminal] so TOML does not nest them under [terminal]).
+max_iterations = 50
+max_tool_output_chars = 10000
+max_web_tool_output_chars = 50000
+
 # Local stdin/stdout chat. Set enable = false for API-only or headless runs (requires another channel).
 [terminal]
 enable = true
-
-max_iterations = 50
-max_tool_output_chars = 10000
-# max_web_tool_output_chars = 50000  # optional cap for web_search / web_fetch (default 50000)
 
 [provider]
 model_name = "gemini-3-flash-preview"
@@ -57,3 +58,42 @@ short_term_threshold_mins = 15
 long_term_interval_mins = 360
 long_term_threshold_summaries = 5
 max_recent_summaries = 5
+
+# Registers the `git_worktree` tool (list / add / remove). Paths stay inside the sandbox unless you
+# set allow_path_outside_sandbox = true. See docs/harness-implementation-plan.md Phase 4.
+[harness.git_worktree]
+enabled = false
+
+# Phase 5: background sub-agents (separate reasoning loop per task). See docs/harness-implementation-plan.md.
+[harness.subagents]
+enabled = false
+# cancel_children_on_parent_cancel = false  # default true: new user message / cancel also stops sub-tasks
+# allowed_tools = ["read_file", "glob_files", "search_text", "edit_file"]  # omit = all tools except nested spawn/plan
+
+# Phase 2 execution plane: `execution_session_create`, `execution_run`, `execution_cancel`,
+# `execution_session_close`, `execution_env_info` (local subprocess, Jupyter kernel, or SSH remote).
+# Operator guide: docs/execution-user-guide.md — roadmap: docs/execution-implementation-plan.md
+[harness.execution]
+enabled = false
+# default_provider = "local"          # "local" | "jupyter" | "ssh"
+# max_wall_secs = 300                  # clamp per-run timeout_secs (default 300)
+# max_output_bytes = 262144            # stdout+stderr cap per run (default 256 KiB)
+# max_sessions = 32                    # concurrent sessions (default 32)
+allowed_providers = ["local", "jupyter"]
+python_executable = "python"
+
+# When default_provider = "jupyter": set base_url; token from JUPYTER_TOKEN env preferred over `token` here.
+[harness.execution.jupyter]
+base_url = "http://127.0.0.1:8888"
+token = "<changethis>"
+kernel_name = "python3"
+
+# When default_provider = "ssh": set host, user, remote_workdir; use identity_file and/or env SSH_PASSWORD.
+# [harness.execution.ssh]
+# host = "my.server.example"
+# port = 22
+# user = "ubuntu"
+# identity_file = "~/.ssh/id_ed25519"
+# remote_workdir = "/tmp/isanagent-exec"
+# remote_python = "python3"
+# accept_unknown_host_keys = true   # default true (MITM risk); false = fail until strict host keys exist

@@ -19,7 +19,9 @@ use isanagent::logging::{
     create_logger_channel, create_logging_actor_or_fallback, init_runtime_logger,
     LOGGER_QUEUE_CAPACITY,
 };
-use isanagent::onboarding::{onboard_workspace, BootstrapReport, OnboardOptions};
+use isanagent::onboarding::{
+    build_interactive_config_toml, onboard_workspace, BootstrapReport, OnboardOptions,
+};
 use isanagent::onboarding_interactive;
 use isanagent::provider::OpenAIProvider;
 use isanagent::scheduler::{
@@ -805,10 +807,20 @@ async fn run_onboard(
 
     let config_overrides_used = options.has_overrides();
 
+    let interactive_merged_toml = if interactive_outcome.is_some() {
+        Some(build_interactive_config_toml(&options).map_err(std::io::Error::other)?)
+    } else {
+        None
+    };
+
     let options_for_workspace = options.clone();
     let report = tokio::task::spawn_blocking(move || {
         let workspace_root = resolve_workspace_root(workspace_arg.as_deref());
-        onboard_workspace(&workspace_root, &options_for_workspace)
+        onboard_workspace(
+            &workspace_root,
+            &options_for_workspace,
+            interactive_merged_toml.as_deref(),
+        )
     })
     .await?
     .map_err(std::io::Error::other)?;
