@@ -14,6 +14,12 @@ const SOUL_TEMPLATE: &str = include_str!("../assets/onboarding/SOUL.md");
 const CRON_SKILL_TEMPLATE: &str = include_str!("../assets/onboarding/skills/cron/SKILL.md");
 const SKILL_CREATOR_TEMPLATE: &str =
     include_str!("../assets/onboarding/skills/skill-creator/SKILL.md");
+const EXECUTION_RESEARCH_SKILL_TEMPLATE: &str =
+    include_str!("../assets/onboarding/skills/execution-research/SKILL.md");
+const JUPYTER_HEAVY_OUTPUT_SKILL_TEMPLATE: &str =
+    include_str!("../assets/onboarding/skills/jupyter-heavy-output/SKILL.md");
+const SCIENTIFIC_PYTHON_DEBUGGING_SKILL_TEMPLATE: &str =
+    include_str!("../assets/onboarding/skills/scientific-python-debugging/SKILL.md");
 
 struct TemplateFile {
     relative_path: &'static str,
@@ -376,7 +382,7 @@ that file is first created. Remove or rename config.toml, or point --workspace a
 }
 
 fn embedded_templates() -> &'static [TemplateFile] {
-    static TEMPLATES: [TemplateFile; 6] = [
+    static TEMPLATES: [TemplateFile; 9] = [
         TemplateFile {
             relative_path: "config.toml",
             contents: CONFIG_TEMPLATE,
@@ -400,6 +406,18 @@ fn embedded_templates() -> &'static [TemplateFile] {
         TemplateFile {
             relative_path: "workspace/skills/skill-creator/SKILL.md",
             contents: SKILL_CREATOR_TEMPLATE,
+        },
+        TemplateFile {
+            relative_path: "workspace/skills/execution-research/SKILL.md",
+            contents: EXECUTION_RESEARCH_SKILL_TEMPLATE,
+        },
+        TemplateFile {
+            relative_path: "workspace/skills/jupyter-heavy-output/SKILL.md",
+            contents: JUPYTER_HEAVY_OUTPUT_SKILL_TEMPLATE,
+        },
+        TemplateFile {
+            relative_path: "workspace/skills/scientific-python-debugging/SKILL.md",
+            contents: SCIENTIFIC_PYTHON_DEBUGGING_SKILL_TEMPLATE,
         },
     ];
 
@@ -490,7 +508,13 @@ fn validate_generated_files(layout: &WorkspaceLayout) -> Result<(), String> {
 
     let registry = SkillRegistry::new(layout.skills_dir.clone());
     let skill_names = registry.get_skill_names();
-    for required in ["cron", "skill-creator"] {
+    for required in [
+        "cron",
+        "skill-creator",
+        "execution-research",
+        "jupyter-heavy-output",
+        "scientific-python-debugging",
+    ] {
         if !skill_names.iter().any(|skill| skill == required) {
             return Err(format!(
                 "Generated skill '{}' was not loadable from {}",

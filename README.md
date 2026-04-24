@@ -78,7 +78,13 @@ my_agent/
     └── skills/
         ├── cron/
         │   └── SKILL.md
-        └── skill-creator/
+        ├── skill-creator/
+        │   └── SKILL.md
+        ├── execution-research/
+        │   └── SKILL.md
+        ├── jupyter-heavy-output/
+        │   └── SKILL.md
+        └── scientific-python-debugging/
             └── SKILL.md
 ```
 

@@ -1,17 +1,29 @@
 ---
 name: cron
-description: Use the built-in cron tool to schedule one-time, recurring, or cron-based follow-up actions.
+description: Schedule deferred or recurring work via the isanagent cron tool—add/remove jobs with correct runtime context fields.
 ---
 
-# Cron
+# Cron (isanagent `cron` tool)
 
-Use this skill when the user wants a follow-up action to happen later, repeatedly, or on a fixed schedule.
+Use this when the task requires **you** to register, update, or tear down a scheduled follow‑up message to the **same** or a known chat/channel.
 
-Guidelines:
-- Use `every_seconds` for simple repeating jobs.
-- Use `at` for one-time scheduled execution.
-- Use `cron_expr` for calendar-style recurring schedules.
-- Always use the exact timezone offset from the runtime context when scheduling with `at`.
-- If `[multi_tenant_edge].cron_scheduling_enabled = true`, do not use `every_seconds`; use `at` or a 6-field UTC `cron_expr` instead.
-- Choose stable, descriptive job ids so the same job can be updated or removed later.
-- Remove obsolete jobs explicitly when the user asks to stop or replace an existing schedule.
+## Tool contract
+
+- Tool name: **`cron`**.
+- Actions: **`add`** | **`remove`**. (There is no **`list`** yet—do not assume you can enumerate jobs.)
+- **`add`** requires: **`action`**, **`chat_id`**, **`channel`**, **`message`**, plus **exactly one** schedule among **`every_seconds`**, **`at`**, **`cron_expr`**.
+- **`remove`** requires: **`action`**, **`job_id`**, **`chat_id`**, **`channel`**.
+
+Always copy **`chat_id`** and **`channel`** from the **RUNTIME CONTEXT** block you were given—do not invent them.
+
+## Schedule choice
+
+- **`every_seconds`**: simple periodic nudges. **Forbidden** when the deployment has **`[multi_tenant_edge].cron_scheduling_enabled = true`**—the tool will error; use **`at`** or **`cron_expr`** instead.
+- **`at`**: one shot at an ISO datetime. You **must** include the correct **numeric timezone offset** from runtime context (e.g. `2026-04-24T15:00:00+03:00`). Do **not** default to `Z` unless context is UTC.
+- **`cron_expr`**: recurring. With multi‑tenant edge cron enabled, use a **6‑field UTC** expression (`second minute hour day month weekday`). Otherwise follow the host’s 7‑field cron rules.
+
+## Hygiene
+
+- **`add`** assigns the **`job_id`** (returned in the success string, e.g. `Successfully scheduled job abcdef12 …`). Store it in your reasoning if you may need **`remove`** later; you cannot choose the id yourself today.
+- When the user asks to stop a schedule, call **`remove`** with that exact **`job_id`**.
+- Write **`message`** so a future turn knows what to do when the job fires—include intent, constraints, and any ids/paths the follow‑up needs.

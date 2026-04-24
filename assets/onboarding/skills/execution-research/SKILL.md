@@ -1,20 +1,40 @@
 ---
 name: execution-research
-description: Safe workflow for running analysis code, saving plots/tables as artifacts, and inspecting outputs without blowing the LLM context window.
+description: Run numeric or ML code through isanagent execution tools without flooding context—artifacts, incremental runs, sandbox paths.
 requires:
   bins: []
   env: []
 always: false
 ---
 
-# Execution research workflow
+# Execution research (isanagent)
 
-Use this when the user wants reproducible numeric or ML work inside the workspace.
+Use this playbook whenever you are writing or running analysis code, plots, tables, or benchmarks inside the workspace execution harness.
 
-1. Call **`execution_env_info`** once to confirm provider, caps, and artifact limits.
-2. **`execution_session_create`** with the right `language` (Python locally/Jupyter/SSH per config).
-3. Prefer **small, incremental** `execution_run` steps. After plots or large tables, rely on **`RunResult.attachments`** (Jupyter) or explicit `savefig` / file writes under **`.execution_artifacts/<session_id>/`** (local) so outputs stay on disk.
-4. Use **`execution_artifact_list`** with the `session_id` to enumerate saved files, then **`glob_files`** / **`search_text`** on text logs or CSV previews as needed.
-5. **`execution_session_close`** when done to free the session slot.
+## Before you run anything
 
-Do not paste multi-megabyte base64 into the chat; always reference sandbox-relative paths returned by tools.
+1. Call **`execution_env_info`** once. Note `default_provider`, `max_output_bytes`, `max_wall_secs`, and artifact caps. If execution is disabled, stop and tell the user to enable **`[harness.execution] enabled`**—do not invent a workaround.
+2. Plan for **stdout/stderr caps**: each stream gets roughly half of `max_output_bytes` (with a floor). Large prints truncate; design outputs accordingly.
+
+## Session lifecycle (strict order)
+
+1. **`execution_session_create`** — set `language` (`python`, `shell`, or omit for default Python). Keep **one active `execution_run` per session**; wait for each run to finish before starting another on the same `session_id`.
+2. **`execution_run`** — pass `session_id`, source `code`, and `timeout_secs` within `max_wall_secs`. Prefer **small, verifiable steps** (import → load → transform → plot) instead of one giant cell.
+3. **`execution_artifact_list`** — when you need filenames or sizes under **`.execution_artifacts/<session_id>/`** (Jupyter materialized payloads, or files your code wrote there on local runs).
+4. **`glob_files`** / **`search_text`** — inspect text logs, CSV snippets, or small previews **by path**; never pull multi‑MB content into the reply.
+5. **`execution_session_close`** with the same `session_id` when the analysis branch is done so slots are freed.
+
+## Where outputs land
+
+- **Jupyter provider:** binary or large `display_data` / similar payloads become files under **`sandbox_dir/.execution_artifacts/<session_id>/<run_uuid>/`**. The tool response includes **`attachments`** (sandbox-relative paths, MIME). Treat those paths as the source of truth; summarize, do not inline blobs.
+- **Local Python:** by default the interpreter is **persistent per session** (variables survive across `execution_run` until timeout, cancel, cwd change, or close). If you need a clean interpreter each time, that is a **host config** choice (`local_python_mode = subprocess` in `config.toml`)—you cannot toggle it from a tool. For plots/tables, still **`savefig`** / write files under **`.execution_artifacts/...`** or another sandbox path you resolve with normal file tools so results stay on disk.
+
+## Anti-patterns (avoid)
+
+- Dumping base64 or huge JSON into chat.
+- Issuing **identical** `execution_run` payloads in a tight loop when results do not change—isanagent may inject a **doom-loop** corrective user message; change code, parameters, or diagnostics instead.
+- Skipping **`execution_session_close`** after a long exploratory branch.
+
+## If something hangs
+
+Use **`execution_cancel`** on that `session_id`, then decide whether to retry with a shorter timeout, smaller data, or different approach.
