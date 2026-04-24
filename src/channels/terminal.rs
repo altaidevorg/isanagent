@@ -15,7 +15,8 @@ const ISANAGENT_TOOL_NOTIFY: &str = "isanagent_tool_notify";
 const ISANAGENT_TOOL_PHASE: &str = "isanagent_tool_phase";
 
 use crate::channels::terminal_ui::protocol::{
-    ISANAGENT_EXECUTION_STREAM, METADATA_EXECUTION_RUN_ID, METADATA_EXECUTION_SESSION_ID,
+    ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_STREAM, METADATA_EXECUTION_JOB_ID,
+    METADATA_EXECUTION_JOB_STATUS, METADATA_EXECUTION_RUN_ID, METADATA_EXECUTION_SESSION_ID,
 };
 
 /// When true, `main` skips the large colored stdout banner (Ratatui alternate screen owns the TTY).
@@ -71,6 +72,32 @@ pub fn build_execution_stream_notice(
         chat_id: chat_id.to_string(),
         thread_id: None,
         content: content.to_string(),
+        metadata,
+    }
+}
+
+/// Short user-visible line when a background execution job finishes (or fails).
+pub fn build_execution_job_notice(
+    chat_id: &str,
+    channel: &str,
+    job_id: &str,
+    session_id: &str,
+    status: &str,
+    summary: &str,
+) -> OutboundMessage {
+    let mut metadata = HashMap::new();
+    metadata.insert(ISANAGENT_EXECUTION_JOB.to_string(), json!(true));
+    metadata.insert(METADATA_EXECUTION_JOB_ID.to_string(), json!(job_id));
+    metadata.insert(METADATA_EXECUTION_SESSION_ID.to_string(), json!(session_id));
+    metadata.insert(
+        METADATA_EXECUTION_JOB_STATUS.to_string(),
+        json!(status),
+    );
+    OutboundMessage {
+        channel: channel.to_string(),
+        chat_id: chat_id.to_string(),
+        thread_id: None,
+        content: summary.to_string(),
         metadata,
     }
 }

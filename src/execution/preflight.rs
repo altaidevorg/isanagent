@@ -9,6 +9,9 @@ pub const PREFLIGHT_MARKDOWN: &str = r#"# Execution preflight (capabilities → 
 |--------------------------|-----------------------------------------------|
 | `execution_session_create` | Provider registered and `[harness.execution]` enabled (Phase 2). |
 | `execution_run` | `supports_persistent_sessions` **or** ephemeral one-shot policy documented per provider. |
+| `execution_run_background` | Same session/run contract as `execution_run`; returns a process-local `job_id` immediately. |
+| `execution_job_status` / `execution_job_result` / `execution_job_list` | Jobs registry (always available when execution harness is enabled). |
+| `execution_job_cancel` | `supports_interrupt` (same as `execution_cancel` for the job’s session). |
 | `execution_cancel` | `supports_interrupt` |
 | `execution_package_install` (optional) | `supports_package_install` |
 | `execution_ssh_exec` (optional) | `supports_remote_shell` + provider implements `SshRemoteShell` |

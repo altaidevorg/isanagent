@@ -383,6 +383,35 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             ),
         )
         .with_chat_id(chat_id),
+        TelemetryEvent::ExecutionJobFinished {
+            chat_id,
+            channel,
+            job_id,
+            session_id,
+            provider_id,
+            status,
+            duration_ms,
+            exit_code,
+            stdout_len,
+            stderr_len,
+            artifact_count,
+        } => LogEvent::info(
+            "Telemetry",
+            &format!(
+                "ExecutionJobFinished channel={} job={} session={} provider={} status={} exit={:?} ms={} out={}/{} artifacts={}",
+                channel,
+                job_id,
+                session_id,
+                provider_id,
+                status,
+                exit_code,
+                duration_ms,
+                stdout_len,
+                stderr_len,
+                artifact_count
+            ),
+        )
+        .with_chat_id(chat_id),
     }
 }
 

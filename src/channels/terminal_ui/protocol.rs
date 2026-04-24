@@ -7,3 +7,7 @@ pub const ISANAGENT_TERMINAL_ERROR: &str = "isanagent_terminal_error";
 pub const ISANAGENT_EXECUTION_STREAM: &str = "isanagent_execution_stream";
 pub const METADATA_EXECUTION_SESSION_ID: &str = "execution_session_id";
 pub const METADATA_EXECUTION_RUN_ID: &str = "execution_run_id";
+/// One-line completion / failure notice for `execution_run_background` (Ratatui execution strip).
+pub const ISANAGENT_EXECUTION_JOB: &str = "isanagent_execution_job";
+pub const METADATA_EXECUTION_JOB_ID: &str = "execution_job_id";
+pub const METADATA_EXECUTION_JOB_STATUS: &str = "execution_job_status";

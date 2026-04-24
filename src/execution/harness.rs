@@ -21,6 +21,8 @@ pub struct ExecutionHarness {
     workspace_dir: PathBuf,
     sandbox_dir: PathBuf,
     artifact_limits: ArtifactLimits,
+    /// When `execution_run` omits `timeout_secs`, use this (clamped to provider max at tool call time).
+    pub default_run_timeout_secs: u64,
 }
 
 impl ExecutionHarness {
@@ -30,6 +32,7 @@ impl ExecutionHarness {
         workspace_dir: PathBuf,
         sandbox_dir: PathBuf,
         artifact_limits: ArtifactLimits,
+        default_run_timeout_secs: u64,
     ) -> Self {
         Self {
             provider,
@@ -37,6 +40,7 @@ impl ExecutionHarness {
             workspace_dir,
             sandbox_dir,
             artifact_limits,
+            default_run_timeout_secs,
         }
     }
 
@@ -115,6 +119,7 @@ pub fn build_execution_harness(
                 workspace_dir,
                 sandbox_dir,
                 artifact_limits,
+                config.execution_default_run_timeout_secs(),
             )))
         }
         "jupyter" => {
@@ -142,6 +147,7 @@ pub fn build_execution_harness(
                 workspace_dir,
                 sandbox_dir,
                 artifact_limits,
+                config.execution_default_run_timeout_secs(),
             )))
         }
         "ssh" => {
@@ -174,6 +180,7 @@ pub fn build_execution_harness(
                 workspace_dir,
                 sandbox_dir,
                 artifact_limits,
+                config.execution_default_run_timeout_secs(),
             )))
         }
         other => Err(format!(

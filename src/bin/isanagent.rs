@@ -34,9 +34,11 @@ use isanagent::tools::builtin::{
     CronTool, EditFileTool, GitWorktreeTool, GlobFilesTool, ListDirTool, MessageTool, ReadFileTool,
     SearchTextTool, ShellExecTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
+use isanagent::execution::ExecutionJobManager;
 use isanagent::tools::execution::{
-    ExecutionArtifactListTool, ExecutionCancelTool, ExecutionEnvInfoTool, ExecutionRunTool,
-    ExecutionSessionCloseTool, ExecutionSessionCreateTool,
+    ExecutionArtifactListTool, ExecutionCancelTool, ExecutionEnvInfoTool, ExecutionJobCancelTool,
+    ExecutionJobListTool, ExecutionJobResultTool, ExecutionJobStatusTool, ExecutionRunBackgroundTool,
+    ExecutionRunTool, ExecutionSessionCloseTool, ExecutionSessionCreateTool,
 };
 use isanagent::tools::workflow::{AskUserTool, TodoWriteTool, ToolSearchTool};
 use isanagent::tools::ToolRegistry;
@@ -230,6 +232,11 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     .map_err(std::io::Error::other)?;
     let cron_node = NodeHandle::new(cron_logic, 10, 3, Duration::from_millis(50));
 
+    let max_tool_output_chars = workspace
+        .config
+        .resolved_max_tool_output_chars()
+        .unwrap_or(3000);
+
     let mut tools = ToolRegistry::new();
     let restrict = workspace.config.restrict_to_workspace.unwrap_or(true);
     tools.register(Box::new(ReadFileTool {
@@ -278,12 +285,33 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             &workspace.config,
         )
         .map_err(|e| std::io::Error::other(format!("execution harness: {e}")))?;
+        let execution_jobs = Arc::new(ExecutionJobManager::new(
+            harness.clone(),
+            global_outbound_tx.clone(),
+        ));
         tools.register(Box::new(ExecutionSessionCreateTool {
             harness: harness.clone(),
         }));
         tools.register(Box::new(ExecutionRunTool {
             harness: harness.clone(),
             outbound_tx: global_outbound_tx.clone(),
+        }));
+        tools.register(Box::new(ExecutionRunBackgroundTool {
+            harness: harness.clone(),
+            jobs: execution_jobs.clone(),
+        }));
+        tools.register(Box::new(ExecutionJobStatusTool {
+            jobs: execution_jobs.clone(),
+        }));
+        tools.register(Box::new(ExecutionJobResultTool {
+            jobs: execution_jobs.clone(),
+            max_tool_output_chars,
+        }));
+        tools.register(Box::new(ExecutionJobListTool {
+            jobs: execution_jobs.clone(),
+        }));
+        tools.register(Box::new(ExecutionJobCancelTool {
+            jobs: execution_jobs,
         }));
         tools.register(Box::new(ExecutionArtifactListTool {
             harness: harness.clone(),
@@ -377,10 +405,6 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
 
     // 7. Create Agent Logic
     let max_iterations = workspace.config.resolved_max_iterations().unwrap_or(50);
-    let max_tool_output_chars = workspace
-        .config
-        .resolved_max_tool_output_chars()
-        .unwrap_or(3000);
     let max_recent_summaries = workspace
         .config
         .memory

@@ -1,6 +1,5 @@
 //! Gated harness tools for the execution plane (`[harness.execution] enabled = true`).
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -8,15 +7,13 @@ use async_trait::async_trait;
 use log::info;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 use crate::bus::BusMessage;
-use crate::bus::TelemetryEvent;
 use crate::channels::terminal::build_execution_stream_notice;
 use crate::execution::{
-    sanitize_session_segment, write_run_journal, CwdPolicy, ExecutionError, ExecutionHarness,
-    RunEvent, RunJournalParams, RunSpec, SessionCreateRequest, SessionId,
+    persist_successful_execution_run, sanitize_session_segment, CwdPolicy, ExecutionError,
+    ExecutionHarness, ExecutionJobManager, RunEvent, RunSpec, SessionCreateRequest, SessionId,
 };
 use crate::tool_runtime::current_tool_exec_ctx;
 use crate::traits::Tool;
@@ -56,63 +53,6 @@ fn parse_cwd(args: &Value) -> Result<CwdPolicy, String> {
     }
 }
 
-fn best_effort_git_head(workspace_dir: &Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .args(["-C", workspace_dir.to_str()?, "rev-parse", "HEAD"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s.chars().take(40).collect())
-    }
-}
-
-#[derive(Serialize)]
-struct ExecutionManifestLine<'a> {
-    ts: &'a str,
-    chat_id: &'a str,
-    channel: &'a str,
-    provider_id: &'a str,
-    session_id: &'a str,
-    exit_code: Option<i32>,
-    duration_ms: u64,
-    stdout_len: usize,
-    stderr_len: usize,
-    artifact_count: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    git_head: Option<&'a str>,
-}
-
-async fn append_execution_manifest(
-    workspace_dir: &Path,
-    line: ExecutionManifestLine<'_>,
-) -> Result<(), String> {
-    let dir = workspace_dir.join(".system_generated");
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .map_err(|e| format!("manifest mkdir: {e}"))?;
-    let path = dir.join("execution_runs.jsonl");
-    let mut f = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .await
-        .map_err(|e| format!("manifest open: {e}"))?;
-    let json = serde_json::to_string(&line).map_err(|e| e.to_string())?;
-    f.write_all(json.as_bytes())
-        .await
-        .map_err(|e| format!("manifest write: {e}"))?;
-    f.write_all(b"\n")
-        .await
-        .map_err(|e| format!("manifest nl: {e}"))?;
-    Ok(())
-}
-
 /// Open an execution session (local subprocess or Jupyter kernel per config).
 pub struct ExecutionSessionCreateTool {
     pub harness: Arc<ExecutionHarness>,
@@ -125,7 +65,7 @@ impl Tool for ExecutionSessionCreateTool {
     }
 
     fn description(&self) -> &str {
-        "Create an execution session (requires [harness.execution] enabled). Provider is [harness.execution] default_provider: local runs under the workspace sandbox; jupyter uses a Jupyter Server kernel (new or `resume_jupyter_kernel_id`); ssh opens one SSH session to a configured host (reused until execution_session_close). Returns session_id, session capabilities (Jupyter extensions include `jupyter_kernel_id` and optional `jupyter_notebook_sync_path`), and a short provider capability summary. Use execution_run to execute code; execution_session_close when done. Jupyter may write binary display_data under the sandbox `.execution_artifacts/{session_id}/{run_id}/` and list them in RunResult.attachments."
+        "Create an execution session (requires [harness.execution] enabled). Provider is [harness.execution] default_provider: local runs under the workspace sandbox; jupyter uses a Jupyter Server kernel (new or `resume_jupyter_kernel_id`); ssh opens one SSH session to a configured host (reused until execution_session_close). Returns session_id, session capabilities (Jupyter extensions include `jupyter_kernel_id` and optional `jupyter_notebook_sync_path`), and a short provider capability summary. Use execution_run or execution_run_background to execute code; execution_session_close when done. Jupyter may write binary display_data under the sandbox `.execution_artifacts/{session_id}/{run_id}/` and list them in RunResult.attachments."
     }
 
     fn parameters(&self) -> Value {
@@ -218,7 +158,7 @@ impl Tool for ExecutionRunTool {
         let timeout_secs = args
             .get("timeout_secs")
             .and_then(|v| v.as_u64())
-            .unwrap_or(60);
+            .unwrap_or(self.harness.default_run_timeout_secs);
         let cwd = parse_cwd(&args)?;
         let run_id = uuid::Uuid::new_v4().to_string();
         let started = Instant::now();
@@ -275,73 +215,234 @@ impl Tool for ExecutionRunTool {
             artifact_count
         );
 
-        let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        let git_head = best_effort_git_head(self.harness.workspace_dir());
-
-        let journal_ext = self.harness.provider().session_journal_extensions(&sid);
-        let jupyter_kernel_id = journal_ext
-            .as_ref()
-            .and_then(|m| m.get("jupyter_kernel_id"))
-            .and_then(|v| v.as_str());
-        let jupyter_notebook_path = journal_ext
-            .as_ref()
-            .and_then(|m| m.get("jupyter_notebook_sync_path"))
-            .and_then(|v| v.as_str());
-
-        if let Err(e) = write_run_journal(RunJournalParams {
-            workspace_dir: self.harness.workspace_dir(),
-            provider_id: prov,
-            session_id: &sid,
-            run_id: &run_id,
-            code: &code,
-            result: &result,
-            jupyter_kernel_id,
-            jupyter_notebook_path,
-            started_rfc3339: &started_ts,
-            finished_rfc3339: &ts,
+        persist_successful_execution_run(
+            self.harness.as_ref(),
+            &self.outbound_tx,
+            prov,
+            &sid,
+            &run_id,
+            &code,
+            &result,
+            &started_ts,
+            &chat_id,
+            &channel,
             duration_ms,
-        })
-        .await
-        {
-            log::warn!("execution run journal: {e}");
-        }
-
-        let manifest = ExecutionManifestLine {
-            ts: &ts,
-            chat_id: &chat_id,
-            channel: &channel,
-            provider_id: prov,
-            session_id: sid.as_str(),
-            exit_code: result.exit_code,
-            duration_ms,
-            stdout_len: result.stdout.len(),
-            stderr_len: result.stderr.len(),
-            artifact_count,
-            git_head: git_head.as_deref(),
-        };
-        if let Err(e) = append_execution_manifest(self.harness.workspace_dir(), manifest).await {
-            log::warn!("execution manifest append failed: {e}");
-        }
-
-        let _ = self
-            .outbound_tx
-            .send(BusMessage::Telemetry(
-                TelemetryEvent::ExecutionRunFinished {
-                    chat_id: chat_id.clone(),
-                    channel: channel.clone(),
-                    provider_id: prov.to_string(),
-                    session_id: sid.to_string(),
-                    exit_code: result.exit_code,
-                    duration_ms,
-                    stdout_len: result.stdout.len(),
-                    stderr_len: result.stderr.len(),
-                    artifact_count,
-                    git_head: git_head.clone(),
-                },
-            ))
-            .await;
+            None,
+        )
+        .await;
 
         serde_json::to_string_pretty(&result).map_err(|e| e.to_string())
+    }
+}
+
+/// Start a run on a background task; returns `job_id` immediately (same session concurrency rules as `execution_run`).
+pub struct ExecutionRunBackgroundTool {
+    pub harness: Arc<ExecutionHarness>,
+    pub jobs: Arc<ExecutionJobManager>,
+}
+
+#[async_trait]
+impl Tool for ExecutionRunBackgroundTool {
+    fn name(&self) -> &str {
+        "execution_run_background"
+    }
+
+    fn description(&self) -> &str {
+        "Same as execution_run (session_id, code, optional timeout_secs, cwd_*) but returns immediately with a job_id. Poll execution_job_status / execution_job_result; use execution_job_cancel or execution_cancel on the session to interrupt when supported. One active run or background job per session. Jobs are process-local and lost on agent exit."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "session_id": { "type": "string" },
+                "code": { "type": "string" },
+                "timeout_secs": { "type": "integer", "description": "Wall-clock limit (defaults to [harness.execution] default_execution_timeout_secs, clamped to max_wall_secs)" },
+                "cwd_mode": { "type": "string", "description": "session_default (default) or sandbox_relative" },
+                "cwd_relative": { "type": "string", "description": "Path relative to sandbox when cwd_mode is sandbox_relative" },
+                "label": { "type": "string", "description": "Optional label for operator logs" }
+            },
+            "required": ["session_id", "code"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, String> {
+        let sid = require_session_id(&args)?;
+        let code = args
+            .get("code")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'code'".to_string())?
+            .to_string();
+        let timeout_secs = args
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(self.harness.default_run_timeout_secs);
+        let cwd = parse_cwd(&args)?;
+        let label = args
+            .get("label")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let (chat_id, channel) = current_tool_exec_ctx()
+            .map(|c| (c.chat_id.clone(), c.channel.clone()))
+            .unwrap_or_else(|| (String::new(), String::new()));
+        let job_id = self.jobs.spawn_run(
+            sid.clone(),
+            code,
+            timeout_secs,
+            cwd,
+            label,
+            chat_id,
+            channel,
+        )?;
+        let v = json!({
+            "job_id": job_id,
+            "session_id": sid.to_string(),
+            "provider_id": self.harness.provider().provider_id(),
+        });
+        serde_json::to_string_pretty(&v).map_err(|e| e.to_string())
+    }
+}
+
+pub struct ExecutionJobStatusTool {
+    pub jobs: Arc<ExecutionJobManager>,
+}
+
+#[async_trait]
+impl Tool for ExecutionJobStatusTool {
+    fn name(&self) -> &str {
+        "execution_job_status"
+    }
+
+    fn description(&self) -> &str {
+        "Return status, timestamps, and error (if any) for a background execution job started with execution_run_background."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "job_id": { "type": "string" }
+            },
+            "required": ["job_id"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, String> {
+        let job_id = args
+            .get("job_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'job_id'".to_string())?;
+        let v = self.jobs.job_status_json(job_id).await?;
+        serde_json::to_string_pretty(&v).map_err(|e| e.to_string())
+    }
+}
+
+pub struct ExecutionJobResultTool {
+    pub jobs: Arc<ExecutionJobManager>,
+    pub max_tool_output_chars: usize,
+}
+
+#[async_trait]
+impl Tool for ExecutionJobResultTool {
+    fn name(&self) -> &str {
+        "execution_job_result"
+    }
+
+    fn description(&self) -> &str {
+        "When the job is terminal, return the RunResult-shaped JSON (stdout/stderr/attachments). While running, returns a short JSON message. Output may be truncated to the session max_tool_output_chars cap."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "job_id": { "type": "string" }
+            },
+            "required": ["job_id"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, String> {
+        let job_id = args
+            .get("job_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'job_id'".to_string())?;
+        self.jobs
+            .job_result_pretty(job_id, self.max_tool_output_chars)
+            .await
+    }
+}
+
+pub struct ExecutionJobListTool {
+    pub jobs: Arc<ExecutionJobManager>,
+}
+
+#[async_trait]
+impl Tool for ExecutionJobListTool {
+    fn name(&self) -> &str {
+        "execution_job_list"
+    }
+
+    fn description(&self) -> &str {
+        "List recent in-memory background execution jobs (optional session_id filter, limit default 50, max 500). Jobs are evicted after completion when the registry is full."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "session_id": { "type": "string", "description": "When set, only jobs for this execution session" },
+                "limit": { "type": "integer", "description": "Max rows (default 50, max 500)" }
+            }
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, String> {
+        let session = args
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(SessionId::new);
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(50) as usize;
+        let v = self.jobs.list_jobs_json(session, limit).await;
+        serde_json::to_string_pretty(&v).map_err(|e| e.to_string())
+    }
+}
+
+pub struct ExecutionJobCancelTool {
+    pub jobs: Arc<ExecutionJobManager>,
+}
+
+#[async_trait]
+impl Tool for ExecutionJobCancelTool {
+    fn name(&self) -> &str {
+        "execution_job_cancel"
+    }
+
+    fn description(&self) -> &str {
+        "Best-effort interrupt for a background job by job_id (maps to execution_cancel for that job's session). Same capability gate as execution_cancel."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "job_id": { "type": "string" }
+            },
+            "required": ["job_id"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, String> {
+        let job_id = args
+            .get("job_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing 'job_id'".to_string())?;
+        self.jobs.cancel_job(job_id).await?;
+        Ok(format!("cancel requested for job {job_id}"))
     }
 }
 
@@ -590,6 +691,8 @@ impl Tool for ExecutionEnvInfoTool {
 mod tests {
     use super::*;
     use crate::execution::ArtifactLimits;
+    use crate::execution::ExecutionJobManager;
+    use std::time::Duration;
 
     fn temp_dirs() -> (std::path::PathBuf, std::path::PathBuf) {
         let root =
@@ -611,6 +714,7 @@ mod tests {
             ws.clone(),
             dir.clone(),
             ArtifactLimits::default(),
+            60,
         ));
         let create = ExecutionSessionCreateTool {
             harness: harness.clone(),
@@ -642,6 +746,153 @@ mod tests {
             .expect("run");
         assert!(r.contains("ok-tool"), "run out={r}");
         let _ = orx.try_recv();
+        let close = ExecutionSessionCloseTool { harness };
+        close.execute(json!({ "session_id": sid })).await.unwrap();
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn background_job_poll_and_result() {
+        let (ws, dir) = temp_dirs();
+        let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), true);
+        let prov: Arc<dyn crate::execution::ExecutionProvider> =
+            Arc::new(crate::execution::LocalExecutionProvider::new(cfg).expect("local provider"));
+        let harness = Arc::new(ExecutionHarness::new(
+            prov,
+            "python",
+            ws.clone(),
+            dir.clone(),
+            ArtifactLimits::default(),
+            60,
+        ));
+        let create = ExecutionSessionCreateTool {
+            harness: harness.clone(),
+        };
+        let lang = if cfg!(windows) { "shell" } else { "python" };
+        let out = create
+            .execute(json!({ "language": lang }))
+            .await
+            .expect("create");
+        let v: Value = serde_json::from_str(&out).expect("json");
+        let sid = v["session_id"].as_str().expect("session id");
+        let (otx, _orx) = mpsc::channel::<BusMessage>(8);
+        let jobs = Arc::new(ExecutionJobManager::new(harness.clone(), otx));
+        let bg = ExecutionRunBackgroundTool {
+            harness: harness.clone(),
+            jobs: jobs.clone(),
+        };
+        let code = if cfg!(windows) {
+            "echo bg-job"
+        } else {
+            "print('bg-job')"
+        };
+        let started = bg
+            .execute(json!({
+                "session_id": sid,
+                "code": code,
+                "timeout_secs": 30,
+            }))
+            .await
+            .expect("bg");
+        let jv: Value = serde_json::from_str(&started).expect("json");
+        let jid = jv["job_id"].as_str().expect("job_id");
+        let status_tool = ExecutionJobStatusTool {
+            jobs: jobs.clone(),
+        };
+        let mut terminal = false;
+        for _ in 0..80 {
+            let s = status_tool
+                .execute(json!({ "job_id": jid }))
+                .await
+                .expect("status");
+            if s.contains("\"terminal\": true") {
+                terminal = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(terminal, "job did not reach terminal state");
+        let result_tool = ExecutionJobResultTool {
+            jobs: jobs.clone(),
+            max_tool_output_chars: 20_000,
+        };
+        let r = result_tool
+            .execute(json!({ "job_id": jid }))
+            .await
+            .expect("result");
+        assert!(r.contains("bg-job"), "result={r}");
+        let list = ExecutionJobListTool { jobs: jobs.clone() };
+        let listed = list.execute(json!({})).await.expect("list");
+        assert!(listed.contains(jid));
+        let close = ExecutionSessionCloseTool { harness };
+        close.execute(json!({ "session_id": sid })).await.unwrap();
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn background_job_cancel_requests_interrupt() {
+        let (ws, dir) = temp_dirs();
+        let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), true);
+        let prov: Arc<dyn crate::execution::ExecutionProvider> =
+            Arc::new(crate::execution::LocalExecutionProvider::new(cfg).expect("local provider"));
+        let harness = Arc::new(ExecutionHarness::new(
+            prov,
+            "python",
+            ws.clone(),
+            dir.clone(),
+            ArtifactLimits::default(),
+            60,
+        ));
+        let create = ExecutionSessionCreateTool {
+            harness: harness.clone(),
+        };
+        let lang = if cfg!(windows) { "shell" } else { "python" };
+        let out = create
+            .execute(json!({ "language": lang }))
+            .await
+            .expect("create");
+        let v: Value = serde_json::from_str(&out).expect("json");
+        let sid = v["session_id"].as_str().expect("session id");
+        let (otx, _orx) = mpsc::channel::<BusMessage>(8);
+        let jobs = Arc::new(ExecutionJobManager::new(harness.clone(), otx));
+        let bg = ExecutionRunBackgroundTool {
+            harness: harness.clone(),
+            jobs: jobs.clone(),
+        };
+        let code = if cfg!(windows) {
+            "ping 127.0.0.1 -n 30 >nul"
+        } else {
+            "import time\ntime.sleep(30)"
+        };
+        let started = bg
+            .execute(json!({
+                "session_id": sid,
+                "code": code,
+                "timeout_secs": 60,
+            }))
+            .await
+            .expect("bg");
+        let jv: Value = serde_json::from_str(&started).expect("json");
+        let jid = jv["job_id"].as_str().expect("job_id");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let cancel = ExecutionJobCancelTool {
+            jobs: jobs.clone(),
+        };
+        cancel.execute(json!({ "job_id": jid })).await.expect("cancel");
+        let status_tool = ExecutionJobStatusTool { jobs };
+        let mut saw = false;
+        for _ in 0..120 {
+            let s = status_tool
+                .execute(json!({ "job_id": jid }))
+                .await
+                .expect("status");
+            if s.contains("cancelled") || s.contains("timeout") || s.contains("failed") {
+                saw = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        assert!(saw, "expected terminal non-success after cancel");
         let close = ExecutionSessionCloseTool { harness };
         close.execute(json!({ "session_id": sid })).await.unwrap();
         let _ = std::fs::remove_dir_all(&ws);

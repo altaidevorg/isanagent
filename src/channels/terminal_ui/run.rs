@@ -23,8 +23,9 @@ use crate::bus::{BusMessage, InboundMessage, OutboundMessage};
 use crate::channels::terminal_ui::attachments::parse_terminal_attachments;
 use crate::channels::terminal_ui::markdown;
 use crate::channels::terminal_ui::protocol::{
-    ISANAGENT_AGENT_THOUGHT, ISANAGENT_EXECUTION_STREAM, ISANAGENT_TERMINAL_ERROR,
-    METADATA_EXECUTION_RUN_ID, METADATA_EXECUTION_SESSION_ID,
+    ISANAGENT_AGENT_THOUGHT, ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_STREAM,
+    ISANAGENT_TERMINAL_ERROR, METADATA_EXECUTION_JOB_ID, METADATA_EXECUTION_RUN_ID,
+    METADATA_EXECUTION_SESSION_ID,
 };
 use crate::channels::terminal_ui::{
     init_from_env, uses_ansi_color, App, Cell, Theme, ToastKind, ToolNoticePhase,
@@ -517,6 +518,11 @@ fn outbound_clears_thinking(msg: &OutboundMessage) -> bool {
         .get(ISANAGENT_EXECUTION_STREAM)
         .and_then(|v| v.as_bool())
         == Some(true);
+    let is_exec_job = msg
+        .metadata
+        .get(ISANAGENT_EXECUTION_JOB)
+        .and_then(|v| v.as_bool())
+        == Some(true);
     let is_err = msg
         .metadata
         .get(ISANAGENT_TERMINAL_ERROR)
@@ -527,7 +533,40 @@ fn outbound_clears_thinking(msg: &OutboundMessage) -> bool {
         .get(METADATA_CLARIFICATION)
         .and_then(|v| v.as_bool())
         == Some(true);
-    is_err || is_clar || (!is_thought && !is_tool && !is_exec)
+    is_err || is_clar || (!is_thought && !is_tool && !is_exec && !is_exec_job)
+}
+
+fn append_execution_job_panel(app: &mut App, msg: &OutboundMessage) {
+    let sid = msg
+        .metadata
+        .get(METADATA_EXECUTION_SESSION_ID)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let jid = msg
+        .metadata
+        .get(METADATA_EXECUTION_JOB_ID)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let label = (sid, format!("job:{jid}"));
+    if app.execution_stream_label != Some(label.clone()) {
+        app.execution_stream_recent.clear();
+        app.execution_stream_label = Some(label);
+    }
+    app.execution_stream_recent.push_str(msg.content.trim_end());
+    app.execution_stream_recent.push('\n');
+    const MAX: usize = 24_000;
+    if app.execution_stream_recent.len() > MAX {
+        let drop = app.execution_stream_recent.len() - MAX;
+        let mut cut = drop;
+        while cut < app.execution_stream_recent.len()
+            && !app.execution_stream_recent.is_char_boundary(cut)
+        {
+            cut += 1;
+        }
+        app.execution_stream_recent.drain(..cut);
+    }
 }
 
 fn append_execution_stream_panel(app: &mut App, msg: &OutboundMessage) {
@@ -644,6 +683,15 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 == Some(true)
             {
                 append_execution_stream_panel(&mut app, &msg);
+                continue;
+            }
+            if msg
+                .metadata
+                .get(ISANAGENT_EXECUTION_JOB)
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
+                append_execution_job_panel(&mut app, &msg);
                 continue;
             }
             if outbound_clears_thinking(&msg) {

@@ -13,11 +13,13 @@
 mod artifacts;
 mod capabilities;
 mod error;
+mod execution_jobs;
 mod harness;
 mod ids;
 mod jupyter;
 mod jupyter_notebook;
 mod local;
+mod post_run;
 mod preflight;
 mod provider;
 mod run;
@@ -32,12 +34,14 @@ pub use capabilities::{
     NetworkPolicy, ProviderCapabilities, ProviderCapabilitiesSnapshot, SessionCapabilities,
 };
 pub use error::ExecutionError;
+pub use execution_jobs::{ExecutionJobManager, ExecutionJobRecord, job_status_str};
 pub use harness::{build_execution_harness, ExecutionHarness};
 pub use ids::SessionId;
 pub use jupyter::{JupyterExecutionProvider, JupyterExecutionProviderConfig};
 pub use local::{
     build_python_host_command, LocalExecMode, LocalExecutionConfig, LocalExecutionProvider,
 };
+pub use post_run::persist_successful_execution_run;
 pub use preflight::{allowed_optional_tool_tags, PREFLIGHT_MARKDOWN};
 pub use provider::{ExecutionProvider, PackageOperations, SshRemoteShell};
 pub use run::{

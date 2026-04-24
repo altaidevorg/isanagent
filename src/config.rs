@@ -57,6 +57,8 @@ pub struct ExecutionHarnessConfig {
     pub max_output_bytes: Option<usize>,
     /// Upper bound on per-run `timeout_secs` (default 300, clamped 1–86400).
     pub max_wall_secs: Option<u64>,
+    /// Default `timeout_secs` when `execution_run` / `execution_run_background` omit it (clamped to `max_wall_secs`).
+    pub default_execution_timeout_secs: Option<u64>,
     /// Max concurrent sessions (default 32, clamped 1–256).
     pub max_sessions: Option<usize>,
     /// If set and non-empty, only these provider ids may be constructed (e.g. `["local"]`).
@@ -363,6 +365,19 @@ impl AppConfig {
             .and_then(|e| e.max_wall_secs)
             .unwrap_or(DEFAULT)
             .clamp(MIN, MAX)
+    }
+
+    /// Default per-run wall clock when the model omits `timeout_secs` (1..=max_wall_secs).
+    pub fn execution_default_run_timeout_secs(&self) -> u64 {
+        let cap = self.execution_max_wall_secs();
+        const FALLBACK: u64 = 60;
+        let v = self
+            .harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.default_execution_timeout_secs)
+            .unwrap_or(FALLBACK);
+        v.clamp(1, cap)
     }
 
     pub fn execution_max_sessions(&self) -> usize {
@@ -686,10 +701,31 @@ python_executable = "python3"
         let c: AppConfig = toml::from_str(s).expect("parse");
         assert!(c.execution_harness_enabled());
         assert_eq!(c.execution_max_wall_secs(), 90);
+        assert_eq!(c.execution_default_run_timeout_secs(), 60);
         assert_eq!(c.execution_max_output_bytes(), 8192);
         assert!(c.execution_provider_allowed("local"));
         assert!(!c.execution_provider_allowed("jupyter"));
         assert_eq!(c.execution_python_executable(), "python3");
+    }
+
+    #[test]
+    fn harness_execution_default_run_timeout_respects_max_wall() {
+        let s = r#"
+[harness.execution]
+enabled = true
+max_wall_secs = 120
+default_execution_timeout_secs = 9999
+"#;
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        assert_eq!(c.execution_default_run_timeout_secs(), 120);
+        let s2 = r#"
+[harness.execution]
+enabled = true
+max_wall_secs = 600
+default_execution_timeout_secs = 45
+"#;
+        let c2: AppConfig = toml::from_str(s2).expect("parse");
+        assert_eq!(c2.execution_default_run_timeout_secs(), 45);
     }
 
     #[test]

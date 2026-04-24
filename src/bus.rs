@@ -100,6 +100,22 @@ pub enum TelemetryEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         git_head: Option<String>,
     },
+    /// Background `execution_run_background` job reached a terminal state.
+    ExecutionJobFinished {
+        chat_id: String,
+        #[serde(default)]
+        channel: String,
+        job_id: String,
+        session_id: String,
+        provider_id: String,
+        /// `completed`, `failed`, `cancelled`, or `timeout`.
+        status: String,
+        duration_ms: u64,
+        exit_code: Option<i32>,
+        stdout_len: usize,
+        stderr_len: usize,
+        artifact_count: usize,
+    },
 }
 
 /// Log severity levels for verbose diagnostics.
