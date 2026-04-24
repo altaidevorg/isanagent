@@ -9,8 +9,8 @@ When **`[harness.execution] enabled = true`**, the agent gains these tools:
 | Tool | Purpose |
 |------|--------|
 | **`execution_session_create`** | Start a sandbox-scoped session (choose language: Python, shell, etc.). |
-| **`execution_run`** | Run code in that session **synchronously** (timeouts and output size are capped). Returns **`attachments`** when Jupyter (or future providers) materialize binary or large text blobs on disk. |
-| **`execution_run_background`** | Same inputs as **`execution_run`**, but returns a **`job_id`** immediately while the run continues on a Tokio task. Use for long ML jobs so the model is not blocked for the full wall clock. |
+| **`execution_run`** | Run code in that session **synchronously** (timeouts and output size are capped). Optional **`description`** (short human summary) improves the terminal execution strip and audit JSONL. Returns **`attachments`** when Jupyter (or future providers) materialize binary or large text blobs on disk. |
+| **`execution_run_background`** | Same as **`execution_run`** plus returns a **`job_id`** immediately. Optional **`label`** (logs) and **`description`** (UI/audits). Use for long ML jobs so the model is not blocked for the full wall clock. |
 | **`execution_job_status`** | Poll a background job: status, timestamps, error text. |
 | **`execution_job_result`** | When the job is finished, fetch **`RunResult`** JSON (truncated to the session **`max_tool_output_chars`** cap). |
 | **`execution_job_list`** | List in-memory background jobs (optional **`session_id`** filter). |
@@ -18,7 +18,7 @@ When **`[harness.execution] enabled = true`**, the agent gains these tools:
 | **`execution_artifact_list`** | List files under `.execution_artifacts/<session_id>/` for that session (paths relative to sandbox). |
 | **`execution_cancel`** | Best-effort interrupt of the current run for a **`session_id`** (when the provider supports it). |
 | **`execution_session_close`** | Tear down the session and release resources. |
-| **`execution_env_info`** | Show provider capabilities, artifact caps, and (for local Python) try `python -V`. |
+| **`execution_env_info`** | Show provider capabilities, artifact caps, **`max_wall_secs`**, **`default_run_timeout_secs`**, a **`timeout_policy`** reminder, and (for local Python) try `python -V`. |
 
 Three providers are implemented today:
 
@@ -42,8 +42,8 @@ Optional keys (defaults are sensible if omitted):
 | Key | Meaning |
 |-----|--------|
 | `default_provider` | **`local`** (subprocess), **`jupyter`** (remote kernel), or **`ssh`** (remote exec over SSH). |
-| `max_wall_secs` | Upper bound on each run’s **`timeout_secs`** (default **300**, clamped **1–86400** seconds = up to 24h). Raise this when you need long blocking or background runs. |
-| `default_execution_timeout_secs` | Default wall clock when the model omits **`timeout_secs`** on **`execution_run`** / **`execution_run_background`** (default **60**, clamped to **`max_wall_secs`**). |
+| `max_wall_secs` | Upper bound on each run’s **`timeout_secs`** (default **3600**, clamped **1–86400** seconds = up to 24h). Raise this when you need longer blocking or background runs. |
+| `default_execution_timeout_secs` | Default wall clock when the model omits **`timeout_secs`** on **`execution_run`** / **`execution_run_background`** (default **600**, clamped to **`max_wall_secs`**). |
 | `max_output_bytes` | Max combined stdout+stderr per run (default 256 KiB). |
 | `max_sessions` | Max concurrent sessions (default 32). |
 | `allowed_providers` | e.g. `["local"]`, `["jupyter"]`, `["ssh"]`; if empty or omitted, any implemented provider is allowed. |
@@ -55,7 +55,7 @@ Optional keys (defaults are sensible if omitted):
 
 Top-level **`doom_loop_enabled`** (optional, default **true**): when true, the agent detects repeated identical tool calls and injects a corrective user message before the next LLM call (see `src/agent/doom_loop.rs`).
 
-Each successful **`execution_run`** or completed **`execution_run_background`** job also appends one JSON line to **`workspace_dir/.system_generated/execution_runs.jsonl`** (metadata only: no code body; background lines may include **`job_id`**) and emits **`ExecutionRunFinished`** telemetry. When a background job reaches a **finished** state (completed, failed, cancelled, or timeout), the agent also emits **`ExecutionJobFinished`** telemetry and appends **`workspace_dir/.system_generated/execution_jobs.jsonl`** (metadata audit).
+Each successful **`execution_run`** or completed **`execution_run_background`** job also appends one JSON line to **`workspace_dir/.system_generated/execution_runs.jsonl`** (metadata only: no code body; may include **`job_id`** and optional **`description`**; background lines may include **`job_id`**) and emits **`ExecutionRunFinished`** telemetry (optional **`description`**). When a background job reaches a **finished** state (completed, failed, cancelled, or timeout), the agent also emits **`ExecutionJobFinished`** telemetry and appends **`workspace_dir/.system_generated/execution_jobs.jsonl`** (metadata audit; optional **`description`**).
 
 Additionally, every **`execution_run`** (all providers) writes a **run journal** under **`workspace_dir/.system_generated/execution_history/{provider}/{session_id}/{run_id}/`**: **`run.json`** (truncated stdout/stderr, attachment list, timestamps) and **`source.txt`** (the exact code run). Treat journals as potentially sensitive if code contained secrets.
 
@@ -103,11 +103,11 @@ Materialized run artifacts live under **`sandbox_dir/.execution_artifacts/`** (s
    - **`ssh`:** `python` / `py` / unset, or `shell` / `sh` / `bash`.  
    - Response includes **`session_id`** and capability summaries — keep the `session_id` for the next steps. Jupyter responses include **`jupyter_kernel_id`** (and **`jupyter_notebook_sync_path`** when `notebook_sync_path_template` is configured).
 
-2. **`execution_run`** — required: `session_id`, `code`. Optional: `timeout_secs`, `cwd_mode` (`session_default` or `sandbox_relative`), and `cwd_relative` when using `sandbox_relative`.  
+2. **`execution_run`** — required: `session_id`, `code`. Optional: `timeout_secs`, **`description`** (short human summary for the terminal strip and `execution_runs.jsonl`), `cwd_mode` (`session_default` or `sandbox_relative`), and `cwd_relative` when using `sandbox_relative`. Call **`execution_env_info`** first in a session if you need exact **`max_wall_secs`** / **`default_run_timeout_secs`**.  
    - **`jupyter`:** only **`session_default`** is supported for `cwd_mode` (no per-run sandbox cwd); use notebook magics such as `%cd` inside `code` if you must change directory on the server.  
    - **`ssh`:** only **`session_default`** is supported; the remote working directory is always **`remote_workdir`** from config.
 
-3. **Long runs (optional):** use **`execution_run_background`** with the same arguments (plus optional **`label`**). Poll **`execution_job_status`** until **`terminal`** is true, then read **`execution_job_result`**. Jobs are **process-local** (lost if the agent exits). Only **one** active run or background job may use a session at a time; for overlapping long work, use **separate execution sessions** (or providers that allow it).
+3. **Long runs (optional):** use **`execution_run_background`** with the same arguments (plus optional **`label`** and recommended **`description`**). Poll **`execution_job_status`** until **`terminal`** is true, then read **`execution_job_result`**. Jobs are **process-local** (lost if the agent exits). Only **one** active run or background job may use a session at a time; for overlapping long work, use **separate execution sessions** (or providers that allow it).
 
 4. When finished (or to free slots): **`execution_session_close`** with the same `session_id`.
 

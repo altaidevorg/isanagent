@@ -50,6 +50,16 @@ const DEFAULT_PROVIDER_API_KEY_ENV: &str = "GEMINI_API_KEY";
 const DEFAULT_PROVIDER_BASE_URL: &str =
     "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
 
+/// Appended to the workspace system prompt when `[harness.execution] enabled = true`.
+const EXECUTION_HARNESS_SYSTEM_GUIDANCE: &str = r#"
+
+--- Execution harness ---
+- Call execution_env_info to read max_wall_secs and default_run_timeout_secs before long runs.
+- Set timeout_secs explicitly for generation, training, or heavy I/O (up to max_wall_secs). Omit timeout_secs only for quick checks; use smaller values for tight polling loops.
+- Prefer execution_run_background when work may block the reasoning loop for many minutes; poll execution_job_status then execution_job_result.
+- Pass description on execution_run and execution_run_background for runs that may exceed ~30 seconds or whenever you want a clear label in the terminal UI and audit logs.
+"#;
+
 /// isanagent: A terminal chat interface and autonomous agent engine
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -392,7 +402,14 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     let reflection_task = reflection_engine.start();
 
     // 6. Compile Agent System Prompt
-    let system_prompt = workspace.compile_system_prompt();
+    let system_prompt = {
+        let base = workspace.compile_system_prompt();
+        if workspace.config.execution_harness_enabled() {
+            format!("{base}{EXECUTION_HARNESS_SYSTEM_GUIDANCE}")
+        } else {
+            base
+        }
+    };
 
     // Prepare startup visual references before we move the structs
     let skill_names = skills.get_skill_names().join(", ");

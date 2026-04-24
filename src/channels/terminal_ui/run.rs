@@ -24,13 +24,34 @@ use crate::channels::terminal_ui::attachments::parse_terminal_attachments;
 use crate::channels::terminal_ui::markdown;
 use crate::channels::terminal_ui::protocol::{
     ISANAGENT_AGENT_THOUGHT, ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_STREAM,
-    ISANAGENT_TERMINAL_ERROR, METADATA_EXECUTION_JOB_ID, METADATA_EXECUTION_RUN_ID,
-    METADATA_EXECUTION_SESSION_ID,
+    ISANAGENT_TERMINAL_ERROR, METADATA_EXECUTION_DESCRIPTION, METADATA_EXECUTION_JOB_ID,
+    METADATA_EXECUTION_RUN_ID, METADATA_EXECUTION_SESSION_ID,
 };
 use crate::channels::terminal_ui::{
     init_from_env, uses_ansi_color, App, Cell, Theme, ToastKind, ToolNoticePhase,
 };
 use crate::clarification::{METADATA_CLARIFICATION, METADATA_CLARIFICATION_CHOICES};
+
+/// Second component of `execution_stream_label`: prefer model-provided description, else short id.
+pub(crate) fn execution_strip_subtitle(description: Option<&str>, id: &str) -> String {
+    const MAX_CHARS: usize = 96;
+    if let Some(d) = description.map(str::trim).filter(|s| !s.is_empty()) {
+        let n = d.chars().count();
+        if n <= MAX_CHARS {
+            return d.to_string();
+        }
+        return format!(
+            "{}…",
+            d.chars().take(MAX_CHARS.saturating_sub(1)).collect::<String>()
+        );
+    }
+    let short: String = id.chars().filter(|c| *c != '-').take(8).collect();
+    if short.is_empty() {
+        "…".to_string()
+    } else {
+        format!("…{short}")
+    }
+}
 
 const ISANAGENT_TOOL_NOTIFY: &str = "isanagent_tool_notify";
 const ISANAGENT_TOOL_PHASE: &str = "isanagent_tool_phase";
@@ -549,7 +570,11 @@ fn append_execution_job_panel(app: &mut App, msg: &OutboundMessage) {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let label = (sid, format!("job:{jid}"));
+    let desc = msg
+        .metadata
+        .get(METADATA_EXECUTION_DESCRIPTION)
+        .and_then(|v| v.as_str());
+    let label = (sid, execution_strip_subtitle(desc, &jid));
     if app.execution_stream_label != Some(label.clone()) {
         app.execution_stream_recent.clear();
         app.execution_stream_label = Some(label);
@@ -582,7 +607,11 @@ fn append_execution_stream_panel(app: &mut App, msg: &OutboundMessage) {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let label = (sid, rid);
+    let desc = msg
+        .metadata
+        .get(METADATA_EXECUTION_DESCRIPTION)
+        .and_then(|v| v.as_str());
+    let label = (sid, execution_strip_subtitle(desc, &rid));
     if app.execution_stream_label != Some(label.clone()) {
         app.execution_stream_recent.clear();
         app.execution_stream_label = Some(label);
@@ -986,5 +1015,33 @@ mod width_fit_tests {
             !t.contains("PgUp"),
             "keyboard hint lives in last chunk: {t}"
         );
+    }
+}
+
+#[cfg(test)]
+mod execution_strip_tests {
+    use super::execution_strip_subtitle;
+
+    #[test]
+    fn prefers_description_over_id() {
+        assert_eq!(
+            execution_strip_subtitle(Some("  MCQ generation  "), "abc-def-0123"),
+            "MCQ generation"
+        );
+    }
+
+    #[test]
+    fn truncates_long_description() {
+        let d: String = (0..120).map(|_| 'x').collect();
+        let out = execution_strip_subtitle(Some(&d), "id");
+        assert!(out.ends_with('…'));
+        assert!(out.chars().count() <= 96);
+    }
+
+    #[test]
+    fn fallback_short_id() {
+        let out = execution_strip_subtitle(None, "683c0fdc-a2bd");
+        assert!(out.starts_with('…'));
+        assert!(out.contains("683c0fdc"));
     }
 }

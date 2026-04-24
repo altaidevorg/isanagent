@@ -64,6 +64,8 @@ struct JobAuditLine<'a> {
     duration_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<&'a str>,
 }
 
 async fn append_job_audit_line(workspace_dir: &Path, line: &JobAuditLine<'_>) -> Result<(), String> {
@@ -101,6 +103,7 @@ async fn send_job_finished(
     stdout_len: usize,
     stderr_len: usize,
     artifact_count: usize,
+    description: Option<String>,
 ) {
     let _ = tx
         .send(BusMessage::Telemetry(
@@ -116,6 +119,7 @@ async fn send_job_finished(
                 stdout_len,
                 stderr_len,
                 artifact_count,
+                description,
             },
         ))
         .await;
@@ -126,6 +130,8 @@ pub struct ExecutionJobRecord {
     pub session_id: SessionId,
     pub run_id: String,
     pub label: Option<String>,
+    /// Human-facing summary for UI and audits (optional).
+    pub description: Option<String>,
     pub status: AtomicU8,
     /// Wall-clock finish time for eviction ordering (`0` while not terminal).
     pub finished_unix_ms: AtomicU64,
@@ -247,6 +253,7 @@ impl ExecutionJobManager {
             "session_id": r.session_id.to_string(),
             "run_id": r.run_id,
             "label": r.label,
+            "description": r.description,
             "status": r.status_name(),
             "started_rfc3339": r.started_rfc3339,
             "finished_rfc3339": finished,
@@ -314,6 +321,7 @@ impl ExecutionJobManager {
                 "run_id": rec.run_id,
                 "status": rec.status_name(),
                 "label": rec.label,
+                "description": rec.description,
                 "started_rfc3339": rec.started_rfc3339,
                 "finished_rfc3339": finished,
                 "error": err,
@@ -330,6 +338,7 @@ impl ExecutionJobManager {
         timeout_secs: u64,
         cwd: CwdPolicy,
         label: Option<String>,
+        run_description: Option<String>,
         chat_id: String,
         channel: String,
     ) -> Result<String, String> {
@@ -361,6 +370,7 @@ impl ExecutionJobManager {
             session_id: sid.clone(),
             run_id: run_id.clone(),
             label: label.clone(),
+            description: run_description.clone(),
             status: AtomicU8::new(JOB_RUNNING),
             started_rfc3339: started_ts.clone(),
             finished_unix_ms: AtomicU64::new(0),
@@ -375,6 +385,7 @@ impl ExecutionJobManager {
         let inner = self.inner.clone();
         let sid_spawn = sid.clone();
         let job_id_for_task = job_id.clone();
+        let stream_desc = run_description.clone();
 
         tokio::spawn(async move {
             let _busy = SessionBusyDrop {
@@ -401,7 +412,14 @@ impl ExecutionJobManager {
                 tokio::spawn(async move {
                     while let Some(ev) = rx.recv().await {
                         let payload = serde_json::to_string(&ev).unwrap_or_default();
-                        let msg = build_execution_stream_notice(&cid, &ch, &sid_s, &rid, &payload);
+                        let msg = build_execution_stream_notice(
+                            &cid,
+                            &ch,
+                            &sid_s,
+                            &rid,
+                            &payload,
+                            stream_desc.as_deref(),
+                        );
                         let _ = ob.send(BusMessage::Outbound(msg)).await;
                     }
                 });
@@ -411,6 +429,7 @@ impl ExecutionJobManager {
             spec.cwd = cwd;
             spec.run_id = Some(run_id.clone());
             spec.run_event_tx = event_tx;
+            spec.description = rec.description.clone();
 
             let run_out = inner.harness.provider().run(&sid_spawn, spec).await;
             let duration_ms = started.elapsed().as_millis() as u64;
@@ -438,6 +457,7 @@ impl ExecutionJobManager {
                         &channel,
                         duration_ms,
                         Some(job_id_for_task.as_str()),
+                        rec.description.as_deref(),
                     )
                     .await;
                     send_job_finished(
@@ -453,12 +473,19 @@ impl ExecutionJobManager {
                         result.stdout.len(),
                         result.stderr.len(),
                         result.attachments.len(),
+                        rec.description.clone(),
                     )
                     .await;
-                    let summary = format!(
-                        "Execution job {} completed (exit {:?}, {} ms)",
-                        job_id_for_task, result.exit_code, duration_ms
-                    );
+                    let summary = match rec.description.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                        Some(d) => format!(
+                            "{} — completed (exit {:?}, {} ms)",
+                            d, result.exit_code, duration_ms
+                        ),
+                        None => format!(
+                            "Execution job {} completed (exit {:?}, {} ms)",
+                            job_id_for_task, result.exit_code, duration_ms
+                        ),
+                    };
                     let notice = build_execution_job_notice(
                         &chat_id,
                         &channel,
@@ -466,6 +493,7 @@ impl ExecutionJobManager {
                         &sid_spawn.to_string(),
                         "completed",
                         &summary,
+                        rec.description.as_deref(),
                     );
                     let _ = inner
                         .outbound_tx
@@ -481,6 +509,7 @@ impl ExecutionJobManager {
                             status: "completed",
                             duration_ms,
                             error: None,
+                            description: rec.description.as_deref(),
                         },
                     )
                     .await
@@ -517,15 +546,21 @@ impl ExecutionJobManager {
                         0,
                         0,
                         0,
+                        rec.description.clone(),
                     )
                     .await;
+                    let summary = match rec.description.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                        Some(d) => format!("{} — {status_label} ({es})", d),
+                        None => format!("Execution job {job_id_for_task}: {status_label} ({es})"),
+                    };
                     let notice = build_execution_job_notice(
                         &chat_id,
                         &channel,
                         &job_id_for_task,
                         &sid_spawn.to_string(),
                         status_label,
-                        &format!("Execution job {job_id_for_task}: {status_label} ({es})"),
+                        &summary,
+                        rec.description.as_deref(),
                     );
                     let _ = inner
                         .outbound_tx
@@ -541,6 +576,7 @@ impl ExecutionJobManager {
                             status: status_label,
                             duration_ms,
                             error: Some(es.as_str()),
+                            description: rec.description.as_deref(),
                         },
                     )
                     .await

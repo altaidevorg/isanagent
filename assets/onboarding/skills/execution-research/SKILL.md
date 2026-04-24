@@ -13,13 +13,13 @@ Use this playbook whenever you are writing or running analysis code, plots, tabl
 
 ## Before you run anything
 
-1. Call **`execution_env_info`** once. Note `default_provider`, `max_output_bytes`, `max_wall_secs`, and artifact caps. If execution is disabled, stop and tell the user to enable **`[harness.execution] enabled`**—do not invent a workaround.
+1. Call **`execution_env_info`** once. Note `default_provider`, `max_output_bytes`, **`max_wall_secs`**, **`default_run_timeout_secs`**, **`timeout_policy`**, and artifact caps. If execution is disabled, stop and tell the user to enable **`[harness.execution] enabled`**—do not invent a workaround.
 2. Plan for **stdout/stderr caps**: each stream gets roughly half of `max_output_bytes` (with a floor). Large prints truncate; design outputs accordingly.
 
 ## Session lifecycle (strict order)
 
 1. **`execution_session_create`** — set `language` (`python`, `shell`, or omit for default Python). Keep **one active run or background job per session**; wait for each to finish before starting another on the same `session_id`.
-2. **`execution_run`** — pass `session_id`, source `code`, and `timeout_secs` within `max_wall_secs`. Prefer **small, verifiable steps** (import → load → transform → plot) instead of one giant cell. For **long** wall clocks (many minutes or hours), prefer **`execution_run_background`** and poll **`execution_job_status`** / **`execution_job_result`** (see skill **`long-running-execution`**) so the agent thread is not blocked for the entire duration.
+2. **`execution_run`** — pass `session_id`, source `code`, and `timeout_secs` within `max_wall_secs`. Add **`description`** for any non-trivial run so the terminal strip and JSONL audits show intent. Prefer **small, verifiable steps** (import → load → transform → plot) instead of one giant cell. For **long** wall clocks (many minutes or hours), prefer **`execution_run_background`** (with **`description`**) and poll **`execution_job_status`** / **`execution_job_result`** (see skill **`long-running-execution`**) so the agent thread is not blocked for the entire duration.
 3. **`execution_artifact_list`** — when you need filenames or sizes under **`.execution_artifacts/<session_id>/`** (Jupyter materialized payloads, or files your code wrote there on local runs).
 4. **`glob_files`** / **`search_text`** — inspect text logs, CSV snippets, or small previews **by path**; never pull multi‑MB content into the reply.
 5. **`execution_session_close`** with the same `session_id` when the analysis branch is done so slots are freed.

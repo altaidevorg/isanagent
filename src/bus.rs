@@ -99,6 +99,8 @@ pub enum TelemetryEvent {
         artifact_count: usize,
         #[serde(skip_serializing_if = "Option::is_none")]
         git_head: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
     },
     /// Background `execution_run_background` job reached a terminal state.
     ExecutionJobFinished {
@@ -115,6 +117,8 @@ pub enum TelemetryEvent {
         stdout_len: usize,
         stderr_len: usize,
         artifact_count: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
     },
 }
 

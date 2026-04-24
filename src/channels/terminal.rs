@@ -15,8 +15,9 @@ const ISANAGENT_TOOL_NOTIFY: &str = "isanagent_tool_notify";
 const ISANAGENT_TOOL_PHASE: &str = "isanagent_tool_phase";
 
 use crate::channels::terminal_ui::protocol::{
-    ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_STREAM, METADATA_EXECUTION_JOB_ID,
-    METADATA_EXECUTION_JOB_STATUS, METADATA_EXECUTION_RUN_ID, METADATA_EXECUTION_SESSION_ID,
+    ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_STREAM, METADATA_EXECUTION_DESCRIPTION,
+    METADATA_EXECUTION_JOB_ID, METADATA_EXECUTION_JOB_STATUS, METADATA_EXECUTION_RUN_ID,
+    METADATA_EXECUTION_SESSION_ID,
 };
 
 /// When true, `main` skips the large colored stdout banner (Ratatui alternate screen owns the TTY).
@@ -62,11 +63,18 @@ pub fn build_execution_stream_notice(
     session_id: &str,
     run_id: &str,
     content: &str,
+    description: Option<&str>,
 ) -> OutboundMessage {
     let mut metadata = HashMap::new();
     metadata.insert(ISANAGENT_EXECUTION_STREAM.to_string(), json!(true));
     metadata.insert(METADATA_EXECUTION_SESSION_ID.to_string(), json!(session_id));
     metadata.insert(METADATA_EXECUTION_RUN_ID.to_string(), json!(run_id));
+    if let Some(d) = description.filter(|s| !s.trim().is_empty()) {
+        metadata.insert(
+            METADATA_EXECUTION_DESCRIPTION.to_string(),
+            json!(d.trim()),
+        );
+    }
     OutboundMessage {
         channel: channel.to_string(),
         chat_id: chat_id.to_string(),
@@ -84,6 +92,7 @@ pub fn build_execution_job_notice(
     session_id: &str,
     status: &str,
     summary: &str,
+    description: Option<&str>,
 ) -> OutboundMessage {
     let mut metadata = HashMap::new();
     metadata.insert(ISANAGENT_EXECUTION_JOB.to_string(), json!(true));
@@ -93,6 +102,12 @@ pub fn build_execution_job_notice(
         METADATA_EXECUTION_JOB_STATUS.to_string(),
         json!(status),
     );
+    if let Some(d) = description.filter(|s| !s.trim().is_empty()) {
+        metadata.insert(
+            METADATA_EXECUTION_DESCRIPTION.to_string(),
+            json!(d.trim()),
+        );
+    }
     OutboundMessage {
         channel: channel.to_string(),
         chat_id: chat_id.to_string(),

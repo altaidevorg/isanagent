@@ -30,6 +30,8 @@ struct ExecutionManifestLine<'a> {
     git_head: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     job_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<&'a str>,
 }
 
 async fn append_execution_manifest(
@@ -87,6 +89,7 @@ pub async fn persist_successful_execution_run(
     channel: &str,
     duration_ms: u64,
     job_id: Option<&str>,
+    run_description: Option<&str>,
 ) {
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let git_head = best_effort_git_head(harness.workspace_dir());
@@ -132,6 +135,7 @@ pub async fn persist_successful_execution_run(
         artifact_count: result.attachments.len(),
         git_head: git_head.as_deref(),
         job_id,
+        description: run_description,
     };
     if let Err(e) = append_execution_manifest(harness.workspace_dir(), manifest).await {
         warn!("execution manifest append failed: {e}");
@@ -150,6 +154,7 @@ pub async fn persist_successful_execution_run(
                 stderr_len: result.stderr.len(),
                 artifact_count: result.attachments.len(),
                 git_head: git_head.clone(),
+                description: run_description.map(|s| s.to_string()),
             },
         ))
         .await;

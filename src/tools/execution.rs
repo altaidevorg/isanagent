@@ -53,6 +53,29 @@ fn parse_cwd(args: &Value) -> Result<CwdPolicy, String> {
     }
 }
 
+const MAX_EXEC_DESCRIPTION_CHARS: usize = 200;
+
+/// Optional short human-facing line for terminal UI and audits (truncated).
+fn parse_optional_execution_description(args: &Value) -> Option<String> {
+    args.get("description")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let t = s.to_string();
+            let n = t.chars().count();
+            if n <= MAX_EXEC_DESCRIPTION_CHARS {
+                return t;
+            }
+            format!(
+                "{}…",
+                t.chars()
+                    .take(MAX_EXEC_DESCRIPTION_CHARS.saturating_sub(1))
+                    .collect::<String>()
+            )
+        })
+}
+
 /// Open an execution session (local subprocess or Jupyter kernel per config).
 pub struct ExecutionSessionCreateTool {
     pub harness: Arc<ExecutionHarness>,
@@ -131,7 +154,7 @@ impl Tool for ExecutionRunTool {
     }
 
     fn description(&self) -> &str {
-        "Run code in an execution_session_create session. Args: session_id, code, timeout_secs (optional), cwd_mode (optional session_default|sandbox_relative), cwd_relative when sandbox_relative. stdout/stderr may be truncated per [harness.execution] limits. Jupyter: live stream events are emitted on the bus for the terminal UI; binary plots and large CSV/JSON are saved under `.execution_artifacts/{session_id}/<run>/` and returned in `attachments`. Each run writes a journal under workspace `.system_generated/execution_history/{provider}/{session_id}/{run_id}/` (`run.json` + `source.txt`). A metadata line is appended to `.system_generated/execution_runs.jsonl` (no code)."
+        "Run code in an execution_session_create session. Args: session_id, code, timeout_secs (optional — omit only for quick runs; for generation/training set explicitly up to max_wall_secs; use smaller values for probes), description (optional, strongly recommended for Ratatui and logs: short human summary of intent), cwd_mode, cwd_relative. stdout/stderr may be truncated per [harness.execution] limits. Jupyter: live stream events are emitted on the bus for the terminal UI; binary plots and large CSV/JSON are saved under `.execution_artifacts/{session_id}/<run>/` and returned in `attachments`. Each run writes a journal under workspace `.system_generated/execution_history/{provider}/{session_id}/{run_id}/` (`run.json` + `source.txt`). A metadata line is appended to `.system_generated/execution_runs.jsonl` (no code)."
     }
 
     fn parameters(&self) -> Value {
@@ -140,7 +163,8 @@ impl Tool for ExecutionRunTool {
             "properties": {
                 "session_id": { "type": "string" },
                 "code": { "type": "string" },
-                "timeout_secs": { "type": "integer", "description": "Wall-clock limit for this run (clamped to harness max_wall_secs)" },
+                "timeout_secs": { "type": "integer", "description": "Wall-clock limit (clamped to max_wall_secs). Prefer explicit values for long work; use small values for quick checks." },
+                "description": { "type": "string", "description": "Short human-facing summary for terminal UI and audits (max ~200 chars); omit only for trivial runs" },
                 "cwd_mode": { "type": "string", "description": "session_default (default) or sandbox_relative" },
                 "cwd_relative": { "type": "string", "description": "Path relative to sandbox when cwd_mode is sandbox_relative" }
             },
@@ -160,6 +184,7 @@ impl Tool for ExecutionRunTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(self.harness.default_run_timeout_secs);
         let cwd = parse_cwd(&args)?;
+        let run_description = parse_optional_execution_description(&args);
         let run_id = uuid::Uuid::new_v4().to_string();
         let started = Instant::now();
         let started_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -182,10 +207,18 @@ impl Tool for ExecutionRunTool {
             let rid = run_id.clone();
             let cid = chat_id.clone();
             let ch = channel.clone();
+            let stream_desc = run_description.clone();
             tokio::spawn(async move {
                 while let Some(ev) = rx.recv().await {
                     let payload = serde_json::to_string(&ev).unwrap_or_default();
-                    let msg = build_execution_stream_notice(&cid, &ch, &sid_s, &rid, &payload);
+                    let msg = build_execution_stream_notice(
+                        &cid,
+                        &ch,
+                        &sid_s,
+                        &rid,
+                        &payload,
+                        stream_desc.as_deref(),
+                    );
                     let _ = ob.send(BusMessage::Outbound(msg)).await;
                 }
             });
@@ -195,6 +228,7 @@ impl Tool for ExecutionRunTool {
         spec.cwd = cwd;
         spec.run_id = Some(run_id.clone());
         spec.run_event_tx = event_tx;
+        spec.description = run_description.clone();
 
         let result = self
             .harness
@@ -228,6 +262,7 @@ impl Tool for ExecutionRunTool {
             &channel,
             duration_ms,
             None,
+            run_description.as_deref(),
         )
         .await;
 
@@ -248,7 +283,7 @@ impl Tool for ExecutionRunBackgroundTool {
     }
 
     fn description(&self) -> &str {
-        "Same as execution_run (session_id, code, optional timeout_secs, cwd_*) but returns immediately with a job_id. Poll execution_job_status / execution_job_result; use execution_job_cancel or execution_cancel on the session to interrupt when supported. One active run or background job per session. Jobs are process-local and lost on agent exit."
+        "Same as execution_run (session_id, code, optional timeout_secs, description, cwd_*) but returns immediately with a job_id. Poll execution_job_status / execution_job_result; use execution_job_cancel or execution_cancel on the session to interrupt when supported. One active run or background job per session. Jobs are process-local and lost on agent exit. Always pass description for runs expected to take more than ~30s so the terminal strip stays readable."
     }
 
     fn parameters(&self) -> Value {
@@ -257,7 +292,8 @@ impl Tool for ExecutionRunBackgroundTool {
             "properties": {
                 "session_id": { "type": "string" },
                 "code": { "type": "string" },
-                "timeout_secs": { "type": "integer", "description": "Wall-clock limit (defaults to [harness.execution] default_execution_timeout_secs, clamped to max_wall_secs)" },
+                "timeout_secs": { "type": "integer", "description": "Wall-clock limit (defaults to default_execution_timeout_secs when omitted, clamped to max_wall_secs). Set explicitly for long jobs; use small values for quick checks." },
+                "description": { "type": "string", "description": "Short human-facing summary for terminal UI and audits (max ~200 chars); strongly recommended for background work" },
                 "cwd_mode": { "type": "string", "description": "session_default (default) or sandbox_relative" },
                 "cwd_relative": { "type": "string", "description": "Path relative to sandbox when cwd_mode is sandbox_relative" },
                 "label": { "type": "string", "description": "Optional label for operator logs" }
@@ -282,6 +318,7 @@ impl Tool for ExecutionRunBackgroundTool {
             .get("label")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let run_description = parse_optional_execution_description(&args);
         let (chat_id, channel) = current_tool_exec_ctx()
             .map(|c| (c.chat_id.clone(), c.channel.clone()))
             .unwrap_or_else(|| (String::new(), String::new()));
@@ -291,6 +328,7 @@ impl Tool for ExecutionRunBackgroundTool {
             timeout_secs,
             cwd,
             label,
+            run_description,
             chat_id,
             channel,
         )?;
@@ -657,10 +695,18 @@ impl Tool for ExecutionEnvInfoTool {
             .get("python_executable")
             .and_then(|v| v.as_str())
             .unwrap_or_else(|| self.harness.python_executable());
+        let max_wall = self.harness.max_wall_secs;
+        let def_timeout = self.harness.default_run_timeout_secs;
+        let timeout_policy = format!(
+            "Per-run wall clock is capped at max_wall_secs ({max_wall}). If you omit timeout_secs on execution_run / execution_run_background, default_run_timeout_secs ({def_timeout}) applies. For long generation, training, or heavy I/O, set timeout_secs explicitly (up to the cap). For quick probes and tight polling loops, use a small timeout_secs. Prefer execution_run_background when work may block the reasoning loop for many minutes, then poll execution_job_status. Call execution_env_info anytime to re-read these caps. Use the description field on execution_run / execution_run_background so the terminal UI and audits show intent instead of raw ids."
+        );
         let mut v = json!({
             "provider_capabilities": self.harness.capabilities_summary(),
             "artifact_limits": self.harness.artifact_limits(),
             "artifact_root_relative": crate::execution::ARTIFACT_ROOT_DIR,
+            "max_wall_secs": max_wall,
+            "default_run_timeout_secs": def_timeout,
+            "timeout_policy": timeout_policy,
         });
         let probe = tokio::task::spawn_blocking({
             let exe = exe.to_string();
@@ -715,6 +761,7 @@ mod tests {
             dir.clone(),
             ArtifactLimits::default(),
             60,
+            3600,
         ));
         let create = ExecutionSessionCreateTool {
             harness: harness.clone(),
@@ -764,6 +811,7 @@ mod tests {
             dir.clone(),
             ArtifactLimits::default(),
             60,
+            3600,
         ));
         let create = ExecutionSessionCreateTool {
             harness: harness.clone(),
@@ -830,6 +878,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execution_env_info_includes_timeout_caps() {
+        let (ws, dir) = temp_dirs();
+        let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), true);
+        let prov: Arc<dyn crate::execution::ExecutionProvider> =
+            Arc::new(crate::execution::LocalExecutionProvider::new(cfg).expect("local provider"));
+        let harness = Arc::new(ExecutionHarness::new(
+            prov,
+            "python",
+            ws.clone(),
+            dir.clone(),
+            ArtifactLimits::default(),
+            90,
+            1200,
+        ));
+        let env = ExecutionEnvInfoTool { harness };
+        let out = env.execute(json!({})).await.expect("env");
+        assert!(out.contains("\"max_wall_secs\": 1200"), "out={out}");
+        assert!(out.contains("\"default_run_timeout_secs\": 90"), "out={out}");
+        assert!(out.contains("timeout_policy"));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn background_job_carries_description_in_status_and_list() {
+        let (ws, dir) = temp_dirs();
+        let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), true);
+        let prov: Arc<dyn crate::execution::ExecutionProvider> =
+            Arc::new(crate::execution::LocalExecutionProvider::new(cfg).expect("local provider"));
+        let harness = Arc::new(ExecutionHarness::new(
+            prov,
+            "python",
+            ws.clone(),
+            dir.clone(),
+            ArtifactLimits::default(),
+            60,
+            3600,
+        ));
+        let create = ExecutionSessionCreateTool {
+            harness: harness.clone(),
+        };
+        let lang = if cfg!(windows) { "shell" } else { "python" };
+        let out = create
+            .execute(json!({ "language": lang }))
+            .await
+            .expect("create");
+        let v: Value = serde_json::from_str(&out).expect("json");
+        let sid = v["session_id"].as_str().expect("session id");
+        let (otx, _orx) = mpsc::channel::<BusMessage>(8);
+        let jobs = Arc::new(ExecutionJobManager::new(harness.clone(), otx));
+        let bg = ExecutionRunBackgroundTool {
+            harness: harness.clone(),
+            jobs: jobs.clone(),
+        };
+        let code = if cfg!(windows) {
+            "echo desc-test"
+        } else {
+            "print('desc-test')"
+        };
+        let started = bg
+            .execute(json!({
+                "session_id": sid,
+                "code": code,
+                "timeout_secs": 30,
+                "description": "Unit test background label",
+            }))
+            .await
+            .expect("bg");
+        let jv: Value = serde_json::from_str(&started).expect("json");
+        let jid = jv["job_id"].as_str().expect("job_id");
+        for _ in 0..80 {
+            let st = ExecutionJobStatusTool {
+                jobs: jobs.clone(),
+            };
+            let s = st.execute(json!({ "job_id": jid })).await.expect("st");
+            if s.contains("\"terminal\": true") {
+                assert!(s.contains("Unit test background label"));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let list = ExecutionJobListTool { jobs: jobs.clone() };
+        let listed = list.execute(json!({})).await.expect("list");
+        assert!(listed.contains("Unit test background label"));
+        let close = ExecutionSessionCloseTool { harness };
+        close.execute(json!({ "session_id": sid })).await.unwrap();
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
     async fn background_job_cancel_requests_interrupt() {
         let (ws, dir) = temp_dirs();
         let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), true);
@@ -842,6 +979,7 @@ mod tests {
             dir.clone(),
             ArtifactLimits::default(),
             60,
+            3600,
         ));
         let create = ExecutionSessionCreateTool {
             harness: harness.clone(),

@@ -582,7 +582,7 @@ mod tests {
             "expected execution default_provider as comment"
         );
         assert!(
-            s.contains("# max_wall_secs = 300"),
+            s.contains("# max_wall_secs = 3600"),
             "expected execution max_wall_secs as comment"
         );
         assert!(

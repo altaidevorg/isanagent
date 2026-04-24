@@ -51,6 +51,8 @@ pub struct RunSpec {
     pub run_id: Option<String>,
     /// Live events (Jupyter streams). Not serialized.
     pub run_event_tx: Option<mpsc::Sender<RunEvent>>,
+    /// Short human-facing summary for terminal UI and audits (not sent to the kernel).
+    pub description: Option<String>,
 }
 
 impl RunSpec {
@@ -61,6 +63,7 @@ impl RunSpec {
             cwd: CwdPolicy::default(),
             run_id: None,
             run_event_tx: None,
+            description: None,
         }
     }
 }

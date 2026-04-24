@@ -367,10 +367,11 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             stderr_len,
             artifact_count,
             git_head,
+            description,
         } => LogEvent::info(
             "Telemetry",
             &format!(
-                "ExecutionRunFinished channel={} provider={} session={} exit={:?} ms={} out={}/{} artifacts={} git_head={}",
+                "ExecutionRunFinished channel={} provider={} session={} exit={:?} ms={} out={}/{} artifacts={} git_head={} desc={}",
                 channel,
                 provider_id,
                 session_id,
@@ -379,7 +380,8 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
                 stdout_len,
                 stderr_len,
                 artifact_count,
-                git_head.as_deref().unwrap_or("-")
+                git_head.as_deref().unwrap_or("-"),
+                description.as_deref().unwrap_or("-")
             ),
         )
         .with_chat_id(chat_id),
@@ -395,10 +397,11 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             stdout_len,
             stderr_len,
             artifact_count,
+            description,
         } => LogEvent::info(
             "Telemetry",
             &format!(
-                "ExecutionJobFinished channel={} job={} session={} provider={} status={} exit={:?} ms={} out={}/{} artifacts={}",
+                "ExecutionJobFinished channel={} job={} session={} provider={} status={} exit={:?} ms={} out={}/{} artifacts={} desc={}",
                 channel,
                 job_id,
                 session_id,
@@ -408,7 +411,8 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
                 duration_ms,
                 stdout_len,
                 stderr_len,
-                artifact_count
+                artifact_count,
+                description.as_deref().unwrap_or("-")
             ),
         )
         .with_chat_id(chat_id),

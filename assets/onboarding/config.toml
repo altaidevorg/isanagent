@@ -76,7 +76,8 @@ enabled = false
 [harness.execution]
 enabled = false
 # default_provider = "local"          # "local" | "jupyter" | "ssh"
-# max_wall_secs = 300                  # clamp per-run timeout_secs (default 300)
+# max_wall_secs = 3600                 # clamp per-run timeout_secs (default 3600; max 86400)
+# default_execution_timeout_secs = 600 # when the model omits timeout_secs (default 600; clamped to max_wall_secs)
 # max_output_bytes = 262144            # stdout+stderr cap per run (default 256 KiB)
 # max_sessions = 32                    # concurrent sessions (default 32)
 allowed_providers = ["local", "jupyter"]

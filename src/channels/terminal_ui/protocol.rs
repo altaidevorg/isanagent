@@ -11,3 +11,5 @@ pub const METADATA_EXECUTION_RUN_ID: &str = "execution_run_id";
 pub const ISANAGENT_EXECUTION_JOB: &str = "isanagent_execution_job";
 pub const METADATA_EXECUTION_JOB_ID: &str = "execution_job_id";
 pub const METADATA_EXECUTION_JOB_STATUS: &str = "execution_job_status";
+/// Short human-facing line for Ratatui execution strip (optional on stream/job notices).
+pub const METADATA_EXECUTION_DESCRIPTION: &str = "execution_description";
