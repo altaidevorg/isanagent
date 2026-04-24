@@ -356,6 +356,33 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             ),
         )
         .with_chat_id(chat_id),
+        TelemetryEvent::ExecutionRunFinished {
+            chat_id,
+            channel,
+            provider_id,
+            session_id,
+            exit_code,
+            duration_ms,
+            stdout_len,
+            stderr_len,
+            artifact_count,
+            git_head,
+        } => LogEvent::info(
+            "Telemetry",
+            &format!(
+                "ExecutionRunFinished channel={} provider={} session={} exit={:?} ms={} out={}/{} artifacts={} git_head={}",
+                channel,
+                provider_id,
+                session_id,
+                exit_code,
+                duration_ms,
+                stdout_len,
+                stderr_len,
+                artifact_count,
+                git_head.as_deref().unwrap_or("-")
+            ),
+        )
+        .with_chat_id(chat_id),
     }
 }
 

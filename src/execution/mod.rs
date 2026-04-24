@@ -10,6 +10,7 @@
 //!   types, plus [`ProviderCapabilities`] for preflight and prompt injection.
 //! - See [`preflight::PREFLIGHT_MARKDOWN`] for the capability → tool mapping.
 
+mod artifacts;
 mod capabilities;
 mod error;
 mod harness;
@@ -21,6 +22,9 @@ mod provider;
 mod run;
 mod ssh;
 
+pub use artifacts::{
+    artifact_run_rel_dir, sanitize_session_segment, ArtifactLimits, ARTIFACT_ROOT_DIR,
+};
 pub use capabilities::{
     NetworkPolicy, ProviderCapabilities, ProviderCapabilitiesSnapshot, SessionCapabilities,
 };

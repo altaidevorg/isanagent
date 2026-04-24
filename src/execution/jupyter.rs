@@ -1,6 +1,10 @@
 //! Jupyter Server kernel execution (Phase 3): REST kernel lifecycle + default binary WebSocket
 //! multiplexing channel (`/api/kernels/{id}/channels`).
+//!
+//! Phase 6: `display_data` / `execute_result` may materialize binary MIME payloads (PNG, JPEG,
+//! large CSV/JSON) under the sandbox [`.execution_artifacts`](super::artifacts::ARTIFACT_ROOT_DIR).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +18,10 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
 
+use super::artifacts::{
+    decode_jupyter_base64_data, jupyter_data_utf8_string, materialize_run_artifacts,
+    ArtifactCollector, ArtifactLimits, LARGE_TEXT_SPILL_THRESHOLD,
+};
 use super::capabilities::{
     NetworkPolicy, ProviderCapabilities, ProviderCapabilitiesSnapshot, SessionCapabilities,
 };
@@ -33,6 +41,9 @@ pub struct JupyterExecutionProviderConfig {
     pub max_run_timeout_secs: u64,
     pub max_output_bytes: usize,
     pub max_sessions: usize,
+    /// Agent sandbox root; artifacts are written under [`super::artifacts::ARTIFACT_ROOT_DIR`].
+    pub artifact_sandbox_dir: PathBuf,
+    pub artifact_limits: ArtifactLimits,
 }
 
 /// Jupyter HTTP + kernel WebSocket backend.
@@ -41,6 +52,15 @@ pub struct JupyterExecutionProvider {
     client: reqwest::Client,
     caps: ProviderCapabilities,
     sessions: DashMap<SessionId, Arc<JupyterSession>>,
+}
+
+/// Per-run state for Phase 6 artifact materialization (WS loop → disk).
+struct JupyterRunArtifactSink {
+    sandbox_dir: PathBuf,
+    session_id: SessionId,
+    run_id: String,
+    limits: ArtifactLimits,
+    collector: ArtifactCollector,
 }
 
 struct JupyterSession {
@@ -363,6 +383,7 @@ impl ExecutionProvider for JupyterExecutionProvider {
         let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
             let exec_msg_id = uuid::Uuid::new_v4().to_string();
             let session_key = uuid::Uuid::new_v4().to_string();
+            let run_id = uuid::Uuid::new_v4().to_string();
             let msg = build_execute_request(&exec_msg_id, &session_key, &spec.code);
             let payload = encode_kernel_ws_frame(&msg)?;
 
@@ -381,7 +402,22 @@ impl ExecutionProvider for JupyterExecutionProvider {
                 token: self.config.token.as_deref(),
                 kernel_id: &session.kernel_id,
             };
-            collect_execute_output(ws, &exec_msg_id, self.config.max_output_bytes, cancel, io).await
+            let artifact_sink = JupyterRunArtifactSink {
+                sandbox_dir: self.config.artifact_sandbox_dir.clone(),
+                session_id: session_id.clone(),
+                run_id,
+                limits: self.config.artifact_limits,
+                collector: ArtifactCollector::new(self.config.artifact_limits),
+            };
+            collect_execute_output(
+                ws,
+                &exec_msg_id,
+                self.config.max_output_bytes,
+                cancel,
+                io,
+                artifact_sink,
+            )
+            .await
         })
         .await;
 
@@ -591,6 +627,41 @@ struct ExecuteFoldCtx<'a> {
     exit_code: &'a mut Option<i32>,
     got_execute_reply: &'a mut bool,
     got_iopub_idle: &'a mut bool,
+    artifact_limits: ArtifactLimits,
+    artifact_collector: Option<&'a mut ArtifactCollector>,
+}
+
+fn fold_display_data_payload(v: &Value, ctx: &mut ExecuteFoldCtx<'_>) {
+    let Some(data) = v["content"].get("data") else {
+        return;
+    };
+
+    if let Some(collector) = ctx.artifact_collector.as_mut() {
+        let lim = ctx.artifact_limits.max_file_bytes;
+        for (mime, ext) in [
+            ("image/png", ".png"),
+            ("image/jpeg", ".jpg"),
+            ("image/jpg", ".jpg"),
+        ] {
+            if let Some(bytes) = decode_jupyter_base64_data(data, mime, lim) {
+                let _ = collector.try_push(mime.to_string(), bytes, ext);
+            }
+        }
+        for (mime, ext) in [("text/csv", ".csv"), ("application/json", ".json")] {
+            if let Some(s) = jupyter_data_utf8_string(data, mime) {
+                if s.len() > LARGE_TEXT_SPILL_THRESHOLD {
+                    let bytes = s.into_bytes();
+                    let _ = collector.try_push(mime.to_string(), bytes, ext);
+                } else if !s.is_empty() {
+                    append_truncated(ctx.stdout, &s, ctx.budget);
+                }
+            }
+        }
+    }
+
+    if let Some(s) = text_plain_from_data(data) {
+        append_truncated(ctx.stdout, &s, ctx.budget);
+    }
 }
 
 /// Apply one Jupyter message (decoded JSON envelope) to stdout/stderr / completion state.
@@ -612,11 +683,7 @@ fn fold_execute_ws_message(v: &Value, exec_msg_id: &str, ctx: &mut ExecuteFoldCt
             }
         }
         "execute_result" | "display_data" | "update_display_data" => {
-            if let Some(data) = v["content"].get("data") {
-                if let Some(s) = text_plain_from_data(data) {
-                    append_truncated(ctx.stdout, &s, ctx.budget);
-                }
-            }
+            fold_display_data_payload(v, ctx);
         }
         "error" => {
             let ename = v["content"]["ename"].as_str().unwrap_or("Error");
@@ -672,6 +739,7 @@ async fn collect_execute_output(
     max_output_bytes: usize,
     cancel: CancellationToken,
     io: JupyterWsIoContext<'_>,
+    artifact_sink: JupyterRunArtifactSink,
 ) -> Result<RunResult, ExecutionError> {
     let mut stdout = String::new();
     let mut stderr = String::new();
@@ -679,6 +747,8 @@ async fn collect_execute_output(
     let mut exit_code = Some(0i32);
     let mut got_execute_reply = false;
     let mut got_iopub_idle = false;
+    let artifact_limits = artifact_sink.limits;
+    let mut artifact_sink = artifact_sink;
 
     loop {
         if got_execute_reply && got_iopub_idle {
@@ -716,6 +786,8 @@ async fn collect_execute_output(
                             exit_code: &mut exit_code,
                             got_execute_reply: &mut got_execute_reply,
                             got_iopub_idle: &mut got_iopub_idle,
+                            artifact_limits,
+                            artifact_collector: Some(&mut artifact_sink.collector),
                         };
                         fold_execute_ws_message(&v, exec_msg_id, &mut ctx);
                     }
@@ -742,6 +814,8 @@ async fn collect_execute_output(
                                 exit_code: &mut exit_code,
                                 got_execute_reply: &mut got_execute_reply,
                                 got_iopub_idle: &mut got_iopub_idle,
+                                artifact_limits,
+                                artifact_collector: Some(&mut artifact_sink.collector),
                             };
                             fold_execute_ws_message(&v, exec_msg_id, &mut ctx);
                         }
@@ -751,7 +825,27 @@ async fn collect_execute_output(
         }
     }
 
-    Ok(RunResult::new(stdout, stderr, exit_code))
+    let sandbox_dir = artifact_sink.sandbox_dir;
+    let session_id = artifact_sink.session_id;
+    let run_id = artifact_sink.run_id;
+    let pending = artifact_sink.collector.pending;
+    let attachments =
+        materialize_run_artifacts(&sandbox_dir, &session_id, &run_id, pending).await?;
+
+    let mut summary_budget = max_output_bytes.saturating_sub(stdout.len() + stderr.len());
+    if summary_budget > 0 {
+        for a in &attachments {
+            if let Some(p) = &a.path {
+                let m = a.mime_hint.as_deref().unwrap_or("?");
+                let line = format!("[execution artifact] {p} ({m})\n");
+                append_truncated(&mut stdout, &line, &mut summary_budget);
+            }
+        }
+    }
+
+    let mut result = RunResult::new(stdout, stderr, exit_code);
+    result.attachments = attachments;
+    Ok(result)
 }
 
 async fn interrupt_kernel_rest(
@@ -844,6 +938,8 @@ mod tests {
             exit_code: &mut exit_code,
             got_execute_reply: &mut got_execute_reply,
             got_iopub_idle: &mut got_iopub_idle,
+            artifact_limits: ArtifactLimits::default(),
+            artifact_collector: None,
         };
         fold_execute_ws_message(&v, pid, &mut ctx);
         assert_eq!(stdout, "42");
@@ -876,6 +972,8 @@ mod tests {
             exit_code: &mut exit_code,
             got_execute_reply: &mut got_execute_reply,
             got_iopub_idle: &mut got_iopub_idle,
+            artifact_limits: ArtifactLimits::default(),
+            artifact_collector: None,
         };
         fold_execute_ws_message(&v, "abc", &mut ctx);
         assert_eq!(stdout, "hello");
@@ -924,6 +1022,8 @@ mod tests {
             exit_code: &mut exit_code,
             got_execute_reply: &mut got_execute_reply,
             got_iopub_idle: &mut got_iopub_idle,
+            artifact_limits: ArtifactLimits::default(),
+            artifact_collector: None,
         };
         fold_execute_ws_message(&err, pid, &mut ctx);
         assert_eq!(exit_code, Some(1));
@@ -935,6 +1035,8 @@ mod tests {
             exit_code: &mut exit_code,
             got_execute_reply: &mut got_execute_reply,
             got_iopub_idle: &mut got_iopub_idle,
+            artifact_limits: ArtifactLimits::default(),
+            artifact_collector: None,
         };
         fold_execute_ws_message(&reply, pid, &mut ctx);
         assert_eq!(
@@ -970,9 +1072,48 @@ mod tests {
             exit_code: &mut exit_code,
             got_execute_reply: &mut got_execute_reply,
             got_iopub_idle: &mut got_iopub_idle,
+            artifact_limits: ArtifactLimits::default(),
+            artifact_collector: None,
         };
         fold_execute_ws_message(&idle, pid, &mut ctx);
         assert!(got_iopub_idle);
         assert!(!got_execute_reply);
+    }
+
+    #[test]
+    fn display_data_png_with_collector_queues_bytes() {
+        let pid = "exec-png";
+        let b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        let v: Value = serde_json::from_str(&format!(
+            r#"{{
+            "channel":"iopub",
+            "header":{{"msg_type":"display_data"}},
+            "parent_header":{{"msg_id":"{pid}"}},
+            "content":{{"data":{{"image/png":"{b64}"}}}}
+        }}"#
+        ))
+        .unwrap();
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let mut budget = 10_000;
+        let mut exit_code = Some(0i32);
+        let mut got_execute_reply = false;
+        let mut got_iopub_idle = false;
+        let limits = ArtifactLimits::default();
+        let mut collector = ArtifactCollector::new(limits);
+        let mut ctx = ExecuteFoldCtx {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+            budget: &mut budget,
+            exit_code: &mut exit_code,
+            got_execute_reply: &mut got_execute_reply,
+            got_iopub_idle: &mut got_iopub_idle,
+            artifact_limits: limits,
+            artifact_collector: Some(&mut collector),
+        };
+        fold_execute_ws_message(&v, pid, &mut ctx);
+        assert_eq!(collector.pending.len(), 1);
+        assert_eq!(collector.pending[0].mime, "image/png");
+        assert!(!collector.pending[0].bytes.is_empty());
     }
 }

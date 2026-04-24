@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
 
+mod doom_loop;
 mod subagent;
 pub use subagent::SubagentHarness;
 
@@ -118,6 +119,7 @@ pub(crate) struct ReasoningLoopCtx {
     /// When true, tool list / execution use sub-agent allowlist and deny nested spawn/plan tools.
     pub(crate) is_subagent: bool,
     pub(crate) subagent_allowlist: Option<Arc<HashSet<String>>>,
+    pub(crate) doom_loop_enabled: bool,
 }
 
 /// Constructor arguments for [`AgentLogic`], grouped to keep call sites readable.
@@ -138,6 +140,8 @@ pub struct AgentLogicParams {
     pub clarification_hub: Arc<ClarificationHub>,
     /// When set, registers `subagent_*` / `task_*` tools and wires [`SubagentHarness`].
     pub subagent: Option<SubagentHarnessParams>,
+    /// When true (default), inject corrective user text if repeated tool calls are detected.
+    pub doom_loop_enabled: bool,
 }
 
 /// Build-time options for the Phase 5 sub-agent harness (see `[harness.subagents]`).
@@ -169,6 +173,7 @@ pub struct AgentLogic {
     cancellation_tokens: Arc<dashmap::DashMap<String, Arc<tokio_util::sync::CancellationToken>>>,
     clarification_hub: Arc<ClarificationHub>,
     subagent_harness: Option<Arc<SubagentHarness>>,
+    doom_loop_enabled: bool,
 }
 
 impl AgentLogic {
@@ -189,6 +194,7 @@ impl AgentLogic {
             logger_tx,
             clarification_hub,
             subagent,
+            doom_loop_enabled,
         } = params;
 
         let session_manager = Arc::new(session_manager);
@@ -215,6 +221,7 @@ impl AgentLogic {
                 default_allowlist: p.allowed_tools.clone(),
                 max_tasks: p.max_tasks,
                 max_wait_secs: p.max_wait_secs,
+                doom_loop_enabled,
             }))
         });
 
@@ -236,6 +243,7 @@ impl AgentLogic {
             cancellation_tokens: Arc::new(dashmap::DashMap::new()),
             clarification_hub,
             subagent_harness: subagent_harness.clone(),
+            doom_loop_enabled,
         };
 
         let tools_mut = Arc::get_mut(&mut agent.tools)
@@ -395,6 +403,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 let outbound_tx = self.outbound_tx.clone();
                 let logger_tx = self.logger_tx.clone();
                 let clarification_hub = self.clarification_hub.clone();
+                let doom_loop_enabled = self.doom_loop_enabled;
                 let tool_exec_ctx = ToolExecCtx::new(
                     inbound.channel.clone(),
                     inbound.chat_id.clone(),
@@ -438,6 +447,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                         tool_exec_ctx,
                         is_subagent: false,
                         subagent_allowlist: None,
+                        doom_loop_enabled,
                     })
                     .await;
 
@@ -522,6 +532,7 @@ impl AgentLogic {
             tool_exec_ctx,
             is_subagent,
             subagent_allowlist,
+            doom_loop_enabled,
         } = ctx;
 
         let session_key = tool_exec_ctx.session_key.clone();
@@ -624,6 +635,21 @@ impl AgentLogic {
                 skills.get_capabilities_summary()
             ));
             context.insert(0, system_msg);
+
+            if doom_loop_enabled {
+                if let Some(prompt) = doom_loop::check_for_doom_loop_prompt(&context) {
+                    let correction = crate::utils::ChatMessage::user(&prompt);
+                    mem.add_message(correction.clone()).await?;
+                    context.push(correction);
+                    let _ = logger_tx.send(BusMessage::Log(
+                        LogEvent::warn(
+                            &name,
+                            "Doom loop detected — injecting corrective user message.",
+                        )
+                        .with_chat_id(&inbound.chat_id),
+                    ));
+                }
+            }
 
             let _ = logger_tx.send(BusMessage::Log(
                 LogEvent::debug(
@@ -1256,6 +1282,7 @@ mod tests {
             logger_tx,
             clarification_hub: ClarificationHub::shared(),
             subagent: None,
+            doom_loop_enabled: false,
         });
 
         if let Some(tool_execution_activity) = tool_execution_activity {

@@ -35,8 +35,8 @@ use isanagent::tools::builtin::{
     SearchTextTool, ShellExecTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use isanagent::tools::execution::{
-    ExecutionCancelTool, ExecutionEnvInfoTool, ExecutionRunTool, ExecutionSessionCloseTool,
-    ExecutionSessionCreateTool,
+    ExecutionArtifactListTool, ExecutionCancelTool, ExecutionEnvInfoTool, ExecutionRunTool,
+    ExecutionSessionCloseTool, ExecutionSessionCreateTool,
 };
 use isanagent::tools::workflow::{AskUserTool, TodoWriteTool, ToolSearchTool};
 use isanagent::tools::ToolRegistry;
@@ -272,6 +272,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     }
     if workspace.config.execution_harness_enabled() {
         let harness = isanagent::execution::build_execution_harness(
+            workspace.dir.clone(),
             workspace.sandbox_dir.clone(),
             restrict,
             &workspace.config,
@@ -281,6 +282,10 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             harness: harness.clone(),
         }));
         tools.register(Box::new(ExecutionRunTool {
+            harness: harness.clone(),
+            outbound_tx: global_outbound_tx.clone(),
+        }));
+        tools.register(Box::new(ExecutionArtifactListTool {
             harness: harness.clone(),
         }));
         tools.register(Box::new(ExecutionCancelTool {
@@ -441,6 +446,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         logger_tx: logger_bus_tx.clone(),
         clarification_hub,
         subagent,
+        doom_loop_enabled: workspace.config.doom_loop_enabled(),
     });
     let agent_logic = if let Some(tool_execution_activity) = tool_execution_activity {
         agent_logic.with_tool_execution_activity(tool_execution_activity)

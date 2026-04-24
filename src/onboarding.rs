@@ -214,19 +214,13 @@ fn apply_onboard_options(cfg: &mut AppConfig, opts: &OnboardOptions) {
     {
         let h = cfg.harness.get_or_insert_with(Default::default);
         if let Some(v) = opts.harness_git_worktree_enabled {
-            h.git_worktree
-                .get_or_insert_with(Default::default)
-                .enabled = Some(v);
+            h.git_worktree.get_or_insert_with(Default::default).enabled = Some(v);
         }
         if let Some(v) = opts.harness_subagents_enabled {
-            h.subagents
-                .get_or_insert_with(Default::default)
-                .enabled = Some(v);
+            h.subagents.get_or_insert_with(Default::default).enabled = Some(v);
         }
         if let Some(v) = opts.harness_execution_enabled {
-            h.execution
-                .get_or_insert_with(Default::default)
-                .enabled = Some(v);
+            h.execution.get_or_insert_with(Default::default).enabled = Some(v);
         }
     }
 }
@@ -253,9 +247,8 @@ pub fn build_interactive_config_toml(options: &OnboardOptions) -> Result<String,
         doc["restrict_to_workspace"] = value(v);
     }
     if let Some(v) = options.max_iterations {
-        doc["max_iterations"] = value(
-            i64::try_from(v).map_err(|_| "max_iterations does not fit i64".to_string())?,
-        );
+        doc["max_iterations"] =
+            value(i64::try_from(v).map_err(|_| "max_iterations does not fit i64".to_string())?);
     }
     if let Some(v) = options.max_tool_output_chars {
         doc["max_tool_output_chars"] = value(
@@ -264,7 +257,8 @@ pub fn build_interactive_config_toml(options: &OnboardOptions) -> Result<String,
     }
     if let Some(v) = options.max_web_tool_output_chars {
         doc["max_web_tool_output_chars"] = value(
-            i64::try_from(v).map_err(|_| "max_web_tool_output_chars does not fit i64".to_string())?,
+            i64::try_from(v)
+                .map_err(|_| "max_web_tool_output_chars does not fit i64".to_string())?,
         );
     }
 
@@ -420,7 +414,8 @@ fn write_all_templates(
 ) -> Result<(), String> {
     for template in embedded_templates() {
         if template.relative_path == "config.toml" {
-            let body = if let Some(s) = interactive_merged_config_toml.filter(|_| options.has_overrides())
+            let body = if let Some(s) =
+                interactive_merged_config_toml.filter(|_| options.has_overrides())
             {
                 s.to_string()
             } else if options.has_overrides() {
@@ -535,10 +530,12 @@ mod tests {
 
     #[test]
     fn build_interactive_config_toml_preserves_template_comments() {
-        let mut o = OnboardOptions::default();
-        o.provider_model = Some("test-model".to_string());
-        o.provider_api_key_env = Some("GEMINI_API_KEY".to_string());
-        o.provider_base_url = Some("https://example.com/v1/chat/completions".to_string());
+        let o = OnboardOptions {
+            provider_model: Some("test-model".to_string()),
+            provider_api_key_env: Some("GEMINI_API_KEY".to_string()),
+            provider_base_url: Some("https://example.com/v1/chat/completions".to_string()),
+            ..Default::default()
+        };
         let s = build_interactive_config_toml(&o).expect("toml_edit merge");
         assert!(
             s.contains("# Local stdin/stdout chat"),

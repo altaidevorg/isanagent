@@ -1,6 +1,9 @@
 //! Local subprocess execution (Phase 1): sandbox cwd, timeouts, output caps, best-effort cancel.
+//!
+//! **Python** can run in **REPL mode** (default): one long-lived `python` per session with a shared
+//! namespace across `run` calls, or **subprocess mode**: a fresh interpreter per `run` (legacy).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,8 +27,12 @@ use crate::tools::builtin::resolve_path;
 /// How user code is executed for a session.
 #[derive(Debug, Clone)]
 pub enum LocalExecMode {
-    /// `python_executable -u -` with user source on **stdin** (avoids OS argv length limits).
-    Python { executable: String },
+    /// Python: either a persistent REPL child or one fresh subprocess per `run`.
+    Python {
+        executable: String,
+        /// When true, one interpreter per session (variables persist). When false, each `run` is isolated.
+        repl: bool,
+    },
     /// POSIX `sh -c` or Windows `cmd /C` (shell — use only with trusted prompts).
     Shell,
 }
@@ -44,6 +51,8 @@ pub struct LocalExecutionConfig {
     pub max_sessions: usize,
     /// Default `python` on PATH unless overridden.
     pub python_executable: String,
+    /// When true (default), local Python sessions use a persistent REPL; when false, each run is a new process.
+    pub python_repl: bool,
 }
 
 impl LocalExecutionConfig {
@@ -55,6 +64,7 @@ impl LocalExecutionConfig {
             max_output_bytes: 256 * 1024,
             max_sessions: 32,
             python_executable: "python".to_string(),
+            python_repl: true,
         }
     }
 }
@@ -73,7 +83,44 @@ struct LocalSession {
     active_pid: Mutex<Option<u32>>,
     /// Present while a `run` is in flight (also used to reject overlapping runs).
     run_cancel: Mutex<Option<CancellationToken>>,
+    /// Persistent Python worker (REPL mode only). Dropped on close, cancel, timeout, or cwd change.
+    python_repl: Mutex<Option<ReplPythonChild>>,
 }
+
+/// One long-lived `python -u -c <bootstrap>` with framed stdin/stdout.
+struct ReplPythonChild {
+    cwd: PathBuf,
+    stdin: tokio::process::ChildStdin,
+    stdout: tokio::process::ChildStdout,
+    child: Child,
+}
+
+/// Max UTF-8 source bytes per REPL round-trip (defense in depth; matches Python worker bound).
+const MAX_REPL_SOURCE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Embedded worker: read `>I` length + UTF-8 source, `exec` in shared namespace, reply `>III` + payloads.
+const PYTHON_REPL_BOOTSTRAP: &str = r#"import struct,sys,traceback,io,contextlib
+_g={}
+while 1:
+ h=sys.stdin.buffer.read(4)
+ if len(h)<4:
+  sys.exit(0)
+ n=int.from_bytes(h,'big')
+ if n>16777216 or n<0:
+  sys.exit(2)
+ s=sys.stdin.buffer.read(n).decode('utf-8','replace')
+ o,e=io.StringIO(),io.StringIO()
+ c=0
+ try:
+  with contextlib.redirect_stdout(o),contextlib.redirect_stderr(e):
+   exec(compile(s,'<isanagent>','exec'),_g,_g)
+ except Exception:
+  traceback.print_exc(file=e)
+  c=1
+ ob,eb=o.getvalue().encode('utf-8','backslashreplace'),e.getvalue().encode('utf-8','backslashreplace')
+ sys.stdout.buffer.write(struct.pack('>III',c,len(ob),len(eb))+ob+eb)
+ sys.stdout.buffer.flush()
+"#;
 
 impl LocalExecutionProvider {
     pub fn new(config: LocalExecutionConfig) -> Result<Self, ExecutionError> {
@@ -111,6 +158,7 @@ impl LocalExecutionProvider {
         match lang {
             None | Some("python") | Some("py") => Ok(LocalExecMode::Python {
                 executable: self.config.python_executable.clone(),
+                repl: self.config.python_repl,
             }),
             Some("shell") | Some("sh") | Some("bash") => Ok(LocalExecMode::Shell),
             Some(other) => Err(ExecutionError::InvalidArgument(format!(
@@ -129,6 +177,10 @@ impl LocalExecutionProvider {
             LocalExecMode::Python { .. } => Some("python".into()),
             LocalExecMode::Shell => Some("shell".into()),
         };
+        let mut ext = std::collections::BTreeMap::new();
+        if let LocalExecMode::Python { repl, .. } = mode {
+            ext.insert("local_python_repl".into(), serde_json::Value::Bool(*repl));
+        }
         SessionCapabilities {
             session_id: id.clone(),
             schema_version: 1,
@@ -143,7 +195,7 @@ impl LocalExecutionProvider {
                 jupyter_kernel: self.caps.jupyter_kernel,
                 network_policy: self.caps.network_policy,
             },
-            extensions: Default::default(),
+            extensions: ext,
         }
     }
 
@@ -162,6 +214,117 @@ impl LocalExecutionProvider {
             .map_err(ExecutionError::InvalidArgument),
         }
     }
+
+    /// Spawns or reuses the REPL child when `cwd` matches; otherwise kills the old child and spawns in `cwd`.
+    async fn ensure_python_repl(
+        &self,
+        session: &LocalSession,
+        executable: &str,
+        cwd: &Path,
+    ) -> Result<(), ExecutionError> {
+        let mut slot = session.python_repl.lock().await;
+        let cwd = cwd.to_path_buf();
+        let respawn = match slot.as_ref() {
+            None => true,
+            Some(ch) => ch.cwd != cwd,
+        };
+        if respawn {
+            if let Some(mut old) = slot.take() {
+                let _ = old.child.kill().await;
+            }
+            let mut cmd = Command::new(executable);
+            cmd.arg("-u").arg("-c").arg(PYTHON_REPL_BOOTSTRAP);
+            cmd.current_dir(&cwd);
+            cmd.stdin(Stdio::piped());
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::null());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                unsafe {
+                    cmd.as_std_mut().pre_exec(|| {
+                        if libc::setpgid(0, 0) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                cmd.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+            }
+            let mut child = cmd
+                .spawn()
+                .map_err(|e| ExecutionError::Provider(format!("local repl spawn: {e}")))?;
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| ExecutionError::Provider("local repl missing stdin".into()))?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| ExecutionError::Provider("local repl missing stdout".into()))?;
+            *slot = Some(ReplPythonChild {
+                cwd,
+                stdin,
+                stdout,
+                child,
+            });
+        }
+        Ok(())
+    }
+}
+
+async fn shutdown_repl_locked(m: &Mutex<Option<ReplPythonChild>>) {
+    let mut slot = m.lock().await;
+    if let Some(mut ch) = slot.take() {
+        let _ = ch.child.kill().await;
+    }
+}
+
+async fn read_exact<R: tokio::io::AsyncRead + Unpin>(
+    r: &mut R,
+    buf: &mut [u8],
+) -> Result<(), ExecutionError> {
+    let mut off = 0;
+    while off < buf.len() {
+        let n = r
+            .read(&mut buf[off..])
+            .await
+            .map_err(|e| ExecutionError::Provider(format!("repl read: {e}")))?;
+        if n == 0 {
+            return Err(ExecutionError::Provider(
+                "repl: unexpected EOF from child".into(),
+            ));
+        }
+        off += n;
+    }
+    Ok(())
+}
+
+/// Read `total` bytes from `r`, keeping at most `cap` bytes in the returned buffer (rest discarded).
+async fn read_exact_capped<R: tokio::io::AsyncRead + Unpin>(
+    r: &mut R,
+    total: usize,
+    cap: usize,
+) -> Result<Vec<u8>, ExecutionError> {
+    let mut out = Vec::new();
+    let mut remaining = total;
+    let mut buf = [0u8; 16384];
+    while remaining > 0 {
+        let chunk = remaining.min(buf.len());
+        read_exact(r, &mut buf[..chunk]).await?;
+        if out.len() < cap {
+            let room = cap.saturating_sub(out.len());
+            let take = chunk.min(room);
+            out.extend_from_slice(&buf[..take]);
+        }
+        remaining -= chunk;
+    }
+    Ok(out)
 }
 
 #[async_trait]
@@ -201,6 +364,7 @@ impl ExecutionProvider for LocalExecutionProvider {
             mode,
             active_pid: Mutex::new(None),
             run_cancel: Mutex::new(None),
+            python_repl: Mutex::new(None),
         });
         self.sessions.insert(id.clone(), session);
 
@@ -215,6 +379,7 @@ impl ExecutionProvider for LocalExecutionProvider {
             if let Some(t) = sess.run_cancel.lock().await.take() {
                 t.cancel();
             }
+            shutdown_repl_locked(&sess.python_repl).await;
             if let Some(pid) = sess.active_pid.lock().await.take() {
                 kill_process_best_effort(pid);
             }
@@ -254,80 +419,167 @@ impl ExecutionProvider for LocalExecutionProvider {
         let timeout = Duration::from_secs(timeout_secs);
         let max_each = (self.config.max_output_bytes / 2).max(1024);
 
-        let (mut cmd, stdin_body) = build_command(&session.mode, &spec.code)?;
-        cmd.current_dir(&cwd);
-        cmd.stdin(if stdin_body.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        });
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            // SAFETY: `pre_exec` runs in the child after `fork` and before `exec`; only async-signal-safe
-            // calls are allowed. `setpgid` establishes a new process group so we can kill the whole tree.
-            unsafe {
-                cmd.as_std_mut().pre_exec(|| {
-                    if libc::setpgid(0, 0) != 0 {
-                        return Err(std::io::Error::last_os_error());
+        let result: Result<RunResult, ExecutionError> = match &session.mode {
+            LocalExecMode::Python {
+                executable,
+                repl: true,
+            } => {
+                let exec_owned = executable.clone();
+                let code = spec.code.clone();
+                let work = async {
+                    self.ensure_python_repl(&session, exec_owned.as_str(), &cwd)
+                        .await?;
+                    if let Some(pid) = session
+                        .python_repl
+                        .lock()
+                        .await
+                        .as_ref()
+                        .and_then(|ch| ch.child.id())
+                    {
+                        *session.active_pid.lock().await = Some(pid);
                     }
-                    Ok(())
-                });
-            }
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.as_std_mut().creation_flags(CREATE_NO_WINDOW);
-        }
-
-        let child = cmd
-            .spawn()
-            .map_err(|e| ExecutionError::Provider(e.to_string()))?;
-        let pid = child.id();
-        if let Some(pid) = pid {
-            *session.active_pid.lock().await = Some(pid);
-        }
-
-        // Read stdout/stderr with per-pipe caps while the process runs so a runaway writer cannot
-        // exhaust host RAM (unlike `wait_with_output`, which buffers unbounded until EOF).
-        let work = async move {
-            match tokio::time::timeout(timeout, drain_child_pipes(child, max_each, stdin_body))
-                .await
-            {
-                Err(_) => {
-                    if let Some(p) = pid {
-                        kill_process_best_effort(p);
+                    let mut g = session.python_repl.lock().await;
+                    let repl = g
+                        .as_mut()
+                        .ok_or_else(|| ExecutionError::Provider("local repl unavailable".into()))?;
+                    let cbytes = code.as_bytes();
+                    if cbytes.len() > MAX_REPL_SOURCE_BYTES {
+                        return Err(ExecutionError::InvalidArgument(format!(
+                            "code exceeds max repl bytes ({MAX_REPL_SOURCE_BYTES})"
+                        )));
                     }
-                    Err(ExecutionError::Timeout { timeout_secs })
+                    let len_u = cbytes.len() as u32;
+                    repl.stdin
+                        .write_all(&len_u.to_be_bytes())
+                        .await
+                        .map_err(|e| ExecutionError::Provider(format!("repl stdin: {e}")))?;
+                    repl.stdin
+                        .write_all(cbytes)
+                        .await
+                        .map_err(|e| ExecutionError::Provider(format!("repl stdin: {e}")))?;
+                    repl.stdin
+                        .flush()
+                        .await
+                        .map_err(|e| ExecutionError::Provider(format!("repl stdin: {e}")))?;
+                    let mut hdr = [0u8; 12];
+                    read_exact(&mut repl.stdout, &mut hdr).await?;
+                    let st = u32::from_be_bytes(hdr[0..4].try_into().unwrap());
+                    let olen = u32::from_be_bytes(hdr[4..8].try_into().unwrap()) as usize;
+                    let elen = u32::from_be_bytes(hdr[8..12].try_into().unwrap()) as usize;
+                    const MAX_REPLY: usize = 64 * 1024 * 1024;
+                    if olen > MAX_REPLY || elen > MAX_REPLY {
+                        return Err(ExecutionError::Provider(
+                            "repl: invalid output length from worker".into(),
+                        ));
+                    }
+                    let out_raw = read_exact_capped(&mut repl.stdout, olen, max_each).await?;
+                    let err_raw = read_exact_capped(&mut repl.stdout, elen, max_each).await?;
+                    let stdout = string_from_utf8_lossy_trim_cap(out_raw, max_each);
+                    let stderr = string_from_utf8_lossy_trim_cap(err_raw, max_each);
+                    Ok(RunResult::new(stdout, stderr, Some(st as i32)))
+                };
+
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        if let Some(p) = session.active_pid.lock().await.take() {
+                            kill_process_best_effort(p);
+                        }
+                        shutdown_repl_locked(&session.python_repl).await;
+                        Err(ExecutionError::Cancelled)
+                    }
+                    out = tokio::time::timeout(timeout, work) => match out {
+                        Err(_) => {
+                            if let Some(p) = session.active_pid.lock().await.take() {
+                                kill_process_best_effort(p);
+                            }
+                            shutdown_repl_locked(&session.python_repl).await;
+                            Err(ExecutionError::Timeout { timeout_secs })
+                        }
+                        Ok(Err(e)) => {
+                            if let Some(p) = session.active_pid.lock().await.take() {
+                                kill_process_best_effort(p);
+                            }
+                            shutdown_repl_locked(&session.python_repl).await;
+                            Err(e)
+                        }
+                        Ok(Ok(r)) => Ok(r),
+                    },
                 }
-                Ok(Err(e)) => Err(e),
-                Ok(Ok(r)) => Ok(r),
+            }
+            _ => {
+                let (mut cmd, stdin_body) = build_command(&session.mode, &spec.code)?;
+                cmd.current_dir(&cwd);
+                cmd.stdin(if stdin_body.is_some() {
+                    Stdio::piped()
+                } else {
+                    Stdio::null()
+                });
+                cmd.stdout(Stdio::piped());
+                cmd.stderr(Stdio::piped());
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::CommandExt;
+                    unsafe {
+                        cmd.as_std_mut().pre_exec(|| {
+                            if libc::setpgid(0, 0) != 0 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            Ok(())
+                        });
+                    }
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                    cmd.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+                }
+
+                let child = cmd
+                    .spawn()
+                    .map_err(|e| ExecutionError::Provider(e.to_string()))?;
+                let pid = child.id();
+                if let Some(pid) = pid {
+                    *session.active_pid.lock().await = Some(pid);
+                }
+
+                let work = async move {
+                    match tokio::time::timeout(
+                        timeout,
+                        drain_child_pipes(child, max_each, stdin_body),
+                    )
+                    .await
+                    {
+                        Err(_) => {
+                            if let Some(p) = pid {
+                                kill_process_best_effort(p);
+                            }
+                            Err(ExecutionError::Timeout { timeout_secs })
+                        }
+                        Ok(Err(e)) => Err(e),
+                        Ok(Ok(r)) => Ok(r),
+                    }
+                };
+
+                let mut jh = tokio::spawn(work);
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        if let Some(p) = pid {
+                            kill_process_best_effort(p);
+                        }
+                        jh.abort();
+                        Err(ExecutionError::Cancelled)
+                    }
+                    joined = &mut jh => match joined {
+                        Ok(inner) => inner,
+                        Err(e) if e.is_cancelled() => Err(ExecutionError::Cancelled),
+                        Err(e) => Err(ExecutionError::Provider(format!("run task join: {e}"))),
+                    },
+                }
             }
         };
-
-        let mut jh = tokio::spawn(work);
-        let result: Result<RunResult, ExecutionError> = async move {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    if let Some(p) = pid {
-                        kill_process_best_effort(p);
-                    }
-                    jh.abort();
-                    Err(ExecutionError::Cancelled)
-                }
-                joined = &mut jh => match joined {
-                    Ok(inner) => inner,
-                    Err(e) if e.is_cancelled() => Err(ExecutionError::Cancelled),
-                    Err(e) => Err(ExecutionError::Provider(format!("run task join: {e}"))),
-                },
-            }
-        }
-        .await;
 
         *session.run_cancel.lock().await = None;
         *session.active_pid.lock().await = None;
@@ -347,6 +599,7 @@ impl ExecutionProvider for LocalExecutionProvider {
         if let Some(pid) = session.active_pid.lock().await.take() {
             kill_process_best_effort(pid);
         }
+        shutdown_repl_locked(&session.python_repl).await;
         Ok(())
     }
 }
@@ -436,7 +689,7 @@ fn build_command(
     code: &str,
 ) -> Result<(Command, Option<Vec<u8>>), ExecutionError> {
     let (c, stdin) = match mode {
-        LocalExecMode::Python { executable } => {
+        LocalExecMode::Python { executable, .. } => {
             let mut c = Command::new(executable);
             // Unbuffered; code is sent on stdin to avoid command-line length limits.
             c.arg("-u").arg("-");
@@ -634,6 +887,66 @@ mod tests {
             r
         );
         prov.close_session(&h.id).await.ok();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// REPL mode needs a real `python` on PATH; Windows Store shims are flaky for CI, so Unix-only.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn local_python_repl_persists_variables() {
+        let dir = temp_sandbox();
+        let cfg = LocalExecutionConfig::new(dir.clone(), true);
+        assert!(cfg.python_repl);
+        let prov = LocalExecutionProvider::new(cfg).unwrap();
+        let h = prov
+            .create_session(SessionCreateRequest {
+                language: Some("python".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let r1 = prov
+            .run(&h.id, RunSpec::new("x = 42", 30))
+            .await
+            .unwrap_or_else(|e| panic!("first run: {e:?}"));
+        assert_eq!(r1.exit_code, Some(0), "{r1:?}");
+        let r2 = prov
+            .run(&h.id, RunSpec::new("print(x)", 30))
+            .await
+            .unwrap_or_else(|e| panic!("second run: {e:?}"));
+        assert_eq!(r2.exit_code, Some(0), "{r2:?}");
+        assert!(
+            r2.stdout.contains("42"),
+            "expected repl namespace; stdout={:?}",
+            r2.stdout
+        );
+        prov.close_session(&h.id).await.unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn local_python_subprocess_mode_no_shared_namespace() {
+        let dir = temp_sandbox();
+        let mut cfg = LocalExecutionConfig::new(dir.clone(), true);
+        cfg.python_repl = false;
+        let prov = LocalExecutionProvider::new(cfg).unwrap();
+        let h = prov
+            .create_session(SessionCreateRequest {
+                language: Some("python".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let r1 = prov.run(&h.id, RunSpec::new("x = 42", 30)).await.unwrap();
+        assert_eq!(r1.exit_code, Some(0));
+        let r2 = prov.run(&h.id, RunSpec::new("print(x)", 30)).await.unwrap();
+        assert_ne!(r2.exit_code, Some(0), "{r2:?}");
+        assert!(
+            r2.stderr.contains("NameError") || r2.stdout.contains("NameError"),
+            "{r2:?}"
+        );
+        prov.close_session(&h.id).await.unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 }

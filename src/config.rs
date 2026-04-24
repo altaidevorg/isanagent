@@ -55,6 +55,15 @@ pub struct ExecutionHarnessConfig {
     pub allowed_providers: Option<Vec<String>>,
     /// Interpreter for `language: python` (default `python`) — local provider and `execution_env_info`.
     pub python_executable: Option<String>,
+    /// Local Python only: **`repl`** (default) keeps one interpreter per session so variables survive
+    /// across `execution_run` calls; **`subprocess`** spawns a fresh `python -u -` per run (legacy).
+    pub local_python_mode: Option<String>,
+    /// Max bytes per execution artifact file (default 4MiB, clamped 64KiB–64MiB).
+    pub artifact_max_file_bytes: Option<usize>,
+    /// Max total bytes for all artifacts in one `execution_run` (default 32MiB).
+    pub artifact_max_total_bytes_per_run: Option<usize>,
+    /// Max artifact files per run (default 64, clamped 1–256).
+    pub artifact_max_files_per_run: Option<usize>,
     /// Required when `default_provider = "jupyter"`.
     pub jupyter: Option<JupyterExecutionConfig>,
     /// Required when `default_provider = "ssh"`.
@@ -106,6 +115,8 @@ pub struct AppConfig {
     pub email: Option<EmailConfig>,
     pub terminal: Option<TerminalConfig>,
     pub max_iterations: Option<usize>,
+    /// When true (default), detect repeated identical tool calls and inject a corrective user message.
+    pub doom_loop_enabled: Option<bool>,
     pub max_tool_output_chars: Option<usize>,
     /// Max characters returned by `web_search` / `web_fetch` (default 50_000). Separate from
     /// `max_tool_output_chars`, which caps tool output when passed to the model.
@@ -206,6 +217,11 @@ impl AppConfig {
         self.search_text_ripgrep_timeout_secs
             .unwrap_or(DEFAULT)
             .clamp(MIN, MAX)
+    }
+
+    /// ml-intern-style doom loop detection before each LLM call (default: enabled).
+    pub fn doom_loop_enabled(&self) -> bool {
+        self.doom_loop_enabled.unwrap_or(true)
     }
 
     /// When true, `git_worktree` is registered (see `[harness.git_worktree]` in config).
@@ -343,6 +359,71 @@ impl AppConfig {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "python".to_string())
+    }
+
+    /// Local provider Python: persistent REPL per session (default) vs one subprocess per run.
+    pub fn execution_local_python_repl_enabled(&self) -> bool {
+        let raw = self
+            .harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.local_python_mode.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        match raw {
+            None => true,
+            Some(s) => {
+                let lower = s.to_ascii_lowercase();
+                !matches!(
+                    lower.as_str(),
+                    "subprocess"
+                        | "fresh"
+                        | "stateless"
+                        | "one_shot"
+                        | "oneshot"
+                        | "no"
+                        | "false"
+                        | "0"
+                )
+            }
+        }
+    }
+
+    /// Caps for Phase 6 execution artifacts (Jupyter `display_data` materialization).
+    pub fn execution_artifact_max_file_bytes(&self) -> usize {
+        const DEFAULT: usize = 4 * 1024 * 1024;
+        const MIN: usize = 64 * 1024;
+        const MAX: usize = 64 * 1024 * 1024;
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.artifact_max_file_bytes)
+            .unwrap_or(DEFAULT)
+            .clamp(MIN, MAX)
+    }
+
+    pub fn execution_artifact_max_total_bytes_per_run(&self) -> usize {
+        const DEFAULT: usize = 32 * 1024 * 1024;
+        const MIN: usize = 256 * 1024;
+        const MAX: usize = 128 * 1024 * 1024;
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.artifact_max_total_bytes_per_run)
+            .unwrap_or(DEFAULT)
+            .clamp(MIN, MAX)
+    }
+
+    pub fn execution_artifact_max_files_per_run(&self) -> usize {
+        const DEFAULT: usize = 64;
+        const MIN: usize = 1;
+        const MAX: usize = 256;
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.artifact_max_files_per_run)
+            .unwrap_or(DEFAULT)
+            .clamp(MIN, MAX)
     }
 
     /// When `allowed_providers` is missing or empty, any implemented provider id is allowed.
@@ -573,6 +654,29 @@ python_executable = "python3"
         assert!(c.execution_provider_allowed("local"));
         assert!(!c.execution_provider_allowed("jupyter"));
         assert_eq!(c.execution_python_executable(), "python3");
+    }
+
+    #[test]
+    fn harness_execution_artifact_limits_toml() {
+        let s = r#"
+[harness.execution]
+enabled = true
+artifact_max_file_bytes = 100000
+artifact_max_total_bytes_per_run = 500000
+artifact_max_files_per_run = 10
+"#;
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        assert_eq!(c.execution_artifact_max_file_bytes(), 100_000);
+        assert_eq!(c.execution_artifact_max_total_bytes_per_run(), 500_000);
+        assert_eq!(c.execution_artifact_max_files_per_run(), 10);
+    }
+
+    #[test]
+    fn doom_loop_enabled_toml() {
+        let s = r#"doom_loop_enabled = false"#;
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        assert!(!c.doom_loop_enabled());
+        assert!(AppConfig::default().doom_loop_enabled());
     }
 
     #[test]

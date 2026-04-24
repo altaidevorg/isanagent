@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
@@ -57,23 +59,24 @@ fn build_onboard_options_with_toggles(
     api_key_env: String,
     values: &[bool; FEATURE_TOGGLE_COUNT],
 ) -> OnboardOptions {
-    let mut options = OnboardOptions::default();
-    options.provider_model = Some(model_id);
-    options.provider_base_url = Some(chat_url);
-    options.provider_api_key_env = Some(api_key_env);
-    options.terminal_enable = Some(values[0]);
-    options.slack_enabled = Some(values[1]);
-    options.email_enabled = Some(values[2]);
-    options.api_enabled = Some(values[3]);
-    options.api_serve_ui = Some(values[4]);
-    options.multi_tenant_activity_heartbeat = Some(values[5]);
-    options.multi_tenant_cron_scheduling = Some(values[6]);
-    options.jina_enabled = Some(values[7]);
-    options.memory_enabled = Some(values[8]);
-    options.harness_git_worktree_enabled = Some(values[9]);
-    options.harness_subagents_enabled = Some(values[10]);
-    options.harness_execution_enabled = Some(values[11]);
-    options
+    OnboardOptions {
+        provider_model: Some(model_id),
+        provider_base_url: Some(chat_url),
+        provider_api_key_env: Some(api_key_env),
+        terminal_enable: Some(values[0]),
+        slack_enabled: Some(values[1]),
+        email_enabled: Some(values[2]),
+        api_enabled: Some(values[3]),
+        api_serve_ui: Some(values[4]),
+        multi_tenant_activity_heartbeat: Some(values[5]),
+        multi_tenant_cron_scheduling: Some(values[6]),
+        jina_enabled: Some(values[7]),
+        memory_enabled: Some(values[8]),
+        harness_git_worktree_enabled: Some(values[9]),
+        harness_subagents_enabled: Some(values[10]),
+        harness_execution_enabled: Some(values[11]),
+        ..Default::default()
+    }
 }
 
 /// Outcome of the interactive wizard: merged CLI overrides for `onboard_workspace`.
@@ -103,9 +106,9 @@ impl ProviderChoice {
 
     fn chat_completions_url(self) -> Option<&'static str> {
         match self {
-            ProviderChoice::Gemini => Some(
-                "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-            ),
+            ProviderChoice::Gemini => {
+                Some("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
+            }
             ProviderChoice::OpenAI => Some("https://api.openai.com/v1/chat/completions"),
             ProviderChoice::DeepSeek => Some("https://api.deepseek.com/v1/chat/completions"),
             ProviderChoice::OpenRouter => Some("https://openrouter.ai/api/v1/chat/completions"),
@@ -181,10 +184,7 @@ async fn fetch_model_ids(
             body.chars().take(500).collect::<String>()
         ));
     }
-    let text = res
-        .text()
-        .await
-        .map_err(|e| format!("Read body: {}", e))?;
+    let text = res.text().await.map_err(|e| format!("Read body: {}", e))?;
     let parsed: ModelsListResponse =
         serde_json::from_str(&text).map_err(|e| format!("Invalid JSON from /models: {}", e))?;
     let mut ids: Vec<String> = if !parsed.data.is_empty() {
@@ -224,11 +224,19 @@ fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
 
 #[derive(Clone)]
 enum Step {
-    PickProvider { selected: usize },
-    CustomUrl { input: String },
-    ApiKey { input: String },
+    PickProvider {
+        selected: usize,
+    },
+    CustomUrl {
+        input: String,
+    },
+    ApiKey {
+        input: String,
+    },
     FetchingModels,
-    FetchError { message: String },
+    FetchError {
+        message: String,
+    },
     PickModel {
         models: Vec<String>,
         selected: usize,
@@ -500,11 +508,8 @@ fn run_ui_loop(handle: &Handle) -> Result<InteractiveOnboardOutcome, String> {
                                         return;
                                     }
                                 };
-                                let res = rt_handle.block_on(fetch_model_ids(
-                                    &client,
-                                    &url,
-                                    key.trim(),
-                                ));
+                                let res =
+                                    rt_handle.block_on(fetch_model_ids(&client, &url, key.trim()));
                                 let _ = tx.send(res);
                             });
                             state.fetch_rx = Some(rx);
@@ -554,7 +559,7 @@ fn run_ui_loop(handle: &Handle) -> Result<InteractiveOnboardOutcome, String> {
                 let inner_h = block.height.saturating_sub(4) as usize;
                 let per_page = inner_h.max(3);
                 let n = models.len();
-                let total_pages = (n + per_page - 1) / per_page;
+                let total_pages = n.div_ceil(per_page);
 
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => {
@@ -624,7 +629,7 @@ fn run_ui_loop(handle: &Handle) -> Result<InteractiveOnboardOutcome, String> {
                 let inner_h = block.height.saturating_sub(4) as usize;
                 let per_page = inner_h.max(2);
                 let n = FEATURE_TOGGLE_COUNT;
-                let total_pages = (n + per_page - 1) / per_page;
+                let total_pages = n.div_ceil(per_page);
 
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => {
@@ -752,8 +757,8 @@ fn render(frame: &mut Frame, state: &UiState) {
                     .title_alignment(Alignment::Center),
             );
             frame.render_widget(p, chunks[0]);
-            let footer = Paragraph::new("Enter confirm · ← back · Esc quit")
-                .alignment(Alignment::Center);
+            let footer =
+                Paragraph::new("Enter confirm · ← back · Esc quit").alignment(Alignment::Center);
             frame.render_widget(footer, chunks[1]);
         }
         Step::ApiKey { input } => {
@@ -781,8 +786,8 @@ fn render(frame: &mut Frame, state: &UiState) {
                     .title_alignment(Alignment::Center),
             );
             frame.render_widget(p, chunks[0]);
-            let footer = Paragraph::new("Enter submit · ← back · Esc quit")
-                .alignment(Alignment::Center);
+            let footer =
+                Paragraph::new("Enter submit · ← back · Esc quit").alignment(Alignment::Center);
             frame.render_widget(footer, chunks[1]);
         }
         Step::FetchingModels => {
@@ -819,7 +824,7 @@ fn render(frame: &mut Frame, state: &UiState) {
             let inner_h = block.height.saturating_sub(4) as usize;
             let per_page = inner_h.max(3);
             let n = models.len();
-            let total_pages = (n + per_page - 1) / per_page;
+            let total_pages = n.div_ceil(per_page);
             let page = (*page).min(total_pages.saturating_sub(1));
             let start = page * per_page;
             let end = (start + per_page).min(n);
@@ -859,10 +864,9 @@ fn render(frame: &mut Frame, state: &UiState) {
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(0), Constraint::Length(1)])
                 .split(block);
-            let hint = Paragraph::new(
-                "↑/↓ j/k move · n/p page · Enter confirm · ← back · Esc quit",
-            )
-            .alignment(Alignment::Center);
+            let hint =
+                Paragraph::new("↑/↓ j/k move · n/p page · Enter confirm · ← back · Esc quit")
+                    .alignment(Alignment::Center);
             frame.render_widget(hint, chunks[1]);
         }
         Step::FeatureToggles {
@@ -874,7 +878,7 @@ fn render(frame: &mut Frame, state: &UiState) {
             let inner_h = block.height.saturating_sub(4) as usize;
             let per_page = inner_h.max(2);
             let n = FEATURE_TOGGLE_COUNT;
-            let total_pages = (n + per_page - 1) / per_page;
+            let total_pages = n.div_ceil(per_page);
             let page = (*page).min(total_pages.saturating_sub(1));
             let start = page * per_page;
             let end = (start + per_page).min(n);
@@ -915,7 +919,9 @@ fn render(frame: &mut Frame, state: &UiState) {
                 .constraints([Constraint::Min(0), Constraint::Length(2)])
                 .split(block);
             let hint = Paragraph::new(vec![
-                Line::from("↑/↓ j/k move · Space toggle · n/p page · Enter finish · ← back to models"),
+                Line::from(
+                    "↑/↓ j/k move · Space toggle · n/p page · Enter finish · ← back to models",
+                ),
                 Line::from("Esc or q quit"),
             ])
             .alignment(Alignment::Center);
