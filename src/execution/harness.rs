@@ -131,6 +131,8 @@ pub fn build_execution_harness(
                 max_sessions: config.execution_max_sessions(),
                 artifact_sandbox_dir: sandbox_dir.clone(),
                 artifact_limits,
+                notebook_sync_path_template: config
+                    .execution_jupyter_notebook_sync_path_template(),
             };
             let p =
                 JupyterExecutionProvider::new(jc).map_err(|e: ExecutionError| e.to_string())?;

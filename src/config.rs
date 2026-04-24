@@ -36,6 +36,9 @@ pub struct JupyterExecutionConfig {
     pub token: Option<String>,
     /// Kernel spec name for `POST /api/kernels` (default `python3`).
     pub kernel_name: Option<String>,
+    /// Optional server-side notebook path template for Contents API sync (e.g. `isanagent/{session_id}.ipynb`).
+    /// `{session_id}` is replaced with the **sanitized** isanagent session id. Each `execution_run` appends a code cell.
+    pub notebook_sync_path_template: Option<String>,
 }
 
 /// Code execution harness (`execution_*` tools). Disabled unless `[harness.execution] enabled = true`.
@@ -481,6 +484,16 @@ impl AppConfig {
             .unwrap_or_else(|| "python3".to_string())
     }
 
+    pub fn execution_jupyter_notebook_sync_path_template(&self) -> Option<String> {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.jupyter.as_ref())
+            .and_then(|j| j.notebook_sync_path_template.as_ref())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
     pub fn execution_ssh_host(&self) -> Option<String> {
         self.harness
             .as_ref()
@@ -691,6 +704,7 @@ allowed_providers = ["jupyter", "local"]
 base_url = "http://127.0.0.1:8888"
 token = "testtoken"
 kernel_name = "python3"
+notebook_sync_path_template = "scratch/{session_id}.ipynb"
 "#;
         let c: AppConfig = toml::from_str(s).expect("parse");
         assert_eq!(c.execution_default_provider(), "jupyter");
@@ -701,6 +715,10 @@ kernel_name = "python3"
         );
         assert_eq!(c.execution_jupyter_token().as_deref(), Some("testtoken"));
         assert_eq!(c.execution_jupyter_kernel_name(), "python3");
+        assert_eq!(
+            c.execution_jupyter_notebook_sync_path_template().as_deref(),
+            Some("scratch/{session_id}.ipynb")
+        );
     }
 
     #[test]

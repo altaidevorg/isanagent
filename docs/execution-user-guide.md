@@ -51,6 +51,8 @@ Top-level **`doom_loop_enabled`** (optional, default **true**): when true, the a
 
 Each successful **`execution_run`** also appends one JSON line to **`workspace_dir/.system_generated/execution_runs.jsonl`** (metadata only: no code body) and emits **`ExecutionRunFinished`** telemetry.
 
+Additionally, every **`execution_run`** (all providers) writes a **run journal** under **`workspace_dir/.system_generated/execution_history/{provider}/{session_id}/{run_id}/`**: **`run.json`** (truncated stdout/stderr, attachment list, timestamps) and **`source.txt`** (the exact code run). Treat journals as potentially sensitive if code contained secrets.
+
 When `default_provider = "jupyter"`, add **`[harness.execution.jupyter]`**:
 
 | Key | Meaning |
@@ -58,6 +60,11 @@ When `default_provider = "jupyter"`, add **`[harness.execution.jupyter]`**:
 | `base_url` | Jupyter Server root, e.g. `http://127.0.0.1:8888` (no `/lab` path). **Required** for Jupyter. |
 | `token` | Optional server token. Prefer host env **`JUPYTER_TOKEN`** (wins over this field) so secrets are not committed. |
 | `kernel_name` | Kernel spec name for `POST /api/kernels` when `language` is Python or unset (default **`python3`**). |
+| `notebook_sync_path_template` | Optional. When set (e.g. `isanagent/{session_id}.ipynb`), each successful run **appends a code cell** to that server-side notebook via the Contents API (`{session_id}` is the **sanitized** isanagent session id). Open it in JupyterLab to watch progress. |
+
+**Terminal UI:** while a Jupyter **`execution_run`** is in flight, stream events appear in the **execution** strip below the transcript (Ratatui).
+
+**Resume a kernel:** pass **`resume_jupyter_kernel_id`** to **`execution_session_create`** with the value from **`session_capabilities.extensions.jupyter_kernel_id`** (or from the Jupyter server’s kernel list). The call fails if that kernel no longer exists.
 
 When `default_provider = "ssh"`, add **`[harness.execution.ssh]`**:
 
@@ -84,11 +91,11 @@ Materialized run artifacts live under **`sandbox_dir/.execution_artifacts/`** (s
 
 ## Typical workflow (for you or the model)
 
-1. **`execution_session_create`** — optional `label`, optional `language`.  
+1. **`execution_session_create`** — optional `label`, optional `language`, optional **`resume_jupyter_kernel_id`** (Jupyter only).  
    - **`local`:** `python`, `py`, `shell`, `sh`, `bash`.  
    - **`jupyter`:** `python` / `py` / unset (uses `kernel_name`), or **`r`** / **`R`** (uses the **`ir`** kernel spec if installed).  
    - **`ssh`:** `python` / `py` / unset, or `shell` / `sh` / `bash`.  
-   - Response includes **`session_id`** and capability summaries — keep the `session_id` for the next steps.
+   - Response includes **`session_id`** and capability summaries — keep the `session_id` for the next steps. Jupyter responses include **`jupyter_kernel_id`** (and **`jupyter_notebook_sync_path`** when `notebook_sync_path_template` is configured).
 
 2. **`execution_run`** — required: `session_id`, `code`. Optional: `timeout_secs`, `cwd_mode` (`session_default` or `sandbox_relative`), and `cwd_relative` when using `sandbox_relative`.  
    - **`jupyter`:** only **`session_default`** is supported for `cwd_mode` (no per-run sandbox cwd); use notebook magics such as `%cd` inside `code` if you must change directory on the server.  

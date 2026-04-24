@@ -16,10 +16,13 @@ mod error;
 mod harness;
 mod ids;
 mod jupyter;
+mod jupyter_notebook;
 mod local;
 mod preflight;
 mod provider;
 mod run;
+mod run_events;
+mod run_history;
 mod ssh;
 
 pub use artifacts::{
@@ -38,4 +41,6 @@ pub use provider::{ExecutionProvider, PackageOperations, SshRemoteShell};
 pub use run::{
     CwdPolicy, RunAttachmentRef, RunResult, RunSpec, SessionCreateRequest, SessionHandle,
 };
+pub use run_events::RunEvent;
+pub use run_history::{write_run_journal, RunJournalParams};
 pub use ssh::{validate_remote_workdir, SshExecutionProvider, SshExecutionProviderConfig};

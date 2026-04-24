@@ -14,6 +14,10 @@ use tokio::sync::mpsc::Sender;
 const ISANAGENT_TOOL_NOTIFY: &str = "isanagent_tool_notify";
 const ISANAGENT_TOOL_PHASE: &str = "isanagent_tool_phase";
 
+use crate::channels::terminal_ui::protocol::{
+    ISANAGENT_EXECUTION_STREAM, METADATA_EXECUTION_RUN_ID, METADATA_EXECUTION_SESSION_ID,
+};
+
 /// When true, `main` skips the large colored stdout banner (Ratatui alternate screen owns the TTY).
 pub fn terminal_startup_suppresses_plain_banner(cfg: &AppConfig) -> bool {
     use std::io::{self, IsTerminal};
@@ -48,6 +52,27 @@ fn summarize_tool_result_for_terminal(result: &str) -> String {
         return t.to_string();
     }
     format!("{} chars", t.chars().count())
+}
+
+/// Live `execution_run` stream line for Ratatui (`content` is usually JSON for [`RunEvent`](crate::execution::RunEvent)).
+pub fn build_execution_stream_notice(
+    chat_id: &str,
+    channel: &str,
+    session_id: &str,
+    run_id: &str,
+    content: &str,
+) -> OutboundMessage {
+    let mut metadata = HashMap::new();
+    metadata.insert(ISANAGENT_EXECUTION_STREAM.to_string(), json!(true));
+    metadata.insert(METADATA_EXECUTION_SESSION_ID.to_string(), json!(session_id));
+    metadata.insert(METADATA_EXECUTION_RUN_ID.to_string(), json!(run_id));
+    OutboundMessage {
+        channel: channel.to_string(),
+        chat_id: chat_id.to_string(),
+        thread_id: None,
+        content: content.to_string(),
+        metadata,
+    }
 }
 
 /// Live terminal line when a tool is invoked (mirrors telemetry, user-visible).

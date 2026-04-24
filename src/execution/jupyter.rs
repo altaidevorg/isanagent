@@ -4,6 +4,7 @@
 //! Phase 6: `display_data` / `execute_result` may materialize binary MIME payloads (PNG, JPEG,
 //! large CSV/JSON) under the sandbox [`.execution_artifacts`](super::artifacts::ARTIFACT_ROOT_DIR).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,15 +21,17 @@ use tokio_util::sync::CancellationToken;
 
 use super::artifacts::{
     decode_jupyter_base64_data, jupyter_data_utf8_string, materialize_run_artifacts,
-    ArtifactCollector, ArtifactLimits, LARGE_TEXT_SPILL_THRESHOLD,
+    sanitize_session_segment, ArtifactCollector, ArtifactLimits, LARGE_TEXT_SPILL_THRESHOLD,
 };
 use super::capabilities::{
     NetworkPolicy, ProviderCapabilities, ProviderCapabilitiesSnapshot, SessionCapabilities,
 };
 use super::error::ExecutionError;
 use super::ids::SessionId;
+use super::jupyter_notebook;
 use super::provider::ExecutionProvider;
 use super::run::{CwdPolicy, RunResult, RunSpec, SessionCreateRequest, SessionHandle};
+use super::run_events::{RunEvent, RunEventThrottle};
 
 type ExecWsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -44,6 +47,8 @@ pub struct JupyterExecutionProviderConfig {
     /// Agent sandbox root; artifacts are written under [`super::artifacts::ARTIFACT_ROOT_DIR`].
     pub artifact_sandbox_dir: PathBuf,
     pub artifact_limits: ArtifactLimits,
+    /// When set (e.g. `isanagent/{session_id}.ipynb`), append each successful run as a code cell via Contents API.
+    pub notebook_sync_path_template: Option<String>,
 }
 
 /// Jupyter HTTP + kernel WebSocket backend.
@@ -67,6 +72,8 @@ struct JupyterSession {
     kernel_id: String,
     ws: Mutex<Option<ExecWsStream>>,
     run_cancel: Mutex<Option<CancellationToken>>,
+    /// Resolved server-side `.ipynb` path for optional Contents sync (from template at session create).
+    notebook_server_path: Option<String>,
 }
 
 impl JupyterExecutionProvider {
@@ -120,6 +127,16 @@ impl JupyterExecutionProvider {
         req
     }
 
+    async fn kernel_exists(&self, kernel_id: &str) -> Result<bool, ExecutionError> {
+        let url = self.rest_url(&format!("/api/kernels/{kernel_id}"));
+        let resp = self
+            .apply_auth(self.client.get(url))
+            .send()
+            .await
+            .map_err(|e| ExecutionError::Provider(format!("jupyter GET kernel: {e}")))?;
+        Ok(resp.status().is_success())
+    }
+
     fn ws_channels_url(&self, kernel_id: &str) -> Result<String, ExecutionError> {
         let mut base = self.config.base_url.clone();
         if base.starts_with("https://") {
@@ -156,12 +173,24 @@ impl JupyterExecutionProvider {
         id: &SessionId,
         kernel_name: &str,
         kernel_id: &str,
+        notebook_server_path: Option<&str>,
     ) -> SessionCapabilities {
         let active_language = if kernel_name == "ir" {
             Some("r".into())
         } else {
             Some("python".into())
         };
+        let mut ext = BTreeMap::new();
+        ext.insert(
+            "jupyter_kernel_id".into(),
+            Value::String(kernel_id.to_string()),
+        );
+        if let Some(p) = notebook_server_path {
+            ext.insert(
+                "jupyter_notebook_sync_path".into(),
+                Value::String(p.to_string()),
+            );
+        }
         SessionCapabilities {
             session_id: id.clone(),
             schema_version: 1,
@@ -179,7 +208,7 @@ impl JupyterExecutionProvider {
                 jupyter_kernel: self.caps.jupyter_kernel,
                 network_policy: self.caps.network_policy,
             },
-            extensions: Default::default(),
+            extensions: ext,
         }
     }
 
@@ -305,6 +334,27 @@ impl ExecutionProvider for JupyterExecutionProvider {
         self.caps.clone()
     }
 
+    fn session_journal_extensions(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<BTreeMap<String, Value>> {
+        self.sessions.get(session_id).map(|sess| {
+            let s = sess.value();
+            let mut ext = BTreeMap::new();
+            ext.insert(
+                "jupyter_kernel_id".into(),
+                Value::String(s.kernel_id.clone()),
+            );
+            if let Some(ref p) = s.notebook_server_path {
+                ext.insert(
+                    "jupyter_notebook_sync_path".into(),
+                    Value::String(p.clone()),
+                );
+            }
+            ext
+        })
+    }
+
     async fn create_session(
         &self,
         req: SessionCreateRequest,
@@ -316,13 +366,39 @@ impl ExecutionProvider for JupyterExecutionProvider {
             ));
         }
         let kernel_name = self.pick_kernel_name(&req)?;
-        let kernel_id = self.post_kernel(&kernel_name).await?;
         let id = SessionId::new(uuid::Uuid::new_v4().to_string());
-        let caps = self.session_caps(&id, &kernel_name, &kernel_id);
+        let kernel_id = if let Some(ref kid) = req.resume_jupyter_kernel_id {
+            let kid = kid.trim();
+            if kid.is_empty() {
+                return Err(ExecutionError::InvalidArgument(
+                    "resume_jupyter_kernel_id must not be empty".into(),
+                ));
+            }
+            if !self.kernel_exists(kid).await? {
+                return Err(ExecutionError::InvalidArgument(format!(
+                    "resume_jupyter_kernel_id not found on Jupyter server: {kid}"
+                )));
+            }
+            kid.to_string()
+        } else {
+            self.post_kernel(&kernel_name).await?
+        };
+        let notebook_server_path = self
+            .config
+            .notebook_sync_path_template
+            .as_deref()
+            .map(|t| t.replace("{session_id}", &sanitize_session_segment(&id)));
+        let caps = self.session_caps(
+            &id,
+            &kernel_name,
+            &kernel_id,
+            notebook_server_path.as_deref(),
+        );
         let session = Arc::new(JupyterSession {
             kernel_id,
             ws: Mutex::new(None),
             run_cancel: Mutex::new(None),
+            notebook_server_path,
         });
         self.sessions.insert(id.clone(), session);
         Ok(SessionHandle {
@@ -380,12 +456,24 @@ impl ExecutionProvider for JupyterExecutionProvider {
 
         self.ensure_ws(&session).await?;
 
+        let notebook_code = spec.code.clone();
+        let nb_path = session.notebook_server_path.clone();
+        let auth_token = self.config.token.clone();
+
         let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
             let exec_msg_id = uuid::Uuid::new_v4().to_string();
             let session_key = uuid::Uuid::new_v4().to_string();
-            let run_id = uuid::Uuid::new_v4().to_string();
+            let run_id = spec
+                .run_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             let msg = build_execute_request(&exec_msg_id, &session_key, &spec.code);
             let payload = encode_kernel_ws_frame(&msg)?;
+
+            let throttle = spec
+                .run_event_tx
+                .as_ref()
+                .map(|_| Arc::new(RunEventThrottle::new(Duration::from_millis(40))));
 
             let mut ws_guard = session.ws.lock().await;
             let ws = ws_guard
@@ -416,6 +504,8 @@ impl ExecutionProvider for JupyterExecutionProvider {
                 cancel,
                 io,
                 artifact_sink,
+                spec.run_event_tx.clone(),
+                throttle,
             )
             .await
         })
@@ -423,10 +513,33 @@ impl ExecutionProvider for JupyterExecutionProvider {
 
         *session.run_cancel.lock().await = None;
 
-        match result {
+        let out = match result {
             Err(_) => Err(ExecutionError::Timeout { timeout_secs }),
             Ok(inner) => inner,
+        };
+
+        if let (Ok(_), Some(path)) = (&out, nb_path.as_ref()) {
+            let token = auth_token.clone();
+            let r = jupyter_notebook::append_code_cell(
+                &self.client,
+                &self.config.base_url,
+                self.config.token.as_deref(),
+                path,
+                &notebook_code,
+                |mut b: reqwest::RequestBuilder| {
+                    if let Some(ref t) = token {
+                        b = b.header("Authorization", format!("token {t}"));
+                    }
+                    b
+                },
+            )
+            .await;
+            if let Err(e) = r {
+                log::warn!("jupyter notebook sync {}: {}", path, e);
+            }
         }
+
+        out
     }
 
     async fn cancel(&self, session_id: &SessionId) -> Result<(), ExecutionError> {
@@ -733,6 +846,72 @@ fn fold_execute_ws_message(v: &Value, exec_msg_id: &str, ctx: &mut ExecuteFoldCt
     }
 }
 
+fn try_emit_run_event(tx: &Option<tokio::sync::mpsc::Sender<RunEvent>>, ev: RunEvent) {
+    if let Some(t) = tx {
+        let _ = t.try_send(ev);
+    }
+}
+
+fn emit_jupyter_ws_run_events(
+    v: &Value,
+    exec_msg_id: &str,
+    tx: &Option<tokio::sync::mpsc::Sender<RunEvent>>,
+    throttle: &Option<Arc<RunEventThrottle>>,
+) {
+    let parent_id = v["parent_header"]["msg_id"].as_str();
+    if parent_id != Some(exec_msg_id) {
+        return;
+    }
+    let msg_type = v["header"]["msg_type"].as_str().unwrap_or("");
+    match msg_type {
+        "stream" => {
+            if throttle.as_ref().is_some_and(|th| !th.should_emit()) {
+                return;
+            }
+            let name = v["content"]["name"].as_str().unwrap_or("stdout");
+            let text = stream_text(&v["content"]);
+            if text.is_empty() {
+                return;
+            }
+            let chunk: String = text.chars().take(2000).collect();
+            let chunk = if text.chars().nth(2000).is_some() {
+                format!("{chunk}…")
+            } else {
+                chunk
+            };
+            if name == "stderr" {
+                try_emit_run_event(tx, RunEvent::StderrChunk { text: chunk });
+            } else {
+                try_emit_run_event(tx, RunEvent::StdoutChunk { text: chunk });
+            }
+        }
+        "status" => {
+            let state = v["content"]["execution_state"].as_str().unwrap_or("");
+            if state == "busy" {
+                try_emit_run_event(tx, RunEvent::KernelBusy);
+            }
+            if state == "idle" {
+                try_emit_run_event(tx, RunEvent::KernelIdle);
+            }
+        }
+        "display_data" | "execute_result" => {
+            if throttle.as_ref().is_some_and(|th| !th.should_emit()) {
+                return;
+            }
+            if let Some(data) = v["content"].get("data").and_then(|d| d.as_object()) {
+                let mime = data
+                    .keys()
+                    .next()
+                    .cloned()
+                    .unwrap_or_else(|| "?".to_string());
+                try_emit_run_event(tx, RunEvent::DisplayDataSummary { mime });
+            }
+        }
+        _ => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn collect_execute_output(
     ws: &mut ExecWsStream,
     exec_msg_id: &str,
@@ -740,6 +919,8 @@ async fn collect_execute_output(
     cancel: CancellationToken,
     io: JupyterWsIoContext<'_>,
     artifact_sink: JupyterRunArtifactSink,
+    event_tx: Option<tokio::sync::mpsc::Sender<RunEvent>>,
+    throttle: Option<Arc<RunEventThrottle>>,
 ) -> Result<RunResult, ExecutionError> {
     let mut stdout = String::new();
     let mut stderr = String::new();
@@ -779,6 +960,7 @@ async fn collect_execute_output(
                 match frame {
                     Message::Binary(b) => {
                         let v = decode_incoming_ws_bytes(&b)?;
+                        emit_jupyter_ws_run_events(&v, exec_msg_id, &event_tx, &throttle);
                         let mut ctx = ExecuteFoldCtx {
                             stdout: &mut stdout,
                             stderr: &mut stderr,
@@ -807,6 +989,7 @@ async fn collect_execute_output(
                     Message::Pong(_) | Message::Frame(_) => {}
                     Message::Text(t) => {
                         if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                            emit_jupyter_ws_run_events(&v, exec_msg_id, &event_tx, &throttle);
                             let mut ctx = ExecuteFoldCtx {
                                 stdout: &mut stdout,
                                 stderr: &mut stderr,
@@ -842,6 +1025,8 @@ async fn collect_execute_output(
             }
         }
     }
+
+    try_emit_run_event(&event_tx, RunEvent::RunFinished);
 
     let mut result = RunResult::new(stdout, stderr, exit_code);
     result.attachments = attachments;

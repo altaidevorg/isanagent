@@ -13,9 +13,10 @@ use tokio::sync::mpsc;
 
 use crate::bus::BusMessage;
 use crate::bus::TelemetryEvent;
+use crate::channels::terminal::build_execution_stream_notice;
 use crate::execution::{
-    sanitize_session_segment, CwdPolicy, ExecutionError, ExecutionHarness, RunSpec,
-    SessionCreateRequest, SessionId,
+    sanitize_session_segment, write_run_journal, CwdPolicy, ExecutionError, ExecutionHarness,
+    RunEvent, RunJournalParams, RunSpec, SessionCreateRequest, SessionId,
 };
 use crate::tool_runtime::current_tool_exec_ctx;
 use crate::traits::Tool;
@@ -124,7 +125,7 @@ impl Tool for ExecutionSessionCreateTool {
     }
 
     fn description(&self) -> &str {
-        "Create an execution session (requires [harness.execution] enabled). Provider is [harness.execution] default_provider: local runs under the workspace sandbox; jupyter uses a configured Jupyter Server kernel; ssh opens one SSH session to a configured host (reused until execution_session_close). Returns session_id, session capabilities, and a short provider capability summary. Use execution_run to execute code; execution_session_close when done. Jupyter may write binary display_data (PNG, JPEG, large CSV/JSON) under the sandbox `.execution_artifacts/{session_id}/{run_id}/` and list them in RunResult.attachments."
+        "Create an execution session (requires [harness.execution] enabled). Provider is [harness.execution] default_provider: local runs under the workspace sandbox; jupyter uses a Jupyter Server kernel (new or `resume_jupyter_kernel_id`); ssh opens one SSH session to a configured host (reused until execution_session_close). Returns session_id, session capabilities (Jupyter extensions include `jupyter_kernel_id` and optional `jupyter_notebook_sync_path`), and a short provider capability summary. Use execution_run to execute code; execution_session_close when done. Jupyter may write binary display_data under the sandbox `.execution_artifacts/{session_id}/{run_id}/` and list them in RunResult.attachments."
     }
 
     fn parameters(&self) -> Value {
@@ -135,6 +136,10 @@ impl Tool for ExecutionSessionCreateTool {
                 "language": {
                     "type": "string",
                     "description": "Optional language hint. Local: python, py, shell, sh, bash. Jupyter: python, py, r, R (ir kernel). SSH: python, py, shell, sh, bash (remote exec with code on stdin)."
+                },
+                "resume_jupyter_kernel_id": {
+                    "type": "string",
+                    "description": "Jupyter only: reuse an existing kernel id from `session_capabilities.extensions.jupyter_kernel_id` (or a prior server listing). Fails if the kernel no longer exists."
                 }
             }
         })
@@ -150,6 +155,11 @@ impl Tool for ExecutionSessionCreateTool {
                 .get("language")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
+            resume_jupyter_kernel_id: args
+                .get("resume_jupyter_kernel_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
         };
         let handle = self
             .harness
@@ -181,7 +191,7 @@ impl Tool for ExecutionRunTool {
     }
 
     fn description(&self) -> &str {
-        "Run code in an execution_session_create session. Args: session_id, code, timeout_secs (optional), cwd_mode (optional session_default|sandbox_relative), cwd_relative when sandbox_relative. stdout/stderr may be truncated per [harness.execution] limits. Jupyter: binary plots and large CSV/JSON are saved under `.execution_artifacts/{session_id}/<run>/` and returned in `attachments` with sandbox-relative paths; use execution_artifact_list to browse. A line is appended to workspace `.system_generated/execution_runs.jsonl` per run (metadata only, no code)."
+        "Run code in an execution_session_create session. Args: session_id, code, timeout_secs (optional), cwd_mode (optional session_default|sandbox_relative), cwd_relative when sandbox_relative. stdout/stderr may be truncated per [harness.execution] limits. Jupyter: live stream events are emitted on the bus for the terminal UI; binary plots and large CSV/JSON are saved under `.execution_artifacts/{session_id}/<run>/` and returned in `attachments`. Each run writes a journal under workspace `.system_generated/execution_history/{provider}/{session_id}/{run_id}/` (`run.json` + `source.txt`). A metadata line is appended to `.system_generated/execution_runs.jsonl` (no code)."
     }
 
     fn parameters(&self) -> Value {
@@ -210,16 +220,48 @@ impl Tool for ExecutionRunTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(60);
         let cwd = parse_cwd(&args)?;
-        let mut spec = RunSpec::new(code, timeout_secs);
-        spec.cwd = cwd;
+        let run_id = uuid::Uuid::new_v4().to_string();
         let started = Instant::now();
+        let started_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+        let prov = self.harness.provider().provider_id();
+        let (event_tx, event_rx) = if prov == "jupyter" {
+            let (tx, rx) = mpsc::channel::<RunEvent>(128);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        let (chat_id, channel) = current_tool_exec_ctx()
+            .map(|c| (c.chat_id.clone(), c.channel.clone()))
+            .unwrap_or_else(|| (String::new(), String::new()));
+
+        if let Some(mut rx) = event_rx {
+            let ob = self.outbound_tx.clone();
+            let sid_s = sid.to_string();
+            let rid = run_id.clone();
+            let cid = chat_id.clone();
+            let ch = channel.clone();
+            tokio::spawn(async move {
+                while let Some(ev) = rx.recv().await {
+                    let payload = serde_json::to_string(&ev).unwrap_or_default();
+                    let msg = build_execution_stream_notice(&cid, &ch, &sid_s, &rid, &payload);
+                    let _ = ob.send(BusMessage::Outbound(msg)).await;
+                }
+            });
+        }
+
+        let mut spec = RunSpec::new(code.clone(), timeout_secs);
+        spec.cwd = cwd;
+        spec.run_id = Some(run_id.clone());
+        spec.run_event_tx = event_tx;
+
         let result = self
             .harness
             .provider()
             .run(&sid, spec)
             .await
             .map_err(exec_err)?;
-        let prov = self.harness.provider().provider_id();
         let duration_ms = started.elapsed().as_millis() as u64;
         let artifact_count = result.attachments.len();
         info!(
@@ -234,10 +276,35 @@ impl Tool for ExecutionRunTool {
         );
 
         let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        let (chat_id, channel) = current_tool_exec_ctx()
-            .map(|c| (c.chat_id, c.channel))
-            .unwrap_or_else(|| (String::new(), String::new()));
         let git_head = best_effort_git_head(self.harness.workspace_dir());
+
+        let journal_ext = self.harness.provider().session_journal_extensions(&sid);
+        let jupyter_kernel_id = journal_ext
+            .as_ref()
+            .and_then(|m| m.get("jupyter_kernel_id"))
+            .and_then(|v| v.as_str());
+        let jupyter_notebook_path = journal_ext
+            .as_ref()
+            .and_then(|m| m.get("jupyter_notebook_sync_path"))
+            .and_then(|v| v.as_str());
+
+        if let Err(e) = write_run_journal(RunJournalParams {
+            workspace_dir: self.harness.workspace_dir(),
+            provider_id: prov,
+            session_id: &sid,
+            run_id: &run_id,
+            code: &code,
+            result: &result,
+            jupyter_kernel_id,
+            jupyter_notebook_path,
+            started_rfc3339: &started_ts,
+            finished_rfc3339: &ts,
+            duration_ms,
+        })
+        .await
+        {
+            log::warn!("execution run journal: {e}");
+        }
 
         let manifest = ExecutionManifestLine {
             ts: &ts,

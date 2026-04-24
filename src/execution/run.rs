@@ -1,9 +1,11 @@
 //! Run requests and results (`RunSpec`, `RunResult`, session open/close payloads).
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
 use super::capabilities::SessionCapabilities;
 use super::ids::SessionId;
+use super::run_events::RunEvent;
 
 /// Request to open a session (Phase 0 contract; executor validates in later phases).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -12,6 +14,10 @@ pub struct SessionCreateRequest {
     pub label: Option<String>,
     /// Hint such as `python`, `rust`, `bash` (provider interprets).
     pub language: Option<String>,
+    /// **Jupyter only:** attach to an existing kernel id (from a prior session or `session_capabilities`).
+    /// When set, no new `POST /api/kernels` is performed; the kernel must still exist on the server.
+    #[serde(default)]
+    pub resume_jupyter_kernel_id: Option<String>,
 }
 
 /// Handle returned after a session is created.
@@ -33,14 +39,18 @@ pub enum CwdPolicy {
 }
 
 /// Single execution unit (code cell, script chunk, etc.).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct RunSpec {
     /// Source text to evaluate or execute.
     pub code: String,
     /// Wall-clock limit for this run (seconds). Executor may clamp to global max.
     pub timeout_secs: u64,
-    #[serde(default)]
     pub cwd: CwdPolicy,
+    /// Stable id for this run (artifacts, run journal). When `None`, Jupyter generates one internally
+    /// (other providers may ignore).
+    pub run_id: Option<String>,
+    /// Live events (Jupyter streams). Not serialized.
+    pub run_event_tx: Option<mpsc::Sender<RunEvent>>,
 }
 
 impl RunSpec {
@@ -49,6 +59,8 @@ impl RunSpec {
             code: code.into(),
             timeout_secs,
             cwd: CwdPolicy::default(),
+            run_id: None,
+            run_event_tx: None,
         }
     }
 }

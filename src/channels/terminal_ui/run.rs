@@ -22,7 +22,10 @@ use tokio::sync::mpsc::Sender;
 use crate::bus::{BusMessage, InboundMessage, OutboundMessage};
 use crate::channels::terminal_ui::attachments::parse_terminal_attachments;
 use crate::channels::terminal_ui::markdown;
-use crate::channels::terminal_ui::protocol::{ISANAGENT_AGENT_THOUGHT, ISANAGENT_TERMINAL_ERROR};
+use crate::channels::terminal_ui::protocol::{
+    ISANAGENT_AGENT_THOUGHT, ISANAGENT_EXECUTION_STREAM, ISANAGENT_TERMINAL_ERROR,
+    METADATA_EXECUTION_RUN_ID, METADATA_EXECUTION_SESSION_ID,
+};
 use crate::channels::terminal_ui::{
     init_from_env, uses_ansi_color, App, Cell, Theme, ToastKind, ToolNoticePhase,
 };
@@ -297,18 +300,24 @@ fn flatten_cells_to_lines(cells: &[Cell], inner_width: usize) -> Vec<Line<'stati
     lines
 }
 
-fn layout_chunks(area: Rect) -> [Rect; 4] {
+fn layout_chunks(area: Rect, exec_panel_h: u16) -> [Rect; 5] {
+    let exec_constraint = if exec_panel_h > 0 {
+        Constraint::Length(exec_panel_h)
+    } else {
+        Constraint::Length(0)
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(0)
         .constraints([
             Constraint::Length(1),
             Constraint::Min(4),
+            exec_constraint,
             Constraint::Length(1),
             Constraint::Length(3),
         ])
         .split(area);
-    [chunks[0], chunks[1], chunks[2], chunks[3]]
+    [chunks[0], chunks[1], chunks[2], chunks[3], chunks[4]]
 }
 
 fn chunks_line_width(spans: &[Span<'static>]) -> usize {
@@ -503,6 +512,11 @@ fn outbound_clears_thinking(msg: &OutboundMessage) -> bool {
         .get(ISANAGENT_TOOL_NOTIFY)
         .and_then(|v| v.as_bool())
         == Some(true);
+    let is_exec = msg
+        .metadata
+        .get(ISANAGENT_EXECUTION_STREAM)
+        .and_then(|v| v.as_bool())
+        == Some(true);
     let is_err = msg
         .metadata
         .get(ISANAGENT_TERMINAL_ERROR)
@@ -513,7 +527,40 @@ fn outbound_clears_thinking(msg: &OutboundMessage) -> bool {
         .get(METADATA_CLARIFICATION)
         .and_then(|v| v.as_bool())
         == Some(true);
-    is_err || is_clar || (!is_thought && !is_tool)
+    is_err || is_clar || (!is_thought && !is_tool && !is_exec)
+}
+
+fn append_execution_stream_panel(app: &mut App, msg: &OutboundMessage) {
+    let sid = msg
+        .metadata
+        .get(METADATA_EXECUTION_SESSION_ID)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let rid = msg
+        .metadata
+        .get(METADATA_EXECUTION_RUN_ID)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let label = (sid, rid);
+    if app.execution_stream_label != Some(label.clone()) {
+        app.execution_stream_recent.clear();
+        app.execution_stream_label = Some(label);
+    }
+    app.execution_stream_recent.push_str(msg.content.trim_end());
+    app.execution_stream_recent.push('\n');
+    const MAX: usize = 24_000;
+    if app.execution_stream_recent.len() > MAX {
+        let drop = app.execution_stream_recent.len() - MAX;
+        let mut cut = drop;
+        while cut < app.execution_stream_recent.len()
+            && !app.execution_stream_recent.is_char_boundary(cut)
+        {
+            cut += 1;
+        }
+        app.execution_stream_recent.drain(..cut);
+    }
 }
 
 fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
@@ -590,6 +637,15 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         app.clear_expired_toast();
 
         while let Ok(msg) = outbound_rx.try_recv() {
+            if msg
+                .metadata
+                .get(ISANAGENT_EXECUTION_STREAM)
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
+                append_execution_stream_panel(&mut app, &msg);
+                continue;
+            }
             if outbound_clears_thinking(&msg) {
                 app.thinking = false;
             }
@@ -606,7 +662,12 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 
         terminal.draw(|f| {
             let area = f.area();
-            let ch = layout_chunks(area);
+            let exec_h = if app.execution_stream_recent.is_empty() {
+                0u16
+            } else {
+                (area.height.saturating_mul(18) / 100).clamp(6, 18)
+            };
+            let ch = layout_chunks(area, exec_h);
 
             let title_w = ch[0].width as usize;
             let title = Paragraph::new(build_title_line(title_w.max(1)));
@@ -618,7 +679,17 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             f.render_widget(transcript_widget, ch[1]);
             app.last_transcript_rect = Some(ch[1]);
 
-            let status_w_px = ch[2].width as usize;
+            if exec_h > 0 {
+                let exec_block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(Span::styled(" execution (jupyter) ", Theme::tool_call()))
+                    .border_style(Theme::dim());
+                let exec_para = Paragraph::new(Text::raw(app.execution_stream_recent.as_str()))
+                    .block(exec_block);
+                f.render_widget(exec_para, ch[2]);
+            }
+
+            let status_w_px = ch[3].width as usize;
             let status_line = build_status_line(
                 status_w_px.max(1),
                 status_model.as_str(),
@@ -628,7 +699,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 app.active_toast(),
             );
             let status_w = Paragraph::new(status_line);
-            f.render_widget(status_w, ch[2]);
+            f.render_widget(status_w, ch[3]);
 
             let input_block = Block::default()
                 .borders(Borders::ALL)
@@ -639,9 +710,9 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 Span::styled(app.input.as_str(), Theme::text()),
             ]))
             .block(input_block);
-            f.render_widget(input_para, ch[3]);
+            f.render_widget(input_para, ch[4]);
 
-            let inner_area = ch[3].inner(Margin::new(1, 1));
+            let inner_area = ch[4].inner(Margin::new(1, 1));
             let prefix_w = crate::channels::terminal_ui::display_width("> ")
                 + crate::channels::terminal_ui::display_width(
                     &app.input[..app.cursor.min(app.input.len())],

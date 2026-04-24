@@ -91,6 +91,9 @@ pub struct App {
     pub last_transcript_rect: Option<Rect>,
     /// Short-lived message shown in the status strip (not stored in the transcript).
     pub toast: Option<Toast>,
+    /// Latest `execution_run` stream (Jupyter); shown in a dedicated strip below the transcript.
+    pub execution_stream_recent: String,
+    pub execution_stream_label: Option<(String, String)>,
 }
 
 impl Default for App {
@@ -117,6 +120,8 @@ impl App {
             thinking: false,
             last_transcript_rect: None,
             toast: None,
+            execution_stream_recent: String::new(),
+            execution_stream_label: None,
         }
     }
 
