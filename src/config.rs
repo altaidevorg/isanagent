@@ -1,9 +1,14 @@
 use serde::{Deserialize, Serialize};
 
-/// Local stdin/stdout chat. When `enable` is omitted, defaults to `true` (legacy behavior).
+/// Local stdin/stdout chat. When `enabled` is omitted, defaults to `true`.
+///
+/// `max_iterations` / `max_tool_output_chars` here are used only when the root-level keys are
+/// unset (see [`AppConfig::resolved_max_iterations`]) — prefer root keys above `[terminal]` in TOML.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct TerminalConfig {
-    pub enable: Option<bool>,
+    pub enabled: Option<bool>,
+    pub max_iterations: Option<usize>,
+    pub max_tool_output_chars: Option<usize>,
 }
 
 /// OpenSSH-style remote exec over TCP (`default_provider = "ssh"`).
@@ -36,6 +41,9 @@ pub struct JupyterExecutionConfig {
     pub token: Option<String>,
     /// Kernel spec name for `POST /api/kernels` (default `python3`).
     pub kernel_name: Option<String>,
+    /// Optional server-side notebook path template for Contents API sync (e.g. `isanagent/{session_id}.ipynb`).
+    /// `{session_id}` is replaced with the **sanitized** isanagent session id. Each `execution_run` appends a code cell.
+    pub notebook_sync_path_template: Option<String>,
 }
 
 /// Code execution harness (`execution_*` tools). Disabled unless `[harness.execution] enabled = true`.
@@ -47,14 +55,25 @@ pub struct ExecutionHarnessConfig {
     pub default_provider: Option<String>,
     /// Max combined stdout+stderr bytes per run (default 262_144).
     pub max_output_bytes: Option<usize>,
-    /// Upper bound on per-run `timeout_secs` (default 300, clamped 1–86400).
+    /// Upper bound on per-run `timeout_secs` (default 3600, clamped 1–86400).
     pub max_wall_secs: Option<u64>,
+    /// Default `timeout_secs` when `execution_run` / `execution_run_background` omit it (default 600 when unset, clamped to `max_wall_secs`).
+    pub default_execution_timeout_secs: Option<u64>,
     /// Max concurrent sessions (default 32, clamped 1–256).
     pub max_sessions: Option<usize>,
     /// If set and non-empty, only these provider ids may be constructed (e.g. `["local"]`).
     pub allowed_providers: Option<Vec<String>>,
     /// Interpreter for `language: python` (default `python`) — local provider and `execution_env_info`.
     pub python_executable: Option<String>,
+    /// Local Python only: **`repl`** (default) keeps one interpreter per session so variables survive
+    /// across `execution_run` calls; **`subprocess`** spawns a fresh `python -u -` per run (legacy).
+    pub local_python_mode: Option<String>,
+    /// Max bytes per execution artifact file (default 4MiB, clamped 64KiB–64MiB).
+    pub artifact_max_file_bytes: Option<usize>,
+    /// Max total bytes for all artifacts in one `execution_run` (default 32MiB).
+    pub artifact_max_total_bytes_per_run: Option<usize>,
+    /// Max artifact files per run (default 64, clamped 1–256).
+    pub artifact_max_files_per_run: Option<usize>,
     /// Required when `default_provider = "jupyter"`.
     pub jupyter: Option<JupyterExecutionConfig>,
     /// Required when `default_provider = "ssh"`.
@@ -106,6 +125,8 @@ pub struct AppConfig {
     pub email: Option<EmailConfig>,
     pub terminal: Option<TerminalConfig>,
     pub max_iterations: Option<usize>,
+    /// When true (default), detect repeated identical tool calls and inject a corrective user message.
+    pub doom_loop_enabled: Option<bool>,
     pub max_tool_output_chars: Option<usize>,
     /// Max characters returned by `web_search` / `web_fetch` (default 50_000). Separate from
     /// `max_tool_output_chars`, which caps tool output when passed to the model.
@@ -153,12 +174,24 @@ fn jina_api_key_looks_like_placeholder(s: &str) -> bool {
 }
 
 impl AppConfig {
-    /// Whether the stdin/stdout terminal channel is active (`[terminal].enable`, default `true`).
+    /// Whether the stdin/stdout terminal channel is active (`[terminal].enabled`, default `true`).
     pub fn terminal_enabled(&self) -> bool {
         self.terminal
             .as_ref()
-            .and_then(|t| t.enable)
+            .and_then(|t| t.enabled)
             .unwrap_or(true)
+    }
+
+    /// Root `max_iterations`, or `[terminal].max_iterations` when root is unset (common TOML mistake).
+    pub fn resolved_max_iterations(&self) -> Option<usize> {
+        self.max_iterations
+            .or_else(|| self.terminal.as_ref().and_then(|t| t.max_iterations))
+    }
+
+    /// Root `max_tool_output_chars`, or `[terminal].max_tool_output_chars` when root is unset.
+    pub fn resolved_max_tool_output_chars(&self) -> Option<usize> {
+        self.max_tool_output_chars
+            .or_else(|| self.terminal.as_ref().and_then(|t| t.max_tool_output_chars))
     }
 
     /// At least one inbound channel other than terminal (API, Slack, or Email).
@@ -206,6 +239,11 @@ impl AppConfig {
         self.search_text_ripgrep_timeout_secs
             .unwrap_or(DEFAULT)
             .clamp(MIN, MAX)
+    }
+
+    /// ml-intern-style doom loop detection before each LLM call (default: enabled).
+    pub fn doom_loop_enabled(&self) -> bool {
+        self.doom_loop_enabled.unwrap_or(true)
     }
 
     /// When true, `git_worktree` is registered (see `[harness.git_worktree]` in config).
@@ -312,7 +350,7 @@ impl AppConfig {
     }
 
     pub fn execution_max_wall_secs(&self) -> u64 {
-        const DEFAULT: u64 = 300;
+        const DEFAULT: u64 = 3600;
         const MIN: u64 = 1;
         const MAX: u64 = 86400;
         self.harness
@@ -321,6 +359,19 @@ impl AppConfig {
             .and_then(|e| e.max_wall_secs)
             .unwrap_or(DEFAULT)
             .clamp(MIN, MAX)
+    }
+
+    /// Default per-run wall clock when the model omits `timeout_secs` (1..=max_wall_secs).
+    pub fn execution_default_run_timeout_secs(&self) -> u64 {
+        let cap = self.execution_max_wall_secs();
+        const FALLBACK: u64 = 600;
+        let v = self
+            .harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.default_execution_timeout_secs)
+            .unwrap_or(FALLBACK);
+        v.clamp(1, cap)
     }
 
     pub fn execution_max_sessions(&self) -> usize {
@@ -343,6 +394,71 @@ impl AppConfig {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "python".to_string())
+    }
+
+    /// Local provider Python: persistent REPL per session (default) vs one subprocess per run.
+    pub fn execution_local_python_repl_enabled(&self) -> bool {
+        let raw = self
+            .harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.local_python_mode.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        match raw {
+            None => true,
+            Some(s) => {
+                let lower = s.to_ascii_lowercase();
+                !matches!(
+                    lower.as_str(),
+                    "subprocess"
+                        | "fresh"
+                        | "stateless"
+                        | "one_shot"
+                        | "oneshot"
+                        | "no"
+                        | "false"
+                        | "0"
+                )
+            }
+        }
+    }
+
+    /// Caps for Phase 6 execution artifacts (Jupyter `display_data` materialization).
+    pub fn execution_artifact_max_file_bytes(&self) -> usize {
+        const DEFAULT: usize = 4 * 1024 * 1024;
+        const MIN: usize = 64 * 1024;
+        const MAX: usize = 64 * 1024 * 1024;
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.artifact_max_file_bytes)
+            .unwrap_or(DEFAULT)
+            .clamp(MIN, MAX)
+    }
+
+    pub fn execution_artifact_max_total_bytes_per_run(&self) -> usize {
+        const DEFAULT: usize = 32 * 1024 * 1024;
+        const MIN: usize = 256 * 1024;
+        const MAX: usize = 128 * 1024 * 1024;
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.artifact_max_total_bytes_per_run)
+            .unwrap_or(DEFAULT)
+            .clamp(MIN, MAX)
+    }
+
+    pub fn execution_artifact_max_files_per_run(&self) -> usize {
+        const DEFAULT: usize = 64;
+        const MIN: usize = 1;
+        const MAX: usize = 256;
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.artifact_max_files_per_run)
+            .unwrap_or(DEFAULT)
+            .clamp(MIN, MAX)
     }
 
     /// When `allowed_providers` is missing or empty, any implemented provider id is allowed.
@@ -398,6 +514,16 @@ impl AppConfig {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "python3".to_string())
+    }
+
+    pub fn execution_jupyter_notebook_sync_path_template(&self) -> Option<String> {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.jupyter.as_ref())
+            .and_then(|j| j.notebook_sync_path_template.as_ref())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
     }
 
     pub fn execution_ssh_host(&self) -> Option<String> {
@@ -569,10 +695,87 @@ python_executable = "python3"
         let c: AppConfig = toml::from_str(s).expect("parse");
         assert!(c.execution_harness_enabled());
         assert_eq!(c.execution_max_wall_secs(), 90);
+        assert_eq!(c.execution_default_run_timeout_secs(), 90);
         assert_eq!(c.execution_max_output_bytes(), 8192);
         assert!(c.execution_provider_allowed("local"));
         assert!(!c.execution_provider_allowed("jupyter"));
         assert_eq!(c.execution_python_executable(), "python3");
+    }
+
+    #[test]
+    fn harness_execution_defaults_when_only_enabled() {
+        let s = r#"
+[harness.execution]
+enabled = true
+"#;
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        assert_eq!(c.execution_max_wall_secs(), 3600);
+        assert_eq!(c.execution_default_run_timeout_secs(), 600);
+    }
+
+    #[test]
+    fn harness_execution_default_run_timeout_respects_max_wall() {
+        let s = r#"
+[harness.execution]
+enabled = true
+max_wall_secs = 120
+default_execution_timeout_secs = 9999
+"#;
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        assert_eq!(c.execution_default_run_timeout_secs(), 120);
+        let s2 = r#"
+[harness.execution]
+enabled = true
+max_wall_secs = 600
+default_execution_timeout_secs = 45
+"#;
+        let c2: AppConfig = toml::from_str(s2).expect("parse");
+        assert_eq!(c2.execution_default_run_timeout_secs(), 45);
+    }
+
+    #[test]
+    fn harness_execution_artifact_limits_toml() {
+        let s = r#"
+[harness.execution]
+enabled = true
+artifact_max_file_bytes = 100000
+artifact_max_total_bytes_per_run = 500000
+artifact_max_files_per_run = 10
+"#;
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        assert_eq!(c.execution_artifact_max_file_bytes(), 100_000);
+        assert_eq!(c.execution_artifact_max_total_bytes_per_run(), 500_000);
+        assert_eq!(c.execution_artifact_max_files_per_run(), 10);
+    }
+
+    #[test]
+    fn doom_loop_enabled_toml() {
+        let s = r#"doom_loop_enabled = false"#;
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        assert!(!c.doom_loop_enabled());
+        assert!(AppConfig::default().doom_loop_enabled());
+    }
+
+    #[test]
+    fn resolved_max_iterations_falls_back_to_terminal_table() {
+        let s = r#"
+[terminal]
+enabled = true
+max_iterations = 999
+"#;
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        assert_eq!(c.resolved_max_iterations(), Some(999));
+    }
+
+    #[test]
+    fn resolved_max_iterations_root_wins_over_terminal() {
+        let s = r#"
+max_iterations = 12
+[terminal]
+max_iterations = 999
+"#;
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        assert_eq!(c.resolved_max_iterations(), Some(12));
     }
 
     #[test]
@@ -587,6 +790,7 @@ allowed_providers = ["jupyter", "local"]
 base_url = "http://127.0.0.1:8888"
 token = "testtoken"
 kernel_name = "python3"
+notebook_sync_path_template = "scratch/{session_id}.ipynb"
 "#;
         let c: AppConfig = toml::from_str(s).expect("parse");
         assert_eq!(c.execution_default_provider(), "jupyter");
@@ -597,6 +801,10 @@ kernel_name = "python3"
         );
         assert_eq!(c.execution_jupyter_token().as_deref(), Some("testtoken"));
         assert_eq!(c.execution_jupyter_kernel_name(), "python3");
+        assert_eq!(
+            c.execution_jupyter_notebook_sync_path_template().as_deref(),
+            Some("scratch/{session_id}.ipynb")
+        );
     }
 
     #[test]

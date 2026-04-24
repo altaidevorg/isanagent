@@ -356,6 +356,66 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             ),
         )
         .with_chat_id(chat_id),
+        TelemetryEvent::ExecutionRunFinished {
+            chat_id,
+            channel,
+            provider_id,
+            session_id,
+            exit_code,
+            duration_ms,
+            stdout_len,
+            stderr_len,
+            artifact_count,
+            git_head,
+            description,
+        } => LogEvent::info(
+            "Telemetry",
+            &format!(
+                "ExecutionRunFinished channel={} provider={} session={} exit={:?} ms={} out={}/{} artifacts={} git_head={} desc={}",
+                channel,
+                provider_id,
+                session_id,
+                exit_code,
+                duration_ms,
+                stdout_len,
+                stderr_len,
+                artifact_count,
+                git_head.as_deref().unwrap_or("-"),
+                description.as_deref().unwrap_or("-")
+            ),
+        )
+        .with_chat_id(chat_id),
+        TelemetryEvent::ExecutionJobFinished {
+            chat_id,
+            channel,
+            job_id,
+            session_id,
+            provider_id,
+            status,
+            duration_ms,
+            exit_code,
+            stdout_len,
+            stderr_len,
+            artifact_count,
+            description,
+        } => LogEvent::info(
+            "Telemetry",
+            &format!(
+                "ExecutionJobFinished channel={} job={} session={} provider={} status={} exit={:?} ms={} out={}/{} artifacts={} desc={}",
+                channel,
+                job_id,
+                session_id,
+                provider_id,
+                status,
+                exit_code,
+                duration_ms,
+                stdout_len,
+                stderr_len,
+                artifact_count,
+                description.as_deref().unwrap_or("-")
+            ),
+        )
+        .with_chat_id(chat_id),
     }
 }
 

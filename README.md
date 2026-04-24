@@ -78,16 +78,30 @@ my_agent/
     └── skills/
         ├── cron/
         │   └── SKILL.md
-        └── skill-creator/
-            └── SKILL.md
+        ├── skill-creator/
+        │   └── SKILL.md
+        ├── execution-research/
+        │   └── SKILL.md
+        ├── jupyter-heavy-output/
+        │   └── SKILL.md
+        ├── scientific-python-debugging/
+        │   └── SKILL.md
+        └── synthetic-dataset-with-afterimage/
+            ├── SKILL.md
+            ├── reference.md
+            └── examples/
+                └── …
 ```
 
 The generated `config.toml` starts with these defaults:
 ```toml
 restrict_to_workspace = true
-max_iterations = 50
+max_iterations = 999
 max_tool_output_chars = 10000
 # max_web_tool_output_chars = 50000  # optional; caps web_search / web_fetch (default 50000)
+
+[terminal]
+enabled = true
 
 [provider]
 model_name = "gemini-3-flash-preview"
@@ -95,7 +109,7 @@ api_key_env = "GEMINI_API_KEY"
 base_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 
 [slack]
-enabled = true
+enabled = false
 mode = "webhook"
 bot_token = "<changethis>"
 signing_secret = "<changethis>"
@@ -135,10 +149,15 @@ short_term_threshold_mins = 15
 long_term_interval_mins = 360
 long_term_threshold_summaries = 5
 max_recent_summaries = 5
+
+[harness.git_worktree]
+enabled = true
+
+[harness.subagents]
+enabled = true
 ```
 
-Update the `<changethis>` placeholders, ensure `GEMINI_API_KEY` is set, and disable any channels you are not ready to use yet before running the agent.
-For example, if you are not using Slack on first boot, set `[slack].enabled = false` in `config.toml`.
+Update the `<changethis>` placeholders and ensure `GEMINI_API_KEY` is set. Slack ships **disabled** in the onboarding template; set `[slack].enabled = true` when you are ready, and fill in tokens. Terminal chat uses **`[terminal] enabled`** (not `enable`).
 
 ### 4. Run the Agent
 ```bash

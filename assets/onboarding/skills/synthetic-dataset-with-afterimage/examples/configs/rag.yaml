@@ -1,0 +1,59 @@
+# RAG-grounded generation
+# Generates conversations grounded in your documents with diverse personas
+#
+# Set your API key first:
+#   export GEMINI_API_KEY=your-key
+#
+# Run:
+#   afterimage generate -c examples/configs/rag.yaml
+
+generation:
+  # Number of conversations to generate
+  num_dialogs: 50
+  # Up to 2 turns per conversation (question-answer-followup-answer)
+  max_turns: 2
+  # Limit concurrent API calls to avoid rate limits
+  max_concurrency: 3
+
+model:
+  # LLM provider: gemini, openai, deepseek, or local
+  provider: gemini
+  # Model identifier (provider-specific)
+  model_name: gemini-2.0-flash
+  # Environment variable holding the API key
+  api_key_env: GEMINI_API_KEY
+
+respondent:
+  # System prompt for the assistant; it will also receive document context
+  system_prompt: |
+    You are an expert assistant. Answer based on the provided context.
+
+documents:
+  # Document provider type: directory, file, jsonl, memory, qdrant
+  provider: directory
+  # Path to your documents (resolved relative to this config file)
+  path: ./my_docs
+
+context:
+  # Enable context-grounded instruction generation
+  enabled: true
+  # Number of documents sampled per instruction generation round
+  num_random_contexts: 2
+  # Instructions generated per round
+  n_instructions: 3
+
+personas:
+  # Enable persona-based generation for more diverse questions
+  enabled: true
+  # null = auto-detect appropriate persona tree depth
+  # n_iterations: null
+
+quality:
+  # Retry low-quality conversations automatically
+  auto_improve: true
+
+output:
+  # Where to save the generated dataset
+  path: ./output/rag_dataset.jsonl
+  # Storage format: jsonl or sql
+  storage: jsonl

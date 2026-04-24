@@ -4,7 +4,7 @@ use crate::config::AppConfig;
 use crate::logging::LoggerHandle;
 use async_trait::async_trait;
 use log::error;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
@@ -13,6 +13,13 @@ use tokio::sync::mpsc::Sender;
 
 const ISANAGENT_TOOL_NOTIFY: &str = "isanagent_tool_notify";
 const ISANAGENT_TOOL_PHASE: &str = "isanagent_tool_phase";
+
+use crate::channels::terminal_ui::protocol::{
+    ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_STREAM, METADATA_EXECUTION_DESCRIPTION,
+    METADATA_EXECUTION_JOB_ID, METADATA_EXECUTION_JOB_STATUS, METADATA_EXECUTION_RUN_ID,
+    METADATA_EXECUTION_SESSION_ID, METADATA_TOOL_CALL_PREVIEW, METADATA_TOOL_NAME,
+    METADATA_TOOL_RESULT_PREVIEW,
+};
 
 /// When true, `main` skips the large colored stdout banner (Ratatui alternate screen owns the TTY).
 pub fn terminal_startup_suppresses_plain_banner(cfg: &AppConfig) -> bool {
@@ -35,10 +42,32 @@ fn tool_result_looks_like_failure(result: &str) -> bool {
     t.starts_with("Error:") || t.starts_with("error:")
 }
 
-fn summarize_tool_result_for_terminal(result: &str) -> String {
+fn summarize_message_tool_result(t: &str) -> Option<String> {
+    const PREFIX: &str = "Message sent to ";
+    let rest = t.strip_prefix(PREFIX)?;
+    let (channel, chat_id) = rest.split_once(':')?;
+    let chat_id = chat_id.trim();
+    if channel.eq_ignore_ascii_case("terminal") && uuid::Uuid::parse_str(chat_id).is_ok() {
+        return Some("Message delivered".to_string());
+    }
+    let id_short = if chat_id.chars().count() > 12 {
+        let head: String = chat_id.chars().take(8).collect();
+        format!("{head}…")
+    } else {
+        chat_id.to_string()
+    };
+    Some(format!("Delivered ({channel}: {id_short})"))
+}
+
+fn summarize_tool_result_for_terminal(tool_name: &str, result: &str) -> String {
     let t = result.trim();
     if t.is_empty() {
         return "(empty output)".to_string();
+    }
+    if tool_name == "message" {
+        if let Some(s) = summarize_message_tool_result(t) {
+            return s;
+        }
     }
     if t.starts_with("Error:") {
         let line = t.lines().next().unwrap_or(t);
@@ -50,21 +79,126 @@ fn summarize_tool_result_for_terminal(result: &str) -> String {
     format!("{} chars", t.chars().count())
 }
 
+fn tool_args_preview_message(args: &str) -> String {
+    let v: Value = match serde_json::from_str(args) {
+        Ok(v) => v,
+        Err(_) => return truncate_display(args, 220),
+    };
+    v.get("content")
+        .and_then(|x| x.as_str())
+        .map(|c| {
+            let t = c.trim();
+            if t.is_empty() {
+                "(empty)".to_string()
+            } else {
+                truncate_display(t, 80)
+            }
+        })
+        .unwrap_or_else(|| truncate_display(args, 220))
+}
+
+fn tool_args_preview_execution(args: &str) -> String {
+    let v: Value = match serde_json::from_str(args) {
+        Ok(v) => v,
+        Err(_) => return truncate_display(args, 220),
+    };
+    if let Some(d) = v
+        .get("description")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return truncate_display(d, 120);
+    }
+    if let Some(t) = v.get("timeout_secs").and_then(|x| x.as_u64()) {
+        return format!("timeout {t}s");
+    }
+    if let Some(t) = v.get("timeout_secs").and_then(|x| x.as_i64()) {
+        return format!("timeout {t}s");
+    }
+    if let Some(c) = v.get("code").and_then(|x| x.as_str()) {
+        return truncate_display(c.trim(), 80);
+    }
+    truncate_display(args, 220)
+}
+
+fn tool_call_preview_for_terminal(tool_name: &str, args: &str) -> String {
+    match tool_name {
+        "message" => tool_args_preview_message(args),
+        "execution_run" | "execution_run_background" => tool_args_preview_execution(args),
+        _ => truncate_display(args, 220),
+    }
+}
+
+/// Live `execution_run` stream line for Ratatui (`content` is usually JSON for [`RunEvent`](crate::execution::RunEvent)).
+pub fn build_execution_stream_notice(
+    chat_id: &str,
+    channel: &str,
+    session_id: &str,
+    run_id: &str,
+    content: &str,
+    description: Option<&str>,
+) -> OutboundMessage {
+    let mut metadata = HashMap::new();
+    metadata.insert(ISANAGENT_EXECUTION_STREAM.to_string(), json!(true));
+    metadata.insert(METADATA_EXECUTION_SESSION_ID.to_string(), json!(session_id));
+    metadata.insert(METADATA_EXECUTION_RUN_ID.to_string(), json!(run_id));
+    if let Some(d) = description.filter(|s| !s.trim().is_empty()) {
+        metadata.insert(METADATA_EXECUTION_DESCRIPTION.to_string(), json!(d.trim()));
+    }
+    OutboundMessage {
+        channel: channel.to_string(),
+        chat_id: chat_id.to_string(),
+        thread_id: None,
+        content: content.to_string(),
+        metadata,
+    }
+}
+
+/// Short user-visible line when a background execution job finishes (or fails).
+pub fn build_execution_job_notice(
+    chat_id: &str,
+    channel: &str,
+    job_id: &str,
+    session_id: &str,
+    status: &str,
+    summary: &str,
+    description: Option<&str>,
+) -> OutboundMessage {
+    let mut metadata = HashMap::new();
+    metadata.insert(ISANAGENT_EXECUTION_JOB.to_string(), json!(true));
+    metadata.insert(METADATA_EXECUTION_JOB_ID.to_string(), json!(job_id));
+    metadata.insert(METADATA_EXECUTION_SESSION_ID.to_string(), json!(session_id));
+    metadata.insert(METADATA_EXECUTION_JOB_STATUS.to_string(), json!(status));
+    if let Some(d) = description.filter(|s| !s.trim().is_empty()) {
+        metadata.insert(METADATA_EXECUTION_DESCRIPTION.to_string(), json!(d.trim()));
+    }
+    OutboundMessage {
+        channel: channel.to_string(),
+        chat_id: chat_id.to_string(),
+        thread_id: None,
+        content: summary.to_string(),
+        metadata,
+    }
+}
+
 /// Live terminal line when a tool is invoked (mirrors telemetry, user-visible).
 pub fn build_tool_call_terminal_notice(
     chat_id: &str,
     tool_name: &str,
     args: &str,
 ) -> OutboundMessage {
-    let detail = truncate_display(args, 220);
-    let content = if detail.is_empty() {
+    let preview = tool_call_preview_for_terminal(tool_name, args);
+    let content = if preview.is_empty() {
         tool_name.to_string()
     } else {
-        format!("{tool_name} {detail}")
+        format!("{tool_name} {preview}")
     };
     let mut metadata = HashMap::new();
     metadata.insert(ISANAGENT_TOOL_NOTIFY.to_string(), json!(true));
     metadata.insert(ISANAGENT_TOOL_PHASE.to_string(), json!("call"));
+    metadata.insert(METADATA_TOOL_NAME.to_string(), json!(tool_name));
+    metadata.insert(METADATA_TOOL_CALL_PREVIEW.to_string(), json!(preview));
     OutboundMessage {
         channel: "terminal".to_string(),
         chat_id: chat_id.to_string(),
@@ -96,7 +230,7 @@ pub fn build_tool_result_terminal_notice(
     tool_name: &str,
     result: &str,
 ) -> OutboundMessage {
-    let summary = summarize_tool_result_for_terminal(result);
+    let summary = summarize_tool_result_for_terminal(tool_name, result);
     let content = format!("{tool_name} → {summary}");
     let mut metadata = HashMap::new();
     metadata.insert(ISANAGENT_TOOL_NOTIFY.to_string(), json!(true));
@@ -106,6 +240,8 @@ pub fn build_tool_result_terminal_notice(
         "result"
     };
     metadata.insert(ISANAGENT_TOOL_PHASE.to_string(), json!(phase));
+    metadata.insert(METADATA_TOOL_NAME.to_string(), json!(tool_name));
+    metadata.insert(METADATA_TOOL_RESULT_PREVIEW.to_string(), json!(summary));
     OutboundMessage {
         channel: "terminal".to_string(),
         chat_id: chat_id.to_string(),
@@ -186,7 +322,7 @@ impl Channel for TerminalChannel {
         if !tty_in || !tty_out {
             return Err(
                 "Terminal channel requires an interactive terminal (stdin and stdout must be TTYs). \
-For headless or piped runs, set [terminal] enable = false in config.toml (requires another inbound channel such as API, Slack, or Email)."
+For headless or piped runs, set [terminal] enabled = false in config.toml (requires another inbound channel such as API, Slack, or Email)."
                     .to_string(),
             );
         }

@@ -1,13 +1,15 @@
 restrict_to_workspace = true
 
 # Root-level limits (must stay above [terminal] so TOML does not nest them under [terminal]).
-max_iterations = 50
+max_iterations = 999
 max_tool_output_chars = 10000
 max_web_tool_output_chars = 50000
 
-# Local stdin/stdout chat. Set enable = false for API-only or headless runs (requires another channel).
+# Local stdin/stdout chat. Set enabled = false for API-only or headless runs (requires another channel).
+# While a reply is in flight, further lines are queued (FIFO per chat). Use /cancel or /stop to abort
+# the current turn and discard queued prompts (see /help in the TUI).
 [terminal]
-enable = true
+enabled = true
 
 [provider]
 model_name = "gemini-3-flash-preview"
@@ -15,7 +17,7 @@ api_key_env = "GEMINI_API_KEY"
 base_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 
 [slack]
-enabled = true
+enabled = false
 mode = "webhook"
 bot_token = "<changethis>"
 signing_secret = "<changethis>"
@@ -62,12 +64,11 @@ max_recent_summaries = 5
 # Registers the `git_worktree` tool (list / add / remove). Paths stay inside the sandbox unless you
 # set allow_path_outside_sandbox = true. See docs/harness-implementation-plan.md Phase 4.
 [harness.git_worktree]
-enabled = false
+enabled = true
 
-# Phase 5: background sub-agents (separate reasoning loop per task). See docs/harness-implementation-plan.md.
 [harness.subagents]
-enabled = false
-# cancel_children_on_parent_cancel = false  # default true: new user message / cancel also stops sub-tasks
+enabled = true
+# cancel_children_on_parent_cancel = false  # default true: explicit cancel (/cancel, BusMessage::Cancel) also stops sub-tasks
 # allowed_tools = ["read_file", "glob_files", "search_text", "edit_file"]  # omit = all tools except nested spawn/plan
 
 # Phase 2 execution plane: `execution_session_create`, `execution_run`, `execution_cancel`,
@@ -76,7 +77,8 @@ enabled = false
 [harness.execution]
 enabled = false
 # default_provider = "local"          # "local" | "jupyter" | "ssh"
-# max_wall_secs = 300                  # clamp per-run timeout_secs (default 300)
+# max_wall_secs = 3600                 # clamp per-run timeout_secs (default 3600; max 86400)
+# default_execution_timeout_secs = 600 # when the model omits timeout_secs (default 600; clamped to max_wall_secs)
 # max_output_bytes = 262144            # stdout+stderr cap per run (default 256 KiB)
 # max_sessions = 32                    # concurrent sessions (default 32)
 allowed_providers = ["local", "jupyter"]

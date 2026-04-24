@@ -35,6 +35,7 @@ which = "6.0.1"
 regex = "1.10.6"
 globset = "0.4.15"
 walkdir = "2.5.0"
+include_dir = "0.7"
 diffy = "0.4.2"
 shellexpand = "3.1.2"
 uuid = { version = "1.21.0", features = ["v4"] }

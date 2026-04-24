@@ -15,6 +15,7 @@ use isanagent::channels::{
     api::ApiChannel, email::EmailChannel, slack::SlackChannel, terminal::TerminalChannel, Channel,
 };
 use isanagent::clarification::ClarificationHub;
+use isanagent::execution::ExecutionJobManager;
 use isanagent::logging::{
     create_logger_channel, create_logging_actor_or_fallback, init_runtime_logger,
     LOGGER_QUEUE_CAPACITY,
@@ -35,7 +36,9 @@ use isanagent::tools::builtin::{
     SearchTextTool, ShellExecTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use isanagent::tools::execution::{
-    ExecutionCancelTool, ExecutionEnvInfoTool, ExecutionRunTool, ExecutionSessionCloseTool,
+    ExecutionArtifactListTool, ExecutionCancelTool, ExecutionEnvInfoTool, ExecutionJobCancelTool,
+    ExecutionJobListTool, ExecutionJobResultTool, ExecutionJobStatusTool,
+    ExecutionRunBackgroundTool, ExecutionRunTool, ExecutionSessionCloseTool,
     ExecutionSessionCreateTool,
 };
 use isanagent::tools::workflow::{AskUserTool, TodoWriteTool, ToolSearchTool};
@@ -47,6 +50,16 @@ const DEFAULT_PROVIDER_MODEL_NAME: &str = "gemini-2.5-flash";
 const DEFAULT_PROVIDER_API_KEY_ENV: &str = "GEMINI_API_KEY";
 const DEFAULT_PROVIDER_BASE_URL: &str =
     "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
+
+/// Appended to the workspace system prompt when `[harness.execution] enabled = true`.
+const EXECUTION_HARNESS_SYSTEM_GUIDANCE: &str = r#"
+
+--- Execution harness ---
+- Call execution_env_info to read max_wall_secs and default_run_timeout_secs before long runs.
+- Set timeout_secs explicitly for generation, training, or heavy I/O (up to max_wall_secs). Omit timeout_secs only for quick checks; use smaller values for tight polling loops.
+- Prefer execution_run_background when work may block the reasoning loop for many minutes; poll execution_job_status then execution_job_result.
+- Pass description on execution_run and execution_run_background for runs that may exceed ~30 seconds or whenever you want a clear label in the terminal UI and audit logs.
+"#;
 
 /// isanagent: A terminal chat interface and autonomous agent engine
 #[derive(Parser, Debug)]
@@ -143,7 +156,7 @@ async fn run_isanagent(
     if !workspace.config.terminal_enabled() && !workspace.config.has_non_terminal_inbound_channel()
     {
         return Err(std::io::Error::other(
-            "Invalid config: [terminal] enable = false requires at least one other inbound channel. \
+            "Invalid config: [terminal] enabled = false requires at least one other inbound channel. \
 Enable [api], [slack], or [email] (with enabled = true) so the agent can receive messages without stdin.",
         )
         .into());
@@ -230,6 +243,11 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     .map_err(std::io::Error::other)?;
     let cron_node = NodeHandle::new(cron_logic, 10, 3, Duration::from_millis(50));
 
+    let max_tool_output_chars = workspace
+        .config
+        .resolved_max_tool_output_chars()
+        .unwrap_or(3000);
+
     let mut tools = ToolRegistry::new();
     let restrict = workspace.config.restrict_to_workspace.unwrap_or(true);
     tools.register(Box::new(ReadFileTool {
@@ -272,15 +290,41 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     }
     if workspace.config.execution_harness_enabled() {
         let harness = isanagent::execution::build_execution_harness(
+            workspace.dir.clone(),
             workspace.sandbox_dir.clone(),
             restrict,
             &workspace.config,
         )
         .map_err(|e| std::io::Error::other(format!("execution harness: {e}")))?;
+        let execution_jobs = Arc::new(ExecutionJobManager::new(
+            harness.clone(),
+            global_outbound_tx.clone(),
+        ));
         tools.register(Box::new(ExecutionSessionCreateTool {
             harness: harness.clone(),
         }));
         tools.register(Box::new(ExecutionRunTool {
+            harness: harness.clone(),
+            outbound_tx: global_outbound_tx.clone(),
+        }));
+        tools.register(Box::new(ExecutionRunBackgroundTool {
+            harness: harness.clone(),
+            jobs: execution_jobs.clone(),
+        }));
+        tools.register(Box::new(ExecutionJobStatusTool {
+            jobs: execution_jobs.clone(),
+        }));
+        tools.register(Box::new(ExecutionJobResultTool {
+            jobs: execution_jobs.clone(),
+            max_tool_output_chars,
+        }));
+        tools.register(Box::new(ExecutionJobListTool {
+            jobs: execution_jobs.clone(),
+        }));
+        tools.register(Box::new(ExecutionJobCancelTool {
+            jobs: execution_jobs,
+        }));
+        tools.register(Box::new(ExecutionArtifactListTool {
             harness: harness.clone(),
         }));
         tools.register(Box::new(ExecutionCancelTool {
@@ -359,7 +403,14 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     let reflection_task = reflection_engine.start();
 
     // 6. Compile Agent System Prompt
-    let system_prompt = workspace.compile_system_prompt();
+    let system_prompt = {
+        let base = workspace.compile_system_prompt();
+        if workspace.config.execution_harness_enabled() {
+            format!("{base}{EXECUTION_HARNESS_SYSTEM_GUIDANCE}")
+        } else {
+            base
+        }
+    };
 
     // Prepare startup visual references before we move the structs
     let skill_names = skills.get_skill_names().join(", ");
@@ -371,8 +422,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     let tool_count = tool_names_list.len();
 
     // 7. Create Agent Logic
-    let max_iterations = workspace.config.max_iterations.unwrap_or(50);
-    let max_tool_output_chars = workspace.config.max_tool_output_chars.unwrap_or(3000);
+    let max_iterations = workspace.config.resolved_max_iterations().unwrap_or(50);
     let max_recent_summaries = workspace
         .config
         .memory
@@ -441,6 +491,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         logger_tx: logger_bus_tx.clone(),
         clarification_hub,
         subagent,
+        doom_loop_enabled: workspace.config.doom_loop_enabled(),
     });
     let agent_logic = if let Some(tool_execution_activity) = tool_execution_activity {
         agent_logic.with_tool_execution_activity(tool_execution_activity)

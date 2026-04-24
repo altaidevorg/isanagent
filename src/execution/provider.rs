@@ -1,6 +1,9 @@
 //! `ExecutionProvider` and optional capability traits.
 
+use std::collections::BTreeMap;
+
 use async_trait::async_trait;
+use serde_json::Value;
 
 use super::capabilities::ProviderCapabilities;
 use super::error::ExecutionError;
@@ -21,6 +24,14 @@ pub trait ExecutionProvider: Send + Sync {
     fn provider_id(&self) -> &str;
 
     fn capabilities(&self) -> ProviderCapabilities;
+
+    /// Optional metadata for durable run journals (kernel id, notebook path, etc.). Default: none.
+    fn session_journal_extensions(
+        &self,
+        _session_id: &SessionId,
+    ) -> Option<BTreeMap<String, Value>> {
+        None
+    }
 
     async fn create_session(
         &self,

@@ -51,6 +51,7 @@ pub struct SubagentSpawnDeps {
     pub default_allowlist: Option<Arc<HashSet<String>>>,
     pub max_tasks: usize,
     pub max_wait_secs: u64,
+    pub doom_loop_enabled: bool,
 }
 
 struct TaskRecord {
@@ -249,6 +250,7 @@ impl SubagentHarness {
             tool_exec_ctx,
             is_subagent: true,
             subagent_allowlist: self.inner.deps.default_allowlist.clone(),
+            doom_loop_enabled: self.inner.deps.doom_loop_enabled,
         };
 
         record

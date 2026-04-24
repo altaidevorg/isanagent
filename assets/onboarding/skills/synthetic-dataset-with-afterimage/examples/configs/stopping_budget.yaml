@@ -1,0 +1,27 @@
+# Stop on token budget instead of a fixed dialog count
+#
+# num_dialogs must be null so the run is not also capped by FixedNumberStoppingCallback.
+#
+# Run:
+#   afterimage generate -c examples/configs/stopping_budget.yaml
+
+generation:
+  num_dialogs: null
+  max_turns: 1
+  max_concurrency: 2
+  stopping:
+    - type: budget
+      max_total_tokens: 250000
+
+model:
+  provider: gemini
+  model_name: gemini-2.0-flash
+  api_key_env: GEMINI_API_KEY
+
+respondent:
+  system_prompt: |
+    You are a helpful AI assistant.
+
+output:
+  path: ./output/budget_capped_dataset.jsonl
+  storage: jsonl

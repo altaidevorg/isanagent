@@ -1,10 +1,11 @@
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::mpsc;
 
+mod doom_loop;
 mod subagent;
 pub use subagent::SubagentHarness;
 
@@ -96,6 +97,157 @@ async fn execute_tool_call_with_activity(
 }
 
 /// Bundles everything needed to run one inbound reasoning task (spawned from `AgentLogic::process`).
+/// Cloned into each spawned main-chat reasoning task (and used to chain queued inbounds).
+#[derive(Clone)]
+struct ReasoningSpawnArgs {
+    name: String,
+    provider: Box<dyn Provider>,
+    session_manager: Arc<SessionManager>,
+    tools: Arc<ToolRegistry>,
+    skills: Arc<SkillRegistry>,
+    system_prompt: String,
+    max_iterations: usize,
+    max_tool_output_chars: usize,
+    max_recent_summaries: usize,
+    short_term_threshold_turns: usize,
+    short_term_threshold_tokens: usize,
+    tool_execution_activity: Option<SharedToolExecutionActivity>,
+    outbound_tx: mpsc::Sender<BusMessage>,
+    logger_tx: LoggerHandle,
+    clarification_hub: Arc<ClarificationHub>,
+    doom_loop_enabled: bool,
+    cancellation_tokens: Arc<dashmap::DashMap<String, Arc<tokio_util::sync::CancellationToken>>>,
+    pending_inbound: Arc<dashmap::DashMap<String, Mutex<VecDeque<crate::bus::InboundMessage>>>>,
+}
+
+fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus::InboundMessage) {
+    let chat_id = inbound.chat_id.clone();
+    let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
+    args.cancellation_tokens
+        .insert(chat_id.clone(), cancel_token.clone());
+
+    let args_for_chain = args.clone();
+    let cancellation_tokens = args.cancellation_tokens.clone();
+    let pending_inbound = args.pending_inbound.clone();
+    let name = args.name.clone();
+    let provider = dyn_clone::clone_box(&*args.provider);
+    let session_manager = args.session_manager.clone();
+    let tools = args.tools.clone();
+    let skills = args.skills.clone();
+    let system_prompt = args.system_prompt.clone();
+    let max_iterations = args.max_iterations;
+    let max_tool_output_chars = args.max_tool_output_chars;
+    let max_recent_summaries = args.max_recent_summaries;
+    let short_term_threshold_turns = args.short_term_threshold_turns;
+    let short_term_threshold_tokens = args.short_term_threshold_tokens;
+    let tool_execution_activity = args.tool_execution_activity.clone();
+    let outbound_tx = args.outbound_tx.clone();
+    let logger_tx = args.logger_tx.clone();
+    let clarification_hub = args.clarification_hub.clone();
+    let doom_loop_enabled = args.doom_loop_enabled;
+    let tool_exec_ctx = ToolExecCtx::new(
+        inbound.channel.clone(),
+        inbound.chat_id.clone(),
+        inbound.thread_id.clone(),
+    )
+    .with_reasoning_cancel(cancel_token.as_ref().clone());
+    let inbound_channel = inbound.channel.clone();
+    let inbound_thread_id = inbound.thread_id.clone();
+
+    tokio::spawn(async move {
+        let task_chat_id = chat_id.clone();
+        let task_token_arc = cancel_token.clone();
+
+        let agent_name = name.clone();
+        let _ = logger_tx.send(BusMessage::Log(
+            LogEvent::debug(
+                &agent_name,
+                &format!("Spawning reasoning task for chat_id: {}", task_chat_id),
+            )
+            .with_chat_id(&task_chat_id),
+        ));
+
+        let res = AgentLogic::run_reasoning_loop(ReasoningLoopCtx {
+            name,
+            provider,
+            session_manager,
+            tools,
+            skills,
+            system_prompt,
+            max_iterations,
+            max_tool_output_chars,
+            max_recent_summaries,
+            short_term_threshold_turns,
+            short_term_threshold_tokens,
+            tool_execution_activity,
+            outbound_tx: outbound_tx.clone(),
+            logger_tx: logger_tx.clone(),
+            inbound,
+            cancel_token: task_token_arc.as_ref().clone(),
+            clarification_hub,
+            tool_exec_ctx,
+            is_subagent: false,
+            subagent_allowlist: None,
+            doom_loop_enabled,
+        })
+        .await;
+
+        if let Err(e) = res {
+            let _ = logger_tx.send(BusMessage::Log(
+                LogEvent::error(
+                    "AgentLogic",
+                    &format!("Reasoning loop failed for chat_id {}: {}", task_chat_id, e),
+                )
+                .with_chat_id(&task_chat_id),
+            ));
+            let notice = crate::channels::terminal::build_channel_error_notice(
+                &inbound_channel,
+                &task_chat_id,
+                inbound_thread_id.as_deref(),
+                &e,
+            );
+            let _ = outbound_tx.send(BusMessage::Outbound(notice)).await;
+        } else if task_token_arc.is_cancelled() {
+            let _ = logger_tx.send(BusMessage::Log(
+                LogEvent::info(
+                    &agent_name,
+                    &format!(
+                        "Reasoning task for chat_id {} finished via cancellation.",
+                        task_chat_id
+                    ),
+                )
+                .with_chat_id(&task_chat_id),
+            ));
+        } else {
+            let _ = logger_tx.send(BusMessage::Log(
+                LogEvent::debug(
+                    &agent_name,
+                    &format!(
+                        "Reasoning task for chat_id {} finished successfully.",
+                        task_chat_id
+                    ),
+                )
+                .with_chat_id(&task_chat_id),
+            ));
+        }
+
+        let _ = cancellation_tokens.remove_if(&task_chat_id, |_key, stored| {
+            Arc::ptr_eq(stored, &task_token_arc)
+        });
+
+        let next_inbound = pending_inbound.get(&task_chat_id).and_then(|r| {
+            let mut g = r
+                .lock()
+                .expect("pending_inbound mutex poisoned after reasoning turn");
+            g.pop_front()
+        });
+
+        if let Some(next_inbound) = next_inbound {
+            spawn_main_chat_reasoning_turn(args_for_chain, next_inbound);
+        }
+    });
+}
+
 pub(crate) struct ReasoningLoopCtx {
     pub(crate) name: String,
     pub(crate) provider: Box<dyn Provider>,
@@ -118,6 +270,7 @@ pub(crate) struct ReasoningLoopCtx {
     /// When true, tool list / execution use sub-agent allowlist and deny nested spawn/plan tools.
     pub(crate) is_subagent: bool,
     pub(crate) subagent_allowlist: Option<Arc<HashSet<String>>>,
+    pub(crate) doom_loop_enabled: bool,
 }
 
 /// Constructor arguments for [`AgentLogic`], grouped to keep call sites readable.
@@ -138,6 +291,8 @@ pub struct AgentLogicParams {
     pub clarification_hub: Arc<ClarificationHub>,
     /// When set, registers `subagent_*` / `task_*` tools and wires [`SubagentHarness`].
     pub subagent: Option<SubagentHarnessParams>,
+    /// When true (default), inject corrective user text if repeated tool calls are detected.
+    pub doom_loop_enabled: bool,
 }
 
 /// Build-time options for the Phase 5 sub-agent harness (see `[harness.subagents]`).
@@ -167,8 +322,11 @@ pub struct AgentLogic {
     outbound_tx: mpsc::Sender<BusMessage>,
     logger_tx: LoggerHandle,
     cancellation_tokens: Arc<dashmap::DashMap<String, Arc<tokio_util::sync::CancellationToken>>>,
+    /// FIFO per `chat_id` when a new user inbound arrives while main reasoning is active.
+    pending_inbound: Arc<dashmap::DashMap<String, Mutex<VecDeque<crate::bus::InboundMessage>>>>,
     clarification_hub: Arc<ClarificationHub>,
     subagent_harness: Option<Arc<SubagentHarness>>,
+    doom_loop_enabled: bool,
 }
 
 impl AgentLogic {
@@ -189,6 +347,7 @@ impl AgentLogic {
             logger_tx,
             clarification_hub,
             subagent,
+            doom_loop_enabled,
         } = params;
 
         let session_manager = Arc::new(session_manager);
@@ -215,6 +374,7 @@ impl AgentLogic {
                 default_allowlist: p.allowed_tools.clone(),
                 max_tasks: p.max_tasks,
                 max_wait_secs: p.max_wait_secs,
+                doom_loop_enabled,
             }))
         });
 
@@ -234,8 +394,10 @@ impl AgentLogic {
             outbound_tx,
             logger_tx,
             cancellation_tokens: Arc::new(dashmap::DashMap::new()),
+            pending_inbound: Arc::new(dashmap::DashMap::new()),
             clarification_hub,
             subagent_harness: subagent_harness.clone(),
+            doom_loop_enabled,
         };
 
         let tools_mut = Arc::get_mut(&mut agent.tools)
@@ -263,6 +425,29 @@ impl AgentLogic {
     ) -> Self {
         self.tool_execution_activity = Some(tool_execution_activity);
         self
+    }
+
+    fn reasoning_spawn_args(&self) -> ReasoningSpawnArgs {
+        ReasoningSpawnArgs {
+            name: self.name.clone(),
+            provider: dyn_clone::clone_box(&*self.provider),
+            session_manager: self.session_manager.clone(),
+            tools: self.tools.clone(),
+            skills: self.skills.clone(),
+            system_prompt: self.system_prompt.clone(),
+            max_iterations: self.max_iterations,
+            max_tool_output_chars: self.max_tool_output_chars,
+            max_recent_summaries: self.max_recent_summaries,
+            short_term_threshold_turns: self.short_term_threshold_turns,
+            short_term_threshold_tokens: self.short_term_threshold_tokens,
+            tool_execution_activity: self.tool_execution_activity.clone(),
+            outbound_tx: self.outbound_tx.clone(),
+            logger_tx: self.logger_tx.clone(),
+            clarification_hub: self.clarification_hub.clone(),
+            doom_loop_enabled: self.doom_loop_enabled,
+            cancellation_tokens: self.cancellation_tokens.clone(),
+            pending_inbound: self.pending_inbound.clone(),
+        }
     }
 
     #[cfg(test)]
@@ -325,6 +510,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                         .with_chat_id(&chat_id),
                     ));
                 }
+                self.pending_inbound.remove(&chat_id);
                 return Ok(None);
             }
             BusMessage::Inbound(inbound) => {
@@ -356,138 +542,27 @@ impl ActorLogic<BusMessage> for AgentLogic {
                     .with_chat_id(&chat_id),
                 ));
 
-                // 1. If there's an existing reasoning loop for this chat, cancel it first.
-                // This ensures only one active reasoning task per conversation.
-                if let Some((_, old_token)) = self.cancellation_tokens.remove(&chat_id) {
-                    if let Some(h) = &self.subagent_harness {
-                        if h.cancel_children_on_parent_cancel() {
-                            h.cancel_children_for_parent(&chat_id);
-                        }
-                    }
-                    old_token.cancel();
+                if self.cancellation_tokens.contains_key(&chat_id) {
+                    self.pending_inbound
+                        .entry(chat_id.clone())
+                        .or_insert_with(|| Mutex::new(VecDeque::new()))
+                        .lock()
+                        .expect("pending_inbound mutex poisoned")
+                        .push_back(inbound);
                     let _ = self.logger_tx.send(BusMessage::Log(
                         LogEvent::debug(
                             &self.name,
-                            &format!("Auto-cancelling previous task for chat_id: {}", chat_id),
+                            &format!(
+                                "Queued inbound for chat_id {} (FIFO) — reasoning already active.",
+                                chat_id
+                            ),
                         )
                         .with_chat_id(&chat_id),
                     ));
+                    return Ok(None);
                 }
 
-                let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
-                self.cancellation_tokens
-                    .insert(chat_id.clone(), cancel_token.clone());
-
-                // Clone necessary components for the task
-                let cancellation_tokens = self.cancellation_tokens.clone();
-                let name = self.name.clone();
-                let provider = dyn_clone::clone_box(&*self.provider);
-                let session_manager = self.session_manager.clone();
-                let tools = self.tools.clone();
-                let skills = self.skills.clone();
-                let system_prompt = self.system_prompt.clone();
-                let max_iterations = self.max_iterations;
-                let max_tool_output_chars = self.max_tool_output_chars;
-                let max_recent_summaries = self.max_recent_summaries;
-                let short_term_threshold_turns = self.short_term_threshold_turns;
-                let short_term_threshold_tokens = self.short_term_threshold_tokens;
-                let tool_execution_activity = self.tool_execution_activity.clone();
-                let outbound_tx = self.outbound_tx.clone();
-                let logger_tx = self.logger_tx.clone();
-                let clarification_hub = self.clarification_hub.clone();
-                let tool_exec_ctx = ToolExecCtx::new(
-                    inbound.channel.clone(),
-                    inbound.chat_id.clone(),
-                    inbound.thread_id.clone(),
-                )
-                .with_reasoning_cancel(cancel_token.as_ref().clone());
-                let inbound_channel = inbound.channel.clone();
-                let inbound_thread_id = inbound.thread_id.clone();
-
-                tokio::spawn(async move {
-                    let task_chat_id = chat_id.clone();
-                    let task_token_arc = cancel_token.clone();
-
-                    let agent_name = name.clone();
-                    let _ = logger_tx.send(BusMessage::Log(
-                        LogEvent::debug(
-                            &agent_name,
-                            &format!("Spawning reasoning task for chat_id: {}", task_chat_id),
-                        )
-                        .with_chat_id(&task_chat_id),
-                    ));
-
-                    let res = Self::run_reasoning_loop(ReasoningLoopCtx {
-                        name,
-                        provider,
-                        session_manager,
-                        tools,
-                        skills,
-                        system_prompt,
-                        max_iterations,
-                        max_tool_output_chars,
-                        max_recent_summaries,
-                        short_term_threshold_turns,
-                        short_term_threshold_tokens,
-                        tool_execution_activity,
-                        outbound_tx: outbound_tx.clone(),
-                        logger_tx: logger_tx.clone(),
-                        inbound,
-                        cancel_token: task_token_arc.as_ref().clone(),
-                        clarification_hub,
-                        tool_exec_ctx,
-                        is_subagent: false,
-                        subagent_allowlist: None,
-                    })
-                    .await;
-
-                    if let Err(e) = res {
-                        let _ = logger_tx.send(BusMessage::Log(
-                            LogEvent::error(
-                                "AgentLogic",
-                                &format!(
-                                    "Reasoning loop failed for chat_id {}: {}",
-                                    task_chat_id, e
-                                ),
-                            )
-                            .with_chat_id(&task_chat_id),
-                        ));
-                        let notice = crate::channels::terminal::build_channel_error_notice(
-                            &inbound_channel,
-                            &task_chat_id,
-                            inbound_thread_id.as_deref(),
-                            &e,
-                        );
-                        let _ = outbound_tx.send(BusMessage::Outbound(notice)).await;
-                    } else if task_token_arc.is_cancelled() {
-                        let _ = logger_tx.send(BusMessage::Log(
-                            LogEvent::info(
-                                &agent_name,
-                                &format!(
-                                    "Reasoning task for chat_id {} finished via cancellation.",
-                                    task_chat_id
-                                ),
-                            )
-                            .with_chat_id(&task_chat_id),
-                        ));
-                    } else {
-                        let _ = logger_tx.send(BusMessage::Log(
-                            LogEvent::debug(
-                                &agent_name,
-                                &format!(
-                                    "Reasoning task for chat_id {} finished successfully.",
-                                    task_chat_id
-                                ),
-                            )
-                            .with_chat_id(&task_chat_id),
-                        ));
-                    }
-
-                    // Drop our entry only if this task still owns the map slot (avoids races with a newer task).
-                    let _ = cancellation_tokens.remove_if(&task_chat_id, |_key, stored| {
-                        Arc::ptr_eq(stored, &task_token_arc)
-                    });
-                });
+                spawn_main_chat_reasoning_turn(self.reasoning_spawn_args(), inbound);
 
                 Ok(None)
             }
@@ -522,6 +597,7 @@ impl AgentLogic {
             tool_exec_ctx,
             is_subagent,
             subagent_allowlist,
+            doom_loop_enabled,
         } = ctx;
 
         let session_key = tool_exec_ctx.session_key.clone();
@@ -624,6 +700,21 @@ impl AgentLogic {
                 skills.get_capabilities_summary()
             ));
             context.insert(0, system_msg);
+
+            if doom_loop_enabled {
+                if let Some(prompt) = doom_loop::check_for_doom_loop_prompt(&context) {
+                    let correction = crate::utils::ChatMessage::user(&prompt);
+                    mem.add_message(correction.clone()).await?;
+                    context.push(correction);
+                    let _ = logger_tx.send(BusMessage::Log(
+                        LogEvent::warn(
+                            &name,
+                            "Doom loop detected — injecting corrective user message.",
+                        )
+                        .with_chat_id(&inbound.chat_id),
+                    ));
+                }
+            }
 
             let _ = logger_tx.send(BusMessage::Log(
                 LogEvent::debug(
@@ -1009,13 +1100,13 @@ mod tests {
     };
     use serde_json::Value;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use tokio::sync::mpsc;
     use tower::util::ServiceExt;
 
-    use crate::bus::BusMessage;
+    use crate::bus::{clarification_session_key, BusMessage, InboundMessage};
     use crate::clarification::ClarificationHub;
     use crate::logging::create_logger_channel;
     use crate::memory::SqliteMemoryActor;
@@ -1025,8 +1116,8 @@ mod tests {
     use crate::tool_activity::SharedToolExecutionActivity;
     use crate::tools::ToolRegistry;
     use crate::traits::{Provider, Tool};
-    use crate::utils::{ChatMessage, LLMResponse};
-    use crate::NodeHandle;
+    use crate::utils::{ChatMessage, LLMError, LLMResponse};
+    use crate::{ActorLogic, NodeHandle};
 
     struct LocalTempDir {
         path: PathBuf,
@@ -1187,8 +1278,58 @@ mod tests {
             &self,
             _messages: &[ChatMessage],
             _tools: Option<serde_json::Value>,
-        ) -> Result<LLMResponse, crate::utils::LLMError> {
+        ) -> Result<LLMResponse, LLMError> {
             unreachable!("DummyProvider is not used in heartbeat tests")
+        }
+    }
+
+    /// First `chat` waits until the test releases `unblock_rx`; later calls return immediately.
+    #[derive(Clone)]
+    struct GateFirstChatProvider {
+        calls: Arc<AtomicUsize>,
+        first_unblock: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+    }
+
+    #[async_trait]
+    impl Provider for GateFirstChatProvider {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<serde_json::Value>,
+        ) -> Result<LLMResponse, LLMError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                let mut slot = self.first_unblock.lock().await;
+                if let Some(rx) = slot.take() {
+                    let _ = rx.await;
+                }
+            }
+            Ok(LLMResponse {
+                content: format!("ok-{n}"),
+                tool_calls: None,
+                reasoning_content: None,
+                usage: None,
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct LongSleepProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for LongSleepProvider {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<serde_json::Value>,
+        ) -> Result<LLMResponse, LLMError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            Err(LLMError::ApiError(
+                "LongSleepProvider should have been cancelled".into(),
+            ))
         }
     }
 
@@ -1218,6 +1359,54 @@ mod tests {
             tokio::time::sleep(self.delay).await;
             Ok(self.result.clone())
         }
+    }
+
+    fn build_agent_with_provider_and_hub(
+        provider: Box<dyn Provider>,
+        clarification_hub: Arc<ClarificationHub>,
+    ) -> (AgentLogic, mpsc::Receiver<BusMessage>) {
+        let memory_actor = SqliteMemoryActor::new(":memory:", None).expect("memory actor");
+        let memory_node = NodeHandle::new(memory_actor, 16, 1, Duration::from_millis(1));
+        let session_manager = SessionManager::new(memory_node);
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(SlowTool {
+            delay: Duration::from_millis(0),
+            result: "tool complete".to_string(),
+        }));
+
+        let skills_temp = LocalTempDir::new();
+        let skills = SkillRegistry::new(skills_temp.path().clone());
+
+        let (outbound_tx, outbound_rx) = mpsc::channel::<BusMessage>(64);
+        let (logger_tx, _logger_rx) = create_logger_channel(32);
+
+        let agent = AgentLogic::new(AgentLogicParams {
+            name: "TestAgent".to_string(),
+            provider,
+            session_manager,
+            tools,
+            skills,
+            system_prompt: "test system prompt".to_string(),
+            max_iterations: 4,
+            max_tool_output_chars: 4_000,
+            max_recent_summaries: 0,
+            short_term_threshold_turns: 10,
+            short_term_threshold_tokens: 10_000,
+            outbound_tx,
+            logger_tx,
+            clarification_hub,
+            subagent: None,
+            doom_loop_enabled: false,
+        });
+
+        (agent, outbound_rx)
+    }
+
+    fn build_agent_with_provider(
+        provider: Box<dyn Provider>,
+    ) -> (AgentLogic, mpsc::Receiver<BusMessage>) {
+        build_agent_with_provider_and_hub(provider, ClarificationHub::shared())
     }
 
     fn build_test_agent(
@@ -1256,6 +1445,7 @@ mod tests {
             logger_tx,
             clarification_hub: ClarificationHub::shared(),
             subagent: None,
+            doom_loop_enabled: false,
         });
 
         if let Some(tool_execution_activity) = tool_execution_activity {
@@ -1404,6 +1594,124 @@ mod tests {
         .expect("tool result");
 
         assert_eq!(result, "tool complete");
+    }
+
+    fn test_inbound(chat_id: &str, content: &str) -> InboundMessage {
+        InboundMessage {
+            channel: "terminal".to_string(),
+            sender_id: "local_user".to_string(),
+            chat_id: chat_id.to_string(),
+            thread_id: None,
+            content: content.to_string(),
+            attachments: vec![],
+            metadata: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn inbound_queues_while_reasoning_active_second_chat_after_first() {
+        let (unblock_tx, unblock_rx) = tokio::sync::oneshot::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let prov = GateFirstChatProvider {
+            calls: calls.clone(),
+            first_unblock: Arc::new(tokio::sync::Mutex::new(Some(unblock_rx))),
+        };
+        let (mut agent, _outbound_rx) = build_agent_with_provider(Box::new(prov));
+        let cid = "queue-seq-chat";
+        agent
+            .process(BusMessage::Inbound(test_inbound(cid, "first")))
+            .await
+            .expect("process");
+        for _ in 0..200 {
+            if calls.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "first reasoning should call provider.chat"
+        );
+        agent
+            .process(BusMessage::Inbound(test_inbound(cid, "second")))
+            .await
+            .expect("process");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "second inbound must be queued, not start a concurrent provider.chat"
+        );
+        let _ = unblock_tx.send(());
+        for _ in 0..400 {
+            if calls.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "after first turn completes, queued inbound should run"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_clears_pending_inbound_second_provider_chat_never_starts() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let prov = LongSleepProvider {
+            calls: calls.clone(),
+        };
+        let (mut agent, _outbound_rx) = build_agent_with_provider(Box::new(prov));
+        let cid = "cancel-q-chat";
+        agent
+            .process(BusMessage::Inbound(test_inbound(cid, "first")))
+            .await
+            .expect("process");
+        for _ in 0..200 {
+            if calls.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        agent
+            .process(BusMessage::Inbound(test_inbound(cid, "second")))
+            .await
+            .expect("process");
+        agent
+            .process(BusMessage::Cancel(cid.to_string()))
+            .await
+            .expect("cancel");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "queued follow-up must not run provider.chat after Cancel cleared the queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn clarification_inbound_routes_via_hub_before_reasoning_spawn() {
+        let hub = Arc::new(ClarificationHub::new());
+        let chat_id = "clar-chat";
+        let sk = clarification_session_key("terminal", chat_id, None);
+        let pending_rx = hub.begin_wait(&sk).expect("begin_wait");
+        let (mut agent, _outbound_rx) =
+            build_agent_with_provider_and_hub(Box::new(DummyProvider), hub);
+        agent
+            .process(BusMessage::Inbound(test_inbound(
+                chat_id,
+                "clarification reply text",
+            )))
+            .await
+            .expect("process");
+        let delivered = tokio::time::timeout(Duration::from_secs(2), pending_rx)
+            .await
+            .expect("timeout waiting clarification")
+            .expect("clarification channel closed");
+        assert_eq!(delivered, "clarification reply text");
     }
 
     #[tokio::test]

@@ -1,0 +1,33 @@
+# Minimal AfterImage config
+# Generates simple Q&A conversations using Gemini
+#
+# Set your API key first:
+#   export GEMINI_API_KEY=your-key
+#
+# Run:
+#   afterimage generate -c examples/configs/basic.yaml
+
+generation:
+  # Number of conversations to generate
+  num_dialogs: 10
+  # Max turns per dialog; each run samples uniformly from 1..max_turns (see ConversationGenerator).
+  max_turns: 3
+
+model:
+  # LLM provider: gemini, openai, deepseek, or local
+  provider: gemini
+  # Model identifier (provider-specific). gemini-2.5-flash works well for multi-turn; 2.0-flash may skew non-English more often.
+  model_name: gemini-2.5-flash
+  # Environment variable holding the API key
+  api_key_env: GEMINI_API_KEY
+
+respondent:
+  # System prompt for the assistant being fine-tuned
+  system_prompt: |
+    You are a well-known expert in AI technologies. You provide consultancy to companies about AI adoption and specific use cases of AI that solve industrial problems. Answer questions clearly and concisely. Avoid heavy technical jargon.
+
+output:
+  # Where to save the generated dataset
+  path: ./output/basic_dataset.jsonl
+  # Storage format: jsonl or sql
+  storage: jsonl

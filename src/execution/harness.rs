@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 
 use crate::config::AppConfig;
 
+use super::artifacts::ArtifactLimits;
 use super::error::ExecutionError;
 use super::jupyter::{JupyterExecutionProvider, JupyterExecutionProviderConfig};
 use super::local::{LocalExecutionConfig, LocalExecutionProvider};
@@ -17,13 +18,33 @@ use super::ssh::{SshExecutionProvider, SshExecutionProviderConfig};
 pub struct ExecutionHarness {
     provider: Arc<dyn ExecutionProvider>,
     python_executable: String,
+    workspace_dir: PathBuf,
+    sandbox_dir: PathBuf,
+    artifact_limits: ArtifactLimits,
+    /// When `execution_run` omits `timeout_secs`, use this (clamped to provider max at tool call time).
+    pub default_run_timeout_secs: u64,
+    /// Upper bound for per-run `timeout_secs` from `[harness.execution] max_wall_secs`.
+    pub max_wall_secs: u64,
 }
 
 impl ExecutionHarness {
-    pub fn new(provider: Arc<dyn ExecutionProvider>, python_executable: impl Into<String>) -> Self {
+    pub fn new(
+        provider: Arc<dyn ExecutionProvider>,
+        python_executable: impl Into<String>,
+        workspace_dir: PathBuf,
+        sandbox_dir: PathBuf,
+        artifact_limits: ArtifactLimits,
+        default_run_timeout_secs: u64,
+        max_wall_secs: u64,
+    ) -> Self {
         Self {
             provider,
             python_executable: python_executable.into(),
+            workspace_dir,
+            sandbox_dir,
+            artifact_limits,
+            default_run_timeout_secs,
+            max_wall_secs,
         }
     }
 
@@ -33,6 +54,18 @@ impl ExecutionHarness {
 
     pub fn python_executable(&self) -> &str {
         &self.python_executable
+    }
+
+    pub fn workspace_dir(&self) -> &PathBuf {
+        &self.workspace_dir
+    }
+
+    pub fn sandbox_dir(&self) -> &PathBuf {
+        &self.sandbox_dir
+    }
+
+    pub fn artifact_limits(&self) -> ArtifactLimits {
+        self.artifact_limits
     }
 
     /// Bounded JSON for injection into tool results (omits `extensions` map).
@@ -56,6 +89,7 @@ impl ExecutionHarness {
 
 /// Build the harness from workspace + app config. Call only when `[harness.execution] enabled = true`.
 pub fn build_execution_harness(
+    workspace_dir: PathBuf,
     sandbox_dir: PathBuf,
     restrict_to_workspace: bool,
     config: &AppConfig,
@@ -66,20 +100,31 @@ pub fn build_execution_harness(
             "execution provider {pid:?} is not listed in [harness.execution].allowed_providers"
         ));
     }
+    let artifact_limits = ArtifactLimits {
+        max_file_bytes: config.execution_artifact_max_file_bytes(),
+        max_total_bytes_per_run: config.execution_artifact_max_total_bytes_per_run(),
+        max_files_per_run: config.execution_artifact_max_files_per_run(),
+    };
     match pid.as_str() {
         "local" => {
             let lc = LocalExecutionConfig {
-                sandbox_dir,
+                sandbox_dir: sandbox_dir.clone(),
                 restrict_to_workspace,
                 max_run_timeout_secs: config.execution_max_wall_secs(),
                 max_output_bytes: config.execution_max_output_bytes(),
                 max_sessions: config.execution_max_sessions(),
                 python_executable: config.execution_python_executable(),
+                python_repl: config.execution_local_python_repl_enabled(),
             };
             let p = LocalExecutionProvider::new(lc).map_err(|e: ExecutionError| e.to_string())?;
             Ok(Arc::new(ExecutionHarness::new(
                 Arc::new(p),
                 config.execution_python_executable(),
+                workspace_dir,
+                sandbox_dir,
+                artifact_limits,
+                config.execution_default_run_timeout_secs(),
+                config.execution_max_wall_secs(),
             )))
         }
         "jupyter" => {
@@ -94,12 +139,21 @@ pub fn build_execution_harness(
                 max_run_timeout_secs: config.execution_max_wall_secs(),
                 max_output_bytes: config.execution_max_output_bytes(),
                 max_sessions: config.execution_max_sessions(),
+                artifact_sandbox_dir: sandbox_dir.clone(),
+                artifact_limits,
+                notebook_sync_path_template: config
+                    .execution_jupyter_notebook_sync_path_template(),
             };
             let p =
                 JupyterExecutionProvider::new(jc).map_err(|e: ExecutionError| e.to_string())?;
             Ok(Arc::new(ExecutionHarness::new(
                 Arc::new(p),
                 config.execution_python_executable(),
+                workspace_dir,
+                sandbox_dir,
+                artifact_limits,
+                config.execution_default_run_timeout_secs(),
+                config.execution_max_wall_secs(),
             )))
         }
         "ssh" => {
@@ -129,6 +183,11 @@ pub fn build_execution_harness(
             Ok(Arc::new(ExecutionHarness::new(
                 Arc::new(p),
                 config.execution_python_executable(),
+                workspace_dir,
+                sandbox_dir,
+                artifact_limits,
+                config.execution_default_run_timeout_secs(),
+                config.execution_max_wall_secs(),
             )))
         }
         other => Err(format!(

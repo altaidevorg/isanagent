@@ -5,7 +5,12 @@ use crate::config::{AppConfig, SlackMode};
 use crate::skills::SkillRegistry;
 use crate::workspace::{ensure_workspace_layout, WorkspaceLayout};
 use clap::Args;
+use include_dir::{include_dir, Dir};
 use toml_edit::{value, DocumentMut};
+
+/// Full skill tree (SKILL.md, reference.md, examples/) embedded at compile time.
+static ONBOARD_SYNTHETIC_SKILL_DIR: Dir<'static> =
+    include_dir!("$CARGO_MANIFEST_DIR/assets/onboarding/skills/synthetic-dataset-with-afterimage");
 
 const CONFIG_TEMPLATE: &str = include_str!("../assets/onboarding/config.toml");
 const AGENTS_TEMPLATE: &str = include_str!("../assets/onboarding/AGENTS.md");
@@ -14,6 +19,12 @@ const SOUL_TEMPLATE: &str = include_str!("../assets/onboarding/SOUL.md");
 const CRON_SKILL_TEMPLATE: &str = include_str!("../assets/onboarding/skills/cron/SKILL.md");
 const SKILL_CREATOR_TEMPLATE: &str =
     include_str!("../assets/onboarding/skills/skill-creator/SKILL.md");
+const EXECUTION_RESEARCH_SKILL_TEMPLATE: &str =
+    include_str!("../assets/onboarding/skills/execution-research/SKILL.md");
+const JUPYTER_HEAVY_OUTPUT_SKILL_TEMPLATE: &str =
+    include_str!("../assets/onboarding/skills/jupyter-heavy-output/SKILL.md");
+const SCIENTIFIC_PYTHON_DEBUGGING_SKILL_TEMPLATE: &str =
+    include_str!("../assets/onboarding/skills/scientific-python-debugging/SKILL.md");
 
 struct TemplateFile {
     relative_path: &'static str,
@@ -56,7 +67,7 @@ pub struct OnboardOptions {
     #[arg(long, help_heading = "Workspace / limits")]
     pub max_web_tool_output_chars: Option<usize>,
 
-    /// Sets `[terminal] enable` (stdin/stdout chat).
+    /// Sets `[terminal] enabled` (stdin/stdout chat).
     #[arg(long, help_heading = "Terminal channel")]
     pub terminal_enable: Option<bool>,
 
@@ -144,7 +155,7 @@ fn apply_onboard_options(cfg: &mut AppConfig, opts: &OnboardOptions) {
     }
 
     if let Some(v) = opts.terminal_enable {
-        cfg.terminal.get_or_insert_with(Default::default).enable = Some(v);
+        cfg.terminal.get_or_insert_with(Default::default).enabled = Some(v);
     }
 
     if let Some(p) = cfg.provider.as_mut() {
@@ -214,19 +225,13 @@ fn apply_onboard_options(cfg: &mut AppConfig, opts: &OnboardOptions) {
     {
         let h = cfg.harness.get_or_insert_with(Default::default);
         if let Some(v) = opts.harness_git_worktree_enabled {
-            h.git_worktree
-                .get_or_insert_with(Default::default)
-                .enabled = Some(v);
+            h.git_worktree.get_or_insert_with(Default::default).enabled = Some(v);
         }
         if let Some(v) = opts.harness_subagents_enabled {
-            h.subagents
-                .get_or_insert_with(Default::default)
-                .enabled = Some(v);
+            h.subagents.get_or_insert_with(Default::default).enabled = Some(v);
         }
         if let Some(v) = opts.harness_execution_enabled {
-            h.execution
-                .get_or_insert_with(Default::default)
-                .enabled = Some(v);
+            h.execution.get_or_insert_with(Default::default).enabled = Some(v);
         }
     }
 }
@@ -253,9 +258,8 @@ pub fn build_interactive_config_toml(options: &OnboardOptions) -> Result<String,
         doc["restrict_to_workspace"] = value(v);
     }
     if let Some(v) = options.max_iterations {
-        doc["max_iterations"] = value(
-            i64::try_from(v).map_err(|_| "max_iterations does not fit i64".to_string())?,
-        );
+        doc["max_iterations"] =
+            value(i64::try_from(v).map_err(|_| "max_iterations does not fit i64".to_string())?);
     }
     if let Some(v) = options.max_tool_output_chars {
         doc["max_tool_output_chars"] = value(
@@ -264,12 +268,13 @@ pub fn build_interactive_config_toml(options: &OnboardOptions) -> Result<String,
     }
     if let Some(v) = options.max_web_tool_output_chars {
         doc["max_web_tool_output_chars"] = value(
-            i64::try_from(v).map_err(|_| "max_web_tool_output_chars does not fit i64".to_string())?,
+            i64::try_from(v)
+                .map_err(|_| "max_web_tool_output_chars does not fit i64".to_string())?,
         );
     }
 
     if let Some(v) = options.terminal_enable {
-        doc["terminal"]["enable"] = value(v);
+        doc["terminal"]["enabled"] = value(v);
     }
 
     if let Some(ref m) = options.provider_model {
@@ -382,7 +387,7 @@ that file is first created. Remove or rename config.toml, or point --workspace a
 }
 
 fn embedded_templates() -> &'static [TemplateFile] {
-    static TEMPLATES: [TemplateFile; 6] = [
+    static TEMPLATES: [TemplateFile; 9] = [
         TemplateFile {
             relative_path: "config.toml",
             contents: CONFIG_TEMPLATE,
@@ -407,6 +412,18 @@ fn embedded_templates() -> &'static [TemplateFile] {
             relative_path: "workspace/skills/skill-creator/SKILL.md",
             contents: SKILL_CREATOR_TEMPLATE,
         },
+        TemplateFile {
+            relative_path: "workspace/skills/execution-research/SKILL.md",
+            contents: EXECUTION_RESEARCH_SKILL_TEMPLATE,
+        },
+        TemplateFile {
+            relative_path: "workspace/skills/jupyter-heavy-output/SKILL.md",
+            contents: JUPYTER_HEAVY_OUTPUT_SKILL_TEMPLATE,
+        },
+        TemplateFile {
+            relative_path: "workspace/skills/scientific-python-debugging/SKILL.md",
+            contents: SCIENTIFIC_PYTHON_DEBUGGING_SKILL_TEMPLATE,
+        },
     ];
 
     &TEMPLATES
@@ -420,7 +437,8 @@ fn write_all_templates(
 ) -> Result<(), String> {
     for template in embedded_templates() {
         if template.relative_path == "config.toml" {
-            let body = if let Some(s) = interactive_merged_config_toml.filter(|_| options.has_overrides())
+            let body = if let Some(s) =
+                interactive_merged_config_toml.filter(|_| options.has_overrides())
             {
                 s.to_string()
             } else if options.has_overrides() {
@@ -439,13 +457,58 @@ fn write_all_templates(
         }
     }
 
+    write_embedded_synthetic_skill_tree(&layout.root, report)?;
+
     Ok(())
 }
 
-fn write_if_missing_string(
+const SYNTHETIC_SKILL_REL_PREFIX: &str = "workspace/skills/synthetic-dataset-with-afterimage";
+
+fn write_embedded_synthetic_skill_tree(
+    root: &Path,
+    report: &mut BootstrapReport,
+) -> Result<(), String> {
+    write_embedded_dir_recursive(
+        &ONBOARD_SYNTHETIC_SKILL_DIR,
+        root,
+        SYNTHETIC_SKILL_REL_PREFIX,
+        Path::new(""),
+        report,
+    )
+}
+
+fn write_embedded_dir_recursive(
+    dir: &Dir<'_>,
+    root: &Path,
+    skill_dest_dir: &str,
+    rel_inside: &Path,
+    report: &mut BootstrapReport,
+) -> Result<(), String> {
+    for file in dir.files() {
+        let rel = if rel_inside.as_os_str().is_empty() {
+            file.path().to_path_buf()
+        } else {
+            rel_inside.join(file.path())
+        };
+        let dest_rel = Path::new(skill_dest_dir).join(rel);
+        let dest_rel_str = dest_rel.to_string_lossy().replace('\\', "/");
+        write_if_missing_bytes(root, &dest_rel_str, file.contents(), report)?;
+    }
+    for sub in dir.dirs() {
+        let next = if rel_inside.as_os_str().is_empty() {
+            sub.path().to_path_buf()
+        } else {
+            rel_inside.join(sub.path())
+        };
+        write_embedded_dir_recursive(sub, root, skill_dest_dir, &next, report)?;
+    }
+    Ok(())
+}
+
+fn write_if_missing_bytes(
     root: &Path,
     relative_path: &str,
-    contents: &str,
+    contents: &[u8],
     report: &mut BootstrapReport,
 ) -> Result<(), String> {
     let rel = PathBuf::from(relative_path);
@@ -469,6 +532,15 @@ fn write_if_missing_string(
     fs::write(&dest, contents).map_err(|e| format!("Failed to write {}: {}", dest.display(), e))?;
     report.created.push(rel);
     Ok(())
+}
+
+fn write_if_missing_string(
+    root: &Path,
+    relative_path: &str,
+    contents: &str,
+    report: &mut BootstrapReport,
+) -> Result<(), String> {
+    write_if_missing_bytes(root, relative_path, contents.as_bytes(), report)
 }
 
 fn validate_generated_files(layout: &WorkspaceLayout) -> Result<(), String> {
@@ -495,7 +567,14 @@ fn validate_generated_files(layout: &WorkspaceLayout) -> Result<(), String> {
 
     let registry = SkillRegistry::new(layout.skills_dir.clone());
     let skill_names = registry.get_skill_names();
-    for required in ["cron", "skill-creator"] {
+    for required in [
+        "cron",
+        "skill-creator",
+        "execution-research",
+        "jupyter-heavy-output",
+        "scientific-python-debugging",
+        "synthetic-dataset-with-afterimage",
+    ] {
         if !skill_names.iter().any(|skill| skill == required) {
             return Err(format!(
                 "Generated skill '{}' was not loadable from {}",
@@ -535,10 +614,12 @@ mod tests {
 
     #[test]
     fn build_interactive_config_toml_preserves_template_comments() {
-        let mut o = OnboardOptions::default();
-        o.provider_model = Some("test-model".to_string());
-        o.provider_api_key_env = Some("GEMINI_API_KEY".to_string());
-        o.provider_base_url = Some("https://example.com/v1/chat/completions".to_string());
+        let o = OnboardOptions {
+            provider_model: Some("test-model".to_string()),
+            provider_api_key_env: Some("GEMINI_API_KEY".to_string()),
+            provider_base_url: Some("https://example.com/v1/chat/completions".to_string()),
+            ..Default::default()
+        };
         let s = build_interactive_config_toml(&o).expect("toml_edit merge");
         assert!(
             s.contains("# Local stdin/stdout chat"),
@@ -561,7 +642,7 @@ mod tests {
             "expected execution default_provider as comment"
         );
         assert!(
-            s.contains("# max_wall_secs = 300"),
+            s.contains("# max_wall_secs = 3600"),
             "expected execution max_wall_secs as comment"
         );
         assert!(
