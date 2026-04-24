@@ -1,6 +1,7 @@
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 /// Suffix after the human-readable runtime context line on user messages (see `agent` injection).
@@ -369,6 +370,65 @@ impl LLMClient {
     }
 }
 
+/// Joins `relative` under `root`, applying `.` / `..` lexically without traversing above `root`.
+///
+/// Extra `..` at the sandbox root are ignored (clamped), so `list_dir("..")` stays inside the
+/// workspace instead of canonicalizing to the parent directory and tripping the boundary check
+/// (common on Windows with `\\?\`-prefixed paths).
+///
+/// Callers must pass [`Path::is_absolute`] == false for `relative` (absolute paths should skip this).
+pub fn join_lexically_under_root(root: &Path, relative: &Path) -> Result<PathBuf, String> {
+    let mut out = root.to_path_buf();
+    for comp in relative.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if out != root {
+                    out.pop();
+                }
+            }
+            Component::Normal(name) => out.push(name),
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "path component {comp:?} is not allowed in a sandbox-relative path"
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// When the tool workspace is already `.../workspace` and the model passes `workspace/foo`, strip
+/// the redundant first segment so resolution targets `.../workspace/foo` instead of
+/// `.../workspace/workspace/foo`.
+pub fn normalize_sandbox_relative_input(workspace_dir: &Path, path: &str) -> PathBuf {
+    let trimmed = path.trim();
+    let raw = Path::new(trimmed);
+    if raw.is_absolute() {
+        return raw.to_path_buf();
+    }
+    let Some(ws_leaf) = workspace_dir.file_name().and_then(|n| n.to_str()) else {
+        return raw.to_path_buf();
+    };
+    let mut it = raw.components().peekable();
+    if matches!(
+        it.peek(),
+        Some(Component::Normal(first))
+            if first
+                .to_str()
+                .is_some_and(|s| s.eq_ignore_ascii_case(ws_leaf))
+    ) {
+        it.next();
+        let rest: PathBuf = it.collect();
+        return if rest.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            rest
+        };
+    }
+    raw.to_path_buf()
+}
+
 /// Resolves `agent_path` relative to `sandbox_dir`, ensuring the resulting
 /// canonical path stays within the sandbox boundary.
 ///
@@ -376,19 +436,20 @@ impl LLMClient {
 /// - the path escapes the sandbox via `../` traversal or absolute references
 ///   outside the sandbox directory, or
 /// - the path does not exist on disk (canonicalization requires existence).
-pub fn resolve_path(sandbox_dir: &std::path::Path, agent_path: &str) -> Option<std::path::PathBuf> {
+pub fn resolve_path(sandbox_dir: &Path, agent_path: &str) -> Option<PathBuf> {
     // Canonicalize the sandbox root first so we can fail fast before touching
     // any user-supplied path data.
     let sandbox_canonical = sandbox_dir.canonicalize().ok()?;
 
-    let raw = std::path::Path::new(agent_path);
+    let raw = Path::new(agent_path);
 
     // Absolute paths are only allowed when they live inside the sandbox.
-    // Relative paths are joined against the sandbox root first.
+    // Relative paths: strip redundant `workspace/`-style prefix, then join with `..` clamped.
     let joined = if raw.is_absolute() {
         raw.to_path_buf()
     } else {
-        sandbox_canonical.join(raw)
+        let rel = normalize_sandbox_relative_input(&sandbox_canonical, agent_path);
+        join_lexically_under_root(&sandbox_canonical, &rel).ok()?
     };
 
     // `canonicalize` resolves symlinks and `..` components and requires the

@@ -1,9 +1,14 @@
 use serde::{Deserialize, Serialize};
 
 /// Local stdin/stdout chat. When `enable` is omitted, defaults to `true` (legacy behavior).
+///
+/// `max_iterations` / `max_tool_output_chars` here are used only when the root-level keys are
+/// unset (see [`AppConfig::resolved_max_iterations`]) — prefer root keys above `[terminal]` in TOML.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct TerminalConfig {
     pub enable: Option<bool>,
+    pub max_iterations: Option<usize>,
+    pub max_tool_output_chars: Option<usize>,
 }
 
 /// OpenSSH-style remote exec over TCP (`default_provider = "ssh"`).
@@ -173,6 +178,24 @@ impl AppConfig {
             .as_ref()
             .and_then(|t| t.enable)
             .unwrap_or(true)
+    }
+
+    /// Root `max_iterations`, or `[terminal].max_iterations` when root is unset (common TOML mistake).
+    pub fn resolved_max_iterations(&self) -> Option<usize> {
+        self.max_iterations.or_else(|| {
+            self.terminal
+                .as_ref()
+                .and_then(|t| t.max_iterations)
+        })
+    }
+
+    /// Root `max_tool_output_chars`, or `[terminal].max_tool_output_chars` when root is unset.
+    pub fn resolved_max_tool_output_chars(&self) -> Option<usize> {
+        self.max_tool_output_chars.or_else(|| {
+            self.terminal
+                .as_ref()
+                .and_then(|t| t.max_tool_output_chars)
+        })
     }
 
     /// At least one inbound channel other than terminal (API, Slack, or Email).
@@ -690,6 +713,28 @@ artifact_max_files_per_run = 10
         let c: AppConfig = toml::from_str(s).expect("parse");
         assert!(!c.doom_loop_enabled());
         assert!(AppConfig::default().doom_loop_enabled());
+    }
+
+    #[test]
+    fn resolved_max_iterations_falls_back_to_terminal_table() {
+        let s = r#"
+[terminal]
+enable = true
+max_iterations = 999
+"#;
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        assert_eq!(c.resolved_max_iterations(), Some(999));
+    }
+
+    #[test]
+    fn resolved_max_iterations_root_wins_over_terminal() {
+        let s = r#"
+max_iterations = 12
+[terminal]
+max_iterations = 999
+"#;
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        assert_eq!(c.resolved_max_iterations(), Some(12));
     }
 
     #[test]

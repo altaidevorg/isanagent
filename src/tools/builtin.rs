@@ -10,6 +10,7 @@ use walkdir::WalkDir;
 use crate::config::JinaWebBackend;
 use crate::traits::Tool;
 use crate::NodeHandle;
+use crate::utils::{join_lexically_under_root, normalize_sandbox_relative_input};
 
 /// Maximum paths returned by `glob_files`.
 const MAX_GLOB_RESULTS: usize = 500;
@@ -20,12 +21,22 @@ const MAX_DIFF_OUTPUT_LINES: usize = 80;
 
 /// Resolves a path against the workspace and enforces boundary restrictions.
 pub fn resolve_path(path: &str, workspace_dir: &Path, restrict: bool) -> Result<PathBuf, String> {
-    // 1. Expand naive relativity to the workspace dir.
-    let base_path = Path::new(path);
+    // 1. Expand naive relativity to the workspace dir. When restricted, resolve `.` / `..`
+    // lexically under the workspace root so `..` at the root stays inside (does not canonicalize
+    // to the parent directory and fail the boundary check). Strip a leading `workspace/` segment
+    // when it duplicates the sandbox directory name (models often pass `workspace/foo` while the
+    // tool root is already `.../workspace`).
+    let trimmed = path.trim();
+    let base_path = Path::new(trimmed);
     let resolved = if base_path.is_absolute() {
         base_path.to_path_buf()
     } else {
-        workspace_dir.join(base_path)
+        let rel = normalize_sandbox_relative_input(workspace_dir, trimmed);
+        if restrict {
+            join_lexically_under_root(workspace_dir, &rel)?
+        } else {
+            workspace_dir.join(rel)
+        }
     };
 
     // 2. Canonicalize if it exists to cleanly remove `..` and `.`.
@@ -2059,6 +2070,48 @@ impl Tool for FetchMemoryByDateTool {
                 results.join("\n\n---\n\n")
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod resolve_path_tests {
+    use super::resolve_path;
+    use std::fs;
+
+    #[test]
+    fn parent_dir_at_workspace_root_stays_inside() {
+        let tmp = std::env::temp_dir().join(format!("isanagent_rp_{}", uuid::Uuid::new_v4()));
+        let ws = tmp.join("workspace");
+        fs::create_dir_all(&ws).unwrap();
+        let canon = ws.canonicalize().unwrap();
+        let got = resolve_path("..", &canon, true).unwrap();
+        assert_eq!(got, canon, "expected .. to clamp to workspace root");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn multiple_parents_clamp_to_workspace_root() {
+        let tmp = std::env::temp_dir().join(format!("isanagent_rp2_{}", uuid::Uuid::new_v4()));
+        let ws = tmp.join("workspace");
+        fs::create_dir_all(ws.join("nested")).unwrap();
+        let canon = ws.canonicalize().unwrap();
+        let got = resolve_path("nested/../../..", &canon, true).unwrap();
+        assert_eq!(got, canon);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Models often pass `workspace/foo` while the tool root is already `.../workspace`.
+    #[test]
+    fn strips_redundant_workspace_prefix_when_sandbox_leaf_matches() {
+        let tmp = std::env::temp_dir().join(format!("isanagent_rp3_{}", uuid::Uuid::new_v4()));
+        let ws = tmp.join("workspace");
+        fs::create_dir_all(ws.join("pkg")).unwrap();
+        let f = ws.join("pkg").join("t.txt");
+        fs::write(&f, "ok").unwrap();
+        let canon = ws.canonicalize().unwrap();
+        let got = resolve_path("workspace/pkg/t.txt", &canon, true).unwrap();
+        assert_eq!(got, f.canonicalize().unwrap());
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
 

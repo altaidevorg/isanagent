@@ -563,7 +563,11 @@ impl Tool for ExecutionEnvInfoTool {
         });
         let probe = tokio::task::spawn_blocking({
             let exe = exe.to_string();
-            move || std::process::Command::new(&exe).arg("-V").output()
+            move || {
+                crate::execution::build_python_host_command(&exe)
+                    .arg("-V")
+                    .output()
+            }
         })
         .await
         .map_err(|e| e.to_string())?;

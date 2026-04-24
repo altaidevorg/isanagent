@@ -376,8 +376,11 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     let tool_count = tool_names_list.len();
 
     // 7. Create Agent Logic
-    let max_iterations = workspace.config.max_iterations.unwrap_or(50);
-    let max_tool_output_chars = workspace.config.max_tool_output_chars.unwrap_or(3000);
+    let max_iterations = workspace.config.resolved_max_iterations().unwrap_or(50);
+    let max_tool_output_chars = workspace
+        .config
+        .resolved_max_tool_output_chars()
+        .unwrap_or(3000);
     let max_recent_summaries = workspace
         .config
         .memory

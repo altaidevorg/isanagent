@@ -122,6 +122,21 @@ while 1:
  sys.stdout.buffer.flush()
 "#;
 
+/// Host `python` invocation for REPL and subprocess runs. On Windows, bare `python` / `python3`
+/// often resolve to Store stubs that exit immediately; use the `py -3` launcher instead.
+pub fn build_python_host_command(executable: &str) -> StdCommand {
+    let ex = executable.trim();
+    #[cfg(windows)]
+    {
+        if ex.eq_ignore_ascii_case("python") || ex.eq_ignore_ascii_case("python3") {
+            let mut c = StdCommand::new("py");
+            c.arg("-3");
+            return c;
+        }
+    }
+    StdCommand::new(ex)
+}
+
 impl LocalExecutionProvider {
     pub fn new(config: LocalExecutionConfig) -> Result<Self, ExecutionError> {
         let sandbox = &config.sandbox_dir;
@@ -232,7 +247,7 @@ impl LocalExecutionProvider {
             if let Some(mut old) = slot.take() {
                 let _ = old.child.kill().await;
             }
-            let mut cmd = Command::new(executable);
+            let mut cmd = Command::from(build_python_host_command(executable));
             cmd.arg("-u").arg("-c").arg(PYTHON_REPL_BOOTSTRAP);
             cmd.current_dir(&cwd);
             cmd.stdin(Stdio::piped());
@@ -690,7 +705,7 @@ fn build_command(
 ) -> Result<(Command, Option<Vec<u8>>), ExecutionError> {
     let (c, stdin) = match mode {
         LocalExecMode::Python { executable, .. } => {
-            let mut c = Command::new(executable);
+            let mut c = Command::from(build_python_host_command(executable));
             // Unbuffered; code is sent on stdin to avoid command-line length limits.
             c.arg("-u").arg("-");
             (c, Some(code.as_bytes().to_vec()))

@@ -35,7 +35,9 @@ pub use error::ExecutionError;
 pub use harness::{build_execution_harness, ExecutionHarness};
 pub use ids::SessionId;
 pub use jupyter::{JupyterExecutionProvider, JupyterExecutionProviderConfig};
-pub use local::{LocalExecMode, LocalExecutionConfig, LocalExecutionProvider};
+pub use local::{
+    build_python_host_command, LocalExecMode, LocalExecutionConfig, LocalExecutionProvider,
+};
 pub use preflight::{allowed_optional_tool_tags, PREFLIGHT_MARKDOWN};
 pub use provider::{ExecutionProvider, PackageOperations, SshRemoteShell};
 pub use run::{
