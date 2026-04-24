@@ -59,6 +59,23 @@ async fn append_execution_manifest(
     Ok(())
 }
 
+/// Arguments for [`persist_successful_execution_run`].
+pub struct PersistSuccessfulExecutionRunParams<'a> {
+    pub harness: &'a ExecutionHarness,
+    pub outbound_tx: &'a mpsc::Sender<BusMessage>,
+    pub provider_id: &'a str,
+    pub sid: &'a SessionId,
+    pub run_id: &'a str,
+    pub code: &'a str,
+    pub result: &'a RunResult,
+    pub started_ts: &'a str,
+    pub chat_id: &'a str,
+    pub channel: &'a str,
+    pub duration_ms: u64,
+    pub job_id: Option<&'a str>,
+    pub run_description: Option<&'a str>,
+}
+
 fn best_effort_git_head(workspace_dir: &Path) -> Option<String> {
     let out = std::process::Command::new("git")
         .args(["-C", workspace_dir.to_str()?, "rev-parse", "HEAD"])
@@ -76,21 +93,23 @@ fn best_effort_git_head(workspace_dir: &Path) -> Option<String> {
 }
 
 /// Run journal, `execution_runs.jsonl` line, and `ExecutionRunFinished` telemetry.
-pub async fn persist_successful_execution_run(
-    harness: &ExecutionHarness,
-    outbound_tx: &mpsc::Sender<BusMessage>,
-    provider_id: &str,
-    sid: &SessionId,
-    run_id: &str,
-    code: &str,
-    result: &RunResult,
-    started_ts: &str,
-    chat_id: &str,
-    channel: &str,
-    duration_ms: u64,
-    job_id: Option<&str>,
-    run_description: Option<&str>,
-) {
+pub async fn persist_successful_execution_run(p: PersistSuccessfulExecutionRunParams<'_>) {
+    let PersistSuccessfulExecutionRunParams {
+        harness,
+        outbound_tx,
+        provider_id,
+        sid,
+        run_id,
+        code,
+        result,
+        started_ts,
+        chat_id,
+        channel,
+        duration_ms,
+        job_id,
+        run_description,
+    } = p;
+
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let git_head = best_effort_git_head(harness.workspace_dir());
 

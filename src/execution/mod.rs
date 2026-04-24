@@ -34,14 +34,16 @@ pub use capabilities::{
     NetworkPolicy, ProviderCapabilities, ProviderCapabilitiesSnapshot, SessionCapabilities,
 };
 pub use error::ExecutionError;
-pub use execution_jobs::{job_status_str, ExecutionJobManager, ExecutionJobRecord};
+pub use execution_jobs::{
+    job_status_str, ExecutionJobManager, ExecutionJobRecord, SpawnBackgroundRunRequest,
+};
 pub use harness::{build_execution_harness, ExecutionHarness};
 pub use ids::SessionId;
 pub use jupyter::{JupyterExecutionProvider, JupyterExecutionProviderConfig};
 pub use local::{
     build_python_host_command, LocalExecMode, LocalExecutionConfig, LocalExecutionProvider,
 };
-pub use post_run::persist_successful_execution_run;
+pub use post_run::{persist_successful_execution_run, PersistSuccessfulExecutionRunParams};
 pub use preflight::{allowed_optional_tool_tags, PREFLIGHT_MARKDOWN};
 pub use provider::{ExecutionProvider, PackageOperations, SshRemoteShell};
 pub use run::{

@@ -13,7 +13,8 @@ use crate::bus::BusMessage;
 use crate::channels::terminal::build_execution_stream_notice;
 use crate::execution::{
     persist_successful_execution_run, sanitize_session_segment, CwdPolicy, ExecutionError,
-    ExecutionHarness, ExecutionJobManager, RunEvent, RunSpec, SessionCreateRequest, SessionId,
+    ExecutionHarness, ExecutionJobManager, PersistSuccessfulExecutionRunParams, RunEvent, RunSpec,
+    SessionCreateRequest, SessionId, SpawnBackgroundRunRequest,
 };
 use crate::tool_runtime::current_tool_exec_ctx;
 use crate::traits::Tool;
@@ -254,21 +255,21 @@ impl Tool for ExecutionRunTool {
             artifact_count
         );
 
-        persist_successful_execution_run(
-            self.harness.as_ref(),
-            &self.outbound_tx,
-            prov,
-            &sid,
-            &run_id,
-            &code,
-            &result,
-            &started_ts,
-            &chat_id,
-            &channel,
+        persist_successful_execution_run(PersistSuccessfulExecutionRunParams {
+            harness: self.harness.as_ref(),
+            outbound_tx: &self.outbound_tx,
+            provider_id: prov,
+            sid: &sid,
+            run_id: &run_id,
+            code: &code,
+            result: &result,
+            started_ts: &started_ts,
+            chat_id: &chat_id,
+            channel: &channel,
             duration_ms,
-            None,
-            run_description.as_deref(),
-        )
+            job_id: None,
+            run_description: run_description.as_deref(),
+        })
         .await;
 
         serde_json::to_string_pretty(&result).map_err(|e| e.to_string())
@@ -327,8 +328,8 @@ impl Tool for ExecutionRunBackgroundTool {
         let (chat_id, channel) = current_tool_exec_ctx()
             .map(|c| (c.chat_id.clone(), c.channel.clone()))
             .unwrap_or_else(|| (String::new(), String::new()));
-        let job_id = self.jobs.spawn_run(
-            sid.clone(),
+        let job_id = self.jobs.spawn_run(SpawnBackgroundRunRequest {
+            sid: sid.clone(),
             code,
             timeout_secs,
             cwd,
@@ -336,7 +337,7 @@ impl Tool for ExecutionRunBackgroundTool {
             run_description,
             chat_id,
             channel,
-        )?;
+        })?;
         let v = json!({
             "job_id": job_id,
             "session_id": sid.to_string(),

@@ -16,7 +16,7 @@ use tokio::sync::{mpsc, RwLock};
 use crate::bus::{BusMessage, TelemetryEvent};
 use crate::channels::terminal::{build_execution_job_notice, build_execution_stream_notice};
 use crate::execution::error::ExecutionError;
-use crate::execution::persist_successful_execution_run;
+use crate::execution::{persist_successful_execution_run, PersistSuccessfulExecutionRunParams};
 use crate::execution::{CwdPolicy, ExecutionHarness, RunEvent, RunResult, RunSpec, SessionId};
 
 const JOB_RUNNING: u8 = 1;
@@ -102,36 +102,37 @@ async fn append_job_audit_line(
     Ok(())
 }
 
-async fn send_job_finished(
-    tx: &mpsc::Sender<BusMessage>,
-    chat_id: &str,
-    channel: &str,
-    job_id: &str,
-    session_id: &str,
-    provider_id: &str,
-    status: &str,
+struct JobFinishedTelemetry<'a> {
+    chat_id: &'a str,
+    channel: &'a str,
+    job_id: &'a str,
+    session_id: &'a str,
+    provider_id: &'a str,
+    status: &'a str,
     duration_ms: u64,
     exit_code: Option<i32>,
     stdout_len: usize,
     stderr_len: usize,
     artifact_count: usize,
     description: Option<String>,
-) {
+}
+
+async fn send_job_finished(tx: &mpsc::Sender<BusMessage>, msg: JobFinishedTelemetry<'_>) {
     let _ = tx
         .send(BusMessage::Telemetry(
             TelemetryEvent::ExecutionJobFinished {
-                chat_id: chat_id.to_string(),
-                channel: channel.to_string(),
-                job_id: job_id.to_string(),
-                session_id: session_id.to_string(),
-                provider_id: provider_id.to_string(),
-                status: status.to_string(),
-                duration_ms,
-                exit_code,
-                stdout_len,
-                stderr_len,
-                artifact_count,
-                description,
+                chat_id: msg.chat_id.to_string(),
+                channel: msg.channel.to_string(),
+                job_id: msg.job_id.to_string(),
+                session_id: msg.session_id.to_string(),
+                provider_id: msg.provider_id.to_string(),
+                status: msg.status.to_string(),
+                duration_ms: msg.duration_ms,
+                exit_code: msg.exit_code,
+                stdout_len: msg.stdout_len,
+                stderr_len: msg.stderr_len,
+                artifact_count: msg.artifact_count,
+                description: msg.description,
             },
         ))
         .await;
@@ -171,6 +172,19 @@ struct ExecutionJobManagerInner {
     jobs: DashMap<String, Arc<ExecutionJobRecord>>,
     session_busy: Arc<DashMap<String, ()>>,
     max_jobs: usize,
+}
+
+/// Arguments for [`ExecutionJobManager::spawn_run`].
+#[derive(Debug)]
+pub struct SpawnBackgroundRunRequest {
+    pub sid: SessionId,
+    pub code: String,
+    pub timeout_secs: u64,
+    pub cwd: CwdPolicy,
+    pub label: Option<String>,
+    pub run_description: Option<String>,
+    pub chat_id: String,
+    pub channel: String,
 }
 
 /// Process-local registry for background runs.
@@ -355,17 +369,18 @@ impl ExecutionJobManager {
     }
 
     /// Returns `job_id` immediately; the run executes on a Tokio task. One active job (or synchronous run) per session.
-    pub fn spawn_run(
-        &self,
-        sid: SessionId,
-        code: String,
-        timeout_secs: u64,
-        cwd: CwdPolicy,
-        label: Option<String>,
-        run_description: Option<String>,
-        chat_id: String,
-        channel: String,
-    ) -> Result<String, String> {
+    pub fn spawn_run(&self, req: SpawnBackgroundRunRequest) -> Result<String, String> {
+        let SpawnBackgroundRunRequest {
+            sid,
+            code,
+            timeout_secs,
+            cwd,
+            label,
+            run_description,
+            chat_id,
+            channel,
+        } = req;
+
         self.evict_terminal_jobs_if_at_cap();
         if self.inner.jobs.len() >= self.inner.max_jobs {
             return Err(format!(
@@ -466,36 +481,38 @@ impl ExecutionJobManager {
                     rec.finished_unix_ms.store(now_unix_ms(), Ordering::Release);
                     rec.status.store(JOB_COMPLETED, Ordering::Release);
                     *rec.result.write().await = Some(result.clone());
-                    persist_successful_execution_run(
-                        inner.harness.as_ref(),
-                        &inner.outbound_tx,
-                        &prov,
-                        &sid_spawn,
-                        &run_id,
-                        &code,
-                        &result,
-                        &started_ts,
-                        &chat_id,
-                        &channel,
+                    persist_successful_execution_run(PersistSuccessfulExecutionRunParams {
+                        harness: inner.harness.as_ref(),
+                        outbound_tx: &inner.outbound_tx,
+                        provider_id: &prov,
+                        sid: &sid_spawn,
+                        run_id: &run_id,
+                        code: &code,
+                        result: &result,
+                        started_ts: &started_ts,
+                        chat_id: &chat_id,
+                        channel: &channel,
                         duration_ms,
-                        Some(job_id_for_task.as_str()),
-                        rec.description.as_deref(),
-                    )
+                        job_id: Some(job_id_for_task.as_str()),
+                        run_description: rec.description.as_deref(),
+                    })
                     .await;
                     send_job_finished(
                         &inner.outbound_tx,
-                        &chat_id,
-                        &channel,
-                        &job_id_for_task,
-                        &sid_spawn.to_string(),
-                        &prov,
-                        "completed",
-                        duration_ms,
-                        result.exit_code,
-                        result.stdout.len(),
-                        result.stderr.len(),
-                        result.attachments.len(),
-                        rec.description.clone(),
+                        JobFinishedTelemetry {
+                            chat_id: &chat_id,
+                            channel: &channel,
+                            job_id: &job_id_for_task,
+                            session_id: &sid_spawn.to_string(),
+                            provider_id: &prov,
+                            status: "completed",
+                            duration_ms,
+                            exit_code: result.exit_code,
+                            stdout_len: result.stdout.len(),
+                            stderr_len: result.stderr.len(),
+                            artifact_count: result.attachments.len(),
+                            description: rec.description.clone(),
+                        },
                     )
                     .await;
                     let exit_s = format_exit_for_user(result.exit_code);
@@ -557,18 +574,20 @@ impl ExecutionJobManager {
                     *rec.error.write().await = Some(es.clone());
                     send_job_finished(
                         &inner.outbound_tx,
-                        &chat_id,
-                        &channel,
-                        &job_id_for_task,
-                        &sid_spawn.to_string(),
-                        &prov,
-                        status_label,
-                        duration_ms,
-                        None,
-                        0,
-                        0,
-                        0,
-                        rec.description.clone(),
+                        JobFinishedTelemetry {
+                            chat_id: &chat_id,
+                            channel: &channel,
+                            job_id: &job_id_for_task,
+                            session_id: &sid_spawn.to_string(),
+                            provider_id: &prov,
+                            status: status_label,
+                            duration_ms,
+                            exit_code: None,
+                            stdout_len: 0,
+                            stderr_len: 0,
+                            artifact_count: 0,
+                            description: rec.description.clone(),
+                        },
                     )
                     .await;
                     let summary = match rec
