@@ -187,6 +187,15 @@ cargo run --release -p isanagent -- --workspace /path/to/my_agent
 
 Ensure your **`[provider]`** API key env is set. The model should see the execution tools in its tool list once enabled.
 
+The Ratatui alternate-screen UI includes:
+
+- **Transcript** — conversation cells (you, agent, tool lines, errors). Slash commands such as **`/help`**, **`/tools`**, **`/copy`**, **`/new`**, **`/exit`** apply here.  
+- **Tool activity** — press **Tab** or **Ctrl+T** (or run **`/tools`**) to focus a scrollable pane of recent tool calls and outcomes (ring buffer, capped in the client). **PgUp** / **PgDn** and the mouse wheel scroll whichever pane is focused.  
+- **Active tool** strip — one line above **compose** shows the in-flight tool call preview when the model invokes a tool, then **Idle (no running tool)** after the result or when a normal assistant reply arrives.  
+- **Execution strip** — while Jupyter **`execution_run`** is active, stream events still appear in the **execution (jupyter)** block; background job summaries use human-readable exit text (no `Some(0)`-style debug).
+
+**`NO_COLOR`:** if this environment variable is set to any non-empty value, the TUI disables ANSI foreground colors (labels and borders stay readable; see `init_from_env` / `uses_ansi_color` in the terminal UI theme).
+
 ## Roadmap (where this doc stays in sync)
 
 - **Implemented:** Jupyter provider (`execution-implementation-plan.md` Phase 3); SSH MVP (`execution-implementation-plan.md` Phase 4); Phase 6 artifacts, **`execution_artifact_list`**, run manifest (`execution_runs.jsonl`), telemetry **`ExecutionRunFinished`**, background jobs (**`execution_run_background`**, **`execution_jobs.jsonl`**, **`ExecutionJobFinished`**), and **`doom_loop_enabled`**.  

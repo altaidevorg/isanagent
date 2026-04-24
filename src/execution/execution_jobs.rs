@@ -43,6 +43,15 @@ pub fn job_status_str(s: u8) -> &'static str {
     }
 }
 
+/// Human-facing exit code text (never `Debug` on `Option`).
+fn format_exit_for_user(code: Option<i32>) -> String {
+    match code {
+        None => "none".to_string(),
+        Some(0) => "0".to_string(),
+        Some(n) => format!("exit {n}"),
+    }
+}
+
 struct SessionBusyDrop {
     map: Arc<DashMap<String, ()>>,
     key: String,
@@ -476,14 +485,15 @@ impl ExecutionJobManager {
                         rec.description.clone(),
                     )
                     .await;
+                    let exit_s = format_exit_for_user(result.exit_code);
                     let summary = match rec.description.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                         Some(d) => format!(
-                            "{} — completed (exit {:?}, {} ms)",
-                            d, result.exit_code, duration_ms
+                            "{} — completed (exit {}, {} ms)",
+                            d, exit_s, duration_ms
                         ),
                         None => format!(
-                            "Execution job {} completed (exit {:?}, {} ms)",
-                            job_id_for_task, result.exit_code, duration_ms
+                            "Execution job {} completed (exit {}, {} ms)",
+                            job_id_for_task, exit_s, duration_ms
                         ),
                     };
                     let notice = build_execution_job_notice(

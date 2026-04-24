@@ -13,3 +13,9 @@ pub const METADATA_EXECUTION_JOB_ID: &str = "execution_job_id";
 pub const METADATA_EXECUTION_JOB_STATUS: &str = "execution_job_status";
 /// Short human-facing line for Ratatui execution strip (optional on stream/job notices).
 pub const METADATA_EXECUTION_DESCRIPTION: &str = "execution_description";
+/// Tool name for Ratatui tool rail / transcript previews (paired with `isanagent_tool_notify`).
+pub const METADATA_TOOL_NAME: &str = "isanagent_tool_name";
+/// Short args preview (no raw JSON dump) for tool call notices.
+pub const METADATA_TOOL_CALL_PREVIEW: &str = "isanagent_tool_call_preview";
+/// Short result summary for tool result / fail notices.
+pub const METADATA_TOOL_RESULT_PREVIEW: &str = "isanagent_tool_result_preview";

@@ -25,10 +25,12 @@ use crate::channels::terminal_ui::markdown;
 use crate::channels::terminal_ui::protocol::{
     ISANAGENT_AGENT_THOUGHT, ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_STREAM,
     ISANAGENT_TERMINAL_ERROR, METADATA_EXECUTION_DESCRIPTION, METADATA_EXECUTION_JOB_ID,
-    METADATA_EXECUTION_RUN_ID, METADATA_EXECUTION_SESSION_ID,
+    METADATA_EXECUTION_RUN_ID, METADATA_EXECUTION_SESSION_ID, METADATA_TOOL_CALL_PREVIEW,
+    METADATA_TOOL_NAME, METADATA_TOOL_RESULT_PREVIEW,
 };
 use crate::channels::terminal_ui::{
-    init_from_env, uses_ansi_color, App, Cell, Theme, ToastKind, ToolNoticePhase,
+    init_from_env, uses_ansi_color, App, Cell, TerminalUiFocus, Theme, ToastKind, ToolNoticePhase,
+    ToolRailEntry,
 };
 use crate::clarification::{METADATA_CLARIFICATION, METADATA_CLARIFICATION_CHOICES};
 
@@ -64,12 +66,14 @@ const TERMINAL_HELP: &str = r#"Commands (leading slash):
   /exit, /quit   Quit and restore the terminal
   /new           Start a new session (new chat id)
   /copy          Copy the last assistant reply to the clipboard
+  /tools         Open the tool activity pane (same as Tab)
   /help, /?      Show this help
 
 Keys:
   Enter             Send the compose line
-  PgUp / PgDn       Scroll the transcript
-  Mouse wheel       Scroll when the pointer is over the transcript (horizontal wheel scrolls too)
+  Tab / Ctrl+T      Switch focus: transcript <-> tool activity
+  PgUp / PgDn       Scroll the focused pane (transcript or tool activity)
+  Mouse wheel       Scroll when the pointer is over the focused pane (horizontal wheel scrolls too)
   Ctrl+Shift+Y      Copy last assistant reply
   Ctrl+W / Ctrl+U   Delete word / clear line
   Ctrl+C            Exit (same idea as /exit)
@@ -79,6 +83,69 @@ Environment:
 "#;
 
 /// Coalesce consecutive model-thought lines into one cell (streaming-style UX).
+fn tool_notice_display_content(msg: &OutboundMessage, phase_str: &str) -> String {
+    let tn = msg
+        .metadata
+        .get(METADATA_TOOL_NAME)
+        .and_then(|v| v.as_str());
+    match (tn, phase_str) {
+        (Some(name), "call") => msg
+            .metadata
+            .get(METADATA_TOOL_CALL_PREVIEW)
+            .and_then(|v| v.as_str())
+            .map(|pv| {
+                if pv.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{name} {pv}")
+                }
+            })
+            .unwrap_or_else(|| msg.content.clone()),
+        (Some(name), "result" | "fail") => msg
+            .metadata
+            .get(METADATA_TOOL_RESULT_PREVIEW)
+            .and_then(|v| v.as_str())
+            .map(|pv| format!("{name} → {pv}"))
+            .unwrap_or_else(|| msg.content.clone()),
+        _ => msg.content.clone(),
+    }
+}
+
+fn apply_terminal_tool_aux(app: &mut App, msg: &OutboundMessage) {
+    let phase_str = msg
+        .metadata
+        .get(ISANAGENT_TOOL_PHASE)
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let ph = match phase_str {
+        "call" => ToolNoticePhase::Call,
+        "result" => ToolNoticePhase::Result,
+        "fail" => ToolNoticePhase::Failed,
+        _ => ToolNoticePhase::Other,
+    };
+    let display = tool_notice_display_content(msg, phase_str);
+    let tool_name = msg
+        .metadata
+        .get(METADATA_TOOL_NAME)
+        .and_then(|v| v.as_str())
+        .unwrap_or("tool")
+        .to_string();
+    app.push_tool_rail(ToolRailEntry {
+        tool_name,
+        phase: ph,
+        summary: display.clone(),
+    });
+    match phase_str {
+        "call" => {
+            app.active_tool_line = Some(display);
+        }
+        "result" | "fail" => {
+            app.active_tool_line = None;
+        }
+        _ => {}
+    }
+}
+
 fn append_cell_merging_thought(cells: &mut Vec<Cell>, cell: Cell) {
     match (&cell, cells.last_mut()) {
         (Cell::Thinking { text: new_t }, Some(Cell::Thinking { text: acc })) => {
@@ -135,10 +202,8 @@ fn outbound_to_cell(msg: &OutboundMessage) -> Cell {
             "fail" => ToolNoticePhase::Failed,
             _ => ToolNoticePhase::Other,
         };
-        Cell::ToolNotice {
-            phase: ph,
-            content: msg.content.clone(),
-        }
+        let content = tool_notice_display_content(msg, phase);
+        Cell::ToolNotice { phase: ph, content }
     } else if clarification {
         let choices = msg
             .metadata
@@ -322,7 +387,7 @@ fn flatten_cells_to_lines(cells: &[Cell], inner_width: usize) -> Vec<Line<'stati
     lines
 }
 
-fn layout_chunks(area: Rect, exec_panel_h: u16) -> [Rect; 5] {
+fn layout_chunks(area: Rect, exec_panel_h: u16, active_tool_h: u16) -> [Rect; 6] {
     let exec_constraint = if exec_panel_h > 0 {
         Constraint::Length(exec_panel_h)
     } else {
@@ -336,10 +401,18 @@ fn layout_chunks(area: Rect, exec_panel_h: u16) -> [Rect; 5] {
             Constraint::Min(4),
             exec_constraint,
             Constraint::Length(1),
+            Constraint::Length(active_tool_h),
             Constraint::Length(3),
         ])
         .split(area);
-    [chunks[0], chunks[1], chunks[2], chunks[3], chunks[4]]
+    [
+        chunks[0],
+        chunks[1],
+        chunks[2],
+        chunks[3],
+        chunks[4],
+        chunks[5],
+    ]
 }
 
 fn chunks_line_width(spans: &[Span<'static>]) -> usize {
@@ -442,7 +515,7 @@ fn build_title_line(max_width: usize) -> Line<'static> {
             dim,
         )],
         vec![Span::styled(
-            "· /exit · /new · /copy · /help · ↑↓ · wheel · PgUp/PgDn",
+            "· /exit · /new · /copy · /tools · /help · Tab · ↑↓ · wheel · PgUp/PgDn",
             dim,
         )],
     ];
@@ -519,6 +592,64 @@ fn transcript_paragraph(
     let block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(" transcript ", Theme::dim()))
+        .border_style(Theme::dim());
+    (Paragraph::new(Text::from(slice)).block(block), max_scroll)
+}
+
+fn tool_history_paragraph(
+    entries: &[ToolRailEntry],
+    area: Rect,
+    scroll_from_bottom: u16,
+) -> (Paragraph<'static>, u16) {
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No tool calls yet. Invoke the agent with tools enabled to see activity here.",
+            Theme::dim(),
+        )));
+    } else {
+        for e in entries {
+            let label_style = match e.phase {
+                ToolNoticePhase::Call => Theme::tool_call().add_modifier(Modifier::BOLD),
+                ToolNoticePhase::Result => Theme::tool_done().add_modifier(Modifier::BOLD),
+                ToolNoticePhase::Failed => Theme::error().add_modifier(Modifier::BOLD),
+                ToolNoticePhase::Other => Theme::tool_call().add_modifier(Modifier::BOLD),
+            };
+            let label = match e.phase {
+                ToolNoticePhase::Call => "call",
+                ToolNoticePhase::Result => "done",
+                ToolNoticePhase::Failed => "fail",
+                ToolNoticePhase::Other => "tool",
+            };
+            let body_w = inner_w.max(8).saturating_sub(8);
+            let wrapped = wrap_text(&e.summary, body_w);
+            for (i, seg) in wrapped.into_iter().enumerate() {
+                if i == 0 {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!(" {label} "), label_style),
+                        Span::styled(seg, Theme::text()),
+                    ]));
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        format!("       {seg}"),
+                        Theme::dim(),
+                    )));
+                }
+            }
+        }
+    }
+    let visible = area.height.saturating_sub(2) as usize;
+    let total = lines.len();
+    let max_scroll = total.saturating_sub(visible).min(u16::MAX as usize) as u16;
+    let start = total
+        .saturating_sub(visible)
+        .saturating_sub(scroll_from_bottom as usize);
+    let take = visible.max(1);
+    let slice: Vec<Line<'static>> = lines.into_iter().skip(start).take(take).collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(" tool activity ", Theme::tool_call()))
         .border_style(Theme::dim());
     (Paragraph::new(Text::from(slice)).block(block), max_scroll)
 }
@@ -699,7 +830,8 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
     });
 
     let tick = Duration::from_millis(80);
-    let max_scroll_holder = std::cell::Cell::new(0u16);
+    let max_transcript_scroll_holder = std::cell::Cell::new(0u16);
+    let max_tool_history_scroll_holder = std::cell::Cell::new(0u16);
 
     loop {
         app.clear_expired_toast();
@@ -725,6 +857,18 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             }
             if outbound_clears_thinking(&msg) {
                 app.thinking = false;
+                app.active_tool_line = None;
+            }
+            let is_tool_notify = msg
+                .metadata
+                .get(ISANAGENT_TOOL_NOTIFY)
+                .and_then(|v| v.as_bool())
+                == Some(true);
+            if is_tool_notify {
+                apply_terminal_tool_aux(&mut app, &msg);
+                if app.ui_focus == TerminalUiFocus::ToolHistory && app.tool_history_following_tail() {
+                    app.tool_history_scroll = 0;
+                }
             }
             let cell = outbound_to_cell(&msg);
             append_cell_merging_thought(&mut app.cells, cell);
@@ -744,17 +888,31 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             } else {
                 (area.height.saturating_mul(18) / 100).clamp(6, 18)
             };
-            let ch = layout_chunks(area, exec_h);
+            let active_strip_h: u16 = 1;
+            let ch = layout_chunks(area, exec_h, active_strip_h);
 
             let title_w = ch[0].width as usize;
             let title = Paragraph::new(build_title_line(title_w.max(1)));
             f.render_widget(title, ch[0]);
 
-            let (transcript_widget, max_s) =
-                transcript_paragraph(&app.cells, ch[1], app.scroll_offset);
-            max_scroll_holder.set(max_s);
-            f.render_widget(transcript_widget, ch[1]);
-            app.last_transcript_rect = Some(ch[1]);
+            match app.ui_focus {
+                TerminalUiFocus::Transcript => {
+                    let (w, max_s) =
+                        transcript_paragraph(&app.cells, ch[1], app.scroll_offset);
+                    max_transcript_scroll_holder.set(max_s);
+                    f.render_widget(w, ch[1]);
+                    app.last_transcript_rect = Some(ch[1]);
+                    app.last_tool_history_rect = None;
+                }
+                TerminalUiFocus::ToolHistory => {
+                    let (w, max_s) =
+                        tool_history_paragraph(&app.tool_rail, ch[1], app.tool_history_scroll);
+                    max_tool_history_scroll_holder.set(max_s);
+                    f.render_widget(w, ch[1]);
+                    app.last_tool_history_rect = Some(ch[1]);
+                    app.last_transcript_rect = None;
+                }
+            }
 
             if exec_h > 0 {
                 let exec_block = Block::default()
@@ -778,6 +936,16 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             let status_w = Paragraph::new(status_line);
             f.render_widget(status_w, ch[3]);
 
+            let active_w = ch[4].width as usize;
+            let idle = "Idle (no running tool)";
+            let active_text = app.active_tool_line.as_deref().unwrap_or(idle);
+            let t = truncate_chars_display(active_text, active_w.max(8).saturating_sub(6));
+            let active_row = Line::from(vec![
+                Span::styled(" tool ", Theme::tool_call()),
+                Span::styled(t, Theme::dim()),
+            ]);
+            f.render_widget(Paragraph::new(active_row), ch[4]);
+
             let input_block = Block::default()
                 .borders(Borders::ALL)
                 .title(Span::styled(" compose ", Theme::dim()))
@@ -787,9 +955,9 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 Span::styled(app.input.as_str(), Theme::text()),
             ]))
             .block(input_block);
-            f.render_widget(input_para, ch[4]);
+            f.render_widget(input_para, ch[5]);
 
-            let inner_area = ch[4].inner(Margin::new(1, 1));
+            let inner_area = ch[5].inner(Margin::new(1, 1));
             let prefix_w = crate::channels::terminal_ui::display_width("> ")
                 + crate::channels::terminal_ui::display_width(
                     &app.input[..app.cursor.min(app.input.len())],
@@ -801,9 +969,13 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             f.set_cursor_position((cx, cy));
         })?;
 
-        app.max_scroll = max_scroll_holder.get();
+        app.max_scroll = max_transcript_scroll_holder.get();
+        app.tool_history_max_scroll = max_tool_history_scroll_holder.get();
         if app.scroll_offset > app.max_scroll {
             app.scroll_offset = app.max_scroll;
+        }
+        if app.tool_history_scroll > app.tool_history_max_scroll {
+            app.tool_history_scroll = app.tool_history_max_scroll;
         }
 
         if !event::poll(tick)? {
@@ -868,8 +1040,12 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             });
                             continue;
                         }
+                        if text.eq_ignore_ascii_case("/tools") {
+                            app.focus_tool_history();
+                            continue;
+                        }
                         app.cells.push(Cell::System {
-                            message: "Unknown command. Try /help, /exit, /new, /copy.".into(),
+                            message: "Unknown command. Try /help, /exit, /new, /copy, /tools.".into(),
                         });
                         continue;
                     }
@@ -908,8 +1084,40 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 KeyCode::End => app.end(),
                 KeyCode::Up => app.history_up(),
                 KeyCode::Down => app.history_down(),
-                KeyCode::PageUp => app.scroll_up(8),
-                KeyCode::PageDown => app.scroll_down(8),
+                KeyCode::Tab => {
+                    app.toggle_ui_focus();
+                    if app.following_tail() {
+                        app.scroll_offset = 0;
+                    }
+                    if app.tool_history_following_tail() {
+                        app.tool_history_scroll = 0;
+                    }
+                }
+                KeyCode::Char('t') | KeyCode::Char('T')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    app.toggle_ui_focus();
+                    if app.following_tail() {
+                        app.scroll_offset = 0;
+                    }
+                    if app.tool_history_following_tail() {
+                        app.tool_history_scroll = 0;
+                    }
+                }
+                KeyCode::PageUp => {
+                    if app.ui_focus == TerminalUiFocus::ToolHistory {
+                        app.tool_history_scroll_up(8);
+                    } else {
+                        app.scroll_up(8);
+                    }
+                }
+                KeyCode::PageDown => {
+                    if app.ui_focus == TerminalUiFocus::ToolHistory {
+                        app.tool_history_scroll_down(8);
+                    } else {
+                        app.scroll_down(8);
+                    }
+                }
                 KeyCode::Char(c)
                     if matches!(c, 'y' | 'Y')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -943,6 +1151,10 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     .last_transcript_rect
                     .map(|r| rect_contains(r, me.column, me.row))
                     .unwrap_or(false);
+                let over_tool_history = app
+                    .last_tool_history_rect
+                    .map(|r| rect_contains(r, me.column, me.row))
+                    .unwrap_or(false);
                 if over_transcript {
                     match me.kind {
                         MouseEventKind::ScrollUp => app.scroll_up(MOUSE_SCROLL_LINES),
@@ -950,6 +1162,18 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         // Trackpads: horizontal wheel maps to vertical transcript scroll.
                         MouseEventKind::ScrollLeft => app.scroll_up(MOUSE_SCROLL_LINES),
                         MouseEventKind::ScrollRight => app.scroll_down(MOUSE_SCROLL_LINES),
+                        _ => {}
+                    }
+                } else if over_tool_history {
+                    match me.kind {
+                        MouseEventKind::ScrollUp => app.tool_history_scroll_up(MOUSE_SCROLL_LINES),
+                        MouseEventKind::ScrollDown => {
+                            app.tool_history_scroll_down(MOUSE_SCROLL_LINES)
+                        }
+                        MouseEventKind::ScrollLeft => app.tool_history_scroll_up(MOUSE_SCROLL_LINES),
+                        MouseEventKind::ScrollRight => {
+                            app.tool_history_scroll_down(MOUSE_SCROLL_LINES)
+                        }
                         _ => {}
                     }
                 }

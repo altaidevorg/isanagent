@@ -23,6 +23,24 @@ pub enum ToolNoticePhase {
     Other,
 }
 
+/// Which main pane has keyboard and scroll focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TerminalUiFocus {
+    #[default]
+    Transcript,
+    ToolHistory,
+}
+
+const TOOL_RAIL_CAP: usize = 150;
+
+/// One line in the tool-activity ring buffer (call / result / fail).
+#[derive(Debug, Clone)]
+pub struct ToolRailEntry {
+    pub tool_name: String,
+    pub phase: ToolNoticePhase,
+    pub summary: String,
+}
+
 /// One renderable unit in the transcript (Xerxes-style cell model: labeled blocks, tool rail).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cell {
@@ -80,6 +98,14 @@ pub struct App {
     pub streaming_thinking: String,
     pub streaming_assistant: String,
     pub active_tool_line: Option<String>,
+    pub ui_focus: TerminalUiFocus,
+    /// Recent tool telemetry (ring buffer, newest at end).
+    pub tool_rail: Vec<ToolRailEntry>,
+    /// Lines hidden below the tool-history viewport bottom (`0` = follow tail).
+    pub tool_history_scroll: u16,
+    /// Upper bound on `tool_history_scroll`, set from wrapped tool-rail line counts.
+    pub tool_history_max_scroll: u16,
+    pub last_tool_history_rect: Option<Rect>,
     /// Lines hidden below the viewport bottom. `0` = follow latest output.
     pub scroll_offset: u16,
     /// Upper bound on `scroll_offset`, set by the renderer from wrapped line counts.
@@ -114,6 +140,11 @@ impl App {
             streaming_thinking: String::new(),
             streaming_assistant: String::new(),
             active_tool_line: None,
+            ui_focus: TerminalUiFocus::default(),
+            tool_rail: Vec::new(),
+            tool_history_scroll: 0,
+            tool_history_max_scroll: 0,
+            last_tool_history_rect: None,
             scroll_offset: 0,
             max_scroll: 0,
             should_quit: false,
@@ -154,6 +185,41 @@ impl App {
 
     pub fn following_tail(&self) -> bool {
         self.scroll_offset == 0
+    }
+
+    pub fn toggle_ui_focus(&mut self) {
+        self.ui_focus = match self.ui_focus {
+            TerminalUiFocus::Transcript => TerminalUiFocus::ToolHistory,
+            TerminalUiFocus::ToolHistory => TerminalUiFocus::Transcript,
+        };
+        self.tool_history_scroll = 0;
+    }
+
+    pub fn focus_tool_history(&mut self) {
+        self.ui_focus = TerminalUiFocus::ToolHistory;
+        self.tool_history_scroll = 0;
+    }
+
+    pub fn tool_history_following_tail(&self) -> bool {
+        self.tool_history_scroll == 0
+    }
+
+    pub fn push_tool_rail(&mut self, entry: ToolRailEntry) {
+        self.tool_rail.push(entry);
+        while self.tool_rail.len() > TOOL_RAIL_CAP {
+            self.tool_rail.remove(0);
+        }
+    }
+
+    pub fn tool_history_scroll_up(&mut self, n: u16) {
+        self.tool_history_scroll = self
+            .tool_history_scroll
+            .saturating_add(n)
+            .min(self.tool_history_max_scroll);
+    }
+
+    pub fn tool_history_scroll_down(&mut self, n: u16) {
+        self.tool_history_scroll = self.tool_history_scroll.saturating_sub(n);
     }
 
     pub fn scroll_to_bottom(&mut self) {

@@ -238,11 +238,16 @@ impl Tool for ExecutionRunTool {
             .map_err(exec_err)?;
         let duration_ms = started.elapsed().as_millis() as u64;
         let artifact_count = result.attachments.len();
+        let exit_s = match result.exit_code {
+            None => "none".to_string(),
+            Some(0) => "0".to_string(),
+            Some(n) => format!("exit {n}"),
+        };
         info!(
-            "execution_run provider={} session={} exit={:?} stdout_len={} stderr_len={} duration_ms={} artifacts={}",
+            "execution_run provider={} session={} exit={} stdout_len={} stderr_len={} duration_ms={} artifacts={}",
             prov,
             sid,
-            result.exit_code,
+            exit_s,
             result.stdout.len(),
             result.stderr.len(),
             duration_ms,

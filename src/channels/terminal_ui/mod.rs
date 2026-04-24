@@ -10,7 +10,7 @@ pub(crate) mod protocol;
 mod run;
 mod theme;
 
-pub use app::{App, Cell, TerminalUiMode, ToastKind, ToolNoticePhase};
+pub use app::{App, Cell, TerminalUiFocus, TerminalUiMode, ToastKind, ToolNoticePhase, ToolRailEntry};
 pub use theme::{init_from_env, uses_ansi_color, Theme};
 
 pub(crate) use attachments::parse_terminal_attachments;
