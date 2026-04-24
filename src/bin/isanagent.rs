@@ -15,6 +15,7 @@ use isanagent::channels::{
     api::ApiChannel, email::EmailChannel, slack::SlackChannel, terminal::TerminalChannel, Channel,
 };
 use isanagent::clarification::ClarificationHub;
+use isanagent::execution::ExecutionJobManager;
 use isanagent::logging::{
     create_logger_channel, create_logging_actor_or_fallback, init_runtime_logger,
     LOGGER_QUEUE_CAPACITY,
@@ -34,11 +35,11 @@ use isanagent::tools::builtin::{
     CronTool, EditFileTool, GitWorktreeTool, GlobFilesTool, ListDirTool, MessageTool, ReadFileTool,
     SearchTextTool, ShellExecTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
-use isanagent::execution::ExecutionJobManager;
 use isanagent::tools::execution::{
     ExecutionArtifactListTool, ExecutionCancelTool, ExecutionEnvInfoTool, ExecutionJobCancelTool,
-    ExecutionJobListTool, ExecutionJobResultTool, ExecutionJobStatusTool, ExecutionRunBackgroundTool,
-    ExecutionRunTool, ExecutionSessionCloseTool, ExecutionSessionCreateTool,
+    ExecutionJobListTool, ExecutionJobResultTool, ExecutionJobStatusTool,
+    ExecutionRunBackgroundTool, ExecutionRunTool, ExecutionSessionCloseTool,
+    ExecutionSessionCreateTool,
 };
 use isanagent::tools::workflow::{AskUserTool, TodoWriteTool, ToolSearchTool};
 use isanagent::tools::ToolRegistry;

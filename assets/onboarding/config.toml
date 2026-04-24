@@ -6,6 +6,8 @@ max_tool_output_chars = 10000
 max_web_tool_output_chars = 50000
 
 # Local stdin/stdout chat. Set enabled = false for API-only or headless runs (requires another channel).
+# While a reply is in flight, further lines are queued (FIFO per chat). Use /cancel or /stop to abort
+# the current turn and discard queued prompts (see /help in the TUI).
 [terminal]
 enabled = true
 
@@ -64,10 +66,9 @@ max_recent_summaries = 5
 [harness.git_worktree]
 enabled = true
 
-# Phase 5: background sub-agents (separate reasoning loop per task). See docs/harness-implementation-plan.md.
 [harness.subagents]
 enabled = true
-# cancel_children_on_parent_cancel = false  # default true: new user message / cancel also stops sub-tasks
+# cancel_children_on_parent_cancel = false  # default true: explicit cancel (/cancel, BusMessage::Cancel) also stops sub-tasks
 # allowed_tools = ["read_file", "glob_files", "search_text", "edit_file"]  # omit = all tools except nested spawn/plan
 
 # Phase 2 execution plane: `execution_session_create`, `execution_run`, `execution_cancel`,

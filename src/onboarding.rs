@@ -9,9 +9,8 @@ use include_dir::{include_dir, Dir};
 use toml_edit::{value, DocumentMut};
 
 /// Full skill tree (SKILL.md, reference.md, examples/) embedded at compile time.
-static ONBOARD_SYNTHETIC_SKILL_DIR: Dir<'static> = include_dir!(
-    "$CARGO_MANIFEST_DIR/assets/onboarding/skills/synthetic-dataset-with-afterimage"
-);
+static ONBOARD_SYNTHETIC_SKILL_DIR: Dir<'static> =
+    include_dir!("$CARGO_MANIFEST_DIR/assets/onboarding/skills/synthetic-dataset-with-afterimage");
 
 const CONFIG_TEMPLATE: &str = include_str!("../assets/onboarding/config.toml");
 const AGENTS_TEMPLATE: &str = include_str!("../assets/onboarding/AGENTS.md");

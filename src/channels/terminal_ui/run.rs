@@ -44,7 +44,9 @@ pub(crate) fn execution_strip_subtitle(description: Option<&str>, id: &str) -> S
         }
         return format!(
             "{}…",
-            d.chars().take(MAX_CHARS.saturating_sub(1)).collect::<String>()
+            d.chars()
+                .take(MAX_CHARS.saturating_sub(1))
+                .collect::<String>()
         );
     }
     let short: String = id.chars().filter(|c| *c != '-').take(8).collect();
@@ -66,6 +68,7 @@ const TERMINAL_HELP: &str = r#"Commands (leading slash):
   /exit, /quit   Quit and restore the terminal
   /new           Start a new session (new chat id)
   /copy          Copy the last assistant reply to the clipboard
+  /cancel, /stop Stop the in-flight reply for this chat (drops queued prompts)
   /tools         Open the tool activity pane (same as Tab)
   /help, /?      Show this help
 
@@ -407,12 +410,7 @@ fn layout_chunks(area: Rect, exec_panel_h: u16, active_tool_h: u16) -> [Rect; 6]
         ])
         .split(area);
     [
-        chunks[0],
-        chunks[1],
-        chunks[2],
-        chunks[3],
-        chunks[4],
-        chunks[5],
+        chunks[0], chunks[1], chunks[2], chunks[3], chunks[4], chunks[5],
     ]
 }
 
@@ -516,7 +514,7 @@ fn build_title_line(max_width: usize) -> Line<'static> {
             dim,
         )],
         vec![Span::styled(
-            "· /exit · /new · /copy · /tools · /help · Tab · Esc · ↑↓ · wheel · PgUp/PgDn",
+            "· /exit · /new · /copy · /cancel · /tools · /help · Tab · Esc · ↑↓ · wheel · PgUp/PgDn",
             dim,
         )],
     ];
@@ -867,7 +865,8 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 == Some(true);
             if is_tool_notify {
                 apply_terminal_tool_aux(&mut app, &msg);
-                if app.ui_focus == TerminalUiFocus::ToolHistory && app.tool_history_following_tail() {
+                if app.ui_focus == TerminalUiFocus::ToolHistory && app.tool_history_following_tail()
+                {
                     app.tool_history_scroll = 0;
                 }
             }
@@ -898,8 +897,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 
             match app.ui_focus {
                 TerminalUiFocus::Transcript => {
-                    let (w, max_s) =
-                        transcript_paragraph(&app.cells, ch[1], app.scroll_offset);
+                    let (w, max_s) = transcript_paragraph(&app.cells, ch[1], app.scroll_offset);
                     max_transcript_scroll_holder.set(max_s);
                     f.render_widget(w, ch[1]);
                     app.last_transcript_rect = Some(ch[1]);
@@ -1045,8 +1043,30 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             app.focus_tool_history();
                             continue;
                         }
+                        if text.eq_ignore_ascii_case("/cancel")
+                            || text.eq_ignore_ascii_case("/stop")
+                        {
+                            app.thinking = false;
+                            if bus_tx
+                                .blocking_send(BusMessage::Cancel(chat_id.clone()))
+                                .is_err()
+                            {
+                                app.cells.push(Cell::System {
+                                    message: "Bus closed; exiting.".into(),
+                                });
+                                app.request_quit();
+                            } else {
+                                app.cells.push(Cell::System {
+                                    message: "Cancel sent for this chat (queued prompts cleared)."
+                                        .into(),
+                                });
+                            }
+                            continue;
+                        }
                         app.cells.push(Cell::System {
-                            message: "Unknown command. Try /help, /exit, /new, /copy, /tools.".into(),
+                            message:
+                                "Unknown command. Try /help, /exit, /new, /copy, /cancel, /tools."
+                                    .into(),
                         });
                         continue;
                     }
@@ -1176,7 +1196,9 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         MouseEventKind::ScrollDown => {
                             app.tool_history_scroll_down(MOUSE_SCROLL_LINES)
                         }
-                        MouseEventKind::ScrollLeft => app.tool_history_scroll_up(MOUSE_SCROLL_LINES),
+                        MouseEventKind::ScrollLeft => {
+                            app.tool_history_scroll_up(MOUSE_SCROLL_LINES)
+                        }
                         MouseEventKind::ScrollRight => {
                             app.tool_history_scroll_down(MOUSE_SCROLL_LINES)
                         }

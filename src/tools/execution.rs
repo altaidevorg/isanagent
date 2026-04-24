@@ -446,10 +446,7 @@ impl Tool for ExecutionJobListTool {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(SessionId::new);
-        let limit = args
-            .get("limit")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(50) as usize;
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
         let v = self.jobs.list_jobs_json(session, limit).await;
         serde_json::to_string_pretty(&v).map_err(|e| e.to_string())
     }
@@ -849,9 +846,7 @@ mod tests {
             .expect("bg");
         let jv: Value = serde_json::from_str(&started).expect("json");
         let jid = jv["job_id"].as_str().expect("job_id");
-        let status_tool = ExecutionJobStatusTool {
-            jobs: jobs.clone(),
-        };
+        let status_tool = ExecutionJobStatusTool { jobs: jobs.clone() };
         let mut terminal = false;
         for _ in 0..80 {
             let s = status_tool
@@ -900,7 +895,10 @@ mod tests {
         let env = ExecutionEnvInfoTool { harness };
         let out = env.execute(json!({})).await.expect("env");
         assert!(out.contains("\"max_wall_secs\": 1200"), "out={out}");
-        assert!(out.contains("\"default_run_timeout_secs\": 90"), "out={out}");
+        assert!(
+            out.contains("\"default_run_timeout_secs\": 90"),
+            "out={out}"
+        );
         assert!(out.contains("timeout_policy"));
         let _ = std::fs::remove_dir_all(&ws);
     }
@@ -953,9 +951,7 @@ mod tests {
         let jv: Value = serde_json::from_str(&started).expect("json");
         let jid = jv["job_id"].as_str().expect("job_id");
         for _ in 0..80 {
-            let st = ExecutionJobStatusTool {
-                jobs: jobs.clone(),
-            };
+            let st = ExecutionJobStatusTool { jobs: jobs.clone() };
             let s = st.execute(json!({ "job_id": jid })).await.expect("st");
             if s.contains("\"terminal\": true") {
                 assert!(s.contains("Unit test background label"));
@@ -1018,10 +1014,11 @@ mod tests {
         let jv: Value = serde_json::from_str(&started).expect("json");
         let jid = jv["job_id"].as_str().expect("job_id");
         tokio::time::sleep(Duration::from_millis(80)).await;
-        let cancel = ExecutionJobCancelTool {
-            jobs: jobs.clone(),
-        };
-        cancel.execute(json!({ "job_id": jid })).await.expect("cancel");
+        let cancel = ExecutionJobCancelTool { jobs: jobs.clone() };
+        cancel
+            .execute(json!({ "job_id": jid }))
+            .await
+            .expect("cancel");
         let status_tool = ExecutionJobStatusTool { jobs };
         let mut saw = false;
         for _ in 0..120 {

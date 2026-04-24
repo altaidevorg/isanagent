@@ -9,8 +9,8 @@ use walkdir::WalkDir;
 
 use crate::config::JinaWebBackend;
 use crate::traits::Tool;
-use crate::NodeHandle;
 use crate::utils::{join_lexically_under_root, normalize_sandbox_relative_input};
+use crate::NodeHandle;
 
 /// Maximum paths returned by `glob_files`.
 const MAX_GLOB_RESULTS: usize = 500;

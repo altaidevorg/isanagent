@@ -189,7 +189,7 @@ Ensure your **`[provider]`** API key env is set. The model should see the execut
 
 The Ratatui alternate-screen UI includes:
 
-- **Transcript** — conversation cells (you, agent, tool lines, errors). Slash commands such as **`/help`**, **`/tools`**, **`/copy`**, **`/new`**, **`/exit`** apply here.  
+- **Transcript** — conversation cells (you, agent, tool lines, errors). While the model is still replying, you can send another line: it is **queued** (FIFO per chat) instead of aborting the current turn. Use **`/cancel`** or **`/stop`** to stop the in-flight reply and **discard** queued prompts for this session. Slash commands also include **`/help`**, **`/tools`**, **`/copy`**, **`/new`**, **`/exit`**.  
 - **Tool activity** — press **Tab** or **Ctrl+T** (or run **`/tools`**) to focus a scrollable pane of recent tool calls and outcomes (ring buffer, capped in the client). **Esc** returns to the transcript when the tool pane is focused. **PgUp** / **PgDn** and the mouse wheel scroll whichever pane is focused.  
 - **Active tool** strip — one line above **compose** shows the in-flight tool call preview when the model invokes a tool, then **Idle (no running tool)** after the result or when a normal assistant reply arrives.  
 - **Execution strip** — while Jupyter **`execution_run`** is active, stream events still appear in the **execution (jupyter)** block; background job summaries use human-readable exit text (no `Some(0)`-style debug).

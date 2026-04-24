@@ -184,20 +184,14 @@ impl AppConfig {
 
     /// Root `max_iterations`, or `[terminal].max_iterations` when root is unset (common TOML mistake).
     pub fn resolved_max_iterations(&self) -> Option<usize> {
-        self.max_iterations.or_else(|| {
-            self.terminal
-                .as_ref()
-                .and_then(|t| t.max_iterations)
-        })
+        self.max_iterations
+            .or_else(|| self.terminal.as_ref().and_then(|t| t.max_iterations))
     }
 
     /// Root `max_tool_output_chars`, or `[terminal].max_tool_output_chars` when root is unset.
     pub fn resolved_max_tool_output_chars(&self) -> Option<usize> {
-        self.max_tool_output_chars.or_else(|| {
-            self.terminal
-                .as_ref()
-                .and_then(|t| t.max_tool_output_chars)
-        })
+        self.max_tool_output_chars
+            .or_else(|| self.terminal.as_ref().and_then(|t| t.max_tool_output_chars))
     }
 
     /// At least one inbound channel other than terminal (API, Slack, or Email).

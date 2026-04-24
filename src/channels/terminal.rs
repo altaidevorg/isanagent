@@ -144,10 +144,7 @@ pub fn build_execution_stream_notice(
     metadata.insert(METADATA_EXECUTION_SESSION_ID.to_string(), json!(session_id));
     metadata.insert(METADATA_EXECUTION_RUN_ID.to_string(), json!(run_id));
     if let Some(d) = description.filter(|s| !s.trim().is_empty()) {
-        metadata.insert(
-            METADATA_EXECUTION_DESCRIPTION.to_string(),
-            json!(d.trim()),
-        );
+        metadata.insert(METADATA_EXECUTION_DESCRIPTION.to_string(), json!(d.trim()));
     }
     OutboundMessage {
         channel: channel.to_string(),
@@ -172,15 +169,9 @@ pub fn build_execution_job_notice(
     metadata.insert(ISANAGENT_EXECUTION_JOB.to_string(), json!(true));
     metadata.insert(METADATA_EXECUTION_JOB_ID.to_string(), json!(job_id));
     metadata.insert(METADATA_EXECUTION_SESSION_ID.to_string(), json!(session_id));
-    metadata.insert(
-        METADATA_EXECUTION_JOB_STATUS.to_string(),
-        json!(status),
-    );
+    metadata.insert(METADATA_EXECUTION_JOB_STATUS.to_string(), json!(status));
     if let Some(d) = description.filter(|s| !s.trim().is_empty()) {
-        metadata.insert(
-            METADATA_EXECUTION_DESCRIPTION.to_string(),
-            json!(d.trim()),
-        );
+        metadata.insert(METADATA_EXECUTION_DESCRIPTION.to_string(), json!(d.trim()));
     }
     OutboundMessage {
         channel: channel.to_string(),

@@ -77,7 +77,10 @@ struct JobAuditLine<'a> {
     description: Option<&'a str>,
 }
 
-async fn append_job_audit_line(workspace_dir: &Path, line: &JobAuditLine<'_>) -> Result<(), String> {
+async fn append_job_audit_line(
+    workspace_dir: &Path,
+    line: &JobAuditLine<'_>,
+) -> Result<(), String> {
     let dir = workspace_dir.join(".system_generated");
     tokio::fs::create_dir_all(&dir)
         .await
@@ -237,7 +240,13 @@ impl ExecutionJobManager {
         if rec.is_terminal() {
             return Err("Job already finished".to_string());
         }
-        if !self.inner.harness.provider().capabilities().supports_interrupt {
+        if !self
+            .inner
+            .harness
+            .provider()
+            .capabilities()
+            .supports_interrupt
+        {
             return Err(
                 "execution_job_cancel unsupported: provider capabilities.supports_interrupt is false"
                     .to_string(),
@@ -272,7 +281,11 @@ impl ExecutionJobManager {
     }
 
     /// Pretty JSON for a finished job’s [`RunResult`], or a structured error payload; running jobs get a short message.
-    pub async fn job_result_pretty(&self, job_id: &str, max_chars: usize) -> Result<String, String> {
+    pub async fn job_result_pretty(
+        &self,
+        job_id: &str,
+        max_chars: usize,
+    ) -> Result<String, String> {
         let r = self
             .get(job_id)
             .ok_or_else(|| "Unknown job_id".to_string())?;
@@ -297,19 +310,21 @@ impl ExecutionJobManager {
             }
             None => {
                 let err = r.error.read().await.clone().unwrap_or_default();
-                serde_json::to_string_pretty(
-                    &json!({
-                        "status": r.status_name(),
-                        "run_result": serde_json::Value::Null,
-                        "error": err,
-                    }),
-                )
+                serde_json::to_string_pretty(&json!({
+                    "status": r.status_name(),
+                    "run_result": serde_json::Value::Null,
+                    "error": err,
+                }))
                 .map_err(|e| e.to_string())
             }
         }
     }
 
-    pub async fn list_jobs_json(&self, session: Option<SessionId>, limit: usize) -> serde_json::Value {
+    pub async fn list_jobs_json(
+        &self,
+        session: Option<SessionId>,
+        limit: usize,
+    ) -> serde_json::Value {
         let limit = limit.clamp(1, 500);
         let mut rows: Vec<serde_json::Value> = Vec::new();
         for e in self.inner.jobs.iter() {
@@ -448,9 +463,7 @@ impl ExecutionJobManager {
 
             match run_out {
                 Ok(result) => {
-                    rec
-                        .finished_unix_ms
-                        .store(now_unix_ms(), Ordering::Release);
+                    rec.finished_unix_ms.store(now_unix_ms(), Ordering::Release);
                     rec.status.store(JOB_COMPLETED, Ordering::Release);
                     *rec.result.write().await = Some(result.clone());
                     persist_successful_execution_run(
@@ -486,11 +499,15 @@ impl ExecutionJobManager {
                     )
                     .await;
                     let exit_s = format_exit_for_user(result.exit_code);
-                    let summary = match rec.description.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                        Some(d) => format!(
-                            "{} — completed (exit {}, {} ms)",
-                            d, exit_s, duration_ms
-                        ),
+                    let summary = match rec
+                        .description
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        Some(d) => {
+                            format!("{} — completed (exit {}, {} ms)", d, exit_s, duration_ms)
+                        }
                         None => format!(
                             "Execution job {} completed (exit {}, {} ms)",
                             job_id_for_task, exit_s, duration_ms
@@ -505,10 +522,7 @@ impl ExecutionJobManager {
                         &summary,
                         rec.description.as_deref(),
                     );
-                    let _ = inner
-                        .outbound_tx
-                        .send(BusMessage::Outbound(notice))
-                        .await;
+                    let _ = inner.outbound_tx.send(BusMessage::Outbound(notice)).await;
                     if let Err(e) = append_job_audit_line(
                         &ws,
                         &JobAuditLine {
@@ -537,9 +551,7 @@ impl ExecutionJobManager {
                         ExecutionError::Cancelled => (JOB_CANCELLED, "cancelled"),
                         _ => (JOB_FAILED, "failed"),
                     };
-                    rec
-                        .finished_unix_ms
-                        .store(now_unix_ms(), Ordering::Release);
+                    rec.finished_unix_ms.store(now_unix_ms(), Ordering::Release);
                     rec.status.store(st_u8, Ordering::Release);
                     let es = e.to_string();
                     *rec.error.write().await = Some(es.clone());
@@ -559,7 +571,12 @@ impl ExecutionJobManager {
                         rec.description.clone(),
                     )
                     .await;
-                    let summary = match rec.description.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    let summary = match rec
+                        .description
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
                         Some(d) => format!("{} — {status_label} ({es})", d),
                         None => format!("Execution job {job_id_for_task}: {status_label} ({es})"),
                     };
@@ -572,10 +589,7 @@ impl ExecutionJobManager {
                         &summary,
                         rec.description.as_deref(),
                     );
-                    let _ = inner
-                        .outbound_tx
-                        .send(BusMessage::Outbound(notice))
-                        .await;
+                    let _ = inner.outbound_tx.send(BusMessage::Outbound(notice)).await;
                     if let Err(log_e) = append_job_audit_line(
                         &ws,
                         &JobAuditLine {

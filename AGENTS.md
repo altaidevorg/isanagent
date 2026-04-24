@@ -12,8 +12,13 @@ pub enum BusMessage {
     Inbound(InboundMessage),
     Outbound(OutboundMessage),
     Telemetry(TelemetryEvent),
+    Log(LogEvent),
+    LoggerControl(LoggerControlMessage),
+    Cancel(String), // chat_id — explicit stop; clears FIFO queued inbounds for that chat
 }
 ```
+
+While a **main** reasoning loop is already active for a `chat_id`, additional **`Inbound`** messages for that chat are held in a **per-chat FIFO** and started only after the current turn finishes. **`BusMessage::Cancel(chat_id)`** (for example terminal **`/cancel`** / **`/stop`**) is the explicit stop path: it cancels the in-flight loop, optionally cascades to sub-agents when configured, and **drops** any queued prompts for that chat. New user text does **not** implicitly cancel an in-flight turn.
 
 The fundamental philosophy here is **Wait-Free Threading**. Do not use `std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>`. All critical I/O, especially database storage, must route through an opaque lock-free asynchronous Actor (`MemoryActor` wrapping `SqliteMemory` for instance).
 
@@ -30,7 +35,7 @@ User clarification (`ask_user`) sends an outbound message tagged with metadata `
 
 Git worktrees (`git_worktree`): **off** in a minimal `config.toml` until you set `[harness.git_worktree] enabled = true`. The onboarding template under `assets/onboarding/config.toml` turns this **on** for new workspaces. Worktree paths use the same `resolve_path` sandbox rules as other filesystem tools unless `allow_path_outside_sandbox = true`, which permits canonical paths outside the sandbox (for example a host temp directory). See `docs/harness-implementation-plan.md` Phase 4.
 
-Sub-agents (`subagent_spawn`, `task_*`, `subagent_plan_execute`): **off** in a minimal config until `[harness.subagents] enabled = true`. The onboarding template enables this for new workspaces. Sub-agents run a second `run_reasoning_loop` with a synthetic chat id (`subagent-…`) and optional tool allowlist. `cancel_children_on_parent_cancel` (default true) controls whether cancelling or superseding the parent chat’s reasoning also cancels those child tasks. See `docs/harness-implementation-plan.md` Phase 5.
+Sub-agents (`subagent_spawn`, `task_*`, `subagent_plan_execute`): **off** in a minimal config until `[harness.subagents] enabled = true`. The onboarding template enables this for new workspaces. Sub-agents run a second `run_reasoning_loop` with a synthetic chat id (`subagent-…`) and optional tool allowlist. `cancel_children_on_parent_cancel` (default true) controls whether an **explicit** parent cancel (`BusMessage::Cancel` / API cancel / terminal **`/cancel`**) also cancels those child tasks (not triggered by queued follow-up user messages). See `docs/harness-implementation-plan.md` Phase 5.
 
 **Execution plane** (reproducible code run): **operator guide** → `docs/execution-user-guide.md`; **engineer roadmap** → `docs/execution-implementation-plan.md`. **Keep the user guide in sync** with any change to execution tools, config keys, provider behavior, or defaults—update `docs/execution-user-guide.md` in the **same PR** as the code or config change.
 

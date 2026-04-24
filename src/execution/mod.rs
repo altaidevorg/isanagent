@@ -34,7 +34,7 @@ pub use capabilities::{
     NetworkPolicy, ProviderCapabilities, ProviderCapabilitiesSnapshot, SessionCapabilities,
 };
 pub use error::ExecutionError;
-pub use execution_jobs::{ExecutionJobManager, ExecutionJobRecord, job_status_str};
+pub use execution_jobs::{job_status_str, ExecutionJobManager, ExecutionJobRecord};
 pub use harness::{build_execution_harness, ExecutionHarness};
 pub use ids::SessionId;
 pub use jupyter::{JupyterExecutionProvider, JupyterExecutionProviderConfig};
