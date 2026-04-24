@@ -1,12 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-/// Local stdin/stdout chat. When `enable` is omitted, defaults to `true` (legacy behavior).
+/// Local stdin/stdout chat. When `enabled` is omitted, defaults to `true`.
 ///
 /// `max_iterations` / `max_tool_output_chars` here are used only when the root-level keys are
 /// unset (see [`AppConfig::resolved_max_iterations`]) — prefer root keys above `[terminal]` in TOML.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct TerminalConfig {
-    pub enable: Option<bool>,
+    pub enabled: Option<bool>,
     pub max_iterations: Option<usize>,
     pub max_tool_output_chars: Option<usize>,
 }
@@ -174,11 +174,11 @@ fn jina_api_key_looks_like_placeholder(s: &str) -> bool {
 }
 
 impl AppConfig {
-    /// Whether the stdin/stdout terminal channel is active (`[terminal].enable`, default `true`).
+    /// Whether the stdin/stdout terminal channel is active (`[terminal].enabled`, default `true`).
     pub fn terminal_enabled(&self) -> bool {
         self.terminal
             .as_ref()
-            .and_then(|t| t.enable)
+            .and_then(|t| t.enabled)
             .unwrap_or(true)
     }
 
@@ -766,7 +766,7 @@ artifact_max_files_per_run = 10
     fn resolved_max_iterations_falls_back_to_terminal_table() {
         let s = r#"
 [terminal]
-enable = true
+enabled = true
 max_iterations = 999
 "#;
         let c: AppConfig = toml::from_str(s).expect("parse");

@@ -5,7 +5,13 @@ use crate::config::{AppConfig, SlackMode};
 use crate::skills::SkillRegistry;
 use crate::workspace::{ensure_workspace_layout, WorkspaceLayout};
 use clap::Args;
+use include_dir::{include_dir, Dir};
 use toml_edit::{value, DocumentMut};
+
+/// Full skill tree (SKILL.md, reference.md, examples/) embedded at compile time.
+static ONBOARD_SYNTHETIC_SKILL_DIR: Dir<'static> = include_dir!(
+    "$CARGO_MANIFEST_DIR/assets/onboarding/skills/synthetic-dataset-with-afterimage"
+);
 
 const CONFIG_TEMPLATE: &str = include_str!("../assets/onboarding/config.toml");
 const AGENTS_TEMPLATE: &str = include_str!("../assets/onboarding/AGENTS.md");
@@ -62,7 +68,7 @@ pub struct OnboardOptions {
     #[arg(long, help_heading = "Workspace / limits")]
     pub max_web_tool_output_chars: Option<usize>,
 
-    /// Sets `[terminal] enable` (stdin/stdout chat).
+    /// Sets `[terminal] enabled` (stdin/stdout chat).
     #[arg(long, help_heading = "Terminal channel")]
     pub terminal_enable: Option<bool>,
 
@@ -150,7 +156,7 @@ fn apply_onboard_options(cfg: &mut AppConfig, opts: &OnboardOptions) {
     }
 
     if let Some(v) = opts.terminal_enable {
-        cfg.terminal.get_or_insert_with(Default::default).enable = Some(v);
+        cfg.terminal.get_or_insert_with(Default::default).enabled = Some(v);
     }
 
     if let Some(p) = cfg.provider.as_mut() {
@@ -269,7 +275,7 @@ pub fn build_interactive_config_toml(options: &OnboardOptions) -> Result<String,
     }
 
     if let Some(v) = options.terminal_enable {
-        doc["terminal"]["enable"] = value(v);
+        doc["terminal"]["enabled"] = value(v);
     }
 
     if let Some(ref m) = options.provider_model {
@@ -452,13 +458,58 @@ fn write_all_templates(
         }
     }
 
+    write_embedded_synthetic_skill_tree(&layout.root, report)?;
+
     Ok(())
 }
 
-fn write_if_missing_string(
+const SYNTHETIC_SKILL_REL_PREFIX: &str = "workspace/skills/synthetic-dataset-with-afterimage";
+
+fn write_embedded_synthetic_skill_tree(
+    root: &Path,
+    report: &mut BootstrapReport,
+) -> Result<(), String> {
+    write_embedded_dir_recursive(
+        &ONBOARD_SYNTHETIC_SKILL_DIR,
+        root,
+        SYNTHETIC_SKILL_REL_PREFIX,
+        Path::new(""),
+        report,
+    )
+}
+
+fn write_embedded_dir_recursive(
+    dir: &Dir<'_>,
+    root: &Path,
+    skill_dest_dir: &str,
+    rel_inside: &Path,
+    report: &mut BootstrapReport,
+) -> Result<(), String> {
+    for file in dir.files() {
+        let rel = if rel_inside.as_os_str().is_empty() {
+            file.path().to_path_buf()
+        } else {
+            rel_inside.join(file.path())
+        };
+        let dest_rel = Path::new(skill_dest_dir).join(rel);
+        let dest_rel_str = dest_rel.to_string_lossy().replace('\\', "/");
+        write_if_missing_bytes(root, &dest_rel_str, file.contents(), report)?;
+    }
+    for sub in dir.dirs() {
+        let next = if rel_inside.as_os_str().is_empty() {
+            sub.path().to_path_buf()
+        } else {
+            rel_inside.join(sub.path())
+        };
+        write_embedded_dir_recursive(sub, root, skill_dest_dir, &next, report)?;
+    }
+    Ok(())
+}
+
+fn write_if_missing_bytes(
     root: &Path,
     relative_path: &str,
-    contents: &str,
+    contents: &[u8],
     report: &mut BootstrapReport,
 ) -> Result<(), String> {
     let rel = PathBuf::from(relative_path);
@@ -482,6 +533,15 @@ fn write_if_missing_string(
     fs::write(&dest, contents).map_err(|e| format!("Failed to write {}: {}", dest.display(), e))?;
     report.created.push(rel);
     Ok(())
+}
+
+fn write_if_missing_string(
+    root: &Path,
+    relative_path: &str,
+    contents: &str,
+    report: &mut BootstrapReport,
+) -> Result<(), String> {
+    write_if_missing_bytes(root, relative_path, contents.as_bytes(), report)
 }
 
 fn validate_generated_files(layout: &WorkspaceLayout) -> Result<(), String> {
@@ -514,6 +574,7 @@ fn validate_generated_files(layout: &WorkspaceLayout) -> Result<(), String> {
         "execution-research",
         "jupyter-heavy-output",
         "scientific-python-debugging",
+        "synthetic-dataset-with-afterimage",
     ] {
         if !skill_names.iter().any(|skill| skill == required) {
             return Err(format!(

@@ -200,6 +200,11 @@ impl App {
         self.tool_history_scroll = 0;
     }
 
+    pub fn focus_transcript(&mut self) {
+        self.ui_focus = TerminalUiFocus::Transcript;
+        self.tool_history_scroll = 0;
+    }
+
     pub fn tool_history_following_tail(&self) -> bool {
         self.tool_history_scroll == 0
     }

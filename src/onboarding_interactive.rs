@@ -19,7 +19,7 @@ use tokio::runtime::Handle;
 
 use crate::onboarding::OnboardOptions;
 
-/// Matches [`assets/onboarding/config.toml`] defaults for boolean-ish sections (harness absent = off).
+/// Matches [`assets/onboarding/config.toml`] defaults for boolean-ish sections.
 const FEATURE_TOGGLE_COUNT: usize = 12;
 const FEATURE_TOGGLE_LABELS: [&str; FEATURE_TOGGLE_COUNT] = [
     "[terminal] stdin/stdout chat",
@@ -39,7 +39,7 @@ const FEATURE_TOGGLE_LABELS: [&str; FEATURE_TOGGLE_COUNT] = [
 fn default_feature_toggle_values() -> [bool; FEATURE_TOGGLE_COUNT] {
     [
         true,  // terminal
-        true,  // slack
+        false, // slack
         false, // email
         false, // api
         false, // serve_ui
@@ -47,8 +47,8 @@ fn default_feature_toggle_values() -> [bool; FEATURE_TOGGLE_COUNT] {
         false, // mte cron
         false, // jina
         true,  // memory
-        false, // harness git_worktree (template has no harness block)
-        false, // harness subagents
+        true,  // harness git_worktree
+        true,  // harness subagents
         false, // harness execution
     ]
 }

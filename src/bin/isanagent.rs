@@ -155,7 +155,7 @@ async fn run_isanagent(
     if !workspace.config.terminal_enabled() && !workspace.config.has_non_terminal_inbound_channel()
     {
         return Err(std::io::Error::other(
-            "Invalid config: [terminal] enable = false requires at least one other inbound channel. \
+            "Invalid config: [terminal] enabled = false requires at least one other inbound channel. \
 Enable [api], [slack], or [email] (with enabled = true) so the agent can receive messages without stdin.",
         )
         .into());

@@ -1,0 +1,38 @@
+# Local model generation (vLLM, Ollama, llama.cpp)
+# Zero API cost -- uses an OpenAI-compatible server running locally
+#
+# Start your server first:
+#   vllm serve Qwen/Qwen3-1.7B --port 8000
+#   OR: ollama serve  (then set base_url to http://localhost:11434/v1)
+#   OR: ./llama-server -m model.gguf --port 8000
+#
+# Run:
+#   afterimage generate -c examples/configs/local.yaml
+
+generation:
+  # Number of conversations to generate
+  num_dialogs: 20
+  # Single-turn conversations
+  max_turns: 1
+  # Lower concurrency for local inference
+  max_concurrency: 2
+
+model:
+  # Use the local provider for OpenAI-compatible endpoints
+  provider: local
+  # URL of your local model server
+  base_url: http://localhost:8000/v1
+  # Model name as registered on your server
+  model_name: Qwen/Qwen3-1.7B
+  # No API key needed for local models (omit api_key_env)
+
+respondent:
+  # System prompt for the assistant
+  system_prompt: |
+    You are a helpful AI assistant.
+
+output:
+  # Where to save the generated dataset
+  path: ./output/local_dataset.jsonl
+  # Storage format: jsonl or sql
+  storage: jsonl

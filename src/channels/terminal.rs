@@ -331,7 +331,7 @@ impl Channel for TerminalChannel {
         if !tty_in || !tty_out {
             return Err(
                 "Terminal channel requires an interactive terminal (stdin and stdout must be TTYs). \
-For headless or piped runs, set [terminal] enable = false in config.toml (requires another inbound channel such as API, Slack, or Email)."
+For headless or piped runs, set [terminal] enabled = false in config.toml (requires another inbound channel such as API, Slack, or Email)."
                     .to_string(),
             );
         }

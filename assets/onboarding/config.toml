@@ -1,13 +1,13 @@
 restrict_to_workspace = true
 
 # Root-level limits (must stay above [terminal] so TOML does not nest them under [terminal]).
-max_iterations = 50
+max_iterations = 999
 max_tool_output_chars = 10000
 max_web_tool_output_chars = 50000
 
-# Local stdin/stdout chat. Set enable = false for API-only or headless runs (requires another channel).
+# Local stdin/stdout chat. Set enabled = false for API-only or headless runs (requires another channel).
 [terminal]
-enable = true
+enabled = true
 
 [provider]
 model_name = "gemini-3-flash-preview"
@@ -15,7 +15,7 @@ api_key_env = "GEMINI_API_KEY"
 base_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 
 [slack]
-enabled = true
+enabled = false
 mode = "webhook"
 bot_token = "<changethis>"
 signing_secret = "<changethis>"
@@ -62,11 +62,11 @@ max_recent_summaries = 5
 # Registers the `git_worktree` tool (list / add / remove). Paths stay inside the sandbox unless you
 # set allow_path_outside_sandbox = true. See docs/harness-implementation-plan.md Phase 4.
 [harness.git_worktree]
-enabled = false
+enabled = true
 
 # Phase 5: background sub-agents (separate reasoning loop per task). See docs/harness-implementation-plan.md.
 [harness.subagents]
-enabled = false
+enabled = true
 # cancel_children_on_parent_cancel = false  # default true: new user message / cancel also stops sub-tasks
 # allowed_tools = ["read_file", "glob_files", "search_text", "edit_file"]  # omit = all tools except nested spawn/plan
 

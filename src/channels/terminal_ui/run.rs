@@ -72,6 +72,7 @@ const TERMINAL_HELP: &str = r#"Commands (leading slash):
 Keys:
   Enter             Send the compose line
   Tab / Ctrl+T      Switch focus: transcript <-> tool activity
+  Esc               From tool activity: return to transcript (no-op on transcript)
   PgUp / PgDn       Scroll the focused pane (transcript or tool activity)
   Mouse wheel       Scroll when the pointer is over the focused pane (horizontal wheel scrolls too)
   Ctrl+Shift+Y      Copy last assistant reply
@@ -515,7 +516,7 @@ fn build_title_line(max_width: usize) -> Line<'static> {
             dim,
         )],
         vec![Span::styled(
-            "· /exit · /new · /copy · /tools · /help · Tab · ↑↓ · wheel · PgUp/PgDn",
+            "· /exit · /new · /copy · /tools · /help · Tab · Esc · ↑↓ · wheel · PgUp/PgDn",
             dim,
         )],
     ];
@@ -1084,6 +1085,11 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 KeyCode::End => app.end(),
                 KeyCode::Up => app.history_up(),
                 KeyCode::Down => app.history_down(),
+                KeyCode::Esc => {
+                    if app.ui_focus == TerminalUiFocus::ToolHistory {
+                        app.focus_transcript();
+                    }
+                }
                 KeyCode::Tab => {
                     app.toggle_ui_focus();
                     if app.following_tail() {
