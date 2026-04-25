@@ -439,11 +439,7 @@ impl App {
         tool_name: &str,
         description: Option<&str>,
     ) {
-        if let Some(existing) = self
-            .jobs_strip
-            .iter_mut()
-            .find(|e| e.job_id == job_id)
-        {
+        if let Some(existing) = self.jobs_strip.iter_mut().find(|e| e.job_id == job_id) {
             existing.status = JobStripStatus::Running;
             existing.terminal_at = None;
             existing.tool_name = tool_name.to_string();
@@ -465,11 +461,7 @@ impl App {
     }
 
     pub fn job_strip_set_last_line(&mut self, job_id: &str, line: &str) {
-        if let Some(existing) = self
-            .jobs_strip
-            .iter_mut()
-            .find(|e| e.job_id == job_id)
-        {
+        if let Some(existing) = self.jobs_strip.iter_mut().find(|e| e.job_id == job_id) {
             let trimmed = line.trim_end();
             if !trimmed.is_empty() {
                 existing.last_line = trimmed.to_string();
@@ -479,11 +471,7 @@ impl App {
 
     pub fn job_strip_finished(&mut self, job_id: &str, status: &str, summary: &str) {
         let new_status = JobStripStatus::from_str(status);
-        if let Some(existing) = self
-            .jobs_strip
-            .iter_mut()
-            .find(|e| e.job_id == job_id)
-        {
+        if let Some(existing) = self.jobs_strip.iter_mut().find(|e| e.job_id == job_id) {
             existing.status = new_status;
             existing.terminal_at = Some(Instant::now());
             let trimmed = summary.trim_end();
@@ -509,11 +497,10 @@ impl App {
     /// Drop terminal rows older than `linger`, and any extras over `running_cap` running rows.
     pub fn evict_expired_jobs(&mut self, linger: Duration) {
         let now = Instant::now();
-        self.jobs_strip
-            .retain(|e| match e.terminal_at {
-                Some(t) => now.saturating_duration_since(t) < linger,
-                None => true,
-            });
+        self.jobs_strip.retain(|e| match e.terminal_at {
+            Some(t) => now.saturating_duration_since(t) < linger,
+            None => true,
+        });
     }
 
     /// Cap the strip length so it cannot grow unbounded across long sessions.
@@ -643,10 +630,7 @@ mod tests {
             JobStripStatus::from_str("cancelled"),
             JobStripStatus::Cancelled
         );
-        assert_eq!(
-            JobStripStatus::from_str("timeout"),
-            JobStripStatus::Timeout
-        );
+        assert_eq!(JobStripStatus::from_str("timeout"), JobStripStatus::Timeout);
         assert_eq!(
             JobStripStatus::from_str("anything-else"),
             JobStripStatus::Running

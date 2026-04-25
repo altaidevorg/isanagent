@@ -1284,9 +1284,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             || text.eq_ignore_ascii_case("/bg")
                         {
                             if bus_tx
-                                .blocking_send(BusMessage::PromoteSyncToBackground(
-                                    chat_id.clone(),
-                                ))
+                                .blocking_send(BusMessage::PromoteSyncToBackground(chat_id.clone()))
                                 .is_err()
                             {
                                 app.cells.push(Cell::System {

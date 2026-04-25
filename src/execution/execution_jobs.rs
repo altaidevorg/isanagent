@@ -797,10 +797,7 @@ impl ExecutionJobManager {
     /// Used by sync tools (`colab_mcp_tool_call`, `execution_run`) that started their work
     /// inline, then crossed the auto-promote bound and need to hand the in-flight task to the
     /// job manager. The manager takes over completion bookkeeping (status, telemetry, journal).
-    pub fn adopt_inflight(
-        &self,
-        req: AdoptInflightRequest,
-    ) -> Result<String, String> {
+    pub fn adopt_inflight(&self, req: AdoptInflightRequest) -> Result<String, String> {
         let AdoptInflightRequest {
             sid,
             tool_name,
@@ -938,8 +935,14 @@ fn send_job_started(
     tool_name: &str,
     description: Option<&str>,
 ) {
-    let notice =
-        build_execution_job_started_notice(chat_id, channel, job_id, session_id, tool_name, description);
+    let notice = build_execution_job_started_notice(
+        chat_id,
+        channel,
+        job_id,
+        session_id,
+        tool_name,
+        description,
+    );
     let _ = tx.try_send(BusMessage::Outbound(notice));
 }
 
@@ -1269,7 +1272,11 @@ mod tests {
         (root, sandbox)
     }
 
-    fn build_jobs() -> (Arc<ExecutionJobManager>, mpsc::Receiver<BusMessage>, std::path::PathBuf) {
+    fn build_jobs() -> (
+        Arc<ExecutionJobManager>,
+        mpsc::Receiver<BusMessage>,
+        std::path::PathBuf,
+    ) {
         let (ws, dir) = temp_workspace();
         let cfg = LocalExecutionConfig::new(dir.clone(), true);
         let prov: Arc<dyn crate::execution::ExecutionProvider> =
@@ -1370,9 +1377,7 @@ mod tests {
             .expect_err("must error");
         assert!(err.contains("Unknown"), "unexpected error: {err}");
 
-        let work: ArbitraryWork = Box::pin(async move {
-            Ok(RunResult::new("", "", Some(0)))
-        });
+        let work: ArbitraryWork = Box::pin(async move { Ok(RunResult::new("", "", Some(0))) });
         let jid = jobs
             .spawn_arbitrary(SpawnArbitraryRequest {
                 sid: fake_session(),

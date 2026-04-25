@@ -298,9 +298,7 @@ impl Tool for ExecutionRunTool {
 
         let jobs = self.jobs.clone().expect("jobs checked above");
         let inflight = self.inflight.clone();
-        let promote_rx = inflight
-            .as_ref()
-            .map(|reg| reg.register(&chat_id));
+        let promote_rx = inflight.as_ref().map(|reg| reg.register(&chat_id));
         let (promote_signal_rx, _inflight_guard) = match promote_rx {
             Some((rx, guard)) => (Some(rx), Some(guard)),
             None => (None, None),
@@ -944,7 +942,8 @@ impl Tool for ColabMcpToolCallTool {
 
         // Decide whether we can use auto-promote at all (need both a job manager and a non-zero
         // bound). If not, fall through to the original synchronous path.
-        let promote_enabled = self.jobs.is_some() && auto_promote > 0 && auto_promote < timeout_secs;
+        let promote_enabled =
+            self.jobs.is_some() && auto_promote > 0 && auto_promote < timeout_secs;
         if !promote_enabled {
             let outcome = work.await;
             return self
@@ -1128,8 +1127,7 @@ impl ColabMcpToolCallTool {
         &self,
         p: FinalizeSyncMcpCallParams<'_>,
     ) -> Result<String, String> {
-        let finished_ts =
-            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let finished_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let duration_ms = p.started.elapsed().as_millis() as u64;
         let provider_id = self
             .harness
@@ -1197,7 +1195,6 @@ impl ColabMcpToolCallTool {
         }
     }
 }
-
 
 /// Host-oriented snapshot (capabilities + optional python -V).
 pub struct ExecutionEnvInfoTool {

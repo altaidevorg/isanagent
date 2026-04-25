@@ -182,13 +182,11 @@ pub async fn append_mcp_call_manifest(
 fn redact_large_blobs(v: &serde_json::Value) -> serde_json::Value {
     const MAX_STRING: usize = 8 * 1024;
     match v {
-        serde_json::Value::String(s) if s.len() > MAX_STRING => {
-            serde_json::Value::String(format!(
-                "<redacted {} bytes; truncated for journal>\n{}",
-                s.len(),
-                &s[..MAX_STRING.min(s.len())]
-            ))
-        }
+        serde_json::Value::String(s) if s.len() > MAX_STRING => serde_json::Value::String(format!(
+            "<redacted {} bytes; truncated for journal>\n{}",
+            s.len(),
+            &s[..MAX_STRING.min(s.len())]
+        )),
         serde_json::Value::Array(arr) => {
             serde_json::Value::Array(arr.iter().map(redact_large_blobs).collect())
         }

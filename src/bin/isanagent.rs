@@ -17,6 +17,7 @@ use isanagent::channels::{
 };
 use isanagent::clarification::ClarificationHub;
 use isanagent::execution::ExecutionJobManager;
+use isanagent::execution::InflightSyncRegistry;
 use isanagent::logging::{
     create_logger_channel, create_logging_actor_or_fallback, init_runtime_logger,
     LOGGER_QUEUE_CAPACITY,
@@ -36,7 +37,6 @@ use isanagent::tools::builtin::{
     CronTool, EditFileTool, GitWorktreeTool, GlobFilesTool, ListDirTool, MessageTool, ReadFileTool,
     SearchTextTool, ShellExecTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
-use isanagent::execution::InflightSyncRegistry;
 use isanagent::tools::execution::{
     compile_colab_mcp_tool_allowlist, ColabMcpToolCallTool, ExecutionArtifactListTool,
     ExecutionCancelTool, ExecutionEnvInfoTool, ExecutionJobCancelTool, ExecutionJobListTool,
@@ -709,9 +709,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             if let BusMessage::PromoteSyncToBackground(chat_id) = &msg {
                 if let Some(reg) = inflight_promote.as_ref() {
                     let promoted = reg.promote(chat_id);
-                    log::debug!(
-                        "PromoteSyncToBackground chat={chat_id} promoted={promoted}"
-                    );
+                    log::debug!("PromoteSyncToBackground chat={chat_id} promoted={promoted}");
                 }
                 continue;
             }
