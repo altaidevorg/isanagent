@@ -13,6 +13,7 @@ use crate::clarification::ClarificationHub;
 use crate::tool_runtime::ToolExecCtx;
 
 use crate::bus::{BusMessage, LogEvent, OutboundMessage, TelemetryEvent};
+use crate::config::{ResolvedShellPolicy, ShellPolicyMode};
 use crate::logging::LoggerHandle;
 use crate::session::SessionManager;
 use crate::skills::SkillRegistry;
@@ -20,12 +21,141 @@ use crate::tool_activity::SharedToolExecutionActivity;
 use crate::tools::ToolRegistry;
 use crate::traits::{Memory, Provider, Tool};
 use crate::{ActorError, ActorLogic};
+use futures::future::join_all;
 
 static REDACTED_THINKING_STRIP_RE: OnceLock<Regex> = OnceLock::new();
+
+fn metadata_truthy(meta: &HashMap<String, serde_json::Value>, key: &str) -> bool {
+    meta.get(key)
+        .map(|v| {
+            v.as_bool().unwrap_or(false)
+                || v.as_str()
+                    .map(|s| s.eq_ignore_ascii_case("true") || s == "1")
+                    .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+fn text_looks_like_research_request(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    [
+        "research",
+        "literature",
+        "paper",
+        "state-of-the-art",
+        "state of the art",
+        "survey",
+        "arxiv",
+        "evidence",
+        "cite",
+        "compare methods",
+    ]
+    .iter()
+    .any(|k| lower.contains(k))
+}
+
+fn context_has_tool_call(context: &[crate::utils::ChatMessage], tool_name: &str) -> bool {
+    context.iter().any(|msg| {
+        msg.tool_calls.as_ref().is_some_and(|calls| {
+            calls
+                .iter()
+                .any(|tc| tc.function.name.eq_ignore_ascii_case(tool_name))
+        })
+    })
+}
+
+fn should_nudge_research_depth(
+    inbound: &crate::bus::InboundMessage,
+    context: &[crate::utils::ChatMessage],
+) -> bool {
+    if !text_looks_like_research_request(&inbound.content) {
+        return false;
+    }
+    let searched = context_has_tool_call(context, "web_search")
+        || context_has_tool_call(context, "arxiv_search");
+    if !searched {
+        return false;
+    }
+    let has_deep_source_reads = context_has_tool_call(context, "web_fetch")
+        || context_has_tool_call(context, "arxiv_fetch")
+        || context_has_tool_call(context, "hf_hub_file_fetch")
+        || context_has_tool_call(context, "read_file");
+    !has_deep_source_reads
+}
 
 enum ToolExecutionFinished {
     Completed(Result<String, String>),
     Cancelled,
+}
+
+fn extract_exec_command(args: &Value) -> Option<String> {
+    args.get("command")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn should_require_shell_approval(command: &str, patterns: &[String]) -> bool {
+    let lower = command.to_ascii_lowercase();
+    patterns.iter().any(|p| lower.contains(p))
+}
+
+fn shell_policy_mode_for_session(
+    policy: &ResolvedShellPolicy,
+    unattended_session: bool,
+) -> ShellPolicyMode {
+    if unattended_session {
+        policy.unattended_mode
+    } else {
+        policy.interactive_mode
+    }
+}
+
+fn command_preview(command: &str) -> String {
+    const MAX_PREVIEW: usize = 160;
+    if command.len() <= MAX_PREVIEW {
+        command.to_string()
+    } else {
+        format!("{}...", &command[..MAX_PREVIEW])
+    }
+}
+
+fn shell_command_uses_grep_like(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    lower.contains("grep ")
+        || lower.contains("| grep")
+        || lower.contains("cat ")
+        || lower.contains("wc ")
+}
+
+async fn log_tool_invocation_start(
+    logger_tx: &LoggerHandle,
+    outbound_tx: &mpsc::Sender<BusMessage>,
+    agent_name: &str,
+    inbound: &crate::bus::InboundMessage,
+    tc: &crate::utils::ToolCallRequest,
+) {
+    let tool_name = &tc.function.name;
+    let args_str = &tc.function.arguments;
+    let _ = logger_tx.send(BusMessage::Log(
+        LogEvent::info(agent_name, &format!("Invoking tool: {}", tool_name))
+            .with_chat_id(&inbound.chat_id),
+    ));
+    let _ = outbound_tx
+        .send(BusMessage::Telemetry(TelemetryEvent::ToolCall {
+            chat_id: inbound.chat_id.clone(),
+            channel: inbound.channel.clone(),
+            tool_name: tool_name.to_string(),
+            args: args_str.clone(),
+        }))
+        .await;
+    let _ = outbound_tx
+        .send(BusMessage::Telemetry(TelemetryEvent::ToolCallStarted {
+            chat_id: inbound.chat_id.clone(),
+            tool_name: tool_name.to_string(),
+            args: args_str.clone(),
+        }))
+        .await;
 }
 
 /// Session-scoped wiring for tools that need the active chat (e.g. `ask_user`).
@@ -35,6 +165,8 @@ struct ToolCallRuntime {
     hub: Arc<ClarificationHub>,
     is_subagent: bool,
     subagent_allowlist: Option<Arc<HashSet<String>>>,
+    shell_policy: Arc<ResolvedShellPolicy>,
+    unattended_session: bool,
 }
 
 /// Runs a tool with optional per-call activity heartbeats and optional cooperative cancellation.
@@ -42,6 +174,8 @@ async fn execute_tool_call_with_activity(
     tools: &Arc<ToolRegistry>,
     tool_execution_activity: Option<SharedToolExecutionActivity>,
     chat_id: &str,
+    channel: &str,
+    outbound_tx: &mpsc::Sender<BusMessage>,
     tool_name: &str,
     args: Value,
     cancel_token: Option<&tokio_util::sync::CancellationToken>,
@@ -52,16 +186,118 @@ async fn execute_tool_call_with_activity(
     let tool_exec_ctx = runtime.session;
     let chat_id = chat_id.to_string();
     let tool_name = tool_name.to_string();
+    let channel = channel.to_string();
     let tools = Arc::clone(tools);
+    let outbound_tx = outbound_tx.clone();
     let cancel_owned = cancel_token.cloned();
 
     crate::tool_runtime::with_tool_exec_scope(tool_exec_ctx, async move {
+        let args = args;
         let activity_handle = tool_execution_activity
             .as_ref()
             .map(|a| a.start(chat_id.as_str(), tool_name.as_str()));
 
         let is_subagent = runtime.is_subagent;
         let allow = runtime.subagent_allowlist.clone();
+        if tool_name == "exec" {
+            if let Some(command) = extract_exec_command(&args) {
+                let preview = command_preview(&command);
+                let mode =
+                    shell_policy_mode_for_session(&runtime.shell_policy, runtime.unattended_session);
+                let requires_approval =
+                    should_require_shell_approval(&command, &runtime.shell_policy.approval_patterns);
+                match mode {
+                    ShellPolicyMode::Allow => {}
+                    ShellPolicyMode::Deny => {
+                        if requires_approval {
+                            let _ = outbound_tx
+                                .send(BusMessage::Telemetry(TelemetryEvent::ShellPolicyDecision {
+                                    chat_id: chat_id.clone(),
+                                    channel: channel.clone(),
+                                    mode: "deny".to_string(),
+                                    decision: "blocked".to_string(),
+                                    command_preview: preview,
+                                }))
+                                .await;
+                            return ToolExecutionFinished::Completed(Err(format!(
+                                "Command blocked by shell policy (mode=deny): {}",
+                                command
+                            )));
+                        }
+                    }
+                    ShellPolicyMode::Ask => {
+                        if requires_approval {
+                            let _ = outbound_tx
+                                .send(BusMessage::Telemetry(TelemetryEvent::ShellPolicyDecision {
+                                    chat_id: chat_id.clone(),
+                                    channel: channel.clone(),
+                                    mode: "ask".to_string(),
+                                    decision: "approval_requested".to_string(),
+                                    command_preview: preview.clone(),
+                                }))
+                                .await;
+                            let ask_payload = serde_json::json!({
+                                "prompt": format!(
+                                    "Approve potentially destructive shell command?\n\n`{}`\n\nReply with approve or deny.",
+                                    command
+                                ),
+                                "choices": ["approve", "deny"],
+                                "timeout_secs": 1800,
+                                "allow_empty": false
+                            });
+                            let ask_result = tools
+                                .execute_tool_scoped(
+                                    "ask_user",
+                                    ask_payload,
+                                    allow.as_deref(),
+                                    is_subagent,
+                                )
+                                .await;
+                            match ask_result {
+                                Ok(reply) => {
+                                    let approved = reply.to_ascii_lowercase().contains("approve")
+                                        && !reply.to_ascii_lowercase().contains("deny");
+                                    if !approved {
+                                        let _ = outbound_tx
+                                            .send(BusMessage::Telemetry(
+                                                TelemetryEvent::ShellPolicyDecision {
+                                                    chat_id: chat_id.clone(),
+                                                    channel: channel.clone(),
+                                                    mode: "ask".to_string(),
+                                                    decision: "approval_denied".to_string(),
+                                                    command_preview: preview,
+                                                },
+                                            ))
+                                            .await;
+                                        return ToolExecutionFinished::Completed(Err(
+                                            "Command not approved by user; execution skipped."
+                                                .to_string(),
+                                        ));
+                                    }
+                                    let _ = outbound_tx
+                                        .send(BusMessage::Telemetry(
+                                            TelemetryEvent::ShellPolicyDecision {
+                                                chat_id: chat_id.clone(),
+                                                channel: channel.clone(),
+                                                mode: "ask".to_string(),
+                                                decision: "approval_granted".to_string(),
+                                                command_preview: preview,
+                                            },
+                                        ))
+                                        .await;
+                                }
+                                Err(e) => {
+                                    return ToolExecutionFinished::Completed(Err(format!(
+                                        "Shell policy approval failed: {}",
+                                        e
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let completed = match cancel_owned.as_ref() {
             None => Some(
                 tools
@@ -118,6 +354,9 @@ struct ReasoningSpawnArgs {
     doom_loop_enabled: bool,
     cancellation_tokens: Arc<dashmap::DashMap<String, Arc<tokio_util::sync::CancellationToken>>>,
     pending_inbound: Arc<dashmap::DashMap<String, Mutex<VecDeque<crate::bus::InboundMessage>>>>,
+    harness_runtime_summary: String,
+    forbid_final_without_tools: bool,
+    shell_policy: Arc<ResolvedShellPolicy>,
 }
 
 fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus::InboundMessage) {
@@ -145,6 +384,9 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
     let logger_tx = args.logger_tx.clone();
     let clarification_hub = args.clarification_hub.clone();
     let doom_loop_enabled = args.doom_loop_enabled;
+    let harness_runtime_summary = args.harness_runtime_summary.clone();
+    let forbid_final_without_tools = args.forbid_final_without_tools;
+    let shell_policy = args.shell_policy.clone();
     let tool_exec_ctx = ToolExecCtx::new(
         inbound.channel.clone(),
         inbound.chat_id.clone(),
@@ -189,6 +431,9 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
             is_subagent: false,
             subagent_allowlist: None,
             doom_loop_enabled,
+            harness_runtime_summary: harness_runtime_summary.clone(),
+            forbid_final_without_tools,
+            shell_policy: shell_policy.clone(),
         })
         .await;
 
@@ -271,6 +516,9 @@ pub(crate) struct ReasoningLoopCtx {
     pub(crate) is_subagent: bool,
     pub(crate) subagent_allowlist: Option<Arc<HashSet<String>>>,
     pub(crate) doom_loop_enabled: bool,
+    pub(crate) harness_runtime_summary: String,
+    pub(crate) forbid_final_without_tools: bool,
+    pub(crate) shell_policy: Arc<ResolvedShellPolicy>,
 }
 
 /// Constructor arguments for [`AgentLogic`], grouped to keep call sites readable.
@@ -293,6 +541,14 @@ pub struct AgentLogicParams {
     pub subagent: Option<SubagentHarnessParams>,
     /// When true (default), inject corrective user text if repeated tool calls are detected.
     pub doom_loop_enabled: bool,
+    /// Pre-formatted harness lines for system context (execution caps, subagent flags, etc.).
+    pub harness_runtime_summary: String,
+    /// System prompt used for `subagent_spawn` / plan runs (may include research appendix).
+    pub subagent_system_prompt: String,
+    /// Config default; inbound metadata `isanagent_autonomous_forbid_final_without_tools` can override.
+    pub forbid_final_without_tools: bool,
+    /// Shell command safety policy (`exec`) resolved from config.
+    pub shell_policy: ResolvedShellPolicy,
 }
 
 /// Build-time options for the Phase 5 sub-agent harness (see `[harness.subagents]`).
@@ -327,6 +583,9 @@ pub struct AgentLogic {
     clarification_hub: Arc<ClarificationHub>,
     subagent_harness: Option<Arc<SubagentHarness>>,
     doom_loop_enabled: bool,
+    harness_runtime_summary: String,
+    forbid_final_without_tools: bool,
+    shell_policy: Arc<ResolvedShellPolicy>,
 }
 
 impl AgentLogic {
@@ -348,11 +607,18 @@ impl AgentLogic {
             clarification_hub,
             subagent,
             doom_loop_enabled,
+            harness_runtime_summary,
+            subagent_system_prompt,
+            forbid_final_without_tools,
+            shell_policy,
         } = params;
 
+        let harness_for_subagent = harness_runtime_summary.clone();
         let session_manager = Arc::new(session_manager);
         let skills = Arc::new(skills);
         let tools = Arc::new(tools);
+        let memory_node = session_manager.get_memory_node();
+        let shell_policy = Arc::new(shell_policy);
 
         let subagent_harness = subagent.map(|p| {
             Arc::new(SubagentHarness::new(subagent::SubagentSpawnDeps {
@@ -360,7 +626,7 @@ impl AgentLogic {
                 provider_template: dyn_clone::clone_box(&*provider),
                 session_manager: session_manager.clone(),
                 skills: skills.clone(),
-                system_prompt: system_prompt.clone(),
+                system_prompt: subagent_system_prompt,
                 max_iterations,
                 max_tool_output_chars,
                 max_recent_summaries,
@@ -375,6 +641,9 @@ impl AgentLogic {
                 max_tasks: p.max_tasks,
                 max_wait_secs: p.max_wait_secs,
                 doom_loop_enabled,
+                memory_node: memory_node.clone(),
+                harness_runtime_summary: harness_for_subagent.clone(),
+                shell_policy: shell_policy.clone(),
             }))
         });
 
@@ -398,12 +667,15 @@ impl AgentLogic {
             clarification_hub,
             subagent_harness: subagent_harness.clone(),
             doom_loop_enabled,
+            harness_runtime_summary,
+            forbid_final_without_tools,
+            shell_policy: shell_policy.clone(),
         };
 
         let tools_mut = Arc::get_mut(&mut agent.tools)
             .expect("expected unique ownership of tools registry during initialization");
         if let Some(ref h) = subagent_harness {
-            subagent::register_subagent_tools(tools_mut, h.clone());
+            subagent::register_subagent_tools(tools_mut, h.clone(), memory_node);
         }
         let skill_reg = agent.skills.clone();
         let loader_tool = LoadSkillTool {
@@ -447,6 +719,9 @@ impl AgentLogic {
             doom_loop_enabled: self.doom_loop_enabled,
             cancellation_tokens: self.cancellation_tokens.clone(),
             pending_inbound: self.pending_inbound.clone(),
+            harness_runtime_summary: self.harness_runtime_summary.clone(),
+            forbid_final_without_tools: self.forbid_final_without_tools,
+            shell_policy: self.shell_policy.clone(),
         }
     }
 
@@ -461,6 +736,8 @@ impl AgentLogic {
             &self.tools,
             self.tool_execution_activity.clone(),
             chat_id,
+            "test",
+            &self.outbound_tx,
             tool_name,
             args,
             None,
@@ -469,6 +746,8 @@ impl AgentLogic {
                 hub: self.clarification_hub.clone(),
                 is_subagent: false,
                 subagent_allowlist: None,
+                shell_policy: self.shell_policy.clone(),
+                unattended_session: false,
             },
         )
         .await
@@ -598,11 +877,23 @@ impl AgentLogic {
             is_subagent,
             subagent_allowlist,
             doom_loop_enabled,
+            harness_runtime_summary,
+            forbid_final_without_tools,
+            shell_policy,
         } = ctx;
 
         let session_key = tool_exec_ctx.session_key.clone();
 
         let mut mem = session_manager.get_session(&session_key).await?;
+
+        let forbid_final_effective = !is_subagent
+            && (forbid_final_without_tools
+                || metadata_truthy(
+                    &inbound.metadata,
+                    "isanagent_autonomous_forbid_final_without_tools",
+                ));
+        let unattended_session = metadata_truthy(&inbound.metadata, "isanagent_autonomous_session")
+            || inbound.metadata.contains_key("isanagent_autonomous_until");
 
         // 1. Build runtime context and prepend to User message before adding to memory
         let thread_info = inbound
@@ -611,13 +902,54 @@ impl AgentLogic {
             .map(|t| format!(", thread: '{}'", t))
             .unwrap_or_default();
         let now = chrono::Local::now().to_rfc3339();
-        let runtime_context = format!(
+        let os_family = std::env::consts::OS;
+        let path_sep = std::path::MAIN_SEPARATOR;
+        let shell_family = if cfg!(windows) {
+            if std::env::var("PSModulePath").is_ok() {
+                "powershell"
+            } else {
+                "cmd"
+            }
+        } else if std::env::var("SHELL")
+            .ok()
+            .map(|s| s.contains("bash"))
+            .unwrap_or(false)
+        {
+            "bash"
+        } else {
+            "sh"
+        };
+        let mut runtime_context = format!(
             "[RUNTIME CONTEXT] Current time is {}. You are navigating and responding in channel: '{}', with chat ID: '{}'{}.",
             now,
             inbound.channel,
             inbound.chat_id,
             thread_info
-        ) + crate::utils::RUNTIME_CONTEXT_END_SUFFIX;
+        );
+        runtime_context.push_str(&format!(
+            " Host hints: os_family='{}', shell_family='{}', path_separator='{}', windows={}.",
+            os_family,
+            shell_family,
+            path_sep,
+            cfg!(windows)
+        ));
+        if let Ok(term) = std::env::var("TERM") {
+            if !term.trim().is_empty() {
+                runtime_context.push_str(&format!(" terminal='{}'.", term.trim()));
+            }
+        }
+        if let Some(v) = inbound.metadata.get("isanagent_autonomous_until") {
+            if let Some(s) = v.as_str() {
+                runtime_context
+                    .push_str(&format!(" Autonomous session deadline (RFC3339): '{}'.", s));
+            }
+        }
+        if forbid_final_effective {
+            runtime_context.push_str(
+                " This session expects tool use until work is complete — avoid ending on plain text alone.",
+            );
+        }
+        runtime_context.push_str(crate::utils::RUNTIME_CONTEXT_END_SUFFIX);
 
         let contextualized_content = format!("{}{}", runtime_context, inbound.content);
 
@@ -693,12 +1025,35 @@ impl AgentLogic {
             };
 
             // Inject the latest static system prompt to the beginning of the context
-            let system_msg = crate::utils::ChatMessage::system(&format!(
-                "{}\n\n{}\n\n{}",
+            let harness_block = if harness_runtime_summary.trim().is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n\n--- Harness snapshot (this step) ---\n{}\n",
+                    harness_runtime_summary.trim()
+                )
+            };
+            let iteration_line = format!(
+                "\n--- Reasoning budget ---\nYou are on tool/LLM step {} of {} for this user turn.\n",
+                iterations, max_iterations
+            );
+            let autonomy_line = if forbid_final_effective {
+                "\n--- Autonomy ---\nDo not finish this step with assistant text only — call tools (or `ask_user` if blocked). If you believe you are done, still run a verification tool (e.g. read_file or execution_env_info) when appropriate.\n"
+            } else {
+                ""
+            };
+            let mut system_body = format!(
+                "{}\n\n{}\n{}{}{}",
                 system_prompt,
                 summaries_text,
-                skills.get_capabilities_summary()
-            ));
+                skills.get_capabilities_summary(),
+                harness_block,
+                iteration_line
+            )
+            .trim_end()
+            .to_string();
+            system_body.push_str(autonomy_line);
+            let system_msg = crate::utils::ChatMessage::system(&system_body);
             context.insert(0, system_msg);
 
             if doom_loop_enabled {
@@ -788,60 +1143,15 @@ impl AgentLogic {
                 };
                 mem.add_message(assistant_msg).await?;
 
-                for tc in tool_calls {
-                    if cancel_token.is_cancelled() {
-                        return Ok(String::new());
-                    }
+                let parallel_ok = !is_subagent
+                    && tool_calls.len() > 1
+                    && tool_calls.iter().all(|tc| {
+                        crate::tools::ToolRegistry::is_parallel_safe_tool(tc.function.name.as_str())
+                    });
 
-                    let tool_name = &tc.function.name;
-                    let args_str = &tc.function.arguments;
-                    let _ = logger_tx.send(BusMessage::Log(
-                        LogEvent::info(&name, &format!("Invoking tool: {}", tool_name))
-                            .with_chat_id(&inbound.chat_id),
-                    ));
-
-                    // Emit Telemetry Tool Call
-                    let args = serde_json::from_str::<serde_json::Value>(args_str)
-                        .unwrap_or_else(|_| serde_json::json!({}));
-                    let _ = outbound_tx
-                        .send(BusMessage::Telemetry(TelemetryEvent::ToolCall {
-                            chat_id: inbound.chat_id.clone(),
-                            channel: inbound.channel.clone(),
-                            tool_name: tool_name.to_string(),
-                            args: args_str.clone(),
-                        }))
-                        .await;
-                    let _ = outbound_tx
-                        .send(BusMessage::Telemetry(TelemetryEvent::ToolCallStarted {
-                            chat_id: inbound.chat_id.clone(),
-                            tool_name: tool_name.to_string(),
-                            args: args_str.clone(),
-                        }))
-                        .await;
-
-                    let tool_result = match execute_tool_call_with_activity(
-                        &tools,
-                        tool_execution_activity.clone(),
-                        &inbound.chat_id,
-                        tool_name,
-                        args,
-                        Some(&cancel_token),
-                        ToolCallRuntime {
-                            session: tool_exec_ctx.clone(),
-                            hub: clarification_hub.clone(),
-                            is_subagent,
-                            subagent_allowlist: subagent_allowlist.clone(),
-                        },
-                    )
-                    .await
-                    {
-                        ToolExecutionFinished::Completed(res) => res,
-                        ToolExecutionFinished::Cancelled => return Ok(String::new()),
-                    };
-
-                    let tool_result_text = match tool_result {
-                        Ok(res) => {
-                            let mut output = res;
+                let finalize_tool_output = |res: Result<String, String>| -> String {
+                    match res {
+                        Ok(mut output) => {
                             if output.len() > max_tool_output_chars {
                                 output.truncate(max_tool_output_chars);
                                 output.push_str("\n... [TRUNCATED FOR LENGTH]");
@@ -849,29 +1159,175 @@ impl AgentLogic {
                             output
                         }
                         Err(e) => format!("Error: {}", e),
-                    };
+                    }
+                };
 
-                    // Emit Telemetry Tool Result
-                    let _ = outbound_tx
-                        .send(BusMessage::Telemetry(TelemetryEvent::ToolResult {
-                            chat_id: inbound.chat_id.clone(),
-                            channel: inbound.channel.clone(),
-                            tool_name: tool_name.to_string(),
-                            result: tool_result_text.clone(),
-                        }))
-                        .await;
-                    let _ = outbound_tx
-                        .send(BusMessage::Telemetry(TelemetryEvent::ToolCallFinished {
-                            chat_id: inbound.chat_id.clone(),
-                            tool_name: tool_name.to_string(),
-                            result: tool_result_text.clone(),
-                        }))
-                        .await;
-
-                    // Add the tool execution back as a tool role message natively
-                    mem.add_message(crate::utils::ChatMessage::tool(&tool_result_text, &tc.id))
-                        .await?;
+                if parallel_ok {
+                    for tc in tool_calls.iter() {
+                        if cancel_token.is_cancelled() {
+                            return Ok(String::new());
+                        }
+                        log_tool_invocation_start(&logger_tx, &outbound_tx, &name, &inbound, tc)
+                            .await;
+                    }
+                    let mut futures_vec = Vec::with_capacity(tool_calls.len());
+                    for tc in tool_calls.iter() {
+                        let tools = Arc::clone(&tools);
+                        let tool_execution_activity = tool_execution_activity.clone();
+                        let chat_id = inbound.chat_id.clone();
+                        let tool_name = tc.function.name.clone();
+                        let args =
+                            serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+                                .unwrap_or_else(|_| serde_json::json!({}));
+                        if tool_name == "exec" {
+                            if let Some(cmd) = extract_exec_command(&args) {
+                                if shell_command_uses_grep_like(&cmd) {
+                                    let _ = outbound_tx
+                                        .send(BusMessage::Telemetry(
+                                            TelemetryEvent::ShellGrepLikeDetected {
+                                                chat_id: inbound.chat_id.clone(),
+                                                channel: inbound.channel.clone(),
+                                                command_preview: command_preview(&cmd),
+                                            },
+                                        ))
+                                        .await;
+                                }
+                            }
+                        }
+                        let cancel_token = cancel_token.clone();
+                        let tool_exec_ctx = tool_exec_ctx.clone();
+                        let clarification_hub = clarification_hub.clone();
+                        let subagent_allowlist = subagent_allowlist.clone();
+                        let shell_policy_for_call = shell_policy.clone();
+                        let outbound_for_call = outbound_tx.clone();
+                        let channel_for_call = inbound.channel.clone();
+                        futures_vec.push(async move {
+                            execute_tool_call_with_activity(
+                                &tools,
+                                tool_execution_activity,
+                                &chat_id,
+                                &channel_for_call,
+                                &outbound_for_call,
+                                &tool_name,
+                                args,
+                                Some(&cancel_token),
+                                ToolCallRuntime {
+                                    session: tool_exec_ctx,
+                                    hub: clarification_hub,
+                                    is_subagent,
+                                    subagent_allowlist,
+                                    shell_policy: shell_policy_for_call,
+                                    unattended_session,
+                                },
+                            )
+                            .await
+                        });
+                    }
+                    let outcomes = join_all(futures_vec).await;
+                    for (tc, fin) in tool_calls.iter().zip(outcomes) {
+                        if cancel_token.is_cancelled() {
+                            return Ok(String::new());
+                        }
+                        let tool_result = match fin {
+                            ToolExecutionFinished::Completed(res) => res,
+                            ToolExecutionFinished::Cancelled => return Ok(String::new()),
+                        };
+                        let tool_result_text = finalize_tool_output(tool_result);
+                        let tool_name = tc.function.name.clone();
+                        let _ = outbound_tx
+                            .send(BusMessage::Telemetry(TelemetryEvent::ToolResult {
+                                chat_id: inbound.chat_id.clone(),
+                                channel: inbound.channel.clone(),
+                                tool_name: tool_name.clone(),
+                                result: tool_result_text.clone(),
+                            }))
+                            .await;
+                        let _ = outbound_tx
+                            .send(BusMessage::Telemetry(TelemetryEvent::ToolCallFinished {
+                                chat_id: inbound.chat_id.clone(),
+                                tool_name,
+                                result: tool_result_text.clone(),
+                            }))
+                            .await;
+                        mem.add_message(crate::utils::ChatMessage::tool(&tool_result_text, &tc.id))
+                            .await?;
+                    }
                     tool_invoked = true;
+                } else {
+                    for tc in tool_calls {
+                        if cancel_token.is_cancelled() {
+                            return Ok(String::new());
+                        }
+
+                        log_tool_invocation_start(&logger_tx, &outbound_tx, &name, &inbound, tc)
+                            .await;
+
+                        let tool_name = &tc.function.name;
+                        let args_str = &tc.function.arguments;
+                        let args = serde_json::from_str::<serde_json::Value>(args_str)
+                            .unwrap_or_else(|_| serde_json::json!({}));
+                        if tool_name == "exec" {
+                            if let Some(cmd) = extract_exec_command(&args) {
+                                if shell_command_uses_grep_like(&cmd) {
+                                    let _ = outbound_tx
+                                        .send(BusMessage::Telemetry(
+                                            TelemetryEvent::ShellGrepLikeDetected {
+                                                chat_id: inbound.chat_id.clone(),
+                                                channel: inbound.channel.clone(),
+                                                command_preview: command_preview(&cmd),
+                                            },
+                                        ))
+                                        .await;
+                                }
+                            }
+                        }
+
+                        let tool_result = match execute_tool_call_with_activity(
+                            &tools,
+                            tool_execution_activity.clone(),
+                            &inbound.chat_id,
+                            &inbound.channel,
+                            &outbound_tx,
+                            tool_name,
+                            args,
+                            Some(&cancel_token),
+                            ToolCallRuntime {
+                                session: tool_exec_ctx.clone(),
+                                hub: clarification_hub.clone(),
+                                is_subagent,
+                                subagent_allowlist: subagent_allowlist.clone(),
+                                shell_policy: shell_policy.clone(),
+                                unattended_session,
+                            },
+                        )
+                        .await
+                        {
+                            ToolExecutionFinished::Completed(res) => res,
+                            ToolExecutionFinished::Cancelled => return Ok(String::new()),
+                        };
+
+                        let tool_result_text = finalize_tool_output(tool_result);
+
+                        let _ = outbound_tx
+                            .send(BusMessage::Telemetry(TelemetryEvent::ToolResult {
+                                chat_id: inbound.chat_id.clone(),
+                                channel: inbound.channel.clone(),
+                                tool_name: tool_name.to_string(),
+                                result: tool_result_text.clone(),
+                            }))
+                            .await;
+                        let _ = outbound_tx
+                            .send(BusMessage::Telemetry(TelemetryEvent::ToolCallFinished {
+                                chat_id: inbound.chat_id.clone(),
+                                tool_name: tool_name.to_string(),
+                                result: tool_result_text.clone(),
+                            }))
+                            .await;
+
+                        mem.add_message(crate::utils::ChatMessage::tool(&tool_result_text, &tc.id))
+                            .await?;
+                        tool_invoked = true;
+                    }
                 }
             } else {
                 // Add vanilla assistant response to memory
@@ -880,6 +1336,27 @@ impl AgentLogic {
             }
 
             if !tool_invoked {
+                let research_nudge =
+                    iterations < max_iterations && should_nudge_research_depth(&inbound, &context);
+                if forbid_final_effective && iterations < max_iterations {
+                    let nudge = "[SYSTEM: Continue with at least one tool call (or `ask_user` if you are blocked). Plain assistant text alone is not sufficient for this session until the objective is met.]";
+                    let correction = crate::utils::ChatMessage::user(nudge);
+                    mem.add_message(correction).await?;
+                    continue;
+                }
+                if research_nudge {
+                    let _ = outbound_tx
+                        .send(BusMessage::Telemetry(TelemetryEvent::ResearchDepthNudge {
+                            chat_id: inbound.chat_id.clone(),
+                            channel: inbound.channel.clone(),
+                            reason: "search_without_primary_fetch".to_string(),
+                        }))
+                        .await;
+                    let nudge = "[SYSTEM: Research depth check — you used discovery search but did not fetch primary sources. Before finalizing, use `web_fetch`/`arxiv_fetch` (and/or `hf_hub_file_fetch`) on concrete sources, cross-verify at least two sources, then synthesize findings with explicit uncertainties.]";
+                    let correction = crate::utils::ChatMessage::user(nudge);
+                    mem.add_message(correction).await?;
+                    continue;
+                }
                 // Final outbound text
                 let final_response = thinking_strip_re
                     .replace_all(&response_text, "")
@@ -1398,6 +1875,14 @@ mod tests {
             clarification_hub,
             subagent: None,
             doom_loop_enabled: false,
+            harness_runtime_summary: String::new(),
+            subagent_system_prompt: "test system prompt".to_string(),
+            forbid_final_without_tools: false,
+            shell_policy: crate::config::ResolvedShellPolicy {
+                interactive_mode: crate::config::ShellPolicyMode::Ask,
+                unattended_mode: crate::config::ShellPolicyMode::Deny,
+                approval_patterns: Vec::new(),
+            },
         });
 
         (agent, outbound_rx)
@@ -1446,6 +1931,14 @@ mod tests {
             clarification_hub: ClarificationHub::shared(),
             subagent: None,
             doom_loop_enabled: false,
+            harness_runtime_summary: String::new(),
+            subagent_system_prompt: "test system prompt".to_string(),
+            forbid_final_without_tools: false,
+            shell_policy: crate::config::ResolvedShellPolicy {
+                interactive_mode: crate::config::ShellPolicyMode::Ask,
+                unattended_mode: crate::config::ShellPolicyMode::Deny,
+                approval_patterns: Vec::new(),
+            },
         });
 
         if let Some(tool_execution_activity) = tool_execution_activity {

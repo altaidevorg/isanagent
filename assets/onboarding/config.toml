@@ -2,7 +2,7 @@ restrict_to_workspace = true
 
 # Root-level limits (must stay above [terminal] so TOML does not nest them under [terminal]).
 max_iterations = 999
-max_tool_output_chars = 10000
+max_tool_output_chars = 20000
 max_web_tool_output_chars = 50000
 
 # Local stdin/stdout chat. Set enabled = false for API-only or headless runs (requires another channel).
@@ -71,7 +71,19 @@ enabled = true
 # cancel_children_on_parent_cancel = false  # default true: explicit cancel (/cancel, BusMessage::Cancel) also stops sub-tasks
 # allowed_tools = ["read_file", "glob_files", "search_text", "edit_file"]  # omit = all tools except nested spawn/plan
 
-# Phase 2 execution plane: `execution_session_create`, `execution_run`, `execution_cancel`,
+# Shell policy for `exec` safety. mode applies to interactive sessions; unattended_default applies
+# when inbound metadata indicates autonomous/headless execution.
+[harness.shell_policy]
+mode = "ask"                # ask | deny | allow
+unattended_default = "allow" # ask | deny | allow
+# interactive_requires_approval_for = ["rm -rf", "git reset --hard"]
+
+# ML policy overlay (embedded in the isanagent binary when enabled). Reference copy: workspace/ML_ENGINEER_OVERLAY.md (onboard). Optional rules merge: workspace/ML_POLICY.md
+[harness.ml_engineer]
+enabled = true
+# subagent_research_overlay = false  # default true when enabled: extra research instructions for sub-agents only
+# forbid_final_without_tools = true   # default false: require at least one tool call before ending a reasoning step (also overridable via inbound metadata isanagent_autonomous_forbid_final_without_tools)
+
 # `execution_session_close`, `execution_env_info` (local subprocess, Jupyter kernel, or SSH remote).
 # Operator guide: docs/execution-user-guide.md — roadmap: docs/execution-implementation-plan.md
 [harness.execution]
@@ -84,13 +96,13 @@ enabled = false
 allowed_providers = ["local", "jupyter"]
 python_executable = "python"
 
-# When default_provider = "jupyter": set base_url; token from JUPYTER_TOKEN env preferred over `token` here.
+# When you enable "jupyter": set base_url; token from JUPYTER_TOKEN env preferred over `token` here.
 [harness.execution.jupyter]
 base_url = "http://127.0.0.1:8888"
 token = "<changethis>"
 kernel_name = "python3"
 
-# When default_provider = "ssh": set host, user, remote_workdir; use identity_file and/or env SSH_PASSWORD.
+# When you enable "ssh": set host, user, remote_workdir; use identity_file and/or env SSH_PASSWORD.
 # [harness.execution.ssh]
 # host = "my.server.example"
 # port = 22

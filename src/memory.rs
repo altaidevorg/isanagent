@@ -105,6 +105,47 @@ pub fn ensure_harness_todos_schema(conn: &Connection) -> Result<(), rusqlite::Er
     Ok(())
 }
 
+/// Persisted sub-agent runs for audit (`subagent_tasks` in the agent DB).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SubagentTaskRecord {
+    pub task_id: String,
+    pub parent_chat_id: String,
+    pub child_chat_id: String,
+    pub display_name: Option<String>,
+    pub prompt: String,
+    pub status: String,
+    pub result: Option<String>,
+    pub error: Option<String>,
+    pub execution_job_id: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+pub fn ensure_subagent_tasks_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS subagent_tasks (
+            task_id TEXT PRIMARY KEY NOT NULL,
+            parent_chat_id TEXT NOT NULL,
+            child_chat_id TEXT NOT NULL,
+            display_name TEXT,
+            prompt TEXT NOT NULL,
+            status TEXT NOT NULL,
+            result TEXT,
+            error TEXT,
+            execution_job_id TEXT,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_subagent_tasks_parent
+         ON subagent_tasks(parent_chat_id, updated_at_ms DESC)",
+        [],
+    )?;
+    Ok(())
+}
+
 /// One row in a session todo list (`harness_todos`, via [`SqliteMemoryActor`]).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TodoRow {
@@ -302,6 +343,31 @@ pub enum MemoryMessage {
         chat_id: String,
         reply: SharedReply<Result<Option<Vec<TodoRow>>, String>>,
     },
+    /// Insert a `running` row when a sub-agent task starts.
+    InsertSubagentTask {
+        task_id: String,
+        parent_chat_id: String,
+        child_chat_id: String,
+        display_name: Option<String>,
+        prompt: String,
+        reply: SharedReply<Result<(), String>>,
+    },
+    /// Update row when a sub-agent task finishes (`completed`, `failed`, `cancelled`).
+    FinalizeSubagentTask {
+        task_id: String,
+        parent_chat_id: String,
+        status: String,
+        result: Option<String>,
+        error: Option<String>,
+        execution_job_id: Option<String>,
+        reply: SharedReply<Result<(), String>>,
+    },
+    /// Recent persisted sub-agent tasks for a parent chat (newest first).
+    ListSubagentTasksForParent {
+        parent_chat_id: String,
+        limit: usize,
+        reply: SharedReply<Result<Vec<SubagentTaskRecord>, String>>,
+    },
 }
 
 /// Persistent SQLite-based memory Actor for agents.
@@ -414,6 +480,7 @@ impl SqliteMemoryActor {
         )?;
 
         ensure_harness_todos_schema(&conn)?;
+        ensure_subagent_tasks_schema(&conn)?;
 
             Ok(conn)
         })()
@@ -981,6 +1048,118 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
             }
             MemoryMessage::LoadHarnessTodos { chat_id, reply } => {
                 let res = todo_load_sqlite_conn(&self.conn, &chat_id);
+                let _ = reply.send(res);
+            }
+            MemoryMessage::InsertSubagentTask {
+                task_id,
+                parent_chat_id,
+                child_chat_id,
+                display_name,
+                prompt,
+                reply,
+            } => {
+                let res = (|| -> Result<(), String> {
+                    let now = Utc::now().timestamp_millis();
+                    self.conn
+                        .execute(
+                            "INSERT INTO subagent_tasks (
+                                task_id, parent_chat_id, child_chat_id, display_name, prompt,
+                                status, result, error, execution_job_id, created_at_ms, updated_at_ms
+                            ) VALUES (?1, ?2, ?3, ?4, ?5, 'running', NULL, NULL, NULL, ?6, ?6)",
+                            params![
+                                task_id,
+                                parent_chat_id,
+                                child_chat_id,
+                                display_name,
+                                prompt,
+                                now
+                            ],
+                        )
+                        .map_err(|e| format!("insert subagent_tasks: {}", e))?;
+                    Ok(())
+                })();
+                let _ = reply.send(res);
+            }
+            MemoryMessage::FinalizeSubagentTask {
+                task_id,
+                parent_chat_id,
+                status,
+                result,
+                error,
+                execution_job_id,
+                reply,
+            } => {
+                let res = (|| -> Result<(), String> {
+                    let now = Utc::now().timestamp_millis();
+                    let n = self
+                        .conn
+                        .execute(
+                            "UPDATE subagent_tasks SET
+                                status = ?1,
+                                result = ?2,
+                                error = ?3,
+                                execution_job_id = COALESCE(?4, execution_job_id),
+                                updated_at_ms = ?5
+                             WHERE task_id = ?6 AND parent_chat_id = ?7",
+                            params![
+                                status,
+                                result,
+                                error,
+                                execution_job_id,
+                                now,
+                                task_id,
+                                parent_chat_id
+                            ],
+                        )
+                        .map_err(|e| format!("finalize subagent_tasks: {}", e))?;
+                    if n == 0 {
+                        return Err("subagent_tasks update: no matching row".to_string());
+                    }
+                    Ok(())
+                })();
+                let _ = reply.send(res);
+            }
+            MemoryMessage::ListSubagentTasksForParent {
+                parent_chat_id,
+                limit,
+                reply,
+            } => {
+                let res = (|| -> Result<Vec<SubagentTaskRecord>, String> {
+                    let lim = limit.clamp(1, 200) as i64;
+                    let mut stmt = self
+                        .conn
+                        .prepare(
+                            "SELECT task_id, parent_chat_id, child_chat_id, display_name, prompt,
+                                    status, result, error, execution_job_id, created_at_ms, updated_at_ms
+                             FROM subagent_tasks
+                             WHERE parent_chat_id = ?1
+                             ORDER BY updated_at_ms DESC
+                             LIMIT ?2",
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let rows = stmt
+                        .query_map(params![parent_chat_id, lim], |row| {
+                            Ok(SubagentTaskRecord {
+                                task_id: row.get(0)?,
+                                parent_chat_id: row.get(1)?,
+                                child_chat_id: row.get(2)?,
+                                display_name: row.get(3)?,
+                                prompt: row.get(4)?,
+                                status: row.get(5)?,
+                                result: row.get(6)?,
+                                error: row.get(7)?,
+                                execution_job_id: row.get(8)?,
+                                created_at_ms: row.get(9)?,
+                                updated_at_ms: row.get(10)?,
+                            })
+                        })
+                        .map_err(|e| e.to_string())?;
+                    let mut out = Vec::new();
+                    for r in rows {
+                        out.push(r.map_err(|e| e.to_string())?);
+                    }
+                    Ok(out)
+                })();
                 let _ = reply.send(res);
             }
         }

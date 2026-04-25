@@ -20,7 +20,7 @@ use tokio::runtime::Handle;
 use crate::onboarding::OnboardOptions;
 
 /// Matches [`assets/onboarding/config.toml`] defaults for boolean-ish sections.
-const FEATURE_TOGGLE_COUNT: usize = 12;
+const FEATURE_TOGGLE_COUNT: usize = 13;
 const FEATURE_TOGGLE_LABELS: [&str; FEATURE_TOGGLE_COUNT] = [
     "[terminal] stdin/stdout chat",
     "[slack]",
@@ -33,6 +33,7 @@ const FEATURE_TOGGLE_LABELS: [&str; FEATURE_TOGGLE_COUNT] = [
     "[memory]",
     "[harness.git_worktree]",
     "[harness.subagents]",
+    "[harness.ml_engineer] ML policy overlay (see workspace/ML_ENGINEER_OVERLAY.md)",
     "[harness.execution]",
 ];
 
@@ -49,6 +50,7 @@ fn default_feature_toggle_values() -> [bool; FEATURE_TOGGLE_COUNT] {
         true,  // memory
         true,  // harness git_worktree
         true,  // harness subagents
+        true,  // harness ml_engineer
         false, // harness execution
     ]
 }
@@ -74,7 +76,8 @@ fn build_onboard_options_with_toggles(
         memory_enabled: Some(values[8]),
         harness_git_worktree_enabled: Some(values[9]),
         harness_subagents_enabled: Some(values[10]),
-        harness_execution_enabled: Some(values[11]),
+        harness_ml_engineer_enabled: Some(values[11]),
+        harness_execution_enabled: Some(values[12]),
         ..Default::default()
     }
 }

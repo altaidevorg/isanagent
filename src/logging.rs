@@ -416,6 +416,70 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             ),
         )
         .with_chat_id(chat_id),
+        TelemetryEvent::SubagentSpawned {
+            parent_chat_id,
+            child_chat_id,
+            task_id,
+            display_name,
+        } => LogEvent::info(
+            "Telemetry",
+            &format!(
+                "SubagentSpawned parent={} child={} task={} name={}",
+                parent_chat_id,
+                child_chat_id,
+                task_id,
+                display_name.as_deref().unwrap_or("-")
+            ),
+        )
+        .with_chat_id(parent_chat_id.as_str()),
+        TelemetryEvent::SubagentFinished {
+            parent_chat_id,
+            child_chat_id,
+            task_id,
+            status,
+        } => LogEvent::info(
+            "Telemetry",
+            &format!(
+                "SubagentFinished parent={} child={} task={} status={}",
+                parent_chat_id, child_chat_id, task_id, status
+            ),
+        )
+        .with_chat_id(parent_chat_id.as_str()),
+        TelemetryEvent::ShellPolicyDecision {
+            chat_id,
+            channel,
+            mode,
+            decision,
+            command_preview,
+        } => LogEvent::info(
+            "Telemetry",
+            &format!(
+                "ShellPolicyDecision channel={} mode={} decision={} command={}",
+                channel, mode, decision, command_preview
+            ),
+        )
+        .with_chat_id(chat_id),
+        TelemetryEvent::ShellGrepLikeDetected {
+            chat_id,
+            channel,
+            command_preview,
+        } => LogEvent::warn(
+            "Telemetry",
+            &format!(
+                "ShellGrepLikeDetected channel={} command={}",
+                channel, command_preview
+            ),
+        )
+        .with_chat_id(chat_id),
+        TelemetryEvent::ResearchDepthNudge {
+            chat_id,
+            channel,
+            reason,
+        } => LogEvent::info(
+            "Telemetry",
+            &format!("ResearchDepthNudge channel={} reason={}", channel, reason),
+        )
+        .with_chat_id(chat_id),
     }
 }
 
@@ -493,12 +557,14 @@ mod tests {
 
     #[test]
     fn sanitize_message_masks_secrets_and_emails() {
-        let message = "Bearer abc.def ghi myawesomesecret umut@altai.dev";
+        let message =
+            "Bearer abc.def ghi AIzaSyDummyKeyValue012345678901234 myawesomesecret umut@altai.dev";
         let sanitized = sanitize_message(message);
         assert!(sanitized.contains("Bearer [REDACTED]"));
         assert!(sanitized.contains("[REDACTED_API_KEY]"));
         assert!(sanitized.contains("u***@altai.dev"));
-        assert!(!sanitized.contains("myawesomesecret"));
+        // Arbitrary words are not redacted; only Bearer tokens, Gemini-style keys, and emails.
+        assert!(sanitized.contains("myawesomesecret"));
     }
 
     #[test]

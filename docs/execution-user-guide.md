@@ -20,6 +20,10 @@ When **`[harness.execution] enabled = true`**, the agent gains these tools:
 | **`execution_session_close`** | Tear down the session and release resources. |
 | **`execution_env_info`** | Show provider capabilities, artifact caps, **`max_wall_secs`**, **`default_run_timeout_secs`**, a **`timeout_policy`** reminder, and (for local Python) try `python -V`. |
 
+### Research helpers (related tools)
+
+The agent also ships read-only **arXiv** (`arxiv_search`, `arxiv_fetch`) and **Hugging Face Hub file** (`hf_hub_file_fetch`, uses host env **`HF_TOKEN`** when set) tools. Use them together with **`web_fetch`** on stable URLs—e.g. `https://raw.githubusercontent.com/.../refs/heads/main/...` for pinned examples—when checking current library APIs before long **`execution_run_background`** jobs.
+
 Three providers are implemented today:
 
 - **`local`** — each session uses a working directory under your workspace sandbox. **Python (default):** one long-lived interpreter per session (**REPL-like**): variables and imports persist across **`execution_run`** calls until the session closes, you cancel, a run times out, or the working directory for the run changes (then the interpreter is restarted in the new cwd). Code is sent over a framed stdin/stdout channel to the worker (not via argv). **Opt out** with **`local_python_mode = "subprocess"`** in **`[harness.execution]`** to use a fresh **`python -u -`** subprocess per run (legacy, stateless). **Shell** sessions still use one short-lived **`sh -c`** / **`cmd /C`** per run. Stdout/stderr are capped the same as **`max_output_bytes`** (half per stream, minimum each side). On Unix the child is placed in its own process group and cancellation/timeout sends **SIGKILL** to that group (similar to Windows **`taskkill /T`**); **`SIGKILL`** is never sent for PID 0 or 1.
@@ -56,6 +60,13 @@ Optional keys (defaults are sensible if omitted):
 Top-level **`doom_loop_enabled`** (optional, default **true**): when true, the agent detects repeated identical tool calls and injects a corrective user message before the next LLM call (see `src/agent/doom_loop.rs`).
 
 Each successful **`execution_run`** or completed **`execution_run_background`** job also appends one JSON line to **`workspace_dir/.system_generated/execution_runs.jsonl`** (metadata only: no code body; may include **`job_id`** and optional **`description`**; background lines may include **`job_id`**) and emits **`ExecutionRunFinished`** telemetry (optional **`description`**). When a background job reaches a **finished** state (completed, failed, cancelled, or timeout), the agent also emits **`ExecutionJobFinished`** telemetry and appends **`workspace_dir/.system_generated/execution_jobs.jsonl`** (metadata audit; optional **`description`**).
+
+For agent-quality diagnostics, `conversation.jsonl` / `runtime.log` now also include:
+- **`ShellPolicyDecision`** telemetry (`approval_requested`, `approval_granted`, `approval_denied`, `blocked`) for risky `exec` commands.
+- **`ShellGrepLikeDetected`** telemetry when shell grep/cat/wc-style pipelines are attempted (helps track tool-first drift).
+- **`ResearchDepthNudge`** telemetry when a research turn tries to finish after discovery search without primary-source fetch.
+
+Use these events to track regressions over time (for example, “grep-like shell attempts per 100 turns” or “research nudges triggered per session”).
 
 Additionally, every **`execution_run`** (all providers) writes a **run journal** under **`workspace_dir/.system_generated/execution_history/{provider}/{session_id}/{run_id}/`**: **`run.json`** (truncated stdout/stderr, attachment list, timestamps) and **`source.txt`** (the exact code run). Treat journals as potentially sensitive if code contained secrets.
 

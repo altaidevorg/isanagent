@@ -12,6 +12,7 @@ This branch delivers harness **Phases 1–5** (through sub-agents / plans under 
 - **Phase 3:** `ClarificationHub` (`src/clarification.rs`), `ToolExecCtx` task-local (`src/tool_runtime.rs`), `AskUserTool` (`src/tools/workflow.rs`), `AgentLogic` inbound **early** `try_deliver_reply` before cancel/spawn, `ToolCallRuntime` + scoped tool execution (`src/agent/mod.rs`), terminal `[Question]` for `isanagent_clarification` metadata (`src/channels/terminal.rs`), registration in `src/bin/isanagent.rs`.
 - **Phase 4:** `GitWorktreeTool` (`src/tools/builtin.rs`), `[harness.git_worktree]` in `src/config.rs`, conditional registration in `src/bin/isanagent.rs`.
 - **Phase 5:** `SubagentHarness` + tools in `src/agent/subagent.rs`; `ReasoningLoopCtx` / scoped tool execution; `[harness.subagents]` (`cancel_children_on_parent_cancel`, `allowed_tools`, `max_tasks`, `max_wait_secs`); agent split `src/agent/mod.rs`.
+- **ML engineer convergence:** `[harness.ml_engineer]` + `assets/ml_engineer_overlay.md` (`src/ml_engineer.rs`); optional `workspace/ML_POLICY.md` in `compile_system_prompt` (`src/workspace.rs`); onboard writes `workspace/ML_ENGINEER_OVERLAY.md` as a human-readable copy; harness/runtime lines in `run_reasoning_loop`; optional forbid-final-without-tools (config + inbound metadata); `subagent_tasks` SQLite + `task_history_list`; `arxiv_*` / `hf_hub_file_fetch` in `src/tools/ml_domain.rs`; parallel safe tool batch in main loop; onboarding skills `ml-execution-preflight`, `literature-to-recipe`, `oom-recovery-playbook`. Subagent ↔ execution job correlation: `docs/subagent-execution-wiring.md`.
 - **Docs:** `docs/harness-implementation-plan.md`, `AGENTS.md` updated for the above.
 
 ## What We Tried / What Didn’t Work
@@ -59,7 +60,10 @@ This branch delivers harness **Phases 1–5** (through sub-agents / plans under 
 | `src/tools/workflow.rs` | `todo_write`, `search_tools`, `AskUserTool`, todo SQLite helpers |
 | `src/tools/builtin.rs` | Glob/search/edit/message/shell/web/memory/`git_worktree` tools |
 | `src/tools.rs` | `ToolRegistry`, catalog, `search_tool_index` |
-| `src/memory.rs` | Memory actor, `harness_todos` schema, SQLite busy_timeout helper |
+| `src/memory.rs` | Memory actor, `harness_todos` + `subagent_tasks` schema, SQLite busy_timeout helper |
+| `src/ml_engineer.rs` | ML overlay text, subagent research append |
+| `docs/subagent-execution-wiring.md` | Plan for `subagent_tasks.execution_job_id` + execution tools |
+| `src/tools/ml_domain.rs` | `arxiv_search`, `arxiv_fetch`, `hf_hub_file_fetch` |
 | `src/channels/terminal.rs` | `[Question]` styling for clarification outbounds |
 | `src/bin/isanagent.rs` | Tool registration, `ClarificationHub` + `AgentLogicParams` wiring |
 | `src/execution/` | Phases 0–2: contracts, `local.rs`, `harness.rs` + `build_execution_harness`; tools in `src/tools/execution.rs`; `[harness.execution]` in `config.rs` (`docs/execution-implementation-plan.md`) |
