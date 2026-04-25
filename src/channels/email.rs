@@ -3,9 +3,9 @@ use crate::channels::Channel;
 use crate::config::EmailConfig;
 use crate::logging::LoggerHandle;
 use async_trait::async_trait;
+use imap::ClientBuilder;
 use lettre::{transport::smtp::authentication::Credentials, Message, SmtpTransport, Transport};
 use log::{error, info};
-use native_tls::TlsConnector;
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::{mpsc::Sender, watch};
@@ -148,13 +148,9 @@ impl Channel for EmailChannel {
 }
 
 fn poll_inbox_once(config: EmailConfig, bus_tx: Sender<BusMessage>) -> Result<(), String> {
-    let tls = TlsConnector::builder().build().map_err(|e| e.to_string())?;
-    let client = imap::connect(
-        (&config.imap_host as &str, config.imap_port),
-        &config.imap_host,
-        &tls,
-    )
-    .map_err(|e| e.to_string())?;
+    let client = ClientBuilder::new(&config.imap_host, config.imap_port)
+        .connect()
+        .map_err(|e| e.to_string())?;
 
     let mut session = client
         .login(&config.imap_username, &config.imap_password)
@@ -173,16 +169,16 @@ fn poll_inbox_once(config: EmailConfig, bus_tx: Sender<BusMessage>) -> Result<()
                 let mut subject = String::new();
 
                 if let Some(envelope) = m.envelope() {
-                    if let Some(subject_bytes) = envelope.subject {
-                        subject = String::from_utf8_lossy(subject_bytes).to_string();
+                    if let Some(subject_bytes) = &envelope.subject {
+                        subject = String::from_utf8_lossy(subject_bytes.as_ref()).to_string();
                     }
                     if let Some(froms) = envelope.from.as_ref() {
                         if let Some(from) = froms.first() {
-                            if let (Some(mailbox), Some(host)) = (from.mailbox, from.host) {
+                            if let (Some(mailbox), Some(host)) = (&from.mailbox, &from.host) {
                                 sender = format!(
                                     "{}@{}",
-                                    String::from_utf8_lossy(mailbox),
-                                    String::from_utf8_lossy(host)
+                                    String::from_utf8_lossy(mailbox.as_ref()),
+                                    String::from_utf8_lossy(host.as_ref())
                                 );
                             }
                         }

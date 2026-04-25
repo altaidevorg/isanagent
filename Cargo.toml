@@ -51,7 +51,8 @@ axum = "0.8.8"
 tokio-stream = "0.1.18"
 dashmap = "6.1.0"
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "tokio1", "tokio1-native-tls"] }
-imap = "2.4.1"
+# 3.x alpha tracks imap-proto 0.16+ (2.4.1 pinned 0.10.2, which triggers a rustc future-incompat warning).
+imap = "3.0.0-alpha.15"
 native-tls = "0.2.11"
 moka = { version = "0.12.10", features = ["sync"] }
 hmac = "0.12.1"
