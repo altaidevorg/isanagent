@@ -42,8 +42,22 @@ pub struct ColabMcpExecutionProvider {
 
 struct ColabMcpSession {
     client: Mutex<McpProcessClient>,
-    execute_tool_name: String,
-    execute_code_arg_key: String,
+    execution_mode: ColabExecutionMode,
+}
+
+#[derive(Debug, Clone)]
+enum ColabExecutionMode {
+    Direct {
+        execute_tool_name: String,
+        execute_code_arg_key: String,
+    },
+    NotebookCells {
+        add_code_cell_tool_name: String,
+        add_code_arg_key: String,
+        add_cell_index_arg_key: Option<String>,
+        run_code_cell_tool_name: String,
+        run_cell_id_arg_key: String,
+    },
 }
 
 struct McpProcessClient {
@@ -148,42 +162,121 @@ impl ExecutionProvider for ColabMcpExecutionProvider {
         };
 
         let startup = Duration::from_secs(self.config.startup_timeout_secs);
-        let tools = tokio::time::timeout(startup, async {
-            client.initialize().await?;
-            client.list_tools().await
-        })
-        .await
-        .map_err(|_| ExecutionError::Timeout {
-            timeout_secs: self.config.startup_timeout_secs,
-        })??;
+        tokio::time::timeout(startup, client.initialize())
+            .await
+            .map_err(|_| ExecutionError::Timeout {
+                timeout_secs: self.config.startup_timeout_secs,
+            })??;
 
+        let mut tools = tokio::time::timeout(startup, client.list_tools())
+            .await
+            .map_err(|_| ExecutionError::Timeout {
+                timeout_secs: self.config.startup_timeout_secs,
+            })??;
+
+        // Some Colab MCP installs expose notebook execution tools only after
+        // browser authorization is established; retry discovery after connect.
         let execute_tool_name =
-            pick_execute_tool_name(&tools, self.config.execute_tool_name.as_deref())?;
+            match pick_execute_tool_name(&tools, self.config.execute_tool_name.as_deref()) {
+                Ok(name) => name,
+                Err(e) if self.config.execute_tool_name.is_none() => {
+                    let _ = tokio::time::timeout(
+                        startup,
+                        client.call_tool(
+                            &self.config.connect_tool_name,
+                            serde_json::Map::new(),
+                            self.config.max_output_bytes,
+                        ),
+                    )
+                    .await;
+                    tools = tokio::time::timeout(startup, client.list_tools())
+                        .await
+                        .map_err(|_| ExecutionError::Timeout {
+                            timeout_secs: self.config.startup_timeout_secs,
+                        })??;
+                    pick_execute_tool_name(&tools, None).map_err(|_| e)?
+                }
+                Err(e) => return Err(e),
+            };
+
         let execute_code_arg_key = pick_execute_code_arg_key(
             &tools,
             &execute_tool_name,
             &self.config.execute_code_arg_keys,
         );
+        let execution_mode = detect_execution_mode(
+            &tools,
+            &execute_tool_name,
+            &execute_code_arg_key,
+            &self.config.execute_code_arg_keys,
+        )?;
 
         // Best effort: this call opens/requests browser connection on disconnected clients.
-        let _ = client
-            .call_tool(
+        let _ = tokio::time::timeout(
+            startup,
+            client.call_tool(
                 &self.config.connect_tool_name,
                 serde_json::Map::new(),
                 self.config.max_output_bytes,
-            )
-            .await;
+            ),
+        )
+        .await;
 
         let sid = SessionId::new(uuid::Uuid::new_v4().to_string());
         let mut ext = std::collections::BTreeMap::new();
-        ext.insert(
-            "colab_mcp_execute_tool".into(),
-            Value::String(execute_tool_name.clone()),
-        );
-        ext.insert(
-            "colab_mcp_code_arg_key".into(),
-            Value::String(execute_code_arg_key.clone()),
-        );
+        match &execution_mode {
+            ColabExecutionMode::Direct {
+                execute_tool_name,
+                execute_code_arg_key,
+            } => {
+                ext.insert(
+                    "colab_mcp_execute_tool".into(),
+                    Value::String(execute_tool_name.clone()),
+                );
+                ext.insert(
+                    "colab_mcp_code_arg_key".into(),
+                    Value::String(execute_code_arg_key.clone()),
+                );
+                ext.insert(
+                    "colab_mcp_execution_mode".into(),
+                    Value::String("direct".to_string()),
+                );
+            }
+            ColabExecutionMode::NotebookCells {
+                add_code_cell_tool_name,
+                add_code_arg_key,
+                add_cell_index_arg_key,
+                run_code_cell_tool_name,
+                run_cell_id_arg_key,
+            } => {
+                ext.insert(
+                    "colab_mcp_execution_mode".into(),
+                    Value::String("notebook_cells".to_string()),
+                );
+                ext.insert(
+                    "colab_mcp_add_code_cell_tool".into(),
+                    Value::String(add_code_cell_tool_name.clone()),
+                );
+                ext.insert(
+                    "colab_mcp_add_code_arg_key".into(),
+                    Value::String(add_code_arg_key.clone()),
+                );
+                if let Some(idx_key) = add_cell_index_arg_key {
+                    ext.insert(
+                        "colab_mcp_add_cell_index_arg_key".into(),
+                        Value::String(idx_key.clone()),
+                    );
+                }
+                ext.insert(
+                    "colab_mcp_run_code_cell_tool".into(),
+                    Value::String(run_code_cell_tool_name.clone()),
+                );
+                ext.insert(
+                    "colab_mcp_run_cell_id_arg_key".into(),
+                    Value::String(run_cell_id_arg_key.clone()),
+                );
+            }
+        }
         ext.insert(
             "colab_mcp_connect_tool".into(),
             Value::String(self.config.connect_tool_name.clone()),
@@ -207,8 +300,7 @@ impl ExecutionProvider for ColabMcpExecutionProvider {
 
         let session = Arc::new(ColabMcpSession {
             client: Mutex::new(client),
-            execute_tool_name,
-            execute_code_arg_key,
+            execution_mode,
         });
         self.sessions.insert(sid.clone(), session);
         Ok(SessionHandle {
@@ -242,22 +334,71 @@ impl ExecutionProvider for ColabMcpExecutionProvider {
             .get(session_id)
             .ok_or_else(|| ExecutionError::InvalidSession(session_id.to_string()))?;
         let mut guard = sess.client.lock().await;
-        let mut args = serde_json::Map::new();
-        args.insert(
-            sess.execute_code_arg_key.clone(),
-            Value::String(spec.code.to_string()),
-        );
-        args.insert(
-            "timeout_secs".to_string(),
-            Value::Number(spec.timeout_secs.into()),
-        );
-        let output = guard
-            .call_tool(
-                &sess.execute_tool_name,
-                args,
-                self.config.max_output_bytes / 2,
-            )
-            .await?;
+        let run_timeout = Duration::from_secs(spec.timeout_secs.max(1));
+        let output = match &sess.execution_mode {
+            ColabExecutionMode::Direct {
+                execute_tool_name,
+                execute_code_arg_key,
+            } => {
+                let mut args = serde_json::Map::new();
+                args.insert(
+                    execute_code_arg_key.clone(),
+                    Value::String(spec.code.to_string()),
+                );
+                tokio::time::timeout(
+                    run_timeout,
+                    guard.call_tool(execute_tool_name, args, self.config.max_output_bytes / 2),
+                )
+                .await
+                .map_err(|_| ExecutionError::Timeout {
+                    timeout_secs: spec.timeout_secs,
+                })??
+            }
+            ColabExecutionMode::NotebookCells {
+                add_code_cell_tool_name,
+                add_code_arg_key,
+                add_cell_index_arg_key,
+                run_code_cell_tool_name,
+                run_cell_id_arg_key,
+            } => {
+                let mut add_args = serde_json::Map::new();
+                add_args.insert(
+                    add_code_arg_key.clone(),
+                    Value::String(spec.code.to_string()),
+                );
+                if let Some(idx_key) = add_cell_index_arg_key {
+                    // Insert at top by default for tools requiring explicit index.
+                    add_args.insert(idx_key.clone(), Value::Number(serde_json::Number::from(0)));
+                }
+                // Hint for Colab editors that expose language selection.
+                add_args.insert("language".to_string(), Value::String("python".to_string()));
+                let add_resp = tokio::time::timeout(
+                    run_timeout,
+                    guard.call_tool_raw(add_code_cell_tool_name, add_args),
+                )
+                .await
+                .map_err(|_| ExecutionError::Timeout {
+                    timeout_secs: spec.timeout_secs,
+                })??;
+                let cell_id = extract_cell_id_from_tool_result(&add_resp).ok_or_else(|| {
+                    ExecutionError::Provider(format!(
+                        "colab_mcp add_code_cell did not return a cell id. response={}",
+                        truncate_json_for_error(&add_resp, 800)
+                    ))
+                })?;
+                let mut run_args = serde_json::Map::new();
+                run_args.insert(run_cell_id_arg_key.clone(), Value::String(cell_id));
+                let run_resp = tokio::time::timeout(
+                    run_timeout,
+                    guard.call_tool_raw(run_code_cell_tool_name, run_args),
+                )
+                .await
+                .map_err(|_| ExecutionError::Timeout {
+                    timeout_secs: spec.timeout_secs,
+                })??;
+                extract_tool_text(&run_resp, self.config.max_output_bytes / 2)
+            }
+        };
         Ok(RunResult::new(output, String::new(), Some(0)))
     }
 
@@ -315,16 +456,23 @@ impl McpProcessClient {
         args: serde_json::Map<String, Value>,
         max_text: usize,
     ) -> Result<String, ExecutionError> {
-        let result = self
-            .request(
-                "tools/call",
-                json!({
-                    "name": tool_name,
-                    "arguments": Value::Object(args),
-                }),
-            )
-            .await?;
+        let result = self.call_tool_raw(tool_name, args).await?;
         Ok(extract_tool_text(&result, max_text))
+    }
+
+    async fn call_tool_raw(
+        &mut self,
+        tool_name: &str,
+        args: serde_json::Map<String, Value>,
+    ) -> Result<Value, ExecutionError> {
+        self.request(
+            "tools/call",
+            json!({
+                "name": tool_name,
+                "arguments": Value::Object(args),
+            }),
+        )
+        .await
     }
 
     async fn notify(&mut self, method: &str, params: Value) -> Result<(), ExecutionError> {
@@ -366,12 +514,8 @@ impl McpProcessClient {
     }
 
     async fn write_message(&mut self, msg: &Value) -> Result<(), ExecutionError> {
-        let payload = serde_json::to_vec(msg)?;
-        let header = format!("Content-Length: {}\r\n\r\n", payload.len());
-        self.stdin
-            .write_all(header.as_bytes())
-            .await
-            .map_err(|e| ExecutionError::Provider(format!("mcp stdin write header: {e}")))?;
+        let mut payload = serde_json::to_vec(msg)?;
+        payload.push(b'\n');
         self.stdin
             .write_all(&payload)
             .await
@@ -384,7 +528,6 @@ impl McpProcessClient {
     }
 
     async fn read_message(&mut self) -> Result<Value, ExecutionError> {
-        let mut content_length: Option<usize> = None;
         loop {
             let mut line = String::new();
             let n =
@@ -398,26 +541,30 @@ impl McpProcessClient {
             }
             let t = line.trim();
             if t.is_empty() {
-                break;
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(t) {
+                return Ok(v);
             }
             let lower = t.to_ascii_lowercase();
+            // Compatibility fallback: MCP Content-Length framing.
             if let Some(rest) = lower.strip_prefix("content-length:") {
                 let parsed = rest.trim().parse::<usize>().map_err(|e| {
                     ExecutionError::Provider(format!("invalid MCP Content-Length header: {e}"))
                 })?;
-                content_length = Some(parsed);
+                let mut delimiter = String::new();
+                let _ = self.stdout.read_line(&mut delimiter).await.map_err(|e| {
+                    ExecutionError::Provider(format!("mcp stdout read header delimiter: {e}"))
+                })?;
+                let mut buf = vec![0u8; parsed];
+                self.stdout
+                    .read_exact(&mut buf)
+                    .await
+                    .map_err(|e| ExecutionError::Provider(format!("mcp stdout read body: {e}")))?;
+                let v: Value = serde_json::from_slice(&buf)?;
+                return Ok(v);
             }
         }
-        let len = content_length.ok_or_else(|| {
-            ExecutionError::Provider("missing MCP Content-Length header".to_string())
-        })?;
-        let mut buf = vec![0u8; len];
-        self.stdout
-            .read_exact(&mut buf)
-            .await
-            .map_err(|e| ExecutionError::Provider(format!("mcp stdout read body: {e}")))?;
-        let v: Value = serde_json::from_slice(&buf)?;
-        Ok(v)
     }
 
     async fn shutdown(&mut self) {
@@ -501,6 +648,113 @@ fn pick_execute_code_arg_key(
         .first()
         .cloned()
         .unwrap_or_else(|| "code".to_string())
+}
+
+fn pick_arg_key_from_tool_schema(
+    tools: &[McpToolDef],
+    tool_name: &str,
+    preferred: &[&str],
+) -> Option<String> {
+    let tool = tools.iter().find(|t| t.name == tool_name)?;
+    let props = tool
+        .input_schema
+        .as_ref()
+        .and_then(|s| s.get("properties"))
+        .and_then(|p| p.as_object())?;
+    for key in preferred {
+        if props.contains_key(*key) {
+            return Some((*key).to_string());
+        }
+    }
+    None
+}
+
+fn detect_execution_mode(
+    tools: &[McpToolDef],
+    execute_tool_name: &str,
+    execute_code_arg_key: &str,
+    configured_code_keys: &[String],
+) -> Result<ColabExecutionMode, ExecutionError> {
+    let key_lower = execute_code_arg_key.to_ascii_lowercase();
+    if !matches!(key_lower.as_str(), "cellid" | "cell_id" | "id") {
+        return Ok(ColabExecutionMode::Direct {
+            execute_tool_name: execute_tool_name.to_string(),
+            execute_code_arg_key: execute_code_arg_key.to_string(),
+        });
+    }
+    let add_tool = "add_code_cell";
+    if !tools.iter().any(|t| t.name == add_tool) {
+        return Ok(ColabExecutionMode::Direct {
+            execute_tool_name: execute_tool_name.to_string(),
+            execute_code_arg_key: execute_code_arg_key.to_string(),
+        });
+    }
+    let configured_pref: Vec<&str> = configured_code_keys.iter().map(String::as_str).collect();
+    let add_key = pick_arg_key_from_tool_schema(tools, add_tool, &configured_pref)
+        .or_else(|| {
+            pick_arg_key_from_tool_schema(tools, add_tool, &["code", "source", "cell", "input"])
+        })
+        .ok_or_else(|| {
+            ExecutionError::Provider(
+                "colab_mcp: add_code_cell found but no usable code argument key in schema"
+                    .to_string(),
+            )
+        })?;
+    let add_cell_index_arg_key =
+        pick_arg_key_from_tool_schema(tools, add_tool, &["cellIndex", "cell_index", "index"]);
+    Ok(ColabExecutionMode::NotebookCells {
+        add_code_cell_tool_name: add_tool.to_string(),
+        add_code_arg_key: add_key,
+        add_cell_index_arg_key,
+        run_code_cell_tool_name: execute_tool_name.to_string(),
+        run_cell_id_arg_key: execute_code_arg_key.to_string(),
+    })
+}
+
+fn extract_cell_id_from_tool_result(value: &Value) -> Option<String> {
+    fn walk(v: &Value) -> Option<String> {
+        match v {
+            Value::Object(map) => {
+                for key in ["newCellId", "cellId", "cell_id", "id"] {
+                    if let Some(Value::String(s)) = map.get(key) {
+                        if !s.trim().is_empty() {
+                            return Some(s.trim().to_string());
+                        }
+                    }
+                }
+                for nested in map.values() {
+                    if let Some(found) = walk(nested) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            Value::Array(arr) => {
+                for item in arr {
+                    if let Some(found) = walk(item) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+    walk(value)
+}
+
+fn truncate_json_for_error(value: &Value, max_chars: usize) -> String {
+    let mut s = value.to_string();
+    if s.len() <= max_chars {
+        return s;
+    }
+    let mut end = max_chars;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    s.push('…');
+    s
 }
 
 fn extract_tool_text(result: &Value, max_text: usize) -> String {

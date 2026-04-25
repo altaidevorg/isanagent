@@ -1038,4 +1038,66 @@ mod tests {
         close.execute(json!({ "session_id": sid })).await.unwrap();
         let _ = std::fs::remove_dir_all(&ws);
     }
+
+    /// Live Colab MCP smoke for execution tools. Requires:
+    /// - Browser connected via colab-mcp
+    /// - `uvx` available on PATH
+    /// Run manually:
+    /// `cargo test --release -p isanagent colab_mcp_live_execution_roundtrip -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn colab_mcp_live_execution_roundtrip() {
+        let (ws, dir) = temp_dirs();
+        let cfg_toml = r#"
+[harness.execution]
+enabled = true
+default_provider = "colab_mcp"
+allowed_providers = ["colab_mcp"]
+max_wall_secs = 180
+max_output_bytes = 262144
+max_sessions = 2
+
+[harness.execution.colab_mcp]
+command = "uvx"
+args = ["git+https://github.com/googlecolab/colab-mcp"]
+startup_timeout_secs = 60
+connect_tool_name = "open_colab_browser_connection"
+"#;
+        let app_cfg: crate::config::AppConfig = toml::from_str(cfg_toml).expect("parse config");
+        let harness =
+            crate::execution::build_execution_harness(ws.clone(), dir.clone(), true, &app_cfg)
+                .expect("build colab harness");
+
+        let create = ExecutionSessionCreateTool {
+            harness: harness.clone(),
+        };
+        let created = create
+            .execute(json!({ "language": "python" }))
+            .await
+            .expect("create session");
+        let cv: Value = serde_json::from_str(&created).expect("json create");
+        let sid = cv["session_id"].as_str().expect("session id").to_string();
+
+        let (otx, _orx) = mpsc::channel::<BusMessage>(8);
+        let run = ExecutionRunTool {
+            harness: harness.clone(),
+            outbound_tx: otx,
+        };
+        let out = run
+            .execute(json!({
+                "session_id": sid,
+                "code": "print('isanagent-colab-smoke')",
+                "timeout_secs": 120
+            }))
+            .await
+            .expect("run");
+        assert!(
+            out.to_ascii_lowercase().contains("isanagent-colab-smoke"),
+            "unexpected output: {out}"
+        );
+
+        let close = ExecutionSessionCloseTool { harness };
+        close.execute(json!({ "session_id": sid })).await.unwrap();
+        let _ = std::fs::remove_dir_all(&ws);
+    }
 }
