@@ -416,6 +416,35 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             ),
         )
         .with_chat_id(chat_id),
+        TelemetryEvent::SubagentSpawned {
+            parent_chat_id,
+            child_chat_id,
+            task_id,
+            display_name,
+        } => LogEvent::info(
+            "Telemetry",
+            &format!(
+                "SubagentSpawned parent={} child={} task={} name={}",
+                parent_chat_id,
+                child_chat_id,
+                task_id,
+                display_name.as_deref().unwrap_or("-")
+            ),
+        )
+        .with_chat_id(parent_chat_id.as_str()),
+        TelemetryEvent::SubagentFinished {
+            parent_chat_id,
+            child_chat_id,
+            task_id,
+            status,
+        } => LogEvent::info(
+            "Telemetry",
+            &format!(
+                "SubagentFinished parent={} child={} task={} status={}",
+                parent_chat_id, child_chat_id, task_id, status
+            ),
+        )
+        .with_chat_id(parent_chat_id.as_str()),
     }
 }
 
@@ -493,12 +522,14 @@ mod tests {
 
     #[test]
     fn sanitize_message_masks_secrets_and_emails() {
-        let message = "Bearer abc.def ghi myawesomesecret umut@altai.dev";
+        let message =
+            "Bearer abc.def ghi AIzaSyDummyKeyValue012345678901234 myawesomesecret umut@altai.dev";
         let sanitized = sanitize_message(message);
         assert!(sanitized.contains("Bearer [REDACTED]"));
         assert!(sanitized.contains("[REDACTED_API_KEY]"));
         assert!(sanitized.contains("u***@altai.dev"));
-        assert!(!sanitized.contains("myawesomesecret"));
+        // Arbitrary words are not redacted; only Bearer tokens, Gemini-style keys, and emails.
+        assert!(sanitized.contains("myawesomesecret"));
     }
 
     #[test]

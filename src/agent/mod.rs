@@ -20,12 +20,54 @@ use crate::tool_activity::SharedToolExecutionActivity;
 use crate::tools::ToolRegistry;
 use crate::traits::{Memory, Provider, Tool};
 use crate::{ActorError, ActorLogic};
+use futures::future::join_all;
 
 static REDACTED_THINKING_STRIP_RE: OnceLock<Regex> = OnceLock::new();
+
+fn metadata_truthy(meta: &HashMap<String, serde_json::Value>, key: &str) -> bool {
+    meta.get(key)
+        .map(|v| {
+            v.as_bool().unwrap_or(false)
+                || v.as_str()
+                    .map(|s| s.eq_ignore_ascii_case("true") || s == "1")
+                    .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
 
 enum ToolExecutionFinished {
     Completed(Result<String, String>),
     Cancelled,
+}
+
+async fn log_tool_invocation_start(
+    logger_tx: &LoggerHandle,
+    outbound_tx: &mpsc::Sender<BusMessage>,
+    agent_name: &str,
+    inbound: &crate::bus::InboundMessage,
+    tc: &crate::utils::ToolCallRequest,
+) {
+    let tool_name = &tc.function.name;
+    let args_str = &tc.function.arguments;
+    let _ = logger_tx.send(BusMessage::Log(
+        LogEvent::info(agent_name, &format!("Invoking tool: {}", tool_name))
+            .with_chat_id(&inbound.chat_id),
+    ));
+    let _ = outbound_tx
+        .send(BusMessage::Telemetry(TelemetryEvent::ToolCall {
+            chat_id: inbound.chat_id.clone(),
+            channel: inbound.channel.clone(),
+            tool_name: tool_name.to_string(),
+            args: args_str.clone(),
+        }))
+        .await;
+    let _ = outbound_tx
+        .send(BusMessage::Telemetry(TelemetryEvent::ToolCallStarted {
+            chat_id: inbound.chat_id.clone(),
+            tool_name: tool_name.to_string(),
+            args: args_str.clone(),
+        }))
+        .await;
 }
 
 /// Session-scoped wiring for tools that need the active chat (e.g. `ask_user`).
@@ -118,6 +160,8 @@ struct ReasoningSpawnArgs {
     doom_loop_enabled: bool,
     cancellation_tokens: Arc<dashmap::DashMap<String, Arc<tokio_util::sync::CancellationToken>>>,
     pending_inbound: Arc<dashmap::DashMap<String, Mutex<VecDeque<crate::bus::InboundMessage>>>>,
+    harness_runtime_summary: String,
+    forbid_final_without_tools: bool,
 }
 
 fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus::InboundMessage) {
@@ -145,6 +189,8 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
     let logger_tx = args.logger_tx.clone();
     let clarification_hub = args.clarification_hub.clone();
     let doom_loop_enabled = args.doom_loop_enabled;
+    let harness_runtime_summary = args.harness_runtime_summary.clone();
+    let forbid_final_without_tools = args.forbid_final_without_tools;
     let tool_exec_ctx = ToolExecCtx::new(
         inbound.channel.clone(),
         inbound.chat_id.clone(),
@@ -189,6 +235,8 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
             is_subagent: false,
             subagent_allowlist: None,
             doom_loop_enabled,
+            harness_runtime_summary: harness_runtime_summary.clone(),
+            forbid_final_without_tools,
         })
         .await;
 
@@ -271,6 +319,8 @@ pub(crate) struct ReasoningLoopCtx {
     pub(crate) is_subagent: bool,
     pub(crate) subagent_allowlist: Option<Arc<HashSet<String>>>,
     pub(crate) doom_loop_enabled: bool,
+    pub(crate) harness_runtime_summary: String,
+    pub(crate) forbid_final_without_tools: bool,
 }
 
 /// Constructor arguments for [`AgentLogic`], grouped to keep call sites readable.
@@ -293,6 +343,12 @@ pub struct AgentLogicParams {
     pub subagent: Option<SubagentHarnessParams>,
     /// When true (default), inject corrective user text if repeated tool calls are detected.
     pub doom_loop_enabled: bool,
+    /// Pre-formatted harness lines for system context (execution caps, subagent flags, etc.).
+    pub harness_runtime_summary: String,
+    /// System prompt used for `subagent_spawn` / plan runs (may include research appendix).
+    pub subagent_system_prompt: String,
+    /// Config default; inbound metadata `isanagent_autonomous_forbid_final_without_tools` can override.
+    pub forbid_final_without_tools: bool,
 }
 
 /// Build-time options for the Phase 5 sub-agent harness (see `[harness.subagents]`).
@@ -327,6 +383,8 @@ pub struct AgentLogic {
     clarification_hub: Arc<ClarificationHub>,
     subagent_harness: Option<Arc<SubagentHarness>>,
     doom_loop_enabled: bool,
+    harness_runtime_summary: String,
+    forbid_final_without_tools: bool,
 }
 
 impl AgentLogic {
@@ -348,11 +406,16 @@ impl AgentLogic {
             clarification_hub,
             subagent,
             doom_loop_enabled,
+            harness_runtime_summary,
+            subagent_system_prompt,
+            forbid_final_without_tools,
         } = params;
 
+        let harness_for_subagent = harness_runtime_summary.clone();
         let session_manager = Arc::new(session_manager);
         let skills = Arc::new(skills);
         let tools = Arc::new(tools);
+        let memory_node = session_manager.get_memory_node();
 
         let subagent_harness = subagent.map(|p| {
             Arc::new(SubagentHarness::new(subagent::SubagentSpawnDeps {
@@ -360,7 +423,7 @@ impl AgentLogic {
                 provider_template: dyn_clone::clone_box(&*provider),
                 session_manager: session_manager.clone(),
                 skills: skills.clone(),
-                system_prompt: system_prompt.clone(),
+                system_prompt: subagent_system_prompt,
                 max_iterations,
                 max_tool_output_chars,
                 max_recent_summaries,
@@ -375,6 +438,8 @@ impl AgentLogic {
                 max_tasks: p.max_tasks,
                 max_wait_secs: p.max_wait_secs,
                 doom_loop_enabled,
+                memory_node: memory_node.clone(),
+                harness_runtime_summary: harness_for_subagent.clone(),
             }))
         });
 
@@ -398,12 +463,14 @@ impl AgentLogic {
             clarification_hub,
             subagent_harness: subagent_harness.clone(),
             doom_loop_enabled,
+            harness_runtime_summary,
+            forbid_final_without_tools,
         };
 
         let tools_mut = Arc::get_mut(&mut agent.tools)
             .expect("expected unique ownership of tools registry during initialization");
         if let Some(ref h) = subagent_harness {
-            subagent::register_subagent_tools(tools_mut, h.clone());
+            subagent::register_subagent_tools(tools_mut, h.clone(), memory_node);
         }
         let skill_reg = agent.skills.clone();
         let loader_tool = LoadSkillTool {
@@ -447,6 +514,8 @@ impl AgentLogic {
             doom_loop_enabled: self.doom_loop_enabled,
             cancellation_tokens: self.cancellation_tokens.clone(),
             pending_inbound: self.pending_inbound.clone(),
+            harness_runtime_summary: self.harness_runtime_summary.clone(),
+            forbid_final_without_tools: self.forbid_final_without_tools,
         }
     }
 
@@ -598,11 +667,20 @@ impl AgentLogic {
             is_subagent,
             subagent_allowlist,
             doom_loop_enabled,
+            harness_runtime_summary,
+            forbid_final_without_tools,
         } = ctx;
 
         let session_key = tool_exec_ctx.session_key.clone();
 
         let mut mem = session_manager.get_session(&session_key).await?;
+
+        let forbid_final_effective = !is_subagent
+            && (forbid_final_without_tools
+                || metadata_truthy(
+                    &inbound.metadata,
+                    "isanagent_autonomous_forbid_final_without_tools",
+                ));
 
         // 1. Build runtime context and prepend to User message before adding to memory
         let thread_info = inbound
@@ -611,13 +689,25 @@ impl AgentLogic {
             .map(|t| format!(", thread: '{}'", t))
             .unwrap_or_default();
         let now = chrono::Local::now().to_rfc3339();
-        let runtime_context = format!(
+        let mut runtime_context = format!(
             "[RUNTIME CONTEXT] Current time is {}. You are navigating and responding in channel: '{}', with chat ID: '{}'{}.",
             now,
             inbound.channel,
             inbound.chat_id,
             thread_info
-        ) + crate::utils::RUNTIME_CONTEXT_END_SUFFIX;
+        );
+        if let Some(v) = inbound.metadata.get("isanagent_autonomous_until") {
+            if let Some(s) = v.as_str() {
+                runtime_context
+                    .push_str(&format!(" Autonomous session deadline (RFC3339): '{}'.", s));
+            }
+        }
+        if forbid_final_effective {
+            runtime_context.push_str(
+                " This session expects tool use until work is complete — avoid ending on plain text alone.",
+            );
+        }
+        runtime_context.push_str(crate::utils::RUNTIME_CONTEXT_END_SUFFIX);
 
         let contextualized_content = format!("{}{}", runtime_context, inbound.content);
 
@@ -693,12 +783,35 @@ impl AgentLogic {
             };
 
             // Inject the latest static system prompt to the beginning of the context
-            let system_msg = crate::utils::ChatMessage::system(&format!(
-                "{}\n\n{}\n\n{}",
+            let harness_block = if harness_runtime_summary.trim().is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n\n--- Harness snapshot (this step) ---\n{}\n",
+                    harness_runtime_summary.trim()
+                )
+            };
+            let iteration_line = format!(
+                "\n--- Reasoning budget ---\nYou are on tool/LLM step {} of {} for this user turn.\n",
+                iterations, max_iterations
+            );
+            let autonomy_line = if forbid_final_effective {
+                "\n--- Autonomy ---\nDo not finish this step with assistant text only — call tools (or `ask_user` if blocked). If you believe you are done, still run a verification tool (e.g. read_file or execution_env_info) when appropriate.\n"
+            } else {
+                ""
+            };
+            let mut system_body = format!(
+                "{}\n\n{}\n{}{}{}",
                 system_prompt,
                 summaries_text,
-                skills.get_capabilities_summary()
-            ));
+                skills.get_capabilities_summary(),
+                harness_block,
+                iteration_line
+            )
+            .trim_end()
+            .to_string();
+            system_body.push_str(autonomy_line);
+            let system_msg = crate::utils::ChatMessage::system(&system_body);
             context.insert(0, system_msg);
 
             if doom_loop_enabled {
@@ -788,60 +901,15 @@ impl AgentLogic {
                 };
                 mem.add_message(assistant_msg).await?;
 
-                for tc in tool_calls {
-                    if cancel_token.is_cancelled() {
-                        return Ok(String::new());
-                    }
+                let parallel_ok = !is_subagent
+                    && tool_calls.len() > 1
+                    && tool_calls.iter().all(|tc| {
+                        crate::tools::ToolRegistry::is_parallel_safe_tool(tc.function.name.as_str())
+                    });
 
-                    let tool_name = &tc.function.name;
-                    let args_str = &tc.function.arguments;
-                    let _ = logger_tx.send(BusMessage::Log(
-                        LogEvent::info(&name, &format!("Invoking tool: {}", tool_name))
-                            .with_chat_id(&inbound.chat_id),
-                    ));
-
-                    // Emit Telemetry Tool Call
-                    let args = serde_json::from_str::<serde_json::Value>(args_str)
-                        .unwrap_or_else(|_| serde_json::json!({}));
-                    let _ = outbound_tx
-                        .send(BusMessage::Telemetry(TelemetryEvent::ToolCall {
-                            chat_id: inbound.chat_id.clone(),
-                            channel: inbound.channel.clone(),
-                            tool_name: tool_name.to_string(),
-                            args: args_str.clone(),
-                        }))
-                        .await;
-                    let _ = outbound_tx
-                        .send(BusMessage::Telemetry(TelemetryEvent::ToolCallStarted {
-                            chat_id: inbound.chat_id.clone(),
-                            tool_name: tool_name.to_string(),
-                            args: args_str.clone(),
-                        }))
-                        .await;
-
-                    let tool_result = match execute_tool_call_with_activity(
-                        &tools,
-                        tool_execution_activity.clone(),
-                        &inbound.chat_id,
-                        tool_name,
-                        args,
-                        Some(&cancel_token),
-                        ToolCallRuntime {
-                            session: tool_exec_ctx.clone(),
-                            hub: clarification_hub.clone(),
-                            is_subagent,
-                            subagent_allowlist: subagent_allowlist.clone(),
-                        },
-                    )
-                    .await
-                    {
-                        ToolExecutionFinished::Completed(res) => res,
-                        ToolExecutionFinished::Cancelled => return Ok(String::new()),
-                    };
-
-                    let tool_result_text = match tool_result {
-                        Ok(res) => {
-                            let mut output = res;
+                let finalize_tool_output = |res: Result<String, String>| -> String {
+                    match res {
+                        Ok(mut output) => {
                             if output.len() > max_tool_output_chars {
                                 output.truncate(max_tool_output_chars);
                                 output.push_str("\n... [TRUNCATED FOR LENGTH]");
@@ -849,29 +917,134 @@ impl AgentLogic {
                             output
                         }
                         Err(e) => format!("Error: {}", e),
-                    };
+                    }
+                };
 
-                    // Emit Telemetry Tool Result
-                    let _ = outbound_tx
-                        .send(BusMessage::Telemetry(TelemetryEvent::ToolResult {
-                            chat_id: inbound.chat_id.clone(),
-                            channel: inbound.channel.clone(),
-                            tool_name: tool_name.to_string(),
-                            result: tool_result_text.clone(),
-                        }))
-                        .await;
-                    let _ = outbound_tx
-                        .send(BusMessage::Telemetry(TelemetryEvent::ToolCallFinished {
-                            chat_id: inbound.chat_id.clone(),
-                            tool_name: tool_name.to_string(),
-                            result: tool_result_text.clone(),
-                        }))
-                        .await;
-
-                    // Add the tool execution back as a tool role message natively
-                    mem.add_message(crate::utils::ChatMessage::tool(&tool_result_text, &tc.id))
-                        .await?;
+                if parallel_ok {
+                    for tc in tool_calls.iter() {
+                        if cancel_token.is_cancelled() {
+                            return Ok(String::new());
+                        }
+                        log_tool_invocation_start(&logger_tx, &outbound_tx, &name, &inbound, tc)
+                            .await;
+                    }
+                    let mut futures_vec = Vec::with_capacity(tool_calls.len());
+                    for tc in tool_calls.iter() {
+                        let tools = Arc::clone(&tools);
+                        let tool_execution_activity = tool_execution_activity.clone();
+                        let chat_id = inbound.chat_id.clone();
+                        let tool_name = tc.function.name.clone();
+                        let args =
+                            serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+                                .unwrap_or_else(|_| serde_json::json!({}));
+                        let cancel_token = cancel_token.clone();
+                        let tool_exec_ctx = tool_exec_ctx.clone();
+                        let clarification_hub = clarification_hub.clone();
+                        let subagent_allowlist = subagent_allowlist.clone();
+                        futures_vec.push(async move {
+                            execute_tool_call_with_activity(
+                                &tools,
+                                tool_execution_activity,
+                                &chat_id,
+                                &tool_name,
+                                args,
+                                Some(&cancel_token),
+                                ToolCallRuntime {
+                                    session: tool_exec_ctx,
+                                    hub: clarification_hub,
+                                    is_subagent,
+                                    subagent_allowlist,
+                                },
+                            )
+                            .await
+                        });
+                    }
+                    let outcomes = join_all(futures_vec).await;
+                    for (tc, fin) in tool_calls.iter().zip(outcomes) {
+                        if cancel_token.is_cancelled() {
+                            return Ok(String::new());
+                        }
+                        let tool_result = match fin {
+                            ToolExecutionFinished::Completed(res) => res,
+                            ToolExecutionFinished::Cancelled => return Ok(String::new()),
+                        };
+                        let tool_result_text = finalize_tool_output(tool_result);
+                        let tool_name = tc.function.name.clone();
+                        let _ = outbound_tx
+                            .send(BusMessage::Telemetry(TelemetryEvent::ToolResult {
+                                chat_id: inbound.chat_id.clone(),
+                                channel: inbound.channel.clone(),
+                                tool_name: tool_name.clone(),
+                                result: tool_result_text.clone(),
+                            }))
+                            .await;
+                        let _ = outbound_tx
+                            .send(BusMessage::Telemetry(TelemetryEvent::ToolCallFinished {
+                                chat_id: inbound.chat_id.clone(),
+                                tool_name,
+                                result: tool_result_text.clone(),
+                            }))
+                            .await;
+                        mem.add_message(crate::utils::ChatMessage::tool(&tool_result_text, &tc.id))
+                            .await?;
+                    }
                     tool_invoked = true;
+                } else {
+                    for tc in tool_calls {
+                        if cancel_token.is_cancelled() {
+                            return Ok(String::new());
+                        }
+
+                        log_tool_invocation_start(&logger_tx, &outbound_tx, &name, &inbound, tc)
+                            .await;
+
+                        let tool_name = &tc.function.name;
+                        let args_str = &tc.function.arguments;
+                        let args = serde_json::from_str::<serde_json::Value>(args_str)
+                            .unwrap_or_else(|_| serde_json::json!({}));
+
+                        let tool_result = match execute_tool_call_with_activity(
+                            &tools,
+                            tool_execution_activity.clone(),
+                            &inbound.chat_id,
+                            tool_name,
+                            args,
+                            Some(&cancel_token),
+                            ToolCallRuntime {
+                                session: tool_exec_ctx.clone(),
+                                hub: clarification_hub.clone(),
+                                is_subagent,
+                                subagent_allowlist: subagent_allowlist.clone(),
+                            },
+                        )
+                        .await
+                        {
+                            ToolExecutionFinished::Completed(res) => res,
+                            ToolExecutionFinished::Cancelled => return Ok(String::new()),
+                        };
+
+                        let tool_result_text = finalize_tool_output(tool_result);
+
+                        let _ = outbound_tx
+                            .send(BusMessage::Telemetry(TelemetryEvent::ToolResult {
+                                chat_id: inbound.chat_id.clone(),
+                                channel: inbound.channel.clone(),
+                                tool_name: tool_name.to_string(),
+                                result: tool_result_text.clone(),
+                            }))
+                            .await;
+                        let _ = outbound_tx
+                            .send(BusMessage::Telemetry(TelemetryEvent::ToolCallFinished {
+                                chat_id: inbound.chat_id.clone(),
+                                tool_name: tool_name.to_string(),
+                                result: tool_result_text.clone(),
+                            }))
+                            .await;
+
+                        mem.add_message(crate::utils::ChatMessage::tool(&tool_result_text, &tc.id))
+                            .await?;
+                        tool_invoked = true;
+                    }
                 }
             } else {
                 // Add vanilla assistant response to memory
@@ -880,6 +1053,12 @@ impl AgentLogic {
             }
 
             if !tool_invoked {
+                if forbid_final_effective && iterations < max_iterations {
+                    let nudge = "[SYSTEM: Continue with at least one tool call (or `ask_user` if you are blocked). Plain assistant text alone is not sufficient for this session until the objective is met.]";
+                    let correction = crate::utils::ChatMessage::user(nudge);
+                    mem.add_message(correction).await?;
+                    continue;
+                }
                 // Final outbound text
                 let final_response = thinking_strip_re
                     .replace_all(&response_text, "")
@@ -1398,6 +1577,9 @@ mod tests {
             clarification_hub,
             subagent: None,
             doom_loop_enabled: false,
+            harness_runtime_summary: String::new(),
+            subagent_system_prompt: "test system prompt".to_string(),
+            forbid_final_without_tools: false,
         });
 
         (agent, outbound_rx)
@@ -1446,6 +1628,9 @@ mod tests {
             clarification_hub: ClarificationHub::shared(),
             subagent: None,
             doom_loop_enabled: false,
+            harness_runtime_summary: String::new(),
+            subagent_system_prompt: "test system prompt".to_string(),
+            forbid_final_without_tools: false,
         });
 
         if let Some(tool_execution_activity) = tool_execution_activity {

@@ -95,6 +95,17 @@ pub struct SubagentHarnessConfig {
     pub max_wait_secs: Option<u64>,
 }
 
+/// HF ml-intern–style ML policy overlay + optional autonomy hints (see `assets/ml_engineer_overlay.md`).
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct MlEngineerHarnessConfig {
+    /// Append ML engineer policy to the compiled system prompt (default: false).
+    pub enabled: Option<bool>,
+    /// Append research-oriented instructions to **sub-agent** system prompts when `enabled` (default: true when enabled).
+    pub subagent_research_overlay: Option<bool>,
+    /// When true, if an inbound message sets no metadata override, autonomous sessions may still use config default (see inbound metadata `isanagent_autonomous_forbid_final_without_tools`).
+    pub forbid_final_without_tools: Option<bool>,
+}
+
 /// Optional harness features (see `docs/harness-implementation-plan.md`).
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct HarnessConfig {
@@ -103,6 +114,8 @@ pub struct HarnessConfig {
     pub subagents: Option<SubagentHarnessConfig>,
     /// Local / future execution providers (`execution_*` tools). See `docs/execution-implementation-plan.md`.
     pub execution: Option<ExecutionHarnessConfig>,
+    /// ML engineer prompt overlay and related defaults.
+    pub ml_engineer: Option<MlEngineerHarnessConfig>,
 }
 
 /// Git worktree helpers (`git_worktree` tool). Disabled unless `[harness.git_worktree] enabled = true`.
@@ -325,6 +338,95 @@ impl AppConfig {
             .and_then(|h| h.execution.as_ref())
             .and_then(|e| e.enabled)
             .unwrap_or(false)
+    }
+
+    /// `[harness.ml_engineer] enabled = true` appends ML policy overlay to the system prompt.
+    pub fn ml_engineer_harness_enabled(&self) -> bool {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.ml_engineer.as_ref())
+            .and_then(|m| m.enabled)
+            .unwrap_or(false)
+    }
+
+    /// When ML harness is on, append research instructions to sub-agent system prompts (default true).
+    pub fn ml_engineer_subagent_research_overlay(&self) -> bool {
+        if !self.ml_engineer_harness_enabled() {
+            return false;
+        }
+        self.harness
+            .as_ref()
+            .and_then(|h| h.ml_engineer.as_ref())
+            .and_then(|m| m.subagent_research_overlay)
+            .unwrap_or(true)
+    }
+
+    /// Config default for forbidding a final assistant message with no tool calls (overridable per inbound metadata).
+    pub fn ml_engineer_forbid_final_without_tools(&self) -> bool {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.ml_engineer.as_ref())
+            .and_then(|m| m.forbid_final_without_tools)
+            .unwrap_or(false)
+    }
+
+    /// Short lines for `[RUNTIME CONTEXT]` (token-frugal). Built in the binary and passed into the agent.
+    pub fn runtime_harness_summary_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "execution_harness_enabled={}",
+            self.execution_harness_enabled()
+        ));
+        if self.execution_harness_enabled() {
+            lines.push(format!(
+                "execution_default_provider={}",
+                self.execution_default_provider()
+            ));
+            lines.push(format!(
+                "execution_max_wall_secs={}",
+                self.execution_max_wall_secs()
+            ));
+            lines.push(format!(
+                "execution_default_run_timeout_secs={}",
+                self.execution_default_run_timeout_secs()
+            ));
+            lines.push(format!(
+                "execution_max_output_bytes={}",
+                self.execution_max_output_bytes()
+            ));
+            lines.push(format!(
+                "execution_artifact_caps=file:{} total_per_run:{} max_files:{}",
+                self.execution_artifact_max_file_bytes(),
+                self.execution_artifact_max_total_bytes_per_run(),
+                self.execution_artifact_max_files_per_run()
+            ));
+        }
+        lines.push(format!(
+            "subagent_harness_enabled={}",
+            self.subagent_harness_enabled()
+        ));
+        if self.subagent_harness_enabled() {
+            lines.push(format!("subagent_max_tasks={}", self.subagent_max_tasks()));
+            lines.push(format!(
+                "subagent_max_wait_secs={}",
+                self.subagent_max_wait_secs()
+            ));
+            let allow = self.subagent_allowed_tools_set();
+            lines.push(format!(
+                "subagent_allowlist_active={} (count={})",
+                allow.is_some(),
+                allow.map(|s| s.len()).unwrap_or(0)
+            ));
+        }
+        lines.push(format!(
+            "ml_engineer_harness_enabled={}",
+            self.ml_engineer_harness_enabled()
+        ));
+        lines.push(format!(
+            "ml_engineer_forbid_final_without_tools_default={}",
+            self.ml_engineer_forbid_final_without_tools()
+        ));
+        lines
     }
 
     pub fn execution_default_provider(&self) -> String {

@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::config::{AppConfig, SlackMode};
+use crate::ml_engineer::HARNESS_OVERLAY;
 use crate::skills::SkillRegistry;
 use crate::workspace::{ensure_workspace_layout, WorkspaceLayout};
 use clap::Args;
@@ -25,6 +26,12 @@ const JUPYTER_HEAVY_OUTPUT_SKILL_TEMPLATE: &str =
     include_str!("../assets/onboarding/skills/jupyter-heavy-output/SKILL.md");
 const SCIENTIFIC_PYTHON_DEBUGGING_SKILL_TEMPLATE: &str =
     include_str!("../assets/onboarding/skills/scientific-python-debugging/SKILL.md");
+const ML_EXECUTION_PREFLIGHT_SKILL_TEMPLATE: &str =
+    include_str!("../assets/onboarding/skills/ml-execution-preflight/SKILL.md");
+const LITERATURE_TO_RECIPE_SKILL_TEMPLATE: &str =
+    include_str!("../assets/onboarding/skills/literature-to-recipe/SKILL.md");
+const OOM_RECOVERY_PLAYBOOK_SKILL_TEMPLATE: &str =
+    include_str!("../assets/onboarding/skills/oom-recovery-playbook/SKILL.md");
 
 struct TemplateFile {
     relative_path: &'static str,
@@ -109,6 +116,8 @@ pub struct OnboardOptions {
     #[arg(long, help_heading = "Harness")]
     pub harness_subagents_enabled: Option<bool>,
     #[arg(long, help_heading = "Harness")]
+    pub harness_ml_engineer_enabled: Option<bool>,
+    #[arg(long, help_heading = "Harness")]
     pub harness_execution_enabled: Option<bool>,
 }
 
@@ -136,6 +145,7 @@ impl OnboardOptions {
             || self.multi_tenant_cron_scheduling.is_some()
             || self.harness_git_worktree_enabled.is_some()
             || self.harness_subagents_enabled.is_some()
+            || self.harness_ml_engineer_enabled.is_some()
             || self.harness_execution_enabled.is_some()
     }
 }
@@ -221,6 +231,7 @@ fn apply_onboard_options(cfg: &mut AppConfig, opts: &OnboardOptions) {
 
     if opts.harness_git_worktree_enabled.is_some()
         || opts.harness_subagents_enabled.is_some()
+        || opts.harness_ml_engineer_enabled.is_some()
         || opts.harness_execution_enabled.is_some()
     {
         let h = cfg.harness.get_or_insert_with(Default::default);
@@ -229,6 +240,9 @@ fn apply_onboard_options(cfg: &mut AppConfig, opts: &OnboardOptions) {
         }
         if let Some(v) = opts.harness_subagents_enabled {
             h.subagents.get_or_insert_with(Default::default).enabled = Some(v);
+        }
+        if let Some(v) = opts.harness_ml_engineer_enabled {
+            h.ml_engineer.get_or_insert_with(Default::default).enabled = Some(v);
         }
         if let Some(v) = opts.harness_execution_enabled {
             h.execution.get_or_insert_with(Default::default).enabled = Some(v);
@@ -336,6 +350,9 @@ pub fn build_interactive_config_toml(options: &OnboardOptions) -> Result<String,
     if let Some(v) = options.harness_subagents_enabled {
         doc["harness"]["subagents"]["enabled"] = value(v);
     }
+    if let Some(v) = options.harness_ml_engineer_enabled {
+        doc["harness"]["ml_engineer"]["enabled"] = value(v);
+    }
     if let Some(v) = options.harness_execution_enabled {
         doc["harness"]["execution"]["enabled"] = value(v);
     }
@@ -387,7 +404,7 @@ that file is first created. Remove or rename config.toml, or point --workspace a
 }
 
 fn embedded_templates() -> &'static [TemplateFile] {
-    static TEMPLATES: [TemplateFile; 9] = [
+    static TEMPLATES: [TemplateFile; 12] = [
         TemplateFile {
             relative_path: "config.toml",
             contents: CONFIG_TEMPLATE,
@@ -424,6 +441,18 @@ fn embedded_templates() -> &'static [TemplateFile] {
             relative_path: "workspace/skills/scientific-python-debugging/SKILL.md",
             contents: SCIENTIFIC_PYTHON_DEBUGGING_SKILL_TEMPLATE,
         },
+        TemplateFile {
+            relative_path: "workspace/skills/ml-execution-preflight/SKILL.md",
+            contents: ML_EXECUTION_PREFLIGHT_SKILL_TEMPLATE,
+        },
+        TemplateFile {
+            relative_path: "workspace/skills/literature-to-recipe/SKILL.md",
+            contents: LITERATURE_TO_RECIPE_SKILL_TEMPLATE,
+        },
+        TemplateFile {
+            relative_path: "workspace/skills/oom-recovery-playbook/SKILL.md",
+            contents: OOM_RECOVERY_PLAYBOOK_SKILL_TEMPLATE,
+        },
     ];
 
     &TEMPLATES
@@ -459,7 +488,28 @@ fn write_all_templates(
 
     write_embedded_synthetic_skill_tree(&layout.root, report)?;
 
+    let overlay_ref = workspace_ml_engineer_overlay_reference();
+    write_if_missing_string(
+        &layout.root,
+        "workspace/ML_ENGINEER_OVERLAY.md",
+        &overlay_ref,
+        report,
+    )?;
+
     Ok(())
+}
+
+/// Human-readable copy of the embedded ML overlay (same bytes as `crate::ml_engineer::HARNESS_OVERLAY`).
+fn workspace_ml_engineer_overlay_reference() -> String {
+    format!(
+        "# ML engineer overlay (reference copy)\n\n\
+This file is created by **`isanagent onboard`**. It mirrors the policy text that the binary \
+appends to the system prompt when **`[harness.ml_engineer] enabled = true`** in `config.toml`. \
+Editing this file does **not** change runtime behavior (the live text is embedded in the \
+`isanagent` build). For workspace-specific ML rules, add or edit **`ML_POLICY.md`** in this \
+directory (merged by `compile_system_prompt`).\n\n---\n\n{}",
+        HARNESS_OVERLAY
+    )
 }
 
 const SYNTHETIC_SKILL_REL_PREFIX: &str = "workspace/skills/synthetic-dataset-with-afterimage";
@@ -554,6 +604,7 @@ fn validate_generated_files(layout: &WorkspaceLayout) -> Result<(), String> {
         "workspace/AGENTS.md",
         "workspace/USER.md",
         "workspace/SOUL.md",
+        "workspace/ML_ENGINEER_OVERLAY.md",
     ] {
         let path = layout.root.join(relative_path);
         fs::read_to_string(&path).map_err(|e| {
@@ -573,6 +624,9 @@ fn validate_generated_files(layout: &WorkspaceLayout) -> Result<(), String> {
         "execution-research",
         "jupyter-heavy-output",
         "scientific-python-debugging",
+        "ml-execution-preflight",
+        "literature-to-recipe",
+        "oom-recovery-playbook",
         "synthetic-dataset-with-afterimage",
     ] {
         if !skill_names.iter().any(|skill| skill == required) {
@@ -613,6 +667,33 @@ mod tests {
     }
 
     #[test]
+    fn workspace_ml_engineer_overlay_reference_matches_embedded_overlay() {
+        let s = workspace_ml_engineer_overlay_reference();
+        assert!(
+            s.contains("ML engineer harness"),
+            "reference should include the embedded overlay body"
+        );
+        assert!(
+            s.contains("reference copy"),
+            "preamble should explain this is not the live prompt source"
+        );
+    }
+
+    #[test]
+    fn build_config_toml_merge_preserves_ml_engineer_section() {
+        let o = OnboardOptions {
+            api_enabled: Some(true),
+            ..Default::default()
+        };
+        let s = build_config_toml(&o).expect("toml");
+        assert!(
+            s.contains("ml_engineer") && s.contains("enabled"),
+            "merged config should still carry harness.ml_engineer from template: {}",
+            s
+        );
+    }
+
+    #[test]
     fn build_interactive_config_toml_preserves_template_comments() {
         let o = OnboardOptions {
             provider_model: Some("test-model".to_string()),
@@ -644,6 +725,10 @@ mod tests {
         assert!(
             s.contains("# max_wall_secs = 3600"),
             "expected execution max_wall_secs as comment"
+        );
+        assert!(
+            s.contains("[harness.ml_engineer]") || s.contains("harness.ml_engineer"),
+            "expected ml_engineer section preserved from template"
         );
         assert!(
             !s.contains("allow_path_outside_sandbox = false"),

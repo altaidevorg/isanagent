@@ -41,6 +41,7 @@ use isanagent::tools::execution::{
     ExecutionRunBackgroundTool, ExecutionRunTool, ExecutionSessionCloseTool,
     ExecutionSessionCreateTool,
 };
+use isanagent::tools::ml_domain::{ArxivFetchTool, ArxivSearchTool, HfHubFileFetchTool};
 use isanagent::tools::workflow::{AskUserTool, TodoWriteTool, ToolSearchTool};
 use isanagent::tools::ToolRegistry;
 use isanagent::workspace::{resolve_workspace_root, IsanagentWorkspace};
@@ -59,6 +60,10 @@ const EXECUTION_HARNESS_SYSTEM_GUIDANCE: &str = r#"
 - Set timeout_secs explicitly for generation, training, or heavy I/O (up to max_wall_secs). Omit timeout_secs only for quick checks; use smaller values for tight polling loops.
 - Prefer execution_run_background when work may block the reasoning loop for many minutes; poll execution_job_status then execution_job_result.
 - Pass description on execution_run and execution_run_background for runs that may exceed ~30 seconds or whenever you want a clear label in the terminal UI and audit logs.
+- Pilot with a short execution_run, then scale; do not launch many parallel heavy jobs until one path succeeds.
+- Prefer grep-friendly logging in training scripts (plain text lines) so stdout stays searchable in captured logs.
+- Know where outputs live: sandbox-relative paths, execution_artifact_list, run journals under workspace_dir/.system_generated/execution_history/, and execution_runs.jsonl.
+- For Jupyter/SSH: confirm interpreter and (if needed) GPU visibility with a tiny execution_run before a long job.
 "#;
 
 /// isanagent: A terminal chat interface and autonomous agent engine
@@ -345,6 +350,15 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         jina,
         max_output_chars: max_web_output_chars,
     }));
+    tools.register(Box::new(ArxivSearchTool {
+        max_output_chars: max_web_output_chars,
+    }));
+    tools.register(Box::new(ArxivFetchTool {
+        max_output_chars: max_web_output_chars,
+    }));
+    tools.register(Box::new(HfHubFileFetchTool {
+        max_output_chars: max_web_output_chars,
+    }));
     tools.register(Box::new(CronTool {
         cron_node: cron_node.clone(),
         multi_tenant_edge_cron_enabled: mte_cron_scheduler.is_some(),
@@ -403,14 +417,26 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     let reflection_task = reflection_engine.start();
 
     // 6. Compile Agent System Prompt
-    let system_prompt = {
-        let base = workspace.compile_system_prompt();
-        if workspace.config.execution_harness_enabled() {
-            format!("{base}{EXECUTION_HARNESS_SYSTEM_GUIDANCE}")
-        } else {
-            base
-        }
+    let mut system_prompt = workspace.compile_system_prompt();
+    if workspace.config.ml_engineer_harness_enabled() {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(isanagent::ml_engineer::HARNESS_OVERLAY);
+    }
+    if workspace.config.execution_harness_enabled() {
+        system_prompt.push_str(EXECUTION_HARNESS_SYSTEM_GUIDANCE);
+    }
+    let subagent_system_prompt = if workspace.config.ml_engineer_subagent_research_overlay() {
+        format!(
+            "{}\n{}",
+            system_prompt,
+            isanagent::ml_engineer::SUBAGENT_RESEARCH_APPEND
+        )
+    } else {
+        system_prompt.clone()
     };
+
+    let harness_runtime_summary = workspace.config.runtime_harness_summary_lines().join("\n");
+    let forbid_final_without_tools = workspace.config.ml_engineer_forbid_final_without_tools();
 
     // Prepare startup visual references before we move the structs
     let skill_names = skills.get_skill_names().join(", ");
@@ -492,6 +518,9 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         clarification_hub,
         subagent,
         doom_loop_enabled: workspace.config.doom_loop_enabled(),
+        harness_runtime_summary,
+        subagent_system_prompt,
+        forbid_final_without_tools,
     });
     let agent_logic = if let Some(tool_execution_activity) = tool_execution_activity {
         agent_logic.with_tool_execution_activity(tool_execution_activity)

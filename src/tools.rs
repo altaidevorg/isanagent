@@ -5,6 +5,7 @@ use std::sync::{Arc, RwLock};
 
 pub mod builtin;
 pub mod execution;
+pub mod ml_domain;
 pub mod workflow;
 
 /// Score `(name, description)` entries for a free-text `query`. Higher is better.
@@ -114,6 +115,28 @@ impl ToolRegistry {
     /// Tools that must not run inside a sub-agent loop (prevents unbounded recursion).
     pub fn is_subagent_restricted_tool(name: &str) -> bool {
         matches!(name, "subagent_spawn" | "subagent_plan_execute")
+    }
+
+    /// Read-only or side-effect-free tools safe to run concurrently (same assistant turn).
+    pub fn is_parallel_safe_tool(name: &str) -> bool {
+        matches!(
+            name,
+            "read_file"
+                | "glob_files"
+                | "list_dir"
+                | "search_text"
+                | "web_search"
+                | "web_fetch"
+                | "search_memory"
+                | "fetch_memory_by_date"
+                | "search_tools"
+                | "load_skill_instructions"
+                | "arxiv_search"
+                | "arxiv_fetch"
+                | "hf_hub_file_fetch"
+                | "execution_env_info"
+                | "task_history_list"
+        )
     }
 
     /// Tool list for provider calls when `is_subagent` is true and/or an allowlist applies.

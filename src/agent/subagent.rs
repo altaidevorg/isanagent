@@ -10,15 +10,18 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use super::ReasoningLoopCtx;
-use crate::bus::{BusMessage, InboundMessage};
+use crate::bus::{BusMessage, InboundMessage, TelemetryEvent};
 use crate::clarification::ClarificationHub;
 use crate::logging::LoggerHandle;
+use crate::memory::{MemoryMessage, SharedReply};
 use crate::session::SessionManager;
 use crate::skills::SkillRegistry;
 use crate::tool_activity::SharedToolExecutionActivity;
 use crate::tool_runtime::ToolExecCtx;
 use crate::tools::ToolRegistry;
 use crate::traits::{Provider, Tool};
+use crate::NodeHandle;
+use tokio::sync::oneshot;
 
 /// Arguments for [`SubagentHarness::spawn`].
 pub struct SubagentSpawnSpec {
@@ -52,6 +55,9 @@ pub struct SubagentSpawnDeps {
     pub max_tasks: usize,
     pub max_wait_secs: u64,
     pub doom_loop_enabled: bool,
+    pub memory_node: NodeHandle<MemoryMessage>,
+    /// Same harness snapshot as the parent agent (sub-agents do not use autonomy-forbid).
+    pub harness_runtime_summary: String,
 }
 
 struct TaskRecord {
@@ -70,6 +76,66 @@ const ST_RUNNING: u8 = 1;
 const ST_COMPLETED: u8 = 2;
 const ST_FAILED: u8 = 3;
 const ST_CANCELLED: u8 = 4;
+
+fn truncate_sqlite_field(s: String, max: usize) -> String {
+    if s.len() <= max {
+        return s;
+    }
+    let mut t = s;
+    t.truncate(max);
+    t.push_str("\n… [truncated for sqlite]");
+    t
+}
+
+async fn persist_subagent_start(
+    memory: &NodeHandle<MemoryMessage>,
+    task_id: String,
+    parent_chat_id: String,
+    child_chat_id: String,
+    display_name: Option<String>,
+    prompt: String,
+) -> Result<(), String> {
+    let prompt = truncate_sqlite_field(prompt, 150_000);
+    let (tx, rx) = oneshot::channel();
+    memory
+        .send_packet(MemoryMessage::InsertSubagentTask {
+            task_id,
+            parent_chat_id,
+            child_chat_id,
+            display_name,
+            prompt,
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .map_err(|e| format!("memory: {}", e))?;
+    rx.await.map_err(|_| "memory actor closed".to_string())?
+}
+
+async fn persist_subagent_end(
+    memory: &NodeHandle<MemoryMessage>,
+    task_id: String,
+    parent_chat_id: String,
+    status: String,
+    result: Option<String>,
+    error: Option<String>,
+    execution_job_id: Option<String>,
+) {
+    let result = result.map(|s| truncate_sqlite_field(s, 400_000));
+    let error = error.map(|s| truncate_sqlite_field(s, 50_000));
+    let (tx, rx) = oneshot::channel();
+    let _ = memory
+        .send_packet(MemoryMessage::FinalizeSubagentTask {
+            task_id,
+            parent_chat_id,
+            status,
+            result,
+            error,
+            execution_job_id,
+            reply: SharedReply::new(tx),
+        })
+        .await;
+    let _ = rx.await;
+}
 
 impl TaskRecord {
     fn is_terminal(&self) -> bool {
@@ -182,6 +248,16 @@ impl SubagentHarness {
         let task_id = uuid::Uuid::new_v4().simple().to_string();
         let child_chat_id = format!("subagent-{}", &task_id[..12.min(task_id.len())]);
 
+        persist_subagent_start(
+            &self.inner.deps.memory_node,
+            task_id.clone(),
+            parent_chat_id.clone(),
+            child_chat_id.clone(),
+            display_name.clone(),
+            prompt.clone(),
+        )
+        .await?;
+
         let task_cancel = match (
             &parent_reasoning_cancel,
             self.inner.deps.cancel_children_on_parent_cancel,
@@ -202,6 +278,18 @@ impl SubagentHarness {
         });
 
         self.inner.tasks.insert(task_id.clone(), record.clone());
+
+        let _ = self
+            .inner
+            .deps
+            .outbound_tx
+            .send(BusMessage::Telemetry(TelemetryEvent::SubagentSpawned {
+                parent_chat_id: parent_chat_id.clone(),
+                child_chat_id: child_chat_id.clone(),
+                task_id: task_id.clone(),
+                display_name: display_name.clone(),
+            }))
+            .await;
 
         let provider = dyn_clone::clone_box(&*self.inner.deps.provider_template);
         let inbound = InboundMessage {
@@ -251,6 +339,8 @@ impl SubagentHarness {
             is_subagent: true,
             subagent_allowlist: self.inner.deps.default_allowlist.clone(),
             doom_loop_enabled: self.inner.deps.doom_loop_enabled,
+            harness_runtime_summary: self.inner.deps.harness_runtime_summary.clone(),
+            forbid_final_without_tools: false,
         };
 
         record
@@ -260,28 +350,55 @@ impl SubagentHarness {
         let tasks = self.inner.tasks.clone();
         let tid = task_id.clone();
         let rec = record.clone();
+        let memory = self.inner.deps.memory_node.clone();
+        let outbound = self.inner.deps.outbound_tx.clone();
+        let parent_for_db = parent_chat_id.clone();
         tokio::spawn(async move {
             let outcome = super::AgentLogic::run_reasoning_loop(ctx).await;
-            match outcome {
+            let (status_str, result_opt, err_opt) = match outcome {
                 Ok(text) => {
                     if rec.cancel.is_cancelled() {
                         rec.status
                             .store(ST_CANCELLED, std::sync::atomic::Ordering::Release);
+                        ("cancelled".to_string(), None, Some("cancelled".to_string()))
                     } else {
                         {
                             let mut r = rec.result.write().await;
-                            *r = Some(text);
+                            *r = Some(text.clone());
                         }
                         rec.status
                             .store(ST_COMPLETED, std::sync::atomic::Ordering::Release);
+                        ("completed".to_string(), Some(text), None)
                     }
                 }
                 Err(e) => {
-                    *rec.error.write().await = Some(e);
+                    *rec.error.write().await = Some(e.clone());
                     rec.status
                         .store(ST_FAILED, std::sync::atomic::Ordering::Release);
+                    ("failed".to_string(), None, Some(e))
                 }
-            }
+            };
+
+            persist_subagent_end(
+                &memory,
+                tid.clone(),
+                parent_for_db.clone(),
+                status_str.clone(),
+                result_opt,
+                err_opt,
+                None,
+            )
+            .await;
+
+            let _ = outbound
+                .send(BusMessage::Telemetry(TelemetryEvent::SubagentFinished {
+                    parent_chat_id: parent_for_db,
+                    child_chat_id: rec.child_chat_id.clone(),
+                    task_id: tid.clone(),
+                    status: status_str,
+                }))
+                .await;
+
             // Drop from the index before waking `wait=true` callers so `task_list` does not
             // briefly show a finished task after a blocking spawn returns.
             tasks.remove(&tid);
@@ -455,7 +572,7 @@ impl Tool for TaskGetTool {
     }
 
     fn description(&self) -> &str {
-        "Get status snapshot JSON for a sub-agent task still listed for this chat. Completed tasks are dropped from the table quickly; use subagent_spawn with wait=true for the `result` text in the spawn response."
+        "Get status snapshot JSON for a sub-agent task still listed for this chat (in-memory only while running). For completed runs use `task_history_list` (SQLite). Use subagent_spawn with wait=true for immediate `result` text in the spawn response."
     }
 
     fn parameters(&self) -> Value {
@@ -632,7 +749,58 @@ impl Tool for SubagentPlanTool {
     }
 }
 
-pub fn register_subagent_tools(registry: &mut ToolRegistry, harness: Arc<SubagentHarness>) {
+pub struct TaskHistoryListTool {
+    pub memory_node: NodeHandle<MemoryMessage>,
+}
+
+#[async_trait]
+impl Tool for TaskHistoryListTool {
+    fn name(&self) -> &str {
+        "task_history_list"
+    }
+
+    fn description(&self) -> &str {
+        "List recent persisted sub-agent tasks for this chat (newest first, from SQLite). Use after parallel `subagent_spawn` runs complete to audit results. Optional `limit` (default 40, max 200)."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "limit": { "type": "integer", "description": "Max rows (default 40, max 200)" }
+            }
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, String> {
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(40)
+            .clamp(1, 200) as usize;
+        let (_, parent_chat, _, _) = current_parent_ids()?;
+        let (tx, rx) = oneshot::channel();
+        self.memory_node
+            .send_packet(MemoryMessage::ListSubagentTasksForParent {
+                parent_chat_id: parent_chat,
+                limit,
+                reply: SharedReply::new(tx),
+            })
+            .await
+            .map_err(|e| format!("memory: {}", e))?;
+        let rows = rx.await.map_err(|_| "memory actor closed".to_string())??;
+        if rows.is_empty() {
+            return Ok("No persisted sub-agent tasks for this chat yet.".to_string());
+        }
+        serde_json::to_string_pretty(&rows).map_err(|e| e.to_string())
+    }
+}
+
+pub fn register_subagent_tools(
+    registry: &mut ToolRegistry,
+    harness: Arc<SubagentHarness>,
+    memory_node: NodeHandle<MemoryMessage>,
+) {
     registry.register(Box::new(SubagentSpawnTool {
         harness: harness.clone(),
     }));
@@ -644,6 +812,9 @@ pub fn register_subagent_tools(registry: &mut ToolRegistry, harness: Arc<Subagen
     }));
     registry.register(Box::new(TaskCancelTool {
         harness: harness.clone(),
+    }));
+    registry.register(Box::new(TaskHistoryListTool {
+        memory_node: memory_node.clone(),
     }));
     registry.register(Box::new(SubagentPlanTool { harness }));
 }

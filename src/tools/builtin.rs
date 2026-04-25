@@ -1226,7 +1226,7 @@ impl Tool for WebSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search the web. Uses Jina (s.jina.ai) when [jina].enabled is true in config; otherwise DuckDuckGo Lite."
+        "Search the web for **current** facts, docs, and release notes. Uses Jina (s.jina.ai) when [jina].enabled is true in config; otherwise DuckDuckGo Lite. Before writing ML library code, search for up-to-date APIs and examples; pair with `web_fetch` on authoritative URLs."
     }
 
     fn parameters(&self) -> Value {
@@ -1270,7 +1270,7 @@ impl Tool for WebFetchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch a URL. Uses Jina Reader (r.jina.ai) when [jina].enabled is true; otherwise direct GET with HTML text extraction or JSON pretty-print."
+        "Fetch a URL (docs, raw GitHub, paper pages). Uses Jina Reader (r.jina.ai) when [jina].enabled is true; otherwise direct GET with HTML text extraction or JSON pretty-print. Prefer official docs and pinned `raw.githubusercontent.com` sources when validating ML APIs."
     }
 
     fn parameters(&self) -> Value {

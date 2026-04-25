@@ -71,7 +71,12 @@ enabled = true
 # cancel_children_on_parent_cancel = false  # default true: explicit cancel (/cancel, BusMessage::Cancel) also stops sub-tasks
 # allowed_tools = ["read_file", "glob_files", "search_text", "edit_file"]  # omit = all tools except nested spawn/plan
 
-# Phase 2 execution plane: `execution_session_create`, `execution_run`, `execution_cancel`,
+# ML policy overlay (embedded in the isanagent binary when enabled). Reference copy: workspace/ML_ENGINEER_OVERLAY.md (onboard). Optional rules merge: workspace/ML_POLICY.md
+[harness.ml_engineer]
+enabled = true
+# subagent_research_overlay = false  # default true when enabled: extra research instructions for sub-agents only
+# forbid_final_without_tools = true   # default false: require at least one tool call before ending a reasoning step (also overridable via inbound metadata isanagent_autonomous_forbid_final_without_tools)
+
 # `execution_session_close`, `execution_env_info` (local subprocess, Jupyter kernel, or SSH remote).
 # Operator guide: docs/execution-user-guide.md — roadmap: docs/execution-implementation-plan.md
 [harness.execution]

@@ -14,6 +14,7 @@ pub mod config;
 pub mod execution;
 pub mod logging;
 pub mod memory;
+pub mod ml_engineer;
 pub mod multi_tenant_edge;
 pub mod onboarding;
 pub mod onboarding_interactive;

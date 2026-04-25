@@ -120,6 +120,22 @@ pub enum TelemetryEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
     },
+    /// A sub-agent task was started from a parent chat (for UI / audit filtering).
+    SubagentSpawned {
+        parent_chat_id: String,
+        child_chat_id: String,
+        task_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+    },
+    /// Sub-agent task reached a terminal state (also persisted in SQLite).
+    SubagentFinished {
+        parent_chat_id: String,
+        child_chat_id: String,
+        task_id: String,
+        /// `completed`, `failed`, or `cancelled`.
+        status: String,
+    },
 }
 
 /// Log severity levels for verbose diagnostics.

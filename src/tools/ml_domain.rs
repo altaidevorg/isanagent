@@ -1,0 +1,280 @@
+//! arXiv and Hugging Face Hub read-only helpers for ML engineering workflows.
+
+use async_trait::async_trait;
+use reqwest::header::AUTHORIZATION;
+use serde_json::Value;
+
+use crate::traits::Tool;
+
+const HF_USER_AGENT: &str =
+    "isanagent-ml-domain/0.1 (https://github.com/huggingface; research tool)";
+
+fn hf_path_safe(path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("path must be non-empty".to_string());
+    }
+    if path.contains("..") {
+        return Err("path must not contain '..'".to_string());
+    }
+    if path.starts_with('/') {
+        return Err("path must be relative (no leading slash)".to_string());
+    }
+    Ok(())
+}
+
+/// Search arXiv via the public Atom API (`export.arxiv.org`).
+pub struct ArxivSearchTool {
+    pub max_output_chars: usize,
+}
+
+#[async_trait]
+impl Tool for ArxivSearchTool {
+    fn name(&self) -> &str {
+        "arxiv_search"
+    }
+
+    fn description(&self) -> &str {
+        "Search arXiv (papers) via the public API. Returns Atom/XML snippets (titles, ids, summaries). Use before citing methods; follow up with `arxiv_fetch` for abstract text. Prefer precise English keywords."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Search terms (e.g. 'DPO preference optimization')" },
+                "max_results": { "type": "integer", "description": "1–30 (default 10)" }
+            },
+            "required": ["query"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, String> {
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing query")?;
+        let max_results = args
+            .get("max_results")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10)
+            .clamp(1, 30);
+
+        let q = urlencoding::encode(query);
+        let url = format!(
+            "https://export.arxiv.org/api/query?search_query=all:{}&start=0&max_results={}",
+            q, max_results
+        );
+
+        let client = reqwest::Client::builder()
+            .user_agent(HF_USER_AGENT)
+            .build()
+            .map_err(|e| e.to_string())?;
+
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("arxiv_search request: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("arxiv_search HTTP {}", resp.status()));
+        }
+
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| format!("arxiv_search body: {}", e))?;
+
+        let mut out = body;
+        if out.len() > self.max_output_chars {
+            out.truncate(self.max_output_chars);
+            out.push_str("\n... [TRUNCATED]");
+        }
+        Ok(out)
+    }
+}
+
+/// Fetch one arXiv abstract page (abs HTML) by id.
+pub struct ArxivFetchTool {
+    pub max_output_chars: usize,
+}
+
+#[async_trait]
+impl Tool for ArxivFetchTool {
+    fn name(&self) -> &str {
+        "arxiv_fetch"
+    }
+
+    fn description(&self) -> &str {
+        "Fetch an arXiv abstract page by id (e.g. `2401.0001` or `cs.CL/0001001`). Returns HTML text (truncated). Use after `arxiv_search` to read abstract and links."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "arxiv_id": { "type": "string", "description": "arXiv paper id" }
+            },
+            "required": ["arxiv_id"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, String> {
+        let id = args
+            .get("arxiv_id")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing arxiv_id")?
+            .trim()
+            .replace(' ', "");
+        if id.is_empty() || id.contains("..") {
+            return Err("invalid arxiv_id".to_string());
+        }
+
+        let url = format!("https://arxiv.org/abs/{}", id);
+
+        let client = reqwest::Client::builder()
+            .user_agent(HF_USER_AGENT)
+            .build()
+            .map_err(|e| e.to_string())?;
+
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("arxiv_fetch request: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("arxiv_fetch HTTP {}", resp.status()));
+        }
+
+        let mut body = resp
+            .text()
+            .await
+            .map_err(|e| format!("arxiv_fetch body: {}", e))?;
+        if body.len() > self.max_output_chars {
+            body.truncate(self.max_output_chars);
+            body.push_str("\n... [TRUNCATED]");
+        }
+        Ok(body)
+    }
+}
+
+/// GET a file from the Hugging Face Hub `resolve` URL (read-only). Uses `HF_TOKEN` when set for private repos.
+pub struct HfHubFileFetchTool {
+    pub max_output_chars: usize,
+}
+
+#[async_trait]
+impl Tool for HfHubFileFetchTool {
+    fn name(&self) -> &str {
+        "hf_hub_file_fetch"
+    }
+
+    fn description(&self) -> &str {
+        "Download a **single text file** from the Hugging Face Hub via the public `resolve` URL (e.g. config.json, README). Pass `repo` like `org/model`, optional `revision` (branch/commit, default `main`), and relative `path`. Requires network; respects `HF_TOKEN` for gated models. Not for huge binaries—use `web_fetch` on the raw URL if needed."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "repo": { "type": "string", "description": "Hub repo id, e.g. `meta-llama/Llama-2-7b-hf`" },
+                "path": { "type": "string", "description": "Repo-relative path, e.g. `config.json` or `README.md`" },
+                "revision": { "type": "string", "description": "Git revision (default `main`)" }
+            },
+            "required": ["repo", "path"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, String> {
+        let repo = args
+            .get("repo")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing repo")?
+            .trim();
+        let path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing path")?
+            .trim();
+        hf_path_safe(path)?;
+
+        let revision = args
+            .get("revision")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("main");
+
+        if repo.is_empty() || repo.contains("..") || repo.starts_with('/') {
+            return Err("invalid repo id".to_string());
+        }
+
+        let enc_path = path
+            .split('/')
+            .map(urlencoding::encode)
+            .collect::<Vec<_>>()
+            .join("/");
+        let url = format!(
+            "https://huggingface.co/{}/resolve/{}/{}",
+            repo, revision, enc_path
+        );
+
+        let client = reqwest::Client::builder()
+            .user_agent(HF_USER_AGENT)
+            .build()
+            .map_err(|e| e.to_string())?;
+
+        let mut req = client.get(&url);
+        if let Ok(token) = std::env::var("HF_TOKEN") {
+            let t = token.trim();
+            if !t.is_empty() {
+                req = req.header(AUTHORIZATION, format!("Bearer {}", t));
+            }
+        }
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("hf_hub_file_fetch request: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!(
+                "hf_hub_file_fetch HTTP {} for {}",
+                resp.status(),
+                url
+            ));
+        }
+
+        let ctype = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ctype.contains("application/octet-stream")
+            && !path.ends_with(".json")
+            && !path.ends_with(".md")
+            && !path.ends_with(".txt")
+            && !path.ends_with(".py")
+            && !path.ends_with(".toml")
+            && !path.ends_with(".yaml")
+            && !path.ends_with(".yml")
+        {
+            return Err(
+                "Refusing to dump large binary: use a text path (json/md/txt/py) or open the file in the browser."
+                    .to_string(),
+            );
+        }
+
+        let mut body = resp
+            .text()
+            .await
+            .map_err(|e| format!("hf_hub_file_fetch body: {}", e))?;
+        if body.len() > self.max_output_chars {
+            body.truncate(self.max_output_chars);
+            body.push_str("\n... [TRUNCATED]");
+        }
+        Ok(body)
+    }
+}

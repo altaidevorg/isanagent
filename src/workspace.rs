@@ -119,6 +119,12 @@ impl IsanagentWorkspace {
         if let Some(memory) = self.read_md_file("MEMORY.md") {
             prompt_parts.push(format!("--- LONG TERM MEMORY ---\n{}\n", memory));
         }
+        if let Some(ml) = self.read_md_file("ML_POLICY.md") {
+            prompt_parts.push(format!(
+                "--- ML / TRAINING POLICY (ML_POLICY.md) ---\n{}\n",
+                ml
+            ));
+        }
 
         if prompt_parts.is_empty() {
             "You are isanagent, a helpful AI assistant.".to_string()
