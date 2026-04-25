@@ -33,6 +33,7 @@ pub struct ExecutionHarness {
 }
 
 impl ExecutionHarness {
+    #[allow(clippy::too_many_arguments)] // Constructor matches harness config surface area.
     pub fn new(
         provider: Arc<dyn ExecutionProvider>,
         python_executable: impl Into<String>,
@@ -57,6 +58,7 @@ impl ExecutionHarness {
     }
 
     /// Colab MCP harness only (`default_provider = "colab_mcp"`).
+    #[allow(clippy::too_many_arguments)] // Constructor matches harness config surface area.
     pub fn new_colab_mcp(
         colab: Arc<ColabMcpExecutionProvider>,
         python_executable: impl Into<String>,

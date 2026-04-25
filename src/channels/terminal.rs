@@ -189,6 +189,7 @@ pub fn build_execution_job_started_notice(
 }
 
 /// Short user-visible line when a background execution job finishes (or fails).
+#[allow(clippy::too_many_arguments)] // Outbound metadata builder; each field maps to protocol keys.
 pub fn build_execution_job_notice(
     chat_id: &str,
     channel: &str,

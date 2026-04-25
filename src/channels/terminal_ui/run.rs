@@ -465,7 +465,7 @@ fn jobs_strip_lines(app: &App, max_width: usize, include_stream_tail: bool) -> V
             .execution_stream_recent
             .lines()
             .filter(|s| !s.trim().is_empty())
-            .last()
+            .next_back()
         {
             let label = app
                 .execution_stream_label

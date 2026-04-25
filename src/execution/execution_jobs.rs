@@ -308,7 +308,7 @@ impl ExecutionJobManager {
             .ok_or_else(|| "Unknown job_id".to_string())?;
         let finished = r.finished_rfc3339.read().await.clone();
         let err = r.error.read().await.clone();
-        let cancel_kind = r.cancel_kind.read().await.clone();
+        let cancel_kind = *r.cancel_kind.read().await;
         let mut payload = json!({
             "job_id": r.job_id,
             "session_id": r.session_id.to_string(),
@@ -1178,6 +1178,7 @@ async fn finalize_arbitrary_job(p: FinalizeArbitraryParams) {
 }
 
 /// Persist a JSON file at `.system_generated/execution_history/colab_mcp_tool_call/{session}/{job_id}/result.json`.
+#[allow(clippy::too_many_arguments)] // Journal row mirrors persisted JSON fields.
 pub(crate) async fn write_colab_mcp_call_journal(
     workspace_dir: &Path,
     session_id: &SessionId,

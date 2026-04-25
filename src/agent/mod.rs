@@ -170,6 +170,7 @@ struct ToolCallRuntime {
 }
 
 /// Runs a tool with optional per-call activity heartbeats and optional cooperative cancellation.
+#[allow(clippy::too_many_arguments)] // Central tool-dispatch path; grouping would obscure call sites.
 async fn execute_tool_call_with_activity(
     tools: &Arc<ToolRegistry>,
     tool_execution_activity: Option<SharedToolExecutionActivity>,
