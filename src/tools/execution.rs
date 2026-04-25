@@ -13,9 +13,11 @@ use tokio::sync::mpsc;
 use crate::bus::BusMessage;
 use crate::channels::terminal::build_execution_stream_notice;
 use crate::execution::{
-    persist_successful_execution_run, sanitize_session_segment, CwdPolicy, ExecutionError,
-    ExecutionHarness, ExecutionJobManager, PersistSuccessfulExecutionRunParams, RunEvent, RunSpec,
-    SessionCreateRequest, SessionId, SpawnBackgroundRunRequest,
+    append_mcp_call_manifest, persist_successful_execution_run, run_with_auto_promote,
+    sanitize_session_segment, write_mcp_call_journal, AdoptInflightRequest, AutoPromoteOutcome,
+    CwdPolicy, ExecutionError, ExecutionHarness, ExecutionJobManager, InflightSyncRegistry,
+    McpCallJournalParams, McpCallManifestLine, PersistSuccessfulExecutionRunParams, RunEvent,
+    RunResult, RunSpec, SessionCreateRequest, SessionId, SpawnBackgroundRunRequest,
 };
 use crate::tool_runtime::current_tool_exec_ctx;
 use crate::traits::Tool;
@@ -174,6 +176,12 @@ impl Tool for ExecutionSessionCreateTool {
 pub struct ExecutionRunTool {
     pub harness: Arc<ExecutionHarness>,
     pub outbound_tx: mpsc::Sender<BusMessage>,
+    /// Job manager used to auto-promote long synchronous runs into background jobs.
+    /// `None` disables auto-promote (e.g. unit tests or harnesses without a job registry).
+    pub jobs: Option<Arc<ExecutionJobManager>>,
+    /// Registry that maps `chat_id -> oneshot::Sender<()>`; the `/background` slash command
+    /// pushes onto it to let the user manually promote a sync run before the timer fires.
+    pub inflight: Option<Arc<InflightSyncRegistry>>,
 }
 
 #[async_trait]
@@ -259,26 +267,135 @@ impl Tool for ExecutionRunTool {
         spec.run_event_tx = event_tx;
         spec.description = run_description.clone();
 
-        let result = self
-            .harness
-            .provider()
-            .run(&sid, spec)
-            .await
-            .map_err(exec_err)?;
-        let duration_ms = started.elapsed().as_millis() as u64;
-        let artifact_count = result.attachments.len();
-        let exit_s = match result.exit_code {
+        let auto_promote = self.harness.auto_promote_after_secs;
+        let promote_enabled = self.jobs.is_some()
+            && auto_promote > 0
+            && auto_promote < timeout_secs
+            && !chat_id.is_empty();
+
+        if !promote_enabled {
+            let result = self
+                .harness
+                .provider()
+                .run(&sid, spec)
+                .await
+                .map_err(exec_err)?;
+            return self
+                .finalize_sync_run(FinalizeSyncRunParams {
+                    sid: &sid,
+                    code: &code,
+                    result: &result,
+                    started,
+                    started_ts: &started_ts,
+                    run_id: &run_id,
+                    chat_id: &chat_id,
+                    channel: &channel,
+                    run_description: run_description.as_deref(),
+                    provider_id: prov,
+                })
+                .await;
+        }
+
+        let jobs = self.jobs.clone().expect("jobs checked above");
+        let inflight = self.inflight.clone();
+        let promote_rx = inflight.as_ref().map(|reg| reg.register(&chat_id));
+        let (promote_signal_rx, _inflight_guard) = match promote_rx {
+            Some((rx, guard)) => (Some(rx), Some(guard)),
+            None => (None, None),
+        };
+
+        let provider = self.harness.provider().clone();
+        let sid_for_work = sid.clone();
+        let work = async move { provider.run(&sid_for_work, spec).await };
+
+        let chat_id_for_promote = chat_id.clone();
+        let channel_for_promote = channel.clone();
+        let sid_for_promote = sid.clone();
+        let description_for_promote = run_description.clone();
+
+        let outcome = run_with_auto_promote::<Result<RunResult, ExecutionError>, _, _>(
+            work,
+            Duration::from_secs(auto_promote),
+            promote_signal_rx,
+            move |handle, _reason| {
+                let req = AdoptInflightRequest {
+                    sid: sid_for_promote,
+                    tool_name: "execution_run".to_string(),
+                    label: None,
+                    description: description_for_promote,
+                    chat_id: chat_id_for_promote,
+                    channel: channel_for_promote,
+                    join: handle,
+                };
+                jobs.adopt_inflight(req).unwrap_or_else(|e| {
+                    log::warn!("execution_run: adopt_inflight failed: {e}");
+                    String::new()
+                })
+            },
+        )
+        .await;
+
+        match outcome {
+            AutoPromoteOutcome::Completed(Ok(result)) => {
+                self.finalize_sync_run(FinalizeSyncRunParams {
+                    sid: &sid,
+                    code: &code,
+                    result: &result,
+                    started,
+                    started_ts: &started_ts,
+                    run_id: &run_id,
+                    chat_id: &chat_id,
+                    channel: &channel,
+                    run_description: run_description.as_deref(),
+                    provider_id: prov,
+                })
+                .await
+            }
+            AutoPromoteOutcome::Completed(Err(e)) => Err(exec_err(e)),
+            AutoPromoteOutcome::Promoted { job_id, reason } => {
+                let envelope = json!({
+                    "auto_promoted": true,
+                    "reason": reason.as_str(),
+                    "job_id": job_id,
+                    "session_id": sid.to_string(),
+                    "tool_name": "execution_run",
+                    "follow_up": "Use execution_job_status / execution_job_result to retrieve the run result when it finishes. Use execution_job_cancel for best-effort interrupt.",
+                });
+                serde_json::to_string_pretty(&envelope).map_err(|e| e.to_string())
+            }
+        }
+    }
+}
+
+struct FinalizeSyncRunParams<'a> {
+    sid: &'a SessionId,
+    code: &'a str,
+    result: &'a RunResult,
+    started: Instant,
+    started_ts: &'a str,
+    run_id: &'a str,
+    chat_id: &'a str,
+    channel: &'a str,
+    run_description: Option<&'a str>,
+    provider_id: &'a str,
+}
+
+impl ExecutionRunTool {
+    async fn finalize_sync_run(&self, p: FinalizeSyncRunParams<'_>) -> Result<String, String> {
+        let duration_ms = p.started.elapsed().as_millis() as u64;
+        let artifact_count = p.result.attachments.len();
+        let exit_s = match p.result.exit_code {
             None => "none".to_string(),
             Some(0) => "0".to_string(),
             Some(n) => format!("exit {n}"),
         };
         info!(
             "execution_run provider={} session={} exit={} stdout_len={} stderr_len={} duration_ms={} artifacts={}",
-            prov,
-            sid,
+            p.provider_id,
+            p.sid,
             exit_s,
-            result.stdout.len(),
-            result.stderr.len(),
+            p.result.stdout.len(),
+            p.result.stderr.len(),
             duration_ms,
             artifact_count
         );
@@ -286,21 +403,21 @@ impl Tool for ExecutionRunTool {
         persist_successful_execution_run(PersistSuccessfulExecutionRunParams {
             harness: self.harness.as_ref(),
             outbound_tx: &self.outbound_tx,
-            provider_id: prov,
-            sid: &sid,
-            run_id: &run_id,
-            code: &code,
-            result: &result,
-            started_ts: &started_ts,
-            chat_id: &chat_id,
-            channel: &channel,
+            provider_id: p.provider_id,
+            sid: p.sid,
+            run_id: p.run_id,
+            code: p.code,
+            result: p.result,
+            started_ts: p.started_ts,
+            chat_id: p.chat_id,
+            channel: p.channel,
             duration_ms,
             job_id: None,
-            run_description: run_description.as_deref(),
+            run_description: p.run_description,
         })
         .await;
 
-        serde_json::to_string_pretty(&result).map_err(|e| e.to_string())
+        serde_json::to_string_pretty(p.result).map_err(|e| e.to_string())
     }
 }
 
@@ -492,7 +609,7 @@ impl Tool for ExecutionJobCancelTool {
     }
 
     fn description(&self) -> &str {
-        "Best-effort interrupt for a background job by job_id (maps to execution_cancel for that job's session). Same capability gate as execution_cancel."
+        "Best-effort interrupt for a background job by job_id. Prefers the cooperative provider cancel (same capability gate as execution_cancel); when the provider does not support cooperative interrupts (e.g. colab_mcp), falls back to aborting the local wait. On the abort path the remote work (e.g. a Colab cell) may keep running on the other side until it finishes naturally."
     }
 
     fn parameters(&self) -> Value {
@@ -510,8 +627,18 @@ impl Tool for ExecutionJobCancelTool {
             .get("job_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing 'job_id'".to_string())?;
-        self.jobs.cancel_job(job_id).await?;
-        Ok(format!("cancel requested for job {job_id}"))
+        let outcome = self.jobs.cancel_job(job_id).await?;
+        let mut payload = serde_json::json!({
+            "job_id": job_id,
+            "cancel_kind": outcome.cancel_kind,
+            "message": format!("cancel requested for job {job_id}"),
+        });
+        if let Some(note) = outcome.note {
+            if let Value::Object(ref mut m) = payload {
+                m.insert("note".to_string(), Value::String(note));
+            }
+        }
+        serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())
     }
 }
 
@@ -699,6 +826,12 @@ pub struct ColabMcpToolCallTool {
     pub harness: Arc<ExecutionHarness>,
     pub allowlist: GlobSet,
     pub max_result_chars: usize,
+    /// Job manager used to auto-promote long calls into background jobs.
+    /// `None` disables auto-promote (e.g. unit tests).
+    pub jobs: Option<Arc<ExecutionJobManager>>,
+    /// Per-chat in-flight sync registry; the `/background` slash command pushes onto this to
+    /// promote the current call before the timer fires.
+    pub inflight: Option<Arc<InflightSyncRegistry>>,
 }
 
 #[async_trait]
@@ -708,7 +841,7 @@ impl Tool for ColabMcpToolCallTool {
     }
 
     fn description(&self) -> &str {
-        "Colab MCP only: invoke a proxied MCP tool in the connected browser session. `tool_name` must match a pattern in `[harness.execution.colab_mcp].extra_mcp_tool_allowlist`. Use `list_cached_tool_names: true` to list tool names from the last `tools/list` (refreshed when the server sends `notifications/tools/list_changed`). Prefer `execution_run` for Python code cells."
+        "Colab MCP only: invoke a proxied MCP tool in the connected browser session. `tool_name` must match a pattern in `[harness.execution.colab_mcp].extra_mcp_tool_allowlist`. Use `list_cached_tool_names: true` to list tool names from the last `tools/list` (refreshed when the server sends `notifications/tools/list_changed`). Prefer `execution_run` for Python code cells. Long calls auto-promote to a background job after auto_promote_after_secs and return a `job_id` envelope; poll with execution_job_status / execution_job_result. Default `timeout_secs` is the harness `default_run_timeout_secs` (no artificial 120s cap)."
     }
 
     fn parameters(&self) -> Value {
@@ -719,7 +852,7 @@ impl Tool for ColabMcpToolCallTool {
                 "tool_name": { "type": "string", "description": "MCP tool name from tools/list" },
                 "arguments": { "type": "object", "description": "MCP tool arguments (JSON object)" },
                 "list_cached_tool_names": { "type": "boolean", "description": "If true, return cached tool names only" },
-                "timeout_secs": { "type": "integer", "description": "Wall clock for the MCP call (default 120, capped by max_wall_secs)" }
+                "timeout_secs": { "type": "integer", "description": "Wall clock for the MCP call (defaults to default_execution_timeout_secs, capped by max_wall_secs). Long calls beyond auto_promote_after_secs return a job_id envelope and keep running in the background." }
             },
             "required": ["session_id"]
         })
@@ -743,11 +876,11 @@ impl Tool for ColabMcpToolCallTool {
             .get("tool_name")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing tool_name (or set list_cached_tool_names: true)".to_string())?;
-        let tool_name = tool_name.trim();
+        let tool_name = tool_name.trim().to_string();
         if tool_name.is_empty() {
             return Err("tool_name must be non-empty".to_string());
         }
-        if !self.allowlist.is_match(tool_name) {
+        if !self.allowlist.is_match(&tool_name) {
             return Err(format!(
                 "tool_name {tool_name:?} does not match any pattern in extra_mcp_tool_allowlist"
             ));
@@ -761,17 +894,305 @@ impl Tool for ColabMcpToolCallTool {
         let timeout_secs = args
             .get("timeout_secs")
             .and_then(|v| v.as_u64())
-            .unwrap_or(120)
+            .unwrap_or(self.harness.default_run_timeout_secs)
             .clamp(1, cap_secs);
-        let out = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            cm.call_mcp_tool_raw(&sid, tool_name, arguments),
+        let description = args
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("colab_mcp:{tool_name}"));
+
+        let auto_promote = self.harness.auto_promote_after_secs;
+        let (chat_id, channel) = current_tool_exec_ctx()
+            .map(|c| (c.chat_id.clone(), c.channel.clone()))
+            .unwrap_or_else(|| (String::new(), String::new()));
+
+        let call_id = uuid::Uuid::new_v4().to_string();
+        let started = Instant::now();
+        let started_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let arguments_json: serde_json::Value = serde_json::Value::Object(arguments.clone());
+
+        // Build the work future: timeout-bounded MCP call mapped into a `RunResult`.
+        let cm_for_work = cm.clone();
+        let sid_for_work = sid.clone();
+        let tool_name_for_work = tool_name.clone();
+        let arguments_for_work = arguments.clone();
+        let work = async move {
+            let res = tokio::time::timeout(
+                Duration::from_secs(timeout_secs),
+                cm_for_work.call_mcp_tool_raw(
+                    &sid_for_work,
+                    &tool_name_for_work,
+                    arguments_for_work,
+                ),
+            )
+            .await;
+            match res {
+                Err(_) => Err(ExecutionError::Timeout { timeout_secs }),
+                Ok(Err(e)) => Err(e),
+                Ok(Ok(value)) => {
+                    let stdout = serde_json::to_string(&value)
+                        .unwrap_or_else(|_| "<unserialisable mcp result>".to_string());
+                    Ok(RunResult::new(stdout, "", Some(0)))
+                }
+            }
+        };
+
+        // Decide whether we can use auto-promote at all (need both a job manager and a non-zero
+        // bound). If not, fall through to the original synchronous path.
+        let promote_enabled =
+            self.jobs.is_some() && auto_promote > 0 && auto_promote < timeout_secs;
+        if !promote_enabled {
+            let outcome = work.await;
+            return self
+                .finalize_sync_mcp_call(FinalizeSyncMcpCallParams {
+                    sid: &sid,
+                    call_id: &call_id,
+                    tool_name: &tool_name,
+                    arguments: &arguments_json,
+                    description: Some(description.as_str()),
+                    started,
+                    started_ts: &started_ts,
+                    chat_id: &chat_id,
+                    channel: &channel,
+                    outcome,
+                    auto_promoted: false,
+                    job_id: None,
+                })
+                .await;
+        }
+
+        let jobs = self.jobs.clone().expect("jobs checked above");
+        let inflight = self.inflight.clone();
+        let promote_rx = inflight
+            .as_ref()
+            .filter(|_| !chat_id.is_empty())
+            .map(|reg| reg.register(&chat_id));
+        // Keep the guard alive for the duration of the race; drop it after promote/complete.
+        let (promote_signal_rx, _inflight_guard) = match promote_rx {
+            Some((rx, guard)) => (Some(rx), Some(guard)),
+            None => (None, None),
+        };
+
+        let chat_id_for_promote = chat_id.clone();
+        let channel_for_promote = channel.clone();
+        let sid_for_promote = sid.clone();
+        let tool_name_for_promote = tool_name.clone();
+        let description_for_promote = description.clone();
+
+        let outcome = run_with_auto_promote::<Result<RunResult, ExecutionError>, _, _>(
+            work,
+            Duration::from_secs(auto_promote),
+            promote_signal_rx,
+            move |handle, _reason| {
+                let req = AdoptInflightRequest {
+                    sid: sid_for_promote,
+                    tool_name: tool_name_for_promote,
+                    label: None,
+                    description: Some(description_for_promote),
+                    chat_id: chat_id_for_promote,
+                    channel: channel_for_promote,
+                    join: handle,
+                };
+                jobs.adopt_inflight(req).unwrap_or_else(|e| {
+                    log::warn!("colab_mcp_tool_call: adopt_inflight failed: {e}");
+                    String::new()
+                })
+            },
+        )
+        .await;
+
+        match outcome {
+            AutoPromoteOutcome::Completed(work_outcome) => {
+                self.finalize_sync_mcp_call(FinalizeSyncMcpCallParams {
+                    sid: &sid,
+                    call_id: &call_id,
+                    tool_name: &tool_name,
+                    arguments: &arguments_json,
+                    description: Some(description.as_str()),
+                    started,
+                    started_ts: &started_ts,
+                    chat_id: &chat_id,
+                    channel: &channel,
+                    outcome: work_outcome,
+                    auto_promoted: false,
+                    job_id: None,
+                })
+                .await
+            }
+            AutoPromoteOutcome::Promoted { job_id, reason } => {
+                let envelope = json!({
+                    "auto_promoted": true,
+                    "reason": reason.as_str(),
+                    "job_id": job_id,
+                    "call_id": call_id,
+                    "session_id": sid.to_string(),
+                    "tool_name": tool_name,
+                    "follow_up": "Use execution_job_status / execution_job_result to retrieve the MCP result when it finishes. Use execution_job_cancel for best-effort interrupt (the Colab cell may keep running on Google's side).",
+                });
+                // Journal the auto-promotion event itself; the background completion writes a
+                // separate result.txt when the job finishes (TODO: hook into job completion).
+                let workspace_dir = self.harness.workspace_dir().to_path_buf();
+                let provider_id = self
+                    .harness
+                    .provider()
+                    .capabilities()
+                    .provider_id
+                    .to_string();
+                let sid_clone = sid.clone();
+                let call_id_clone = call_id.clone();
+                let tool_name_clone = tool_name.clone();
+                let arguments_clone = arguments_json.clone();
+                let description_clone = description.clone();
+                let chat_id_clone = chat_id.clone();
+                let channel_clone = channel.clone();
+                let started_ts_clone = started_ts.clone();
+                let job_id_clone = job_id.clone();
+                let started_for_journal = started;
+                tokio::spawn(async move {
+                    let finished_ts =
+                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                    let duration_ms = started_for_journal.elapsed().as_millis() as u64;
+                    let result_summary = format!(
+                        "auto-promoted to background job {job_id_clone} after {auto_promote}s; poll execution_job_status/execution_job_result"
+                    );
+                    if let Err(e) = write_mcp_call_journal(McpCallJournalParams {
+                        workspace_dir: &workspace_dir,
+                        provider_id: &provider_id,
+                        session_id: &sid_clone,
+                        call_id: &call_id_clone,
+                        tool_name: &tool_name_clone,
+                        arguments: &arguments_clone,
+                        started_rfc3339: &started_ts_clone,
+                        finished_rfc3339: &finished_ts,
+                        duration_ms,
+                        status: "promoted",
+                        auto_promoted: true,
+                        job_id: Some(&job_id_clone),
+                        description: Some(description_clone.as_str()),
+                        result: &result_summary,
+                    })
+                    .await
+                    {
+                        log::warn!("colab_mcp_tool_call journal (promoted): {e}");
+                    }
+                    if let Err(e) = append_mcp_call_manifest(
+                        &workspace_dir,
+                        McpCallManifestLine {
+                            ts: &finished_ts,
+                            chat_id: &chat_id_clone,
+                            channel: &channel_clone,
+                            provider_id: &provider_id,
+                            session_id: &sid_clone.to_string(),
+                            call_id: &call_id_clone,
+                            tool_name: &tool_name_clone,
+                            status: "promoted",
+                            duration_ms,
+                            auto_promoted: true,
+                            job_id: Some(&job_id_clone),
+                            description: Some(description_clone.as_str()),
+                            result_len: result_summary.len(),
+                        },
+                    )
+                    .await
+                    {
+                        log::warn!("colab_mcp_tool_call manifest (promoted): {e}");
+                    }
+                });
+                serde_json::to_string_pretty(&envelope).map_err(|e| e.to_string())
+            }
+        }
+    }
+}
+
+struct FinalizeSyncMcpCallParams<'a> {
+    sid: &'a SessionId,
+    call_id: &'a str,
+    tool_name: &'a str,
+    arguments: &'a serde_json::Value,
+    description: Option<&'a str>,
+    started: Instant,
+    started_ts: &'a str,
+    chat_id: &'a str,
+    channel: &'a str,
+    outcome: Result<RunResult, ExecutionError>,
+    auto_promoted: bool,
+    job_id: Option<&'a str>,
+}
+
+impl ColabMcpToolCallTool {
+    async fn finalize_sync_mcp_call(
+        &self,
+        p: FinalizeSyncMcpCallParams<'_>,
+    ) -> Result<String, String> {
+        let finished_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let duration_ms = p.started.elapsed().as_millis() as u64;
+        let provider_id = self
+            .harness
+            .provider()
+            .capabilities()
+            .provider_id
+            .to_string();
+        let workspace_dir = self.harness.workspace_dir().to_path_buf();
+
+        let (status, result_text) = match &p.outcome {
+            Ok(rr) => ("completed", rr.stdout.clone()),
+            Err(ExecutionError::Timeout { timeout_secs }) => (
+                "timeout",
+                format!("colab_mcp_tool_call timeout after {timeout_secs}s"),
+            ),
+            Err(e) => ("failed", format!("Error: {e}")),
+        };
+
+        if let Err(e) = write_mcp_call_journal(McpCallJournalParams {
+            workspace_dir: &workspace_dir,
+            provider_id: &provider_id,
+            session_id: p.sid,
+            call_id: p.call_id,
+            tool_name: p.tool_name,
+            arguments: p.arguments,
+            started_rfc3339: p.started_ts,
+            finished_rfc3339: &finished_ts,
+            duration_ms,
+            status,
+            auto_promoted: p.auto_promoted,
+            job_id: p.job_id,
+            description: p.description,
+            result: &result_text,
+        })
+        .await
+        {
+            log::warn!("colab_mcp_tool_call journal: {e}");
+        }
+        if let Err(e) = append_mcp_call_manifest(
+            &workspace_dir,
+            McpCallManifestLine {
+                ts: &finished_ts,
+                chat_id: p.chat_id,
+                channel: p.channel,
+                provider_id: &provider_id,
+                session_id: &p.sid.to_string(),
+                call_id: p.call_id,
+                tool_name: p.tool_name,
+                status,
+                duration_ms,
+                auto_promoted: p.auto_promoted,
+                job_id: p.job_id,
+                description: p.description,
+                result_len: result_text.len(),
+            },
         )
         .await
-        .map_err(|_| format!("colab_mcp_tool_call timed out after {timeout_secs}s"))?
-        .map_err(exec_err)?;
-        let s = serde_json::to_string(&out).map_err(|e| e.to_string())?;
-        Ok(cap_mcp_tool_json_text(s, self.max_result_chars))
+        {
+            log::warn!("colab_mcp_tool_call manifest: {e}");
+        }
+
+        match p.outcome {
+            Ok(rr) => Ok(cap_mcp_tool_json_text(rr.stdout, self.max_result_chars)),
+            Err(e) => Err(exec_err(e)),
+        }
     }
 }
 
@@ -821,8 +1242,17 @@ impl Tool for ExecutionEnvInfoTool {
             "timeout_policy": timeout_policy,
         });
         if self.harness.colab_mcp().is_some() {
+            let auto_promote = self.harness.auto_promote_after_secs;
             v["colab_mcp"] = json!({
-                "note": "When [harness.execution.colab_mcp] extra_mcp_tool_call_enabled = true and extra_mcp_tool_allowlist is set, tool colab_mcp_tool_call is registered for allowlisted MCP tools."
+                "note": "When [harness.execution.colab_mcp] extra_mcp_tool_call_enabled = true and extra_mcp_tool_allowlist is set, tool colab_mcp_tool_call is registered for allowlisted MCP tools.",
+                "colab_mcp_tool_call_default_timeout_secs": def_timeout,
+                "auto_promote_after_secs": auto_promote,
+                "colab_mcp_tool_call_timeout_hint": format!(
+                    "colab_mcp_tool_call wraps a single MCP tools/call; omitting timeout_secs defaults to default_run_timeout_secs ({def_timeout}, capped by max_wall_secs). Calls that exceed auto_promote_after_secs ({auto_promote}) auto-promote to a background job and return a job_id envelope you can poll with execution_job_status / execution_job_result."
+                ),
+                "execution_run_timeout_hint": "execution_run maps to add_code_cell + run_code_cell in notebook mode; both steps share the run's timeout_secs. Set timeout_secs high for training. Colab's browser-side run_code_cell may still enforce its own cap (see tool result / tmp_colab_mcp_probe.py --dump-schemas). Long runs auto-promote to a background job using the same auto_promote_after_secs bound.",
+                "cancel_semantics": "execution_job_cancel and execution_cancel are best-effort for colab_mcp: the local wait is dropped immediately, but the Colab cell may keep running on Google's side until it finishes naturally. cancel_kind=\"abort\" in the job status payload signals this.",
+                "upstream_probe": "tmp_colab_mcp_probe.py documents MCP vs Colab timeouts and can dump live run_code_cell inputSchema."
             });
         }
         let probe = tokio::task::spawn_blocking({
@@ -889,6 +1319,7 @@ mod tests {
             ArtifactLimits::default(),
             60,
             3600,
+            0,
         ));
         let create = ExecutionSessionCreateTool {
             harness: harness.clone(),
@@ -904,6 +1335,8 @@ mod tests {
         let run = ExecutionRunTool {
             harness: harness.clone(),
             outbound_tx: otx,
+            jobs: None,
+            inflight: None,
         };
         let code = if cfg!(windows) {
             "echo ok-tool"
@@ -939,6 +1372,7 @@ mod tests {
             ArtifactLimits::default(),
             60,
             3600,
+            0,
         ));
         let create = ExecutionSessionCreateTool {
             harness: harness.clone(),
@@ -1003,6 +1437,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execution_run_auto_promotes_when_bound_smaller_than_runtime() {
+        let (ws, dir) = temp_dirs();
+        let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), true);
+        let prov: Arc<dyn crate::execution::ExecutionProvider> =
+            Arc::new(crate::execution::LocalExecutionProvider::new(cfg).expect("local provider"));
+        let harness = Arc::new(ExecutionHarness::new(
+            prov,
+            "python",
+            ws.clone(),
+            dir.clone(),
+            ArtifactLimits::default(),
+            60,
+            3600,
+            // Tight 1s auto-promote bound so any 5s+ run is forced into the background.
+            1,
+        ));
+        let create = ExecutionSessionCreateTool {
+            harness: harness.clone(),
+        };
+        let lang = if cfg!(windows) { "shell" } else { "python" };
+        let out = create
+            .execute(json!({ "language": lang }))
+            .await
+            .expect("create");
+        let v: Value = serde_json::from_str(&out).expect("json");
+        let sid = v["session_id"].as_str().expect("session id");
+        let (otx, _orx) = mpsc::channel::<BusMessage>(64);
+        let jobs = Arc::new(ExecutionJobManager::new(harness.clone(), otx.clone()));
+        let inflight = Arc::new(InflightSyncRegistry::new());
+        let run = ExecutionRunTool {
+            harness: harness.clone(),
+            outbound_tx: otx,
+            jobs: Some(jobs.clone()),
+            inflight: Some(inflight.clone()),
+        };
+        let code = if cfg!(windows) {
+            "ping 127.0.0.1 -n 6 >nul"
+        } else {
+            "import time\ntime.sleep(5)\nprint('done')"
+        };
+        let res = crate::tool_runtime::with_tool_exec_scope(
+            crate::tool_runtime::ToolExecCtx::new("terminal", "auto-promote-chat", None),
+            async {
+                run.execute(json!({
+                    "session_id": sid,
+                    "code": code,
+                    "timeout_secs": 60,
+                    "description": "auto-promote-test",
+                }))
+                .await
+            },
+        )
+        .await
+        .expect("run");
+        let envelope: Value = serde_json::from_str(&res).expect("envelope is JSON");
+        assert_eq!(envelope["auto_promoted"].as_bool(), Some(true), "out={res}");
+        assert_eq!(
+            envelope["reason"].as_str(),
+            Some("auto_promote_after_secs"),
+            "out={res}"
+        );
+        let jid = envelope["job_id"]
+            .as_str()
+            .expect("job_id missing in envelope");
+        // Drain the spawned job so the test does not leave background work running.
+        for _ in 0..200 {
+            let st = ExecutionJobStatusTool { jobs: jobs.clone() };
+            let s = st.execute(json!({ "job_id": jid })).await.expect("st");
+            if s.contains("\"terminal\": true") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let close = ExecutionSessionCloseTool { harness };
+        close.execute(json!({ "session_id": sid })).await.unwrap();
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
     async fn execution_env_info_includes_timeout_caps() {
         let (ws, dir) = temp_dirs();
         let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), true);
@@ -1016,6 +1529,7 @@ mod tests {
             ArtifactLimits::default(),
             90,
             1200,
+            0,
         ));
         let env = ExecutionEnvInfoTool { harness };
         let out = env.execute(json!({})).await.expect("env");
@@ -1042,6 +1556,7 @@ mod tests {
             ArtifactLimits::default(),
             60,
             3600,
+            0,
         ));
         let create = ExecutionSessionCreateTool {
             harness: harness.clone(),
@@ -1106,6 +1621,7 @@ mod tests {
             ArtifactLimits::default(),
             60,
             3600,
+            0,
         ));
         let create = ExecutionSessionCreateTool {
             harness: harness.clone(),
@@ -1206,6 +1722,8 @@ connect_tool_name = "open_colab_browser_connection"
         let run = ExecutionRunTool {
             harness: harness.clone(),
             outbound_tx: otx,
+            jobs: None,
+            inflight: None,
         };
         let out = run
             .execute(json!({

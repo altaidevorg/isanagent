@@ -28,9 +28,12 @@ pub struct ExecutionHarness {
     pub default_run_timeout_secs: u64,
     /// Upper bound for per-run `timeout_secs` from `[harness.execution] max_wall_secs`.
     pub max_wall_secs: u64,
+    /// Short bound after which a synchronous run auto-promotes to a background job (`0` disables).
+    pub auto_promote_after_secs: u64,
 }
 
 impl ExecutionHarness {
+    #[allow(clippy::too_many_arguments)] // Constructor matches harness config surface area.
     pub fn new(
         provider: Arc<dyn ExecutionProvider>,
         python_executable: impl Into<String>,
@@ -39,6 +42,7 @@ impl ExecutionHarness {
         artifact_limits: ArtifactLimits,
         default_run_timeout_secs: u64,
         max_wall_secs: u64,
+        auto_promote_after_secs: u64,
     ) -> Self {
         Self {
             provider,
@@ -49,10 +53,12 @@ impl ExecutionHarness {
             artifact_limits,
             default_run_timeout_secs,
             max_wall_secs,
+            auto_promote_after_secs,
         }
     }
 
     /// Colab MCP harness only (`default_provider = "colab_mcp"`).
+    #[allow(clippy::too_many_arguments)] // Constructor matches harness config surface area.
     pub fn new_colab_mcp(
         colab: Arc<ColabMcpExecutionProvider>,
         python_executable: impl Into<String>,
@@ -61,6 +67,7 @@ impl ExecutionHarness {
         artifact_limits: ArtifactLimits,
         default_run_timeout_secs: u64,
         max_wall_secs: u64,
+        auto_promote_after_secs: u64,
     ) -> Self {
         let provider: Arc<dyn ExecutionProvider> = colab.clone();
         Self {
@@ -72,6 +79,7 @@ impl ExecutionHarness {
             artifact_limits,
             default_run_timeout_secs,
             max_wall_secs,
+            auto_promote_after_secs,
         }
     }
 
@@ -176,6 +184,7 @@ pub fn build_execution_harness(
                 artifact_limits,
                 config.execution_default_run_timeout_secs(),
                 config.execution_max_wall_secs(),
+                config.execution_auto_promote_after_secs(),
             )))
         }
         "jupyter" => {
@@ -205,6 +214,7 @@ pub fn build_execution_harness(
                 artifact_limits,
                 config.execution_default_run_timeout_secs(),
                 config.execution_max_wall_secs(),
+                config.execution_auto_promote_after_secs(),
             )))
         }
         "ssh" => {
@@ -239,6 +249,7 @@ pub fn build_execution_harness(
                 artifact_limits,
                 config.execution_default_run_timeout_secs(),
                 config.execution_max_wall_secs(),
+                config.execution_auto_promote_after_secs(),
             )))
         }
         "colab_mcp" => {
@@ -264,6 +275,7 @@ pub fn build_execution_harness(
                 artifact_limits,
                 config.execution_default_run_timeout_secs(),
                 config.execution_max_wall_secs(),
+                config.execution_auto_promote_after_secs(),
             )))
         }
         other => Err(format!(

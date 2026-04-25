@@ -23,14 +23,15 @@ use crate::bus::{BusMessage, InboundMessage, OutboundMessage};
 use crate::channels::terminal_ui::attachments::parse_terminal_attachments;
 use crate::channels::terminal_ui::markdown;
 use crate::channels::terminal_ui::protocol::{
-    ISANAGENT_AGENT_THOUGHT, ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_STREAM,
-    ISANAGENT_TERMINAL_ERROR, METADATA_EXECUTION_DESCRIPTION, METADATA_EXECUTION_JOB_ID,
+    ISANAGENT_AGENT_THOUGHT, ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_JOB_STARTED,
+    ISANAGENT_EXECUTION_STREAM, ISANAGENT_TERMINAL_ERROR, METADATA_EXECUTION_DESCRIPTION,
+    METADATA_EXECUTION_JOB_ID, METADATA_EXECUTION_JOB_STATUS, METADATA_EXECUTION_JOB_TOOL_NAME,
     METADATA_EXECUTION_RUN_ID, METADATA_EXECUTION_SESSION_ID, METADATA_TOOL_CALL_PREVIEW,
     METADATA_TOOL_NAME, METADATA_TOOL_RESULT_PREVIEW,
 };
 use crate::channels::terminal_ui::{
-    init_from_env, uses_ansi_color, App, Cell, TerminalUiFocus, Theme, ToastKind, ToolNoticePhase,
-    ToolRailEntry,
+    init_from_env, uses_ansi_color, App, Cell, JobStripStatus, TerminalUiFocus, Theme, ToastKind,
+    ToolNoticePhase, ToolRailEntry,
 };
 use crate::clarification::{METADATA_CLARIFICATION, METADATA_CLARIFICATION_CHOICES};
 
@@ -70,6 +71,7 @@ const TERMINAL_HELP: &str = r#"Commands (leading slash):
   /copy          Copy the last assistant reply to the clipboard
   /install-python Install uv (best effort) in the background; UI stays responsive
   /cancel, /stop Stop the in-flight reply for this chat (drops queued prompts)
+  /background, /bg Promote the in-flight execution_run / colab_mcp_tool_call to a background job
   /tools         Open the tool activity pane (same as Tab)
   /help, /?      Show this help
 
@@ -453,6 +455,93 @@ fn truncate_chars_display(s: &str, max: usize) -> String {
     }
 }
 
+/// Build one line per job in the multi-job strip, plus an optional Jupyter-stream tail
+/// (the latest line of `execution_stream_recent`) so single-stream UX is preserved when
+/// there are no Colab jobs racing.
+fn jobs_strip_lines(app: &App, max_width: usize, include_stream_tail: bool) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    if include_stream_tail {
+        if let Some(last) = app
+            .execution_stream_recent
+            .lines()
+            .filter(|s| !s.trim().is_empty())
+            .next_back()
+        {
+            let label = app
+                .execution_stream_label
+                .as_ref()
+                .map(|(_, sub)| sub.as_str())
+                .unwrap_or("jupyter");
+            out.push(job_strip_line(
+                "·",
+                label,
+                Some("(stream)"),
+                last,
+                None,
+                max_width,
+                Theme::tool_call(),
+            ));
+        }
+    }
+    for entry in app.jobs_strip.iter() {
+        let style = match entry.status {
+            JobStripStatus::Running => Theme::tool_call(),
+            JobStripStatus::Completed => Theme::dim(),
+            JobStripStatus::Failed | JobStripStatus::Timeout => Theme::input_prompt(),
+            JobStripStatus::Cancelled => Theme::dim(),
+        };
+        let age = entry.started_at.elapsed();
+        out.push(job_strip_line(
+            entry.status.icon(),
+            &entry.tool_name,
+            entry.description.as_deref(),
+            entry.last_line.as_str(),
+            Some(format_age(age)),
+            max_width,
+            style,
+        ));
+    }
+    out
+}
+
+fn job_strip_line(
+    icon: &str,
+    tool_name: &str,
+    description: Option<&str>,
+    last_line: &str,
+    age: Option<String>,
+    max_width: usize,
+    head_style: ratatui::style::Style,
+) -> Line<'static> {
+    let dim = Theme::dim();
+    let mut head = format!("{icon} {tool_name}");
+    if let Some(d) = description.map(str::trim).filter(|s| !s.is_empty()) {
+        head.push_str(": ");
+        head.push_str(d);
+    }
+    let mut groups: Vec<Vec<Span<'static>>> = Vec::new();
+    groups.push(vec![Span::styled(head, head_style)]);
+    if let Some(a) = age {
+        groups.push(vec![Span::styled(format!("  ·  {a}"), dim)]);
+    }
+    let trimmed = last_line.trim_end();
+    if !trimmed.is_empty() {
+        groups.push(vec![Span::styled(format!("  ·  {trimmed}"), dim)]);
+    }
+    line_from_chunk_groups(groups, max_width)
+}
+
+fn format_age(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
 /// Merge span groups left-to-right until `max_width` would be exceeded; drops trailing groups.
 /// If the first group is wider than `max_width`, truncates its text (first group must be one span).
 fn line_from_chunk_groups(groups: Vec<Vec<Span<'static>>>, max_width: usize) -> Line<'static> {
@@ -515,7 +604,7 @@ fn build_title_line(max_width: usize) -> Line<'static> {
             dim,
         )],
         vec![Span::styled(
-            "· /exit · /new · /copy · /cancel · /tools · /help · Tab · Esc · ↑↓ · wheel · PgUp/PgDn",
+            "· /exit · /new · /copy · /cancel · /background · /tools · /help · Tab · Esc · ↑↓ · wheel · PgUp/PgDn",
             dim,
         )],
     ];
@@ -686,6 +775,51 @@ fn outbound_clears_thinking(msg: &OutboundMessage) -> bool {
         .and_then(|v| v.as_bool())
         == Some(true);
     is_err || is_clar || (!is_thought && !is_tool && !is_exec && !is_exec_job)
+}
+
+fn handle_execution_job_started_notice(app: &mut App, msg: &OutboundMessage) {
+    let jid = msg
+        .metadata
+        .get(METADATA_EXECUTION_JOB_ID)
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if jid.is_empty() {
+        return;
+    }
+    let sid = msg
+        .metadata
+        .get(METADATA_EXECUTION_SESSION_ID)
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let tool = msg
+        .metadata
+        .get(METADATA_EXECUTION_JOB_TOOL_NAME)
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let desc = msg
+        .metadata
+        .get(METADATA_EXECUTION_DESCRIPTION)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+    app.job_strip_started(jid, sid, tool, desc);
+}
+
+fn handle_execution_job_finished_notice(app: &mut App, msg: &OutboundMessage) {
+    let jid = msg
+        .metadata
+        .get(METADATA_EXECUTION_JOB_ID)
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if jid.is_empty() {
+        return;
+    }
+    let status = msg
+        .metadata
+        .get(METADATA_EXECUTION_JOB_STATUS)
+        .and_then(|v| v.as_str())
+        .unwrap_or("completed");
+    let summary = msg.content.trim();
+    app.job_strip_finished(jid, status, summary);
 }
 
 fn append_execution_job_panel(app: &mut App, msg: &OutboundMessage) {
@@ -862,11 +996,29 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         while let Ok(msg) = outbound_rx.try_recv() {
             if msg
                 .metadata
+                .get(ISANAGENT_EXECUTION_JOB_STARTED)
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
+                handle_execution_job_started_notice(&mut app, &msg);
+                continue;
+            }
+            if msg
+                .metadata
                 .get(ISANAGENT_EXECUTION_STREAM)
                 .and_then(|v| v.as_bool())
                 == Some(true)
             {
                 append_execution_stream_panel(&mut app, &msg);
+                if let Some(jid) = msg
+                    .metadata
+                    .get(METADATA_EXECUTION_JOB_ID)
+                    .and_then(|v| v.as_str())
+                {
+                    if let Some(line) = msg.content.lines().last() {
+                        app.job_strip_set_last_line(jid, line);
+                    }
+                }
                 continue;
             }
             if msg
@@ -875,6 +1027,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 .and_then(|v| v.as_bool())
                 == Some(true)
             {
+                handle_execution_job_finished_notice(&mut app, &msg);
                 append_execution_job_panel(&mut app, &msg);
                 continue;
             }
@@ -905,12 +1058,22 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             break;
         }
 
+        // Drop terminal strip rows that are older than the linger window.
+        app.evict_expired_jobs(Duration::from_secs(10));
+
         terminal.draw(|f| {
             let area = f.area();
-            let exec_h = if app.execution_stream_recent.is_empty() {
+            let stream_active = !app.execution_stream_recent.is_empty();
+            let strip_active = !app.jobs_strip.is_empty();
+            let exec_h = if !stream_active && !strip_active {
                 0u16
             } else {
-                (area.height.saturating_mul(18) / 100).clamp(6, 18)
+                let base = (area.height.saturating_mul(18) / 100).clamp(6, 18);
+                if strip_active && !stream_active {
+                    base.min(10)
+                } else {
+                    base
+                }
             };
             let active_strip_h: u16 = 1;
             let ch = layout_chunks(area, exec_h, active_strip_h);
@@ -940,11 +1103,19 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             if exec_h > 0 {
                 let exec_block = Block::default()
                     .borders(Borders::ALL)
-                    .title(Span::styled(" execution (jupyter) ", Theme::tool_call()))
+                    .title(Span::styled(" execution ", Theme::tool_call()))
                     .border_style(Theme::dim());
-                let exec_para = Paragraph::new(Text::raw(app.execution_stream_recent.as_str()))
-                    .block(exec_block);
-                f.render_widget(exec_para, ch[2]);
+                if strip_active {
+                    let inner = exec_block.inner(ch[2]);
+                    f.render_widget(exec_block, ch[2]);
+                    let lines = jobs_strip_lines(&app, inner.width as usize, stream_active);
+                    let para = Paragraph::new(Text::from(lines));
+                    f.render_widget(para, inner);
+                } else {
+                    let exec_para = Paragraph::new(Text::raw(app.execution_stream_recent.as_str()))
+                        .block(exec_block);
+                    f.render_widget(exec_para, ch[2]);
+                }
             }
 
             let status_w_px = ch[3].width as usize;
@@ -1109,9 +1280,27 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             }
                             continue;
                         }
+                        if text.eq_ignore_ascii_case("/background")
+                            || text.eq_ignore_ascii_case("/bg")
+                        {
+                            if bus_tx
+                                .blocking_send(BusMessage::PromoteSyncToBackground(chat_id.clone()))
+                                .is_err()
+                            {
+                                app.cells.push(Cell::System {
+                                    message: "Bus closed; exiting.".into(),
+                                });
+                                app.request_quit();
+                            } else {
+                                app.cells.push(Cell::System {
+                                    message: "Promote-to-background requested. If a sync execution_run / colab_mcp_tool_call is in flight it will return a job_id you can poll with execution_job_status.".into(),
+                                });
+                            }
+                            continue;
+                        }
                         app.cells.push(Cell::System {
                             message:
-                                "Unknown command. Try /help, /exit, /new, /copy, /install-python, /cancel, /tools."
+                                "Unknown command. Try /help, /exit, /new, /copy, /install-python, /cancel, /background, /tools."
                                     .into(),
                         });
                         continue;

@@ -380,4 +380,8 @@ pub enum BusMessage {
     LoggerControl(LoggerControlMessage),
     /// Signal to interrupt an active reasoning loop for a specific chat.
     Cancel(String),
+    /// Signal to promote the current in-flight synchronous tool call (if any) to
+    /// a background `ExecutionJobManager` job for the given chat. Triggered by
+    /// the `/background` slash command.
+    PromoteSyncToBackground(String),
 }
