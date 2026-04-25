@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
+use sha2::Digest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -53,10 +54,24 @@ pub struct LocalExecutionConfig {
     pub python_executable: String,
     /// When true (default), local Python sessions use a persistent REPL; when false, each run is a new process.
     pub python_repl: bool,
+    /// `system` (default) uses host interpreter resolution. `uv_managed` provisions one env and reuses it.
+    pub python_runtime: LocalPythonRuntime,
+    /// UV binary when `python_runtime = uv_managed`.
+    pub uv_binary: String,
+    /// Python version request for `uv venv --python`.
+    pub uv_python: String,
+    /// Optional package specs installed once for the managed env.
+    pub uv_requirements: Vec<String>,
+    /// Root for UV-managed runtime cache (e.g. workspace `.system_generated/uv/envs`).
+    pub uv_env_root: PathBuf,
 }
 
 impl LocalExecutionConfig {
     pub fn new(sandbox_dir: PathBuf, restrict_to_workspace: bool) -> Self {
+        let uv_env_root = sandbox_dir
+            .join(".system_generated")
+            .join("uv")
+            .join("envs");
         Self {
             sandbox_dir,
             restrict_to_workspace,
@@ -65,8 +80,19 @@ impl LocalExecutionConfig {
             max_sessions: 32,
             python_executable: "python".to_string(),
             python_repl: true,
+            python_runtime: LocalPythonRuntime::System,
+            uv_binary: "uv".to_string(),
+            uv_python: "3.11".to_string(),
+            uv_requirements: Vec::new(),
+            uv_env_root,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalPythonRuntime {
+    System,
+    UvManaged,
 }
 
 /// Local process-backed [`ExecutionProvider`].
@@ -74,6 +100,11 @@ pub struct LocalExecutionProvider {
     config: LocalExecutionConfig,
     caps: ProviderCapabilities,
     sessions: DashMap<SessionId, Arc<LocalSession>>,
+    uv_state: Option<Arc<UvManagedState>>,
+}
+
+struct UvManagedState {
+    env_python_path: Mutex<Option<PathBuf>>,
 }
 
 struct LocalSession {
@@ -137,6 +168,62 @@ pub fn build_python_host_command(executable: &str) -> StdCommand {
     StdCommand::new(ex)
 }
 
+/// True when the UV binary is discoverable on PATH.
+pub fn uv_binary_available(uv_binary: &str) -> bool {
+    which::which(uv_binary).is_ok()
+}
+
+/// Best-effort host installation flow for UV (used by startup prompt and `/install-python`).
+pub fn install_uv_best_effort() -> Result<String, String> {
+    if let Ok(path) = which::which("uv") {
+        return Ok(format!("uv already installed at {}", path.display()));
+    }
+    let mut attempts: Vec<(&str, Vec<&str>)> = Vec::new();
+    #[cfg(windows)]
+    {
+        attempts.push(("py", vec!["-m", "pip", "install", "--user", "-U", "uv"]));
+        attempts.push(("python", vec!["-m", "pip", "install", "--user", "-U", "uv"]));
+        attempts.push(("pip", vec!["install", "--user", "-U", "uv"]));
+    }
+    #[cfg(not(windows))]
+    {
+        attempts.push((
+            "python3",
+            vec!["-m", "pip", "install", "--user", "-U", "uv"],
+        ));
+        attempts.push(("python", vec!["-m", "pip", "install", "--user", "-U", "uv"]));
+        attempts.push(("pip3", vec!["install", "--user", "-U", "uv"]));
+        attempts.push(("pip", vec!["install", "--user", "-U", "uv"]));
+    }
+    let mut errors = Vec::new();
+    for (bin, args) in attempts {
+        let out = StdCommand::new(bin).args(&args).output();
+        let Ok(out) = out else {
+            errors.push(format!("{bin}: not found"));
+            continue;
+        };
+        if out.status.success() {
+            if let Ok(path) = which::which("uv") {
+                return Ok(format!("uv installed at {}", path.display()));
+            }
+            return Ok(
+                "uv install command completed; restart shell if PATH not updated yet".to_string(),
+            );
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        errors.push(format!(
+            "{bin} {} (exit {:?}) {}",
+            args.join(" "),
+            out.status.code(),
+            stderr
+        ));
+    }
+    Err(format!(
+        "failed to install uv automatically; tried: {}",
+        errors.join(" | ")
+    ))
+}
+
 impl LocalExecutionProvider {
     pub fn new(config: LocalExecutionConfig) -> Result<Self, ExecutionError> {
         let sandbox = &config.sandbox_dir;
@@ -156,15 +243,96 @@ impl LocalExecutionProvider {
         caps.jupyter_kernel = false;
         caps.network_policy = NetworkPolicy::Off;
         caps.max_output_bytes_default = Some(config.max_output_bytes as u64);
+        let runtime_name = match config.python_runtime {
+            LocalPythonRuntime::System => "system",
+            LocalPythonRuntime::UvManaged => "uv_managed",
+        };
+        caps.extensions.insert(
+            "local_python_runtime".into(),
+            serde_json::Value::String(runtime_name.to_string()),
+        );
+        if matches!(config.python_runtime, LocalPythonRuntime::UvManaged) {
+            caps.extensions.insert(
+                "local_uv_python".into(),
+                serde_json::Value::String(config.uv_python.clone()),
+            );
+            caps.extensions.insert(
+                "local_uv_requirements".into(),
+                serde_json::to_value(&config.uv_requirements)
+                    .unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
+            );
+        }
+
+        let uv_state = if matches!(config.python_runtime, LocalPythonRuntime::UvManaged) {
+            Some(Arc::new(UvManagedState {
+                env_python_path: Mutex::new(None),
+            }))
+        } else {
+            None
+        };
 
         Ok(Self {
             config,
             caps,
             sessions: DashMap::new(),
+            uv_state,
         })
     }
 
-    fn pick_mode(&self, req: &SessionCreateRequest) -> Result<LocalExecMode, ExecutionError> {
+    async fn resolve_python_executable(&self) -> Result<String, ExecutionError> {
+        match self.config.python_runtime {
+            LocalPythonRuntime::System => Ok(self.config.python_executable.clone()),
+            LocalPythonRuntime::UvManaged => {
+                let Some(state) = self.uv_state.as_ref() else {
+                    return Err(ExecutionError::Provider(
+                        "uv runtime state unavailable".to_string(),
+                    ));
+                };
+                let mut slot = state.env_python_path.lock().await;
+                if let Some(p) = slot.as_ref() {
+                    return Ok(p.to_string_lossy().to_string());
+                }
+                tokio::fs::create_dir_all(&self.config.uv_env_root)
+                    .await
+                    .map_err(|e| ExecutionError::Provider(format!("create uv env root: {e}")))?;
+                let env_dir = self
+                    .config
+                    .uv_env_root
+                    .join(compute_uv_env_key(&self.config));
+                tokio::fs::create_dir_all(&env_dir)
+                    .await
+                    .map_err(|e| ExecutionError::Provider(format!("create uv env dir: {e}")))?;
+                let py = uv_env_python_path(&env_dir);
+                if !py.exists() {
+                    run_uv_command(
+                        &self.config.uv_binary,
+                        &[
+                            "venv".to_string(),
+                            "--python".to_string(),
+                            self.config.uv_python.clone(),
+                            env_dir.to_string_lossy().to_string(),
+                        ],
+                        None,
+                    )
+                    .await?;
+                    if !self.config.uv_requirements.is_empty() {
+                        let mut args = vec![
+                            "pip".to_string(),
+                            "install".to_string(),
+                            "--python".to_string(),
+                            py.to_string_lossy().to_string(),
+                        ];
+                        args.extend(self.config.uv_requirements.clone());
+                        run_uv_command(&self.config.uv_binary, &args, None).await?;
+                    }
+                }
+                *slot = Some(py.clone());
+                Ok(py.to_string_lossy().to_string())
+            }
+        }
+    }
+
+    async fn pick_mode(&self, req: &SessionCreateRequest) -> Result<LocalExecMode, ExecutionError> {
         let lang = req
             .language
             .as_deref()
@@ -172,7 +340,7 @@ impl LocalExecutionProvider {
             .filter(|s| !s.is_empty());
         match lang {
             None | Some("python") | Some("py") => Ok(LocalExecMode::Python {
-                executable: self.config.python_executable.clone(),
+                executable: self.resolve_python_executable().await?,
                 repl: self.config.python_repl,
             }),
             Some("shell") | Some("sh") | Some("bash") => Ok(LocalExecMode::Shell),
@@ -195,6 +363,14 @@ impl LocalExecutionProvider {
         let mut ext = std::collections::BTreeMap::new();
         if let LocalExecMode::Python { repl, .. } = mode {
             ext.insert("local_python_repl".into(), serde_json::Value::Bool(*repl));
+            let runtime = match self.config.python_runtime {
+                LocalPythonRuntime::System => "system",
+                LocalPythonRuntime::UvManaged => "uv_managed",
+            };
+            ext.insert(
+                "local_python_runtime".into(),
+                serde_json::Value::String(runtime.to_string()),
+            );
         }
         SessionCapabilities {
             session_id: id.clone(),
@@ -363,7 +539,7 @@ impl ExecutionProvider for LocalExecutionProvider {
             ));
         }
 
-        let mode = self.pick_mode(&req)?;
+        let mode = self.pick_mode(&req).await?;
         let root = resolve_path(
             ".",
             &self.config.sandbox_dir,
@@ -697,6 +873,73 @@ fn string_from_utf8_lossy_trim_cap(bytes: Vec<u8>, max_chars: usize) -> String {
     s
 }
 
+fn compute_uv_env_key(config: &LocalExecutionConfig) -> String {
+    let mut payload = format!(
+        "{}|{}|{}|{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        config.uv_python,
+        env!("CARGO_PKG_VERSION")
+    );
+    if !config.uv_requirements.is_empty() {
+        payload.push('|');
+        payload.push_str(&config.uv_requirements.join(","));
+    }
+    let digest = sha2::Sha256::digest(payload.as_bytes());
+    hex::encode(digest)
+}
+
+fn uv_env_python_path(env_dir: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        env_dir.join("Scripts").join("python.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        env_dir.join("bin").join("python")
+    }
+}
+
+async fn run_uv_command(
+    uv_binary: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+) -> Result<(), ExecutionError> {
+    let uv_binary = uv_binary.to_string();
+    let args = args.to_vec();
+    let cwd = cwd.map(Path::to_path_buf);
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = StdCommand::new(uv_binary);
+        cmd.args(&args);
+        if let Some(cwd) = cwd.as_ref() {
+            cmd.current_dir(cwd);
+        }
+        cmd.stdin(Stdio::null());
+        let out = cmd
+            .output()
+            .map_err(|e| ExecutionError::Provider(format!("failed to start uv: {e}")))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        Err(ExecutionError::Provider(format!(
+            "uv command failed (status {:?}): {}{}",
+            out.status.code(),
+            if stderr.is_empty() { "" } else { &stderr },
+            if stdout.is_empty() {
+                "".to_string()
+            } else if stderr.is_empty() {
+                format!(" stdout={stdout}")
+            } else {
+                format!("; stdout={stdout}")
+            }
+        )))
+    })
+    .await
+    .map_err(|e| ExecutionError::Provider(format!("uv task join error: {e}")))?
+}
+
 /// Returns the command and optional stdin payload (UTF-8 source) when the interpreter reads code
 /// from stdin instead of argv.
 fn build_command(
@@ -962,6 +1205,22 @@ mod tests {
             "{r2:?}"
         );
         prov.close_session(&h.id).await.unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn uv_env_key_changes_with_python_or_requirements() {
+        let dir = temp_sandbox();
+        let mut cfg1 = LocalExecutionConfig::new(dir.clone(), true);
+        cfg1.python_runtime = LocalPythonRuntime::UvManaged;
+        cfg1.uv_python = "3.11".into();
+        cfg1.uv_requirements = vec!["numpy".into()];
+        let mut cfg2 = cfg1.clone();
+        cfg2.uv_python = "3.12".into();
+        let mut cfg3 = cfg1.clone();
+        cfg3.uv_requirements = vec!["numpy".into(), "pandas".into()];
+        assert_ne!(compute_uv_env_key(&cfg1), compute_uv_env_key(&cfg2));
+        assert_ne!(compute_uv_env_key(&cfg1), compute_uv_env_key(&cfg3));
         let _ = fs::remove_dir_all(&dir);
     }
 }

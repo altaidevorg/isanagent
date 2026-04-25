@@ -68,6 +68,7 @@ const TERMINAL_HELP: &str = r#"Commands (leading slash):
   /exit, /quit   Quit and restore the terminal
   /new           Start a new session (new chat id)
   /copy          Copy the last assistant reply to the clipboard
+  /install-python Install uv (best effort) in the background; UI stays responsive
   /cancel, /stop Stop the in-flight reply for this chat (drops queued prompts)
   /tools         Open the tool activity pane (same as Tab)
   /help, /?      Show this help
@@ -828,12 +829,35 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         message: session_banner,
     });
 
+    // Result of a background `install_uv_best_effort` started from `/install-python`.
+    let mut uv_install_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>> = None;
+
     let tick = Duration::from_millis(80);
     let max_transcript_scroll_holder = std::cell::Cell::new(0u16);
     let max_tool_history_scroll_holder = std::cell::Cell::new(0u16);
 
     loop {
         app.clear_expired_toast();
+
+        if let Some(ref rx) = uv_install_rx {
+            match rx.try_recv() {
+                Ok(Ok(msg)) => {
+                    uv_install_rx = None;
+                    app.cells.push(Cell::System { message: msg });
+                }
+                Ok(Err(err)) => {
+                    uv_install_rx = None;
+                    app.cells.push(Cell::Error { message: err });
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    uv_install_rx = None;
+                    app.cells.push(Cell::System {
+                        message: "uv install finished (no result message).".into(),
+                    });
+                }
+            }
+        }
 
         while let Ok(msg) = outbound_rx.try_recv() {
             if msg
@@ -1033,6 +1057,28 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             }
                             continue;
                         }
+                        if text.eq_ignore_ascii_case("/install-python") {
+                            if uv_install_rx.is_some() {
+                                app.set_toast(
+                                    ToastKind::Err,
+                                    "uv install already running".into(),
+                                    Duration::from_secs(4),
+                                );
+                                continue;
+                            }
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            uv_install_rx = Some(rx);
+                            std::thread::spawn(move || {
+                                let out = crate::execution::install_uv_best_effort();
+                                let _ = tx.send(out);
+                            });
+                            app.set_toast(
+                                ToastKind::Ok,
+                                "Installing uv in the background…".into(),
+                                Duration::from_secs(5),
+                            );
+                            continue;
+                        }
                         if text.eq_ignore_ascii_case("/help") || text.eq_ignore_ascii_case("/?") {
                             app.cells.push(Cell::System {
                                 message: TERMINAL_HELP.trim().to_string(),
@@ -1065,7 +1111,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         }
                         app.cells.push(Cell::System {
                             message:
-                                "Unknown command. Try /help, /exit, /new, /copy, /cancel, /tools."
+                                "Unknown command. Try /help, /exit, /new, /copy, /install-python, /cancel, /tools."
                                     .into(),
                         });
                         continue;

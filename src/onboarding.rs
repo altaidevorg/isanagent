@@ -711,20 +711,20 @@ mod tests {
             "expected jina section comment from template"
         );
         assert!(
-            s.contains("# When default_provider = \"jupyter\""),
-            "expected harness jupyter comment from template"
+            s.contains("# Execution: docs/execution-user-guide.md"),
+            "expected harness execution pointer comment from template"
         );
         assert!(
             s.contains("# cancel_children_on_parent_cancel"),
             "expected subagents optional key as comment"
         );
         assert!(
-            s.contains("# default_provider = \"local\""),
-            "expected execution default_provider as comment"
+            s.contains("default_provider = \"colab_mcp\""),
+            "expected execution default_provider from template"
         );
         assert!(
-            s.contains("# max_wall_secs = 3600"),
-            "expected execution max_wall_secs as comment"
+            s.contains("[harness.execution.jupyter]"),
+            "expected jupyter subsection from template"
         );
         assert!(
             s.contains("[harness.ml_engineer]") || s.contains("harness.ml_engineer"),

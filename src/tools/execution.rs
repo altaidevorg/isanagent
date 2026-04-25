@@ -1,9 +1,10 @@
-//! Gated harness tools for the execution plane (`[harness.execution] enabled = true`).
+//! Harness tools for the execution plane (omitted unless `AppConfig::execution_harness_enabled()` is false).
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use log::info;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -21,6 +22,33 @@ use crate::traits::Tool;
 
 fn exec_err(e: ExecutionError) -> String {
     e.to_string()
+}
+
+/// Build a glob set for `[harness.execution.colab_mcp].extra_mcp_tool_allowlist`.
+pub fn compile_colab_mcp_tool_allowlist(patterns: &[String]) -> Result<GlobSet, String> {
+    let mut builder = GlobSetBuilder::new();
+    for p in patterns {
+        let t = p.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let g = Glob::new(t).map_err(|e| format!("invalid glob {p:?}: {e}"))?;
+        builder.add(g);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("allowlist glob set error: {e}"))
+}
+
+fn cap_mcp_tool_json_text(s: String, max: usize) -> String {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n... (truncated)", &s[..end])
 }
 
 fn require_session_id(args: &Value) -> Result<SessionId, String> {
@@ -89,7 +117,7 @@ impl Tool for ExecutionSessionCreateTool {
     }
 
     fn description(&self) -> &str {
-        "Create an execution session (requires [harness.execution] enabled). Provider is [harness.execution] default_provider: local runs under the workspace sandbox; jupyter uses a Jupyter Server kernel (new or `resume_jupyter_kernel_id`); ssh opens one SSH session to a configured host (reused until execution_session_close). Returns session_id, session capabilities (Jupyter extensions include `jupyter_kernel_id` and optional `jupyter_notebook_sync_path`), and a short provider capability summary. Use execution_run or execution_run_background to execute code; execution_session_close when done. Jupyter may write binary display_data under the sandbox `.execution_artifacts/{session_id}/{run_id}/` and list them in RunResult.attachments."
+        "Create an execution session (requires [harness.execution] enabled). Provider is [harness.execution] default_provider: local runs under the workspace sandbox; jupyter uses a Jupyter Server kernel (new or `resume_jupyter_kernel_id`); ssh opens one SSH session to a configured host (reused until execution_session_close); colab_mcp launches a local Colab MCP bridge process and targets a notebook execution tool exposed by the browser session. Returns session_id, session capabilities, and a short provider capability summary. Use execution_run or execution_run_background to execute code; execution_session_close when done. Jupyter may write binary display_data under the sandbox `.execution_artifacts/{session_id}/{run_id}/` and list them in RunResult.attachments."
     }
 
     fn parameters(&self) -> Value {
@@ -99,7 +127,7 @@ impl Tool for ExecutionSessionCreateTool {
                 "label": { "type": "string", "description": "Optional label for logs" },
                 "language": {
                     "type": "string",
-                    "description": "Optional language hint. Local: python, py, shell, sh, bash. Jupyter: python, py, r, R (ir kernel). SSH: python, py, shell, sh, bash (remote exec with code on stdin)."
+                    "description": "Optional language hint. Local: python, py, shell, sh, bash. Jupyter: python, py, r, R (ir kernel). SSH: python, py, shell, sh, bash (remote exec with code on stdin). Colab MCP MVP currently expects python."
                 },
                 "resume_jupyter_kernel_id": {
                     "type": "string",
@@ -666,6 +694,87 @@ impl Tool for ExecutionSessionCloseTool {
     }
 }
 
+/// Call an allowlisted MCP tool on an existing Colab MCP execution session (`default_provider = colab_mcp`).
+pub struct ColabMcpToolCallTool {
+    pub harness: Arc<ExecutionHarness>,
+    pub allowlist: GlobSet,
+    pub max_result_chars: usize,
+}
+
+#[async_trait]
+impl Tool for ColabMcpToolCallTool {
+    fn name(&self) -> &str {
+        "colab_mcp_tool_call"
+    }
+
+    fn description(&self) -> &str {
+        "Colab MCP only: invoke a proxied MCP tool in the connected browser session. `tool_name` must match a pattern in `[harness.execution.colab_mcp].extra_mcp_tool_allowlist`. Use `list_cached_tool_names: true` to list tool names from the last `tools/list` (refreshed when the server sends `notifications/tools/list_changed`). Prefer `execution_run` for Python code cells."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "session_id": { "type": "string" },
+                "tool_name": { "type": "string", "description": "MCP tool name from tools/list" },
+                "arguments": { "type": "object", "description": "MCP tool arguments (JSON object)" },
+                "list_cached_tool_names": { "type": "boolean", "description": "If true, return cached tool names only" },
+                "timeout_secs": { "type": "integer", "description": "Wall clock for the MCP call (default 120, capped by max_wall_secs)" }
+            },
+            "required": ["session_id"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, String> {
+        let cm = self.harness.colab_mcp().ok_or_else(|| {
+            "colab_mcp_tool_call requires [harness.execution] default_provider = \"colab_mcp\""
+                .to_string()
+        })?;
+        let sid = require_session_id(&args)?;
+        if args.get("list_cached_tool_names").and_then(|v| v.as_bool()) == Some(true) {
+            let names = cm
+                .list_cached_mcp_tool_names(&sid)
+                .await
+                .map_err(exec_err)?;
+            return serde_json::to_string_pretty(&json!({ "cached_tool_names": names }))
+                .map_err(|e| e.to_string());
+        }
+        let tool_name = args
+            .get("tool_name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing tool_name (or set list_cached_tool_names: true)".to_string())?;
+        let tool_name = tool_name.trim();
+        if tool_name.is_empty() {
+            return Err("tool_name must be non-empty".to_string());
+        }
+        if !self.allowlist.is_match(tool_name) {
+            return Err(format!(
+                "tool_name {tool_name:?} does not match any pattern in extra_mcp_tool_allowlist"
+            ));
+        }
+        let arguments = args
+            .get("arguments")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let cap_secs = self.harness.max_wall_secs.max(1);
+        let timeout_secs = args
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(120)
+            .clamp(1, cap_secs);
+        let out = tokio::time::timeout(
+            Duration::from_secs(timeout_secs),
+            cm.call_mcp_tool_raw(&sid, tool_name, arguments),
+        )
+        .await
+        .map_err(|_| format!("colab_mcp_tool_call timed out after {timeout_secs}s"))?
+        .map_err(exec_err)?;
+        let s = serde_json::to_string(&out).map_err(|e| e.to_string())?;
+        Ok(cap_mcp_tool_json_text(s, self.max_result_chars))
+    }
+}
+
 /// Host-oriented snapshot (capabilities + optional python -V).
 pub struct ExecutionEnvInfoTool {
     pub harness: Arc<ExecutionHarness>,
@@ -711,6 +820,11 @@ impl Tool for ExecutionEnvInfoTool {
             "default_run_timeout_secs": def_timeout,
             "timeout_policy": timeout_policy,
         });
+        if self.harness.colab_mcp().is_some() {
+            v["colab_mcp"] = json!({
+                "note": "When [harness.execution.colab_mcp] extra_mcp_tool_call_enabled = true and extra_mcp_tool_allowlist is set, tool colab_mcp_tool_call is registered for allowlisted MCP tools."
+            });
+        }
         let probe = tokio::task::spawn_blocking({
             let exe = exe.to_string();
             move || {
@@ -742,6 +856,16 @@ mod tests {
     use crate::execution::ArtifactLimits;
     use crate::execution::ExecutionJobManager;
     use std::time::Duration;
+
+    #[test]
+    fn colab_mcp_allowlist_globset_matches() {
+        let gs =
+            compile_colab_mcp_tool_allowlist(&["mount_*".to_string(), "exact_tool".to_string()])
+                .expect("globset");
+        assert!(gs.is_match("mount_drive"));
+        assert!(gs.is_match("exact_tool"));
+        assert!(!gs.is_match("other_tool"));
+    }
 
     fn temp_dirs() -> (std::path::PathBuf, std::path::PathBuf) {
         let root =
@@ -1034,6 +1158,68 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
         assert!(saw, "expected terminal non-success after cancel");
+        let close = ExecutionSessionCloseTool { harness };
+        close.execute(json!({ "session_id": sid })).await.unwrap();
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// Live Colab MCP smoke for execution tools. Requires:
+    /// - Browser connected via colab-mcp
+    /// - `uvx` available on PATH
+    /// Run manually:
+    /// `cargo test --release -p isanagent colab_mcp_live_execution_roundtrip -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn colab_mcp_live_execution_roundtrip() {
+        let (ws, dir) = temp_dirs();
+        let cfg_toml = r#"
+[harness.execution]
+enabled = true
+default_provider = "colab_mcp"
+allowed_providers = ["colab_mcp"]
+max_wall_secs = 180
+max_output_bytes = 262144
+max_sessions = 2
+
+[harness.execution.colab_mcp]
+command = "uvx"
+args = ["git+https://github.com/googlecolab/colab-mcp"]
+startup_timeout_secs = 60
+connect_tool_name = "open_colab_browser_connection"
+"#;
+        let app_cfg: crate::config::AppConfig = toml::from_str(cfg_toml).expect("parse config");
+        let harness =
+            crate::execution::build_execution_harness(ws.clone(), dir.clone(), true, &app_cfg)
+                .expect("build colab harness");
+
+        let create = ExecutionSessionCreateTool {
+            harness: harness.clone(),
+        };
+        let created = create
+            .execute(json!({ "language": "python" }))
+            .await
+            .expect("create session");
+        let cv: Value = serde_json::from_str(&created).expect("json create");
+        let sid = cv["session_id"].as_str().expect("session id").to_string();
+
+        let (otx, _orx) = mpsc::channel::<BusMessage>(8);
+        let run = ExecutionRunTool {
+            harness: harness.clone(),
+            outbound_tx: otx,
+        };
+        let out = run
+            .execute(json!({
+                "session_id": sid,
+                "code": "print('isanagent-colab-smoke')",
+                "timeout_secs": 120
+            }))
+            .await
+            .expect("run");
+        assert!(
+            out.to_ascii_lowercase().contains("isanagent-colab-smoke"),
+            "unexpected output: {out}"
+        );
+
         let close = ExecutionSessionCloseTool { harness };
         close.execute(json!({ "session_id": sid })).await.unwrap();
         let _ = std::fs::remove_dir_all(&ws);

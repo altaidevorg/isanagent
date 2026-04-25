@@ -13,7 +13,7 @@ Use this playbook whenever you are writing or running analysis code, plots, tabl
 
 ## Before you run anything
 
-1. Call **`execution_env_info`** once. Note `default_provider`, `max_output_bytes`, **`max_wall_secs`**, **`default_run_timeout_secs`**, **`timeout_policy`**, and artifact caps. If execution is disabled, stop and tell the user to enable **`[harness.execution] enabled`**—do not invent a workaround.
+1. Call **`execution_env_info`** once. Note `default_provider`, `max_output_bytes`, **`max_wall_secs`**, **`default_run_timeout_secs`**, **`timeout_policy`**, and artifact caps. If execution is disabled in config.toml (`[harness.execution] enabled = false`), stop and tell the user to turn it back on—do not invent a workaround.
 2. Plan for **stdout/stderr caps**: each stream gets roughly half of `max_output_bytes` (with a floor). Large prints truncate; design outputs accordingly.
 
 ## Session lifecycle (strict order)

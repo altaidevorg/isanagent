@@ -8,15 +8,18 @@ use serde_json::{json, Value};
 use crate::config::AppConfig;
 
 use super::artifacts::ArtifactLimits;
+use super::colab_mcp::{ColabMcpExecutionProvider, ColabMcpExecutionProviderConfig};
 use super::error::ExecutionError;
 use super::jupyter::{JupyterExecutionProvider, JupyterExecutionProviderConfig};
-use super::local::{LocalExecutionConfig, LocalExecutionProvider};
+use super::local::{LocalExecutionConfig, LocalExecutionProvider, LocalPythonRuntime};
 use super::provider::ExecutionProvider;
 use super::ssh::{SshExecutionProvider, SshExecutionProviderConfig};
 
 /// Owns the active [`ExecutionProvider`] and small bits of host config tools need (e.g. `-V` probe).
 pub struct ExecutionHarness {
     provider: Arc<dyn ExecutionProvider>,
+    /// Set when `default_provider = "colab_mcp"`: typed access for `colab_mcp_tool_call` and catalog refresh.
+    colab_mcp: Option<Arc<ColabMcpExecutionProvider>>,
     python_executable: String,
     workspace_dir: PathBuf,
     sandbox_dir: PathBuf,
@@ -39,6 +42,7 @@ impl ExecutionHarness {
     ) -> Self {
         Self {
             provider,
+            colab_mcp: None,
             python_executable: python_executable.into(),
             workspace_dir,
             sandbox_dir,
@@ -46,6 +50,33 @@ impl ExecutionHarness {
             default_run_timeout_secs,
             max_wall_secs,
         }
+    }
+
+    /// Colab MCP harness only (`default_provider = "colab_mcp"`).
+    pub fn new_colab_mcp(
+        colab: Arc<ColabMcpExecutionProvider>,
+        python_executable: impl Into<String>,
+        workspace_dir: PathBuf,
+        sandbox_dir: PathBuf,
+        artifact_limits: ArtifactLimits,
+        default_run_timeout_secs: u64,
+        max_wall_secs: u64,
+    ) -> Self {
+        let provider: Arc<dyn ExecutionProvider> = colab.clone();
+        Self {
+            provider,
+            colab_mcp: Some(colab),
+            python_executable: python_executable.into(),
+            workspace_dir,
+            sandbox_dir,
+            artifact_limits,
+            default_run_timeout_secs,
+            max_wall_secs,
+        }
+    }
+
+    pub fn colab_mcp(&self) -> Option<&Arc<ColabMcpExecutionProvider>> {
+        self.colab_mcp.as_ref()
     }
 
     pub fn provider(&self) -> &Arc<dyn ExecutionProvider> {
@@ -87,7 +118,7 @@ impl ExecutionHarness {
     }
 }
 
-/// Build the harness from workspace + app config. Call only when `[harness.execution] enabled = true`.
+/// Build the harness from workspace + app config. Call only when `AppConfig::execution_harness_enabled()` is true.
 pub fn build_execution_harness(
     workspace_dir: PathBuf,
     sandbox_dir: PathBuf,
@@ -107,19 +138,39 @@ pub fn build_execution_harness(
     };
     match pid.as_str() {
         "local" => {
+            let runtime = match config.execution_local_python_runtime().as_str() {
+                "uv_managed" | "uvmanaged" | "uv" => LocalPythonRuntime::UvManaged,
+                _ => LocalPythonRuntime::System,
+            };
+            let python_executable = match runtime {
+                LocalPythonRuntime::System => config
+                    .execution_python_executable_configured()
+                    .ok_or_else(|| {
+                        "[harness.execution].python_executable is required when local_python_runtime = \"system\"".to_string()
+                    })?,
+                LocalPythonRuntime::UvManaged => config.execution_python_executable(),
+            };
             let lc = LocalExecutionConfig {
                 sandbox_dir: sandbox_dir.clone(),
                 restrict_to_workspace,
                 max_run_timeout_secs: config.execution_max_wall_secs(),
                 max_output_bytes: config.execution_max_output_bytes(),
                 max_sessions: config.execution_max_sessions(),
-                python_executable: config.execution_python_executable(),
+                python_executable: python_executable.clone(),
                 python_repl: config.execution_local_python_repl_enabled(),
+                python_runtime: runtime,
+                uv_binary: config.execution_uv_binary(),
+                uv_python: config.execution_uv_python(),
+                uv_requirements: config.execution_uv_requirements(),
+                uv_env_root: workspace_dir
+                    .join(".system_generated")
+                    .join("uv")
+                    .join("envs"),
             };
             let p = LocalExecutionProvider::new(lc).map_err(|e: ExecutionError| e.to_string())?;
             Ok(Arc::new(ExecutionHarness::new(
                 Arc::new(p),
-                config.execution_python_executable(),
+                python_executable,
                 workspace_dir,
                 sandbox_dir,
                 artifact_limits,
@@ -190,8 +241,63 @@ pub fn build_execution_harness(
                 config.execution_max_wall_secs(),
             )))
         }
+        "colab_mcp" => {
+            let cc = ColabMcpExecutionProviderConfig {
+                command: config.execution_colab_mcp_command(),
+                args: config.execution_colab_mcp_args(),
+                cwd: config.execution_colab_mcp_cwd(),
+                startup_timeout_secs: config.execution_colab_mcp_startup_timeout_secs(),
+                connect_tool_name: config.execution_colab_mcp_connect_tool_name(),
+                execute_tool_name: config.execution_colab_mcp_execute_tool_name(),
+                execute_code_arg_keys: config.execution_colab_mcp_execute_code_arg_keys(),
+                max_sessions: config.execution_max_sessions(),
+                max_output_bytes: config.execution_max_output_bytes(),
+            };
+            let p = Arc::new(
+                ColabMcpExecutionProvider::new(cc).map_err(|e: ExecutionError| e.to_string())?,
+            );
+            Ok(Arc::new(ExecutionHarness::new_colab_mcp(
+                p,
+                config.execution_python_executable(),
+                workspace_dir,
+                sandbox_dir,
+                artifact_limits,
+                config.execution_default_run_timeout_secs(),
+                config.execution_max_wall_secs(),
+            )))
+        }
         other => Err(format!(
-            "unknown [harness.execution] default_provider: {other} (supported: \"local\", \"jupyter\", \"ssh\")"
+            "unknown [harness.execution] default_provider: {other} (supported: \"local\", \"jupyter\", \"ssh\", \"colab_mcp\")"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_system_runtime_requires_python_executable() {
+        let cfg: AppConfig = toml::from_str(
+            r#"
+[harness.execution]
+enabled = true
+default_provider = "local"
+local_python_runtime = "system"
+"#,
+        )
+        .expect("parse");
+        let root =
+            std::env::temp_dir().join(format!("isanagent-harness-test-{}", uuid::Uuid::new_v4()));
+        let sandbox = root.join("workspace");
+        std::fs::create_dir_all(&sandbox).expect("mkdir");
+        let res = build_execution_harness(root.clone(), sandbox.clone(), true, &cfg);
+        assert!(res.is_err(), "expected missing python_executable error");
+        let err = match res {
+            Ok(_) => String::new(),
+            Err(e) => e,
+        };
+        assert!(err.contains("python_executable"), "err={err}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
