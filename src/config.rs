@@ -46,6 +46,25 @@ pub struct JupyterExecutionConfig {
     pub notebook_sync_path_template: Option<String>,
 }
 
+/// Google Colab MCP bridge over stdio (`default_provider = "colab_mcp"`).
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct ColabMcpExecutionConfig {
+    /// Command to launch the MCP server (default `uvx`).
+    pub command: Option<String>,
+    /// Command args (default `["git+https://github.com/googlecolab/colab-mcp"]`).
+    pub args: Option<Vec<String>>,
+    /// Optional working directory for the MCP process.
+    pub cwd: Option<String>,
+    /// Session-start timeout for MCP init + tools/list handshake (default 30, clamped 5–300).
+    pub startup_timeout_secs: Option<u64>,
+    /// Tool used to trigger browser connection (default `open_colab_browser_connection`).
+    pub connect_tool_name: Option<String>,
+    /// Optional explicit execution tool name; when unset, auto-detected from tools/list.
+    pub execute_tool_name: Option<String>,
+    /// Preferred code argument keys to try in order (default `["code","source","cell","input"]`).
+    pub execute_code_arg_keys: Option<Vec<String>>,
+}
+
 /// Code execution harness (`execution_*` tools). Disabled unless `[harness.execution] enabled = true`.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct ExecutionHarnessConfig {
@@ -68,6 +87,14 @@ pub struct ExecutionHarnessConfig {
     /// Local Python only: **`repl`** (default) keeps one interpreter per session so variables survive
     /// across `execution_run` calls; **`subprocess`** spawns a fresh `python -u -` per run (legacy).
     pub local_python_mode: Option<String>,
+    /// Local Python runtime backend: `uv_managed` (default) or `system` (`uv`, `uv-managed` aliases accepted).
+    pub local_python_runtime: Option<String>,
+    /// Binary used when `local_python_runtime = "uv_managed"` (default `uv`).
+    pub uv_binary: Option<String>,
+    /// Python version request for `uv venv --python` (default `3.11`).
+    pub uv_python: Option<String>,
+    /// Optional package specs installed into the managed env (`uv pip install ...`) on first creation.
+    pub uv_requirements: Option<Vec<String>>,
     /// Max bytes per execution artifact file (default 4MiB, clamped 64KiB–64MiB).
     pub artifact_max_file_bytes: Option<usize>,
     /// Max total bytes for all artifacts in one `execution_run` (default 32MiB).
@@ -78,6 +105,8 @@ pub struct ExecutionHarnessConfig {
     pub jupyter: Option<JupyterExecutionConfig>,
     /// Required when `default_provider = "ssh"`.
     pub ssh: Option<SshExecutionConfig>,
+    /// Required when `default_provider = "colab_mcp"`.
+    pub colab_mcp: Option<ColabMcpExecutionConfig>,
 }
 
 /// Sub-agent / task harness. Disabled unless `[harness.subagents] enabled = true`.
@@ -586,13 +615,18 @@ impl AppConfig {
     }
 
     pub fn execution_python_executable(&self) -> String {
+        self.execution_python_executable_configured()
+            .unwrap_or_else(|| "python".to_string())
+    }
+
+    /// Raw configured python executable (trimmed), if set.
+    pub fn execution_python_executable_configured(&self) -> Option<String> {
         self.harness
             .as_ref()
             .and_then(|h| h.execution.as_ref())
             .and_then(|e| e.python_executable.as_ref())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "python".to_string())
     }
 
     /// Local provider Python: persistent REPL per session (default) vs one subprocess per run.
@@ -621,6 +655,55 @@ impl AppConfig {
                 )
             }
         }
+    }
+
+    /// Local provider Python runtime backend.
+    pub fn execution_local_python_runtime(&self) -> String {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.local_python_runtime.as_ref())
+            .map(|s| s.trim().to_ascii_lowercase().replace('-', "_"))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "uv_managed".to_string())
+    }
+
+    /// Binary for UV-managed local Python runtime.
+    pub fn execution_uv_binary(&self) -> String {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.uv_binary.as_ref())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "uv".to_string())
+    }
+
+    /// Requested Python version for UV-managed local Python runtime.
+    pub fn execution_uv_python(&self) -> String {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.uv_python.as_ref())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "3.11".to_string())
+    }
+
+    /// Optional package specs installed once for UV-managed local runtime.
+    pub fn execution_uv_requirements(&self) -> Vec<String> {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.uv_requirements.as_ref())
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
     }
 
     /// Caps for Phase 6 execution artifacts (Jupyter `display_data` materialization).
@@ -803,6 +886,102 @@ impl AppConfig {
             .and_then(|s| s.accept_unknown_host_keys)
             .unwrap_or(true)
     }
+
+    pub fn execution_colab_mcp_command(&self) -> String {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.colab_mcp.as_ref())
+            .and_then(|c| c.command.as_ref())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "uvx".to_string())
+    }
+
+    pub fn execution_colab_mcp_args(&self) -> Vec<String> {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.colab_mcp.as_ref())
+            .and_then(|c| c.args.as_ref())
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec!["git+https://github.com/googlecolab/colab-mcp".to_string()])
+    }
+
+    pub fn execution_colab_mcp_cwd(&self) -> Option<String> {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.colab_mcp.as_ref())
+            .and_then(|c| c.cwd.as_ref())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn execution_colab_mcp_startup_timeout_secs(&self) -> u64 {
+        const DEFAULT: u64 = 30;
+        const MIN: u64 = 5;
+        const MAX: u64 = 300;
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.colab_mcp.as_ref())
+            .and_then(|c| c.startup_timeout_secs)
+            .unwrap_or(DEFAULT)
+            .clamp(MIN, MAX)
+    }
+
+    pub fn execution_colab_mcp_connect_tool_name(&self) -> String {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.colab_mcp.as_ref())
+            .and_then(|c| c.connect_tool_name.as_ref())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "open_colab_browser_connection".to_string())
+    }
+
+    pub fn execution_colab_mcp_execute_tool_name(&self) -> Option<String> {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.colab_mcp.as_ref())
+            .and_then(|c| c.execute_tool_name.as_ref())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn execution_colab_mcp_execute_code_arg_keys(&self) -> Vec<String> {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.colab_mcp.as_ref())
+            .and_then(|c| c.execute_code_arg_keys.as_ref())
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| {
+                vec![
+                    "code".to_string(),
+                    "source".to_string(),
+                    "cell".to_string(),
+                    "input".to_string(),
+                ]
+            })
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -910,6 +1089,7 @@ enabled = true
         let c: AppConfig = toml::from_str(s).expect("parse");
         assert_eq!(c.execution_max_wall_secs(), 3600);
         assert_eq!(c.execution_default_run_timeout_secs(), 600);
+        assert_eq!(c.execution_local_python_runtime(), "uv_managed");
     }
 
     #[test]
@@ -1040,6 +1220,65 @@ accept_unknown_host_keys = false
         );
         assert_eq!(c.execution_ssh_remote_python(), "python3");
         assert!(!c.execution_ssh_accept_unknown_host_keys());
+    }
+
+    #[test]
+    fn harness_execution_uv_local_runtime_toml() {
+        let s = r#"
+[harness.execution]
+enabled = true
+local_python_runtime = "uv_managed"
+uv_binary = "uvx"
+uv_python = "3.12"
+uv_requirements = ["numpy", "pandas>=2.2"]
+"#;
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        assert_eq!(c.execution_local_python_runtime(), "uv_managed");
+        assert_eq!(c.execution_uv_binary(), "uvx");
+        assert_eq!(c.execution_uv_python(), "3.12");
+        assert_eq!(
+            c.execution_uv_requirements(),
+            vec!["numpy".to_string(), "pandas>=2.2".to_string()]
+        );
+    }
+
+    #[test]
+    fn harness_execution_colab_mcp_toml() {
+        let s = r#"
+[harness.execution]
+enabled = true
+default_provider = "colab_mcp"
+allowed_providers = ["colab_mcp", "local"]
+
+[harness.execution.colab_mcp]
+command = "uvx"
+args = ["git+https://github.com/googlecolab/colab-mcp"]
+startup_timeout_secs = 45
+connect_tool_name = "open_colab_browser_connection"
+execute_tool_name = "execute_python"
+execute_code_arg_keys = ["code", "source"]
+"#;
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        assert_eq!(c.execution_default_provider(), "colab_mcp");
+        assert!(c.execution_provider_allowed("colab_mcp"));
+        assert_eq!(c.execution_colab_mcp_command(), "uvx");
+        assert_eq!(
+            c.execution_colab_mcp_args(),
+            vec!["git+https://github.com/googlecolab/colab-mcp".to_string()]
+        );
+        assert_eq!(c.execution_colab_mcp_startup_timeout_secs(), 45);
+        assert_eq!(
+            c.execution_colab_mcp_connect_tool_name(),
+            "open_colab_browser_connection"
+        );
+        assert_eq!(
+            c.execution_colab_mcp_execute_tool_name().as_deref(),
+            Some("execute_python")
+        );
+        assert_eq!(
+            c.execution_colab_mcp_execute_code_arg_keys(),
+            vec!["code".to_string(), "source".to_string()]
+        );
     }
 
     #[test]

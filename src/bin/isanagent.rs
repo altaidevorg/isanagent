@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::{self, IsTerminal, Write};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
@@ -166,6 +167,8 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         )
         .into());
     }
+
+    maybe_prompt_uv_install_on_launch(&workspace);
 
     // 1. Setup SqliteMemoryActor and SessionManager
     let db_path = workspace
@@ -854,6 +857,63 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     }
 
     Ok(())
+}
+
+fn maybe_prompt_uv_install_on_launch(workspace: &IsanagentWorkspace) {
+    if !workspace.config.execution_harness_enabled() {
+        return;
+    }
+    if workspace.config.execution_default_provider() != "local" {
+        return;
+    }
+    let runtime = workspace.config.execution_local_python_runtime();
+    if !matches!(runtime.as_str(), "uv_managed" | "uvmanaged" | "uv") {
+        return;
+    }
+    let uv_bin = workspace.config.execution_uv_binary();
+    if isanagent::execution::uv_binary_available(&uv_bin) {
+        return;
+    }
+    let interactive = workspace.config.terminal_enabled()
+        && io::stdin().is_terminal()
+        && io::stdout().is_terminal();
+    if !interactive {
+        log::warn!(
+            "Execution local runtime is uv-managed but '{}' was not found on PATH. \
+Install uv manually or run /install-python from terminal mode.",
+            uv_bin
+        );
+        return;
+    }
+
+    println!(
+        "\nExecution runtime is set to uv-managed, but '{}' was not found on PATH.",
+        uv_bin
+    );
+    println!("Install uv now? (yes/no)");
+    let _ = io::stdout().flush();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if io::stdin().read_line(&mut line).is_err() {
+            println!("Unable to read input. Skipping uv installation prompt.");
+            break;
+        }
+        let ans = line.trim().to_ascii_lowercase();
+        if matches!(ans.as_str(), "yes" | "y") {
+            match isanagent::execution::install_uv_best_effort() {
+                Ok(msg) => println!("{msg}"),
+                Err(err) => println!("Auto-install failed: {err}"),
+            }
+            break;
+        }
+        if matches!(ans.as_str(), "no" | "n") {
+            println!("Skipping uv installation. You can run /install-python anytime.");
+            break;
+        }
+        println!("Please answer yes or no:");
+        let _ = io::stdout().flush();
+    }
 }
 
 async fn run_onboard(

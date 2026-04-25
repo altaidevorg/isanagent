@@ -89,7 +89,7 @@ impl Tool for ExecutionSessionCreateTool {
     }
 
     fn description(&self) -> &str {
-        "Create an execution session (requires [harness.execution] enabled). Provider is [harness.execution] default_provider: local runs under the workspace sandbox; jupyter uses a Jupyter Server kernel (new or `resume_jupyter_kernel_id`); ssh opens one SSH session to a configured host (reused until execution_session_close). Returns session_id, session capabilities (Jupyter extensions include `jupyter_kernel_id` and optional `jupyter_notebook_sync_path`), and a short provider capability summary. Use execution_run or execution_run_background to execute code; execution_session_close when done. Jupyter may write binary display_data under the sandbox `.execution_artifacts/{session_id}/{run_id}/` and list them in RunResult.attachments."
+        "Create an execution session (requires [harness.execution] enabled). Provider is [harness.execution] default_provider: local runs under the workspace sandbox; jupyter uses a Jupyter Server kernel (new or `resume_jupyter_kernel_id`); ssh opens one SSH session to a configured host (reused until execution_session_close); colab_mcp launches a local Colab MCP bridge process and targets a notebook execution tool exposed by the browser session. Returns session_id, session capabilities, and a short provider capability summary. Use execution_run or execution_run_background to execute code; execution_session_close when done. Jupyter may write binary display_data under the sandbox `.execution_artifacts/{session_id}/{run_id}/` and list them in RunResult.attachments."
     }
 
     fn parameters(&self) -> Value {
@@ -99,7 +99,7 @@ impl Tool for ExecutionSessionCreateTool {
                 "label": { "type": "string", "description": "Optional label for logs" },
                 "language": {
                     "type": "string",
-                    "description": "Optional language hint. Local: python, py, shell, sh, bash. Jupyter: python, py, r, R (ir kernel). SSH: python, py, shell, sh, bash (remote exec with code on stdin)."
+                    "description": "Optional language hint. Local: python, py, shell, sh, bash. Jupyter: python, py, r, R (ir kernel). SSH: python, py, shell, sh, bash (remote exec with code on stdin). Colab MCP MVP currently expects python."
                 },
                 "resume_jupyter_kernel_id": {
                     "type": "string",

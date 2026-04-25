@@ -154,6 +154,15 @@ See `AGENTS.md` for workspace/sandbox rules, actor discipline, and telemetry con
 
 **Objective:** One hosted path with explicit **auth and limitation** documentation—not feature parity with local on day one.
 
+**Status (MVP implemented):** `ColabMcpExecutionProvider` in `src/execution/colab_mcp.rs` behind
+`default_provider = "colab_mcp"` + `[harness.execution.colab_mcp]` in `config.toml`. Session create
+spawns a local MCP stdio process (`uvx git+https://github.com/googlecolab/colab-mcp` by default),
+runs `initialize` + `tools/list`, auto-detects (or configures) an execution tool, and best-effort
+calls `open_colab_browser_connection` to prompt browser attachment. `execution_run` forwards code via
+`tools/call` and maps text content to `RunResult.stdout`. Current limits: no interrupt (`supports_interrupt: false`),
+no artifact materialization, and MCP tool naming variability may require explicit
+`execute_tool_name` / `execute_code_arg_keys`.
+
 **Deliverables**
 
 - Narrow scope: e.g. “attach to existing runtime” or minimal API surface you can support reliably.
@@ -166,6 +175,9 @@ See `AGENTS.md` for workspace/sandbox rules, actor discipline, and telemetry con
 - Documented manual test path; automated tests mock HTTP where feasible.
 
 **Depends on:** Phase 0–2 minimum; real value stacks after Phase 3 patterns exist.
+
+**OAuth-native follow-up:** feasibility findings and go/no-go gate are tracked in
+`docs/colab-oauth-feasibility.md` (currently no-go for near-term implementation).
 
 ---
 

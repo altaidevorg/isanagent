@@ -1,0 +1,568 @@
+//! Colab MCP-backed execution provider (Phase 5 MVP).
+//!
+//! This provider launches a local `colab-mcp` stdio server (typically via `uvx`) and
+//! forwards `execution_run` as MCP `tools/call` requests to a notebook-execution tool.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use dashmap::DashMap;
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::Mutex;
+
+use super::capabilities::{
+    NetworkPolicy, ProviderCapabilities, ProviderCapabilitiesSnapshot, SessionCapabilities,
+};
+use super::error::ExecutionError;
+use super::ids::SessionId;
+use super::provider::ExecutionProvider;
+use super::run::{CwdPolicy, RunResult, RunSpec, SessionCreateRequest, SessionHandle};
+
+#[derive(Debug, Clone)]
+pub struct ColabMcpExecutionProviderConfig {
+    pub command: String,
+    pub args: Vec<String>,
+    pub cwd: Option<String>,
+    pub startup_timeout_secs: u64,
+    pub connect_tool_name: String,
+    pub execute_tool_name: Option<String>,
+    pub execute_code_arg_keys: Vec<String>,
+    pub max_sessions: usize,
+    pub max_output_bytes: usize,
+}
+
+pub struct ColabMcpExecutionProvider {
+    config: ColabMcpExecutionProviderConfig,
+    caps: ProviderCapabilities,
+    sessions: DashMap<SessionId, Arc<ColabMcpSession>>,
+}
+
+struct ColabMcpSession {
+    client: Mutex<McpProcessClient>,
+    execute_tool_name: String,
+    execute_code_arg_key: String,
+}
+
+struct McpProcessClient {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next_id: u64,
+}
+
+impl ColabMcpExecutionProvider {
+    pub fn new(config: ColabMcpExecutionProviderConfig) -> Result<Self, ExecutionError> {
+        if config.command.trim().is_empty() {
+            return Err(ExecutionError::InvalidArgument(
+                "colab_mcp.command must be non-empty".to_string(),
+            ));
+        }
+        if config.args.is_empty() {
+            return Err(ExecutionError::InvalidArgument(
+                "colab_mcp.args must contain at least one argument".to_string(),
+            ));
+        }
+        let mut caps = ProviderCapabilities::minimal("colab_mcp");
+        caps.languages = vec!["python".into()];
+        caps.supports_persistent_sessions = true;
+        caps.supports_interrupt = false;
+        caps.supports_package_install = false;
+        caps.supports_remote_shell = false;
+        caps.jupyter_kernel = false;
+        caps.network_policy = NetworkPolicy::Full;
+        caps.max_output_bytes_default = Some(config.max_output_bytes as u64);
+        caps.extensions.insert(
+            "transport".into(),
+            Value::String("mcp_stdio_colab_proxy".to_string()),
+        );
+        caps.extensions.insert(
+            "connect_tool_name".into(),
+            Value::String(config.connect_tool_name.clone()),
+        );
+        if let Some(name) = config.execute_tool_name.as_ref() {
+            caps.extensions
+                .insert("execute_tool_name_hint".into(), Value::String(name.clone()));
+        }
+
+        Ok(Self {
+            config,
+            caps,
+            sessions: DashMap::new(),
+        })
+    }
+}
+
+#[async_trait]
+impl ExecutionProvider for ColabMcpExecutionProvider {
+    fn provider_id(&self) -> &str {
+        "colab_mcp"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.caps.clone()
+    }
+
+    async fn create_session(
+        &self,
+        _req: SessionCreateRequest,
+    ) -> Result<SessionHandle, ExecutionError> {
+        if self.config.max_sessions > 0 && self.sessions.len() >= self.config.max_sessions {
+            return Err(ExecutionError::limit_exceeded(
+                "sessions",
+                format!("max_sessions={} reached", self.config.max_sessions),
+            ));
+        }
+        let mut cmd = Command::new(&self.config.command);
+        cmd.args(&self.config.args);
+        if let Some(cwd) = self.config.cwd.as_ref() {
+            cmd.current_dir(cwd);
+        }
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = cmd.spawn().map_err(|e| {
+            ExecutionError::Provider(format!("spawn colab_mcp command failed: {e}"))
+        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| ExecutionError::Provider("colab_mcp missing stdin".to_string()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ExecutionError::Provider("colab_mcp missing stdout".to_string()))?;
+        let mut client = McpProcessClient {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            next_id: 1,
+        };
+
+        let startup = Duration::from_secs(self.config.startup_timeout_secs);
+        let tools = tokio::time::timeout(startup, async {
+            client.initialize().await?;
+            client.list_tools().await
+        })
+        .await
+        .map_err(|_| ExecutionError::Timeout {
+            timeout_secs: self.config.startup_timeout_secs,
+        })??;
+
+        let execute_tool_name =
+            pick_execute_tool_name(&tools, self.config.execute_tool_name.as_deref())?;
+        let execute_code_arg_key = pick_execute_code_arg_key(
+            &tools,
+            &execute_tool_name,
+            &self.config.execute_code_arg_keys,
+        );
+
+        // Best effort: this call opens/requests browser connection on disconnected clients.
+        let _ = client
+            .call_tool(
+                &self.config.connect_tool_name,
+                serde_json::Map::new(),
+                self.config.max_output_bytes,
+            )
+            .await;
+
+        let sid = SessionId::new(uuid::Uuid::new_v4().to_string());
+        let mut ext = std::collections::BTreeMap::new();
+        ext.insert(
+            "colab_mcp_execute_tool".into(),
+            Value::String(execute_tool_name.clone()),
+        );
+        ext.insert(
+            "colab_mcp_code_arg_key".into(),
+            Value::String(execute_code_arg_key.clone()),
+        );
+        ext.insert(
+            "colab_mcp_connect_tool".into(),
+            Value::String(self.config.connect_tool_name.clone()),
+        );
+        let caps = SessionCapabilities {
+            session_id: sid.clone(),
+            schema_version: 1,
+            provider_id: "colab_mcp".to_string(),
+            active_language: Some("python".to_string()),
+            gpu_visible: None,
+            working_directory_display: Some("colab-browser-runtime".to_string()),
+            provider_snapshot: ProviderCapabilitiesSnapshot {
+                supports_interrupt: false,
+                supports_package_install: false,
+                supports_remote_shell: false,
+                jupyter_kernel: false,
+                network_policy: NetworkPolicy::Full,
+            },
+            extensions: ext,
+        };
+
+        let session = Arc::new(ColabMcpSession {
+            client: Mutex::new(client),
+            execute_tool_name,
+            execute_code_arg_key,
+        });
+        self.sessions.insert(sid.clone(), session);
+        Ok(SessionHandle {
+            id: sid,
+            capabilities: caps,
+        })
+    }
+
+    async fn close_session(&self, session_id: &SessionId) -> Result<(), ExecutionError> {
+        if let Some((_, sess)) = self.sessions.remove(session_id) {
+            let mut guard = sess.client.lock().await;
+            guard.shutdown().await;
+            return Ok(());
+        }
+        Err(ExecutionError::InvalidSession(session_id.to_string()))
+    }
+
+    async fn run(
+        &self,
+        session_id: &SessionId,
+        spec: RunSpec,
+    ) -> Result<RunResult, ExecutionError> {
+        if !matches!(spec.cwd, CwdPolicy::SessionDefault) {
+            return Err(ExecutionError::unsupported(
+                "cwd_mode",
+                "colab_mcp provider supports only session_default cwd",
+            ));
+        }
+        let sess = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| ExecutionError::InvalidSession(session_id.to_string()))?;
+        let mut guard = sess.client.lock().await;
+        let mut args = serde_json::Map::new();
+        args.insert(
+            sess.execute_code_arg_key.clone(),
+            Value::String(spec.code.to_string()),
+        );
+        args.insert(
+            "timeout_secs".to_string(),
+            Value::Number(spec.timeout_secs.into()),
+        );
+        let output = guard
+            .call_tool(
+                &sess.execute_tool_name,
+                args,
+                self.config.max_output_bytes / 2,
+            )
+            .await?;
+        Ok(RunResult::new(output, String::new(), Some(0)))
+    }
+
+    async fn cancel(&self, session_id: &SessionId) -> Result<(), ExecutionError> {
+        if !self.sessions.contains_key(session_id) {
+            return Err(ExecutionError::InvalidSession(session_id.to_string()));
+        }
+        Err(ExecutionError::unsupported(
+            "execution_cancel",
+            "colab_mcp provider does not support interrupt in MVP",
+        ))
+    }
+}
+
+impl McpProcessClient {
+    async fn initialize(&mut self) -> Result<(), ExecutionError> {
+        let _ = self
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": { "name": "isanagent", "version": env!("CARGO_PKG_VERSION") }
+                }),
+            )
+            .await?;
+        self.notify("notifications/initialized", json!({})).await
+    }
+
+    async fn list_tools(&mut self) -> Result<Vec<McpToolDef>, ExecutionError> {
+        let result = self.request("tools/list", json!({})).await?;
+        let tools = result
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                ExecutionError::Provider("MCP tools/list missing tools[]".to_string())
+            })?;
+        let mut out = Vec::with_capacity(tools.len());
+        for t in tools {
+            let name = t
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ExecutionError::Provider("MCP tool missing name".to_string()))?;
+            out.push(McpToolDef {
+                name: name.to_string(),
+                input_schema: t.get("inputSchema").cloned(),
+            });
+        }
+        Ok(out)
+    }
+
+    async fn call_tool(
+        &mut self,
+        tool_name: &str,
+        args: serde_json::Map<String, Value>,
+        max_text: usize,
+    ) -> Result<String, ExecutionError> {
+        let result = self
+            .request(
+                "tools/call",
+                json!({
+                    "name": tool_name,
+                    "arguments": Value::Object(args),
+                }),
+            )
+            .await?;
+        Ok(extract_tool_text(&result, max_text))
+    }
+
+    async fn notify(&mut self, method: &str, params: Value) -> Result<(), ExecutionError> {
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        });
+        self.write_message(&msg).await
+    }
+
+    async fn request(&mut self, method: &str, params: Value) -> Result<Value, ExecutionError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        self.write_message(&req).await?;
+        loop {
+            let msg = self.read_message().await?;
+            let is_response = msg.get("id").and_then(|v| v.as_u64()) == Some(id);
+            if !is_response {
+                continue;
+            }
+            if let Some(err) = msg.get("error") {
+                return Err(ExecutionError::Provider(format!(
+                    "MCP {method} error: {}",
+                    err
+                )));
+            }
+            return msg
+                .get("result")
+                .cloned()
+                .ok_or_else(|| ExecutionError::Provider(format!("MCP {method} missing result")));
+        }
+    }
+
+    async fn write_message(&mut self, msg: &Value) -> Result<(), ExecutionError> {
+        let payload = serde_json::to_vec(msg)?;
+        let header = format!("Content-Length: {}\r\n\r\n", payload.len());
+        self.stdin
+            .write_all(header.as_bytes())
+            .await
+            .map_err(|e| ExecutionError::Provider(format!("mcp stdin write header: {e}")))?;
+        self.stdin
+            .write_all(&payload)
+            .await
+            .map_err(|e| ExecutionError::Provider(format!("mcp stdin write body: {e}")))?;
+        self.stdin
+            .flush()
+            .await
+            .map_err(|e| ExecutionError::Provider(format!("mcp stdin flush: {e}")))?;
+        Ok(())
+    }
+
+    async fn read_message(&mut self) -> Result<Value, ExecutionError> {
+        let mut content_length: Option<usize> = None;
+        loop {
+            let mut line = String::new();
+            let n =
+                self.stdout.read_line(&mut line).await.map_err(|e| {
+                    ExecutionError::Provider(format!("mcp stdout read header: {e}"))
+                })?;
+            if n == 0 {
+                return Err(ExecutionError::Provider(
+                    "colab_mcp process closed stdout".to_string(),
+                ));
+            }
+            let t = line.trim();
+            if t.is_empty() {
+                break;
+            }
+            let lower = t.to_ascii_lowercase();
+            if let Some(rest) = lower.strip_prefix("content-length:") {
+                let parsed = rest.trim().parse::<usize>().map_err(|e| {
+                    ExecutionError::Provider(format!("invalid MCP Content-Length header: {e}"))
+                })?;
+                content_length = Some(parsed);
+            }
+        }
+        let len = content_length.ok_or_else(|| {
+            ExecutionError::Provider("missing MCP Content-Length header".to_string())
+        })?;
+        let mut buf = vec![0u8; len];
+        self.stdout
+            .read_exact(&mut buf)
+            .await
+            .map_err(|e| ExecutionError::Provider(format!("mcp stdout read body: {e}")))?;
+        let v: Value = serde_json::from_slice(&buf)?;
+        Ok(v)
+    }
+
+    async fn shutdown(&mut self) {
+        let _ = self.child.kill().await;
+    }
+}
+
+#[derive(Debug, Clone)]
+struct McpToolDef {
+    name: String,
+    input_schema: Option<Value>,
+}
+
+fn pick_execute_tool_name(
+    tools: &[McpToolDef],
+    configured: Option<&str>,
+) -> Result<String, ExecutionError> {
+    if let Some(name) = configured {
+        if tools.iter().any(|t| t.name == name) {
+            return Ok(name.to_string());
+        }
+        return Err(ExecutionError::Provider(format!(
+            "configured colab_mcp execute_tool_name {name:?} not found in tools/list"
+        )));
+    }
+    const CANDIDATES: &[&str] = &[
+        "execute_python",
+        "run_python",
+        "run_python_cell",
+        "execute_cell",
+        "run_code",
+    ];
+    for c in CANDIDATES {
+        if let Some(t) = tools.iter().find(|t| t.name.eq_ignore_ascii_case(c)) {
+            return Ok(t.name.clone());
+        }
+    }
+    for t in tools {
+        let n = t.name.to_ascii_lowercase();
+        if (n.contains("run") || n.contains("execute"))
+            && (n.contains("python") || n.contains("code") || n.contains("cell"))
+        {
+            return Ok(t.name.clone());
+        }
+    }
+    Err(ExecutionError::Provider(
+        "could not auto-detect a Colab execution tool from MCP tools/list; configure [harness.execution.colab_mcp].execute_tool_name".to_string(),
+    ))
+}
+
+fn pick_execute_code_arg_key(
+    tools: &[McpToolDef],
+    tool_name: &str,
+    preferred: &[String],
+) -> String {
+    let Some(tool) = tools.iter().find(|t| t.name == tool_name) else {
+        return preferred
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "code".to_string());
+    };
+    let props = tool
+        .input_schema
+        .as_ref()
+        .and_then(|s| s.get("properties"))
+        .and_then(|p| p.as_object());
+    if let Some(props) = props {
+        for key in preferred {
+            if props.contains_key(key) {
+                return key.clone();
+            }
+        }
+        for k in props.keys() {
+            let lower = k.to_ascii_lowercase();
+            if lower.contains("code") || lower.contains("source") || lower.contains("cell") {
+                return k.clone();
+            }
+        }
+    }
+    preferred
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "code".to_string())
+}
+
+fn extract_tool_text(result: &Value, max_text: usize) -> String {
+    let mut chunks: Vec<String> = Vec::new();
+    if let Some(content) = result.get("content").and_then(|v| v.as_array()) {
+        for item in content {
+            if item.get("type").and_then(|v| v.as_str()) == Some("text") {
+                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                    chunks.push(text.to_string());
+                }
+            }
+        }
+    }
+    if chunks.is_empty() {
+        if let Some(s) = result.get("structuredContent") {
+            chunks.push(s.to_string());
+        } else {
+            chunks.push(result.to_string());
+        }
+    }
+    let mut out = chunks.join("\n");
+    if out.len() > max_text {
+        let mut end = max_text;
+        while end > 0 && !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.truncate(end);
+        out.push_str("\n... (truncated)");
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn execute_tool_autodetect_prefers_named_candidates() {
+        let tools = vec![McpToolDef {
+            name: "execute_python".to_string(),
+            input_schema: None,
+        }];
+        let picked = pick_execute_tool_name(&tools, None).expect("pick");
+        assert_eq!(picked, "execute_python");
+    }
+
+    #[test]
+    fn code_arg_key_prefers_schema_match() {
+        let tools = vec![McpToolDef {
+            name: "run_code".to_string(),
+            input_schema: Some(json!({
+                "type": "object",
+                "properties": {
+                    "source": { "type": "string" }
+                }
+            })),
+        }];
+        let key = pick_execute_code_arg_key(
+            &tools,
+            "run_code",
+            &["code".to_string(), "source".to_string()],
+        );
+        assert_eq!(key, "source");
+    }
+}

@@ -68,6 +68,7 @@ const TERMINAL_HELP: &str = r#"Commands (leading slash):
   /exit, /quit   Quit and restore the terminal
   /new           Start a new session (new chat id)
   /copy          Copy the last assistant reply to the clipboard
+  /install-python Install uv (best effort) for uv-managed runtime
   /cancel, /stop Stop the in-flight reply for this chat (drops queued prompts)
   /tools         Open the tool activity pane (same as Tab)
   /help, /?      Show this help
@@ -1033,6 +1034,13 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             }
                             continue;
                         }
+                        if text.eq_ignore_ascii_case("/install-python") {
+                            match crate::execution::install_uv_best_effort() {
+                                Ok(msg) => app.cells.push(Cell::System { message: msg }),
+                                Err(err) => app.cells.push(Cell::Error { message: err }),
+                            }
+                            continue;
+                        }
                         if text.eq_ignore_ascii_case("/help") || text.eq_ignore_ascii_case("/?") {
                             app.cells.push(Cell::System {
                                 message: TERMINAL_HELP.trim().to_string(),
@@ -1065,7 +1073,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         }
                         app.cells.push(Cell::System {
                             message:
-                                "Unknown command. Try /help, /exit, /new, /copy, /cancel, /tools."
+                                "Unknown command. Try /help, /exit, /new, /copy, /install-python, /cancel, /tools."
                                     .into(),
                         });
                         continue;

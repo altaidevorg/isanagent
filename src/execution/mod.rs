@@ -1,7 +1,8 @@
 //! Execution plane: Phase 0 contracts (errors, run specs, capabilities, provider trait),
 //! Phase 1 local subprocess provider ([`local::LocalExecutionProvider`]), Phase 3
 //! Jupyter kernel provider ([`jupyter::JupyterExecutionProvider`]), and Phase 4
-//! SSH exec provider ([`ssh::SshExecutionProvider`]).
+//! SSH exec provider ([`ssh::SshExecutionProvider`]) plus Phase 5 Colab MCP provider
+//! ([`colab_mcp::ColabMcpExecutionProvider`]).
 //!
 //! ## Design: object-safe core + capability traits
 //!
@@ -12,6 +13,7 @@
 
 mod artifacts;
 mod capabilities;
+mod colab_mcp;
 mod error;
 mod execution_jobs;
 mod harness;
@@ -33,6 +35,7 @@ pub use artifacts::{
 pub use capabilities::{
     NetworkPolicy, ProviderCapabilities, ProviderCapabilitiesSnapshot, SessionCapabilities,
 };
+pub use colab_mcp::{ColabMcpExecutionProvider, ColabMcpExecutionProviderConfig};
 pub use error::ExecutionError;
 pub use execution_jobs::{
     job_status_str, ExecutionJobManager, ExecutionJobRecord, SpawnBackgroundRunRequest,
@@ -41,7 +44,8 @@ pub use harness::{build_execution_harness, ExecutionHarness};
 pub use ids::SessionId;
 pub use jupyter::{JupyterExecutionProvider, JupyterExecutionProviderConfig};
 pub use local::{
-    build_python_host_command, LocalExecMode, LocalExecutionConfig, LocalExecutionProvider,
+    build_python_host_command, install_uv_best_effort, uv_binary_available, LocalExecMode,
+    LocalExecutionConfig, LocalExecutionProvider, LocalPythonRuntime,
 };
 pub use post_run::{persist_successful_execution_run, PersistSuccessfulExecutionRunParams};
 pub use preflight::{allowed_optional_tool_tags, PREFLIGHT_MARKDOWN};
