@@ -445,6 +445,41 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             ),
         )
         .with_chat_id(parent_chat_id.as_str()),
+        TelemetryEvent::ShellPolicyDecision {
+            chat_id,
+            channel,
+            mode,
+            decision,
+            command_preview,
+        } => LogEvent::info(
+            "Telemetry",
+            &format!(
+                "ShellPolicyDecision channel={} mode={} decision={} command={}",
+                channel, mode, decision, command_preview
+            ),
+        )
+        .with_chat_id(chat_id),
+        TelemetryEvent::ShellGrepLikeDetected {
+            chat_id,
+            channel,
+            command_preview,
+        } => LogEvent::warn(
+            "Telemetry",
+            &format!(
+                "ShellGrepLikeDetected channel={} command={}",
+                channel, command_preview
+            ),
+        )
+        .with_chat_id(chat_id),
+        TelemetryEvent::ResearchDepthNudge {
+            chat_id,
+            channel,
+            reason,
+        } => LogEvent::info(
+            "Telemetry",
+            &format!("ResearchDepthNudge channel={} reason={}", channel, reason),
+        )
+        .with_chat_id(chat_id),
     }
 }
 

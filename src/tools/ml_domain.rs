@@ -34,7 +34,7 @@ impl Tool for ArxivSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search arXiv (papers) via the public API. Returns Atom/XML snippets (titles, ids, summaries). Use before citing methods; follow up with `arxiv_fetch` for abstract text. Prefer precise English keywords."
+        "Search arXiv (papers) via the public API. Discovery tool: returns Atom/XML snippets (titles, ids, summaries) so you can shortlist candidates. Follow up with `arxiv_fetch` to read details before citing claims. Prefer precise English keywords."
     }
 
     fn parameters(&self) -> Value {
@@ -106,7 +106,7 @@ impl Tool for ArxivFetchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch an arXiv abstract page by id (e.g. `2401.0001` or `cs.CL/0001001`). Returns HTML text (truncated). Use after `arxiv_search` to read abstract and links."
+        "Fetch an arXiv abstract page by id (e.g. `2401.0001` or `cs.CL/0001001`). Returns HTML text (truncated). Use after `arxiv_search` for detailed reading and cross-verification; do not rely on search snippets alone."
     }
 
     fn parameters(&self) -> Value {

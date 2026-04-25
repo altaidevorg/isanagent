@@ -61,6 +61,13 @@ Top-level **`doom_loop_enabled`** (optional, default **true**): when true, the a
 
 Each successful **`execution_run`** or completed **`execution_run_background`** job also appends one JSON line to **`workspace_dir/.system_generated/execution_runs.jsonl`** (metadata only: no code body; may include **`job_id`** and optional **`description`**; background lines may include **`job_id`**) and emits **`ExecutionRunFinished`** telemetry (optional **`description`**). When a background job reaches a **finished** state (completed, failed, cancelled, or timeout), the agent also emits **`ExecutionJobFinished`** telemetry and appends **`workspace_dir/.system_generated/execution_jobs.jsonl`** (metadata audit; optional **`description`**).
 
+For agent-quality diagnostics, `conversation.jsonl` / `runtime.log` now also include:
+- **`ShellPolicyDecision`** telemetry (`approval_requested`, `approval_granted`, `approval_denied`, `blocked`) for risky `exec` commands.
+- **`ShellGrepLikeDetected`** telemetry when shell grep/cat/wc-style pipelines are attempted (helps track tool-first drift).
+- **`ResearchDepthNudge`** telemetry when a research turn tries to finish after discovery search without primary-source fetch.
+
+Use these events to track regressions over time (for example, “grep-like shell attempts per 100 turns” or “research nudges triggered per session”).
+
 Additionally, every **`execution_run`** (all providers) writes a **run journal** under **`workspace_dir/.system_generated/execution_history/{provider}/{session_id}/{run_id}/`**: **`run.json`** (truncated stdout/stderr, attachment list, timestamps) and **`source.txt`** (the exact code run). Treat journals as potentially sensitive if code contained secrets.
 
 When `default_provider = "jupyter"`, add **`[harness.execution.jupyter]`**:

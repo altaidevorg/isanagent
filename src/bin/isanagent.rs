@@ -437,6 +437,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
 
     let harness_runtime_summary = workspace.config.runtime_harness_summary_lines().join("\n");
     let forbid_final_without_tools = workspace.config.ml_engineer_forbid_final_without_tools();
+    let shell_policy = workspace.config.resolved_shell_policy();
 
     // Prepare startup visual references before we move the structs
     let skill_names = skills.get_skill_names().join(", ");
@@ -521,6 +522,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         harness_runtime_summary,
         subagent_system_prompt,
         forbid_final_without_tools,
+        shell_policy,
     });
     let agent_logic = if let Some(tool_execution_activity) = tool_execution_activity {
         agent_logic.with_tool_execution_activity(tool_execution_activity)

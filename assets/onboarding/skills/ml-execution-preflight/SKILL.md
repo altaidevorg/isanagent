@@ -1,7 +1,7 @@
 ---
 name: ml-execution-preflight
 description: Checklist before long execution_run or execution_run_background for ML/training scripts.
-always: false
+always: true
 ---
 
 # ML execution preflight
@@ -17,3 +17,5 @@ Run these checks **before** a long or GPU-heavy `execution_run` / `execution_run
 7. **Single path first** — do not launch many parallel heavy jobs until one configuration completes successfully.
 
 If any step fails, fix the root cause before scaling.
+
+**Before launching a fine-tuning or dataset generation script, also load `long-running-execution` with `load_skill_instructions`.

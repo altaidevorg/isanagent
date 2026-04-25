@@ -106,12 +106,39 @@ pub struct MlEngineerHarnessConfig {
     pub forbid_final_without_tools: Option<bool>,
 }
 
+/// Shell safety policy for `exec` tool decisions before command execution.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct ShellPolicyConfig {
+    /// Interactive default mode: `ask`, `deny`, or `allow` (default `ask`).
+    pub mode: Option<String>,
+    /// Unattended/autonomous mode: `ask`, `deny`, or `allow` (default `deny`).
+    pub unattended_default: Option<String>,
+    /// Extra lowercase substrings that should require approval in `ask` mode.
+    pub interactive_requires_approval_for: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellPolicyMode {
+    Ask,
+    Deny,
+    Allow,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedShellPolicy {
+    pub interactive_mode: ShellPolicyMode,
+    pub unattended_mode: ShellPolicyMode,
+    pub approval_patterns: Vec<String>,
+}
+
 /// Optional harness features (see `docs/harness-implementation-plan.md`).
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct HarnessConfig {
     pub git_worktree: Option<GitWorktreeConfig>,
     /// Background sub-agents, task tools, and optional plan execution (Phase 5).
     pub subagents: Option<SubagentHarnessConfig>,
+    /// Shell command policy (`exec`), including approval-vs-deny behavior.
+    pub shell_policy: Option<ShellPolicyConfig>,
     /// Local / future execution providers (`execution_*` tools). See `docs/execution-implementation-plan.md`.
     pub execution: Option<ExecutionHarnessConfig>,
     /// ML engineer prompt overlay and related defaults.
@@ -184,6 +211,18 @@ fn jina_api_key_looks_like_placeholder(s: &str) -> bool {
     ["optional", "placeholder", "replace_me", "replaceme"]
         .iter()
         .any(|pat| lower.contains(pat))
+}
+
+fn parse_shell_policy_mode(raw: Option<&str>, default_mode: ShellPolicyMode) -> ShellPolicyMode {
+    let Some(value) = raw else {
+        return default_mode;
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "allow" => ShellPolicyMode::Allow,
+        "deny" => ShellPolicyMode::Deny,
+        "ask" => ShellPolicyMode::Ask,
+        _ => default_mode,
+    }
 }
 
 impl AppConfig {
@@ -370,9 +409,61 @@ impl AppConfig {
             .unwrap_or(false)
     }
 
+    pub fn resolved_shell_policy(&self) -> ResolvedShellPolicy {
+        let shell_cfg = self.harness.as_ref().and_then(|h| h.shell_policy.as_ref());
+        let interactive_mode = parse_shell_policy_mode(
+            shell_cfg.and_then(|s| s.mode.as_deref()),
+            ShellPolicyMode::Ask,
+        );
+        let unattended_mode = parse_shell_policy_mode(
+            shell_cfg.and_then(|s| s.unattended_default.as_deref()),
+            ShellPolicyMode::Deny,
+        );
+        let mut approval_patterns = vec![
+            "rm -rf".to_string(),
+            "rm -fr".to_string(),
+            "del /f".to_string(),
+            "del /q".to_string(),
+            "rmdir /s".to_string(),
+            "git clean -fd".to_string(),
+            "git reset --hard".to_string(),
+        ];
+        if let Some(extra) = shell_cfg
+            .and_then(|s| s.interactive_requires_approval_for.as_ref())
+            .filter(|v| !v.is_empty())
+        {
+            approval_patterns.extend(
+                extra
+                    .iter()
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty()),
+            );
+        }
+        approval_patterns.sort();
+        approval_patterns.dedup();
+        ResolvedShellPolicy {
+            interactive_mode,
+            unattended_mode,
+            approval_patterns,
+        }
+    }
+
     /// Short lines for `[RUNTIME CONTEXT]` (token-frugal). Built in the binary and passed into the agent.
     pub fn runtime_harness_summary_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
+        let shell_policy = self.resolved_shell_policy();
+        let os_family = std::env::consts::OS;
+        let shell_family = if cfg!(windows) {
+            "powershell_or_cmd"
+        } else {
+            "sh_or_bash"
+        };
+        lines.push(format!(
+            "host_os={} shell_family={} path_separator={}",
+            os_family,
+            shell_family,
+            std::path::MAIN_SEPARATOR
+        ));
         lines.push(format!(
             "execution_harness_enabled={}",
             self.execution_harness_enabled()
@@ -425,6 +516,12 @@ impl AppConfig {
         lines.push(format!(
             "ml_engineer_forbid_final_without_tools_default={}",
             self.ml_engineer_forbid_final_without_tools()
+        ));
+        lines.push(format!(
+            "shell_policy_mode_interactive={:?} shell_policy_mode_unattended={:?} shell_policy_approval_patterns={}",
+            shell_policy.interactive_mode,
+            shell_policy.unattended_mode,
+            shell_policy.approval_patterns.len()
         ));
         lines
     }
@@ -943,5 +1040,29 @@ accept_unknown_host_keys = false
         );
         assert_eq!(c.execution_ssh_remote_python(), "python3");
         assert!(!c.execution_ssh_accept_unknown_host_keys());
+    }
+
+    #[test]
+    fn shell_policy_defaults_and_overrides() {
+        let c = AppConfig::default();
+        let p = c.resolved_shell_policy();
+        assert_eq!(p.interactive_mode, ShellPolicyMode::Ask);
+        assert_eq!(p.unattended_mode, ShellPolicyMode::Deny);
+        assert!(!p.approval_patterns.is_empty());
+
+        let s = r#"
+[harness.shell_policy]
+mode = "deny"
+unattended_default = "allow"
+interactive_requires_approval_for = ["terraform destroy"]
+"#;
+        let c2: AppConfig = toml::from_str(s).expect("parse");
+        let p2 = c2.resolved_shell_policy();
+        assert_eq!(p2.interactive_mode, ShellPolicyMode::Deny);
+        assert_eq!(p2.unattended_mode, ShellPolicyMode::Allow);
+        assert!(p2
+            .approval_patterns
+            .iter()
+            .any(|s| s.contains("terraform destroy")));
     }
 }

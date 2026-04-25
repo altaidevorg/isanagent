@@ -1,7 +1,7 @@
 ---
 name: literature-to-recipe
-description: Turn papers and docs into a concrete training or evaluation recipe (datasets, metrics, hyperparameters).
-always: false
+description: Turn papers and docs into a concrete training or evaluation recipe (datasets, metrics, hyperparameters, fine-tuning code).
+always: true
 ---
 
 # Literature to recipe

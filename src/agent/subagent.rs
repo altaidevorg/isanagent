@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use super::ReasoningLoopCtx;
 use crate::bus::{BusMessage, InboundMessage, TelemetryEvent};
 use crate::clarification::ClarificationHub;
+use crate::config::ResolvedShellPolicy;
 use crate::logging::LoggerHandle;
 use crate::memory::{MemoryMessage, SharedReply};
 use crate::session::SessionManager;
@@ -58,6 +59,8 @@ pub struct SubagentSpawnDeps {
     pub memory_node: NodeHandle<MemoryMessage>,
     /// Same harness snapshot as the parent agent (sub-agents do not use autonomy-forbid).
     pub harness_runtime_summary: String,
+    /// Shell policy inherited from the parent agent.
+    pub shell_policy: std::sync::Arc<ResolvedShellPolicy>,
 }
 
 struct TaskRecord {
@@ -341,6 +344,7 @@ impl SubagentHarness {
             doom_loop_enabled: self.inner.deps.doom_loop_enabled,
             harness_runtime_summary: self.inner.deps.harness_runtime_summary.clone(),
             forbid_final_without_tools: false,
+            shell_policy: self.inner.deps.shell_policy.clone(),
         };
 
         record
@@ -653,7 +657,7 @@ impl Tool for SubagentPlanTool {
     }
 
     fn description(&self) -> &str {
-        "Run a multi-step plan: JSON object {\"steps\":[{\"id\":\"1\",\"depends_on\":[],\"prompt\":\"...\"}, ...]}. Steps run in dependency order (sequential). Each step sees prior steps' assistant-facing final output (subagent_spawn result text) in its prompt prefix."
+        "Run a multi-step plan: JSON object {\"steps\":[{\"id\":\"1\",\"depends_on\":[],\"prompt\":\"...\"}, ...]}. Steps run in dependency order (sequential). Recommended deep-research pattern: discovery -> deep read -> contradiction check -> synthesis. Each step sees prior steps' assistant-facing final output (subagent_spawn result text) in its prompt prefix."
     }
 
     fn parameters(&self) -> Value {

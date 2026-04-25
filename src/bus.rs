@@ -136,6 +136,32 @@ pub enum TelemetryEvent {
         /// `completed`, `failed`, or `cancelled`.
         status: String,
     },
+    /// Shell policy decision before executing `exec`.
+    ShellPolicyDecision {
+        chat_id: String,
+        #[serde(default)]
+        channel: String,
+        /// `ask`, `deny`, `allow`
+        mode: String,
+        /// `approval_requested`, `approval_granted`, `approval_denied`, `blocked`
+        decision: String,
+        /// Redacted command preview for diagnostics.
+        command_preview: String,
+    },
+    /// Non-blocking signal that a grep/cat/wc-style shell pipeline was attempted.
+    ShellGrepLikeDetected {
+        chat_id: String,
+        #[serde(default)]
+        channel: String,
+        command_preview: String,
+    },
+    /// Research-depth correction was injected (search without source fetch).
+    ResearchDepthNudge {
+        chat_id: String,
+        #[serde(default)]
+        channel: String,
+        reason: String,
+    },
 }
 
 /// Log severity levels for verbose diagnostics.

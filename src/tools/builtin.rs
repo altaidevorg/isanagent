@@ -704,7 +704,7 @@ impl Tool for SearchTextTool {
     }
 
     fn description(&self) -> &str {
-        "Search file contents with a Rust regex. Uses ripgrep when installed for speed and features (e.g. context lines); otherwise scans files under the search path (skips very large files in fallback mode)."
+        "Search file contents with a Rust regex. Prefer this over shell grep/findstr pipelines when locating code or logs. Uses ripgrep when installed for speed and context-line support; otherwise scans files under the search path (skipping very large files in fallback mode)."
     }
 
     fn parameters(&self) -> Value {
@@ -833,13 +833,9 @@ pub struct ShellExecTool {
 impl ShellExecTool {
     fn check_safety_guards(command: &str) -> Result<(), String> {
         let lower_cmd = command.to_lowercase();
-        // Mimic Nanobot destructive safety guards
+        // Hard safety rails for catastrophic host operations. Workflow-level policy (ask/deny/allow)
+        // handles common destructive workspace commands such as rm/del/git reset.
         let blocked_patterns = [
-            "rm -rf",
-            "rm -fr",
-            "del /f",
-            "del /q",
-            "rmdir /s",
             "format ",
             "mkfs",
             "diskpart",
@@ -870,7 +866,7 @@ impl Tool for ShellExecTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command and return its output. Use with caution. Bounded by a 60 second timeout."
+        "Execute a shell command and return its output (60s timeout). Host details (OS/shell/path style) are provided in RUNTIME CONTEXT each turn; write commands for that host. Prefer first-class tools (`search_text`, `read_file`, `glob_files`, `web_fetch`) before shell one-liners, especially for grep/cat/wc style tasks."
     }
 
     fn parameters(&self) -> Value {
@@ -895,6 +891,11 @@ impl Tool for ShellExecTool {
             .get("command")
             .and_then(|v| v.as_str())
             .ok_or("Missing 'command' argument")?;
+        let lower_cmd = command.to_ascii_lowercase();
+        let grep_like = lower_cmd.contains("grep ")
+            || lower_cmd.contains("| grep")
+            || lower_cmd.contains("cat ")
+            || lower_cmd.contains("wc ");
 
         Self::check_safety_guards(command)?;
 
@@ -945,6 +946,9 @@ impl Tool for ShellExecTool {
                 if result.is_empty() {
                     Ok("(no output)".to_string())
                 } else {
+                    if grep_like {
+                        result.push_str("\n\n[advisory] Prefer `search_text` for code/log discovery and `read_file` for file reads; shell grep/cat pipelines are less portable across hosts.");
+                    }
                     // Truncate if massive
                     if result.len() > 10000 {
                         Ok(format!(
@@ -1226,7 +1230,7 @@ impl Tool for WebSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search the web for **current** facts, docs, and release notes. Uses Jina (s.jina.ai) when [jina].enabled is true in config; otherwise DuckDuckGo Lite. Before writing ML library code, search for up-to-date APIs and examples; pair with `web_fetch` on authoritative URLs."
+        "Search the web for **current** facts, docs, and release notes. Discovery tool only: use this to find candidate sources, then follow with `web_fetch` on authoritative URLs before concluding. Uses Jina (s.jina.ai) when [jina].enabled is true in config; otherwise DuckDuckGo Lite."
     }
 
     fn parameters(&self) -> Value {
@@ -1270,7 +1274,7 @@ impl Tool for WebFetchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch a URL (docs, raw GitHub, paper pages). Uses Jina Reader (r.jina.ai) when [jina].enabled is true; otherwise direct GET with HTML text extraction or JSON pretty-print. Prefer official docs and pinned `raw.githubusercontent.com` sources when validating ML APIs."
+        "Fetch a URL in detail (docs, raw GitHub, paper pages). Use after `web_search` to read primary sources and extract evidence. Uses Jina Reader (r.jina.ai) when [jina].enabled is true; otherwise direct GET with HTML text extraction or JSON pretty-print. Prefer official docs and pinned `raw.githubusercontent.com` sources when validating ML APIs."
     }
 
     fn parameters(&self) -> Value {
