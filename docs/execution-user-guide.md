@@ -4,7 +4,7 @@ This guide is for **operators and users** of isanagent who want to run code safe
 
 ## What you get
 
-When **`[harness.execution] enabled = true`**, the agent gains these tools:
+When the execution harness is **not** turned off in config (it is **on by default**), the agent gains these tools:
 
 | Tool | Purpose |
 |------|--------|
@@ -29,24 +29,19 @@ Four providers are implemented today:
 - **`local`** — each session uses a working directory under your workspace sandbox. **Python (default):** one long-lived interpreter per session (**REPL-like**): variables and imports persist across **`execution_run`** calls until the session closes, you cancel, a run times out, or the working directory for the run changes (then the interpreter is restarted in the new cwd). Code is sent over a framed stdin/stdout channel to the worker (not via argv). **Opt out** with **`local_python_mode = "subprocess"`** in **`[harness.execution]`** to use a fresh **`python -u -`** subprocess per run (legacy, stateless). **Runtime choice:** `local_python_runtime = "uv_managed"` (default) provisions and reuses a managed env under `workspace_dir/.system_generated/uv/envs/`; `local_python_runtime = "system"` requires explicitly setting `python_executable`. If uv is missing at startup and uv-managed runtime is active, terminal mode prompts for yes/no auto-install and `/install-python` can be used later. **Shell** sessions still use one short-lived **`sh -c`** / **`cmd /C`** per run. Stdout/stderr are capped the same as **`max_output_bytes`** (half per stream, minimum each side). On Unix the child is placed in its own process group and cancellation/timeout sends **SIGKILL** to that group (similar to Windows **`taskkill /T`**); **`SIGKILL`** is never sent for PID 0 or 1.
 - **`jupyter`** — each session is a **Jupyter Server** kernel you point at with `base_url` + token; runs use the kernel’s WebSocket execute channel (persistent variables, interrupt via server API). **`display_data` / `execute_result`** may include **`image/png`**, **`image/jpeg`**, large **`text/csv`**, or large **`application/json`** payloads: those are written under **`sandbox_dir/.execution_artifacts/<session_id>/<run_uuid>/`** (size-capped) and referenced in **`RunResult.attachments`**; stdout gets short `[execution artifact] …` lines. Use **`execution_artifact_list`** to browse.
 - **`ssh`** — **`execution_session_create`** opens one authenticated SSH session (TCP + handshake) to the configured host and keeps it open for that session; each **`execution_run`** opens a new exec channel, runs a short remote `cd … && exec python3 -u -` (or `exec bash -s` for shell), and **streams your code on channel stdin** so large payloads are not embedded in `argv`. There is **no** Jupyter-style persistent kernel variables across runs—only the transport is reused. **`execution_cancel`** only cancels the client wait (remote process may keep running). Use **`identity_file`** (OpenSSH private key) and/or host env **`SSH_PASSWORD`** (never commit passwords in `config.toml`).
-- **`colab_mcp`** — **`execution_session_create`** starts a local MCP process (default `uvx git+https://github.com/googlecolab/colab-mcp`), performs MCP init + tool discovery, and selects a Colab execution tool (auto-detected or configured). The provider then sends `execution_run` code through MCP `tools/call` into the connected Colab browser runtime. MVP limitations: no interrupt, no artifact extraction, and tool naming differs across frontends (configure `execute_tool_name` / `execute_code_arg_keys` when auto-detection fails). Colab MCP also exposes **many other proxied tools** (Drive, runtime, files, etc.) after the browser connects; see **`docs/colab-mcp-positioning.md`** for how those relate to `ExecutionProvider` and future integration options.
+- **`colab_mcp`** — **`execution_session_create`** starts a local MCP process (default `uvx git+https://github.com/googlecolab/colab-mcp`), performs MCP init + tool discovery, and selects a Colab execution tool (auto-detected or configured). The provider then sends `execution_run` code through MCP `tools/call` into the connected Colab browser runtime. MVP limitations: no interrupt, no artifact extraction, and tool naming differs across frontends (configure `execute_tool_name` / `execute_code_arg_keys` when auto-detection fails). Colab MCP also exposes **many other proxied tools** (Drive, runtime, files, etc.) after the browser connects; see **`docs/colab-mcp-positioning.md`**. **`colab_mcp_tool_call`** is registered when `default_provider` is **`colab_mcp`** and extra MCP tool call settings in config allow it; see **`[harness.execution.colab_mcp]`** keys below.
 
 Other hosted remotes (Colab-shaped providers, policy-gated **provisioners** that allocate targets) are described in **`execution-implementation-plan.md`** and are not the same as this SSH provider.
 
-## Enable the feature
+## Configuration
 
-In your workspace **`config.toml`** (next to `.agents/`, not inside the sandbox):
-
-```toml
-[harness.execution]
-enabled = true
-```
+Execution is **on by default** with **`default_provider = "colab_mcp"`** when keys are omitted. To disable the harness, set **`[harness.execution] enabled = false`** in workspace **`config.toml`** (next to `.agents/`, not inside the sandbox). If you restrict **`allowed_providers`**, set **`default_provider`** to a member of that list (for example **`local`** when only local runs are allowed).
 
 Optional keys (defaults are sensible if omitted):
 
 | Key | Meaning |
 |-----|--------|
-| `default_provider` | **`local`** (sandbox process), **`jupyter`** (remote kernel), **`ssh`** (remote exec over SSH), or **`colab_mcp`** (Colab browser bridge over MCP stdio). |
+| `default_provider` | **`colab_mcp`** (default), **`local`** (sandbox process), **`jupyter`** (remote kernel), or **`ssh`** (remote exec over SSH). |
 | `max_wall_secs` | Upper bound on each run’s **`timeout_secs`** (default **3600**, clamped **1–86400** seconds = up to 24h). Raise this when you need longer blocking or background runs. |
 | `default_execution_timeout_secs` | Default wall clock when the model omits **`timeout_secs`** on **`execution_run`** / **`execution_run_background`** (default **600**, clamped to **`max_wall_secs`**). |
 | `max_output_bytes` | Max combined stdout+stderr per run (default 256 KiB). |
@@ -180,12 +175,7 @@ The client requests WebSocket subprotocol **`v1.kernel.websocket.jupyter.org`** 
    set JUPYTER_TOKEN=...your-token...
    ```
    (Unix: `export JUPYTER_TOKEN=...`) or put `token = "..."` under `[harness.execution.jupyter]` only for local experiments.
-4. In **`config.toml`**, set `default_provider = "jupyter"` and:
-   ```toml
-   [harness.execution.jupyter]
-   base_url = "http://127.0.0.1:8888"
-   ```
-   Use the **server root** (`http://…:port`), not the `/lab?token=…` page URL.
+4. In **`config.toml`**, set **`default_provider = "jupyter"`** and fill **`[harness.execution.jupyter]`** (at minimum **`base_url`** as the server root `http://…:port`, not the `/lab?token=…` page URL).
 5. Restart isanagent. You may see Jupyter log **`No session ID specified`** on first WebSocket traffic; that is a known server warning and does not block execution.
 
 ### Jupyter: troubleshooting
@@ -223,7 +213,7 @@ Start the binary with your workspace, for example:
 cargo run --release -p isanagent -- --workspace /path/to/my_agent
 ```
 
-Ensure your **`[provider]`** API key env is set. The model should see the execution tools in its tool list once enabled.
+Ensure your **`[provider]`** API key env is set. The model should see the execution tools in its tool list whenever the harness is not disabled.
 
 The Ratatui alternate-screen UI includes:
 

@@ -4,6 +4,7 @@
 //! forwards `execution_run` as MCP `tools/call` requests to a notebook-execution tool.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,7 +14,7 @@ use log::{trace, warn};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 
 use super::capabilities::{
@@ -43,11 +44,6 @@ pub struct ColabMcpExecutionProvider {
     sessions: DashMap<SessionId, Arc<ColabMcpSession>>,
 }
 
-struct ColabMcpSession {
-    client: Mutex<McpProcessClient>,
-    execution_mode: ColabExecutionMode,
-}
-
 #[derive(Debug, Clone)]
 enum ColabExecutionMode {
     Direct {
@@ -63,6 +59,12 @@ enum ColabExecutionMode {
     },
 }
 
+#[derive(Debug, Clone)]
+struct McpToolDef {
+    name: String,
+    input_schema: Option<Value>,
+}
+
 /// Max buffered out-of-band JSON-RPC messages (notifications / stray responses) while waiting
 /// for a matching response id. Oldest entries are dropped when full.
 const MCP_INCOMING_BUFFER_CAP: usize = 64;
@@ -72,10 +74,19 @@ struct McpProcessClient {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
+    /// Set when the server sends MCP `notifications/tools/list_changed`.
+    tools_list_dirty: Arc<AtomicBool>,
     /// Messages read from stdout that were not the JSON-RPC response for the in-flight request.
     incoming_buffer: VecDeque<Value>,
     stderr_tail: Arc<Mutex<String>>,
     stderr_reader: JoinHandle<()>,
+}
+
+struct ColabMcpSession {
+    client: Mutex<McpProcessClient>,
+    execution_mode: ColabExecutionMode,
+    /// Last `tools/list` snapshot for this session (refreshed on `notifications/tools/list_changed`).
+    cached_tools: Arc<RwLock<Vec<McpToolDef>>>,
 }
 
 async fn append_stderr_lines(tail: Arc<Mutex<String>>, stderr: ChildStderr) {
@@ -139,6 +150,40 @@ impl ColabMcpExecutionProvider {
             caps,
             sessions: DashMap::new(),
         })
+    }
+
+    /// Call a proxied Colab MCP tool by name (used by `colab_mcp_tool_call` after allowlist checks).
+    pub async fn call_mcp_tool_raw(
+        &self,
+        session_id: &SessionId,
+        tool_name: &str,
+        arguments: serde_json::Map<String, Value>,
+    ) -> Result<Value, ExecutionError> {
+        let sess = self
+            .sessions
+            .get(session_id)
+            .map(|r| r.value().clone())
+            .ok_or_else(|| ExecutionError::InvalidSession(session_id.to_string()))?;
+        let mut guard = sess.client.lock().await;
+        if guard.take_tools_list_dirty() {
+            let t = guard.list_tools().await?;
+            *sess.cached_tools.write().await = t;
+        }
+        guard.call_tool_raw(tool_name, arguments).await
+    }
+
+    /// Tool names from the last `tools/list` (or last refresh after `notifications/tools/list_changed`).
+    pub async fn list_cached_mcp_tool_names(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<String>, ExecutionError> {
+        let sess = self
+            .sessions
+            .get(session_id)
+            .map(|r| r.value().clone())
+            .ok_or_else(|| ExecutionError::InvalidSession(session_id.to_string()))?;
+        let g = sess.cached_tools.read().await;
+        Ok(g.iter().map(|t| t.name.clone()).collect())
     }
 }
 
@@ -357,9 +402,11 @@ impl ExecutionProvider for ColabMcpExecutionProvider {
             extensions: ext,
         };
 
+        let cached_tools = Arc::new(RwLock::new(tools.clone()));
         let session = Arc::new(ColabMcpSession {
             client: Mutex::new(client),
             execution_mode,
+            cached_tools,
         });
         self.sessions.insert(sid.clone(), session);
         Ok(SessionHandle {
@@ -391,8 +438,13 @@ impl ExecutionProvider for ColabMcpExecutionProvider {
         let sess = self
             .sessions
             .get(session_id)
+            .map(|r| r.value().clone())
             .ok_or_else(|| ExecutionError::InvalidSession(session_id.to_string()))?;
         let mut guard = sess.client.lock().await;
+        if guard.take_tools_list_dirty() {
+            let t = guard.list_tools().await?;
+            *sess.cached_tools.write().await = t;
+        }
         let run_timeout = Duration::from_secs(spec.timeout_secs.max(1));
         let output = match &sess.execution_mode {
             ColabExecutionMode::Direct {
@@ -498,10 +550,15 @@ impl McpProcessClient {
             stdin,
             stdout: BufReader::new(stdout),
             next_id: 1,
+            tools_list_dirty: Arc::new(AtomicBool::new(false)),
             incoming_buffer: VecDeque::new(),
             stderr_tail,
             stderr_reader,
         })
+    }
+
+    fn take_tools_list_dirty(&self) -> bool {
+        self.tools_list_dirty.swap(false, Ordering::AcqRel)
     }
 
     async fn stderr_hint(&self) -> String {
@@ -536,11 +593,35 @@ impl McpProcessClient {
         self.incoming_buffer.push_back(msg);
     }
 
+    fn consume_tools_list_changed_if_notification(dirty: &AtomicBool, msg: &Value) -> bool {
+        let Some(Value::String(method)) = msg.get("method") else {
+            return false;
+        };
+        let m = method.as_str();
+        let hit = m == "notifications/tools/list_changed"
+            || m == "tools/list_changed"
+            || m.ends_with("/tools/list_changed");
+        if hit {
+            dirty.store(true, Ordering::Release);
+            trace!("colab_mcp: tools/list changed notification ({m})");
+        }
+        hit
+    }
+
     async fn next_decoded_message(&mut self) -> Result<Value, ExecutionError> {
-        if let Some(msg) = self.incoming_buffer.pop_front() {
+        loop {
+            if let Some(msg) = self.incoming_buffer.pop_front() {
+                if Self::consume_tools_list_changed_if_notification(&self.tools_list_dirty, &msg) {
+                    continue;
+                }
+                return Ok(msg);
+            }
+            let msg = self.read_message_from_wire().await?;
+            if Self::consume_tools_list_changed_if_notification(&self.tools_list_dirty, &msg) {
+                continue;
+            }
             return Ok(msg);
         }
-        self.read_message_from_wire().await
     }
 
     async fn initialize(&mut self) -> Result<(), ExecutionError> {
@@ -637,6 +718,9 @@ impl McpProcessClient {
                     ExecutionError::Provider(format!("MCP {method} missing result"))
                 });
             }
+            if Self::consume_tools_list_changed_if_notification(&self.tools_list_dirty, &msg) {
+                continue;
+            }
             // Preserve notifications and unrelated responses for a later request (same client).
             self.push_incoming_buffered(msg);
         }
@@ -710,12 +794,6 @@ impl McpProcessClient {
         self.stderr_reader.abort();
         let _ = self.child.kill().await;
     }
-}
-
-#[derive(Debug, Clone)]
-struct McpToolDef {
-    name: String,
-    input_schema: Option<Value>,
 }
 
 fn pick_execute_tool_name(

@@ -12,7 +12,7 @@ max_web_tool_output_chars = 50000
 enabled = true
 
 [provider]
-model_name = "gemini-3-flash-preview"
+model_name = "gemini-3.1-pro-preview-customtools"
 api_key_env = "GEMINI_API_KEY"
 base_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 
@@ -84,30 +84,23 @@ enabled = true
 # subagent_research_overlay = false  # default true when enabled: extra research instructions for sub-agents only
 # forbid_final_without_tools = true   # default false: require at least one tool call before ending a reasoning step (also overridable via inbound metadata isanagent_autonomous_forbid_final_without_tools)
 
-# `execution_session_close`, `execution_env_info` (local, Jupyter, SSH, or Colab MCP).
-# Operator guide: docs/execution-user-guide.md — roadmap: docs/execution-implementation-plan.md
+# Execution: docs/execution-user-guide.md
 [harness.execution]
-enabled = false
-# default_provider = "local"          # "local" | "jupyter" | "ssh" | "colab_mcp"
-# max_wall_secs = 3600                 # clamp per-run timeout_secs (default 3600; max 86400)
-# default_execution_timeout_secs = 600 # when the model omits timeout_secs (default 600; clamped to max_wall_secs)
-# max_output_bytes = 262144            # stdout+stderr cap per run (default 256 KiB)
-# max_sessions = 32                    # concurrent sessions (default 32)
+enabled = true
+default_provider = "colab_mcp"
 allowed_providers = ["local", "jupyter", "colab_mcp"]
-local_python_mode = "repl"           # "repl" (default) or "subprocess" for one fresh process per run
-local_python_runtime = "uv_managed"    # default runtime; auto-provisions local Python with uv
-uv_binary = "uv"                     # used only with local_python_runtime = "uv_managed"
-uv_python = "3.11"                   # used only with local_python_runtime = "uv_managed"
-uv_requirements = ["afterimage>=0.16.0"]  # optional initial packages for uv-managed runtime
-# python_executable = "/usr/bin/python3"    # required only when local_python_runtime = "system"
+local_python_mode = "repl"
+local_python_runtime = "uv_managed"
+uv_binary = "uv"
+uv_python = "3.11"
+uv_requirements = ["afterimage>=0.15.0"]
 
-# When you enable "jupyter": set base_url; token from JUPYTER_TOKEN env preferred over `token` here.
 [harness.execution.jupyter]
 base_url = "http://127.0.0.1:8888"
 token = "<changethis>"
 kernel_name = "python3"
 
-# When you enable "ssh": set host, user, remote_workdir; use identity_file and/or env SSH_PASSWORD.
+# Uncomment when default_provider = "ssh" (key or SSH_PASSWORD in env).
 # [harness.execution.ssh]
 # host = "my.server.example"
 # port = 22
@@ -115,13 +108,15 @@ kernel_name = "python3"
 # identity_file = "~/.ssh/id_ed25519"
 # remote_workdir = "/tmp/isanagent-exec"
 # remote_python = "python3"
-# accept_unknown_host_keys = true   # default true (MITM risk); false = fail until strict host keys exist
+# accept_unknown_host_keys = true
 
-# When you enable "colab_mcp": local browser + uv are typically required.
+# Uncomment to override Colab MCP defaults (browser + uv).
 # [harness.execution.colab_mcp]
 # command = "uvx"
 # args = ["git+https://github.com/googlecolab/colab-mcp"]
 # startup_timeout_secs = 30
 # connect_tool_name = "open_colab_browser_connection"
-# execute_tool_name = "execute_python"         # optional; set if auto-detection fails
-# execute_code_arg_keys = ["code", "source"]   # optional fallback preference
+# execute_tool_name = "execute_python"
+# execute_code_arg_keys = ["code", "source"]
+# extra_mcp_tool_call_enabled = true
+# extra_mcp_tool_allowlist = ["*"]

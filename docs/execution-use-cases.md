@@ -1,6 +1,6 @@
 # Execution harness — scripted use cases
 
-Short scenarios for manual or regression testing when **`[harness.execution] enabled = true`**. All paths are relative to your workspace sandbox unless noted.
+Short scenarios for manual or regression testing when the execution harness is active (it is on by default unless **`[harness.execution] enabled = false`**). All paths are relative to your workspace sandbox unless noted.
 
 ## 1. Local Python smoke (system runtime)
 

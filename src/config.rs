@@ -63,12 +63,16 @@ pub struct ColabMcpExecutionConfig {
     pub execute_tool_name: Option<String>,
     /// Preferred code argument keys to try in order (default `["code","source","cell","input"]`).
     pub execute_code_arg_keys: Option<Vec<String>>,
+    /// When true, register agent tool `colab_mcp_tool_call` for allowlisted MCP tools (default true).
+    pub extra_mcp_tool_call_enabled: Option<bool>,
+    /// Glob patterns matched against MCP tool names (e.g. `mount_*`). Default `["*"]`.
+    pub extra_mcp_tool_allowlist: Option<Vec<String>>,
 }
 
-/// Code execution harness (`execution_*` tools). Disabled unless `[harness.execution] enabled = true`.
+/// Code execution harness (`execution_*` tools). On by default; set `[harness.execution] enabled = false` to disable.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct ExecutionHarnessConfig {
-    /// Register execution tools when true (default: false).
+    /// When `Some(false)`, execution tools are not registered. Omitted or `Some(true)` keeps them on.
     pub enabled: Option<bool>,
     /// Provider id: `local` (subprocess), `jupyter` (remote kernel), or `ssh` (remote exec).
     pub default_provider: Option<String>,
@@ -399,13 +403,12 @@ impl AppConfig {
             .clamp(MIN, MAX)
     }
 
-    /// `[harness.execution] enabled = true` registers `execution_*` tools.
+    /// When false under `[harness.execution]`, execution tools are not registered. Otherwise on (including when the table is omitted).
     pub fn execution_harness_enabled(&self) -> bool {
-        self.harness
-            .as_ref()
-            .and_then(|h| h.execution.as_ref())
-            .and_then(|e| e.enabled)
-            .unwrap_or(false)
+        match self.harness.as_ref().and_then(|h| h.execution.as_ref()) {
+            None => true,
+            Some(e) => e.enabled.unwrap_or(true),
+        }
     }
 
     /// `[harness.ml_engineer] enabled = true` appends ML policy overlay to the system prompt.
@@ -562,7 +565,7 @@ impl AppConfig {
             .and_then(|e| e.default_provider.as_ref())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "local".to_string())
+            .unwrap_or_else(|| "colab_mcp".to_string())
     }
 
     pub fn execution_max_output_bytes(&self) -> usize {
@@ -982,6 +985,32 @@ impl AppConfig {
                 ]
             })
     }
+
+    pub fn execution_colab_mcp_extra_mcp_tool_call_enabled(&self) -> bool {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.colab_mcp.as_ref())
+            .and_then(|c| c.extra_mcp_tool_call_enabled)
+            .unwrap_or(true)
+    }
+
+    pub fn execution_colab_mcp_extra_mcp_tool_allowlist(&self) -> Vec<String> {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.colab_mcp.as_ref())
+            .and_then(|c| c.extra_mcp_tool_allowlist.as_ref())
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec!["*".to_string()])
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -1065,6 +1094,7 @@ mod tests {
         let s = r#"
 [harness.execution]
 enabled = true
+default_provider = "local"
 max_wall_secs = 90
 max_output_bytes = 8192
 allowed_providers = ["local"]
@@ -1081,6 +1111,25 @@ python_executable = "python3"
     }
 
     #[test]
+    fn harness_execution_on_by_default_without_harness_section() {
+        let s = "restrict_to_workspace = true\n";
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        assert!(c.execution_harness_enabled());
+        assert_eq!(c.execution_default_provider(), "colab_mcp");
+    }
+
+    #[test]
+    fn harness_execution_explicit_disabled() {
+        let s = r#"
+restrict_to_workspace = true
+[harness.execution]
+enabled = false
+"#;
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        assert!(!c.execution_harness_enabled());
+    }
+
+    #[test]
     fn harness_execution_defaults_when_only_enabled() {
         let s = r#"
 [harness.execution]
@@ -1090,6 +1139,7 @@ enabled = true
         assert_eq!(c.execution_max_wall_secs(), 3600);
         assert_eq!(c.execution_default_run_timeout_secs(), 600);
         assert_eq!(c.execution_local_python_runtime(), "uv_managed");
+        assert_eq!(c.execution_default_provider(), "colab_mcp");
     }
 
     #[test]
@@ -1257,6 +1307,8 @@ startup_timeout_secs = 45
 connect_tool_name = "open_colab_browser_connection"
 execute_tool_name = "execute_python"
 execute_code_arg_keys = ["code", "source"]
+extra_mcp_tool_call_enabled = true
+extra_mcp_tool_allowlist = ["get_*", "mount_drive"]
 "#;
         let c: AppConfig = toml::from_str(s).expect("parse");
         assert_eq!(c.execution_default_provider(), "colab_mcp");
@@ -1278,6 +1330,26 @@ execute_code_arg_keys = ["code", "source"]
         assert_eq!(
             c.execution_colab_mcp_execute_code_arg_keys(),
             vec!["code".to_string(), "source".to_string()]
+        );
+        assert!(c.execution_colab_mcp_extra_mcp_tool_call_enabled());
+        assert_eq!(
+            c.execution_colab_mcp_extra_mcp_tool_allowlist(),
+            vec!["get_*".to_string(), "mount_drive".to_string()]
+        );
+    }
+
+    #[test]
+    fn harness_execution_colab_mcp_extra_tools_defaults_enabled() {
+        let s = r#"
+[harness.execution]
+enabled = true
+default_provider = "colab_mcp"
+"#;
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        assert!(c.execution_colab_mcp_extra_mcp_tool_call_enabled());
+        assert_eq!(
+            c.execution_colab_mcp_extra_mcp_tool_allowlist(),
+            vec!["*".to_string()]
         );
     }
 

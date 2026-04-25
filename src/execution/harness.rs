@@ -18,6 +18,8 @@ use super::ssh::{SshExecutionProvider, SshExecutionProviderConfig};
 /// Owns the active [`ExecutionProvider`] and small bits of host config tools need (e.g. `-V` probe).
 pub struct ExecutionHarness {
     provider: Arc<dyn ExecutionProvider>,
+    /// Set when `default_provider = "colab_mcp"`: typed access for `colab_mcp_tool_call` and catalog refresh.
+    colab_mcp: Option<Arc<ColabMcpExecutionProvider>>,
     python_executable: String,
     workspace_dir: PathBuf,
     sandbox_dir: PathBuf,
@@ -40,6 +42,7 @@ impl ExecutionHarness {
     ) -> Self {
         Self {
             provider,
+            colab_mcp: None,
             python_executable: python_executable.into(),
             workspace_dir,
             sandbox_dir,
@@ -47,6 +50,33 @@ impl ExecutionHarness {
             default_run_timeout_secs,
             max_wall_secs,
         }
+    }
+
+    /// Colab MCP harness only (`default_provider = "colab_mcp"`).
+    pub fn new_colab_mcp(
+        colab: Arc<ColabMcpExecutionProvider>,
+        python_executable: impl Into<String>,
+        workspace_dir: PathBuf,
+        sandbox_dir: PathBuf,
+        artifact_limits: ArtifactLimits,
+        default_run_timeout_secs: u64,
+        max_wall_secs: u64,
+    ) -> Self {
+        let provider: Arc<dyn ExecutionProvider> = colab.clone();
+        Self {
+            provider,
+            colab_mcp: Some(colab),
+            python_executable: python_executable.into(),
+            workspace_dir,
+            sandbox_dir,
+            artifact_limits,
+            default_run_timeout_secs,
+            max_wall_secs,
+        }
+    }
+
+    pub fn colab_mcp(&self) -> Option<&Arc<ColabMcpExecutionProvider>> {
+        self.colab_mcp.as_ref()
     }
 
     pub fn provider(&self) -> &Arc<dyn ExecutionProvider> {
@@ -88,7 +118,7 @@ impl ExecutionHarness {
     }
 }
 
-/// Build the harness from workspace + app config. Call only when `[harness.execution] enabled = true`.
+/// Build the harness from workspace + app config. Call only when `AppConfig::execution_harness_enabled()` is true.
 pub fn build_execution_harness(
     workspace_dir: PathBuf,
     sandbox_dir: PathBuf,
@@ -223,9 +253,11 @@ pub fn build_execution_harness(
                 max_sessions: config.execution_max_sessions(),
                 max_output_bytes: config.execution_max_output_bytes(),
             };
-            let p = ColabMcpExecutionProvider::new(cc).map_err(|e: ExecutionError| e.to_string())?;
-            Ok(Arc::new(ExecutionHarness::new(
-                Arc::new(p),
+            let p = Arc::new(
+                ColabMcpExecutionProvider::new(cc).map_err(|e: ExecutionError| e.to_string())?,
+            );
+            Ok(Arc::new(ExecutionHarness::new_colab_mcp(
+                p,
                 config.execution_python_executable(),
                 workspace_dir,
                 sandbox_dir,

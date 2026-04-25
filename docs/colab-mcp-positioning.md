@@ -61,12 +61,13 @@ The harness or a dedicated **`colab_mcp_*` agent tool** can downcast / match on 
 
 ### 4. Dedicated agent tools (special case, still clean UX)
 
-Examples:
+Implemented in `isanagent`:
 
-- `colab_mcp_tools_list` — refresh and return tool names + short schema hints for the model.
-- `colab_mcp_tool_call` — generic passthrough with config-guarded allowlist/denylist.
+- **`colab_mcp_tool_call`** — passthrough `tools/call` for an existing Colab MCP execution session when config registers it for `default_provider = "colab_mcp"`. Use `list_cached_tool_names: true` to read the cached `tools/list` names. Prefer **`execution_run`** for Python.
 
-This is a **special case at the tool registry layer**, not in the core trait, and maps well to how MCP clients are supposed to handle evolving tool lists.
+Optional future: `colab_mcp_tools_list` with richer schema hints (today the cache + `execution_env_info` colab note suffice for many flows).
+
+This stays a **tool-registry** concern, not an `ExecutionProvider` method.
 
 ### 5. Full “MCP client in the agent” (only if needed)
 
@@ -85,7 +86,7 @@ Overloading `RunSpec` with Colab-only fields tends to rot; prefer **explicit too
 
 ## Upstream client expectations
 
-The Colab MCP README states that clients should support **`notifications/tools/list_changed`**. Long term, `isanagent` should handle that notification (refresh cached tool list, update session capabilities). That aligns with both extension exposure and robust execution discovery.
+The Colab MCP README states that clients should support **`notifications/tools/list_changed`**. `isanagent` now marks the MCP client dirty on that notification, **refreshes `tools/list` into a per-session cache** before the next `execution_run` or `colab_mcp_tool_call`, and records tool names for `list_cached_tool_names` (session capabilities extensions are unchanged for stability).
 
 ## References
 

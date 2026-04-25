@@ -37,10 +37,10 @@ use isanagent::tools::builtin::{
     SearchTextTool, ShellExecTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use isanagent::tools::execution::{
-    ExecutionArtifactListTool, ExecutionCancelTool, ExecutionEnvInfoTool, ExecutionJobCancelTool,
-    ExecutionJobListTool, ExecutionJobResultTool, ExecutionJobStatusTool,
-    ExecutionRunBackgroundTool, ExecutionRunTool, ExecutionSessionCloseTool,
-    ExecutionSessionCreateTool,
+    compile_colab_mcp_tool_allowlist, ColabMcpToolCallTool, ExecutionArtifactListTool,
+    ExecutionCancelTool, ExecutionEnvInfoTool, ExecutionJobCancelTool, ExecutionJobListTool,
+    ExecutionJobResultTool, ExecutionJobStatusTool, ExecutionRunBackgroundTool, ExecutionRunTool,
+    ExecutionSessionCloseTool, ExecutionSessionCreateTool,
 };
 use isanagent::tools::ml_domain::{ArxivFetchTool, ArxivSearchTool, HfHubFileFetchTool};
 use isanagent::tools::workflow::{AskUserTool, TodoWriteTool, ToolSearchTool};
@@ -53,7 +53,7 @@ const DEFAULT_PROVIDER_API_KEY_ENV: &str = "GEMINI_API_KEY";
 const DEFAULT_PROVIDER_BASE_URL: &str =
     "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
 
-/// Appended to the workspace system prompt when `[harness.execution] enabled = true`.
+/// Appended to the workspace system prompt when the execution harness is enabled.
 const EXECUTION_HARNESS_SYSTEM_GUIDANCE: &str = r#"
 
 --- Execution harness ---
@@ -65,6 +65,7 @@ const EXECUTION_HARNESS_SYSTEM_GUIDANCE: &str = r#"
 - Prefer grep-friendly logging in training scripts (plain text lines) so stdout stays searchable in captured logs.
 - Know where outputs live: sandbox-relative paths, execution_artifact_list, run journals under workspace_dir/.system_generated/execution_history/, and execution_runs.jsonl.
 - For Jupyter/SSH: confirm interpreter and (if needed) GPU visibility with a tiny execution_run before a long job.
+- For Colab MCP: use execution_run for Python. If `colab_mcp_tool_call` is registered (config allowlist), use it only for allowlisted MCP tools (e.g. Drive); keep arguments minimal and time-bounded.
 "#;
 
 /// isanagent: A terminal chat interface and autonomous agent engine
@@ -341,7 +342,40 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         tools.register(Box::new(ExecutionSessionCloseTool {
             harness: harness.clone(),
         }));
-        tools.register(Box::new(ExecutionEnvInfoTool { harness }));
+        tools.register(Box::new(ExecutionEnvInfoTool {
+            harness: harness.clone(),
+        }));
+        if workspace.config.execution_default_provider() == "colab_mcp"
+            && workspace
+                .config
+                .execution_colab_mcp_extra_mcp_tool_call_enabled()
+        {
+            let patterns = workspace
+                .config
+                .execution_colab_mcp_extra_mcp_tool_allowlist();
+            if patterns.is_empty() {
+                log::warn!(
+                    "extra_mcp_tool_call_enabled is true but extra_mcp_tool_allowlist is empty; skipping colab_mcp_tool_call registration."
+                );
+            } else {
+                match compile_colab_mcp_tool_allowlist(&patterns) {
+                    Ok(gs) => {
+                        let max_chars = workspace
+                            .config
+                            .execution_max_output_bytes()
+                            .min(512 * 1024);
+                        tools.register(Box::new(ColabMcpToolCallTool {
+                            harness: harness.clone(),
+                            allowlist: gs,
+                            max_result_chars: max_chars,
+                        }));
+                    }
+                    Err(e) => log::warn!(
+                        "invalid extra_mcp_tool_allowlist: {e}; skipping colab_mcp_tool_call"
+                    ),
+                }
+            }
+        }
     }
     let jina = workspace.config.jina_web_backend();
     let max_web_output_chars = workspace.config.effective_max_web_tool_output_chars();

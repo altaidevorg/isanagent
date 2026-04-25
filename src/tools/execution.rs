@@ -1,9 +1,10 @@
-//! Gated harness tools for the execution plane (`[harness.execution] enabled = true`).
+//! Harness tools for the execution plane (omitted unless `AppConfig::execution_harness_enabled()` is false).
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use log::info;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -21,6 +22,33 @@ use crate::traits::Tool;
 
 fn exec_err(e: ExecutionError) -> String {
     e.to_string()
+}
+
+/// Build a glob set for `[harness.execution.colab_mcp].extra_mcp_tool_allowlist`.
+pub fn compile_colab_mcp_tool_allowlist(patterns: &[String]) -> Result<GlobSet, String> {
+    let mut builder = GlobSetBuilder::new();
+    for p in patterns {
+        let t = p.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let g = Glob::new(t).map_err(|e| format!("invalid glob {p:?}: {e}"))?;
+        builder.add(g);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("allowlist glob set error: {e}"))
+}
+
+fn cap_mcp_tool_json_text(s: String, max: usize) -> String {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n... (truncated)", &s[..end])
 }
 
 fn require_session_id(args: &Value) -> Result<SessionId, String> {
@@ -666,6 +694,87 @@ impl Tool for ExecutionSessionCloseTool {
     }
 }
 
+/// Call an allowlisted MCP tool on an existing Colab MCP execution session (`default_provider = colab_mcp`).
+pub struct ColabMcpToolCallTool {
+    pub harness: Arc<ExecutionHarness>,
+    pub allowlist: GlobSet,
+    pub max_result_chars: usize,
+}
+
+#[async_trait]
+impl Tool for ColabMcpToolCallTool {
+    fn name(&self) -> &str {
+        "colab_mcp_tool_call"
+    }
+
+    fn description(&self) -> &str {
+        "Colab MCP only: invoke a proxied MCP tool in the connected browser session. `tool_name` must match a pattern in `[harness.execution.colab_mcp].extra_mcp_tool_allowlist`. Use `list_cached_tool_names: true` to list tool names from the last `tools/list` (refreshed when the server sends `notifications/tools/list_changed`). Prefer `execution_run` for Python code cells."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "session_id": { "type": "string" },
+                "tool_name": { "type": "string", "description": "MCP tool name from tools/list" },
+                "arguments": { "type": "object", "description": "MCP tool arguments (JSON object)" },
+                "list_cached_tool_names": { "type": "boolean", "description": "If true, return cached tool names only" },
+                "timeout_secs": { "type": "integer", "description": "Wall clock for the MCP call (default 120, capped by max_wall_secs)" }
+            },
+            "required": ["session_id"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, String> {
+        let cm = self.harness.colab_mcp().ok_or_else(|| {
+            "colab_mcp_tool_call requires [harness.execution] default_provider = \"colab_mcp\""
+                .to_string()
+        })?;
+        let sid = require_session_id(&args)?;
+        if args.get("list_cached_tool_names").and_then(|v| v.as_bool()) == Some(true) {
+            let names = cm
+                .list_cached_mcp_tool_names(&sid)
+                .await
+                .map_err(exec_err)?;
+            return serde_json::to_string_pretty(&json!({ "cached_tool_names": names }))
+                .map_err(|e| e.to_string());
+        }
+        let tool_name = args
+            .get("tool_name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Missing tool_name (or set list_cached_tool_names: true)".to_string())?;
+        let tool_name = tool_name.trim();
+        if tool_name.is_empty() {
+            return Err("tool_name must be non-empty".to_string());
+        }
+        if !self.allowlist.is_match(tool_name) {
+            return Err(format!(
+                "tool_name {tool_name:?} does not match any pattern in extra_mcp_tool_allowlist"
+            ));
+        }
+        let arguments = args
+            .get("arguments")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let cap_secs = self.harness.max_wall_secs.max(1);
+        let timeout_secs = args
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(120)
+            .clamp(1, cap_secs);
+        let out = tokio::time::timeout(
+            Duration::from_secs(timeout_secs),
+            cm.call_mcp_tool_raw(&sid, tool_name, arguments),
+        )
+        .await
+        .map_err(|_| format!("colab_mcp_tool_call timed out after {timeout_secs}s"))?
+        .map_err(exec_err)?;
+        let s = serde_json::to_string(&out).map_err(|e| e.to_string())?;
+        Ok(cap_mcp_tool_json_text(s, self.max_result_chars))
+    }
+}
+
 /// Host-oriented snapshot (capabilities + optional python -V).
 pub struct ExecutionEnvInfoTool {
     pub harness: Arc<ExecutionHarness>,
@@ -711,6 +820,11 @@ impl Tool for ExecutionEnvInfoTool {
             "default_run_timeout_secs": def_timeout,
             "timeout_policy": timeout_policy,
         });
+        if self.harness.colab_mcp().is_some() {
+            v["colab_mcp"] = json!({
+                "note": "When [harness.execution.colab_mcp] extra_mcp_tool_call_enabled = true and extra_mcp_tool_allowlist is set, tool colab_mcp_tool_call is registered for allowlisted MCP tools."
+            });
+        }
         let probe = tokio::task::spawn_blocking({
             let exe = exe.to_string();
             move || {
@@ -742,6 +856,16 @@ mod tests {
     use crate::execution::ArtifactLimits;
     use crate::execution::ExecutionJobManager;
     use std::time::Duration;
+
+    #[test]
+    fn colab_mcp_allowlist_globset_matches() {
+        let gs =
+            compile_colab_mcp_tool_allowlist(&["mount_*".to_string(), "exact_tool".to_string()])
+                .expect("globset");
+        assert!(gs.is_match("mount_drive"));
+        assert!(gs.is_match("exact_tool"));
+        assert!(!gs.is_match("other_tool"));
+    }
 
     fn temp_dirs() -> (std::path::PathBuf, std::path::PathBuf) {
         let root =

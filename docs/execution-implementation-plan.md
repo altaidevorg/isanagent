@@ -86,8 +86,8 @@ See `AGENTS.md` for workspace/sandbox rules, actor discipline, and telemetry con
 
 **Acceptance**
 
-- With `enabled = false`, execution tools are not registered (mirror `git_worktree` / `subagents` pattern).
-- With `enabled = true`, happy path + timeout + cancel paths covered by tests (mock provider acceptable for tool routing tests).
+- With `enabled = false` under `[harness.execution]`, execution tools are not registered (mirror `git_worktree` / `subagents` pattern). When the table is omitted or `enabled` is omitted, the harness is on by default.
+- With the harness on, happy path + timeout + cancel paths covered by tests (mock provider acceptable for tool routing tests).
 - Telemetry hook for run duration/outcome (optional in v1, required before Phase 6 of this doc if you want analytics parity).
 
 **Depends on:** Phase 1.

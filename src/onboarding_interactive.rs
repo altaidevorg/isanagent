@@ -51,7 +51,7 @@ fn default_feature_toggle_values() -> [bool; FEATURE_TOGGLE_COUNT] {
         true,  // harness git_worktree
         true,  // harness subagents
         true,  // harness ml_engineer
-        false, // harness execution
+        true,  // harness execution
     ]
 }
 

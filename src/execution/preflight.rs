@@ -7,7 +7,7 @@ pub const PREFLIGHT_MARKDOWN: &str = r#"# Execution preflight (capabilities → 
 
 | Conceptual tool / branch | Required capability (provider or session) |
 |--------------------------|-----------------------------------------------|
-| `execution_session_create` | Provider registered and `[harness.execution]` enabled (Phase 2). |
+| `execution_session_create` | Provider registered and execution harness not disabled in config (Phase 2). |
 | `execution_run` | `supports_persistent_sessions` **or** ephemeral one-shot policy documented per provider. |
 | `execution_run_background` | Same session/run contract as `execution_run`; returns a process-local `job_id` immediately. |
 | `execution_job_status` / `execution_job_result` / `execution_job_list` | Jobs registry (always available when execution harness is enabled). |
@@ -16,6 +16,7 @@ pub const PREFLIGHT_MARKDOWN: &str = r#"# Execution preflight (capabilities → 
 | `execution_package_install` (optional) | `supports_package_install` |
 | `execution_ssh_exec` (optional) | `supports_remote_shell` + provider implements `SshRemoteShell` |
 | `execution_env_info` / GPU summary (optional) | Provider-specific; gate on session or extension trait |
+| `colab_mcp_tool_call` (optional) | `default_provider = \"colab_mcp\"` and extra MCP tool call settings in config; tool name must match a configured allowlist glob |
 
 **Preflight rule:** the executor MUST reject calls with [`crate::execution::ExecutionError::Unsupported`] before hitting the network or subprocess when the capability matrix says the operation is unavailable—even if the model requests it.
 
