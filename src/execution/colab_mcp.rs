@@ -3,15 +3,18 @@
 //! This provider launches a local `colab-mcp` stdio server (typically via `uvx`) and
 //! forwards `execution_run` as MCP `tools/call` requests to a notebook-execution tool.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
+use log::{trace, warn};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 use super::capabilities::{
     NetworkPolicy, ProviderCapabilities, ProviderCapabilitiesSnapshot, SessionCapabilities,
@@ -60,11 +63,41 @@ enum ColabExecutionMode {
     },
 }
 
+/// Max buffered out-of-band JSON-RPC messages (notifications / stray responses) while waiting
+/// for a matching response id. Oldest entries are dropped when full.
+const MCP_INCOMING_BUFFER_CAP: usize = 64;
+
 struct McpProcessClient {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
+    /// Messages read from stdout that were not the JSON-RPC response for the in-flight request.
+    incoming_buffer: VecDeque<Value>,
+    stderr_tail: Arc<Mutex<String>>,
+    stderr_reader: JoinHandle<()>,
+}
+
+async fn append_stderr_lines(tail: Arc<Mutex<String>>, stderr: ChildStderr) {
+    let mut r = BufReader::new(stderr);
+    let mut line = String::new();
+    const MAX_CHARS: usize = 8192;
+    loop {
+        line.clear();
+        match r.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => {
+                let mut s = tail.lock().await;
+                s.push_str(&line);
+                if s.len() > MAX_CHARS {
+                    let over = s.len() - MAX_CHARS;
+                    let cut = s.char_indices().nth(over).map(|(i, _)| i).unwrap_or(0);
+                    s.drain(..cut);
+                }
+            }
+            Err(_) => break,
+        }
+    }
 }
 
 impl ColabMcpExecutionProvider {
@@ -136,50 +169,59 @@ impl ExecutionProvider for ColabMcpExecutionProvider {
         }
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::piped());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             cmd.as_std_mut().creation_flags(CREATE_NO_WINDOW);
         }
-        let mut child = cmd.spawn().map_err(|e| {
+        let child = cmd.spawn().map_err(|e| {
             ExecutionError::Provider(format!("spawn colab_mcp command failed: {e}"))
         })?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| ExecutionError::Provider("colab_mcp missing stdin".to_string()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| ExecutionError::Provider("colab_mcp missing stdout".to_string()))?;
-        let mut client = McpProcessClient {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-            next_id: 1,
-        };
+        let mut client = McpProcessClient::new_from_child(child)?;
 
         let startup = Duration::from_secs(self.config.startup_timeout_secs);
-        tokio::time::timeout(startup, client.initialize())
-            .await
-            .map_err(|_| ExecutionError::Timeout {
-                timeout_secs: self.config.startup_timeout_secs,
-            })??;
+        match tokio::time::timeout(startup, client.initialize()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(client.wrap_provider_err(e).await),
+            Err(_) => {
+                let h = client.stderr_hint().await;
+                if !h.is_empty() {
+                    warn!(
+                        "colab_mcp: initialize timed out after {}s:{}",
+                        self.config.startup_timeout_secs, h
+                    );
+                }
+                return Err(ExecutionError::Timeout {
+                    timeout_secs: self.config.startup_timeout_secs,
+                });
+            }
+        }
 
-        let mut tools = tokio::time::timeout(startup, client.list_tools())
-            .await
-            .map_err(|_| ExecutionError::Timeout {
-                timeout_secs: self.config.startup_timeout_secs,
-            })??;
+        let mut tools = match tokio::time::timeout(startup, client.list_tools()).await {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => return Err(client.wrap_provider_err(e).await),
+            Err(_) => {
+                let h = client.stderr_hint().await;
+                if !h.is_empty() {
+                    warn!(
+                        "colab_mcp: tools/list timed out after {}s:{}",
+                        self.config.startup_timeout_secs, h
+                    );
+                }
+                return Err(ExecutionError::Timeout {
+                    timeout_secs: self.config.startup_timeout_secs,
+                });
+            }
+        };
 
         // Some Colab MCP installs expose notebook execution tools only after
         // browser authorization is established; retry discovery after connect.
         let execute_tool_name =
             match pick_execute_tool_name(&tools, self.config.execute_tool_name.as_deref()) {
                 Ok(name) => name,
-                Err(e) if self.config.execute_tool_name.is_none() => {
+                Err(_e) if self.config.execute_tool_name.is_none() => {
                     let _ = tokio::time::timeout(
                         startup,
                         client.call_tool(
@@ -189,14 +231,28 @@ impl ExecutionProvider for ColabMcpExecutionProvider {
                         ),
                     )
                     .await;
-                    tools = tokio::time::timeout(startup, client.list_tools())
-                        .await
-                        .map_err(|_| ExecutionError::Timeout {
-                            timeout_secs: self.config.startup_timeout_secs,
-                        })??;
-                    pick_execute_tool_name(&tools, None).map_err(|_| e)?
+                    tools = match tokio::time::timeout(startup, client.list_tools()).await {
+                        Ok(Ok(t)) => t,
+                        Ok(Err(err)) => return Err(client.wrap_provider_err(err).await),
+                        Err(_) => {
+                            let h = client.stderr_hint().await;
+                            if !h.is_empty() {
+                                warn!(
+                                    "colab_mcp: tools/list (post-connect) timed out after {}s:{}",
+                                    self.config.startup_timeout_secs, h
+                                );
+                            }
+                            return Err(ExecutionError::Timeout {
+                                timeout_secs: self.config.startup_timeout_secs,
+                            });
+                        }
+                    };
+                    match pick_execute_tool_name(&tools, None) {
+                        Ok(name) => name,
+                        Err(e2) => return Err(client.wrap_provider_err(e2).await),
+                    }
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(client.wrap_provider_err(e).await),
             };
 
         let execute_code_arg_key = pick_execute_code_arg_key(
@@ -204,12 +260,15 @@ impl ExecutionProvider for ColabMcpExecutionProvider {
             &execute_tool_name,
             &self.config.execute_code_arg_keys,
         );
-        let execution_mode = detect_execution_mode(
+        let execution_mode = match detect_execution_mode(
             &tools,
             &execute_tool_name,
             &execute_code_arg_key,
             &self.config.execute_code_arg_keys,
-        )?;
+        ) {
+            Ok(m) => m,
+            Err(e) => return Err(client.wrap_provider_err(e).await),
+        };
 
         // Best effort: this call opens/requests browser connection on disconnected clients.
         let _ = tokio::time::timeout(
@@ -414,6 +473,76 @@ impl ExecutionProvider for ColabMcpExecutionProvider {
 }
 
 impl McpProcessClient {
+    fn new_from_child(mut child: Child) -> Result<Self, ExecutionError> {
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| ExecutionError::Provider("colab_mcp missing stdin".to_string()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ExecutionError::Provider("colab_mcp missing stdout".to_string()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| ExecutionError::Provider("colab_mcp missing stderr".to_string()))?;
+
+        let stderr_tail = Arc::new(Mutex::new(String::new()));
+        let tail_for_reader = Arc::clone(&stderr_tail);
+        let stderr_reader = tokio::spawn(async move {
+            append_stderr_lines(tail_for_reader, stderr).await;
+        });
+
+        Ok(Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            next_id: 1,
+            incoming_buffer: VecDeque::new(),
+            stderr_tail,
+            stderr_reader,
+        })
+    }
+
+    async fn stderr_hint(&self) -> String {
+        let g = self.stderr_tail.lock().await;
+        if g.is_empty() {
+            return String::new();
+        }
+        format!("\ncolab-mcp stderr (recent):\n{}", g.as_str())
+    }
+
+    async fn wrap_provider_err(&self, e: ExecutionError) -> ExecutionError {
+        match e {
+            ExecutionError::Provider(s) => {
+                let h = self.stderr_hint().await;
+                if h.is_empty() {
+                    ExecutionError::Provider(s)
+                } else {
+                    ExecutionError::Provider(format!("{s}{h}"))
+                }
+            }
+            other => other,
+        }
+    }
+
+    fn push_incoming_buffered(&mut self, msg: Value) {
+        if self.incoming_buffer.len() >= MCP_INCOMING_BUFFER_CAP {
+            self.incoming_buffer.pop_front();
+            trace!(
+                "colab_mcp: dropped oldest buffered MCP message (cap={MCP_INCOMING_BUFFER_CAP})"
+            );
+        }
+        self.incoming_buffer.push_back(msg);
+    }
+
+    async fn next_decoded_message(&mut self) -> Result<Value, ExecutionError> {
+        if let Some(msg) = self.incoming_buffer.pop_front() {
+            return Ok(msg);
+        }
+        self.read_message_from_wire().await
+    }
+
     async fn initialize(&mut self) -> Result<(), ExecutionError> {
         let _ = self
             .request(
@@ -495,21 +624,21 @@ impl McpProcessClient {
         });
         self.write_message(&req).await?;
         loop {
-            let msg = self.read_message().await?;
-            let is_response = msg.get("id").and_then(|v| v.as_u64()) == Some(id);
-            if !is_response {
-                continue;
+            let msg = self.next_decoded_message().await?;
+            let matches_id = msg.get("id").and_then(|v| v.as_u64()) == Some(id);
+            if matches_id {
+                if let Some(err) = msg.get("error") {
+                    return Err(ExecutionError::Provider(format!(
+                        "MCP {method} error: {}",
+                        err
+                    )));
+                }
+                return msg.get("result").cloned().ok_or_else(|| {
+                    ExecutionError::Provider(format!("MCP {method} missing result"))
+                });
             }
-            if let Some(err) = msg.get("error") {
-                return Err(ExecutionError::Provider(format!(
-                    "MCP {method} error: {}",
-                    err
-                )));
-            }
-            return msg
-                .get("result")
-                .cloned()
-                .ok_or_else(|| ExecutionError::Provider(format!("MCP {method} missing result")));
+            // Preserve notifications and unrelated responses for a later request (same client).
+            self.push_incoming_buffered(msg);
         }
     }
 
@@ -527,7 +656,7 @@ impl McpProcessClient {
         Ok(())
     }
 
-    async fn read_message(&mut self) -> Result<Value, ExecutionError> {
+    async fn read_message_from_wire(&mut self) -> Result<Value, ExecutionError> {
         loop {
             let mut line = String::new();
             let n =
@@ -547,15 +676,25 @@ impl McpProcessClient {
                 return Ok(v);
             }
             let lower = t.to_ascii_lowercase();
-            // Compatibility fallback: MCP Content-Length framing.
+            // Compatibility fallback: MCP Content-Length framing (may include extra header lines).
             if let Some(rest) = lower.strip_prefix("content-length:") {
                 let parsed = rest.trim().parse::<usize>().map_err(|e| {
                     ExecutionError::Provider(format!("invalid MCP Content-Length header: {e}"))
                 })?;
-                let mut delimiter = String::new();
-                let _ = self.stdout.read_line(&mut delimiter).await.map_err(|e| {
-                    ExecutionError::Provider(format!("mcp stdout read header delimiter: {e}"))
-                })?;
+                loop {
+                    let mut hdr = String::new();
+                    let hn = self.stdout.read_line(&mut hdr).await.map_err(|e| {
+                        ExecutionError::Provider(format!("mcp stdout read framing header: {e}"))
+                    })?;
+                    if hn == 0 {
+                        return Err(ExecutionError::Provider(
+                            "colab_mcp EOF before Content-Length body".to_string(),
+                        ));
+                    }
+                    if hdr.trim().is_empty() {
+                        break;
+                    }
+                }
                 let mut buf = vec![0u8; parsed];
                 self.stdout
                     .read_exact(&mut buf)
@@ -568,6 +707,7 @@ impl McpProcessClient {
     }
 
     async fn shutdown(&mut self) {
+        self.stderr_reader.abort();
         let _ = self.child.kill().await;
     }
 }
@@ -594,6 +734,7 @@ fn pick_execute_tool_name(
         "execute_python",
         "run_python",
         "run_python_cell",
+        "run_code_cell",
         "execute_cell",
         "run_code",
     ];

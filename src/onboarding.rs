@@ -711,7 +711,7 @@ mod tests {
             "expected jina section comment from template"
         );
         assert!(
-            s.contains("# When default_provider = \"jupyter\""),
+            s.contains("# When you enable \"jupyter\""),
             "expected harness jupyter comment from template"
         );
         assert!(

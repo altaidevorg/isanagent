@@ -168,7 +168,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         .into());
     }
 
-    maybe_prompt_uv_install_on_launch(&workspace);
+    maybe_prompt_uv_install_on_launch(&workspace).await;
 
     // 1. Setup SqliteMemoryActor and SessionManager
     let db_path = workspace
@@ -859,7 +859,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     Ok(())
 }
 
-fn maybe_prompt_uv_install_on_launch(workspace: &IsanagentWorkspace) {
+async fn maybe_prompt_uv_install_on_launch(workspace: &IsanagentWorkspace) {
     if !workspace.config.execution_harness_enabled() {
         return;
     }
@@ -886,33 +886,41 @@ Install uv manually or run /install-python from terminal mode.",
         return;
     }
 
-    println!(
-        "\nExecution runtime is set to uv-managed, but '{}' was not found on PATH.",
-        uv_bin
-    );
-    println!("Install uv now? (yes/no)");
-    let _ = io::stdout().flush();
-    let mut line = String::new();
-    loop {
-        line.clear();
-        if io::stdin().read_line(&mut line).is_err() {
-            println!("Unable to read input. Skipping uv installation prompt.");
-            break;
-        }
-        let ans = line.trim().to_ascii_lowercase();
-        if matches!(ans.as_str(), "yes" | "y") {
-            match isanagent::execution::install_uv_best_effort() {
-                Ok(msg) => println!("{msg}"),
-                Err(err) => println!("Auto-install failed: {err}"),
-            }
-            break;
-        }
-        if matches!(ans.as_str(), "no" | "n") {
-            println!("Skipping uv installation. You can run /install-python anytime.");
-            break;
-        }
-        println!("Please answer yes or no:");
+    let uv_bin = uv_bin.to_string();
+    let prompt_result = tokio::task::spawn_blocking(move || {
+        println!(
+            "\nExecution runtime is set to uv-managed, but '{}' was not found on PATH.",
+            uv_bin
+        );
+        println!("Install uv now? (yes/no)");
         let _ = io::stdout().flush();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if io::stdin().read_line(&mut line).is_err() {
+                println!("Unable to read input. Skipping uv installation prompt.");
+                break;
+            }
+            let ans = line.trim().to_ascii_lowercase();
+            if matches!(ans.as_str(), "yes" | "y") {
+                match isanagent::execution::install_uv_best_effort() {
+                    Ok(msg) => println!("{msg}"),
+                    Err(err) => println!("Auto-install failed: {err}"),
+                }
+                break;
+            }
+            if matches!(ans.as_str(), "no" | "n") {
+                println!("Skipping uv installation. You can run /install-python anytime.");
+                break;
+            }
+            println!("Please answer yes or no:");
+            let _ = io::stdout().flush();
+        }
+    })
+    .await;
+
+    if let Err(e) = prompt_result {
+        log::warn!("uv installation prompt task failed: {e}");
     }
 }
 
