@@ -12,15 +12,18 @@
 //! - See [`preflight::PREFLIGHT_MARKDOWN`] for the capability → tool mapping.
 
 mod artifacts;
+mod auto_promote;
 mod capabilities;
 mod colab_mcp;
 mod error;
 mod execution_jobs;
 mod harness;
 mod ids;
+mod inflight;
 mod jupyter;
 mod jupyter_notebook;
 mod local;
+mod mcp_call_history;
 mod post_run;
 mod preflight;
 mod provider;
@@ -32,20 +35,27 @@ mod ssh;
 pub use artifacts::{
     artifact_run_rel_dir, sanitize_session_segment, ArtifactLimits, ARTIFACT_ROOT_DIR,
 };
+pub use auto_promote::{run_with_auto_promote, AutoPromoteOutcome, PromoteReason};
 pub use capabilities::{
     NetworkPolicy, ProviderCapabilities, ProviderCapabilitiesSnapshot, SessionCapabilities,
 };
 pub use colab_mcp::{ColabMcpExecutionProvider, ColabMcpExecutionProviderConfig};
 pub use error::ExecutionError;
 pub use execution_jobs::{
-    job_status_str, ExecutionJobManager, ExecutionJobRecord, SpawnBackgroundRunRequest,
+    job_status_str, AdoptInflightRequest, ArbitraryWork, CancelOutcome, ExecutionJobManager,
+    ExecutionJobRecord, SpawnArbitraryRequest, SpawnBackgroundRunRequest,
 };
 pub use harness::{build_execution_harness, ExecutionHarness};
 pub use ids::SessionId;
+pub use inflight::{InflightGuard, InflightSyncRegistry};
 pub use jupyter::{JupyterExecutionProvider, JupyterExecutionProviderConfig};
 pub use local::{
     build_python_host_command, install_uv_best_effort, uv_binary_available, LocalExecMode,
     LocalExecutionConfig, LocalExecutionProvider, LocalPythonRuntime,
+};
+pub use mcp_call_history::{
+    append_mcp_call_manifest, mcp_call_history_dir, write_mcp_call_journal, McpCallJournalParams,
+    McpCallManifestLine,
 };
 pub use post_run::{persist_successful_execution_run, PersistSuccessfulExecutionRunParams};
 pub use preflight::{allowed_optional_tool_tags, PREFLIGHT_MARKDOWN};

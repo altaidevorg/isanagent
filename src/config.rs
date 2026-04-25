@@ -82,6 +82,11 @@ pub struct ExecutionHarnessConfig {
     pub max_wall_secs: Option<u64>,
     /// Default `timeout_secs` when `execution_run` / `execution_run_background` omit it (default 600 when unset, clamped to `max_wall_secs`).
     pub default_execution_timeout_secs: Option<u64>,
+    /// Short bound after which a synchronous run (`execution_run`, `colab_mcp_tool_call`)
+    /// auto-promotes to a background job and returns a `job_id` envelope.
+    /// Default 120 when unset; clamped to `5..=max_wall_secs`. Set to `0` to disable
+    /// auto-promotion (synchronous calls then run up to their full `timeout_secs`).
+    pub auto_promote_after_secs: Option<u64>,
     /// Max concurrent sessions (default 32, clamped 1–256).
     pub max_sessions: Option<usize>,
     /// If set and non-empty, only these provider ids may be constructed (e.g. `["local"]`).
@@ -514,6 +519,10 @@ impl AppConfig {
                 self.execution_default_run_timeout_secs()
             ));
             lines.push(format!(
+                "execution_auto_promote_after_secs={}",
+                self.execution_auto_promote_after_secs()
+            ));
+            lines.push(format!(
                 "execution_max_output_bytes={}",
                 self.execution_max_output_bytes()
             ));
@@ -603,6 +612,28 @@ impl AppConfig {
             .and_then(|e| e.default_execution_timeout_secs)
             .unwrap_or(FALLBACK);
         v.clamp(1, cap)
+    }
+
+    /// Short bound after which a synchronous run auto-promotes to a background job
+    /// (`execution_run`, `colab_mcp_tool_call`).
+    ///
+    /// Returns `0` when auto-promote is explicitly disabled (`auto_promote_after_secs = 0`).
+    /// Otherwise returns the configured value clamped to `5..=max_wall_secs`, defaulting to
+    /// `min(120, max_wall_secs)` when unset.
+    pub fn execution_auto_promote_after_secs(&self) -> u64 {
+        const FALLBACK: u64 = 120;
+        const MIN_NONZERO: u64 = 5;
+        let cap = self.execution_max_wall_secs();
+        let raw = self
+            .harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.auto_promote_after_secs);
+        match raw {
+            Some(0) => 0,
+            Some(v) => v.clamp(MIN_NONZERO, cap),
+            None => FALLBACK.min(cap).max(MIN_NONZERO.min(cap)),
+        }
     }
 
     pub fn execution_max_sessions(&self) -> usize {

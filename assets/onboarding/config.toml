@@ -94,6 +94,11 @@ local_python_runtime = "uv_managed"
 uv_binary = "uv"
 uv_python = "3.11"
 uv_requirements = ["afterimage>=0.15.0"]
+# Synchronous execution_run / colab_mcp_tool_call calls that exceed this many seconds are
+# transparently auto-promoted to a background job; the tool returns a `job_id` envelope you can
+# poll with execution_job_status / execution_job_result. Set to 0 to disable, or any value
+# between 5 and max_wall_secs. Default: 120.
+# auto_promote_after_secs = 120
 
 [harness.execution.jupyter]
 base_url = "http://127.0.0.1:8888"

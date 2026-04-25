@@ -9,8 +9,13 @@ pub const METADATA_EXECUTION_SESSION_ID: &str = "execution_session_id";
 pub const METADATA_EXECUTION_RUN_ID: &str = "execution_run_id";
 /// One-line completion / failure notice for `execution_run_background` (Ratatui execution strip).
 pub const ISANAGENT_EXECUTION_JOB: &str = "isanagent_execution_job";
+/// One-line "started" notice when a background execution job is registered (Ratatui multi-job strip).
+pub const ISANAGENT_EXECUTION_JOB_STARTED: &str = "isanagent_execution_job_started";
 pub const METADATA_EXECUTION_JOB_ID: &str = "execution_job_id";
 pub const METADATA_EXECUTION_JOB_STATUS: &str = "execution_job_status";
+/// Originating tool name for a background execution job (e.g. `colab_mcp_tool_call`,
+/// `execution_run_background`, `execution_run` after auto-promote).
+pub const METADATA_EXECUTION_JOB_TOOL_NAME: &str = "execution_job_tool_name";
 /// Short human-facing line for Ratatui execution strip (optional on stream/job notices).
 pub const METADATA_EXECUTION_DESCRIPTION: &str = "execution_description";
 /// Tool name for Ratatui tool rail / transcript previews (paired with `isanagent_tool_notify`).

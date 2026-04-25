@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
@@ -39,6 +40,56 @@ pub struct ToolRailEntry {
     pub tool_name: String,
     pub phase: ToolNoticePhase,
     pub summary: String,
+}
+
+/// Lifecycle of a job tracked by the multi-job execution strip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobStripStatus {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    Timeout,
+}
+
+impl JobStripStatus {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "completed" => JobStripStatus::Completed,
+            "failed" => JobStripStatus::Failed,
+            "cancelled" => JobStripStatus::Cancelled,
+            "timeout" => JobStripStatus::Timeout,
+            _ => JobStripStatus::Running,
+        }
+    }
+
+    pub fn icon(&self) -> &'static str {
+        match self {
+            JobStripStatus::Running => "·",
+            JobStripStatus::Completed => "✓",
+            JobStripStatus::Failed => "✗",
+            JobStripStatus::Cancelled => "⨯",
+            JobStripStatus::Timeout => "⏱",
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self, JobStripStatus::Running)
+    }
+}
+
+/// One row in the multi-job execution strip below the transcript.
+#[derive(Debug, Clone)]
+pub struct JobStripEntry {
+    pub job_id: String,
+    pub session_id: String,
+    pub tool_name: String,
+    pub description: Option<String>,
+    pub started_at: Instant,
+    pub status: JobStripStatus,
+    pub last_line: String,
+    /// Set when the job reached a terminal status; used to evict finished rows after a delay.
+    pub terminal_at: Option<Instant>,
 }
 
 /// One renderable unit in the transcript (Xerxes-style cell model: labeled blocks, tool rail).
@@ -120,6 +171,8 @@ pub struct App {
     /// Latest `execution_run` stream (Jupyter); shown in a dedicated strip below the transcript.
     pub execution_stream_recent: String,
     pub execution_stream_label: Option<(String, String)>,
+    /// Multi-job execution strip rows (Colab MCP background calls, auto-promoted runs, etc.).
+    pub jobs_strip: VecDeque<JobStripEntry>,
 }
 
 impl Default for App {
@@ -153,6 +206,7 @@ impl App {
             toast: None,
             execution_stream_recent: String::new(),
             execution_stream_label: None,
+            jobs_strip: VecDeque::new(),
         }
     }
 
@@ -376,6 +430,105 @@ impl App {
     pub fn request_quit(&mut self) {
         self.should_quit = true;
     }
+
+    /// Insert (or refresh) a Running row for `job_id` in the multi-job strip.
+    pub fn job_strip_started(
+        &mut self,
+        job_id: &str,
+        session_id: &str,
+        tool_name: &str,
+        description: Option<&str>,
+    ) {
+        if let Some(existing) = self
+            .jobs_strip
+            .iter_mut()
+            .find(|e| e.job_id == job_id)
+        {
+            existing.status = JobStripStatus::Running;
+            existing.terminal_at = None;
+            existing.tool_name = tool_name.to_string();
+            existing.session_id = session_id.to_string();
+            existing.description = description.map(|s| s.to_string());
+            return;
+        }
+        self.jobs_strip.push_back(JobStripEntry {
+            job_id: job_id.to_string(),
+            session_id: session_id.to_string(),
+            tool_name: tool_name.to_string(),
+            description: description.map(|s| s.to_string()),
+            started_at: Instant::now(),
+            status: JobStripStatus::Running,
+            last_line: String::new(),
+            terminal_at: None,
+        });
+        self.cap_jobs_strip();
+    }
+
+    pub fn job_strip_set_last_line(&mut self, job_id: &str, line: &str) {
+        if let Some(existing) = self
+            .jobs_strip
+            .iter_mut()
+            .find(|e| e.job_id == job_id)
+        {
+            let trimmed = line.trim_end();
+            if !trimmed.is_empty() {
+                existing.last_line = trimmed.to_string();
+            }
+        }
+    }
+
+    pub fn job_strip_finished(&mut self, job_id: &str, status: &str, summary: &str) {
+        let new_status = JobStripStatus::from_str(status);
+        if let Some(existing) = self
+            .jobs_strip
+            .iter_mut()
+            .find(|e| e.job_id == job_id)
+        {
+            existing.status = new_status;
+            existing.terminal_at = Some(Instant::now());
+            let trimmed = summary.trim_end();
+            if !trimmed.is_empty() {
+                existing.last_line = trimmed.to_string();
+            }
+        } else {
+            // Finished notice for an unknown job (rare): synthesize a row so the user sees the result.
+            self.jobs_strip.push_back(JobStripEntry {
+                job_id: job_id.to_string(),
+                session_id: String::new(),
+                tool_name: String::new(),
+                description: None,
+                started_at: Instant::now(),
+                status: new_status,
+                last_line: summary.trim_end().to_string(),
+                terminal_at: Some(Instant::now()),
+            });
+            self.cap_jobs_strip();
+        }
+    }
+
+    /// Drop terminal rows older than `linger`, and any extras over `running_cap` running rows.
+    pub fn evict_expired_jobs(&mut self, linger: Duration) {
+        let now = Instant::now();
+        self.jobs_strip
+            .retain(|e| match e.terminal_at {
+                Some(t) => now.saturating_duration_since(t) < linger,
+                None => true,
+            });
+    }
+
+    /// Cap the strip length so it cannot grow unbounded across long sessions.
+    fn cap_jobs_strip(&mut self) {
+        const MAX_ROWS: usize = 16;
+        while self.jobs_strip.len() > MAX_ROWS {
+            self.jobs_strip.pop_front();
+        }
+    }
+
+    pub fn jobs_strip_has_running(&self) -> bool {
+        self.jobs_strip
+            .iter()
+            .any(|e| e.status == JobStripStatus::Running)
+    }
 }
 
 #[cfg(test)]
@@ -438,5 +591,65 @@ mod tests {
     fn display_width_counts_wide_chars() {
         assert!(super::super::display_width("你好") >= 4);
         assert_eq!(super::super::display_width("ab"), 2);
+    }
+
+    #[test]
+    fn job_strip_started_inserts_running_row() {
+        let mut app = App::new();
+        app.job_strip_started("job-1", "sess-1", "colab_mcp_tool_call", Some("training"));
+        assert_eq!(app.jobs_strip.len(), 1);
+        let row = app.jobs_strip.front().unwrap();
+        assert_eq!(row.job_id, "job-1");
+        assert_eq!(row.tool_name, "colab_mcp_tool_call");
+        assert_eq!(row.description.as_deref(), Some("training"));
+        assert_eq!(row.status, JobStripStatus::Running);
+        assert!(app.jobs_strip_has_running());
+    }
+
+    #[test]
+    fn job_strip_finished_marks_terminal_status() {
+        let mut app = App::new();
+        app.job_strip_started("job-1", "sess-1", "execution_run", None);
+        app.job_strip_set_last_line("job-1", "epoch 4 / 8");
+        app.job_strip_finished("job-1", "completed", "exit 0 in 1234ms");
+        let row = app.jobs_strip.front().unwrap();
+        assert_eq!(row.status, JobStripStatus::Completed);
+        assert!(row.terminal_at.is_some());
+        assert_eq!(row.last_line, "exit 0 in 1234ms");
+    }
+
+    #[test]
+    fn evict_expired_jobs_drops_only_old_terminal_rows() {
+        let mut app = App::new();
+        app.job_strip_started("running", "s1", "execution_run", None);
+        app.job_strip_started("done", "s1", "execution_run", None);
+        app.job_strip_finished("done", "completed", "ok");
+        if let Some(row) = app.jobs_strip.iter_mut().find(|e| e.job_id == "done") {
+            row.terminal_at = Some(Instant::now() - Duration::from_secs(60));
+        }
+        app.evict_expired_jobs(Duration::from_secs(10));
+        assert_eq!(app.jobs_strip.len(), 1);
+        assert_eq!(app.jobs_strip.front().unwrap().job_id, "running");
+    }
+
+    #[test]
+    fn job_strip_status_from_str_maps_known_states() {
+        assert_eq!(
+            JobStripStatus::from_str("completed"),
+            JobStripStatus::Completed
+        );
+        assert_eq!(JobStripStatus::from_str("failed"), JobStripStatus::Failed);
+        assert_eq!(
+            JobStripStatus::from_str("cancelled"),
+            JobStripStatus::Cancelled
+        );
+        assert_eq!(
+            JobStripStatus::from_str("timeout"),
+            JobStripStatus::Timeout
+        );
+        assert_eq!(
+            JobStripStatus::from_str("anything-else"),
+            JobStripStatus::Running
+        );
     }
 }

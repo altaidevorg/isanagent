@@ -848,7 +848,8 @@ impl ActorLogic<BusMessage> for AgentLogic {
             BusMessage::Outbound(_)
             | BusMessage::Telemetry(_)
             | BusMessage::LoggerControl(_)
-            | BusMessage::Log(_) => Ok(None),
+            | BusMessage::Log(_)
+            | BusMessage::PromoteSyncToBackground(_) => Ok(None),
         }
     }
 }

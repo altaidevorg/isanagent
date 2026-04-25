@@ -1,8 +1,10 @@
 //! In-process background execution jobs (`execution_run_background`). Jobs end when the agent process exits.
 
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::mapref::entry::Entry;
@@ -12,9 +14,12 @@ use serde::Serialize;
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, RwLock};
+use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::bus::{BusMessage, TelemetryEvent};
-use crate::channels::terminal::{build_execution_job_notice, build_execution_stream_notice};
+use crate::channels::terminal::{
+    build_execution_job_notice, build_execution_job_started_notice, build_execution_stream_notice,
+};
 use crate::execution::error::ExecutionError;
 use crate::execution::{persist_successful_execution_run, PersistSuccessfulExecutionRunParams};
 use crate::execution::{CwdPolicy, ExecutionHarness, RunEvent, RunResult, RunSpec, SessionId};
@@ -145,6 +150,8 @@ pub struct ExecutionJobRecord {
     pub label: Option<String>,
     /// Human-facing summary for UI and audits (optional).
     pub description: Option<String>,
+    /// Originating tool name (`execution_run`, `execution_run_background`, `colab_mcp_tool_call`, …).
+    pub tool_name: String,
     pub status: AtomicU8,
     /// Wall-clock finish time for eviction ordering (`0` while not terminal).
     pub finished_unix_ms: AtomicU64,
@@ -154,6 +161,12 @@ pub struct ExecutionJobRecord {
     pub result: RwLock<Option<RunResult>>,
     pub chat_id: String,
     pub channel: String,
+    /// Abort handle for the spawned task; used by `cancel_job_force` for best-effort cancel
+    /// (e.g. when the underlying provider does not support cooperative cancel).
+    pub abort: Mutex<Option<AbortHandle>>,
+    /// `Some("provider")` when cancelled via cooperative provider cancel; `Some("abort")` when
+    /// best-effort `JoinHandle::abort` was used; `None` while running or for other terminal states.
+    pub cancel_kind: RwLock<Option<&'static str>>,
 }
 
 impl ExecutionJobRecord {
@@ -247,31 +260,46 @@ impl ExecutionJobManager {
     }
 
     /// Best-effort interrupt for the session backing this job (same as `execution_cancel` for that session).
-    pub async fn cancel_job(&self, job_id: &str) -> Result<(), String> {
+    ///
+    /// Prefers the cooperative provider-level cancel (`provider.cancel`) when supported.
+    /// Falls back to `cancel_job_force` (best-effort `JoinHandle::abort`) when the provider
+    /// does not support cooperative interrupts (e.g. `colab_mcp`). On the abort path the local
+    /// wait is dropped immediately, but remote work (e.g. a Colab cell) may continue running.
+    pub async fn cancel_job(&self, job_id: &str) -> Result<CancelOutcome, String> {
         let rec = self
             .get(job_id)
             .ok_or_else(|| "Unknown job_id".to_string())?;
         if rec.is_terminal() {
             return Err("Job already finished".to_string());
         }
-        if !self
+        if self
             .inner
             .harness
             .provider()
             .capabilities()
             .supports_interrupt
         {
-            return Err(
-                "execution_job_cancel unsupported: provider capabilities.supports_interrupt is false"
-                    .to_string(),
-            );
+            self.inner
+                .harness
+                .provider()
+                .cancel(&rec.session_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            *rec.cancel_kind.write().await = Some("provider");
+            return Ok(CancelOutcome {
+                cancel_kind: "provider",
+                note: None,
+            });
         }
-        self.inner
-            .harness
-            .provider()
-            .cancel(&rec.session_id)
-            .await
-            .map_err(|e| e.to_string())
+        // Provider does not support cooperative cancel; try best-effort task abort.
+        self.cancel_job_force(job_id).await?;
+        Ok(CancelOutcome {
+            cancel_kind: "abort",
+            note: Some(
+                "Best-effort abort: the local wait was dropped, but the remote work may keep running until it finishes naturally (e.g. a Colab cell on Google's side)."
+                    .to_string(),
+            ),
+        })
     }
 
     pub async fn job_status_json(&self, job_id: &str) -> Result<serde_json::Value, String> {
@@ -280,18 +308,32 @@ impl ExecutionJobManager {
             .ok_or_else(|| "Unknown job_id".to_string())?;
         let finished = r.finished_rfc3339.read().await.clone();
         let err = r.error.read().await.clone();
-        Ok(json!({
+        let cancel_kind = r.cancel_kind.read().await.clone();
+        let mut payload = json!({
             "job_id": r.job_id,
             "session_id": r.session_id.to_string(),
             "run_id": r.run_id,
             "label": r.label,
             "description": r.description,
+            "tool_name": r.tool_name,
             "status": r.status_name(),
             "started_rfc3339": r.started_rfc3339,
             "finished_rfc3339": finished,
             "error": err,
             "terminal": r.is_terminal(),
-        }))
+        });
+        if let Some(kind) = cancel_kind {
+            if let serde_json::Value::Object(ref mut m) = payload {
+                m.insert("cancel_kind".to_string(), json!(kind));
+                if kind == "abort" {
+                    m.insert(
+                        "cancel_note".to_string(),
+                        json!("Best-effort abort: local wait was dropped; remote work may keep running until it finishes naturally (e.g. a Colab cell on Google's side)."),
+                    );
+                }
+            }
+        }
+        Ok(payload)
     }
 
     /// Pretty JSON for a finished job’s [`RunResult`], or a structured error payload; running jobs get a short message.
@@ -410,6 +452,7 @@ impl ExecutionJobManager {
             run_id: run_id.clone(),
             label: label.clone(),
             description: run_description.clone(),
+            tool_name: "execution_run_background".to_string(),
             status: AtomicU8::new(JOB_RUNNING),
             started_rfc3339: started_ts.clone(),
             finished_unix_ms: AtomicU64::new(0),
@@ -418,15 +461,30 @@ impl ExecutionJobManager {
             result: RwLock::new(None),
             chat_id: chat_id.clone(),
             channel: channel.clone(),
+            abort: Mutex::new(None),
+            cancel_kind: RwLock::new(None),
         });
         self.inner.jobs.insert(job_id.clone(), rec.clone());
+
+        // Notify the UI (multi-job strip) that a new job has started.
+        send_job_started(
+            &self.inner.outbound_tx,
+            &chat_id,
+            &channel,
+            &job_id,
+            &sid.to_string(),
+            &rec.tool_name,
+            run_description.as_deref(),
+        );
 
         let inner = self.inner.clone();
         let sid_spawn = sid.clone();
         let job_id_for_task = job_id.clone();
         let stream_desc = run_description.clone();
+        let rec_for_task = rec.clone();
 
-        tokio::spawn(async move {
+        let join = tokio::spawn(async move {
+            let rec = rec_for_task;
             let _busy = SessionBusyDrop {
                 map: inner.session_busy.clone(),
                 key: sid_str,
@@ -538,6 +596,7 @@ impl ExecutionJobManager {
                         "completed",
                         &summary,
                         rec.description.as_deref(),
+                        Some(rec.tool_name.as_str()),
                     );
                     let _ = inner.outbound_tx.send(BusMessage::Outbound(notice)).await;
                     if let Err(e) = append_job_audit_line(
@@ -607,6 +666,7 @@ impl ExecutionJobManager {
                         status_label,
                         &summary,
                         rec.description.as_deref(),
+                        Some(rec.tool_name.as_str()),
                     );
                     let _ = inner.outbound_tx.send(BusMessage::Outbound(notice)).await;
                     if let Err(log_e) = append_job_audit_line(
@@ -634,6 +694,706 @@ impl ExecutionJobManager {
             }
         });
 
+        if let Ok(mut g) = rec.abort.lock() {
+            *g = Some(join.abort_handle());
+        }
+
         Ok(job_id)
+    }
+
+    /// Spawn an arbitrary future as a tracked background job.
+    ///
+    /// The future's `RunResult` (or `ExecutionError`) is recorded just like `spawn_run`'s.
+    /// Used by `colab_mcp_tool_call` (auto-promote) and similar tool-side wrappers that already
+    /// wrap their own provider-level work into a `RunResult`.
+    pub fn spawn_arbitrary(&self, req: SpawnArbitraryRequest) -> Result<String, String> {
+        let SpawnArbitraryRequest {
+            sid,
+            tool_name,
+            label,
+            description,
+            chat_id,
+            channel,
+            work,
+        } = req;
+
+        self.evict_terminal_jobs_if_at_cap();
+        if self.inner.jobs.len() >= self.inner.max_jobs {
+            return Err(format!(
+                "Too many execution jobs in memory (max {}). Wait for jobs to finish or restart the agent.",
+                self.inner.max_jobs
+            ));
+        }
+
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let started_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+        let rec = Arc::new(ExecutionJobRecord {
+            job_id: job_id.clone(),
+            session_id: sid.clone(),
+            run_id: run_id.clone(),
+            label,
+            description: description.clone(),
+            tool_name: tool_name.clone(),
+            status: AtomicU8::new(JOB_RUNNING),
+            started_rfc3339: started_ts.clone(),
+            finished_unix_ms: AtomicU64::new(0),
+            finished_rfc3339: RwLock::new(None),
+            error: RwLock::new(None),
+            result: RwLock::new(None),
+            chat_id: chat_id.clone(),
+            channel: channel.clone(),
+            abort: Mutex::new(None),
+            cancel_kind: RwLock::new(None),
+        });
+        self.inner.jobs.insert(job_id.clone(), rec.clone());
+
+        send_job_started(
+            &self.inner.outbound_tx,
+            &chat_id,
+            &channel,
+            &job_id,
+            &sid.to_string(),
+            &tool_name,
+            description.as_deref(),
+        );
+
+        let inner = self.inner.clone();
+        let sid_spawn = sid.clone();
+        let job_id_for_task = job_id.clone();
+        let rec_for_task = rec.clone();
+
+        let join = tokio::spawn(async move {
+            let rec = rec_for_task;
+            let prov = inner.harness.provider().provider_id().to_string();
+            let started = Instant::now();
+            let run_out = work.await;
+            finalize_arbitrary_job(FinalizeArbitraryParams {
+                inner: inner.clone(),
+                rec: rec.clone(),
+                sid: sid_spawn,
+                job_id: job_id_for_task,
+                chat_id,
+                channel,
+                provider_id: prov,
+                started,
+                started_ts,
+                tool_name,
+                run_out,
+            })
+            .await;
+        });
+
+        if let Ok(mut g) = rec.abort.lock() {
+            *g = Some(join.abort_handle());
+        }
+
+        Ok(job_id)
+    }
+
+    /// Adopt an already-running [`JoinHandle`] (auto-promote path) into the job manager.
+    ///
+    /// Used by sync tools (`colab_mcp_tool_call`, `execution_run`) that started their work
+    /// inline, then crossed the auto-promote bound and need to hand the in-flight task to the
+    /// job manager. The manager takes over completion bookkeeping (status, telemetry, journal).
+    pub fn adopt_inflight(
+        &self,
+        req: AdoptInflightRequest,
+    ) -> Result<String, String> {
+        let AdoptInflightRequest {
+            sid,
+            tool_name,
+            label,
+            description,
+            chat_id,
+            channel,
+            join,
+        } = req;
+
+        self.evict_terminal_jobs_if_at_cap();
+        if self.inner.jobs.len() >= self.inner.max_jobs {
+            return Err(format!(
+                "Too many execution jobs in memory (max {}). Wait for jobs to finish or restart the agent.",
+                self.inner.max_jobs
+            ));
+        }
+
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let started_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+        let rec = Arc::new(ExecutionJobRecord {
+            job_id: job_id.clone(),
+            session_id: sid.clone(),
+            run_id: run_id.clone(),
+            label,
+            description: description.clone(),
+            tool_name: tool_name.clone(),
+            status: AtomicU8::new(JOB_RUNNING),
+            started_rfc3339: started_ts.clone(),
+            finished_unix_ms: AtomicU64::new(0),
+            finished_rfc3339: RwLock::new(None),
+            error: RwLock::new(None),
+            result: RwLock::new(None),
+            chat_id: chat_id.clone(),
+            channel: channel.clone(),
+            abort: Mutex::new(Some(join.abort_handle())),
+            cancel_kind: RwLock::new(None),
+        });
+        self.inner.jobs.insert(job_id.clone(), rec.clone());
+
+        send_job_started(
+            &self.inner.outbound_tx,
+            &chat_id,
+            &channel,
+            &job_id,
+            &sid.to_string(),
+            &tool_name,
+            description.as_deref(),
+        );
+
+        let inner = self.inner.clone();
+        let sid_spawn = sid.clone();
+        let job_id_for_task = job_id.clone();
+
+        tokio::spawn(async move {
+            let prov = inner.harness.provider().provider_id().to_string();
+            let started = Instant::now();
+            let run_out = match join.await {
+                Ok(v) => v,
+                Err(e) if e.is_cancelled() => Err(ExecutionError::Cancelled),
+                Err(e) => Err(ExecutionError::Provider(format!("join error: {e}"))),
+            };
+            finalize_arbitrary_job(FinalizeArbitraryParams {
+                inner: inner.clone(),
+                rec: rec.clone(),
+                sid: sid_spawn,
+                job_id: job_id_for_task,
+                chat_id,
+                channel,
+                provider_id: prov,
+                started,
+                started_ts,
+                tool_name,
+                run_out,
+            })
+            .await;
+        });
+
+        Ok(job_id)
+    }
+
+    /// Best-effort cancel by aborting the spawned tokio task. Used when the provider does not
+    /// support cooperative cancel (e.g. `colab_mcp`). The remote work (e.g. a Colab cell) may
+    /// keep running on the other side until it finishes naturally.
+    pub async fn cancel_job_force(&self, job_id: &str) -> Result<(), String> {
+        let rec = self
+            .get(job_id)
+            .ok_or_else(|| "Unknown job_id".to_string())?;
+        if rec.is_terminal() {
+            return Err("Job already finished".to_string());
+        }
+        let handle = match rec.abort.lock() {
+            Ok(mut g) => g.take(),
+            Err(_) => None,
+        };
+        match handle {
+            Some(h) => {
+                h.abort();
+                rec.status.store(JOB_CANCELLED, Ordering::Release);
+                rec.finished_unix_ms.store(now_unix_ms(), Ordering::Release);
+                let ts_finish =
+                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                *rec.finished_rfc3339.write().await = Some(ts_finish);
+                *rec.error.write().await = Some(
+                    "cancelled via cancel_job_force (best-effort abort; remote work may continue)"
+                        .to_string(),
+                );
+                *rec.cancel_kind.write().await = Some("abort");
+                Ok(())
+            }
+            None => Err(
+                "execution_job_cancel unsupported: no abort handle available for this job"
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+/// Outcome of [`ExecutionJobManager::cancel_job`]; tells callers whether the cancel went through
+/// the cooperative provider path or the best-effort `JoinHandle::abort` path.
+#[derive(Debug, Clone)]
+pub struct CancelOutcome {
+    pub cancel_kind: &'static str,
+    pub note: Option<String>,
+}
+
+fn send_job_started(
+    tx: &mpsc::Sender<BusMessage>,
+    chat_id: &str,
+    channel: &str,
+    job_id: &str,
+    session_id: &str,
+    tool_name: &str,
+    description: Option<&str>,
+) {
+    let notice =
+        build_execution_job_started_notice(chat_id, channel, job_id, session_id, tool_name, description);
+    let _ = tx.try_send(BusMessage::Outbound(notice));
+}
+
+/// Boxed work future for [`ExecutionJobManager::spawn_arbitrary`].
+pub type ArbitraryWork =
+    Pin<Box<dyn Future<Output = Result<RunResult, ExecutionError>> + Send + 'static>>;
+
+/// Arguments for [`ExecutionJobManager::spawn_arbitrary`].
+pub struct SpawnArbitraryRequest {
+    pub sid: SessionId,
+    pub tool_name: String,
+    pub label: Option<String>,
+    pub description: Option<String>,
+    pub chat_id: String,
+    pub channel: String,
+    pub work: ArbitraryWork,
+}
+
+/// Arguments for [`ExecutionJobManager::adopt_inflight`].
+pub struct AdoptInflightRequest {
+    pub sid: SessionId,
+    pub tool_name: String,
+    pub label: Option<String>,
+    pub description: Option<String>,
+    pub chat_id: String,
+    pub channel: String,
+    pub join: JoinHandle<Result<RunResult, ExecutionError>>,
+}
+
+struct FinalizeArbitraryParams {
+    inner: Arc<ExecutionJobManagerInner>,
+    rec: Arc<ExecutionJobRecord>,
+    sid: SessionId,
+    job_id: String,
+    chat_id: String,
+    channel: String,
+    provider_id: String,
+    started: Instant,
+    started_ts: String,
+    tool_name: String,
+    run_out: Result<RunResult, ExecutionError>,
+}
+
+async fn finalize_arbitrary_job(p: FinalizeArbitraryParams) {
+    let FinalizeArbitraryParams {
+        inner,
+        rec,
+        sid,
+        job_id,
+        chat_id,
+        channel,
+        provider_id,
+        started,
+        started_ts,
+        tool_name,
+        run_out,
+    } = p;
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let ts_finish = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    *rec.finished_rfc3339.write().await = Some(ts_finish.clone());
+    let ws = inner.harness.workspace_dir().clone();
+
+    match run_out {
+        Ok(result) => {
+            rec.finished_unix_ms.store(now_unix_ms(), Ordering::Release);
+            rec.status.store(JOB_COMPLETED, Ordering::Release);
+            *rec.result.write().await = Some(result.clone());
+            send_job_finished(
+                &inner.outbound_tx,
+                JobFinishedTelemetry {
+                    chat_id: &chat_id,
+                    channel: &channel,
+                    job_id: &job_id,
+                    session_id: &sid.to_string(),
+                    provider_id: &provider_id,
+                    status: "completed",
+                    duration_ms,
+                    exit_code: result.exit_code,
+                    stdout_len: result.stdout.len(),
+                    stderr_len: result.stderr.len(),
+                    artifact_count: result.attachments.len(),
+                    description: rec.description.clone(),
+                },
+            )
+            .await;
+            let exit_s = format_exit_for_user(result.exit_code);
+            let summary = match rec
+                .description
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(d) => format!("{} - completed (exit {}, {} ms)", d, exit_s, duration_ms),
+                None => format!(
+                    "{} job {} completed (exit {}, {} ms)",
+                    tool_name, job_id, exit_s, duration_ms
+                ),
+            };
+            let notice = build_execution_job_notice(
+                &chat_id,
+                &channel,
+                &job_id,
+                &sid.to_string(),
+                "completed",
+                &summary,
+                rec.description.as_deref(),
+                Some(rec.tool_name.as_str()),
+            );
+            let _ = inner.outbound_tx.send(BusMessage::Outbound(notice)).await;
+            if let Err(e) = append_job_audit_line(
+                &ws,
+                &JobAuditLine {
+                    ts: &ts_finish,
+                    job_id: &job_id,
+                    session_id: sid.as_str(),
+                    provider_id: &provider_id,
+                    status: "completed",
+                    duration_ms,
+                    error: None,
+                    description: rec.description.as_deref(),
+                },
+            )
+            .await
+            {
+                warn!("execution_jobs audit: {e}");
+            }
+            // Tool-call style journal (e.g. for `colab_mcp_tool_call`).
+            if tool_name == "colab_mcp_tool_call" {
+                if let Err(e) = write_colab_mcp_call_journal(
+                    &ws,
+                    &sid,
+                    &job_id,
+                    &started_ts,
+                    &ts_finish,
+                    duration_ms,
+                    &result.stdout,
+                    rec.description.as_deref(),
+                )
+                .await
+                {
+                    warn!("colab_mcp_tool_call journal: {e}");
+                }
+            }
+            info!(
+                "execution_job_done job={} session={} provider={} status=completed tool={}",
+                job_id, sid, provider_id, tool_name
+            );
+        }
+        Err(e) => {
+            let (st_u8, status_label) = match &e {
+                ExecutionError::Timeout { .. } => (JOB_TIMEOUT, "timeout"),
+                ExecutionError::Cancelled => (JOB_CANCELLED, "cancelled"),
+                _ => (JOB_FAILED, "failed"),
+            };
+            rec.finished_unix_ms.store(now_unix_ms(), Ordering::Release);
+            rec.status.store(st_u8, Ordering::Release);
+            let es = e.to_string();
+            *rec.error.write().await = Some(es.clone());
+            send_job_finished(
+                &inner.outbound_tx,
+                JobFinishedTelemetry {
+                    chat_id: &chat_id,
+                    channel: &channel,
+                    job_id: &job_id,
+                    session_id: &sid.to_string(),
+                    provider_id: &provider_id,
+                    status: status_label,
+                    duration_ms,
+                    exit_code: None,
+                    stdout_len: 0,
+                    stderr_len: 0,
+                    artifact_count: 0,
+                    description: rec.description.clone(),
+                },
+            )
+            .await;
+            let summary = match rec
+                .description
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(d) => format!("{} - {status_label} ({es})", d),
+                None => format!("{tool_name} job {job_id}: {status_label} ({es})"),
+            };
+            let notice = build_execution_job_notice(
+                &chat_id,
+                &channel,
+                &job_id,
+                &sid.to_string(),
+                status_label,
+                &summary,
+                rec.description.as_deref(),
+                Some(rec.tool_name.as_str()),
+            );
+            let _ = inner.outbound_tx.send(BusMessage::Outbound(notice)).await;
+            if let Err(log_e) = append_job_audit_line(
+                &ws,
+                &JobAuditLine {
+                    ts: &ts_finish,
+                    job_id: &job_id,
+                    session_id: sid.as_str(),
+                    provider_id: &provider_id,
+                    status: status_label,
+                    duration_ms,
+                    error: Some(es.as_str()),
+                    description: rec.description.as_deref(),
+                },
+            )
+            .await
+            {
+                warn!("execution_jobs audit: {log_e}");
+            }
+            if tool_name == "colab_mcp_tool_call" {
+                if let Err(jerr) = write_colab_mcp_call_journal(
+                    &ws,
+                    &sid,
+                    &job_id,
+                    &started_ts,
+                    &ts_finish,
+                    duration_ms,
+                    &format!("error: {es}"),
+                    rec.description.as_deref(),
+                )
+                .await
+                {
+                    warn!("colab_mcp_tool_call journal: {jerr}");
+                }
+            }
+            info!(
+                "execution_job_done job={} session={} provider={} status={} tool={}",
+                job_id, sid, provider_id, status_label, tool_name
+            );
+        }
+    }
+}
+
+/// Persist a JSON file at `.system_generated/execution_history/colab_mcp_tool_call/{session}/{job_id}/result.json`.
+pub(crate) async fn write_colab_mcp_call_journal(
+    workspace_dir: &Path,
+    session_id: &SessionId,
+    job_id: &str,
+    started_rfc3339: &str,
+    finished_rfc3339: &str,
+    duration_ms: u64,
+    body: &str,
+    description: Option<&str>,
+) -> Result<(), String> {
+    let session_seg = crate::execution::sanitize_session_segment(session_id);
+    let dir = workspace_dir
+        .join(".system_generated")
+        .join("execution_history")
+        .join("colab_mcp_tool_call")
+        .join(&session_seg)
+        .join(job_id);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| format!("colab_mcp_call mkdir: {e}"))?;
+    let line = json!({
+        "schema_version": 1,
+        "tool_name": "colab_mcp_tool_call",
+        "session_id": session_id.to_string(),
+        "job_id": job_id,
+        "started_rfc3339": started_rfc3339,
+        "finished_rfc3339": finished_rfc3339,
+        "duration_ms": duration_ms,
+        "description": description,
+        "result_excerpt": truncate_for_journal(body, 64 * 1024),
+    });
+    let pretty = serde_json::to_string_pretty(&line).map_err(|e| e.to_string())?;
+    tokio::fs::write(dir.join("result.json"), pretty.as_bytes())
+        .await
+        .map_err(|e| format!("colab_mcp_call result.json: {e}"))?;
+    // Append to a sibling JSONL.
+    let manifest = workspace_dir
+        .join(".system_generated")
+        .join("colab_mcp_calls.jsonl");
+    if let Some(parent) = manifest.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    let mut f = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&manifest)
+        .await
+        .map_err(|e| format!("colab_mcp_calls.jsonl open: {e}"))?;
+    let row = json!({
+        "ts": finished_rfc3339,
+        "session_id": session_id.to_string(),
+        "job_id": job_id,
+        "duration_ms": duration_ms,
+        "description": description,
+    });
+    let s = serde_json::to_string(&row).map_err(|e| e.to_string())?;
+    f.write_all(s.as_bytes())
+        .await
+        .map_err(|e| format!("colab_mcp_calls.jsonl write: {e}"))?;
+    f.write_all(b"\n")
+        .await
+        .map_err(|e| format!("colab_mcp_calls.jsonl nl: {e}"))?;
+    Ok(())
+}
+
+fn truncate_for_journal(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n... (truncated)", &s[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution::{ArtifactLimits, LocalExecutionConfig, LocalExecutionProvider};
+    use std::time::Duration;
+
+    fn temp_workspace() -> (std::path::PathBuf, std::path::PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("isanagent-jobs-test-{}", uuid::Uuid::new_v4()));
+        let sandbox = root.join("sandbox");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        (root, sandbox)
+    }
+
+    fn build_jobs() -> (Arc<ExecutionJobManager>, mpsc::Receiver<BusMessage>, std::path::PathBuf) {
+        let (ws, dir) = temp_workspace();
+        let cfg = LocalExecutionConfig::new(dir.clone(), true);
+        let prov: Arc<dyn crate::execution::ExecutionProvider> =
+            Arc::new(LocalExecutionProvider::new(cfg).expect("local provider"));
+        let harness = Arc::new(ExecutionHarness::new(
+            prov,
+            "python",
+            ws.clone(),
+            dir,
+            ArtifactLimits::default(),
+            60,
+            3600,
+            0,
+        ));
+        let (otx, orx) = mpsc::channel::<BusMessage>(64);
+        (Arc::new(ExecutionJobManager::new(harness, otx)), orx, ws)
+    }
+
+    fn fake_session() -> SessionId {
+        SessionId::new("test-session")
+    }
+
+    #[tokio::test]
+    async fn spawn_arbitrary_records_completion() {
+        let (jobs, _orx, _ws) = build_jobs();
+        let work: ArbitraryWork = Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok(RunResult::new("hello", "", Some(0)))
+        });
+        let jid = jobs
+            .spawn_arbitrary(SpawnArbitraryRequest {
+                sid: fake_session(),
+                tool_name: "colab_mcp_tool_call".to_string(),
+                label: None,
+                description: Some("unit-arbitrary".to_string()),
+                chat_id: "chat-test".to_string(),
+                channel: "terminal".to_string(),
+                work,
+            })
+            .expect("spawn_arbitrary ok");
+        // Drain to terminal.
+        for _ in 0..100 {
+            let v = jobs.job_status_json(&jid).await.expect("status");
+            if v["terminal"].as_bool() == Some(true) {
+                assert_eq!(v["status"].as_str(), Some("completed"));
+                assert_eq!(v["tool_name"].as_str(), Some("colab_mcp_tool_call"));
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("spawn_arbitrary job never reached terminal state");
+    }
+
+    #[tokio::test]
+    async fn cancel_job_force_aborts_long_running_task() {
+        let (jobs, _orx, _ws) = build_jobs();
+        let work: ArbitraryWork = Box::pin(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(RunResult::new("", "", Some(0)))
+        });
+        let jid = jobs
+            .spawn_arbitrary(SpawnArbitraryRequest {
+                sid: fake_session(),
+                tool_name: "colab_mcp_tool_call".to_string(),
+                label: None,
+                description: None,
+                chat_id: "chat-test".to_string(),
+                channel: "terminal".to_string(),
+                work,
+            })
+            .expect("spawn ok");
+        // Give the task a tick to start.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        jobs.cancel_job_force(&jid).await.expect("cancel ok");
+        // Give the abort + finalize a tick to settle.
+        for _ in 0..100 {
+            let v = jobs.job_status_json(&jid).await.expect("status");
+            if v["terminal"].as_bool() == Some(true) {
+                assert_eq!(v["status"].as_str(), Some("cancelled"));
+                assert_eq!(v["cancel_kind"].as_str(), Some("abort"));
+                assert!(
+                    v.get("cancel_note").is_some(),
+                    "expected cancel_note for abort path: {v}"
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("cancel_job_force did not transition job to cancelled state");
+    }
+
+    #[tokio::test]
+    async fn cancel_job_force_rejects_unknown_or_terminal() {
+        let (jobs, _orx, _ws) = build_jobs();
+        let err = jobs
+            .cancel_job_force("no-such-job")
+            .await
+            .expect_err("must error");
+        assert!(err.contains("Unknown"), "unexpected error: {err}");
+
+        let work: ArbitraryWork = Box::pin(async move {
+            Ok(RunResult::new("", "", Some(0)))
+        });
+        let jid = jobs
+            .spawn_arbitrary(SpawnArbitraryRequest {
+                sid: fake_session(),
+                tool_name: "execution_run".to_string(),
+                label: None,
+                description: None,
+                chat_id: "chat-test".to_string(),
+                channel: "terminal".to_string(),
+                work,
+            })
+            .expect("spawn ok");
+        for _ in 0..100 {
+            let v = jobs.job_status_json(&jid).await.expect("status");
+            if v["terminal"].as_bool() == Some(true) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let err = jobs
+            .cancel_job_force(&jid)
+            .await
+            .expect_err("terminal cancel must error");
+        assert!(err.contains("already finished"), "unexpected error: {err}");
     }
 }

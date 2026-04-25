@@ -15,10 +15,10 @@ const ISANAGENT_TOOL_NOTIFY: &str = "isanagent_tool_notify";
 const ISANAGENT_TOOL_PHASE: &str = "isanagent_tool_phase";
 
 use crate::channels::terminal_ui::protocol::{
-    ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_STREAM, METADATA_EXECUTION_DESCRIPTION,
-    METADATA_EXECUTION_JOB_ID, METADATA_EXECUTION_JOB_STATUS, METADATA_EXECUTION_RUN_ID,
-    METADATA_EXECUTION_SESSION_ID, METADATA_TOOL_CALL_PREVIEW, METADATA_TOOL_NAME,
-    METADATA_TOOL_RESULT_PREVIEW,
+    ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_JOB_STARTED, ISANAGENT_EXECUTION_STREAM,
+    METADATA_EXECUTION_DESCRIPTION, METADATA_EXECUTION_JOB_ID, METADATA_EXECUTION_JOB_STATUS,
+    METADATA_EXECUTION_JOB_TOOL_NAME, METADATA_EXECUTION_RUN_ID, METADATA_EXECUTION_SESSION_ID,
+    METADATA_TOOL_CALL_PREVIEW, METADATA_TOOL_NAME, METADATA_TOOL_RESULT_PREVIEW,
 };
 
 /// When true, `main` skips the large colored stdout banner (Ratatui alternate screen owns the TTY).
@@ -155,6 +155,39 @@ pub fn build_execution_stream_notice(
     }
 }
 
+/// Short user-visible line when a background execution job is registered with the manager.
+///
+/// Surfaces the new job in the multi-job execution strip immediately (before any output is
+/// available). Paired with [`build_execution_job_notice`] which fires on completion / failure.
+pub fn build_execution_job_started_notice(
+    chat_id: &str,
+    channel: &str,
+    job_id: &str,
+    session_id: &str,
+    tool_name: &str,
+    description: Option<&str>,
+) -> OutboundMessage {
+    let mut metadata = HashMap::new();
+    metadata.insert(ISANAGENT_EXECUTION_JOB_STARTED.to_string(), json!(true));
+    metadata.insert(METADATA_EXECUTION_JOB_ID.to_string(), json!(job_id));
+    metadata.insert(METADATA_EXECUTION_SESSION_ID.to_string(), json!(session_id));
+    metadata.insert(METADATA_EXECUTION_JOB_TOOL_NAME.to_string(), json!(tool_name));
+    if let Some(d) = description.filter(|s| !s.trim().is_empty()) {
+        metadata.insert(METADATA_EXECUTION_DESCRIPTION.to_string(), json!(d.trim()));
+    }
+    let summary = match description.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(d) => format!("{tool_name} started: {d}"),
+        None => format!("{tool_name} started"),
+    };
+    OutboundMessage {
+        channel: channel.to_string(),
+        chat_id: chat_id.to_string(),
+        thread_id: None,
+        content: summary,
+        metadata,
+    }
+}
+
 /// Short user-visible line when a background execution job finishes (or fails).
 pub fn build_execution_job_notice(
     chat_id: &str,
@@ -164,6 +197,7 @@ pub fn build_execution_job_notice(
     status: &str,
     summary: &str,
     description: Option<&str>,
+    tool_name: Option<&str>,
 ) -> OutboundMessage {
     let mut metadata = HashMap::new();
     metadata.insert(ISANAGENT_EXECUTION_JOB.to_string(), json!(true));
@@ -172,6 +206,9 @@ pub fn build_execution_job_notice(
     metadata.insert(METADATA_EXECUTION_JOB_STATUS.to_string(), json!(status));
     if let Some(d) = description.filter(|s| !s.trim().is_empty()) {
         metadata.insert(METADATA_EXECUTION_DESCRIPTION.to_string(), json!(d.trim()));
+    }
+    if let Some(t) = tool_name.filter(|s| !s.trim().is_empty()) {
+        metadata.insert(METADATA_EXECUTION_JOB_TOOL_NAME.to_string(), json!(t.trim()));
     }
     OutboundMessage {
         channel: channel.to_string(),

@@ -193,6 +193,7 @@ impl LoggingActor {
             BusMessage::Log(_) => return Ok(()),
             BusMessage::LoggerControl(_) => return Ok(()),
             BusMessage::Cancel(_) => return Ok(()),
+            BusMessage::PromoteSyncToBackground(_) => return Ok(()),
         }
         .map_err(|e| ActorError::from(format!("Failed to serialize conversation event: {}", e)))?;
 
@@ -242,6 +243,11 @@ impl LoggingActor {
             BusMessage::Cancel(chat_id) => LogEvent::info(
                 "BusMessage",
                 &format!("Cancel reasoning loop for chat_id={}", chat_id),
+            )
+            .with_chat_id(chat_id),
+            BusMessage::PromoteSyncToBackground(chat_id) => LogEvent::info(
+                "BusMessage",
+                &format!("PromoteSyncToBackground requested for chat_id={}", chat_id),
             )
             .with_chat_id(chat_id),
         };

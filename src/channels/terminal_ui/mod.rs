@@ -11,7 +11,8 @@ mod run;
 mod theme;
 
 pub use app::{
-    App, Cell, TerminalUiFocus, TerminalUiMode, ToastKind, ToolNoticePhase, ToolRailEntry,
+    App, Cell, JobStripEntry, JobStripStatus, TerminalUiFocus, TerminalUiMode, ToastKind,
+    ToolNoticePhase, ToolRailEntry,
 };
 pub use theme::{init_from_env, uses_ansi_color, Theme};
 

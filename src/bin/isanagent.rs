@@ -36,6 +36,7 @@ use isanagent::tools::builtin::{
     CronTool, EditFileTool, GitWorktreeTool, GlobFilesTool, ListDirTool, MessageTool, ReadFileTool,
     SearchTextTool, ShellExecTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
+use isanagent::execution::InflightSyncRegistry;
 use isanagent::tools::execution::{
     compile_colab_mcp_tool_allowlist, ColabMcpToolCallTool, ExecutionArtifactListTool,
     ExecutionCancelTool, ExecutionEnvInfoTool, ExecutionJobCancelTool, ExecutionJobListTool,
@@ -297,6 +298,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             allow_path_outside_sandbox: workspace.config.git_worktree_allow_path_outside_sandbox(),
         }));
     }
+    let mut inflight_sync_outer: Option<Arc<InflightSyncRegistry>> = None;
     if workspace.config.execution_harness_enabled() {
         let harness = isanagent::execution::build_execution_harness(
             workspace.dir.clone(),
@@ -309,12 +311,16 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             harness.clone(),
             global_outbound_tx.clone(),
         ));
+        let inflight_sync = Arc::new(InflightSyncRegistry::new());
+        inflight_sync_outer = Some(inflight_sync.clone());
         tools.register(Box::new(ExecutionSessionCreateTool {
             harness: harness.clone(),
         }));
         tools.register(Box::new(ExecutionRunTool {
             harness: harness.clone(),
             outbound_tx: global_outbound_tx.clone(),
+            jobs: Some(execution_jobs.clone()),
+            inflight: Some(inflight_sync.clone()),
         }));
         tools.register(Box::new(ExecutionRunBackgroundTool {
             harness: harness.clone(),
@@ -331,7 +337,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             jobs: execution_jobs.clone(),
         }));
         tools.register(Box::new(ExecutionJobCancelTool {
-            jobs: execution_jobs,
+            jobs: execution_jobs.clone(),
         }));
         tools.register(Box::new(ExecutionArtifactListTool {
             harness: harness.clone(),
@@ -368,6 +374,8 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                             harness: harness.clone(),
                             allowlist: gs,
                             max_result_chars: max_chars,
+                            jobs: Some(execution_jobs.clone()),
+                            inflight: Some(inflight_sync.clone()),
                         }));
                     }
                     Err(e) => log::warn!(
@@ -693,9 +701,20 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     // Route inbound messages from all channels into the agent and logger
     let agent_tx = agent_node.clone();
     let logger_tx = logger_bus_tx.clone();
+    let inflight_promote = inflight_sync_outer.clone();
     tokio::spawn(async move {
         while let Some(msg) = bus_rx.recv().await {
             let _ = logger_tx.send(msg.clone());
+            // Intercept /background slash commands and fire the in-flight oneshot.
+            if let BusMessage::PromoteSyncToBackground(chat_id) = &msg {
+                if let Some(reg) = inflight_promote.as_ref() {
+                    let promoted = reg.promote(chat_id);
+                    log::debug!(
+                        "PromoteSyncToBackground chat={chat_id} promoted={promoted}"
+                    );
+                }
+                continue;
+            }
             // Only route Inbound and Cancel messages to the agent logic.
             // This prevents the agent from being flooded with its own telemetry or other system messages.
             if matches!(msg, BusMessage::Inbound(_) | BusMessage::Cancel(_)) {
