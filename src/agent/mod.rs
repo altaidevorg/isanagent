@@ -147,6 +147,7 @@ async fn log_tool_invocation_start(
             channel: inbound.channel.clone(),
             tool_name: tool_name.to_string(),
             args: args_str.clone(),
+            tool_call_id: Some(tc.id.clone()),
         }))
         .await;
     let _ = outbound_tx
@@ -855,6 +856,114 @@ impl ActorLogic<BusMessage> for AgentLogic {
     }
 }
 
+/// Outcome of a `provider.chat` invocation that may be retried for transient errors.
+enum ChatRetryOutcome {
+    Ok(crate::utils::LLMResponse),
+    /// Cancellation token fired during a chat or sleep; caller exits the reasoning loop.
+    Cancelled,
+    /// Retries exhausted; final user-facing error string. The caller is expected to surface
+    /// an LLM-failed banner.
+    Failed(String),
+}
+
+/// Wrap `provider.chat` with a small retry loop for transient errors (network/5xx/429).
+/// Up to 3 total attempts with exponential backoff (1s/2s/4s); the cancel token preempts
+/// both the chat and the sleep.
+async fn chat_with_retry(
+    provider: &dyn crate::traits::Provider,
+    context: &[crate::utils::ChatMessage],
+    tools_payload: Option<serde_json::Value>,
+    cancel_token: &tokio_util::sync::CancellationToken,
+    logger_tx: &LoggerHandle,
+    name: &str,
+    chat_id: &str,
+) -> ChatRetryOutcome {
+    const MAX_ATTEMPTS: u32 = 3;
+    const BACKOFF_BASE_MS: u64 = 1000;
+    let mut last_err: Option<crate::utils::LLMError> = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        let res = tokio::select! {
+            r = provider.chat(context, tools_payload.clone()) => r,
+            _ = cancel_token.cancelled() => {
+                let _ = logger_tx.send(BusMessage::Log(LogEvent::info(
+                    name,
+                    "Reasoning loop cancelled during LLM call.",
+                ).with_chat_id(chat_id)));
+                return ChatRetryOutcome::Cancelled;
+            }
+        };
+        match res {
+            Ok(resp) => return ChatRetryOutcome::Ok(resp),
+            Err(e) => {
+                let transient = e.is_transient();
+                let is_last = attempt + 1 >= MAX_ATTEMPTS;
+                if !transient || is_last {
+                    last_err = Some(e);
+                    break;
+                }
+                let backoff_ms = BACKOFF_BASE_MS * (1u64 << attempt);
+                let _ = logger_tx.send(BusMessage::Log(
+                    LogEvent::warn(
+                        name,
+                        &format!(
+                            "LLM call failed (attempt {}/{}): {}. Retrying in {}ms.",
+                            attempt + 1,
+                            MAX_ATTEMPTS,
+                            e,
+                            backoff_ms
+                        ),
+                    )
+                    .with_chat_id(chat_id),
+                ));
+                last_err = Some(e);
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)) => {}
+                    _ = cancel_token.cancelled() => {
+                        return ChatRetryOutcome::Cancelled;
+                    }
+                }
+            }
+        }
+    }
+    ChatRetryOutcome::Failed(
+        last_err
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown LLM error".to_string()),
+    )
+}
+
+/// Build the user-facing terminal banner for an exhausted-retry LLM failure.
+/// Carries the `isanagent_llm_retry_available` metadata flag so the terminal UI can
+/// gate `/retry` on the banner being active.
+fn build_llm_failed_banner(
+    channel: &str,
+    chat_id: &str,
+    thread_id: Option<&str>,
+    error: &str,
+) -> OutboundMessage {
+    let content = format!(
+        "LLM call failed after 3 attempts: {error}\nPress /retry to try again or /cancel to abandon."
+    );
+    let mut metadata: HashMap<String, serde_json::Value> = HashMap::new();
+    if channel == "terminal" {
+        metadata.insert(
+            crate::channels::terminal_ui::protocol::ISANAGENT_TERMINAL_ERROR.to_string(),
+            serde_json::json!(true),
+        );
+        metadata.insert(
+            crate::channels::terminal_ui::protocol::ISANAGENT_LLM_RETRY_AVAILABLE.to_string(),
+            serde_json::json!(true),
+        );
+    }
+    OutboundMessage {
+        channel: channel.to_string(),
+        chat_id: chat_id.to_string(),
+        thread_id: thread_id.map(|s| s.to_string()),
+        content,
+        metadata,
+    }
+}
+
 impl AgentLogic {
     pub(crate) async fn run_reasoning_loop(ctx: ReasoningLoopCtx) -> Result<String, String> {
         let ReasoningLoopCtx {
@@ -1086,17 +1195,30 @@ impl AgentLogic {
                 tools.list_tools_scoped(subagent_allowlist.as_deref(), is_subagent)
             ));
 
-            // Call Provider with cancellation support
-            let response = tokio::select! {
-                res = provider.chat(&context, tools_payload) => {
-                    res.map_err(|e| e.to_string())?
-                }
-                _ = cancel_token.cancelled() => {
-                    let _ = logger_tx.send(BusMessage::Log(LogEvent::info(
-                        &name,
-                        "Reasoning loop cancelled during LLM call.",
-                    ).with_chat_id(&inbound.chat_id)));
+            let response = match chat_with_retry(
+                provider.as_ref(),
+                &context,
+                tools_payload,
+                &cancel_token,
+                &logger_tx,
+                &name,
+                &inbound.chat_id,
+            )
+            .await
+            {
+                ChatRetryOutcome::Ok(resp) => resp,
+                ChatRetryOutcome::Cancelled => {
                     return Ok(String::new());
+                }
+                ChatRetryOutcome::Failed(err) => {
+                    let banner = build_llm_failed_banner(
+                        &inbound.channel,
+                        &inbound.chat_id,
+                        inbound.thread_id.as_deref(),
+                        &err,
+                    );
+                    let _ = outbound_tx.send(BusMessage::Outbound(banner)).await;
+                    return Err(err);
                 }
             };
 
@@ -1142,6 +1264,7 @@ impl AgentLogic {
                     name: None,
                     tool_calls: Some(tool_calls.clone()),
                     tool_call_id: None,
+                    reasoning_content: response.reasoning_content.clone(),
                 };
                 mem.add_message(assistant_msg).await?;
 
@@ -1242,6 +1365,7 @@ impl AgentLogic {
                                 channel: inbound.channel.clone(),
                                 tool_name: tool_name.clone(),
                                 result: tool_result_text.clone(),
+                                tool_call_id: Some(tc.id.clone()),
                             }))
                             .await;
                         let _ = outbound_tx
@@ -1316,6 +1440,7 @@ impl AgentLogic {
                                 channel: inbound.channel.clone(),
                                 tool_name: tool_name.to_string(),
                                 result: tool_result_text.clone(),
+                                tool_call_id: Some(tc.id.clone()),
                             }))
                             .await;
                         let _ = outbound_tx
@@ -1332,9 +1457,9 @@ impl AgentLogic {
                     }
                 }
             } else {
-                // Add vanilla assistant response to memory
-                mem.add_message(crate::utils::ChatMessage::assistant(&response_text))
-                    .await?;
+                let mut assistant_msg = crate::utils::ChatMessage::assistant(&response_text);
+                assistant_msg.reasoning_content = response.reasoning_content.clone();
+                mem.add_message(assistant_msg).await?;
             }
 
             if !tool_invoked {

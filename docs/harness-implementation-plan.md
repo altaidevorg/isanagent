@@ -6,7 +6,7 @@ This document tracks expanding the built-in tool surface toward a strong **code-
 
 - All filesystem tools respect `resolve_path` and `restrict_to_workspace` (see `AGENTS.md`).
 - Prefer bounded output (line/char caps), timeouts on subprocesses, and clear errors over silent truncation where possible.
-- Register new tools in `src/bin/isanagent.rs` unless registration is later centralized.
+- Register new tools in `src/main.rs` unless registration is later centralized.
 
 ## Phases
 

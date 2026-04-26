@@ -17,6 +17,10 @@ pub enum TerminalUiMode {
 /// Telemetry-style tool line phase (mirrors `terminal` channel metadata).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolNoticePhase {
+    /// Initial in-flight phase: a tool call has been emitted but no result has arrived yet.
+    /// Rendered yellow/dim. When a matching result/fail arrives with the same `tool_call_id`,
+    /// `upsert_tool_notice` mutates this cell in place rather than appending a second row.
+    Pending,
     Call,
     Result,
     /// Tool returned an error string (e.g. `Error: …`).
@@ -108,6 +112,12 @@ pub enum Cell {
     ToolNotice {
         phase: ToolNoticePhase,
         content: String,
+        /// LLM-supplied stable id for the originating tool invocation.
+        ///
+        /// When present, lets the UI mutate a single cell from `Pending` → `Result`/`Failed`
+        /// instead of pushing two cells per call. Optional for backwards compatibility with
+        /// older bus messages and synthetic notices that have no upstream id.
+        tool_call_id: Option<String>,
     },
     Clarification {
         text: String,
@@ -173,6 +183,12 @@ pub struct App {
     pub execution_stream_label: Option<(String, String)>,
     /// Multi-job execution strip rows (Colab MCP background calls, auto-promoted runs, etc.).
     pub jobs_strip: VecDeque<JobStripEntry>,
+    /// True when the most recent reasoning turn ended with an exhausted-retry LLM failure
+    /// banner. Cleared once the next user message (or `/retry`) is sent.
+    pub llm_retry_available: bool,
+    /// Remembers the last user-sent inbound text so `/retry` can re-submit it after an
+    /// exhausted-retry LLM failure.
+    pub last_inbound_text: Option<String>,
 }
 
 impl Default for App {
@@ -207,6 +223,8 @@ impl App {
             execution_stream_recent: String::new(),
             execution_stream_label: None,
             jobs_strip: VecDeque::new(),
+            llm_retry_available: false,
+            last_inbound_text: None,
         }
     }
 
@@ -516,6 +534,53 @@ impl App {
             .iter()
             .any(|e| e.status == JobStripStatus::Running)
     }
+
+    /// Insert or mutate a `Cell::ToolNotice` keyed by `tool_call_id`.
+    ///
+    /// - On `Pending` / `Call`: append a new cell (no in-place merge).
+    /// - On `Result` / `Failed`: walk `cells` from the back and mutate the most recent
+    ///   `ToolNotice` whose `tool_call_id` matches. If none is found (race / id missing),
+    ///   append as a fresh cell — preserves visibility for orphan results.
+    /// - When `tool_call_id` is `None`, always appends (legacy behavior).
+    pub fn upsert_tool_notice(
+        &mut self,
+        tool_call_id: Option<String>,
+        phase: ToolNoticePhase,
+        content: String,
+    ) {
+        let id = match (tool_call_id.as_deref(), phase) {
+            (Some(id), ToolNoticePhase::Result | ToolNoticePhase::Failed) if !id.is_empty() => id,
+            _ => {
+                self.cells.push(Cell::ToolNotice {
+                    phase,
+                    content,
+                    tool_call_id,
+                });
+                return;
+            }
+        };
+
+        for cell in self.cells.iter_mut().rev() {
+            if let Cell::ToolNotice {
+                phase: existing_phase,
+                content: existing_content,
+                tool_call_id: existing_id,
+            } = cell
+            {
+                if existing_id.as_deref() == Some(id) {
+                    *existing_phase = phase;
+                    *existing_content = content;
+                    return;
+                }
+            }
+        }
+
+        self.cells.push(Cell::ToolNotice {
+            phase,
+            content,
+            tool_call_id,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -617,6 +682,120 @@ mod tests {
         app.evict_expired_jobs(Duration::from_secs(10));
         assert_eq!(app.jobs_strip.len(), 1);
         assert_eq!(app.jobs_strip.front().unwrap().job_id, "running");
+    }
+
+    #[test]
+    fn upsert_tool_notice_appends_pending_then_mutates_to_result() {
+        let mut app = App::new();
+        app.upsert_tool_notice(
+            Some("call-1".into()),
+            ToolNoticePhase::Pending,
+            "execution_run epoch=1".into(),
+        );
+        assert_eq!(app.cells.len(), 1);
+        match &app.cells[0] {
+            Cell::ToolNotice {
+                phase,
+                tool_call_id,
+                ..
+            } => {
+                assert_eq!(*phase, ToolNoticePhase::Pending);
+                assert_eq!(tool_call_id.as_deref(), Some("call-1"));
+            }
+            _ => panic!("expected ToolNotice"),
+        }
+
+        app.upsert_tool_notice(
+            Some("call-1".into()),
+            ToolNoticePhase::Result,
+            "execution_run → exit 0".into(),
+        );
+        assert_eq!(app.cells.len(), 1, "result should mutate in place");
+        match &app.cells[0] {
+            Cell::ToolNotice { phase, content, .. } => {
+                assert_eq!(*phase, ToolNoticePhase::Result);
+                assert!(content.contains("exit 0"));
+            }
+            _ => panic!("expected ToolNotice"),
+        }
+    }
+
+    #[test]
+    fn upsert_tool_notice_mutates_to_failed_for_matching_id() {
+        let mut app = App::new();
+        app.upsert_tool_notice(
+            Some("call-2".into()),
+            ToolNoticePhase::Pending,
+            "tool x".into(),
+        );
+        app.upsert_tool_notice(
+            Some("call-2".into()),
+            ToolNoticePhase::Failed,
+            "tool x → boom".into(),
+        );
+        assert_eq!(app.cells.len(), 1);
+        match &app.cells[0] {
+            Cell::ToolNotice { phase, .. } => assert_eq!(*phase, ToolNoticePhase::Failed),
+            _ => panic!("expected ToolNotice"),
+        }
+    }
+
+    #[test]
+    fn upsert_tool_notice_appends_orphan_result_when_no_pending_match() {
+        let mut app = App::new();
+        // No prior Pending cell with this id — orphan result should still surface.
+        app.upsert_tool_notice(
+            Some("ghost".into()),
+            ToolNoticePhase::Result,
+            "ghost-tool → late ack".into(),
+        );
+        assert_eq!(app.cells.len(), 1);
+    }
+
+    #[test]
+    fn upsert_tool_notice_uses_most_recent_match_when_id_repeats() {
+        // Defensive: if the same id were ever recycled (e.g. retry path), the back-walk should
+        // resolve to the most recent Pending cell, not the older completed one.
+        let mut app = App::new();
+        app.upsert_tool_notice(Some("dup".into()), ToolNoticePhase::Pending, "first".into());
+        app.upsert_tool_notice(
+            Some("dup".into()),
+            ToolNoticePhase::Result,
+            "first done".into(),
+        );
+        app.upsert_tool_notice(
+            Some("dup".into()),
+            ToolNoticePhase::Pending,
+            "second".into(),
+        );
+        app.upsert_tool_notice(
+            Some("dup".into()),
+            ToolNoticePhase::Failed,
+            "second failed".into(),
+        );
+        assert_eq!(app.cells.len(), 2);
+        match &app.cells[1] {
+            Cell::ToolNotice { phase, content, .. } => {
+                assert_eq!(*phase, ToolNoticePhase::Failed);
+                assert_eq!(content, "second failed");
+            }
+            _ => panic!("expected ToolNotice"),
+        }
+        match &app.cells[0] {
+            Cell::ToolNotice { phase, content, .. } => {
+                assert_eq!(*phase, ToolNoticePhase::Result);
+                assert_eq!(content, "first done");
+            }
+            _ => panic!("expected ToolNotice"),
+        }
+    }
+
+    #[test]
+    fn upsert_tool_notice_without_id_always_appends() {
+        let mut app = App::new();
+        app.upsert_tool_notice(None, ToolNoticePhase::Call, "a".into());
+        app.upsert_tool_notice(None, ToolNoticePhase::Result, "b".into());
+        assert_eq!(app.cells.len(), 2);
     }
 
     #[test]

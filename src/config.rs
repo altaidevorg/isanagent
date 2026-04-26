@@ -577,6 +577,38 @@ impl AppConfig {
             .unwrap_or_else(|| "colab_mcp".to_string())
     }
 
+    /// True iff the user explicitly set `[harness.execution].default_provider` to a non-empty
+    /// string. Used by `build_execution_harness` to decide between auto-pick (implicit fallback
+    /// happened to be misconfigured) and hard-fail (user pinned a now-pruned provider).
+    pub fn execution_default_provider_explicit(&self) -> bool {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.default_provider.as_ref())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Returns the user-configured allowed-providers list (trimmed, non-empty entries).
+    /// `None` means "no restriction" (all implemented providers may be tried).
+    pub fn execution_allowed_providers(&self) -> Option<Vec<String>> {
+        let raw = self
+            .harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.allowed_providers.as_ref())?;
+        let cleaned: Vec<String> = raw
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned)
+        }
+    }
+
     pub fn execution_max_output_bytes(&self) -> usize {
         const DEFAULT: usize = 256 * 1024;
         const MIN: usize = 4096;
@@ -1071,9 +1103,115 @@ pub struct ApiConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ProviderConfig {
+    /// One of `KNOWN_PROVIDERS` (e.g. `"gemini"`, `"openai"`, `"deepseek"`, `"openrouter"`) or
+    /// the `OPENAI_COMPATIBLE` sentinel for any third-party endpoint speaking the OpenAI Chat
+    /// Completions protocol.
+    pub provider_name: String,
     pub model_name: String,
     pub api_key_env: String,
-    pub base_url: String,
+    /// Optional explicit chat-completions URL. Always wins when set, including for known
+    /// provider names (lets users point a known provider at a proxy / Azure-OpenAI / self-hosted
+    /// gateway). Required when `provider_name == "openai_compatible"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+}
+
+impl ProviderConfig {
+    /// Resolve the chat-completions URL using the registry-then-override rules described on
+    /// [`ProviderConfig::base_url`].
+    ///
+    /// Errors:
+    /// - unknown `provider_name` (not in `KNOWN_PROVIDERS` and not `OPENAI_COMPATIBLE`)
+    /// - `provider_name == OPENAI_COMPATIBLE` with no `base_url` set
+    pub fn resolved_base_url(&self) -> Result<String, String> {
+        if let Some(url) = self
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Ok(url.to_string());
+        }
+        if let Some(url) = crate::provider_registry::lookup(self.provider_name.as_str()) {
+            return Ok(url.to_string());
+        }
+        if self.provider_name == crate::provider_registry::OPENAI_COMPATIBLE {
+            return Err(
+                "[provider] provider_name = \"openai_compatible\" requires base_url".to_string(),
+            );
+        }
+        let mut allowed = crate::provider_registry::known_names();
+        allowed.push(crate::provider_registry::OPENAI_COMPATIBLE);
+        Err(format!(
+            "[provider] unknown provider_name '{}'; expected one of [{}]",
+            self.provider_name,
+            allowed.join(", ")
+        ))
+    }
+}
+
+#[cfg(test)]
+mod provider_config_tests {
+    use super::ProviderConfig;
+
+    fn cfg(name: &str, base: Option<&str>) -> ProviderConfig {
+        ProviderConfig {
+            provider_name: name.to_string(),
+            model_name: "m".to_string(),
+            api_key_env: "X".to_string(),
+            base_url: base.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn resolves_known_name_from_registry() {
+        let url = cfg("gemini", None).resolved_base_url().unwrap();
+        assert!(
+            url.contains("generativelanguage.googleapis.com"),
+            "got {url}"
+        );
+    }
+
+    #[test]
+    fn explicit_base_url_overrides_known() {
+        let url = cfg(
+            "openai",
+            Some("https://relay.example.com/v1/chat/completions"),
+        )
+        .resolved_base_url()
+        .unwrap();
+        assert_eq!(url, "https://relay.example.com/v1/chat/completions");
+    }
+
+    #[test]
+    fn openai_compatible_requires_base_url() {
+        let err = cfg("openai_compatible", None)
+            .resolved_base_url()
+            .unwrap_err();
+        assert!(err.contains("openai_compatible"), "got {err}");
+        assert!(err.contains("base_url"), "got {err}");
+
+        let url = cfg(
+            "openai_compatible",
+            Some("https://my.host/v1/chat/completions"),
+        )
+        .resolved_base_url()
+        .unwrap();
+        assert_eq!(url, "https://my.host/v1/chat/completions");
+    }
+
+    #[test]
+    fn unknown_provider_name_errors() {
+        let err = cfg("totally-bogus", None).resolved_base_url().unwrap_err();
+        assert!(err.contains("unknown provider_name"), "got {err}");
+        assert!(err.contains("openai_compatible"), "got {err}");
+    }
+
+    #[test]
+    fn empty_base_url_string_is_treated_as_unset() {
+        let url = cfg("gemini", Some("   ")).resolved_base_url().unwrap();
+        assert!(url.contains("generativelanguage.googleapis.com"));
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]

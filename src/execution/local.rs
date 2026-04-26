@@ -173,6 +173,128 @@ pub fn uv_binary_available(uv_binary: &str) -> bool {
     which::which(uv_binary).is_ok()
 }
 
+/// Path to the python interpreter inside the uv-managed venv that would be created/used
+/// for the given local config. Returns `None` when the runtime is not `uv_managed`.
+pub fn uv_managed_env_python(config: &LocalExecutionConfig) -> Option<PathBuf> {
+    if !matches!(config.python_runtime, LocalPythonRuntime::UvManaged) {
+        return None;
+    }
+    let env_dir = config.uv_env_root.join(compute_uv_env_key(config));
+    Some(uv_env_python_path(&env_dir))
+}
+
+/// Compare declared `uv_requirements` against packages installed in the uv-managed venv.
+///
+/// Returns:
+/// - `Ok(None)` when the venv does not exist yet (nothing to check; first run will populate it).
+/// - `Ok(Some(missing))` with the list of requirements (verbatim) whose normalized package name
+///   was not found in the venv. An empty vector means everything is installed.
+/// - `Err(_)` on `uv pip list` failure.
+///
+/// Version pins, extras, and markers are ignored for v1 (name-only match).
+pub fn uv_requirements_status(
+    uv_binary: &str,
+    env_python: &Path,
+    requirements: &[String],
+) -> Result<Option<Vec<String>>, String> {
+    if !env_python.exists() {
+        return Ok(None);
+    }
+    if requirements.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let out = StdCommand::new(uv_binary)
+        .args([
+            "pip",
+            "list",
+            "--format=json",
+            "--python",
+            &env_python.to_string_lossy(),
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("failed to run uv pip list: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(format!(
+            "uv pip list failed (status {:?}): {}",
+            out.status.code(),
+            stderr
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    parse_uv_pip_list_and_diff(&stdout, requirements).map(Some)
+}
+
+/// Parse `uv pip list --format=json` output and return requirements whose names are missing.
+/// Public for unit-testing the diff logic without invoking `uv`.
+pub fn parse_uv_pip_list_and_diff(
+    pip_list_json: &str,
+    requirements: &[String],
+) -> Result<Vec<String>, String> {
+    #[derive(serde::Deserialize)]
+    struct Pkg {
+        name: String,
+    }
+    let installed: Vec<Pkg> = serde_json::from_str(pip_list_json.trim())
+        .map_err(|e| format!("parse uv pip list json: {e}"))?;
+    let installed_norm: std::collections::HashSet<String> = installed
+        .into_iter()
+        .map(|p| normalize_package_name(&p.name))
+        .collect();
+    let mut missing = Vec::new();
+    for req in requirements {
+        let name = match extract_requirement_name(req) {
+            Some(n) => n,
+            None => continue, // unparseable spec; skip rather than fail
+        };
+        if !installed_norm.contains(&normalize_package_name(&name)) {
+            missing.push(req.clone());
+        }
+    }
+    Ok(missing)
+}
+
+/// PEP 503-style normalization: lowercase and replace runs of `-_.` with a single `-`.
+fn normalize_package_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut last_dash = false;
+    for c in name.trim().chars() {
+        let is_sep = matches!(c, '-' | '_' | '.');
+        if is_sep {
+            if !last_dash && !out.is_empty() {
+                out.push('-');
+                last_dash = true;
+            }
+        } else {
+            out.extend(c.to_lowercase());
+            last_dash = false;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+/// Extract the bare package name from a requirement spec like
+/// `numpy>=1.20`, `pandas[parquet]==2.0`, `scipy ; python_version>='3.10'`. Returns `None`
+/// for `-e <path>`, URL specs, and other forms we cannot trivially diff.
+fn extract_requirement_name(spec: &str) -> Option<String> {
+    let s = spec.trim();
+    if s.is_empty() || s.starts_with('-') || s.contains("://") || s.starts_with('.') {
+        return None;
+    }
+    let stop_chars = [' ', '\t', '[', '=', '<', '>', '!', '~', ';', '@', '('];
+    let end = s.find(|c: char| stop_chars.contains(&c)).unwrap_or(s.len());
+    let name = s[..end].trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 /// Best-effort host installation flow for UV (used by startup prompt and `/install-python`).
 pub fn install_uv_best_effort() -> Result<String, String> {
     if let Ok(path) = which::which("uv") {
@@ -1221,6 +1343,84 @@ mod tests {
         cfg3.uv_requirements = vec!["numpy".into(), "pandas".into()];
         assert_ne!(compute_uv_env_key(&cfg1), compute_uv_env_key(&cfg2));
         assert_ne!(compute_uv_env_key(&cfg1), compute_uv_env_key(&cfg3));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn normalize_package_name_pep503() {
+        assert_eq!(normalize_package_name("Numpy"), "numpy");
+        assert_eq!(normalize_package_name("scikit_learn"), "scikit-learn");
+        assert_eq!(normalize_package_name("scikit.learn"), "scikit-learn");
+        assert_eq!(normalize_package_name("scikit--learn"), "scikit-learn");
+        assert_eq!(normalize_package_name("scikit_._-learn"), "scikit-learn");
+    }
+
+    #[test]
+    fn extract_requirement_name_handles_specs() {
+        assert_eq!(extract_requirement_name("numpy"), Some("numpy".into()));
+        assert_eq!(
+            extract_requirement_name("numpy>=1.20"),
+            Some("numpy".into())
+        );
+        assert_eq!(
+            extract_requirement_name("numpy >= 1.20"),
+            Some("numpy".into())
+        );
+        assert_eq!(
+            extract_requirement_name("pandas[parquet]==2.0"),
+            Some("pandas".into())
+        );
+        assert_eq!(
+            extract_requirement_name("scipy ; python_version>='3.10'"),
+            Some("scipy".into())
+        );
+        assert_eq!(
+            extract_requirement_name("torch~=2.0.0"),
+            Some("torch".into())
+        );
+        assert_eq!(extract_requirement_name(""), None);
+        assert_eq!(extract_requirement_name("-e ."), None);
+        assert_eq!(
+            extract_requirement_name("git+https://example.com/foo.git"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_uv_pip_list_diff_finds_missing() {
+        let json = r#"[
+            {"name":"numpy","version":"1.26.0"},
+            {"name":"Scikit-Learn","version":"1.4.0"}
+        ]"#;
+        let req = vec![
+            "numpy>=1.20".to_string(),
+            "scikit_learn".to_string(),
+            "pandas==2.0".to_string(),
+            "matplotlib[svg]>=3".to_string(),
+        ];
+        let missing = parse_uv_pip_list_and_diff(json, &req).unwrap();
+        assert_eq!(
+            missing,
+            vec!["pandas==2.0".to_string(), "matplotlib[svg]>=3".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_uv_pip_list_diff_empty_when_all_installed() {
+        let json = r#"[
+            {"name":"numpy","version":"1.26.0"},
+            {"name":"pandas","version":"2.0.0"}
+        ]"#;
+        let req = vec!["numpy".into(), "pandas==2.0".into()];
+        assert!(parse_uv_pip_list_and_diff(json, &req).unwrap().is_empty());
+    }
+
+    #[test]
+    fn uv_requirements_status_returns_none_when_venv_missing() {
+        let dir = temp_sandbox();
+        let nonexistent = dir.join("does_not_exist").join("python");
+        let res = uv_requirements_status("uv", &nonexistent, &["numpy".into()]).unwrap();
+        assert!(res.is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 }

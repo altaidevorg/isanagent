@@ -52,6 +52,11 @@ pub enum TelemetryEvent {
         channel: String,
         tool_name: String,
         args: String,
+        /// LLM-supplied stable id for this invocation. Used by the terminal UI to mutate
+        /// the pending cell in place when the matching `ToolResult` arrives. Optional for
+        /// backwards compat with synthetic emit sites that have no upstream id.
+        #[serde(default)]
+        tool_call_id: Option<String>,
     },
     ToolResult {
         chat_id: String,
@@ -59,6 +64,8 @@ pub enum TelemetryEvent {
         channel: String,
         tool_name: String,
         result: String,
+        #[serde(default)]
+        tool_call_id: Option<String>,
     },
     AgentThought {
         chat_id: String,

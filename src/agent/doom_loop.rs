@@ -144,6 +144,7 @@ mod tests {
             name: None,
             tool_calls: Some(calls),
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
 

@@ -16,7 +16,7 @@
     
     # build actual project
     COPY . .
-    RUN cargo build --bin isanagent --release
+    RUN cargo build --release
     
     # ---------- runtime ----------
     FROM debian:bookworm-slim AS runtime

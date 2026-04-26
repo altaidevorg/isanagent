@@ -73,6 +73,12 @@ impl Theme {
         fg(Color::Yellow)
     }
 
+    /// Yellow + dim/italic, used for in-flight `Cell::ToolNotice` cells whose result
+    /// has not yet arrived. Distinguishes "waiting" from a finished green/red result.
+    pub fn tool_pending() -> Style {
+        fg_mod(Color::Yellow, Modifier::DIM | Modifier::ITALIC)
+    }
+
     pub fn tool_done() -> Style {
         fg(Color::Green)
     }

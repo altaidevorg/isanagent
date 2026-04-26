@@ -78,10 +78,17 @@ pub struct OnboardOptions {
     #[arg(long, help_heading = "Terminal channel")]
     pub terminal_enable: Option<bool>,
 
+    /// One of the well-known names from `provider_registry::KNOWN_PROVIDERS` (e.g. `gemini`,
+    /// `openai`, `deepseek`, `openrouter`) or `openai_compatible` for any third-party endpoint
+    /// (which then requires `--provider-base-url`).
+    #[arg(long, help_heading = "Provider")]
+    pub provider_name: Option<String>,
     #[arg(long, help_heading = "Provider")]
     pub provider_model: Option<String>,
     #[arg(long, help_heading = "Provider")]
     pub provider_api_key_env: Option<String>,
+    /// Explicit chat-completions URL. Required when `--provider-name openai_compatible`. For
+    /// known names this is an optional override (e.g. to point at a proxy or self-hosted relay).
     #[arg(long, help_heading = "Provider")]
     pub provider_base_url: Option<String>,
 
@@ -129,6 +136,7 @@ impl OnboardOptions {
             || self.max_tool_output_chars.is_some()
             || self.max_web_tool_output_chars.is_some()
             || self.terminal_enable.is_some()
+            || self.provider_name.is_some()
             || self.provider_model.is_some()
             || self.provider_api_key_env.is_some()
             || self.provider_base_url.is_some()
@@ -169,14 +177,19 @@ fn apply_onboard_options(cfg: &mut AppConfig, opts: &OnboardOptions) {
     }
 
     if let Some(p) = cfg.provider.as_mut() {
+        if let Some(ref n) = opts.provider_name {
+            p.provider_name = n.clone();
+        }
         if let Some(ref m) = opts.provider_model {
             p.model_name = m.clone();
         }
         if let Some(ref e) = opts.provider_api_key_env {
             p.api_key_env = e.clone();
         }
+        // Only persist `base_url` when explicitly set via the CLI flag. For known names we
+        // intentionally leave the field unset so the registry stays the single source of truth.
         if let Some(ref u) = opts.provider_base_url {
-            p.base_url = u.clone();
+            p.base_url = Some(u.clone());
         }
     }
 
@@ -291,14 +304,30 @@ pub fn build_interactive_config_toml(options: &OnboardOptions) -> Result<String,
         doc["terminal"]["enabled"] = value(v);
     }
 
+    if let Some(ref n) = options.provider_name {
+        doc["provider"]["provider_name"] = value(n.as_str());
+    }
     if let Some(ref m) = options.provider_model {
         doc["provider"]["model_name"] = value(m.as_str());
     }
     if let Some(ref e) = options.provider_api_key_env {
         doc["provider"]["api_key_env"] = value(e.as_str());
     }
+    // base_url is optional in the new schema. When the wizard hands us an explicit URL, write it
+    // verbatim. When it doesn't, drop any base_url that may still be in the embedded template so
+    // we never persist a stale URL alongside `provider_name`.
     if let Some(ref u) = options.provider_base_url {
         doc["provider"]["base_url"] = value(u.as_str());
+    } else if doc
+        .get("provider")
+        .and_then(|t| t.as_table())
+        .map(|t| t.contains_key("base_url"))
+        .unwrap_or(false)
+    {
+        doc["provider"]
+            .as_table_mut()
+            .expect("provider table")
+            .remove("base_url");
     }
 
     if let Some(v) = options.api_enabled {
@@ -696,6 +725,7 @@ mod tests {
     #[test]
     fn build_interactive_config_toml_preserves_template_comments() {
         let o = OnboardOptions {
+            provider_name: Some("openai_compatible".to_string()),
             provider_model: Some("test-model".to_string()),
             provider_api_key_env: Some("GEMINI_API_KEY".to_string()),
             provider_base_url: Some("https://example.com/v1/chat/completions".to_string()),
@@ -735,5 +765,52 @@ mod tests {
             "allow_path_outside_sandbox should not appear as an active key in template output"
         );
         assert!(s.contains("test-model"));
+    }
+
+    #[test]
+    fn build_interactive_config_toml_known_provider_drops_base_url() {
+        let o = OnboardOptions {
+            provider_name: Some("gemini".to_string()),
+            provider_model: Some("gemini-2.5-flash".to_string()),
+            provider_api_key_env: Some("GEMINI_API_KEY".to_string()),
+            provider_base_url: None,
+            ..Default::default()
+        };
+        let s = build_interactive_config_toml(&o).expect("toml_edit merge");
+        let doc: toml_edit::DocumentMut = s.parse().expect("parse merged toml");
+        let provider = doc["provider"]
+            .as_table()
+            .expect("[provider] table preserved");
+        assert_eq!(
+            provider["provider_name"].as_str(),
+            Some("gemini"),
+            "provider_name should be persisted verbatim"
+        );
+        assert!(
+            !provider.contains_key("base_url"),
+            "base_url should be elided for known providers; got: {s}"
+        );
+    }
+
+    #[test]
+    fn build_interactive_config_toml_openai_compatible_keeps_base_url() {
+        let o = OnboardOptions {
+            provider_name: Some("openai_compatible".to_string()),
+            provider_model: Some("custom-model".to_string()),
+            provider_api_key_env: Some("MY_KEY".to_string()),
+            provider_base_url: Some("https://my-relay.example/v1/chat/completions".to_string()),
+            ..Default::default()
+        };
+        let s = build_interactive_config_toml(&o).expect("toml_edit merge");
+        let doc: toml_edit::DocumentMut = s.parse().expect("parse merged toml");
+        let provider = doc["provider"].as_table().expect("[provider]");
+        assert_eq!(
+            provider["provider_name"].as_str(),
+            Some("openai_compatible")
+        );
+        assert_eq!(
+            provider["base_url"].as_str(),
+            Some("https://my-relay.example/v1/chat/completions"),
+        );
     }
 }

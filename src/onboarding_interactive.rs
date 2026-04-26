@@ -18,6 +18,7 @@ use serde::Deserialize;
 use tokio::runtime::Handle;
 
 use crate::onboarding::OnboardOptions;
+use crate::provider_registry;
 
 /// Matches [`assets/onboarding/config.toml`] defaults for boolean-ish sections.
 const FEATURE_TOGGLE_COUNT: usize = 13;
@@ -56,14 +57,26 @@ fn default_feature_toggle_values() -> [bool; FEATURE_TOGGLE_COUNT] {
 }
 
 fn build_onboard_options_with_toggles(
+    provider: ProviderChoice,
     model_id: String,
     chat_url: String,
     api_key_env: String,
     values: &[bool; FEATURE_TOGGLE_COUNT],
 ) -> OnboardOptions {
+    // Known providers: write `provider_name` only and let the registry supply `base_url` at
+    // runtime. `Custom` (openai_compatible) has no built-in URL, so we persist the URL the user
+    // typed into `provider_base_url`.
+    let (provider_name, provider_base_url) = match provider {
+        ProviderChoice::Custom => (
+            provider_registry::OPENAI_COMPATIBLE.to_string(),
+            Some(chat_url),
+        ),
+        _ => (provider.provider_name().to_string(), None),
+    };
     OnboardOptions {
+        provider_name: Some(provider_name),
         provider_model: Some(model_id),
-        provider_base_url: Some(chat_url),
+        provider_base_url,
         provider_api_key_env: Some(api_key_env),
         terminal_enable: Some(values[0]),
         slack_enabled: Some(values[1]),
@@ -107,15 +120,23 @@ impl ProviderChoice {
         }
     }
 
+    /// Canonical name written into `[provider].provider_name`. The four built-in entries match
+    /// keys in [`crate::provider_registry::KNOWN_PROVIDERS`]; `Custom` maps to the
+    /// [`crate::provider_registry::OPENAI_COMPATIBLE`] sentinel.
+    fn provider_name(self) -> &'static str {
+        match self {
+            ProviderChoice::Gemini => "gemini",
+            ProviderChoice::OpenAI => "openai",
+            ProviderChoice::DeepSeek => "deepseek",
+            ProviderChoice::OpenRouter => "openrouter",
+            ProviderChoice::Custom => provider_registry::OPENAI_COMPATIBLE,
+        }
+    }
+
     fn chat_completions_url(self) -> Option<&'static str> {
         match self {
-            ProviderChoice::Gemini => {
-                Some("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
-            }
-            ProviderChoice::OpenAI => Some("https://api.openai.com/v1/chat/completions"),
-            ProviderChoice::DeepSeek => Some("https://api.deepseek.com/v1/chat/completions"),
-            ProviderChoice::OpenRouter => Some("https://openrouter.ai/api/v1/chat/completions"),
             ProviderChoice::Custom => None,
+            other => provider_registry::lookup(other.provider_name()),
         }
     }
 }
@@ -673,14 +694,15 @@ fn run_ui_loop(handle: &Handle) -> Result<InteractiveOnboardOutcome, String> {
                         state.feature_toggle_values_cache = Some(*values);
                     }
                     KeyCode::Enter => {
-                        if state.provider.is_none() {
-                            return Err("internal: missing provider".to_string());
-                        }
+                        let provider = state
+                            .provider
+                            .ok_or_else(|| "internal: missing provider".to_string())?;
                         let id = models
                             .get(*model_selected)
                             .ok_or_else(|| "invalid model selection".to_string())?
                             .clone();
                         let options = build_onboard_options_with_toggles(
+                            provider,
                             id,
                             state.chat_url.clone(),
                             state.pending_api_key_env.clone(),

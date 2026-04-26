@@ -24,10 +24,11 @@ use crate::channels::terminal_ui::attachments::parse_terminal_attachments;
 use crate::channels::terminal_ui::markdown;
 use crate::channels::terminal_ui::protocol::{
     ISANAGENT_AGENT_THOUGHT, ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_JOB_STARTED,
-    ISANAGENT_EXECUTION_STREAM, ISANAGENT_TERMINAL_ERROR, METADATA_EXECUTION_DESCRIPTION,
-    METADATA_EXECUTION_JOB_ID, METADATA_EXECUTION_JOB_STATUS, METADATA_EXECUTION_JOB_TOOL_NAME,
-    METADATA_EXECUTION_RUN_ID, METADATA_EXECUTION_SESSION_ID, METADATA_TOOL_CALL_PREVIEW,
-    METADATA_TOOL_NAME, METADATA_TOOL_RESULT_PREVIEW,
+    ISANAGENT_EXECUTION_STREAM, ISANAGENT_LLM_RETRY_AVAILABLE, ISANAGENT_TERMINAL_ERROR,
+    METADATA_EXECUTION_DESCRIPTION, METADATA_EXECUTION_JOB_ID, METADATA_EXECUTION_JOB_STATUS,
+    METADATA_EXECUTION_JOB_TOOL_NAME, METADATA_EXECUTION_RUN_ID, METADATA_EXECUTION_SESSION_ID,
+    METADATA_TOOL_CALL_ID, METADATA_TOOL_CALL_PREVIEW, METADATA_TOOL_NAME,
+    METADATA_TOOL_RESULT_PREVIEW,
 };
 use crate::channels::terminal_ui::{
     init_from_env, uses_ansi_color, App, Cell, JobStripStatus, TerminalUiFocus, Theme, ToastKind,
@@ -72,6 +73,7 @@ const TERMINAL_HELP: &str = r#"Commands (leading slash):
   /install-python Install uv (best effort) in the background; UI stays responsive
   /cancel, /stop Stop the in-flight reply for this chat (drops queued prompts)
   /background, /bg Promote the in-flight execution_run / colab_mcp_tool_call to a background job
+  /retry         Re-submit the last user message after an LLM-failed banner
   /tools         Open the tool activity pane (same as Tab)
   /help, /?      Show this help
 
@@ -203,14 +205,28 @@ fn outbound_to_cell(msg: &OutboundMessage) -> Cell {
             text: msg.content.clone(),
         }
     } else if tool_notify {
+        let tool_call_id = msg
+            .metadata
+            .get(METADATA_TOOL_CALL_ID)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         let ph = match phase {
+            // When we have a stable id we can collapse the two-cell display into one mutating
+            // cell; render the in-flight call as Pending (yellow/dim) and let
+            // `upsert_tool_notice` flip it to Result/Failed when the matching result arrives.
+            "call" if tool_call_id.is_some() => ToolNoticePhase::Pending,
             "call" => ToolNoticePhase::Call,
             "result" => ToolNoticePhase::Result,
             "fail" => ToolNoticePhase::Failed,
             _ => ToolNoticePhase::Other,
         };
         let content = tool_notice_display_content(msg, phase);
-        Cell::ToolNotice { phase: ph, content }
+        Cell::ToolNotice {
+            phase: ph,
+            content,
+            tool_call_id,
+        }
     } else if clarification {
         let choices = msg
             .metadata
@@ -304,14 +320,20 @@ fn cell_block_lines(cell: &Cell, inner_width: usize) -> Vec<Line<'static>> {
             v.push(Line::from(""));
             v
         }
-        Cell::ToolNotice { phase, content } => {
+        Cell::ToolNotice {
+            phase,
+            content,
+            tool_call_id: _,
+        } => {
             let label_style = match phase {
+                ToolNoticePhase::Pending => Theme::tool_pending().add_modifier(Modifier::BOLD),
                 ToolNoticePhase::Call => Theme::tool_call().add_modifier(Modifier::BOLD),
                 ToolNoticePhase::Result => Theme::tool_done().add_modifier(Modifier::BOLD),
                 ToolNoticePhase::Failed => Theme::error().add_modifier(Modifier::BOLD),
                 ToolNoticePhase::Other => Theme::tool_call().add_modifier(Modifier::BOLD),
             };
             let label = match phase {
+                ToolNoticePhase::Pending => "tool",
                 ToolNoticePhase::Call => "tool",
                 ToolNoticePhase::Result => "done",
                 ToolNoticePhase::Failed => "fail",
@@ -322,6 +344,7 @@ fn cell_block_lines(cell: &Cell, inner_width: usize) -> Vec<Line<'static>> {
                 Span::styled(label, label_style),
             ])];
             let body_style = match phase {
+                ToolNoticePhase::Pending => Theme::tool_pending(),
                 ToolNoticePhase::Failed => Theme::error(),
                 _ => Theme::text(),
             };
@@ -604,7 +627,7 @@ fn build_title_line(max_width: usize) -> Line<'static> {
             dim,
         )],
         vec![Span::styled(
-            "· /exit · /new · /copy · /cancel · /background · /tools · /help · Tab · Esc · ↑↓ · wheel · PgUp/PgDn",
+            "· /exit · /new · /copy · /cancel · /background · /retry · /tools · /help · Tab · Esc · ↑↓ · wheel · PgUp/PgDn",
             dim,
         )],
     ];
@@ -700,12 +723,14 @@ fn tool_history_paragraph(
     } else {
         for e in entries {
             let label_style = match e.phase {
+                ToolNoticePhase::Pending => Theme::tool_pending().add_modifier(Modifier::BOLD),
                 ToolNoticePhase::Call => Theme::tool_call().add_modifier(Modifier::BOLD),
                 ToolNoticePhase::Result => Theme::tool_done().add_modifier(Modifier::BOLD),
                 ToolNoticePhase::Failed => Theme::error().add_modifier(Modifier::BOLD),
                 ToolNoticePhase::Other => Theme::tool_call().add_modifier(Modifier::BOLD),
             };
             let label = match e.phase {
+                ToolNoticePhase::Pending => "wait",
                 ToolNoticePhase::Call => "call",
                 ToolNoticePhase::Result => "done",
                 ToolNoticePhase::Failed => "fail",
@@ -1035,6 +1060,14 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 app.thinking = false;
                 app.active_tool_line = None;
             }
+            if msg
+                .metadata
+                .get(ISANAGENT_LLM_RETRY_AVAILABLE)
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
+                app.llm_retry_available = true;
+            }
             let is_tool_notify = msg
                 .metadata
                 .get(ISANAGENT_TOOL_NOTIFY)
@@ -1048,7 +1081,18 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 }
             }
             let cell = outbound_to_cell(&msg);
-            append_cell_merging_thought(&mut app.cells, cell);
+            match cell {
+                Cell::ToolNotice {
+                    phase,
+                    content,
+                    tool_call_id,
+                } => {
+                    app.upsert_tool_notice(tool_call_id, phase, content);
+                }
+                other => {
+                    append_cell_merging_thought(&mut app.cells, other);
+                }
+            }
             if app.following_tail() {
                 app.scroll_offset = 0;
             }
@@ -1298,9 +1342,47 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             }
                             continue;
                         }
+                        if text.eq_ignore_ascii_case("/retry") {
+                            if !app.llm_retry_available {
+                                app.cells.push(Cell::System {
+                                    message: "Nothing to retry. /retry is only available right after an LLM-failed banner.".into(),
+                                });
+                                continue;
+                            }
+                            let Some(prev) = app.last_inbound_text.clone() else {
+                                app.llm_retry_available = false;
+                                app.cells.push(Cell::System {
+                                    message: "No previous user message to re-submit.".into(),
+                                });
+                                continue;
+                            };
+                            app.llm_retry_available = false;
+                            app.cells.push(Cell::User { text: prev.clone() });
+                            app.thinking = true;
+                            let (clean_text, attachments) =
+                                parse_terminal_attachments(&prev, &sandbox_dir);
+                            let msg = InboundMessage {
+                                channel: channel_name.clone(),
+                                sender_id: "local_user".to_string(),
+                                chat_id: chat_id.clone(),
+                                thread_id: None,
+                                content: clean_text,
+                                attachments,
+                                metadata: Default::default(),
+                            };
+                            if bus_tx.blocking_send(BusMessage::Inbound(msg)).is_err() {
+                                app.thinking = false;
+                                app.cells.push(Cell::System {
+                                    message: "Bus closed; exiting.".into(),
+                                });
+                                app.request_quit();
+                            }
+                            app.scroll_to_bottom();
+                            continue;
+                        }
                         app.cells.push(Cell::System {
                             message:
-                                "Unknown command. Try /help, /exit, /new, /copy, /install-python, /cancel, /background, /tools."
+                                "Unknown command. Try /help, /exit, /new, /copy, /install-python, /cancel, /background, /retry, /tools."
                                     .into(),
                         });
                         continue;
@@ -1313,6 +1395,8 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 
                     app.cells.push(Cell::User { text: raw.clone() });
                     app.thinking = true;
+                    app.last_inbound_text = Some(text.to_string());
+                    app.llm_retry_available = false;
                     let (clean_text, attachments) = parse_terminal_attachments(text, &sandbox_dir);
                     let msg = InboundMessage {
                         channel: channel_name.clone(),

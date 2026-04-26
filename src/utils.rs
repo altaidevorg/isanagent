@@ -83,6 +83,12 @@ pub struct ChatMessage {
     pub tool_calls: Option<Vec<ToolCallRequest>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// DeepSeek-style chain-of-thought block surfaced by reasoning models (e.g. `deepseek-v4-pro`).
+    /// Sent back unchanged on subsequent assistant turns so providers that key on it can chain
+    /// reasoning across turns. Skipped from serialization when unset, so OpenAI-compatible
+    /// providers that ignore the field see no change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +130,7 @@ impl ChatMessage {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
 
@@ -143,6 +150,7 @@ impl ChatMessage {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
 
@@ -153,6 +161,7 @@ impl ChatMessage {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
 
@@ -163,6 +172,7 @@ impl ChatMessage {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
 
@@ -173,6 +183,7 @@ impl ChatMessage {
             name: None,
             tool_calls: None,
             tool_call_id: Some(tool_call_id.to_string()),
+            reasoning_content: None,
         }
     }
 }
@@ -189,6 +200,22 @@ pub enum LLMError {
     ParseError(#[from] serde_json::Error),
     #[error("No content in response")]
     NoContent,
+}
+
+impl LLMError {
+    /// Heuristic: should the caller retry this error after a backoff?
+    /// True for network/IO errors and HTTP 429 / 5xx. False for parse errors and 4xx
+    /// (those need user/config attention; retrying just hammers the upstream).
+    pub fn is_transient(&self) -> bool {
+        match self {
+            LLMError::RequestError(_) => true,
+            LLMError::ApiError(msg) => {
+                let m = msg.to_lowercase();
+                m.contains("status 5") || m.contains("status 429") || m.contains("rate limit")
+            }
+            LLMError::ParseError(_) | LLMError::NoContent => false,
+        }
+    }
 }
 
 // --- Client ---
@@ -489,4 +516,49 @@ pub fn extract_json_from_llm_response(text: &str) -> Option<serde_json::Value> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assistant_message_serializes_reasoning_content_when_set() {
+        let mut msg = ChatMessage::assistant("OK");
+        msg.reasoning_content = Some("step 1 ... step 2".to_string());
+        let v = serde_json::to_value(&msg).expect("serialize");
+        assert_eq!(v["role"], "assistant");
+        assert_eq!(v["content"], "OK");
+        assert_eq!(v["reasoning_content"], "step 1 ... step 2");
+    }
+
+    #[test]
+    fn assistant_message_skips_reasoning_content_when_unset() {
+        let msg = ChatMessage::assistant("hi");
+        let s = serde_json::to_string(&msg).expect("serialize");
+        assert!(
+            !s.contains("reasoning_content"),
+            "unset reasoning_content must be skipped: {s}"
+        );
+    }
+
+    #[test]
+    fn chat_message_round_trips_reasoning_content() {
+        let mut msg = ChatMessage::user("hi");
+        msg.reasoning_content = Some("rc".to_string());
+        let s = serde_json::to_string(&msg).unwrap();
+        let back: ChatMessage = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.reasoning_content.as_deref(), Some("rc"));
+    }
+
+    #[test]
+    fn llm_error_transience_classification() {
+        assert!(LLMError::ApiError("Status 500: ...".into()).is_transient());
+        assert!(LLMError::ApiError("Status 503 service unavailable".into()).is_transient());
+        assert!(LLMError::ApiError("Status 429 too many requests".into()).is_transient());
+        assert!(LLMError::ApiError("rate limit exceeded".into()).is_transient());
+        assert!(!LLMError::ApiError("Status 400 bad request".into()).is_transient());
+        assert!(!LLMError::ApiError("Status 401 unauthorized".into()).is_transient());
+        assert!(!LLMError::NoContent.is_transient());
+    }
 }
