@@ -366,6 +366,23 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             ),
         )
         .with_chat_id(chat_id),
+        TelemetryEvent::ToolProgress {
+            chat_id,
+            channel,
+            tool_name,
+            tool_call_id,
+            message,
+        } => LogEvent::debug(
+            "Telemetry",
+            &format!(
+                "ToolProgress channel={} tool={} id={} msg_len={}",
+                channel,
+                tool_name,
+                tool_call_id.as_deref().unwrap_or("-"),
+                message.len()
+            ),
+        )
+        .with_chat_id(chat_id),
         TelemetryEvent::ExecutionRunFinished {
             chat_id,
             channel,

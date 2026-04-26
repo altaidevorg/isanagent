@@ -111,6 +111,7 @@ type ToolCall = {
 
 type StreamEvent =
   | { type: "tool_call_started"; tool_name: string; args: string }
+  | { type: "tool_progress"; tool_name: string; message: string }
   | { type: "tool_call_finished"; tool_name: string; result: string }
   | { type: "agent_thought"; thought: string }
   | { type: "completion"; content: string; internal_chat_id: string; response_id: string }
@@ -913,6 +914,9 @@ export default function App() {
               case "tool_call_started":
                 currentToolCall = { tool_name: event.tool_name, args: event.args };
                 setCurrentStep(`Using tool: ${event.tool_name}`);
+                break;
+              case "tool_progress":
+                setCurrentStep(`${event.tool_name}: ${event.message}`);
                 break;
               case "tool_call_finished":
                 if (currentToolCall && currentToolCall.tool_name === event.tool_name) {

@@ -16,6 +16,7 @@ const ISANAGENT_TOOL_PHASE: &str = "isanagent_tool_phase";
 
 use crate::channels::terminal_ui::protocol::{
     ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_JOB_STARTED, ISANAGENT_EXECUTION_STREAM,
+    ISANAGENT_TOOL_PROGRESS,
     METADATA_EXECUTION_DESCRIPTION, METADATA_EXECUTION_JOB_ID, METADATA_EXECUTION_JOB_STATUS,
     METADATA_EXECUTION_JOB_TOOL_NAME, METADATA_EXECUTION_RUN_ID, METADATA_EXECUTION_SESSION_ID,
     METADATA_TOOL_CALL_ID, METADATA_TOOL_CALL_PREVIEW, METADATA_TOOL_NAME,
@@ -280,6 +281,34 @@ pub fn build_execution_job_notice(
         chat_id: chat_id.to_string(),
         thread_id: None,
         content: summary.to_string(),
+        metadata,
+    }
+}
+
+/// Ephemeral mid–tool status for the Ratatui tool strip (no transcript cell).
+pub fn build_tool_progress_terminal_notice(
+    chat_id: &str,
+    tool_name: &str,
+    message: &str,
+    tool_call_id: Option<&str>,
+) -> OutboundMessage {
+    let detail = message.trim();
+    let content = if detail.is_empty() {
+        tool_name.to_string()
+    } else {
+        format!("{tool_name} — {detail}")
+    };
+    let mut metadata = HashMap::new();
+    metadata.insert(ISANAGENT_TOOL_PROGRESS.to_string(), json!(true));
+    metadata.insert(METADATA_TOOL_NAME.to_string(), json!(tool_name));
+    if let Some(id) = tool_call_id.filter(|s| !s.is_empty()) {
+        metadata.insert(METADATA_TOOL_CALL_ID.to_string(), json!(id));
+    }
+    OutboundMessage {
+        channel: "terminal".to_string(),
+        chat_id: chat_id.to_string(),
+        thread_id: None,
+        content,
         metadata,
     }
 }

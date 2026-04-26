@@ -82,6 +82,10 @@ enum StreamEvent {
         tool_name: String,
         args: String,
     },
+    ToolProgress {
+        tool_name: String,
+        message: String,
+    },
     ToolCallFinished {
         tool_name: String,
         result: String,
@@ -486,6 +490,23 @@ impl ApiChannel {
                             .try_send(StreamEvent::ToolCallStarted { tool_name, args })
                         {
                             error!("Failed to send tool_call_started to stream: {}", e);
+                        }
+                    }
+                }
+            }
+            TelemetryEvent::ToolProgress {
+                chat_id,
+                tool_name,
+                message,
+                ..
+            } => {
+                if let Some(pending) = self.pending_requests.get(&chat_id) {
+                    if let PendingRequest::Stream(pending) = pending.value() {
+                        if let Err(e) = pending.stream_tx.try_send(StreamEvent::ToolProgress {
+                            tool_name,
+                            message,
+                        }) {
+                            error!("Failed to send tool_progress to stream: {}", e);
                         }
                     }
                 }

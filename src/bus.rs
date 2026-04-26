@@ -88,6 +88,16 @@ pub enum TelemetryEvent {
         tool_name: String,
         result: String,
     },
+    /// Mid–tool-call status (e.g. uv-managed Python env setup); not a tool result.
+    ToolProgress {
+        chat_id: String,
+        #[serde(default)]
+        channel: String,
+        tool_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<String>,
+        message: String,
+    },
     CronTrigger {
         job_id: String,
         message: String,

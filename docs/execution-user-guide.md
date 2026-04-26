@@ -146,6 +146,8 @@ The **local** harness runs Python in one of two runtime modes:
 - **`local_python_runtime = "uv_managed"`** (default): provisions/reuses a managed interpreter under `.system_generated/uv/envs/` using `uv venv`, then executes runs with that interpreter.
 - **`local_python_runtime = "system"`**: runs **`python_executable`** as a normal process (no automatic venv activation). `python_executable` must be set explicitly in config.
 
+The first time a UV-managed environment is created (and when `uv_requirements` triggers `uv pip install`), work can take tens of seconds. During that time the **terminal** tool strip shows short status lines, and **`POST /v1/responses`** with **`stream: true`** emits **`tool_progress`** SSE events so the UI does not look stuck.
+
 For `system` runtime, you should either:
 
 - Set **`python_executable`** to the interpreter you want (e.g. path to `uv`-managed `.venv\Scripts\python.exe` on Windows, or `.../.venv/bin/python` on Unix), or  

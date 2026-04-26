@@ -10,7 +10,7 @@ mod subagent;
 pub use subagent::SubagentHarness;
 
 use crate::clarification::ClarificationHub;
-use crate::tool_runtime::ToolExecCtx;
+use crate::tool_runtime::{ToolExecCtx, ToolProgressEmitter, with_tool_exec_and_progress_scope};
 
 use crate::bus::{BusMessage, LogEvent, OutboundMessage, TelemetryEvent};
 use crate::config::{ResolvedShellPolicy, ShellPolicyMode};
@@ -179,6 +179,7 @@ async fn execute_tool_call_with_activity(
     channel: &str,
     outbound_tx: &mpsc::Sender<BusMessage>,
     tool_name: &str,
+    tool_call_id: Option<String>,
     args: Value,
     cancel_token: Option<&tokio_util::sync::CancellationToken>,
     runtime: ToolCallRuntime,
@@ -192,8 +193,15 @@ async fn execute_tool_call_with_activity(
     let tools = Arc::clone(tools);
     let outbound_tx = outbound_tx.clone();
     let cancel_owned = cancel_token.cloned();
+    let progress_emitter = ToolProgressEmitter {
+        outbound_tx: outbound_tx.clone(),
+        channel: channel.clone(),
+        chat_id: chat_id.clone(),
+        tool_name: tool_name.clone(),
+        tool_call_id,
+    };
 
-    crate::tool_runtime::with_tool_exec_scope(tool_exec_ctx, async move {
+    with_tool_exec_and_progress_scope(tool_exec_ctx, progress_emitter, async move {
         let args = args;
         let activity_handle = tool_execution_activity
             .as_ref()
@@ -741,6 +749,7 @@ impl AgentLogic {
             "test",
             &self.outbound_tx,
             tool_name,
+            None,
             args,
             None,
             ToolCallRuntime {
@@ -1326,6 +1335,7 @@ impl AgentLogic {
                         let shell_policy_for_call = shell_policy.clone();
                         let outbound_for_call = outbound_tx.clone();
                         let channel_for_call = inbound.channel.clone();
+                        let tool_call_id = Some(tc.id.clone());
                         futures_vec.push(async move {
                             execute_tool_call_with_activity(
                                 &tools,
@@ -1334,6 +1344,7 @@ impl AgentLogic {
                                 &channel_for_call,
                                 &outbound_for_call,
                                 &tool_name,
+                                tool_call_id,
                                 args,
                                 Some(&cancel_token),
                                 ToolCallRuntime {
@@ -1415,6 +1426,7 @@ impl AgentLogic {
                             &inbound.channel,
                             &outbound_tx,
                             tool_name,
+                            Some(tc.id.clone()),
                             args,
                             Some(&cancel_token),
                             ToolCallRuntime {

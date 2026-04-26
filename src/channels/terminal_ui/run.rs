@@ -25,6 +25,7 @@ use crate::channels::terminal_ui::markdown;
 use crate::channels::terminal_ui::protocol::{
     ISANAGENT_AGENT_THOUGHT, ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_JOB_STARTED,
     ISANAGENT_EXECUTION_STREAM, ISANAGENT_LLM_RETRY_AVAILABLE, ISANAGENT_TERMINAL_ERROR,
+    ISANAGENT_TOOL_PROGRESS,
     METADATA_EXECUTION_DESCRIPTION, METADATA_EXECUTION_JOB_ID, METADATA_EXECUTION_JOB_STATUS,
     METADATA_EXECUTION_JOB_TOOL_NAME, METADATA_EXECUTION_RUN_ID, METADATA_EXECUTION_SESSION_ID,
     METADATA_TOOL_CALL_ID, METADATA_TOOL_CALL_PREVIEW, METADATA_TOOL_NAME,
@@ -1054,6 +1055,15 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             {
                 handle_execution_job_finished_notice(&mut app, &msg);
                 append_execution_job_panel(&mut app, &msg);
+                continue;
+            }
+            if msg
+                .metadata
+                .get(ISANAGENT_TOOL_PROGRESS)
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
+                app.active_tool_line = Some(msg.content.clone());
                 continue;
             }
             if outbound_clears_thinking(&msg) {

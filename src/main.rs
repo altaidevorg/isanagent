@@ -10,7 +10,8 @@ use isanagent::agent::{AgentLogic, AgentLogicParams};
 use isanagent::bus::{BusMessage, LoggerControlMessage, TelemetryEvent};
 use isanagent::channels::terminal::{
     build_agent_thought_terminal_notice, build_tool_call_terminal_notice,
-    build_tool_result_terminal_notice, terminal_startup_suppresses_plain_banner,
+    build_tool_progress_terminal_notice, build_tool_result_terminal_notice,
+    terminal_startup_suppresses_plain_banner,
 };
 use isanagent::channels::{
     api::ApiChannel, email::EmailChannel, slack::SlackChannel, terminal::TerminalChannel, Channel,
@@ -892,6 +893,45 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                                 .handle_telemetry(TelemetryEvent::AgentThought {
                                     chat_id: chat_id.clone(),
                                     thought: thought.clone(),
+                                })
+                                .await;
+                        }
+                    }
+                }
+                BusMessage::Telemetry(TelemetryEvent::ToolProgress {
+                    chat_id,
+                    channel,
+                    tool_name,
+                    tool_call_id,
+                    message,
+                }) => {
+                    if channel == "terminal"
+                        && terminal_session_for_telemetry.as_deref() == Some(chat_id.as_str())
+                    {
+                        let notice = build_tool_progress_terminal_notice(
+                            chat_id,
+                            tool_name,
+                            message,
+                            tool_call_id.as_deref(),
+                        );
+                        if let Some(chan) = delivery_channels.get("terminal") {
+                            if let Err(e) = chan.send(notice).await {
+                                log::error!(
+                                    "Failed to deliver tool-progress notice to terminal: {}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    if let Some(api_chan) = delivery_channels.get("api") {
+                        if let Some(api_chan) = api_chan.as_any().downcast_ref::<ApiChannel>() {
+                            api_chan
+                                .handle_telemetry(TelemetryEvent::ToolProgress {
+                                    chat_id: chat_id.clone(),
+                                    channel: channel.clone(),
+                                    tool_name: tool_name.clone(),
+                                    tool_call_id: tool_call_id.clone(),
+                                    message: message.clone(),
                                 })
                                 .await;
                         }
