@@ -531,7 +531,10 @@ mod preview_tests {
         let args = r#"{"session_id":"s","tool_name":"foo","description":"warm up the kernel"}"#;
         let p = tool_call_preview_for_terminal("colab_mcp_tool_call", args);
         assert!(p.contains("foo"), "preview missing tool_name: {p}");
-        assert!(p.contains("warm up the kernel"), "preview missing description: {p}");
+        assert!(
+            p.contains("warm up the kernel"),
+            "preview missing description: {p}"
+        );
     }
 
     #[test]
@@ -545,7 +548,10 @@ mod preview_tests {
     fn unknown_tool_falls_back_to_generic_description() {
         let args = r#"{"description":"do the thing","other":"x"}"#;
         let p = tool_call_preview_for_terminal("some_future_tool", args);
-        assert!(p.contains("do the thing"), "expected description fallback: {p}");
+        assert!(
+            p.contains("do the thing"),
+            "expected description fallback: {p}"
+        );
         assert!(!p.contains("\"other\""), "should not dump raw JSON: {p}");
     }
 
@@ -596,7 +602,10 @@ mod preview_tests {
     #[test]
     fn other_tools_never_suppressed() {
         let args = r#"{"channel":"terminal"}"#;
-        assert!(!should_suppress_tool_notice_for_terminal("execution_run", args));
+        assert!(!should_suppress_tool_notice_for_terminal(
+            "execution_run",
+            args
+        ));
     }
 
     #[test]
@@ -608,7 +617,10 @@ mod preview_tests {
             Some("call-abc"),
         );
         assert_eq!(
-            notice.metadata.get(METADATA_TOOL_CALL_ID).and_then(|v| v.as_str()),
+            notice
+                .metadata
+                .get(METADATA_TOOL_CALL_ID)
+                .and_then(|v| v.as_str()),
             Some("call-abc"),
         );
     }
@@ -633,7 +645,10 @@ mod preview_tests {
             Some("call-abc"),
         );
         assert_eq!(
-            notice.metadata.get(METADATA_TOOL_CALL_ID).and_then(|v| v.as_str()),
+            notice
+                .metadata
+                .get(METADATA_TOOL_CALL_ID)
+                .and_then(|v| v.as_str()),
             Some("call-abc"),
         );
     }

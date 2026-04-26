@@ -495,7 +495,10 @@ pub fn build_execution_harness(
     let built_summary = {
         let mut ids: Vec<&String> = providers.keys().collect();
         ids.sort();
-        ids.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+        ids.iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     };
     log::info!(
         "Execution harness ready: providers=[{built_summary}], default={default_provider_id}"
@@ -608,7 +611,9 @@ allowed_providers = ["ssh", "local"]
         .expect("parse");
         let (root, sandbox) = fresh_workspace("explicit-default-pruned");
         let res = build_execution_harness(root.clone(), sandbox.clone(), true, &cfg);
-        let err = res.err().expect("expected hard fail when explicit default pruned");
+        let err = res
+            .err()
+            .expect("expected hard fail when explicit default pruned");
         assert!(
             err.contains("default_provider") && err.contains("ssh"),
             "err={err}"
@@ -656,7 +661,10 @@ allowed_providers = ["local"]
             build_execution_harness(root.clone(), sandbox.clone(), true, &cfg).expect("build");
         // None / empty / "default" all resolve to the default.
         assert_eq!(harness.provider_for(None).unwrap().provider_id(), "local");
-        assert_eq!(harness.provider_for(Some("")).unwrap().provider_id(), "local");
+        assert_eq!(
+            harness.provider_for(Some("")).unwrap().provider_id(),
+            "local"
+        );
         assert_eq!(
             harness.provider_for(Some("default")).unwrap().provider_id(),
             "local"
@@ -667,7 +675,10 @@ allowed_providers = ["local"]
             "local"
         );
         // Unknown id surfaces the available list so the model can self-correct.
-        let err = harness.provider_for(Some("colab_mcp")).err().expect("should be unknown");
+        let err = harness
+            .provider_for(Some("colab_mcp"))
+            .err()
+            .expect("should be unknown");
         assert!(err.contains("available providers"), "err={err}");
         assert!(err.contains("local"), "err={err}");
         let _ = std::fs::remove_dir_all(&root);

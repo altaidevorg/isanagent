@@ -490,16 +490,17 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     }));
 
     // 5. Setup Provider (Dynamic from config)
-    let provider_cfg = workspace
-        .config
-        .provider
-        .clone()
-        .unwrap_or_else(|| isanagent::config::ProviderConfig {
-            provider_name: DEFAULT_PROVIDER_NAME.to_string(),
-            model_name: DEFAULT_PROVIDER_MODEL_NAME.to_string(),
-            api_key_env: DEFAULT_PROVIDER_API_KEY_ENV.to_string(),
-            base_url: None,
-        });
+    let provider_cfg =
+        workspace
+            .config
+            .provider
+            .clone()
+            .unwrap_or_else(|| isanagent::config::ProviderConfig {
+                provider_name: DEFAULT_PROVIDER_NAME.to_string(),
+                model_name: DEFAULT_PROVIDER_MODEL_NAME.to_string(),
+                api_key_env: DEFAULT_PROVIDER_API_KEY_ENV.to_string(),
+                base_url: None,
+            });
     let base_url = provider_cfg
         .resolved_base_url()
         .map_err(std::io::Error::other)?;
@@ -917,7 +918,10 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                         );
                         if let Some(chan) = delivery_channels.get("terminal") {
                             if let Err(e) = chan.send(notice).await {
-                                log::error!("Failed to deliver tool-call notice to terminal: {}", e);
+                                log::error!(
+                                    "Failed to deliver tool-call notice to terminal: {}",
+                                    e
+                                );
                             }
                         }
                     }
@@ -1400,6 +1404,9 @@ mod next_steps_tests {
             line.starts_with("isanagent --workspace "),
             "expected --workspace prefix, got {line}"
         );
-        assert!(line.contains(custom.to_string_lossy().as_ref()), "got {line}");
+        assert!(
+            line.contains(custom.to_string_lossy().as_ref()),
+            "got {line}"
+        );
     }
 }

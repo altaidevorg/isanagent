@@ -1358,8 +1358,14 @@ mod tests {
     #[test]
     fn extract_requirement_name_handles_specs() {
         assert_eq!(extract_requirement_name("numpy"), Some("numpy".into()));
-        assert_eq!(extract_requirement_name("numpy>=1.20"), Some("numpy".into()));
-        assert_eq!(extract_requirement_name("numpy >= 1.20"), Some("numpy".into()));
+        assert_eq!(
+            extract_requirement_name("numpy>=1.20"),
+            Some("numpy".into())
+        );
+        assert_eq!(
+            extract_requirement_name("numpy >= 1.20"),
+            Some("numpy".into())
+        );
         assert_eq!(
             extract_requirement_name("pandas[parquet]==2.0"),
             Some("pandas".into())

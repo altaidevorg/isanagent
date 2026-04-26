@@ -17,18 +17,12 @@ pub const OPENAI_COMPATIBLE: &str = "openai_compatible";
 /// Kept alphabetical so `known_names()` returns a deterministic order suitable for help text
 /// and error messages.
 pub const KNOWN_PROVIDERS: &[(&str, &str)] = &[
-    (
-        "deepseek",
-        "https://api.deepseek.com/v1/chat/completions",
-    ),
+    ("deepseek", "https://api.deepseek.com/v1/chat/completions"),
     (
         "gemini",
         "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
     ),
-    (
-        "openai",
-        "https://api.openai.com/v1/chat/completions",
-    ),
+    ("openai", "https://api.openai.com/v1/chat/completions"),
     (
         "openrouter",
         "https://openrouter.ai/api/v1/chat/completions",
@@ -74,10 +68,7 @@ mod tests {
     fn lookup_returns_url_for_each_known_name() {
         for name in known_names() {
             let url = lookup(name).unwrap_or_else(|| panic!("missing url for {name}"));
-            assert!(
-                url.starts_with("https://"),
-                "url for {name} must be https"
-            );
+            assert!(url.starts_with("https://"), "url for {name} must be https");
             assert!(
                 url.ends_with("/chat/completions"),
                 "url for {name} must end in /chat/completions"
@@ -88,8 +79,10 @@ mod tests {
     #[test]
     fn lookup_returns_none_for_unknown() {
         assert!(lookup("nope").is_none());
-        assert!(lookup(OPENAI_COMPATIBLE).is_none(),
-            "OPENAI_COMPATIBLE has no built-in URL on purpose");
+        assert!(
+            lookup(OPENAI_COMPATIBLE).is_none(),
+            "OPENAI_COMPATIBLE has no built-in URL on purpose"
+        );
     }
 
     #[test]

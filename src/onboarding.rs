@@ -804,7 +804,10 @@ mod tests {
         let s = build_interactive_config_toml(&o).expect("toml_edit merge");
         let doc: toml_edit::DocumentMut = s.parse().expect("parse merged toml");
         let provider = doc["provider"].as_table().expect("[provider]");
-        assert_eq!(provider["provider_name"].as_str(), Some("openai_compatible"));
+        assert_eq!(
+            provider["provider_name"].as_str(),
+            Some("openai_compatible")
+        );
         assert_eq!(
             provider["base_url"].as_str(),
             Some("https://my-relay.example/v1/chat/completions"),

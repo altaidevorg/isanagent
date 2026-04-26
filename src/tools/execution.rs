@@ -210,7 +210,8 @@ impl Tool for ExecutionSessionCreateTool {
         let handle = provider.create_session(req).await.map_err(exec_err)?;
         // Bind this session to the provider that created it so subsequent execution_run /
         // execution_session_close calls route to the right provider in mixed-provider setups.
-        self.harness.register_session(handle.id.as_str(), &provider_id);
+        self.harness
+            .register_session(handle.id.as_str(), &provider_id);
         let summary = self.harness.capabilities_summary();
         let mut v = json!({
             "session_id": handle.id,
@@ -331,10 +332,7 @@ impl Tool for ExecutionRunTool {
             && !chat_id.is_empty();
 
         if !promote_enabled {
-            let result = session_provider
-                .run(&sid, spec)
-                .await
-                .map_err(exec_err)?;
+            let result = session_provider.run(&sid, spec).await.map_err(exec_err)?;
             return self
                 .finalize_sync_run(FinalizeSyncRunParams {
                     sid: &sid,

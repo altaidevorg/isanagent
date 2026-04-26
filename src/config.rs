@@ -1124,7 +1124,12 @@ impl ProviderConfig {
     /// - unknown `provider_name` (not in `KNOWN_PROVIDERS` and not `OPENAI_COMPATIBLE`)
     /// - `provider_name == OPENAI_COMPATIBLE` with no `base_url` set
     pub fn resolved_base_url(&self) -> Result<String, String> {
-        if let Some(url) = self.base_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(url) = self
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             return Ok(url.to_string());
         }
         if let Some(url) = crate::provider_registry::lookup(self.provider_name.as_str()) {
@@ -1161,26 +1166,37 @@ mod provider_config_tests {
     #[test]
     fn resolves_known_name_from_registry() {
         let url = cfg("gemini", None).resolved_base_url().unwrap();
-        assert!(url.contains("generativelanguage.googleapis.com"), "got {url}");
+        assert!(
+            url.contains("generativelanguage.googleapis.com"),
+            "got {url}"
+        );
     }
 
     #[test]
     fn explicit_base_url_overrides_known() {
-        let url = cfg("openai", Some("https://relay.example.com/v1/chat/completions"))
-            .resolved_base_url()
-            .unwrap();
+        let url = cfg(
+            "openai",
+            Some("https://relay.example.com/v1/chat/completions"),
+        )
+        .resolved_base_url()
+        .unwrap();
         assert_eq!(url, "https://relay.example.com/v1/chat/completions");
     }
 
     #[test]
     fn openai_compatible_requires_base_url() {
-        let err = cfg("openai_compatible", None).resolved_base_url().unwrap_err();
+        let err = cfg("openai_compatible", None)
+            .resolved_base_url()
+            .unwrap_err();
         assert!(err.contains("openai_compatible"), "got {err}");
         assert!(err.contains("base_url"), "got {err}");
 
-        let url = cfg("openai_compatible", Some("https://my.host/v1/chat/completions"))
-            .resolved_base_url()
-            .unwrap();
+        let url = cfg(
+            "openai_compatible",
+            Some("https://my.host/v1/chat/completions"),
+        )
+        .resolved_base_url()
+        .unwrap();
         assert_eq!(url, "https://my.host/v1/chat/completions");
     }
 

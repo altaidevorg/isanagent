@@ -757,11 +757,7 @@ mod tests {
         // Defensive: if the same id were ever recycled (e.g. retry path), the back-walk should
         // resolve to the most recent Pending cell, not the older completed one.
         let mut app = App::new();
-        app.upsert_tool_notice(
-            Some("dup".into()),
-            ToolNoticePhase::Pending,
-            "first".into(),
-        );
+        app.upsert_tool_notice(Some("dup".into()), ToolNoticePhase::Pending, "first".into());
         app.upsert_tool_notice(
             Some("dup".into()),
             ToolNoticePhase::Result,
