@@ -67,6 +67,7 @@ const EXECUTION_HARNESS_SYSTEM_GUIDANCE: &str = r#"
 - Know where outputs live: sandbox-relative paths, execution_artifact_list, run journals under workspace_dir/.system_generated/execution_history/, and execution_runs.jsonl.
 - For Jupyter/SSH: confirm interpreter and (if needed) GPU visibility with a tiny execution_run before a long job.
 - For Colab MCP: use execution_run for Python. If `colab_mcp_tool_call` is registered (config allowlist), use it only for allowlisted MCP tools (e.g. Drive); keep arguments minimal and time-bounded.
+- For Colab MCP: Colab usually starts on **CPU**; there is no MCP tool to switch GPU/TPU. Read `execution_env_info` → `colab_mcp.runtime_policy`. Ask the user to change **Runtime** in the **browser** only when accelerators are needed; skip that prompt when CPU is enough.
 "#;
 
 /// isanagent: A terminal chat interface and autonomous agent engine

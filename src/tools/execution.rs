@@ -42,6 +42,26 @@ pub fn compile_colab_mcp_tool_allowlist(patterns: &[String]) -> Result<GlobSet, 
         .map_err(|e| format!("allowlist glob set error: {e}"))
 }
 
+/// Colab MCP: runtime (CPU / GPU / TPU) is chosen in the **browser**, not via a dedicated MCP tool.
+/// Canonical copy lives under [`ExecutionEnvInfoTool`] → `colab_mcp.runtime_policy`.
+fn colab_mcp_runtime_policy_value() -> Value {
+    json!({
+        "default": "Colab tabs used with MCP typically start on a **CPU** runtime until changed in the browser.",
+        "mcp_limitation": "Colab MCP does not expose a dependable tool to switch Runtime type (CPU / GPU / TPU); after connect, tool lists are mostly notebook-cell oriented.",
+        "when_ask_the_user": "If this session needs **GPU or TPU** (CUDA-heavy ML, large accelerators, etc.), ask the user to open the **Colab browser tab** and use **Runtime → Change runtime type** (pick GPU/TPU as needed), wait until the runtime reconnects, then continue with `execution_run`. After that, `run_code_cell` uses whatever runtime is active (e.g. `torch.cuda.is_available()` may become true).",
+        "when_do_not_ask": "If **CPU** execution is sufficient for the user's goal, do **not** prompt for a runtime change.",
+        "optional_probe": "When unsure whether an accelerator is active, use a short `execution_run` (e.g. `import torch; print(torch.cuda.is_available())`) after any manual runtime change."
+    })
+}
+
+/// Short reminder returned from `execution_session_create` when `default_provider = colab_mcp`.
+fn colab_mcp_runtime_session_note_value() -> Value {
+    json!({
+        "runtime_note": "Colab defaults to CPU; MCP cannot switch GPU/TPU for you. Ask the user to change Runtime in the browser when accelerators are required; do not ask when CPU is enough.",
+        "full_policy": "Call execution_env_info and read colab_mcp.runtime_policy (same text as here, expanded)."
+    })
+}
+
 fn cap_mcp_tool_json_text(s: String, max: usize) -> String {
     if s.len() <= max {
         return s;
@@ -119,7 +139,7 @@ impl Tool for ExecutionSessionCreateTool {
     }
 
     fn description(&self) -> &str {
-        "Create an execution session (requires [harness.execution] enabled). Provider is [harness.execution] default_provider: local runs under the workspace sandbox; jupyter uses a Jupyter Server kernel (new or `resume_jupyter_kernel_id`); ssh opens one SSH session to a configured host (reused until execution_session_close); colab_mcp launches a local Colab MCP bridge process and targets a notebook execution tool exposed by the browser session. Returns session_id, session capabilities, and a short provider capability summary. Use execution_run or execution_run_background to execute code; execution_session_close when done. Jupyter may write binary display_data under the sandbox `.execution_artifacts/{session_id}/{run_id}/` and list them in RunResult.attachments."
+        "Create an execution session (requires [harness.execution] enabled). Provider is [harness.execution] default_provider: local runs under the workspace sandbox; jupyter uses a Jupyter Server kernel (new or `resume_jupyter_kernel_id`); ssh opens one SSH session to a configured host (reused until execution_session_close); colab_mcp launches a local Colab MCP bridge process and targets a notebook execution tool exposed by the browser session (CPU/GPU/TPU runtime is chosen in the Colab browser; see `colab_mcp` in the tool result when this provider is active). Returns session_id, session capabilities, and a short provider capability summary. Use execution_run or execution_run_background to execute code; execution_session_close when done. Jupyter may write binary display_data under the sandbox `.execution_artifacts/{session_id}/{run_id}/` and list them in RunResult.attachments."
     }
 
     fn parameters(&self) -> Value {
@@ -162,12 +182,15 @@ impl Tool for ExecutionSessionCreateTool {
             .await
             .map_err(exec_err)?;
         let summary = self.harness.capabilities_summary();
-        let v = json!({
+        let mut v = json!({
             "session_id": handle.id,
             "session_capabilities": handle.capabilities,
             "provider_capabilities": summary,
             "artifact_root_relative": format!(".execution_artifacts/{}/", sanitize_session_segment(&handle.id)),
         });
+        if self.harness.colab_mcp().is_some() {
+            v["colab_mcp"] = colab_mcp_runtime_session_note_value();
+        }
         serde_json::to_string_pretty(&v).map_err(|e| e.to_string())
     }
 }
@@ -1208,7 +1231,7 @@ impl Tool for ExecutionEnvInfoTool {
     }
 
     fn description(&self) -> &str {
-        "Return provider capability summary. For local execution, also runs python_executable -V on the agent host (best effort). For jupyter, that probe is still the host interpreter (sanity check only); the kernel Python environment is whatever the Jupyter server started for that kernelspec. For ssh, the probe is still the agent host interpreter (not the remote remote_python)."
+        "Return provider capability summary. For local execution, also runs python_executable -V on the agent host (best effort). For jupyter, that probe is still the host interpreter (sanity check only); the kernel Python environment is whatever the Jupyter server started for that kernelspec. For ssh, the probe is still the agent host interpreter (not the remote remote_python). For colab_mcp, JSON includes colab_mcp.runtime_policy (CPU default, no MCP runtime switch — user changes Runtime in the browser when GPU/TPU is needed)."
     }
 
     fn parameters(&self) -> Value {
@@ -1252,7 +1275,8 @@ impl Tool for ExecutionEnvInfoTool {
                 ),
                 "execution_run_timeout_hint": "execution_run maps to add_code_cell + run_code_cell in notebook mode; both steps share the run's timeout_secs. Set timeout_secs high for training. Colab's browser-side run_code_cell may still enforce its own cap (see tool result / tmp_colab_mcp_probe.py --dump-schemas). Long runs auto-promote to a background job using the same auto_promote_after_secs bound.",
                 "cancel_semantics": "execution_job_cancel and execution_cancel are best-effort for colab_mcp: the local wait is dropped immediately, but the Colab cell may keep running on Google's side until it finishes naturally. cancel_kind=\"abort\" in the job status payload signals this.",
-                "upstream_probe": "tmp_colab_mcp_probe.py documents MCP vs Colab timeouts and can dump live run_code_cell inputSchema."
+                "upstream_probe": "tmp_colab_mcp_probe.py documents MCP vs Colab timeouts and can dump live run_code_cell inputSchema.",
+                "runtime_policy": colab_mcp_runtime_policy_value()
             });
         }
         let probe = tokio::task::spawn_blocking({

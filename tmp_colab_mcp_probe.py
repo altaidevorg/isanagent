@@ -54,7 +54,13 @@ and document **timeouts** (several independent clocks exist).
 3) open_colab_browser_connection
 4) tools/list again (often expands after connect)
 5) Optional: `--dump-schemas` / `--inspect-only`
-6) Try execution strategies in order:
+6) Optional: `--tool-list-survey` — snapshot tool names across phases (pre-connect, post-connect,
+   after draining stdio for `notifications/tools/list_changed`, after optional stdin prompt so you
+   can switch **Runtime** in the Colab tab, after a successful `run_code_cell`) and flag names
+   that look like **GPU / TPU / runtime** controls.
+6b) Optional: `--manual-gpu-then-torch-verify` — after connect, **stdin + GPU runtime** in the
+   browser, then one cell: `torch.cuda.is_available()` (no cells before Enter).
+7) Try execution strategies in order:
    A) direct execution tool (if present)
    B) add_code_cell -> run_code_cell
    C) get_cells -> pick code cell -> update_cell -> run_code_cell
@@ -66,6 +72,12 @@ Run:
   uv run --no-project python tmp_colab_mcp_probe.py --training-sim --timeout 90 --request-timeout 350
     # ~130s cell: 13 x (sleep 10s + print). Logs every MCP stdio line that is not the
     # tools/call JSON-RPC response (usually none until completion).
+  uv run --no-project python tmp_colab_mcp_probe.py --inspect-only --tool-list-survey --prompt-runtime-change
+    # After connect + first tools/list, wait for Enter while you change Runtime type in the browser.
+  uv run --no-project python tmp_colab_mcp_probe.py --tool-list-survey --manual-gpu-then-torch-verify --timeout 90
+    # No cells until you pick a **GPU** runtime in the browser and press Enter; then torch.cuda.is_available().
+  uv run --no-project python tmp_colab_mcp_probe.py --tool-list-survey --drain-stdio-sec 5
+    # Drain MCP messages briefly after connect; on success, re-list tools after run_code_cell.
 """
 
 from __future__ import annotations
@@ -77,7 +89,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 
@@ -101,6 +113,14 @@ for epoch in range(1, epochs + 1):
     acc = min(0.5 + 0.03 * epoch, 0.99)
     print(f"epoch={epoch}/{epochs} loss={loss:.4f} acc={acc:.4f}", flush=True)
 print("training_sim_done", flush=True)
+"""
+
+# After user switches Colab to a GPU runtime (manual); verifies torch sees CUDA from MCP.
+TORCH_CUDA_VERIFY_CODE = """import torch
+print("torch", torch.__version__)
+print("cuda_available", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("device0", torch.cuda.get_device_name(0))
 """
 
 
@@ -313,11 +333,128 @@ class McpClient:
                 tap_interim(msg)
             buffered.append(msg)
 
+    def drain_inbox_for(self, seconds: float, log_prefix: str) -> tuple[int, list[str]]:
+        """
+        Non-destructively observe queued MCP messages for `seconds`, then push them back in order.
+
+        Used to catch `notifications/tools/list_changed` (or other JSON-RPC) that arrived between
+        requests. Returns (count of tools/list_changed notifications, list of `method` strings seen).
+        """
+        deadline = time.time() + seconds
+        buffered: list[dict[str, Any]] = []
+        n_list_changed = 0
+        methods_seen: list[str] = []
+        while time.time() < deadline:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            try:
+                msg = self._inbox.get(timeout=min(remaining, 0.25))
+            except queue.Empty:
+                continue
+            if "_reader_error" in msg:
+                log(f"{log_prefix} reader_error: {msg.get('_reader_error')}")
+                buffered.append(msg)
+                break
+            m = msg.get("method")
+            if isinstance(m, str):
+                methods_seen.append(m)
+                if m == "notifications/tools/list_changed":
+                    n_list_changed += 1
+                    log(f"{log_prefix} NOTIFICATION {m} {_compact_json_for_log(msg, max_len=400)}")
+                else:
+                    log(f"{log_prefix} notification/other method={m!r} {_compact_json_for_log(msg, max_len=500)}")
+            elif msg.get("id") is not None and ("result" in msg or "error" in msg):
+                log(f"{log_prefix} queued JSON-RPC id={msg.get('id')} {_compact_json_for_log(msg, max_len=500)}")
+            else:
+                log(f"{log_prefix} msg {_compact_json_for_log(msg, max_len=500)}")
+            buffered.append(msg)
+        for m in buffered:
+            self._inbox.put(m)
+        return n_list_changed, methods_seen
+
 
 def _tool_list_from_response(resp: dict[str, Any]) -> list[dict[str, Any]]:
     result = resp.get("result", {})
     tools = result.get("tools", [])
     return tools if isinstance(tools, list) else []
+
+
+def _tool_names_sorted(tools: list[dict[str, Any]]) -> list[str]:
+    names = [t.get("name") for t in tools if isinstance(t.get("name"), str)]
+    return sorted(names)
+
+
+def _runtimeish_name_heuristic(name: str) -> bool:
+    """Heuristic: tool name might relate to runtime / hardware / Colab session (not authoritative)."""
+    low = name.lower()
+    needles = (
+        "runtime",
+        "gpu",
+        "tpu",
+        "cuda",
+        "accelerator",
+        "hardware",
+        "machine",
+        "vram",
+        "session",
+        "kernel",
+        "restart",
+        "jax",
+        "torch",
+        "tensorflow",
+    )
+    return any(n in low for n in needles)
+
+
+def _runtimeish_tool_names(names: Iterable[str]) -> list[str]:
+    return sorted(n for n in names if _runtimeish_name_heuristic(n))
+
+
+def _diff_sorted_sets(before: list[str], after: list[str]) -> tuple[list[str], list[str]]:
+    a, b = set(before), set(after)
+    return sorted(b - a), sorted(a - b)
+
+
+class ToolListSurvey:
+    """Collect ordered snapshots of tool *names* across probe phases for Colab MCP evolution debugging."""
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+        self.phases: list[tuple[str, list[str]]] = []
+
+    def record(self, phase: str, tools: list[dict[str, Any]]) -> list[str]:
+        names = _tool_names_sorted(tools)
+        if self.enabled:
+            self.phases.append((phase, list(names)))
+            rt = _runtimeish_tool_names(names)
+            log(
+                f"[tool-survey] phase={phase!r} n={len(names)} "
+                f"runtimeish={rt if rt else '[]'}"
+            )
+        return names
+
+    def summary_lines(self) -> list[str]:
+        if not self.enabled or not self.phases:
+            return []
+        lines: list[str] = ["=== tool-list survey summary (tool names only) ==="]
+        prev: list[str] | None = None
+        for phase, names in self.phases:
+            lines.append(f"  {phase}: {len(names)} tools")
+            if prev is not None:
+                added, removed = _diff_sorted_sets(prev, names)
+                if added or removed:
+                    lines.append(f"    vs previous: +{added}  -{removed}")
+                else:
+                    lines.append("    vs previous: (same set)")
+            rt = _runtimeish_tool_names(names)
+            lines.append(f"    runtime-ish (heuristic): {rt if rt else '(none)'}")
+            prev = names
+        return lines
+
+    def print_summary(self) -> None:
+        for line in self.summary_lines():
+            log(line)
 
 
 def _schema_keys(tool: dict[str, Any]) -> list[str]:
@@ -482,6 +619,73 @@ def _log_schema_timeout_hints(tools: list[dict[str, Any]]) -> None:
             log(f"schema timeout-ish paths for {n}: {hints[:40]}{' …' if len(hints) > 40 else ''}")
 
 
+def _strategy_b_add_and_run(
+    client: McpClient,
+    tools2: list[dict[str, Any]],
+    code: str,
+    call_tc: float,
+    *,
+    tap_run_code_cell: bool,
+    training_sim_analyze: bool,
+    log_label: str,
+) -> bool:
+    """add_code_cell -> run_code_cell. Returns True on success (prints cell output to stdout)."""
+    try:
+        add_tool = _find_tool(tools2, "add_code_cell")
+        run_tool = _find_tool(tools2, "run_code_cell")
+        if not add_tool or not run_tool:
+            log(f"{log_label} notebook add/run tools not present")
+            return False
+        add_key = _first_present_key(_schema_keys(add_tool), ("code", "source", "content", "text"))
+        run_key = _first_present_key(_schema_keys(run_tool), ("cellId", "cell_id", "id"))
+        if not add_key or not run_key:
+            log(f"{log_label} missing add/run schema keys for notebook-cell strategy")
+            return False
+        log(f"{log_label} add_code_cell({add_key}) -> run_code_cell({run_key})")
+        add_args: dict[str, Any] = {add_key: code, "language": "python", "cellIndex": 0}
+        log(f"{log_label} add_code_cell args keys={list(add_args.keys())}")
+        add_resp = client.request(
+            "tools/call",
+            {"name": "add_code_cell", "arguments": add_args},
+            timeout=call_tc,
+        )
+        if "error" in add_resp:
+            log(f"{log_label} add_code_cell error: {json.dumps(add_resp['error'])}")
+            return False
+        cell_id = _extract_cell_id_any(add_resp)
+        log(f"{log_label} add_code_cell response text: {_extract_text_content(add_resp)}")
+        if not cell_id:
+            log(f"{log_label} no cell id could be extracted from add_code_cell")
+            return False
+        req_kw: dict[str, Any] = {}
+        tap_fn, tap_cnt_get = _make_interim_mcp_tap("run_code_cell")
+        if tap_run_code_cell:
+            req_kw["tap_interim"] = tap_fn
+        log(f"{log_label} run_code_cell start (MCP timeout={call_tc}s, tap_interim={tap_run_code_cell})")
+        t_cell = time.time()
+        run_resp = client.request(
+            "tools/call",
+            {"name": "run_code_cell", "arguments": {run_key: cell_id}},
+            timeout=call_tc,
+            **req_kw,
+        )
+        elapsed = time.time() - t_cell
+        interim_n = tap_cnt_get() if tap_run_code_cell else 0
+        log(f"{log_label} run_code_cell returned after {elapsed:.1f}s; interim MCP msgs: {interim_n}")
+        if "error" in run_resp:
+            log(f"{log_label} run_code_cell error: {json.dumps(run_resp['error'])}")
+            return False
+        log(f"{log_label} run_code_cell success")
+        out_txt = _extract_text_content(run_resp)
+        print(out_txt)
+        if training_sim_analyze:
+            _analyze_training_cell_output(out_txt)
+        return True
+    except Exception as e:
+        log(f"{log_label} add/run strategy failed: {e!r}")
+        return False
+
+
 def _spawn_stderr_reader(proc: subprocess.Popen[bytes], buf: list[str]) -> threading.Thread:
     def _work() -> None:
         err = proc.stderr
@@ -562,7 +766,54 @@ def main() -> int:
         default=None,
         help="Explicit MCP execution tool name (skip auto-detect)",
     )
+    ap.add_argument(
+        "--tool-list-survey",
+        action="store_true",
+        help=(
+            "Record tool *names* at each phase (pre/post connect, optional drain/prompt, after successful "
+            "run_code_cell) and print a diff summary; highlights runtime/GPU/TPU-ish names (heuristic)."
+        ),
+    )
+    ap.add_argument(
+        "--drain-stdio-sec",
+        type=float,
+        default=0.0,
+        metavar="SEC",
+        help=(
+            "After the first post-connect tools/list, drain the MCP client inbox for SEC seconds "
+            "(logs notifications including tools/list_changed), then call tools/list again."
+        ),
+    )
+    ap.add_argument(
+        "--prompt-runtime-change",
+        action="store_true",
+        help=(
+            "After connect + survey steps, print a message to stderr and wait for Enter on stdin so you "
+            "can change Runtime in the Colab browser tab; then tools/list again (manual GPU/TPU workflow)."
+        ),
+    )
+    ap.add_argument(
+        "--no-after-cell-survey",
+        action="store_true",
+        help="With --tool-list-survey, skip an extra tools/list after a successful run_code_cell.",
+    )
+    ap.add_argument(
+        "--manual-gpu-then-torch-verify",
+        action="store_true",
+        help=(
+            "After MCP connects to Colab: **no cells** until you switch the browser notebook to a **GPU** "
+            "runtime and press Enter; then add+run `import torch` / `print(torch.cuda.is_available())`. "
+            "Does not run the tools/list-only stdin path of --prompt-runtime-change (use that flag separately)."
+        ),
+    )
     args = ap.parse_args()
+
+    if args.manual_gpu_then_torch_verify and (args.training_sim or args.long_run_seconds > 0):
+        print(
+            "error: --manual-gpu-then-torch-verify cannot be combined with --training-sim or --long-run-seconds",
+            file=sys.stderr,
+        )
+        return 2
 
     long_pad = 180.0
     effective_cell_wall = 0.0
@@ -598,6 +849,7 @@ def main() -> int:
     _spawn_stderr_reader(proc, stderr_buf)
 
     client = McpClient(proc, read_timeout=mcp_read_timeout)
+    survey = ToolListSurvey(args.tool_list_survey)
     try:
         init = client.request(
             "initialize",
@@ -628,6 +880,7 @@ def main() -> int:
                 log(
                     f"tool {n} schema keys: {_schema_keys(t)} required: {_schema_required(t)}"
                 )
+        survey.record("pre_connect", tools)
 
         connect_tool = "open_colab_browser_connection"
         if connect_tool in names:
@@ -658,6 +911,61 @@ def main() -> int:
                 log(
                     f"tool {n} schema keys: {_schema_keys(t)} required: {_schema_required(t)}"
                 )
+        survey.record("post_connect", tools2)
+
+        if args.drain_stdio_sec and args.drain_stdio_sec > 0:
+            n_ch, meth = client.drain_inbox_for(float(args.drain_stdio_sec), "[drain post-connect]")
+            log(
+                f"drain-stdio-sec={args.drain_stdio_sec}: notifications/tools/list_changed={n_ch} "
+                f"methods_seen={meth[:30]}{'…' if len(meth) > 30 else ''}"
+            )
+            resp2d = client.request("tools/list", {}, timeout=args.timeout)
+            if "error" in resp2d:
+                log(f"tools/list after drain error: {json.dumps(resp2d['error'])}")
+            else:
+                tools2 = _tool_list_from_response(resp2d)
+                names2 = [t.get("name") for t in tools2 if isinstance(t.get("name"), str)]
+                log(f"tools/list (after drain) -> {len(names2)} tools: {names2}")
+                survey.record("after_drain_then_tools_list", tools2)
+
+        if args.prompt_runtime_change and not args.manual_gpu_then_torch_verify:
+            print(
+                "\n[colab-mcp probe] Switch to the Colab browser tab: Runtime > Change runtime type "
+                "(e.g. GPU/TPU). When finished, press Enter here to re-fetch tools/list...\n",
+                file=sys.stderr,
+                flush=True,
+            )
+            try:
+                sys.stdin.readline()
+            except (EOFError, KeyboardInterrupt):
+                log("prompt-runtime-change: stdin closed or interrupted; continuing without extra wait")
+            if args.drain_stdio_sec and args.drain_stdio_sec > 0:
+                client.drain_inbox_for(min(float(args.drain_stdio_sec), 2.0), "[drain post-prompt]")
+            resp2p = client.request("tools/list", {}, timeout=args.timeout)
+            if "error" in resp2p:
+                log(f"tools/list after stdin prompt error: {json.dumps(resp2p['error'])}")
+            else:
+                tools2 = _tool_list_from_response(resp2p)
+                names2 = [t.get("name") for t in tools2 if isinstance(t.get("name"), str)]
+                log(f"tools/list (after stdin prompt) -> {len(names2)} tools: {names2}")
+                survey.record("post_stdin_prompt_tools_list", tools2)
+
+        def maybe_survey_after_cell() -> None:
+            if not survey.enabled or args.no_after_cell_survey:
+                return
+            try:
+                r_pc = client.request("tools/list", {}, timeout=args.timeout)
+                if "error" in r_pc:
+                    log(f"[tool-survey] post-run tools/list error: {json.dumps(r_pc['error'])}")
+                    return
+                tools_pc = _tool_list_from_response(r_pc)
+                survey.record("after_successful_run_code_cell", tools_pc)
+            except Exception as e:
+                log(f"[tool-survey] post-run tools/list exception: {e!r}")
+
+        def finish_run_success() -> None:
+            maybe_survey_after_cell()
+            survey.print_summary()
 
         _log_schema_timeout_hints(tools2)
         if args.dump_schemas or args.schemas_out:
@@ -671,9 +979,62 @@ def main() -> int:
                 print("=== tool inputSchema (post-connect tools/list) ===")
                 print(pretty)
 
-        if args.inspect_only:
+        if args.inspect_only and not args.manual_gpu_then_torch_verify:
             log("inspect-only: skipping execution strategies")
+            survey.print_summary()
             return 0
+
+        if args.manual_gpu_then_torch_verify:
+            if args.inspect_only:
+                log(
+                    "note: --inspect-only is ignored with --manual-gpu-then-torch-verify "
+                    "(a torch cell is run after the GPU prompt)"
+                )
+            print(
+                "\n[colab-mcp probe] MCP is connected — **no notebook cells via MCP yet** (recommended for a "
+                "clean GPU check).\n"
+                "1) Switch to the **Colab browser** tab.\n"
+                "2) **Runtime** > **Change runtime type** — pick a **GPU** runtime and wait until it connects.\n"
+                "3) Return here and **press Enter**.\n\n"
+                "The probe will add one cell (`import torch`, `print(torch.cuda.is_available())`, optional "
+                "`get_device_name`), run it through MCP, and print the notebook output below.\n",
+                file=sys.stderr,
+                flush=True,
+            )
+            try:
+                sys.stdin.readline()
+            except (EOFError, KeyboardInterrupt):
+                log("manual-gpu-then-torch-verify: stdin closed or interrupted; continuing anyway")
+            if args.tool_list_survey:
+                resp_g = client.request("tools/list", {}, timeout=args.timeout)
+                if "error" in resp_g:
+                    log(f"[gpu-verify] tools/list after GPU prompt error: {json.dumps(resp_g['error'])}")
+                else:
+                    tools2 = _tool_list_from_response(resp_g)
+                    names_g = [t.get("name") for t in tools2 if isinstance(t.get("name"), str)]
+                    log(f"[gpu-verify] tools/list (after GPU prompt) -> {len(names_g)} tools: {names_g}")
+                    survey.record("post_manual_gpu_prompt_tools_list", tools2)
+            log(
+                f"waiting {args.post_connect_wait}s after GPU prompt before add_code_cell / run_code_cell "
+                "(kernel reconnect / CUDA init)..."
+            )
+            time.sleep(args.post_connect_wait)
+            call_tc_gpu = req_floor
+            tap_gpu = args.tap_mcp_during_run
+            ok_gpu = _strategy_b_add_and_run(
+                client,
+                tools2,
+                TORCH_CUDA_VERIFY_CODE,
+                call_tc_gpu,
+                tap_run_code_cell=tap_gpu,
+                training_sim_analyze=False,
+                log_label="[gpu-verify]",
+            )
+            if ok_gpu:
+                finish_run_success()
+                return 0
+            survey.print_summary()
+            return 4
 
         # Give browser-side plugin a bit more time after first connect.
         log(f"waiting {args.post_connect_wait}s for browser-side readiness before execution calls...")
@@ -713,6 +1074,7 @@ def main() -> int:
                     else:
                         log("[A] direct run success")
                         print(_extract_text_content(run_resp))
+                        finish_run_success()
                         return 0
                 else:
                     log(f"[A] skipped direct run because {exec_tool} expects cell id")
@@ -720,63 +1082,17 @@ def main() -> int:
                 log(f"[A] direct strategy failed: {e!r}")
 
         # Strategy B: add_code_cell -> run_code_cell
-        try:
-            add_tool = _find_tool(tools2, "add_code_cell")
-            run_tool = _find_tool(tools2, "run_code_cell")
-            if add_tool and run_tool:
-                add_key = _first_present_key(_schema_keys(add_tool), ("code", "source", "content", "text"))
-                run_key = _first_present_key(_schema_keys(run_tool), ("cellId", "cell_id", "id"))
-                if add_key and run_key:
-                    log(f"[B] add_code_cell({add_key}) -> run_code_cell({run_key})")
-                    add_args = {add_key: code, "language": "python", "cellIndex": 0}
-                    log(f"[B] add_code_cell args={add_args}")
-                    add_resp = client.request(
-                        "tools/call",
-                        {"name": "add_code_cell", "arguments": add_args},
-                        timeout=call_tc,
-                    )
-                    if "error" in add_resp:
-                        log(f"[B] add_code_cell error: {json.dumps(add_resp['error'])}")
-                    else:
-                        cell_id = _extract_cell_id_any(add_resp)
-                        log(f"[B] add_code_cell response text: {_extract_text_content(add_resp)}")
-                        if cell_id:
-                            req_kw: dict[str, Any] = {}
-                            tap_fn, tap_cnt_get = _make_interim_mcp_tap("run_code_cell")
-                            if tap_run_code_cell:
-                                req_kw["tap_interim"] = tap_fn
-                            hint = f"~{TRAINING_SIM_TOTAL_SECS}s cell" if args.training_sim else "cell"
-                            log(
-                                f"[B] run_code_cell start ({hint}, MCP client timeout={call_tc}s, "
-                                f"tap_interim={tap_run_code_cell})"
-                            )
-                            t_cell = time.time()
-                            run_resp = client.request(
-                                "tools/call",
-                                {"name": "run_code_cell", "arguments": {run_key: cell_id}},
-                                timeout=call_tc,
-                                **req_kw,
-                            )
-                            elapsed = time.time() - t_cell
-                            interim_n = tap_cnt_get() if tap_run_code_cell else 0
-                            log(f"[B] run_code_cell returned after {elapsed:.1f}s; interim MCP msgs: {interim_n}")
-                            if "error" in run_resp:
-                                log(f"[B] run_code_cell error: {json.dumps(run_resp['error'])}")
-                            else:
-                                log("[B] run_code_cell success")
-                                out_txt = _extract_text_content(run_resp)
-                                print(out_txt)
-                                if args.training_sim:
-                                    _analyze_training_cell_output(out_txt)
-                                return 0
-                        else:
-                            log("[B] no cell id could be extracted from add_code_cell")
-                else:
-                    log("[B] missing add/run schema keys for notebook-cell strategy")
-            else:
-                log("[B] notebook add/run tools not present")
-        except Exception as e:
-            log(f"[B] notebook add/run strategy failed: {e!r}")
+        if _strategy_b_add_and_run(
+            client,
+            tools2,
+            code,
+            call_tc,
+            tap_run_code_cell=tap_run_code_cell,
+            training_sim_analyze=args.training_sim,
+            log_label="[B]",
+        ):
+            finish_run_success()
+            return 0
 
         # Strategy C: get_cells -> update_cell -> run_code_cell
         try:
@@ -854,6 +1170,7 @@ def main() -> int:
                                     print(out_c)
                                     if args.training_sim:
                                         _analyze_training_cell_output(out_c)
+                                    finish_run_success()
                                     return 0
                         else:
                             log("[C] could not extract any code cell id")
@@ -865,9 +1182,11 @@ def main() -> int:
             log(f"[C] get/update/run strategy failed: {e!r}")
 
         log("all strategies failed")
+        survey.print_summary()
         return 4
     except Exception as e:
         log(f"probe failed: {e!r}")
+        survey.print_summary()
         if stderr_buf:
             tail = "".join(stderr_buf)[-6000:]
             log("recent colab-mcp stderr:")
