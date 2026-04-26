@@ -62,7 +62,7 @@ cargo build --release
 isanagent now ships with an onboarding command that creates a ready-to-edit workspace root, starter config, sandbox directory, and local skills.
 
 ```bash
-cargo run --bin isanagent -- onboard --workspace my_agent
+cargo run -- onboard --workspace my_agent
 ```
 
 This creates:
@@ -162,7 +162,7 @@ Update the `<changethis>` placeholders and ensure `GEMINI_API_KEY` is set. Slack
 ### 4. Run the Agent
 ```bash
 # Pass your workspace path. `config.toml` defaults to <workspace>/config.toml.
-cargo run --bin isanagent -- --workspace my_agent
+cargo run -- --workspace my_agent
 ```
 
 ## Configuring Channels

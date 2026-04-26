@@ -50,7 +50,7 @@ Long-running execution for Colab MCP and the local harness now uses a configurab
 ## Next Steps
 
 - [ ] Run **`cargo clippy --all-targets --all-features -- -D warnings`** and **`cargo test`** before merge.
-- [ ] On Windows CI/dev: confirm **`cargo build --bin isanagent`** if PDB/link issues matter.
+- [ ] On Windows CI/dev: confirm **`cargo build`** if PDB/link issues matter.
 - [ ] Optional: **`cargo clean`** then rebuild to refresh future-incompat reports.
 - [ ] Optional: remove **`duckduckgo`** dep or refactor **`web_search_duckduckgo`** to **`duckduckgo::Browser`** for a single client implementation.
 - [ ] Optional: when **`imap` 3 stable** ships, pin non-alpha version.
@@ -68,7 +68,7 @@ Long-running execution for Colab MCP and the local harness now uses a configurab
 | `src/tools/execution.rs` | `execution_run`, `colab_mcp_tool_call`, `execution_env_info`, tests |
 | `src/config.rs` | `auto_promote_after_secs` config + accessor |
 | `src/bus.rs` | `PromoteSyncToBackground` |
-| `src/bin/isanagent.rs` | Tool registration (`jobs`, `inflight`), bus → `promote()` |
+| `src/main.rs` | Tool registration (`jobs`, `inflight`), bus → `promote()` |
 | `src/channels/terminal_ui/app.rs` | `JobStripEntry`, `jobs_strip`, eviction helpers + tests |
 | `src/channels/terminal_ui/run.rs` | Slash `/background`, notice handlers, strip render |
 | `src/channels/terminal_ui/protocol.rs` | `ISANAGENT_EXECUTION_JOB_STARTED`, tool name metadata key |

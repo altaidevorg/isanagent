@@ -19,6 +19,7 @@ pub mod multi_tenant_edge;
 pub mod onboarding;
 pub mod onboarding_interactive;
 pub mod provider;
+pub mod provider_registry;
 pub mod reflection;
 pub mod scheduler;
 pub mod session;

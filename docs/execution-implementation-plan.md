@@ -92,7 +92,7 @@ See `AGENTS.md` for workspace/sandbox rules, actor discipline, and telemetry con
 
 **Depends on:** Phase 1.
 
-**Status (implemented):** `[harness.execution]` in `config.rs` (`ExecutionHarnessConfig`); `build_execution_harness` + `ExecutionHarness` in `src/execution/harness.rs`; tools in `src/tools/execution.rs` (`execution_session_create`, `execution_run`, `execution_cancel`, `execution_session_close`, `execution_env_info`); registration in `src/bin/isanagent.rs` when enabled. Session create returns provider capability summary JSON; `execution_cancel` preflights `supports_interrupt`. `execution_run` logs duration at `info`. Unit tests: `tools::execution::tests::create_run_close_roundtrip`, `config::tests::harness_execution_toml_roundtrip`.
+**Status (implemented):** `[harness.execution]` in `config.rs` (`ExecutionHarnessConfig`); `build_execution_harness` + `ExecutionHarness` in `src/execution/harness.rs`; tools in `src/tools/execution.rs` (`execution_session_create`, `execution_run`, `execution_cancel`, `execution_session_close`, `execution_env_info`); registration in `src/main.rs` when enabled. Session create returns provider capability summary JSON; `execution_cancel` preflights `supports_interrupt`. `execution_run` logs duration at `info`. Unit tests: `tools::execution::tests::create_run_close_roundtrip`, `config::tests::harness_execution_toml_roundtrip`.
 
 ---
 

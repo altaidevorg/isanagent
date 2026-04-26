@@ -11,10 +11,15 @@ max_web_tool_output_chars = 50000
 [terminal]
 enabled = true
 
+# LLM provider. `provider_name` selects a built-in entry from the registry (gemini, openai,
+# deepseek, openrouter) so the chat-completions URL stays in code. Set `provider_name =
+# "openai_compatible"` to point at any other OpenAI-compatible endpoint and supply `base_url`
+# explicitly. `base_url` is also accepted as an optional override for known names (e.g. a proxy
+# or self-hosted relay).
 [provider]
+provider_name = "gemini"
 model_name = "gemini-3.1-pro-preview-customtools"
 api_key_env = "GEMINI_API_KEY"
-base_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 
 [slack]
 enabled = false
