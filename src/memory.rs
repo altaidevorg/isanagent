@@ -404,6 +404,7 @@ impl SqliteMemoryActor {
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN name TEXT", []);
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN tool_calls TEXT", []);
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN tool_call_id TEXT", []);
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN reasoning_content TEXT", []);
 
         // Create an index to quickly filter by session_id
         conn.execute(
@@ -525,8 +526,8 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     .tool_calls
                     .map(|tc| serde_json::to_string(&tc).unwrap_or_default());
                 let res = self.conn.execute(
-                    "INSERT INTO messages (session_id, role, content, name, tool_calls, tool_call_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![session_id, message.role, content_str, message.name, tool_calls_str, message.tool_call_id],
+                    "INSERT INTO messages (session_id, role, content, name, tool_calls, tool_call_id, reasoning_content) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![session_id, message.role, content_str, message.name, tool_calls_str, message.tool_call_id, message.reasoning_content],
                 ).map_err(|e| e.to_string()).map(|_| ());
 
                 let _ = reply.send(res);
@@ -534,7 +535,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
             MemoryMessage::GetContext { session_id, reply } => {
                 let res = (|| -> Result<Vec<ChatMessage>, String> {
                     let mut stmt = self.conn.prepare(
-                        "SELECT role, content, name, tool_calls, tool_call_id FROM messages WHERE session_id = ?1 ORDER BY created_at ASC"
+                        "SELECT role, content, name, tool_calls, tool_call_id, reasoning_content FROM messages WHERE session_id = ?1 ORDER BY created_at ASC"
                     ).map_err(|e| e.to_string())?;
 
                     let message_iter = stmt
@@ -550,6 +551,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                                 name: row.get(2)?,
                                 tool_calls,
                                 tool_call_id: row.get(4)?,
+                                reasoning_content: row.get(5)?,
                             })
                         })
                         .map_err(|e| e.to_string())?;
@@ -938,7 +940,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     ).unwrap_or(None);
 
                     let mut msg_stmt = self.conn.prepare(
-                        "SELECT id, role, content, name, tool_calls, tool_call_id FROM messages WHERE session_id = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id ASC"
+                        "SELECT id, role, content, name, tool_calls, tool_call_id, reasoning_content FROM messages WHERE session_id = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id ASC"
                     ).map_err(|e| e.to_string())?;
 
                     let messages_iter = msg_stmt
@@ -952,6 +954,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                             let tool_calls =
                                 tool_calls_str.and_then(|s| serde_json::from_str(&s).ok());
                             let tool_call_id: Option<String> = row.get(5)?;
+                            let reasoning_content: Option<String> = row.get(6)?;
                             Ok((
                                 id,
                                 ChatMessage {
@@ -960,6 +963,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                                     name,
                                     tool_calls,
                                     tool_call_id,
+                                    reasoning_content,
                                 },
                             ))
                         })

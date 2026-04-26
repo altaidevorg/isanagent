@@ -288,13 +288,15 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             channel,
             tool_name,
             args,
+            tool_call_id,
         } => LogEvent::info(
             "Telemetry",
             &format!(
-                "ToolCall channel={} tool={} args_len={}",
+                "ToolCall channel={} tool={} args_len={} id={}",
                 channel,
                 tool_name,
-                args.len()
+                args.len(),
+                tool_call_id.as_deref().unwrap_or("-"),
             ),
         )
         .with_chat_id(chat_id),
@@ -303,13 +305,15 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             channel,
             tool_name,
             result,
+            tool_call_id,
         } => LogEvent::info(
             "Telemetry",
             &format!(
-                "ToolResult channel={} tool={} result_len={}",
+                "ToolResult channel={} tool={} result_len={} id={}",
                 channel,
                 tool_name,
-                result.len()
+                result.len(),
+                tool_call_id.as_deref().unwrap_or("-"),
             ),
         )
         .with_chat_id(chat_id),

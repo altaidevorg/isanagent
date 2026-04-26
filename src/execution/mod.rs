@@ -50,7 +50,8 @@ pub use ids::SessionId;
 pub use inflight::{InflightGuard, InflightSyncRegistry};
 pub use jupyter::{JupyterExecutionProvider, JupyterExecutionProviderConfig};
 pub use local::{
-    build_python_host_command, install_uv_best_effort, uv_binary_available, LocalExecMode,
+    build_python_host_command, install_uv_best_effort, parse_uv_pip_list_and_diff,
+    uv_binary_available, uv_managed_env_python, uv_requirements_status, LocalExecMode,
     LocalExecutionConfig, LocalExecutionProvider, LocalPythonRuntime,
 };
 pub use mcp_call_history::{

@@ -24,3 +24,10 @@ pub const METADATA_TOOL_NAME: &str = "isanagent_tool_name";
 pub const METADATA_TOOL_CALL_PREVIEW: &str = "isanagent_tool_call_preview";
 /// Short result summary for tool result / fail notices.
 pub const METADATA_TOOL_RESULT_PREVIEW: &str = "isanagent_tool_result_preview";
+/// LLM-supplied stable id correlating a tool-call notice with its result/fail notice.
+/// Used by the terminal UI to upsert the same Cell::ToolNotice in place (pending → done/failed)
+/// instead of appending two separate cells per invocation.
+pub const METADATA_TOOL_CALL_ID: &str = "isanagent_tool_call_id";
+/// Set on `ISANAGENT_TERMINAL_ERROR` outbounds emitted after exhausted LLM retries. When the
+/// terminal UI sees this, it activates a `/retry` banner that re-injects the last user inbound.
+pub const ISANAGENT_LLM_RETRY_AVAILABLE: &str = "isanagent_llm_retry_available";

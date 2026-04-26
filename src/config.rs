@@ -577,6 +577,38 @@ impl AppConfig {
             .unwrap_or_else(|| "colab_mcp".to_string())
     }
 
+    /// True iff the user explicitly set `[harness.execution].default_provider` to a non-empty
+    /// string. Used by `build_execution_harness` to decide between auto-pick (implicit fallback
+    /// happened to be misconfigured) and hard-fail (user pinned a now-pruned provider).
+    pub fn execution_default_provider_explicit(&self) -> bool {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.default_provider.as_ref())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Returns the user-configured allowed-providers list (trimmed, non-empty entries).
+    /// `None` means "no restriction" (all implemented providers may be tried).
+    pub fn execution_allowed_providers(&self) -> Option<Vec<String>> {
+        let raw = self
+            .harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.allowed_providers.as_ref())?;
+        let cleaned: Vec<String> = raw
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned)
+        }
+    }
+
     pub fn execution_max_output_bytes(&self) -> usize {
         const DEFAULT: usize = 256 * 1024;
         const MIN: usize = 4096;

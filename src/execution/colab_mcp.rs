@@ -152,6 +152,24 @@ impl ColabMcpExecutionProvider {
         })
     }
 
+    /// Best-effort: gracefully shut down every active MCP session. Used by the agent's exit
+    /// path to avoid leaking child MCP processes. Failures per session are logged but do not
+    /// stop the sweep, since this runs while the process is already on its way down.
+    pub async fn shutdown_all_sessions(&self) {
+        let ids: Vec<SessionId> = self.sessions.iter().map(|r| r.key().clone()).collect();
+        for sid in ids {
+            if let Some((_, sess)) = self.sessions.remove(&sid) {
+                let mut guard = sess.client.lock().await;
+                guard.shutdown().await;
+            }
+        }
+    }
+
+    /// Number of currently registered MCP sessions (for tests and runtime summaries).
+    pub fn active_session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
     /// Call a proxied Colab MCP tool by name (used by `colab_mcp_tool_call` after allowlist checks).
     pub async fn call_mcp_tool_raw(
         &self,
@@ -796,6 +814,19 @@ impl McpProcessClient {
     }
 }
 
+/// Best-effort kill at drop time. `close_session` (or `ColabMcpExecutionProvider::shutdown_all`)
+/// is the primary teardown path; this Drop catches the case where a session leaks past its
+/// graceful close (e.g. process exit without a /exit shutdown sweep) and prevents zombie
+/// MCP child processes.
+impl Drop for McpProcessClient {
+    fn drop(&mut self) {
+        self.stderr_reader.abort();
+        // `start_kill` is synchronous; the actual SIGKILL/TerminateProcess may race with the
+        // OS, but on Windows (where this agent typically runs) it does not block.
+        let _ = self.child.start_kill();
+    }
+}
+
 fn pick_execute_tool_name(
     tools: &[McpToolDef],
     configured: Option<&str>,
@@ -1018,6 +1049,93 @@ mod tests {
         }];
         let picked = pick_execute_tool_name(&tools, None).expect("pick");
         assert_eq!(picked, "execute_python");
+    }
+
+    fn provider_with_dummy_command() -> ColabMcpExecutionProvider {
+        ColabMcpExecutionProvider::new(ColabMcpExecutionProviderConfig {
+            command: "isanagent-colab-mcp-fixture-do-not-spawn".to_string(),
+            args: vec!["--noop".to_string()],
+            cwd: None,
+            startup_timeout_secs: 1,
+            connect_tool_name: "connect".to_string(),
+            execute_tool_name: None,
+            execute_code_arg_keys: vec!["code".to_string()],
+            max_sessions: 4,
+            max_output_bytes: 4096,
+        })
+        .expect("provider builds with valid config (does not spawn)")
+    }
+
+    #[tokio::test]
+    async fn shutdown_all_sessions_is_safe_when_empty() {
+        let p = provider_with_dummy_command();
+        assert_eq!(p.active_session_count(), 0);
+        // Must not panic, must not deadlock.
+        p.shutdown_all_sessions().await;
+        assert_eq!(p.active_session_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn execution_harness_shutdown_without_colab_mcp_is_noop() {
+        // Build a no-op harness whose colab_mcp slot is None; shutdown should return
+        // immediately without any side effects.
+        use crate::execution::harness::ExecutionHarness;
+        use crate::execution::provider::ExecutionProvider;
+        use async_trait::async_trait;
+
+        struct StubProvider {
+            caps: ProviderCapabilities,
+        }
+        #[async_trait]
+        impl ExecutionProvider for StubProvider {
+            fn provider_id(&self) -> &str {
+                "stub"
+            }
+            fn capabilities(&self) -> ProviderCapabilities {
+                self.caps.clone()
+            }
+            async fn create_session(
+                &self,
+                _req: crate::execution::run::SessionCreateRequest,
+            ) -> Result<crate::execution::run::SessionHandle, ExecutionError> {
+                Err(ExecutionError::Provider("stub".into()))
+            }
+            async fn close_session(
+                &self,
+                _id: &crate::execution::ids::SessionId,
+            ) -> Result<(), ExecutionError> {
+                Ok(())
+            }
+            async fn run(
+                &self,
+                _id: &crate::execution::ids::SessionId,
+                _spec: crate::execution::run::RunSpec,
+            ) -> Result<crate::execution::run::RunResult, ExecutionError> {
+                Err(ExecutionError::Provider("stub".into()))
+            }
+            async fn cancel(
+                &self,
+                _id: &crate::execution::ids::SessionId,
+            ) -> Result<(), ExecutionError> {
+                Ok(())
+            }
+        }
+
+        let prov: Arc<dyn ExecutionProvider> = Arc::new(StubProvider {
+            caps: ProviderCapabilities::minimal("stub"),
+        });
+        let h = ExecutionHarness::new(
+            prov,
+            "python",
+            std::path::PathBuf::from("."),
+            std::path::PathBuf::from("."),
+            crate::execution::artifacts::ArtifactLimits::default(),
+            30,
+            300,
+            120,
+        );
+        // No-op; just must not panic.
+        h.shutdown().await;
     }
 
     #[test]

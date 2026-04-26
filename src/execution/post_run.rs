@@ -113,7 +113,9 @@ pub async fn persist_successful_execution_run(p: PersistSuccessfulExecutionRunPa
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let git_head = best_effort_git_head(harness.workspace_dir());
 
-    let journal_ext = harness.provider().session_journal_extensions(sid);
+    let journal_ext = harness
+        .provider_for_session(sid.as_str())
+        .session_journal_extensions(sid);
     let jupyter_kernel_id = journal_ext
         .as_ref()
         .and_then(|m| m.get("jupyter_kernel_id"))

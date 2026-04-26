@@ -139,10 +139,27 @@ impl Tool for ExecutionSessionCreateTool {
     }
 
     fn description(&self) -> &str {
-        "Create an execution session (requires [harness.execution] enabled). Provider is [harness.execution] default_provider: local runs under the workspace sandbox; jupyter uses a Jupyter Server kernel (new or `resume_jupyter_kernel_id`); ssh opens one SSH session to a configured host (reused until execution_session_close); colab_mcp launches a local Colab MCP bridge process and targets a notebook execution tool exposed by the browser session (CPU/GPU/TPU runtime is chosen in the Colab browser; see `colab_mcp` in the tool result when this provider is active). Returns session_id, session capabilities, and a short provider capability summary. Use execution_run or execution_run_background to execute code; execution_session_close when done. Jupyter may write binary display_data under the sandbox `.execution_artifacts/{session_id}/{run_id}/` and list them in RunResult.attachments."
+        "Create an execution session (requires [harness.execution] enabled). \
+         Defaults to [harness.execution] default_provider; pass `provider` to pick another \
+         currently-available provider when multiple are configured. Provider semantics: \
+         local runs under the workspace sandbox; jupyter uses a Jupyter Server kernel \
+         (new or `resume_jupyter_kernel_id`); ssh opens one SSH session to a configured host \
+         (reused until execution_session_close); colab_mcp launches a local Colab MCP bridge \
+         process and targets a notebook execution tool exposed by the browser session \
+         (CPU/GPU/TPU runtime is chosen in the Colab browser; see `colab_mcp` in the tool \
+         result when this provider is active). Misconfigured providers are pruned at startup \
+         (warning logged) and won't appear in `provider`'s allowed values for this run, so \
+         passing a known-bad provider is unnecessary. Returns session_id, session capabilities, \
+         and a short provider capability summary. Use execution_run or execution_run_background \
+         to execute code; execution_session_close when done. Jupyter may write binary \
+         display_data under the sandbox `.execution_artifacts/{session_id}/{run_id}/` and list \
+         them in RunResult.attachments."
     }
 
     fn parameters(&self) -> Value {
+        let avail = self.harness.available_providers();
+        let avail_strs: Vec<String> = avail.iter().map(|s| s.to_string()).collect();
+        let default_id = self.harness.default_provider_id().to_string();
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -154,6 +171,14 @@ impl Tool for ExecutionSessionCreateTool {
                 "resume_jupyter_kernel_id": {
                     "type": "string",
                     "description": "Jupyter only: reuse an existing kernel id from `session_capabilities.extensions.jupyter_kernel_id` (or a prior server listing). Fails if the kernel no longer exists."
+                },
+                "provider": {
+                    "type": "string",
+                    "enum": avail_strs,
+                    "description": format!(
+                        "Optional provider id; omit to use the default ({default_id}). Currently available providers (those that built successfully at startup): [{}].",
+                        avail.join(", ")
+                    )
                 }
             }
         })
@@ -175,20 +200,26 @@ impl Tool for ExecutionSessionCreateTool {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
         };
-        let handle = self
-            .harness
-            .provider()
-            .create_session(req)
-            .await
-            .map_err(exec_err)?;
+        let provider_arg = args
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let provider = self.harness.provider_for(provider_arg)?;
+        let provider_id = provider.provider_id().to_string();
+        let handle = provider.create_session(req).await.map_err(exec_err)?;
+        // Bind this session to the provider that created it so subsequent execution_run /
+        // execution_session_close calls route to the right provider in mixed-provider setups.
+        self.harness.register_session(handle.id.as_str(), &provider_id);
         let summary = self.harness.capabilities_summary();
         let mut v = json!({
             "session_id": handle.id,
             "session_capabilities": handle.capabilities,
             "provider_capabilities": summary,
+            "provider": provider_id,
             "artifact_root_relative": format!(".execution_artifacts/{}/", sanitize_session_segment(&handle.id)),
         });
-        if self.harness.colab_mcp().is_some() {
+        if self.harness.colab_mcp().is_some() && provider_id == "colab_mcp" {
             v["colab_mcp"] = colab_mcp_runtime_session_note_value();
         }
         serde_json::to_string_pretty(&v).map_err(|e| e.to_string())
@@ -249,7 +280,10 @@ impl Tool for ExecutionRunTool {
         let started = Instant::now();
         let started_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
-        let prov = self.harness.provider().provider_id();
+        // Resolve the provider that owns this session (or fall back to default for legacy
+        // single-provider call sites that bypass register_session).
+        let session_provider = self.harness.provider_for_session(sid.as_str());
+        let prov = session_provider.provider_id();
         let (event_tx, event_rx) = if prov == "jupyter" {
             let (tx, rx) = mpsc::channel::<RunEvent>(128);
             (Some(tx), Some(rx))
@@ -297,9 +331,7 @@ impl Tool for ExecutionRunTool {
             && !chat_id.is_empty();
 
         if !promote_enabled {
-            let result = self
-                .harness
-                .provider()
+            let result = session_provider
                 .run(&sid, spec)
                 .await
                 .map_err(exec_err)?;
@@ -327,7 +359,7 @@ impl Tool for ExecutionRunTool {
             None => (None, None),
         };
 
-        let provider = self.harness.provider().clone();
+        let provider = session_provider.clone();
         let sid_for_work = sid.clone();
         let work = async move { provider.run(&sid_for_work, spec).await };
 
@@ -509,7 +541,7 @@ impl Tool for ExecutionRunBackgroundTool {
         let v = json!({
             "job_id": job_id,
             "session_id": sid.to_string(),
-            "provider_id": self.harness.provider().provider_id(),
+            "provider_id": self.harness.provider_for_session(sid.as_str()).provider_id(),
         });
         serde_json::to_string_pretty(&v).map_err(|e| e.to_string())
     }
@@ -792,18 +824,15 @@ impl Tool for ExecutionCancelTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
-        if !self.harness.provider().capabilities().supports_interrupt {
+        let sid = require_session_id(&args)?;
+        let provider = self.harness.provider_for_session(sid.as_str());
+        if !provider.capabilities().supports_interrupt {
             return Err(
                 "execution_cancel unsupported: provider capabilities.supports_interrupt is false"
                     .to_string(),
             );
         }
-        let sid = require_session_id(&args)?;
-        self.harness
-            .provider()
-            .cancel(&sid)
-            .await
-            .map_err(exec_err)?;
+        provider.cancel(&sid).await.map_err(exec_err)?;
         Ok("cancel requested for session".to_string())
     }
 }
@@ -835,11 +864,11 @@ impl Tool for ExecutionSessionCloseTool {
 
     async fn execute(&self, args: Value) -> Result<String, String> {
         let sid = require_session_id(&args)?;
-        self.harness
-            .provider()
-            .close_session(&sid)
-            .await
-            .map_err(exec_err)?;
+        let provider = self.harness.provider_for_session(sid.as_str());
+        provider.close_session(&sid).await.map_err(exec_err)?;
+        // Drop the session→provider mapping; future ops on this id fall back to default and
+        // typically error from the provider (session not found), which is the expected UX.
+        self.harness.unregister_session(sid.as_str());
         Ok("session closed".to_string())
     }
 }
@@ -864,7 +893,7 @@ impl Tool for ColabMcpToolCallTool {
     }
 
     fn description(&self) -> &str {
-        "Colab MCP only: invoke a proxied MCP tool in the connected browser session. `tool_name` must match a pattern in `[harness.execution.colab_mcp].extra_mcp_tool_allowlist`. Use `list_cached_tool_names: true` to list tool names from the last `tools/list` (refreshed when the server sends `notifications/tools/list_changed`). Prefer `execution_run` for Python code cells. Long calls auto-promote to a background job after auto_promote_after_secs and return a `job_id` envelope; poll with execution_job_status / execution_job_result. Default `timeout_secs` is the harness `default_run_timeout_secs` (no artificial 120s cap)."
+        "Colab MCP only: invoke a proxied MCP tool in the connected browser session. `tool_name` must match a pattern in `[harness.execution.colab_mcp].extra_mcp_tool_allowlist`. Use `list_cached_tool_names: true` to list tool names from the last `tools/list` (refreshed when the server sends `notifications/tools/list_changed`). Prefer `execution_run` for Python code cells. Long calls auto-promote to a background job after auto_promote_after_secs and return a `job_id` envelope; poll with execution_job_status / execution_job_result. Default `timeout_secs` is the harness `default_run_timeout_secs` (no artificial 120s cap). Always pass `description` (short human summary of intent) so the terminal UI shows what's happening instead of raw JSON."
     }
 
     fn parameters(&self) -> Value {
@@ -875,6 +904,7 @@ impl Tool for ColabMcpToolCallTool {
                 "tool_name": { "type": "string", "description": "MCP tool name from tools/list" },
                 "arguments": { "type": "object", "description": "MCP tool arguments (JSON object)" },
                 "list_cached_tool_names": { "type": "boolean", "description": "If true, return cached tool names only" },
+                "description": { "type": "string", "description": "Short human-facing summary of intent (for Ratatui and logs). Strongly recommended; falls back to `colab_mcp:{tool_name}` when omitted." },
                 "timeout_secs": { "type": "integer", "description": "Wall clock for the MCP call (defaults to default_execution_timeout_secs, capped by max_wall_secs). Long calls beyond auto_promote_after_secs return a job_id envelope and keep running in the background." }
             },
             "required": ["session_id"]
@@ -1060,7 +1090,7 @@ impl Tool for ColabMcpToolCallTool {
                 let workspace_dir = self.harness.workspace_dir().to_path_buf();
                 let provider_id = self
                     .harness
-                    .provider()
+                    .provider_for_session(sid.as_str())
                     .capabilities()
                     .provider_id
                     .to_string();
@@ -1154,7 +1184,7 @@ impl ColabMcpToolCallTool {
         let duration_ms = p.started.elapsed().as_millis() as u64;
         let provider_id = self
             .harness
-            .provider()
+            .provider_for_session(p.sid.as_str())
             .capabilities()
             .provider_id
             .to_string();
@@ -1327,6 +1357,68 @@ mod tests {
         let sandbox = root.join("sandbox");
         std::fs::create_dir_all(&sandbox).unwrap();
         (root, sandbox)
+    }
+
+    #[tokio::test]
+    async fn execution_session_create_accepts_explicit_provider() {
+        // With a single-provider harness, an explicit `provider: "local"` should resolve cleanly
+        // and the response should echo the provider id back so the model can audit its choice.
+        let (ws, dir) = temp_dirs();
+        let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), true);
+        let prov: Arc<dyn crate::execution::ExecutionProvider> =
+            Arc::new(crate::execution::LocalExecutionProvider::new(cfg).expect("local provider"));
+        let harness = Arc::new(ExecutionHarness::new(
+            prov,
+            "python",
+            ws.clone(),
+            dir.clone(),
+            ArtifactLimits::default(),
+            60,
+            3600,
+            0,
+        ));
+        let create = ExecutionSessionCreateTool {
+            harness: harness.clone(),
+        };
+        let lang = if cfg!(windows) { "shell" } else { "python" };
+        let out = create
+            .execute(json!({ "language": lang, "provider": "local" }))
+            .await
+            .expect("create");
+        let v: Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(v["provider"].as_str(), Some("local"));
+        let sid = v["session_id"].as_str().expect("session id").to_string();
+        // Mapping should be live so subsequent ops route to the same provider.
+        assert_eq!(harness.provider_for_session(&sid).provider_id(), "local");
+
+        let close = ExecutionSessionCloseTool { harness };
+        close.execute(json!({ "session_id": sid })).await.unwrap();
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn execution_session_create_rejects_unknown_provider() {
+        let (ws, dir) = temp_dirs();
+        let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), true);
+        let prov: Arc<dyn crate::execution::ExecutionProvider> =
+            Arc::new(crate::execution::LocalExecutionProvider::new(cfg).expect("local provider"));
+        let harness = Arc::new(ExecutionHarness::new(
+            prov,
+            "python",
+            ws.clone(),
+            dir.clone(),
+            ArtifactLimits::default(),
+            60,
+            3600,
+            0,
+        ));
+        let create = ExecutionSessionCreateTool { harness };
+        let err = create
+            .execute(json!({ "provider": "nope" }))
+            .await
+            .expect_err("expected provider rejection");
+        assert!(err.contains("available providers"), "err={err}");
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[tokio::test]

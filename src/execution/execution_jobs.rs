@@ -272,16 +272,14 @@ impl ExecutionJobManager {
         if rec.is_terminal() {
             return Err("Job already finished".to_string());
         }
-        if self
+        // Cancel through the provider that owns this session — important when local + colab
+        // sessions coexist and only one of them supports cooperative interrupt.
+        let session_provider = self
             .inner
             .harness
-            .provider()
-            .capabilities()
-            .supports_interrupt
-        {
-            self.inner
-                .harness
-                .provider()
+            .provider_for_session(rec.session_id.as_str());
+        if session_provider.capabilities().supports_interrupt {
+            session_provider
                 .cancel(&rec.session_id)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -489,7 +487,8 @@ impl ExecutionJobManager {
                 map: inner.session_busy.clone(),
                 key: sid_str,
             };
-            let prov = inner.harness.provider().provider_id().to_string();
+            let session_provider = inner.harness.provider_for_session(sid_spawn.as_str());
+            let prov = session_provider.provider_id().to_string();
             let started = Instant::now();
             let is_jupyter = prov == "jupyter";
 
@@ -528,7 +527,7 @@ impl ExecutionJobManager {
             spec.run_event_tx = event_tx;
             spec.description = rec.description.clone();
 
-            let run_out = inner.harness.provider().run(&sid_spawn, spec).await;
+            let run_out = session_provider.run(&sid_spawn, spec).await;
             let duration_ms = started.elapsed().as_millis() as u64;
             let ts_finish = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
             *rec.finished_rfc3339.write().await = Some(ts_finish.clone());
@@ -766,7 +765,11 @@ impl ExecutionJobManager {
 
         let join = tokio::spawn(async move {
             let rec = rec_for_task;
-            let prov = inner.harness.provider().provider_id().to_string();
+            let prov = inner
+                .harness
+                .provider_for_session(sid_spawn.as_str())
+                .provider_id()
+                .to_string();
             let started = Instant::now();
             let run_out = work.await;
             finalize_arbitrary_job(FinalizeArbitraryParams {
@@ -855,7 +858,11 @@ impl ExecutionJobManager {
         let job_id_for_task = job_id.clone();
 
         tokio::spawn(async move {
-            let prov = inner.harness.provider().provider_id().to_string();
+            let prov = inner
+                .harness
+                .provider_for_session(sid_spawn.as_str())
+                .provider_id()
+                .to_string();
             let started = Instant::now();
             let run_out = match join.await {
                 Ok(v) => v,

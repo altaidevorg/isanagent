@@ -300,6 +300,8 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         }));
     }
     let mut inflight_sync_outer: Option<Arc<InflightSyncRegistry>> = None;
+    let mut execution_harness_for_shutdown: Option<Arc<isanagent::execution::ExecutionHarness>> =
+        None;
     if workspace.config.execution_harness_enabled() {
         let harness = isanagent::execution::build_execution_harness(
             workspace.dir.clone(),
@@ -308,6 +310,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             &workspace.config,
         )
         .map_err(|e| std::io::Error::other(format!("execution harness: {e}")))?;
+        execution_harness_for_shutdown = Some(harness.clone());
         let execution_jobs = Arc::new(ExecutionJobManager::new(
             harness.clone(),
             global_outbound_tx.clone(),
@@ -838,11 +841,24 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                     chat_id,
                     tool_name,
                     args,
+                    tool_call_id,
                 }) if channel == "terminal" => {
-                    let notice = build_tool_call_terminal_notice(chat_id, tool_name, args);
-                    if let Some(chan) = delivery_channels.get("terminal") {
-                        if let Err(e) = chan.send(notice).await {
-                            log::error!("Failed to deliver tool-call notice to terminal: {}", e);
+                    if isanagent::channels::terminal::should_suppress_tool_notice_for_terminal(
+                        tool_name, args,
+                    ) {
+                        // MessageTool already emits its own user-visible Outbound to the
+                        // terminal; a synthetic tool-call notice would duplicate that line.
+                    } else {
+                        let notice = build_tool_call_terminal_notice(
+                            chat_id,
+                            tool_name,
+                            args,
+                            tool_call_id.as_deref(),
+                        );
+                        if let Some(chan) = delivery_channels.get("terminal") {
+                            if let Err(e) = chan.send(notice).await {
+                                log::error!("Failed to deliver tool-call notice to terminal: {}", e);
+                            }
                         }
                     }
                 }
@@ -851,11 +867,27 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                     chat_id,
                     tool_name,
                     result,
+                    tool_call_id,
                 }) if channel == "terminal" => {
-                    let notice = build_tool_result_terminal_notice(chat_id, tool_name, result);
-                    if let Some(chan) = delivery_channels.get("terminal") {
-                        if let Err(e) = chan.send(notice).await {
-                            log::error!("Failed to deliver tool-result notice to terminal: {}", e);
+                    if isanagent::channels::terminal::should_suppress_tool_notice_for_terminal(
+                        tool_name, result,
+                    ) {
+                        // See ToolCall arm: avoid duplicating the user-visible MessageTool
+                        // outbound with a redundant ack notice.
+                    } else {
+                        let notice = build_tool_result_terminal_notice(
+                            chat_id,
+                            tool_name,
+                            result,
+                            tool_call_id.as_deref(),
+                        );
+                        if let Some(chan) = delivery_channels.get("terminal") {
+                            if let Err(e) = chan.send(notice).await {
+                                log::error!(
+                                    "Failed to deliver tool-result notice to terminal: {}",
+                                    e
+                                );
+                            }
                         }
                     }
                 }
@@ -883,6 +915,16 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     }
 
     log::info!("Stopping channels and shutting down runtime.");
+
+    if let Some(harness) = execution_harness_for_shutdown.as_ref() {
+        let h = harness.clone();
+        let shutdown_result =
+            tokio::time::timeout(Duration::from_secs(5), async move { h.shutdown().await }).await;
+        if shutdown_result.is_err() {
+            log::warn!("Execution harness shutdown timed out after 5s; continuing exit anyway.");
+        }
+    }
+
     for channel in out_channels.values() {
         let _ = channel.stop().await;
     }
@@ -915,64 +957,222 @@ async fn maybe_prompt_uv_install_on_launch(workspace: &IsanagentWorkspace) {
     if !workspace.config.execution_harness_enabled() {
         return;
     }
-    if workspace.config.execution_default_provider() != "local" {
-        return;
-    }
+    let provider = workspace.config.execution_default_provider();
     let runtime = workspace.config.execution_local_python_runtime();
-    if !matches!(runtime.as_str(), "uv_managed" | "uvmanaged" | "uv") {
+    let runtime_is_uv_managed = matches!(runtime.as_str(), "uv_managed" | "uvmanaged" | "uv");
+    let requirements = workspace.config.execution_uv_requirements();
+
+    if !(requirements.is_empty() || provider == "local" && runtime_is_uv_managed) {
+        log::warn!(
+            "[harness.execution].uv_requirements is set ({} entries) but the active provider/runtime \
+does not consume it (provider={}, local_python_runtime={}). Move the dependencies into the active \
+provider's environment, or set default_provider=\"local\" and local_python_runtime=\"uv_managed\".",
+            requirements.len(),
+            provider,
+            runtime
+        );
+    }
+
+    if provider != "local" || !runtime_is_uv_managed {
         return;
     }
     let uv_bin = workspace.config.execution_uv_binary();
-    if isanagent::execution::uv_binary_available(&uv_bin) {
+    if !isanagent::execution::uv_binary_available(&uv_bin) {
+        let interactive = workspace.config.terminal_enabled()
+            && io::stdin().is_terminal()
+            && io::stdout().is_terminal();
+        if !interactive {
+            log::warn!(
+                "Execution local runtime is uv-managed but '{}' was not found on PATH. \
+Install uv manually or run /install-python from terminal mode.",
+                uv_bin
+            );
+            return;
+        }
+
+        let uv_bin_owned = uv_bin.to_string();
+        let prompt_result = tokio::task::spawn_blocking(move || {
+            println!(
+                "\nExecution runtime is set to uv-managed, but '{}' was not found on PATH.",
+                uv_bin_owned
+            );
+            println!("Install uv now? (yes/no)");
+            let _ = io::stdout().flush();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if io::stdin().read_line(&mut line).is_err() {
+                    println!("Unable to read input. Skipping uv installation prompt.");
+                    break;
+                }
+                let ans = line.trim().to_ascii_lowercase();
+                if matches!(ans.as_str(), "yes" | "y") {
+                    match isanagent::execution::install_uv_best_effort() {
+                        Ok(msg) => println!("{msg}"),
+                        Err(err) => println!("Auto-install failed: {err}"),
+                    }
+                    break;
+                }
+                if matches!(ans.as_str(), "no" | "n") {
+                    println!("Skipping uv installation. You can run /install-python anytime.");
+                    break;
+                }
+                println!("Please answer yes or no:");
+                let _ = io::stdout().flush();
+            }
+        })
+        .await;
+
+        if let Err(e) = prompt_result {
+            log::warn!("uv installation prompt task failed: {e}");
+        }
         return;
     }
+
+    if requirements.is_empty() {
+        return;
+    }
+
+    maybe_prompt_uv_requirements_install(workspace, &uv_bin, &requirements).await;
+}
+
+/// Inspect the uv-managed venv and prompt to install any missing `uv_requirements` entries.
+/// No-op when the venv has not yet been created (first execution_run will populate it).
+async fn maybe_prompt_uv_requirements_install(
+    workspace: &IsanagentWorkspace,
+    uv_bin: &str,
+    requirements: &[String],
+) {
+    let local_cfg = isanagent::execution::LocalExecutionConfig {
+        sandbox_dir: workspace.sandbox_dir.clone(),
+        restrict_to_workspace: true,
+        max_run_timeout_secs: workspace.config.execution_max_wall_secs(),
+        max_output_bytes: workspace.config.execution_max_output_bytes(),
+        max_sessions: workspace.config.execution_max_sessions(),
+        python_executable: workspace.config.execution_python_executable(),
+        python_repl: workspace.config.execution_local_python_repl_enabled(),
+        python_runtime: isanagent::execution::LocalPythonRuntime::UvManaged,
+        uv_binary: uv_bin.to_string(),
+        uv_python: workspace.config.execution_uv_python(),
+        uv_requirements: requirements.to_vec(),
+        uv_env_root: workspace
+            .dir
+            .join(".system_generated")
+            .join("uv")
+            .join("envs"),
+    };
+    let Some(env_python) = isanagent::execution::uv_managed_env_python(&local_cfg) else {
+        return;
+    };
+    if !env_python.exists() {
+        // Venv not yet created; the first execution_run will create it and install requirements.
+        return;
+    }
+    let uv_bin_owned = uv_bin.to_string();
+    let env_python_owned = env_python.clone();
+    let requirements_owned = requirements.to_vec();
+    let status = tokio::task::spawn_blocking(move || {
+        isanagent::execution::uv_requirements_status(
+            &uv_bin_owned,
+            &env_python_owned,
+            &requirements_owned,
+        )
+    })
+    .await;
+    let missing = match status {
+        Ok(Ok(Some(missing))) => missing,
+        Ok(Ok(None)) => return,
+        Ok(Err(e)) => {
+            log::warn!("Could not verify uv_requirements (uv pip list failed): {e}");
+            return;
+        }
+        Err(e) => {
+            log::warn!("uv_requirements_status task join failed: {e}");
+            return;
+        }
+    };
+    if missing.is_empty() {
+        return;
+    }
+
     let interactive = workspace.config.terminal_enabled()
         && io::stdin().is_terminal()
         && io::stdout().is_terminal();
     if !interactive {
         log::warn!(
-            "Execution local runtime is uv-managed but '{}' was not found on PATH. \
-Install uv manually or run /install-python from terminal mode.",
-            uv_bin
+            "uv_requirements declares {} package(s) missing from the managed venv: {}. They will be \
+installed on the next execution_run, or run /install-python (no-op when uv is present) and a \
+quick `uv pip install` manually.",
+            missing.len(),
+            missing.join(", ")
         );
         return;
     }
 
-    let uv_bin = uv_bin.to_string();
+    let uv_bin_owned = uv_bin.to_string();
+    let env_python_owned = env_python.clone();
+    let missing_owned = missing.clone();
     let prompt_result = tokio::task::spawn_blocking(move || {
         println!(
-            "\nExecution runtime is set to uv-managed, but '{}' was not found on PATH.",
-            uv_bin
+            "\n{} uv_requirements package(s) declared in config are not installed in the \
+managed venv at {}:",
+            missing_owned.len(),
+            env_python_owned.display()
         );
-        println!("Install uv now? (yes/no)");
+        for r in &missing_owned {
+            println!("  - {r}");
+        }
+        println!("Install them now? (yes/no)");
         let _ = io::stdout().flush();
         let mut line = String::new();
         loop {
             line.clear();
             if io::stdin().read_line(&mut line).is_err() {
-                println!("Unable to read input. Skipping uv installation prompt.");
-                break;
+                println!("Unable to read input. Skipping uv_requirements install prompt.");
+                return;
             }
             let ans = line.trim().to_ascii_lowercase();
             if matches!(ans.as_str(), "yes" | "y") {
-                match isanagent::execution::install_uv_best_effort() {
-                    Ok(msg) => println!("{msg}"),
-                    Err(err) => println!("Auto-install failed: {err}"),
+                let mut args = vec![
+                    "pip".to_string(),
+                    "install".to_string(),
+                    "--python".to_string(),
+                    env_python_owned.to_string_lossy().to_string(),
+                ];
+                args.extend(missing_owned.iter().cloned());
+                let out = std::process::Command::new(&uv_bin_owned)
+                    .args(&args)
+                    .output();
+                match out {
+                    Ok(o) if o.status.success() => {
+                        println!("uv_requirements installed.");
+                    }
+                    Ok(o) => {
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        println!(
+                            "uv pip install failed (status {:?}): {}",
+                            o.status.code(),
+                            stderr.trim()
+                        );
+                    }
+                    Err(e) => println!("Could not invoke uv: {e}"),
                 }
-                break;
+                return;
             }
             if matches!(ans.as_str(), "no" | "n") {
-                println!("Skipping uv installation. You can run /install-python anytime.");
-                break;
+                println!(
+                    "Skipping. The next execution_run will trigger automatic install when the \
+venv is touched."
+                );
+                return;
             }
             println!("Please answer yes or no:");
             let _ = io::stdout().flush();
         }
     })
     .await;
-
     if let Err(e) = prompt_result {
-        log::warn!("uv installation prompt task failed: {e}");
+        log::warn!("uv_requirements install prompt task failed: {e}");
     }
 }
 

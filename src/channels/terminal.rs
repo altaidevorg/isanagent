@@ -18,7 +18,8 @@ use crate::channels::terminal_ui::protocol::{
     ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_JOB_STARTED, ISANAGENT_EXECUTION_STREAM,
     METADATA_EXECUTION_DESCRIPTION, METADATA_EXECUTION_JOB_ID, METADATA_EXECUTION_JOB_STATUS,
     METADATA_EXECUTION_JOB_TOOL_NAME, METADATA_EXECUTION_RUN_ID, METADATA_EXECUTION_SESSION_ID,
-    METADATA_TOOL_CALL_PREVIEW, METADATA_TOOL_NAME, METADATA_TOOL_RESULT_PREVIEW,
+    METADATA_TOOL_CALL_ID, METADATA_TOOL_CALL_PREVIEW, METADATA_TOOL_NAME,
+    METADATA_TOOL_RESULT_PREVIEW,
 };
 
 /// When true, `main` skips the large colored stdout banner (Ratatui alternate screen owns the TTY).
@@ -122,11 +123,68 @@ fn tool_args_preview_execution(args: &str) -> String {
     truncate_display(args, 220)
 }
 
+fn tool_args_preview_colab_mcp(args: &str) -> String {
+    let v: Value = match serde_json::from_str(args) {
+        Ok(v) => v,
+        Err(_) => return truncate_display(args, 220),
+    };
+    let tool_name = v
+        .get("tool_name")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let description = v
+        .get("description")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match (tool_name, description) {
+        (Some(tn), Some(d)) => truncate_display(&format!("{tn}: {d}"), 160),
+        (Some(tn), None) => truncate_display(tn, 160),
+        (None, Some(d)) => truncate_display(d, 160),
+        (None, None) => truncate_display(args, 220),
+    }
+}
+
+/// Generic fallback: if any tool's args carry a top-level `description` (free-form short
+/// human-facing intent), surface it instead of dumping raw JSON. Tools opt in by accepting
+/// a `description` arg in their JSON schema.
+fn tool_args_preview_generic_description(args: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(args).ok()?;
+    v.get("description")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| truncate_display(s, 160))
+}
+
+/// Decide whether to skip emitting a synthetic tool-call/tool-result notice on the terminal
+/// for a given telemetry event. Today this only applies to `MessageTool` whose destination is
+/// the terminal: that tool already emits its own `BusMessage::Outbound` carrying the full
+/// user-facing text, so a second tool-notify cell would print the same content twice.
+///
+/// `payload` is the tool args (for ToolCall) or the tool result string (for ToolResult).
+pub fn should_suppress_tool_notice_for_terminal(tool_name: &str, payload: &str) -> bool {
+    if tool_name != "message" {
+        return false;
+    }
+    if let Ok(v) = serde_json::from_str::<Value>(payload) {
+        if let Some(ch) = v.get("channel").and_then(|x| x.as_str()) {
+            return ch == "terminal";
+        }
+    }
+    // Result string format is `Message sent to {channel}:{chat_id}` (see MessageTool::execute).
+    // Anything else (errors, future formats) keeps the notice visible.
+    payload.starts_with("Message sent to terminal:")
+}
+
 fn tool_call_preview_for_terminal(tool_name: &str, args: &str) -> String {
     match tool_name {
         "message" => tool_args_preview_message(args),
         "execution_run" | "execution_run_background" => tool_args_preview_execution(args),
-        _ => truncate_display(args, 220),
+        "colab_mcp_tool_call" => tool_args_preview_colab_mcp(args),
+        _ => tool_args_preview_generic_description(args)
+            .unwrap_or_else(|| truncate_display(args, 220)),
     }
 }
 
@@ -231,6 +289,7 @@ pub fn build_tool_call_terminal_notice(
     chat_id: &str,
     tool_name: &str,
     args: &str,
+    tool_call_id: Option<&str>,
 ) -> OutboundMessage {
     let preview = tool_call_preview_for_terminal(tool_name, args);
     let content = if preview.is_empty() {
@@ -243,6 +302,9 @@ pub fn build_tool_call_terminal_notice(
     metadata.insert(ISANAGENT_TOOL_PHASE.to_string(), json!("call"));
     metadata.insert(METADATA_TOOL_NAME.to_string(), json!(tool_name));
     metadata.insert(METADATA_TOOL_CALL_PREVIEW.to_string(), json!(preview));
+    if let Some(id) = tool_call_id.filter(|s| !s.is_empty()) {
+        metadata.insert(METADATA_TOOL_CALL_ID.to_string(), json!(id));
+    }
     OutboundMessage {
         channel: "terminal".to_string(),
         chat_id: chat_id.to_string(),
@@ -273,6 +335,7 @@ pub fn build_tool_result_terminal_notice(
     chat_id: &str,
     tool_name: &str,
     result: &str,
+    tool_call_id: Option<&str>,
 ) -> OutboundMessage {
     let summary = summarize_tool_result_for_terminal(tool_name, result);
     let content = format!("{tool_name} → {summary}");
@@ -286,6 +349,9 @@ pub fn build_tool_result_terminal_notice(
     metadata.insert(ISANAGENT_TOOL_PHASE.to_string(), json!(phase));
     metadata.insert(METADATA_TOOL_NAME.to_string(), json!(tool_name));
     metadata.insert(METADATA_TOOL_RESULT_PREVIEW.to_string(), json!(summary));
+    if let Some(id) = tool_call_id.filter(|s| !s.is_empty()) {
+        metadata.insert(METADATA_TOOL_CALL_ID.to_string(), json!(id));
+    }
     OutboundMessage {
         channel: "terminal".to_string(),
         chat_id: chat_id.to_string(),
@@ -453,5 +519,122 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+
+    #[test]
+    fn colab_mcp_preview_uses_description_when_set() {
+        let args = r#"{"session_id":"s","tool_name":"foo","description":"warm up the kernel"}"#;
+        let p = tool_call_preview_for_terminal("colab_mcp_tool_call", args);
+        assert!(p.contains("foo"), "preview missing tool_name: {p}");
+        assert!(p.contains("warm up the kernel"), "preview missing description: {p}");
+    }
+
+    #[test]
+    fn colab_mcp_preview_falls_back_to_tool_name_when_no_description() {
+        let args = r#"{"session_id":"s","tool_name":"foo"}"#;
+        let p = tool_call_preview_for_terminal("colab_mcp_tool_call", args);
+        assert!(p.contains("foo"));
+    }
+
+    #[test]
+    fn unknown_tool_falls_back_to_generic_description() {
+        let args = r#"{"description":"do the thing","other":"x"}"#;
+        let p = tool_call_preview_for_terminal("some_future_tool", args);
+        assert!(p.contains("do the thing"), "expected description fallback: {p}");
+        assert!(!p.contains("\"other\""), "should not dump raw JSON: {p}");
+    }
+
+    #[test]
+    fn unknown_tool_without_description_truncates_args() {
+        let args = r#"{"a":1}"#;
+        let p = tool_call_preview_for_terminal("some_future_tool", args);
+        assert_eq!(p, args);
+    }
+
+    #[test]
+    fn message_preview_unchanged() {
+        let args = r#"{"content":"hi","channel":"terminal","chat_id":"x"}"#;
+        let p = tool_call_preview_for_terminal("message", args);
+        assert!(p.contains("hi"));
+    }
+
+    #[test]
+    fn suppress_message_tool_call_to_terminal() {
+        let args = r#"{"content":"hi","channel":"terminal","chat_id":"x"}"#;
+        assert!(should_suppress_tool_notice_for_terminal("message", args));
+    }
+
+    #[test]
+    fn keep_message_tool_call_to_other_channel() {
+        let args = r#"{"content":"hi","channel":"slack","chat_id":"x"}"#;
+        assert!(!should_suppress_tool_notice_for_terminal("message", args));
+    }
+
+    #[test]
+    fn suppress_message_tool_result_to_terminal() {
+        let result = "Message sent to terminal:abc-123";
+        assert!(should_suppress_tool_notice_for_terminal("message", result));
+    }
+
+    #[test]
+    fn keep_message_tool_result_to_other_channel() {
+        let result = "Message sent to slack:abc-123";
+        assert!(!should_suppress_tool_notice_for_terminal("message", result));
+    }
+
+    #[test]
+    fn keep_message_tool_error_result() {
+        let result = "Failed to send: connection refused";
+        assert!(!should_suppress_tool_notice_for_terminal("message", result));
+    }
+
+    #[test]
+    fn other_tools_never_suppressed() {
+        let args = r#"{"channel":"terminal"}"#;
+        assert!(!should_suppress_tool_notice_for_terminal("execution_run", args));
+    }
+
+    #[test]
+    fn build_tool_call_terminal_notice_attaches_tool_call_id() {
+        let notice = build_tool_call_terminal_notice(
+            "chat-1",
+            "execution_run",
+            r#"{"description":"warm up"}"#,
+            Some("call-abc"),
+        );
+        assert_eq!(
+            notice.metadata.get(METADATA_TOOL_CALL_ID).and_then(|v| v.as_str()),
+            Some("call-abc"),
+        );
+    }
+
+    #[test]
+    fn build_tool_call_terminal_notice_omits_tool_call_id_when_none() {
+        let notice = build_tool_call_terminal_notice(
+            "chat-1",
+            "execution_run",
+            r#"{"description":"warm up"}"#,
+            None,
+        );
+        assert!(!notice.metadata.contains_key(METADATA_TOOL_CALL_ID));
+    }
+
+    #[test]
+    fn build_tool_result_terminal_notice_attaches_tool_call_id() {
+        let notice = build_tool_result_terminal_notice(
+            "chat-1",
+            "execution_run",
+            "exit 0 in 12ms",
+            Some("call-abc"),
+        );
+        assert_eq!(
+            notice.metadata.get(METADATA_TOOL_CALL_ID).and_then(|v| v.as_str()),
+            Some("call-abc"),
+        );
     }
 }
