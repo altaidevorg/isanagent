@@ -2,7 +2,7 @@
 
 **An always-on, agentic ML engineer for your workspace** — built by [ALTAI](https://altai.dev). isanagent doesn’t just answer prompts: it **pushes work toward something shippable** — research, code, runs, checks, and handoffs you can actually use.
 
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache 2.0-blue.svg)](LICENSE)
 
 ---
 
@@ -89,10 +89,4 @@ cargo clippy --release -p isanagent --all-targets
 cargo test --release -p isanagent
 ```
 
-On Windows, prefer **`--release`** for builds and tests if debug linking hits PDB issues (noted in `AGENTS.md`).
-
----
-
-## License
-
-**GNU Affero General Public License v3.0 only** (AGPL-3.0-only) — see [LICENSE](LICENSE).
+On Windows, prefer **`--release`** for builds and tests if debug linking hits PDB issues.
