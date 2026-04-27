@@ -53,29 +53,6 @@ struct SqliteApiResponseStoreActor {
     conn: Connection,
 }
 
-fn table_has_column(conn: &Connection, table: &str, col: &str) -> rusqlite::Result<bool> {
-    let pragma = format!("PRAGMA table_info({})", table);
-    let mut stmt = conn.prepare(&pragma)?;
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        let name: String = row.get(1)?;
-        if name == col {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn migrate_api_responses_thread_column(conn: &Connection) -> rusqlite::Result<()> {
-    if table_has_column(conn, "api_responses", "internal_chat_id")? {
-        conn.execute(
-            "ALTER TABLE api_responses RENAME COLUMN internal_chat_id TO thread_id",
-            [],
-        )?;
-    }
-    Ok(())
-}
-
 impl SqliteApiResponseStoreActor {
     fn new(db_path: impl AsRef<Path>) -> Result<Self, String> {
         let conn = Connection::open(db_path)
@@ -98,13 +75,6 @@ impl SqliteApiResponseStoreActor {
             [],
         )
         .map_err(|e| format!("Failed to initialize api_responses table: {}", e))?;
-
-        migrate_api_responses_thread_column(&conn).map_err(|e| {
-            format!(
-                "Failed to migrate api_responses schema to thread_id naming: {}",
-                e
-            )
-        })?;
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_api_responses_previous_response_id

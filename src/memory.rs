@@ -92,94 +92,6 @@ pub fn configure_agent_sqlite_connection(conn: &Connection) -> Result<(), rusqli
     ))
 }
 
-fn table_has_column(conn: &Connection, table: &str, col: &str) -> rusqlite::Result<bool> {
-    let pragma = format!("PRAGMA table_info({})", table);
-    let mut stmt = conn.prepare(&pragma)?;
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        let name: String = row.get(1)?;
-        if name == col {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// Renames chat-scoped `session_id` columns (and rebuilds FTS) for older agent SQLite files.
-fn migrate_agent_memory_to_thread_schema(conn: &Connection) -> rusqlite::Result<()> {
-    if table_has_column(conn, "messages", "session_id")? {
-        conn.execute(
-            "ALTER TABLE messages RENAME COLUMN session_id TO thread_id",
-            [],
-        )?;
-    }
-    let _ = conn.execute_batch(
-        "DROP INDEX IF EXISTS idx_session_id;
-         DROP INDEX IF EXISTS idx_messages_session_role_id;",
-    );
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_thread_id ON messages (thread_id)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_messages_thread_role_id ON messages (thread_id, role, id)",
-        [],
-    )?;
-
-    if table_has_column(conn, "session_summaries", "session_id")? {
-        conn.execute("DROP TRIGGER IF EXISTS session_summaries_ai", [])?;
-        conn.execute("DROP TRIGGER IF EXISTS session_summaries_ad", [])?;
-        conn.execute("DROP TABLE IF EXISTS session_summaries_fts", [])?;
-        conn.execute(
-            "ALTER TABLE session_summaries RENAME COLUMN session_id TO thread_id",
-            [],
-        )?;
-        let _ = conn.execute("DROP INDEX IF EXISTS idx_summaries_session", []);
-    }
-
-    let fts_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='session_summaries_fts'",
-        [],
-        |row| row.get(0),
-    )?;
-    if fts_count == 0 {
-        conn.execute(
-            "CREATE VIRTUAL TABLE session_summaries_fts USING fts5(
-                thread_id, summary, key_info, knowledge_gaps,
-                content='session_summaries', content_rowid='id'
-            )",
-            [],
-        )?;
-        conn.execute(
-            "INSERT INTO session_summaries_fts(rowid, thread_id, summary, key_info, knowledge_gaps)
-             SELECT id, thread_id, summary, key_info, knowledge_gaps FROM session_summaries",
-            [],
-        )?;
-        conn.execute(
-            "CREATE TRIGGER IF NOT EXISTS session_summaries_ai AFTER INSERT ON session_summaries BEGIN
-                INSERT INTO session_summaries_fts(rowid, thread_id, summary, key_info, knowledge_gaps)
-                VALUES (new.id, new.thread_id, new.summary, new.key_info, new.knowledge_gaps);
-            END;",
-            [],
-        )?;
-        conn.execute(
-            "CREATE TRIGGER IF NOT EXISTS session_summaries_ad AFTER DELETE ON session_summaries BEGIN
-                DELETE FROM session_summaries_fts WHERE rowid = old.id;
-            END;",
-            [],
-        )?;
-    }
-
-    if table_has_column(conn, "session_metadata", "session_id")? {
-        conn.execute(
-            "ALTER TABLE session_metadata RENAME COLUMN session_id TO thread_id",
-            [],
-        )?;
-    }
-
-    Ok(())
-}
-
 /// Schema for `harness_todos` (same DB as agent memory; accessed only via [`MemoryMessage`] on [`SqliteMemoryActor`]).
 pub fn ensure_harness_todos_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(
@@ -516,8 +428,6 @@ impl SqliteMemoryActor {
             )",
             [],
         )?;
-
-        migrate_agent_memory_to_thread_schema(&conn)?;
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_thread_id ON messages (thread_id)",
