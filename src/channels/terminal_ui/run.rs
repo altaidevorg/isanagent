@@ -25,11 +25,10 @@ use crate::channels::terminal_ui::markdown;
 use crate::channels::terminal_ui::protocol::{
     ISANAGENT_AGENT_THOUGHT, ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_JOB_STARTED,
     ISANAGENT_EXECUTION_STREAM, ISANAGENT_LLM_RETRY_AVAILABLE, ISANAGENT_TERMINAL_ERROR,
-    ISANAGENT_TOOL_PROGRESS,
-    METADATA_EXECUTION_DESCRIPTION, METADATA_EXECUTION_JOB_ID, METADATA_EXECUTION_JOB_STATUS,
-    METADATA_EXECUTION_JOB_TOOL_NAME, METADATA_EXECUTION_RUN_ID, METADATA_EXECUTION_SESSION_ID,
-    METADATA_TOOL_CALL_ID, METADATA_TOOL_CALL_PREVIEW, METADATA_TOOL_NAME,
-    METADATA_TOOL_RESULT_PREVIEW,
+    ISANAGENT_TOOL_PROGRESS, METADATA_EXECUTION_DESCRIPTION, METADATA_EXECUTION_JOB_ID,
+    METADATA_EXECUTION_JOB_STATUS, METADATA_EXECUTION_JOB_TOOL_NAME, METADATA_EXECUTION_RUN_ID,
+    METADATA_EXECUTION_SESSION_ID, METADATA_TOOL_CALL_ID, METADATA_TOOL_CALL_PREVIEW,
+    METADATA_TOOL_NAME, METADATA_TOOL_RESULT_PREVIEW,
 };
 use crate::channels::terminal_ui::{
     execution_browser, init_from_env, uses_ansi_color, App, Cell, JobStripStatus, TerminalUiFocus,
@@ -970,7 +969,10 @@ fn rescan_executions_manifest(workspace_dir: &Path, chat_id: &str, app: &mut App
     }
 }
 
-fn execution_run_list_line(item: &execution_browser::ExecutionRunListItem, inner_w: usize) -> String {
+fn execution_run_list_line(
+    item: &execution_browser::ExecutionRunListItem,
+    inner_w: usize,
+) -> String {
     let ex = item
         .exit_code
         .map(|c| format!("exit {c}"))
@@ -987,13 +989,13 @@ fn execution_run_list_line(item: &execution_browser::ExecutionRunListItem, inner
 }
 
 fn execution_code_lines(source: &str, inner_w: usize) -> Vec<Line<'static>> {
-    crate::channels::terminal_ui::syntect_highlight::highlight_source_wrapped(source, inner_w.max(8))
+    crate::channels::terminal_ui::syntect_highlight::highlight_source_wrapped(
+        source,
+        inner_w.max(8),
+    )
 }
 
-fn execution_output_lines(
-    j: &crate::execution::RunJournal,
-    inner_w: usize,
-) -> Vec<Line<'static>> {
+fn execution_output_lines(j: &crate::execution::RunJournal, inner_w: usize) -> Vec<Line<'static>> {
     let w = inner_w.max(8);
     let mut v: Vec<Line<'static>> = Vec::new();
     v.push(Line::from(vec![Span::styled(
@@ -1003,10 +1005,7 @@ fn execution_output_lines(
     for ln in wrap_text(&j.stdout, w) {
         v.push(Line::from(Span::styled(ln, Theme::text())));
     }
-    v.push(Line::from(vec![Span::styled(
-        "— stderr —",
-        Theme::error(),
-    )]));
+    v.push(Line::from(vec![Span::styled("— stderr —", Theme::error())]));
     for ln in wrap_text(&j.stderr, w) {
         v.push(Line::from(Span::styled(ln, Theme::error())));
     }
@@ -1063,10 +1062,7 @@ fn executions_list_paragraph(app: &App, area: Rect) -> (Paragraph<'static>, usiz
         .borders(Borders::ALL)
         .title(Span::styled(" runs (this thread) ", Theme::tool_done()))
         .border_style(Theme::dim());
-    (
-        Paragraph::new(Text::from(slice)).block(block),
-        max_scroll,
-    )
+    (Paragraph::new(Text::from(slice)).block(block), max_scroll)
 }
 
 fn executions_ensure_list_shows_selection(app: &mut App, list_inner_height: usize) {
@@ -1098,10 +1094,7 @@ fn executions_code_paragraph(
         .borders(Borders::ALL)
         .title(Span::styled(" source ", Theme::dim()))
         .border_style(Theme::dim());
-    (
-        Paragraph::new(Text::from(slice)).block(block),
-        max_scroll,
-    )
+    (Paragraph::new(Text::from(slice)).block(block), max_scroll)
 }
 
 fn executions_output_paragraph(
@@ -1120,10 +1113,7 @@ fn executions_output_paragraph(
         .borders(Borders::ALL)
         .title(Span::styled(" output ", Theme::dim()))
         .border_style(Theme::dim());
-    (
-        Paragraph::new(Text::from(slice)).block(block),
-        max_scroll,
-    )
+    (Paragraph::new(Text::from(slice)).block(block), max_scroll)
 }
 
 fn last_assistant_markdown(cells: &[Cell]) -> Option<&str> {
@@ -1390,8 +1380,11 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 
                     match &app.executions_detail {
                         Some(d) => {
-                            let (pc, max_c) =
-                                executions_code_paragraph(d, code_r, app.executions_code_scroll_top);
+                            let (pc, max_c) = executions_code_paragraph(
+                                d,
+                                code_r,
+                                app.executions_code_scroll_top,
+                            );
                             max_exec_code_scroll_holder.set(max_c);
                             f.render_widget(pc, code_r);
                             let (po, max_o) = executions_output_paragraph(
@@ -1622,8 +1615,9 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 app.request_quit();
                             } else {
                                 app.cells.push(Cell::System {
-                                    message: "Cancel sent for this thread (queued prompts cleared)."
-                                        .into(),
+                                    message:
+                                        "Cancel sent for this thread (queued prompts cleared)."
+                                            .into(),
                                 });
                             }
                             continue;
@@ -1727,7 +1721,9 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 KeyCode::Home => app.home(),
                 KeyCode::End => app.end(),
                 KeyCode::Up => {
-                    if app.ui_focus == TerminalUiFocus::Executions && !app.executions_runs.is_empty() {
+                    if app.ui_focus == TerminalUiFocus::Executions
+                        && !app.executions_runs.is_empty()
+                    {
                         if let Some(i) = app.executions_selected_idx {
                             if i > 0 {
                                 app.executions_selected_idx = Some(i - 1);
@@ -1744,7 +1740,9 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     }
                 }
                 KeyCode::Down => {
-                    if app.ui_focus == TerminalUiFocus::Executions && !app.executions_runs.is_empty() {
+                    if app.ui_focus == TerminalUiFocus::Executions
+                        && !app.executions_runs.is_empty()
+                    {
                         if let Some(i) = app.executions_selected_idx {
                             if i + 1 < app.executions_runs.len() {
                                 app.executions_selected_idx = Some(i + 1);

@@ -534,11 +534,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     if thread_ids.is_empty() {
                         return Ok(Vec::new());
                     }
-                    let placeholders = thread_ids
-                        .iter()
-                        .map(|_| "?")
-                        .collect::<Vec<_>>()
-                        .join(",");
+                    let placeholders = thread_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
                     let sql = format!(
                         "SELECT m.thread_id, m.content FROM messages m
                          INNER JOIN (

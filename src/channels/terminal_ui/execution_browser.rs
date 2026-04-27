@@ -37,7 +37,10 @@ pub struct ExecutionRunDetail {
 const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Read and parse `execution_runs.jsonl`, keep lines whose `chat_id` matches, newest first.
-pub fn load_runs_for_chat(workspace_dir: &Path, chat_id: &str) -> Result<Vec<ExecutionRunListItem>, String> {
+pub fn load_runs_for_chat(
+    workspace_dir: &Path,
+    chat_id: &str,
+) -> Result<Vec<ExecutionRunListItem>, String> {
     let path = workspace_dir
         .join(".system_generated")
         .join("execution_runs.jsonl");
@@ -72,26 +75,29 @@ pub fn load_runs_for_chat(workspace_dir: &Path, chat_id: &str) -> Result<Vec<Exe
 }
 
 /// Load `source.txt` and `run.json` under the run journal directory.
-pub fn load_run_detail(workspace_dir: &Path, item: &ExecutionRunListItem) -> Result<ExecutionRunDetail, String> {
+pub fn load_run_detail(
+    workspace_dir: &Path,
+    item: &ExecutionRunListItem,
+) -> Result<ExecutionRunDetail, String> {
     let run_id = item
         .run_id
         .as_deref()
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| "This run has no run_id in the manifest (older isanagent); journal path unknown.".to_string())?;
+        .ok_or_else(|| {
+            "This run has no run_id in the manifest (older isanagent); journal path unknown."
+                .to_string()
+        })?;
     let sid = SessionId::new(item.session_id.clone());
     let dir: PathBuf = run_history_dir(workspace_dir, &item.provider_id, &sid, run_id);
     let source_path = dir.join("source.txt");
     let json_path = dir.join("run.json");
     if !source_path.is_file() || !json_path.is_file() {
-        return Err(format!(
-            "Run journal missing under {}",
-            dir.display()
-        ));
+        return Err(format!("Run journal missing under {}", dir.display()));
     }
-    let source = std::fs::read_to_string(&source_path)
-        .map_err(|e| format!("source.txt: {e}"))?;
+    let source = std::fs::read_to_string(&source_path).map_err(|e| format!("source.txt: {e}"))?;
     let json = std::fs::read_to_string(&json_path).map_err(|e| format!("run.json: {e}"))?;
-    let journal: RunJournal = serde_json::from_str(&json).map_err(|e| format!("run.json parse: {e}"))?;
+    let journal: RunJournal =
+        serde_json::from_str(&json).map_err(|e| format!("run.json parse: {e}"))?;
     Ok(ExecutionRunDetail { source, journal })
 }
 

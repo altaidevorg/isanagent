@@ -10,7 +10,7 @@ mod subagent;
 pub use subagent::SubagentHarness;
 
 use crate::clarification::ClarificationHub;
-use crate::tool_runtime::{ToolExecCtx, ToolProgressEmitter, with_tool_exec_and_progress_scope};
+use crate::tool_runtime::{with_tool_exec_and_progress_scope, ToolExecCtx, ToolProgressEmitter};
 
 use crate::bus::{BusMessage, LogEvent, OutboundMessage, TelemetryEvent};
 use crate::config::{ResolvedShellPolicy, ShellPolicyMode};

@@ -502,10 +502,10 @@ impl ApiChannel {
             } => {
                 if let Some(pending) = self.pending_requests.get(&chat_id) {
                     if let PendingRequest::Stream(pending) = pending.value() {
-                        if let Err(e) = pending.stream_tx.try_send(StreamEvent::ToolProgress {
-                            tool_name,
-                            message,
-                        }) {
+                        if let Err(e) = pending
+                            .stream_tx
+                            .try_send(StreamEvent::ToolProgress { tool_name, message })
+                        {
                             error!("Failed to send tool_progress to stream: {}", e);
                         }
                     }
@@ -1002,8 +1002,7 @@ async fn handle_responses(
     }
 
     let outbound =
-        match dispatch_agent_turn(&state, sender_id.clone(), conv_thread_id.clone(), input).await
-        {
+        match dispatch_agent_turn(&state, sender_id.clone(), conv_thread_id.clone(), input).await {
             Ok(outbound) => outbound,
             Err(err) => return err.into_response(),
         };
@@ -1500,26 +1499,23 @@ async fn handle_list_threads(
                 .iter()
                 .map(|row| resolve_memory_thread_id(&state, &row.thread_id).into_owned())
                 .collect();
-            let preview_opts = match memory_first_user_previews_batch(
-                &state.memory_node,
-                memory_thread_ids,
-            )
-            .await
-            {
-                Ok(v) if v.len() == rows.len() => v,
-                Ok(v) => {
-                    error!(
-                        "thread list preview batch length mismatch: got {} want {}",
-                        v.len(),
-                        rows.len()
-                    );
-                    vec![None; rows.len()]
-                }
-                Err(e) => {
-                    error!("thread list preview batch failed: {}", e);
-                    vec![None; rows.len()]
-                }
-            };
+            let preview_opts =
+                match memory_first_user_previews_batch(&state.memory_node, memory_thread_ids).await
+                {
+                    Ok(v) if v.len() == rows.len() => v,
+                    Ok(v) => {
+                        error!(
+                            "thread list preview batch length mismatch: got {} want {}",
+                            v.len(),
+                            rows.len()
+                        );
+                        vec![None; rows.len()]
+                    }
+                    Err(e) => {
+                        error!("thread list preview batch failed: {}", e);
+                        vec![None; rows.len()]
+                    }
+                };
             let body: Vec<ThreadListEntry> = rows
                 .into_iter()
                 .zip(preview_opts)
@@ -2324,8 +2320,8 @@ mod tests {
         scheduler: Option<Arc<MultiTenantEdgeCronScheduler>>,
     ) -> ApiState {
         let (logger_tx, _logger_rx) = create_logger_channel(32);
-        let memory_actor = SqliteMemoryActor::new(db_path.to_str().expect("utf8 db path"))
-            .expect("memory actor");
+        let memory_actor =
+            SqliteMemoryActor::new(db_path.to_str().expect("utf8 db path")).expect("memory actor");
         let memory_node =
             NodeHandle::<MemoryMessage>::new(memory_actor, 100, 1, Duration::from_millis(5));
         let workspace_sandbox = db_path.parent().expect("db path parent").join("workspace");
@@ -2568,8 +2564,8 @@ bind_address = "127.0.0.1"
         let (logger_tx, _logger_rx) = create_logger_channel(32);
         let response_store = Arc::new(ResponseStore::new(temp.db_path()).expect("response store"));
         let (bus_tx, mut bus_rx) = mpsc::channel(4);
-        let memory_actor = SqliteMemoryActor::new(temp.db_path().to_str().expect("utf8"))
-            .expect("memory actor");
+        let memory_actor =
+            SqliteMemoryActor::new(temp.db_path().to_str().expect("utf8")).expect("memory actor");
         let memory_node =
             NodeHandle::<MemoryMessage>::new(memory_actor, 100, 1, Duration::from_millis(5));
         let workspace_sandbox = temp.path.join("workspace");

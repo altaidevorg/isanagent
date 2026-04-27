@@ -83,7 +83,9 @@ where
     let prog_cell = RefCell::new(Some(progress));
     let ctx_cell = RefCell::new(Some(ctx));
     TOOL_PROGRESS_EMITTER
-        .scope(prog_cell, async { TOOL_EXEC_CTX.scope(ctx_cell, fut).await })
+        .scope(prog_cell, async {
+            TOOL_EXEC_CTX.scope(ctx_cell, fut).await
+        })
         .await
 }
 

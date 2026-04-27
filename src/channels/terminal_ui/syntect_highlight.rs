@@ -9,8 +9,8 @@ use syntect::highlighting::{FontStyle, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
-use super::Theme;
 use super::uses_ansi_color;
+use super::Theme;
 
 const MAX_HIGHLIGHT_SOURCE_CHARS: usize = 256 * 1024;
 
@@ -79,7 +79,11 @@ fn syntect_style_to_ratatui(st: syntect::highlighting::Style) -> Style {
     if !uses_ansi_color() {
         return Theme::dim().add_modifier(Modifier::ITALIC);
     }
-    let mut out = Style::default().fg(Color::Rgb(st.foreground.r, st.foreground.g, st.foreground.b));
+    let mut out = Style::default().fg(Color::Rgb(
+        st.foreground.r,
+        st.foreground.g,
+        st.foreground.b,
+    ));
     let fs = st.font_style;
     if fs.contains(FontStyle::BOLD) {
         out = out.add_modifier(Modifier::BOLD);
