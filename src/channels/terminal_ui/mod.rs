@@ -5,9 +5,11 @@
 
 mod app;
 mod attachments;
+mod execution_browser;
 mod markdown;
 pub(crate) mod protocol;
 mod run;
+mod syntect_highlight;
 mod theme;
 
 pub use app::{

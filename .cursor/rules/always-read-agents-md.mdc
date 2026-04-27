@@ -1,0 +1,10 @@
+---
+description: Guidance on correctly reading AGENTS.md files
+alwaysApply: true
+---
+
+# How to read AGENTS.md files
+
+Do not assume that AGENTS.md is auto-injected to your context. Instead, always look for `AGENTS.md` in the project root and read it before starting a task. The project may also have additional `AGENTS.md` files in subdirectories. If the file you are about to touch lives in a subdirectory (no matter how deeply nested), look for the nearest `AGENTS.md` in the directory hierarchy.
+
+If you make changes that need to be reflected in `AGENTS.md`, do so without expecting an explicit prompt. Keep `AGENTS.md` files aligned with reality and free of outdated information.

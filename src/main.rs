@@ -654,6 +654,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             &id,
             logger_bus_tx.clone(),
             shutdown_tx.clone(),
+            workspace.dir.clone(),
             workspace.sandbox_dir.clone(),
             model_name.clone(),
         ));

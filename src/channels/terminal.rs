@@ -421,6 +421,8 @@ pub struct TerminalChannel {
     chat_id: String,
     logger_tx: LoggerHandle,
     shutdown_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    /// Workspace root (`config.toml`, `.system_generated/`, execution journals).
+    workspace_dir: PathBuf,
     /// All user-supplied `@<filepath>` references are resolved relative to this
     /// directory.  Paths that escape the sandbox boundary are silently rejected.
     sandbox_dir: PathBuf,
@@ -435,6 +437,7 @@ impl TerminalChannel {
         chat_id: &str,
         logger_tx: LoggerHandle,
         shutdown_tx: tokio::sync::mpsc::UnboundedSender<()>,
+        workspace_dir: PathBuf,
         sandbox_dir: PathBuf,
         status_model: String,
     ) -> Self {
@@ -442,6 +445,7 @@ impl TerminalChannel {
             chat_id: chat_id.to_string(),
             logger_tx,
             shutdown_tx,
+            workspace_dir,
             sandbox_dir,
             status_model,
             outbound_ui_tx: Arc::new(Mutex::new(None)),
@@ -472,6 +476,7 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
         let logger_tx = self.logger_tx.clone();
         let shutdown_tx = self.shutdown_tx.clone();
         let sandbox_dir = self.sandbox_dir.clone();
+        let workspace_dir = self.workspace_dir.clone();
 
         let _ = logger_tx.send(BusMessage::Log(LogEvent::info(
             "TerminalChannel",
@@ -507,6 +512,7 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
                         bus_tx: bus_tx_clone,
                         outbound_rx: rx,
                         shutdown_tx: shutdown_clone,
+                        workspace_dir,
                         sandbox_dir: sandbox_clone,
                         chat_id: chat_id_clone,
                         channel_name,

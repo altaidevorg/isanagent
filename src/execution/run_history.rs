@@ -9,7 +9,7 @@ use super::run::RunResult;
 
 const MAX_INLINE_TEXT: usize = 64 * 1024;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunJournal {
     pub schema_version: u32,
     pub provider_id: String,
@@ -30,7 +30,7 @@ pub struct RunJournal {
     pub attachments: Vec<AttachmentJournal>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttachmentJournal {
     pub id: String,
     pub path: Option<String>,

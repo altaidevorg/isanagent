@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
 
+use super::execution_browser::{ExecutionRunDetail, ExecutionRunListItem};
+
 /// High-level UI mode for the terminal front-end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TerminalUiMode {
@@ -34,6 +36,8 @@ pub enum TerminalUiFocus {
     #[default]
     Transcript,
     ToolHistory,
+    /// Browse `execution_runs.jsonl` + per-run journals for this terminal session.
+    Executions,
 }
 
 const TOOL_RAIL_CAP: usize = 150;
@@ -189,6 +193,22 @@ pub struct App {
     /// Remembers the last user-sent inbound text so `/retry` can re-submit it after an
     /// exhausted-retry LLM failure.
     pub last_inbound_text: Option<String>,
+    /// Runs from `execution_runs.jsonl` filtered by this terminal `chat_id` (newest first).
+    pub executions_runs: Vec<ExecutionRunListItem>,
+    pub executions_runs_error: Option<String>,
+    pub executions_selected_idx: Option<usize>,
+    /// Scroll within the run list (lines hidden above the viewport top).
+    pub executions_list_scroll_top: usize,
+    /// Lines skipped above the code pane viewport.
+    pub executions_code_scroll_top: usize,
+    /// Lines skipped above the stdout/stderr pane viewport.
+    pub executions_output_scroll_top: usize,
+    pub executions_detail: Option<ExecutionRunDetail>,
+    pub executions_detail_error: Option<String>,
+    /// Last frame's run-list block (wheel hit-test).
+    pub last_executions_list_rect: Option<Rect>,
+    pub last_executions_code_rect: Option<Rect>,
+    pub last_executions_output_rect: Option<Rect>,
 }
 
 impl Default for App {
@@ -225,6 +245,17 @@ impl App {
             jobs_strip: VecDeque::new(),
             llm_retry_available: false,
             last_inbound_text: None,
+            executions_runs: Vec::new(),
+            executions_runs_error: None,
+            executions_selected_idx: None,
+            executions_list_scroll_top: 0,
+            executions_code_scroll_top: 0,
+            executions_output_scroll_top: 0,
+            executions_detail: None,
+            executions_detail_error: None,
+            last_executions_list_rect: None,
+            last_executions_code_rect: None,
+            last_executions_output_rect: None,
         }
     }
 
@@ -262,7 +293,8 @@ impl App {
     pub fn toggle_ui_focus(&mut self) {
         self.ui_focus = match self.ui_focus {
             TerminalUiFocus::Transcript => TerminalUiFocus::ToolHistory,
-            TerminalUiFocus::ToolHistory => TerminalUiFocus::Transcript,
+            TerminalUiFocus::ToolHistory => TerminalUiFocus::Executions,
+            TerminalUiFocus::Executions => TerminalUiFocus::Transcript,
         };
         self.tool_history_scroll = 0;
     }
@@ -274,6 +306,11 @@ impl App {
 
     pub fn focus_transcript(&mut self) {
         self.ui_focus = TerminalUiFocus::Transcript;
+        self.tool_history_scroll = 0;
+    }
+
+    pub fn focus_executions(&mut self) {
+        self.ui_focus = TerminalUiFocus::Executions;
         self.tool_history_scroll = 0;
     }
 

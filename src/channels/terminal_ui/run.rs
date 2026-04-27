@@ -2,8 +2,8 @@
 //! Inspired by Xerxes-style terminal agents — scrollable rail, role-colored labels, calm chrome.
 
 use std::io::{self, stdout};
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crossterm::{
     event::{
@@ -13,7 +13,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::layout::{Constraint, Layout, Margin, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::prelude::*;
 use ratatui::style::Modifier;
 use ratatui::widgets::{Block, Borders, Paragraph};
@@ -32,8 +32,8 @@ use crate::channels::terminal_ui::protocol::{
     METADATA_TOOL_RESULT_PREVIEW,
 };
 use crate::channels::terminal_ui::{
-    init_from_env, uses_ansi_color, App, Cell, JobStripStatus, TerminalUiFocus, Theme, ToastKind,
-    ToolNoticePhase, ToolRailEntry,
+    execution_browser, init_from_env, uses_ansi_color, App, Cell, JobStripStatus, TerminalUiFocus,
+    Theme, ToastKind, ToolNoticePhase, ToolRailEntry,
 };
 use crate::clarification::{METADATA_CLARIFICATION, METADATA_CLARIFICATION_CHOICES};
 
@@ -75,14 +75,16 @@ const TERMINAL_HELP: &str = r#"Commands (leading slash):
   /cancel, /stop Stop the in-flight reply for this chat (drops queued prompts)
   /background, /bg Promote the in-flight execution_run / colab_mcp_tool_call to a background job
   /retry         Re-submit the last user message after an LLM-failed banner
-  /tools         Open the tool activity pane (same as Tab)
+  /tools         Open the tool activity pane
+  /exec          Open the executions browser (workspace execution_runs.jsonl)
   /help, /?      Show this help
 
 Keys:
   Enter             Send the compose line
-  Tab / Ctrl+T      Switch focus: transcript <-> tool activity
-  Esc               From tool activity: return to transcript (no-op on transcript)
-  PgUp / PgDn       Scroll the focused pane (transcript or tool activity)
+  Tab / Ctrl+T      Switch focus: transcript → tool activity → executions → …
+  Esc               From tool activity or executions: return to transcript
+  PgUp / PgDn       Scroll the focused pane; on executions: output pane (Ctrl+Pg*: code pane)
+  F5                Refresh execution run list (executions pane)
   Mouse wheel       Scroll when the pointer is over the focused pane (horizontal wheel scrolls too)
   Ctrl+Shift+Y      Copy last assistant reply
   Ctrl+W / Ctrl+U   Delete word / clear line
@@ -251,7 +253,7 @@ fn outbound_to_cell(msg: &OutboundMessage) -> Cell {
 }
 
 /// Greedy wrap by display width (`unicode_width`); preserves explicit newlines.
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap_text(text: &str, width: usize) -> Vec<String> {
     if width < 4 {
         return vec![text.to_string()];
     }
@@ -628,7 +630,7 @@ fn build_title_line(max_width: usize) -> Line<'static> {
             dim,
         )],
         vec![Span::styled(
-            "· /exit · /new · /copy · /cancel · /background · /retry · /tools · /help · Tab · Esc · ↑↓ · wheel · PgUp/PgDn",
+            "· /exit · /new · /copy · /cancel · /background · /retry · /tools · /exec · /help · Tab · Esc · wheel · PgUp/PgDn",
             dim,
         )],
     ];
@@ -928,6 +930,206 @@ fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
     col >= r.x && col < x1 && row >= r.y && row < y1
 }
 
+fn clamp_executions_selection(app: &mut App) {
+    if app.executions_runs.is_empty() {
+        app.executions_selected_idx = None;
+        return;
+    }
+    let n = app.executions_runs.len();
+    match app.executions_selected_idx {
+        None => app.executions_selected_idx = Some(0),
+        Some(i) if i >= n => app.executions_selected_idx = Some(n - 1),
+        _ => {}
+    }
+}
+
+fn load_selected_execution_detail(workspace_dir: &Path, app: &mut App) {
+    app.executions_detail = None;
+    app.executions_detail_error = None;
+    let Some(idx) = app.executions_selected_idx else {
+        return;
+    };
+    let Some(item) = app.executions_runs.get(idx) else {
+        return;
+    };
+    match execution_browser::load_run_detail(workspace_dir, item) {
+        Ok(d) => {
+            app.executions_code_scroll_top = 0;
+            app.executions_output_scroll_top = 0;
+            app.executions_detail = Some(d);
+        }
+        Err(e) => app.executions_detail_error = Some(e),
+    }
+}
+
+fn rescan_executions_manifest(workspace_dir: &Path, chat_id: &str, app: &mut App) {
+    match execution_browser::load_runs_for_chat(workspace_dir, chat_id) {
+        Ok(runs) => {
+            app.executions_runs_error = None;
+            app.executions_runs = runs;
+            clamp_executions_selection(app);
+            load_selected_execution_detail(workspace_dir, app);
+        }
+        Err(e) => app.executions_runs_error = Some(e),
+    }
+}
+
+fn execution_run_list_line(item: &execution_browser::ExecutionRunListItem, inner_w: usize) -> String {
+    let ex = item
+        .exit_code
+        .map(|c| format!("exit {c}"))
+        .unwrap_or_else(|| "exit ?".to_string());
+    let desc = item
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("—");
+    let ts_short: String = item.ts.chars().take(26).collect();
+    let raw = format!("{ts_short}  {ex}  {desc}");
+    truncate_chars_display(&raw, inner_w.max(12))
+}
+
+fn execution_code_lines(source: &str, inner_w: usize) -> Vec<Line<'static>> {
+    crate::channels::terminal_ui::syntect_highlight::highlight_source_wrapped(source, inner_w.max(8))
+}
+
+fn execution_output_lines(
+    j: &crate::execution::RunJournal,
+    inner_w: usize,
+) -> Vec<Line<'static>> {
+    let w = inner_w.max(8);
+    let mut v: Vec<Line<'static>> = Vec::new();
+    v.push(Line::from(vec![Span::styled(
+        "— stdout —",
+        Theme::tool_call(),
+    )]));
+    for ln in wrap_text(&j.stdout, w) {
+        v.push(Line::from(Span::styled(ln, Theme::text())));
+    }
+    v.push(Line::from(vec![Span::styled(
+        "— stderr —",
+        Theme::error(),
+    )]));
+    for ln in wrap_text(&j.stderr, w) {
+        v.push(Line::from(Span::styled(ln, Theme::error())));
+    }
+    v
+}
+
+fn executions_list_paragraph(app: &App, area: Rect) -> (Paragraph<'static>, usize) {
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let visible = area.height.saturating_sub(2) as usize;
+    let max_scroll = if app.executions_runs.is_empty() {
+        0usize
+    } else {
+        app.executions_runs.len().saturating_sub(visible.max(1))
+    };
+    let st = app.executions_list_scroll_top.min(max_scroll);
+    let mut slice: Vec<Line<'static>> = Vec::new();
+    if let Some(err) = app.executions_runs_error.as_deref() {
+        slice.push(Line::from(Span::styled(
+            format!("Could not load execution_runs.jsonl: {err}"),
+            Theme::error(),
+        )));
+    } else if app.executions_runs.is_empty() {
+        slice.push(Line::from(Span::styled(
+            "No execution runs recorded for this terminal session yet.",
+            Theme::dim(),
+        )));
+        slice.push(Line::from(Span::styled(
+            "Runs append after each successful execution_run (workspace .system_generated/).",
+            Theme::dim(),
+        )));
+    } else {
+        for (row, item) in app
+            .executions_runs
+            .iter()
+            .enumerate()
+            .skip(st)
+            .take(visible.max(1))
+        {
+            let sel = app.executions_selected_idx == Some(row);
+            let mark = if sel { "› " } else { "  " };
+            let body = execution_run_list_line(item, inner_w.saturating_sub(4));
+            let style = if sel {
+                Theme::tool_call()
+            } else {
+                Theme::text()
+            };
+            slice.push(Line::from(vec![
+                Span::styled(mark, Theme::tool_done()),
+                Span::styled(body, style),
+            ]));
+        }
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(" runs (this session) ", Theme::tool_done()))
+        .border_style(Theme::dim());
+    (
+        Paragraph::new(Text::from(slice)).block(block),
+        max_scroll,
+    )
+}
+
+fn executions_ensure_list_shows_selection(app: &mut App, list_inner_height: usize) {
+    let v = list_inner_height.max(1);
+    let Some(sel) = app.executions_selected_idx else {
+        return;
+    };
+    if sel < app.executions_list_scroll_top {
+        app.executions_list_scroll_top = sel;
+    }
+    if sel >= app.executions_list_scroll_top.saturating_add(v) {
+        app.executions_list_scroll_top = sel.saturating_sub(v.saturating_sub(1));
+    }
+}
+
+fn executions_code_paragraph(
+    detail: &execution_browser::ExecutionRunDetail,
+    area: Rect,
+    scroll_top: usize,
+) -> (Paragraph<'static>, usize) {
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let lines = execution_code_lines(&detail.source, inner_w.max(8));
+    let visible = area.height.saturating_sub(2) as usize;
+    let total = lines.len();
+    let max_scroll = total.saturating_sub(visible.max(1));
+    let st = scroll_top.min(max_scroll);
+    let slice: Vec<Line<'static>> = lines.into_iter().skip(st).take(visible.max(1)).collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(" source ", Theme::dim()))
+        .border_style(Theme::dim());
+    (
+        Paragraph::new(Text::from(slice)).block(block),
+        max_scroll,
+    )
+}
+
+fn executions_output_paragraph(
+    journal: &crate::execution::RunJournal,
+    area: Rect,
+    scroll_top: usize,
+) -> (Paragraph<'static>, usize) {
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let lines = execution_output_lines(journal, inner_w.max(8));
+    let visible = area.height.saturating_sub(2) as usize;
+    let total = lines.len();
+    let max_scroll = total.saturating_sub(visible.max(1));
+    let st = scroll_top.min(max_scroll);
+    let slice: Vec<Line<'static>> = lines.into_iter().skip(st).take(visible.max(1)).collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(" output ", Theme::dim()))
+        .border_style(Theme::dim());
+    (
+        Paragraph::new(Text::from(slice)).block(block),
+        max_scroll,
+    )
+}
+
 fn last_assistant_markdown(cells: &[Cell]) -> Option<&str> {
     cells.iter().rev().find_map(|c| {
         if let Cell::Assistant { markdown } = c {
@@ -952,6 +1154,7 @@ pub(crate) struct RatatuiMainConfig {
     pub bus_tx: Sender<BusMessage>,
     pub outbound_rx: std::sync::mpsc::Receiver<OutboundMessage>,
     pub shutdown_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    pub workspace_dir: PathBuf,
     pub sandbox_dir: PathBuf,
     pub chat_id: String,
     pub channel_name: String,
@@ -965,6 +1168,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         bus_tx,
         outbound_rx,
         shutdown_tx,
+        workspace_dir,
         sandbox_dir,
         mut chat_id,
         channel_name,
@@ -995,9 +1199,20 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
     let tick = Duration::from_millis(80);
     let max_transcript_scroll_holder = std::cell::Cell::new(0u16);
     let max_tool_history_scroll_holder = std::cell::Cell::new(0u16);
+    let max_exec_list_scroll_holder = std::cell::Cell::new(0usize);
+    let max_exec_code_scroll_holder = std::cell::Cell::new(0usize);
+    let max_exec_out_scroll_holder = std::cell::Cell::new(0usize);
+    let mut last_exec_poll = Instant::now() - Duration::from_secs(60);
 
     loop {
         app.clear_expired_toast();
+
+        if app.ui_focus == TerminalUiFocus::Executions
+            && last_exec_poll.elapsed() >= Duration::from_secs(2)
+        {
+            last_exec_poll = Instant::now();
+            rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
+        }
 
         if let Some(ref rx) = uv_install_rx {
             match rx.try_recv() {
@@ -1143,6 +1358,9 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     f.render_widget(w, ch[1]);
                     app.last_transcript_rect = Some(ch[1]);
                     app.last_tool_history_rect = None;
+                    app.last_executions_list_rect = None;
+                    app.last_executions_code_rect = None;
+                    app.last_executions_output_rect = None;
                 }
                 TerminalUiFocus::ToolHistory => {
                     let (w, max_s) =
@@ -1151,6 +1369,67 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     f.render_widget(w, ch[1]);
                     app.last_tool_history_rect = Some(ch[1]);
                     app.last_transcript_rect = None;
+                    app.last_executions_list_rect = None;
+                    app.last_executions_code_rect = None;
+                    app.last_executions_output_rect = None;
+                }
+                TerminalUiFocus::Executions => {
+                    let list_w = (ch[1].width / 3).max(26).min(46);
+                    let hareas = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Length(list_w), Constraint::Min(8)])
+                        .split(ch[1]);
+                    let list_r = hareas[0];
+                    let detail_area = hareas[1];
+                    let vareas = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
+                        .split(detail_area);
+                    let code_r = vareas[0];
+                    let out_r = vareas[1];
+
+                    let (pl, max_l) = executions_list_paragraph(&app, list_r);
+                    max_exec_list_scroll_holder.set(max_l);
+                    f.render_widget(pl, list_r);
+
+                    match &app.executions_detail {
+                        Some(d) => {
+                            let (pc, max_c) =
+                                executions_code_paragraph(d, code_r, app.executions_code_scroll_top);
+                            max_exec_code_scroll_holder.set(max_c);
+                            f.render_widget(pc, code_r);
+                            let (po, max_o) = executions_output_paragraph(
+                                &d.journal,
+                                out_r,
+                                app.executions_output_scroll_top,
+                            );
+                            max_exec_out_scroll_holder.set(max_o);
+                            f.render_widget(po, out_r);
+                            app.last_executions_code_rect = Some(code_r);
+                            app.last_executions_output_rect = Some(out_r);
+                        }
+                        None => {
+                            max_exec_code_scroll_holder.set(0);
+                            max_exec_out_scroll_holder.set(0);
+                            app.last_executions_code_rect = None;
+                            app.last_executions_output_rect = None;
+                            let msg = app
+                                .executions_detail_error
+                                .as_deref()
+                                .unwrap_or("Pick a run from the list (↑↓).");
+                            let empty = Paragraph::new(Line::from(Span::styled(msg, Theme::dim())))
+                                .block(
+                                    Block::default()
+                                        .borders(Borders::ALL)
+                                        .title(Span::styled(" detail ", Theme::dim()))
+                                        .border_style(Theme::dim()),
+                                );
+                            f.render_widget(empty, detail_area);
+                        }
+                    }
+                    app.last_transcript_rect = None;
+                    app.last_tool_history_rect = None;
+                    app.last_executions_list_rect = Some(list_r);
                 }
             }
 
@@ -1225,6 +1504,17 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         if app.tool_history_scroll > app.tool_history_max_scroll {
             app.tool_history_scroll = app.tool_history_max_scroll;
         }
+        if app.ui_focus == TerminalUiFocus::Executions {
+            app.executions_list_scroll_top = app
+                .executions_list_scroll_top
+                .min(max_exec_list_scroll_holder.get());
+            app.executions_code_scroll_top = app
+                .executions_code_scroll_top
+                .min(max_exec_code_scroll_holder.get());
+            app.executions_output_scroll_top = app
+                .executions_output_scroll_top
+                .min(max_exec_out_scroll_holder.get());
+        }
 
         if !event::poll(tick)? {
             continue;
@@ -1261,6 +1551,8 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             app.cells.push(Cell::System {
                                 message: format!("New session: {}", chat_id),
                             });
+                            rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
+                            last_exec_poll = Instant::now();
                             continue;
                         }
                         if text.eq_ignore_ascii_case("/copy") {
@@ -1312,6 +1604,12 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         }
                         if text.eq_ignore_ascii_case("/tools") {
                             app.focus_tool_history();
+                            continue;
+                        }
+                        if text.eq_ignore_ascii_case("/exec") {
+                            app.focus_executions();
+                            rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
+                            last_exec_poll = Instant::now();
                             continue;
                         }
                         if text.eq_ignore_ascii_case("/cancel")
@@ -1392,7 +1690,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         }
                         app.cells.push(Cell::System {
                             message:
-                                "Unknown command. Try /help, /exit, /new, /copy, /install-python, /cancel, /background, /retry, /tools."
+                                "Unknown command. Try /help, /exit, /new, /copy, /install-python, /cancel, /background, /retry, /tools, /exec."
                                     .into(),
                         });
                         continue;
@@ -1432,15 +1730,54 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 KeyCode::Right => app.move_right(),
                 KeyCode::Home => app.home(),
                 KeyCode::End => app.end(),
-                KeyCode::Up => app.history_up(),
-                KeyCode::Down => app.history_down(),
+                KeyCode::Up => {
+                    if app.ui_focus == TerminalUiFocus::Executions && !app.executions_runs.is_empty() {
+                        if let Some(i) = app.executions_selected_idx {
+                            if i > 0 {
+                                app.executions_selected_idx = Some(i - 1);
+                                load_selected_execution_detail(&workspace_dir, &mut app);
+                                let list_h = app
+                                    .last_executions_list_rect
+                                    .map(|r| r.height.saturating_sub(2) as usize)
+                                    .unwrap_or(8);
+                                executions_ensure_list_shows_selection(&mut app, list_h);
+                            }
+                        }
+                    } else if app.ui_focus != TerminalUiFocus::Executions {
+                        app.history_up();
+                    }
+                }
+                KeyCode::Down => {
+                    if app.ui_focus == TerminalUiFocus::Executions && !app.executions_runs.is_empty() {
+                        if let Some(i) = app.executions_selected_idx {
+                            if i + 1 < app.executions_runs.len() {
+                                app.executions_selected_idx = Some(i + 1);
+                                load_selected_execution_detail(&workspace_dir, &mut app);
+                                let list_h = app
+                                    .last_executions_list_rect
+                                    .map(|r| r.height.saturating_sub(2) as usize)
+                                    .unwrap_or(8);
+                                executions_ensure_list_shows_selection(&mut app, list_h);
+                            }
+                        }
+                    } else if app.ui_focus != TerminalUiFocus::Executions {
+                        app.history_down();
+                    }
+                }
                 KeyCode::Esc => {
-                    if app.ui_focus == TerminalUiFocus::ToolHistory {
+                    if matches!(
+                        app.ui_focus,
+                        TerminalUiFocus::ToolHistory | TerminalUiFocus::Executions
+                    ) {
                         app.focus_transcript();
                     }
                 }
                 KeyCode::Tab => {
                     app.toggle_ui_focus();
+                    if app.ui_focus == TerminalUiFocus::Executions {
+                        rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
+                        last_exec_poll = Instant::now();
+                    }
                     if app.following_tail() {
                         app.scroll_offset = 0;
                     }
@@ -1452,6 +1789,10 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
                     app.toggle_ui_focus();
+                    if app.ui_focus == TerminalUiFocus::Executions {
+                        rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
+                        last_exec_poll = Instant::now();
+                    }
                     if app.following_tail() {
                         app.scroll_offset = 0;
                     }
@@ -1459,18 +1800,42 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         app.tool_history_scroll = 0;
                     }
                 }
-                KeyCode::PageUp => {
-                    if app.ui_focus == TerminalUiFocus::ToolHistory {
-                        app.tool_history_scroll_up(8);
-                    } else {
-                        app.scroll_up(8);
+                KeyCode::PageUp => match app.ui_focus {
+                    TerminalUiFocus::ToolHistory => app.tool_history_scroll_up(8),
+                    TerminalUiFocus::Executions => {
+                        if key.modifiers.contains(KeyModifiers::CONTROL) {
+                            app.executions_code_scroll_top =
+                                app.executions_code_scroll_top.saturating_sub(3);
+                        } else if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            app.executions_list_scroll_top =
+                                app.executions_list_scroll_top.saturating_sub(1);
+                        } else {
+                            app.executions_output_scroll_top =
+                                app.executions_output_scroll_top.saturating_sub(3);
+                        }
                     }
-                }
-                KeyCode::PageDown => {
-                    if app.ui_focus == TerminalUiFocus::ToolHistory {
-                        app.tool_history_scroll_down(8);
-                    } else {
-                        app.scroll_down(8);
+                    TerminalUiFocus::Transcript => app.scroll_up(8),
+                },
+                KeyCode::PageDown => match app.ui_focus {
+                    TerminalUiFocus::ToolHistory => app.tool_history_scroll_down(8),
+                    TerminalUiFocus::Executions => {
+                        if key.modifiers.contains(KeyModifiers::CONTROL) {
+                            app.executions_code_scroll_top =
+                                app.executions_code_scroll_top.saturating_add(3);
+                        } else if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            app.executions_list_scroll_top =
+                                app.executions_list_scroll_top.saturating_add(1);
+                        } else {
+                            app.executions_output_scroll_top =
+                                app.executions_output_scroll_top.saturating_add(3);
+                        }
+                    }
+                    TerminalUiFocus::Transcript => app.scroll_down(8),
+                },
+                KeyCode::F(5) => {
+                    if app.ui_focus == TerminalUiFocus::Executions {
+                        rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
+                        last_exec_poll = Instant::now();
                     }
                 }
                 KeyCode::Char(c)
@@ -1532,6 +1897,81 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             app.tool_history_scroll_down(MOUSE_SCROLL_LINES)
                         }
                         _ => {}
+                    }
+                } else if app.ui_focus == TerminalUiFocus::Executions {
+                    let over_list = app
+                        .last_executions_list_rect
+                        .map(|r| rect_contains(r, me.column, me.row))
+                        .unwrap_or(false);
+                    let over_code = app
+                        .last_executions_code_rect
+                        .map(|r| rect_contains(r, me.column, me.row))
+                        .unwrap_or(false);
+                    let over_out = app
+                        .last_executions_output_rect
+                        .map(|r| rect_contains(r, me.column, me.row))
+                        .unwrap_or(false);
+                    let n = MOUSE_SCROLL_LINES as usize;
+                    if over_list {
+                        match me.kind {
+                            MouseEventKind::ScrollUp => {
+                                app.executions_list_scroll_top =
+                                    app.executions_list_scroll_top.saturating_sub(1);
+                            }
+                            MouseEventKind::ScrollDown => {
+                                app.executions_list_scroll_top =
+                                    app.executions_list_scroll_top.saturating_add(1);
+                            }
+                            MouseEventKind::ScrollLeft => {
+                                app.executions_list_scroll_top =
+                                    app.executions_list_scroll_top.saturating_sub(1);
+                            }
+                            MouseEventKind::ScrollRight => {
+                                app.executions_list_scroll_top =
+                                    app.executions_list_scroll_top.saturating_add(1);
+                            }
+                            _ => {}
+                        }
+                    } else if over_code {
+                        match me.kind {
+                            MouseEventKind::ScrollUp => {
+                                app.executions_code_scroll_top =
+                                    app.executions_code_scroll_top.saturating_sub(n);
+                            }
+                            MouseEventKind::ScrollDown => {
+                                app.executions_code_scroll_top =
+                                    app.executions_code_scroll_top.saturating_add(n);
+                            }
+                            MouseEventKind::ScrollLeft => {
+                                app.executions_code_scroll_top =
+                                    app.executions_code_scroll_top.saturating_sub(n);
+                            }
+                            MouseEventKind::ScrollRight => {
+                                app.executions_code_scroll_top =
+                                    app.executions_code_scroll_top.saturating_add(n);
+                            }
+                            _ => {}
+                        }
+                    } else if over_out {
+                        match me.kind {
+                            MouseEventKind::ScrollUp => {
+                                app.executions_output_scroll_top =
+                                    app.executions_output_scroll_top.saturating_sub(n);
+                            }
+                            MouseEventKind::ScrollDown => {
+                                app.executions_output_scroll_top =
+                                    app.executions_output_scroll_top.saturating_add(n);
+                            }
+                            MouseEventKind::ScrollLeft => {
+                                app.executions_output_scroll_top =
+                                    app.executions_output_scroll_top.saturating_sub(n);
+                            }
+                            MouseEventKind::ScrollRight => {
+                                app.executions_output_scroll_top =
+                                    app.executions_output_scroll_top.saturating_add(n);
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }

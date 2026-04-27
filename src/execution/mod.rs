@@ -65,5 +65,5 @@ pub use run::{
     CwdPolicy, RunAttachmentRef, RunResult, RunSpec, SessionCreateRequest, SessionHandle,
 };
 pub use run_events::RunEvent;
-pub use run_history::{write_run_journal, RunJournalParams};
+pub use run_history::{run_history_dir, write_run_journal, RunJournal, RunJournalParams};
 pub use ssh::{validate_remote_workdir, SshExecutionProvider, SshExecutionProviderConfig};
