@@ -10,15 +10,15 @@ use crate::{ActorError, ActorLogic, NodeHandle};
 
 #[derive(Clone, Debug)]
 pub(super) struct StoredResponse {
-    pub(super) internal_chat_id: String,
+    pub(super) thread_id: String,
     pub(super) sender_id: String,
     pub(super) model: String,
 }
 
-/// One row per distinct conversation for a given API user (`sender_id`).
+/// One row per distinct conversation thread for a given API user (`sender_id`).
 #[derive(Clone, Debug)]
-pub(super) struct SessionListRow {
-    pub(super) internal_chat_id: String,
+pub(super) struct ThreadListRow {
+    pub(super) thread_id: String,
     pub(super) updated_at: i64,
     /// Most recent `response_id` for `POST /v1/responses` chaining.
     pub(super) latest_response_id: String,
@@ -37,13 +37,13 @@ enum ApiStoreMessage {
         response_id: String,
         reply: SharedReply<Result<Option<StoredResponse>, String>>,
     },
-    ListSessionsBySender {
+    ListThreadsBySender {
         sender_id: String,
         limit: u32,
-        reply: SharedReply<Result<Vec<SessionListRow>, String>>,
+        reply: SharedReply<Result<Vec<ThreadListRow>, String>>,
     },
-    DeleteSessionResponses {
-        internal_chat_id: String,
+    DeleteThreadResponses {
+        thread_id: String,
         sender_id: String,
         reply: SharedReply<Result<usize, String>>,
     },
@@ -51,6 +51,29 @@ enum ApiStoreMessage {
 
 struct SqliteApiResponseStoreActor {
     conn: Connection,
+}
+
+fn table_has_column(conn: &Connection, table: &str, col: &str) -> rusqlite::Result<bool> {
+    let pragma = format!("PRAGMA table_info({})", table);
+    let mut stmt = conn.prepare(&pragma)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == col {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn migrate_api_responses_thread_column(conn: &Connection) -> rusqlite::Result<()> {
+    if table_has_column(conn, "api_responses", "internal_chat_id")? {
+        conn.execute(
+            "ALTER TABLE api_responses RENAME COLUMN internal_chat_id TO thread_id",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 impl SqliteApiResponseStoreActor {
@@ -67,7 +90,7 @@ impl SqliteApiResponseStoreActor {
             "CREATE TABLE IF NOT EXISTS api_responses (
                 response_id TEXT PRIMARY KEY,
                 previous_response_id TEXT,
-                internal_chat_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
                 sender_id TEXT NOT NULL,
                 model TEXT NOT NULL,
                 created_at INTEGER NOT NULL
@@ -75,6 +98,14 @@ impl SqliteApiResponseStoreActor {
             [],
         )
         .map_err(|e| format!("Failed to initialize api_responses table: {}", e))?;
+
+        migrate_api_responses_thread_column(&conn).map_err(|e| {
+            format!(
+                "Failed to migrate api_responses schema to thread_id naming: {}",
+                e
+            )
+        })?;
+
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_api_responses_previous_response_id
              ON api_responses(previous_response_id)",
@@ -119,12 +150,12 @@ impl ActorLogic<ApiStoreMessage> for SqliteApiResponseStoreActor {
                     .conn
                     .execute(
                         "INSERT INTO api_responses
-                            (response_id, previous_response_id, internal_chat_id, sender_id, model, created_at)
+                            (response_id, previous_response_id, thread_id, sender_id, model, created_at)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                         params![
                             response_id,
                             previous_response_id,
-                            stored.internal_chat_id,
+                            stored.thread_id,
                             stored.sender_id,
                             stored.model,
                             created_at
@@ -138,13 +169,13 @@ impl ActorLogic<ApiStoreMessage> for SqliteApiResponseStoreActor {
                 let result = self
                     .conn
                     .query_row(
-                        "SELECT internal_chat_id, sender_id, model
+                        "SELECT thread_id, sender_id, model
                          FROM api_responses
                          WHERE response_id = ?1",
                         params![response_id],
                         |row| {
                             Ok(StoredResponse {
-                                internal_chat_id: row.get(0)?,
+                                thread_id: row.get(0)?,
                                 sender_id: row.get(1)?,
                                 model: row.get(2)?,
                             })
@@ -154,29 +185,29 @@ impl ActorLogic<ApiStoreMessage> for SqliteApiResponseStoreActor {
                     .map_err(|e| format!("Failed to load response state: {}", e));
                 let _ = reply.send(result);
             }
-            ApiStoreMessage::ListSessionsBySender {
+            ApiStoreMessage::ListThreadsBySender {
                 sender_id,
                 limit,
                 reply,
             } => {
-                let result = (|| -> Result<Vec<SessionListRow>, String> {
+                let result = (|| -> Result<Vec<ThreadListRow>, String> {
                     let limit_i64 = i64::from(limit);
                     let mut stmt = self
                         .conn
                         .prepare(
                             "WITH RankedResponses AS (
                                 SELECT
-                                    internal_chat_id,
+                                    thread_id,
                                     response_id,
                                     created_at,
                                     ROW_NUMBER() OVER (
-                                        PARTITION BY internal_chat_id ORDER BY created_at DESC
+                                        PARTITION BY thread_id ORDER BY created_at DESC
                                     ) AS rn
                                 FROM api_responses
                                 WHERE sender_id = ?1
                             )
                             SELECT
-                                internal_chat_id,
+                                thread_id,
                                 created_at AS updated_at,
                                 response_id AS latest_response_id
                             FROM RankedResponses
@@ -184,26 +215,26 @@ impl ActorLogic<ApiStoreMessage> for SqliteApiResponseStoreActor {
                             ORDER BY updated_at DESC
                             LIMIT ?2",
                         )
-                        .map_err(|e| format!("Failed to list sessions: {}", e))?;
+                        .map_err(|e| format!("Failed to list threads: {}", e))?;
                     let rows = stmt
                         .query_map(params![sender_id, limit_i64], |row| {
-                            Ok(SessionListRow {
-                                internal_chat_id: row.get(0)?,
+                            Ok(ThreadListRow {
+                                thread_id: row.get(0)?,
                                 updated_at: row.get(1)?,
                                 latest_response_id: row.get(2)?,
                             })
                         })
-                        .map_err(|e| format!("Failed to list sessions: {}", e))?;
+                        .map_err(|e| format!("Failed to list threads: {}", e))?;
                     let mut out = Vec::new();
                     for r in rows {
-                        out.push(r.map_err(|e| format!("Failed to read session row: {}", e))?);
+                        out.push(r.map_err(|e| format!("Failed to read thread row: {}", e))?);
                     }
                     Ok(out)
                 })();
                 let _ = reply.send(result);
             }
-            ApiStoreMessage::DeleteSessionResponses {
-                internal_chat_id,
+            ApiStoreMessage::DeleteThreadResponses {
+                thread_id,
                 sender_id,
                 reply,
             } => {
@@ -211,10 +242,10 @@ impl ActorLogic<ApiStoreMessage> for SqliteApiResponseStoreActor {
                     .conn
                     .execute(
                         "DELETE FROM api_responses
-                         WHERE internal_chat_id = ?1 AND sender_id = ?2",
-                        params![internal_chat_id, sender_id],
+                         WHERE thread_id = ?1 AND sender_id = ?2",
+                        params![thread_id, sender_id],
                     )
-                    .map_err(|e| format!("Failed to delete session responses: {}", e));
+                    .map_err(|e| format!("Failed to delete thread responses: {}", e));
                 let _ = reply.send(result);
             }
         }
@@ -271,13 +302,13 @@ impl ResponseStore {
             .map_err(|_| "API response store actor channel closed".to_string())?
     }
 
-    pub(super) async fn list_sessions_by_sender(
+    pub(super) async fn list_threads_by_sender(
         &self,
         sender_id: &str,
         limit: u32,
-    ) -> Result<Vec<SessionListRow>, String> {
+    ) -> Result<Vec<ThreadListRow>, String> {
         let (tx, rx) = oneshot::channel();
-        let msg = ApiStoreMessage::ListSessionsBySender {
+        let msg = ApiStoreMessage::ListThreadsBySender {
             sender_id: sender_id.to_string(),
             limit,
             reply: SharedReply::new(tx),
@@ -285,27 +316,27 @@ impl ResponseStore {
         self.node
             .send_packet(msg)
             .await
-            .map_err(|e| format!("Failed to send list sessions request: {}", e))?;
+            .map_err(|e| format!("Failed to send list threads request: {}", e))?;
         rx.await
             .map_err(|_| "API response store actor channel closed".to_string())?
     }
 
-    /// Deletes persisted response-chain rows for this conversation and sender. Returns rows removed.
-    pub(super) async fn delete_session_responses(
+    /// Deletes persisted response-chain rows for this thread and sender. Returns rows removed.
+    pub(super) async fn delete_thread_responses(
         &self,
-        internal_chat_id: &str,
+        thread_id: &str,
         sender_id: &str,
     ) -> Result<usize, String> {
         let (tx, rx) = oneshot::channel();
-        let msg = ApiStoreMessage::DeleteSessionResponses {
-            internal_chat_id: internal_chat_id.to_string(),
+        let msg = ApiStoreMessage::DeleteThreadResponses {
+            thread_id: thread_id.to_string(),
             sender_id: sender_id.to_string(),
             reply: SharedReply::new(tx),
         };
         self.node
             .send_packet(msg)
             .await
-            .map_err(|e| format!("Failed to send delete session request: {}", e))?;
+            .map_err(|e| format!("Failed to send delete thread request: {}", e))?;
         rx.await
             .map_err(|_| "API response store actor channel closed".to_string())?
     }

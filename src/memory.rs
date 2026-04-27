@@ -92,6 +92,94 @@ pub fn configure_agent_sqlite_connection(conn: &Connection) -> Result<(), rusqli
     ))
 }
 
+fn table_has_column(conn: &Connection, table: &str, col: &str) -> rusqlite::Result<bool> {
+    let pragma = format!("PRAGMA table_info({})", table);
+    let mut stmt = conn.prepare(&pragma)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == col {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Renames chat-scoped `session_id` columns (and rebuilds FTS) for older agent SQLite files.
+fn migrate_agent_memory_to_thread_schema(conn: &Connection) -> rusqlite::Result<()> {
+    if table_has_column(conn, "messages", "session_id")? {
+        conn.execute(
+            "ALTER TABLE messages RENAME COLUMN session_id TO thread_id",
+            [],
+        )?;
+    }
+    let _ = conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_session_id;
+         DROP INDEX IF EXISTS idx_messages_session_role_id;",
+    );
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_thread_id ON messages (thread_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_thread_role_id ON messages (thread_id, role, id)",
+        [],
+    )?;
+
+    if table_has_column(conn, "session_summaries", "session_id")? {
+        conn.execute("DROP TRIGGER IF EXISTS session_summaries_ai", [])?;
+        conn.execute("DROP TRIGGER IF EXISTS session_summaries_ad", [])?;
+        conn.execute("DROP TABLE IF EXISTS session_summaries_fts", [])?;
+        conn.execute(
+            "ALTER TABLE session_summaries RENAME COLUMN session_id TO thread_id",
+            [],
+        )?;
+        let _ = conn.execute("DROP INDEX IF EXISTS idx_summaries_session", []);
+    }
+
+    let fts_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='session_summaries_fts'",
+        [],
+        |row| row.get(0),
+    )?;
+    if fts_count == 0 {
+        conn.execute(
+            "CREATE VIRTUAL TABLE session_summaries_fts USING fts5(
+                thread_id, summary, key_info, knowledge_gaps,
+                content='session_summaries', content_rowid='id'
+            )",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO session_summaries_fts(rowid, thread_id, summary, key_info, knowledge_gaps)
+             SELECT id, thread_id, summary, key_info, knowledge_gaps FROM session_summaries",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS session_summaries_ai AFTER INSERT ON session_summaries BEGIN
+                INSERT INTO session_summaries_fts(rowid, thread_id, summary, key_info, knowledge_gaps)
+                VALUES (new.id, new.thread_id, new.summary, new.key_info, new.knowledge_gaps);
+            END;",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS session_summaries_ad AFTER DELETE ON session_summaries BEGIN
+                DELETE FROM session_summaries_fts WHERE rowid = old.id;
+            END;",
+            [],
+        )?;
+    }
+
+    if table_has_column(conn, "session_metadata", "session_id")? {
+        conn.execute(
+            "ALTER TABLE session_metadata RENAME COLUMN session_id TO thread_id",
+            [],
+        )?;
+    }
+
+    Ok(())
+}
+
 /// Schema for `harness_todos` (same DB as agent memory; accessed only via [`MemoryMessage`] on [`SqliteMemoryActor`]).
 pub fn ensure_harness_todos_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(
@@ -235,7 +323,7 @@ fn migrate_legacy_json_todos(conn: &Connection, legacy_dir: &Path) -> Result<u32
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SummaryEntry {
     pub id: i64,
-    pub session_id: String,
+    pub thread_id: String,
     pub summary: String,
     pub key_info: String,
     pub knowledge_gaps: String,
@@ -246,32 +334,32 @@ pub struct SummaryEntry {
 #[derive(Clone, Debug)]
 pub enum MemoryMessage {
     AddMessage {
-        session_id: String,
+        thread_id: String,
         message: ChatMessage,
         reply: SharedReply<Result<(), String>>,
     },
     GetContext {
-        session_id: String,
+        thread_id: String,
         reply: SharedReply<Result<Vec<ChatMessage>, String>>,
     },
-    /// Plain-text preview from the earliest user turn (for session list titles).
+    /// Plain-text preview from the earliest user turn (for thread list titles).
     FirstUserMessagePreview {
-        session_id: String,
+        thread_id: String,
         reply: SharedReply<Result<Option<String>, String>>,
     },
-    /// Batch variant: one SQLite round-trip for many `session_id`s (same order as input).
+    /// Batch variant: one SQLite round-trip for many `thread_id`s (same order as input).
     FirstUserMessagePreviewsBatch {
-        session_ids: Vec<String>,
+        thread_ids: Vec<String>,
         reply: SharedReply<Result<Vec<Option<String>>, String>>,
     },
     Clear {
-        session_id: String,
+        thread_id: String,
         keep_last: usize,
         reply: SharedReply<Result<(), String>>,
     },
     // --- Reflection and Summary Messages ---
     AddSummary {
-        session_id: String,
+        thread_id: String,
         summary: String,
         key_info: String,
         knowledge_gaps: String,
@@ -285,12 +373,12 @@ pub enum MemoryMessage {
         reply: SharedReply<Result<(), String>>,
     },
     GetRecentSummaries {
-        session_id: String,
+        thread_id: String,
         limit: usize,
         reply: SharedReply<Result<Vec<String>, String>>,
     },
     GetSummaries {
-        session_id: String,
+        thread_id: String,
         limit: usize,
         reply: SharedReply<Result<Vec<SummaryEntry>, String>>,
     },
@@ -298,13 +386,13 @@ pub enum MemoryMessage {
         id: i64,
         reply: SharedReply<Result<(), String>>,
     },
-    UpdateSessionMetadata {
-        session_id: String,
+    UpdateThreadMetadata {
+        thread_id: String,
         last_reflection_msg_id: Option<i64>,
         reply: SharedReply<Result<(), String>>,
     },
-    GetSessionMetadata {
-        session_id: String,
+    GetThreadMetadata {
+        thread_id: String,
         reply: SharedReply<Result<(Option<i64>, String), String>>, // (last_msg_id, last_reflection_time)
     },
     SearchSummaries {
@@ -316,12 +404,12 @@ pub enum MemoryMessage {
         limit: usize,
         reply: SharedReply<Result<Vec<String>, String>>,
     },
-    GetSessionsNeedingReflection {
+    GetThreadsNeedingReflection {
         threshold_mins: u64,
         reply: SharedReply<Result<Vec<String>, String>>,
     },
     GetMessagesSinceReflection {
-        session_id: String,
+        thread_id: String,
         reply: SharedReply<GetMessagesSinceReflectionResult>,
     },
     GetLongTermReflectionState {
@@ -391,7 +479,7 @@ impl SqliteMemoryActor {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
                 role TEXT NOT NULL,
                 content TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -406,22 +494,11 @@ impl SqliteMemoryActor {
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN tool_call_id TEXT", []);
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN reasoning_content TEXT", []);
 
-        // Create an index to quickly filter by session_id
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_session_id ON messages (session_id)",
-            [],
-        )?;
-
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_messages_session_role_id ON messages (session_id, role, id)",
-            [],
-        )?;
-
         // Create the session_summaries table for reflections
         conn.execute(
             "CREATE TABLE IF NOT EXISTS session_summaries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL UNIQUE,
+                thread_id TEXT NOT NULL UNIQUE,
                 summary TEXT NOT NULL,
                 key_info TEXT NOT NULL,
                 knowledge_gaps TEXT NOT NULL,
@@ -430,26 +507,37 @@ impl SqliteMemoryActor {
             [],
         )?;
 
-        // Index for session summaries
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_summaries_session ON session_summaries (session_id)",
-            [],
-        )?;
-
         // Create the session_metadata table to track reflection progress
         conn.execute(
             "CREATE TABLE IF NOT EXISTS session_metadata (
-                session_id TEXT PRIMARY KEY,
+                thread_id TEXT PRIMARY KEY,
                 last_reflection_msg_id INTEGER,
                 last_reflection_time DATETIME DEFAULT CURRENT_TIMESTAMP
             )",
             [],
         )?;
 
+        migrate_agent_memory_to_thread_schema(&conn)?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_thread_id ON messages (thread_id)",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_thread_role_id ON messages (thread_id, role, id)",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_summaries_thread ON session_summaries (thread_id)",
+            [],
+        )?;
+
         // Create the session_summaries virtual table for FTS5
         conn.execute(
             "CREATE VIRTUAL TABLE IF NOT EXISTS session_summaries_fts USING fts5(
-                session_id, summary, key_info, knowledge_gaps,
+                thread_id, summary, key_info, knowledge_gaps,
                 content='session_summaries', content_rowid='id'
             )",
             [],
@@ -458,8 +546,8 @@ impl SqliteMemoryActor {
         // FTS Sync Trigger (Insert)
         conn.execute(
             "CREATE TRIGGER IF NOT EXISTS session_summaries_ai AFTER INSERT ON session_summaries BEGIN
-                INSERT INTO session_summaries_fts(rowid, session_id, summary, key_info, knowledge_gaps)
-                VALUES (new.id, new.session_id, new.summary, new.key_info, new.knowledge_gaps);
+                INSERT INTO session_summaries_fts(rowid, thread_id, summary, key_info, knowledge_gaps)
+                VALUES (new.id, new.thread_id, new.summary, new.key_info, new.knowledge_gaps);
             END;",
             [],
         )?;
@@ -513,7 +601,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
     ) -> Result<Option<(String, MemoryMessage)>, ActorError> {
         match packet {
             MemoryMessage::AddMessage {
-                session_id,
+                thread_id,
                 message,
                 reply,
             } => {
@@ -526,20 +614,20 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     .tool_calls
                     .map(|tc| serde_json::to_string(&tc).unwrap_or_default());
                 let res = self.conn.execute(
-                    "INSERT INTO messages (session_id, role, content, name, tool_calls, tool_call_id, reasoning_content) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![session_id, message.role, content_str, message.name, tool_calls_str, message.tool_call_id, message.reasoning_content],
+                    "INSERT INTO messages (thread_id, role, content, name, tool_calls, tool_call_id, reasoning_content) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![thread_id, message.role, content_str, message.name, tool_calls_str, message.tool_call_id, message.reasoning_content],
                 ).map_err(|e| e.to_string()).map(|_| ());
 
                 let _ = reply.send(res);
             }
-            MemoryMessage::GetContext { session_id, reply } => {
+            MemoryMessage::GetContext { thread_id, reply } => {
                 let res = (|| -> Result<Vec<ChatMessage>, String> {
                     let mut stmt = self.conn.prepare(
-                        "SELECT role, content, name, tool_calls, tool_call_id, reasoning_content FROM messages WHERE session_id = ?1 ORDER BY created_at ASC"
+                        "SELECT role, content, name, tool_calls, tool_call_id, reasoning_content FROM messages WHERE thread_id = ?1 ORDER BY created_at ASC"
                     ).map_err(|e| e.to_string())?;
 
                     let message_iter = stmt
-                        .query_map(params![session_id], |row| {
+                        .query_map(params![thread_id], |row| {
                             let tool_calls_str: Option<String> = row.get(3)?;
                             let tool_calls =
                                 tool_calls_str.and_then(|s| serde_json::from_str(&s).ok());
@@ -568,16 +656,16 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
 
                 let _ = reply.send(res);
             }
-            MemoryMessage::FirstUserMessagePreview { session_id, reply } => {
+            MemoryMessage::FirstUserMessagePreview { thread_id, reply } => {
                 let res = (|| -> Result<Option<String>, String> {
                     let mut stmt = self
                         .conn
                         .prepare(
-                            "SELECT content FROM messages WHERE session_id = ?1 AND role = 'user' ORDER BY id ASC LIMIT 1",
+                            "SELECT content FROM messages WHERE thread_id = ?1 AND role = 'user' ORDER BY id ASC LIMIT 1",
                         )
                         .map_err(|e| e.to_string())?;
                     let content_raw: Option<String> = stmt
-                        .query_row(params![session_id], |row| row.get(0))
+                        .query_row(params![thread_id], |row| row.get(0))
                         .optional()
                         .map_err(|e| e.to_string())?;
                     let Some(s) = content_raw else {
@@ -588,28 +676,28 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
 
                 let _ = reply.send(res);
             }
-            MemoryMessage::FirstUserMessagePreviewsBatch { session_ids, reply } => {
+            MemoryMessage::FirstUserMessagePreviewsBatch { thread_ids, reply } => {
                 let res = (|| -> Result<Vec<Option<String>>, String> {
-                    if session_ids.is_empty() {
+                    if thread_ids.is_empty() {
                         return Ok(Vec::new());
                     }
-                    let placeholders = session_ids
+                    let placeholders = thread_ids
                         .iter()
                         .map(|_| "?")
                         .collect::<Vec<_>>()
                         .join(",");
                     let sql = format!(
-                        "SELECT m.session_id, m.content FROM messages m
+                        "SELECT m.thread_id, m.content FROM messages m
                          INNER JOIN (
-                             SELECT session_id, MIN(id) AS min_id
+                             SELECT thread_id, MIN(id) AS min_id
                              FROM messages
-                             WHERE role = 'user' AND session_id IN ({placeholders})
-                             GROUP BY session_id
-                         ) t ON m.session_id = t.session_id AND m.id = t.min_id AND m.role = 'user'"
+                             WHERE role = 'user' AND thread_id IN ({placeholders})
+                             GROUP BY thread_id
+                         ) t ON m.thread_id = t.thread_id AND m.id = t.min_id AND m.role = 'user'"
                     );
                     let mut stmt = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
                     let mut rows = stmt
-                        .query(params_from_iter(session_ids.iter()))
+                        .query(params_from_iter(thread_ids.iter()))
                         .map_err(|e| e.to_string())?;
 
                     let mut map: HashMap<String, Option<String>> = HashMap::new();
@@ -619,7 +707,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                         map.insert(sid, first_user_preview_from_content(content));
                     }
 
-                    Ok(session_ids
+                    Ok(thread_ids
                         .iter()
                         .map(|id| match map.get(id.as_str()) {
                             None => None,
@@ -631,27 +719,27 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 let _ = reply.send(res);
             }
             MemoryMessage::Clear {
-                session_id,
+                thread_id,
                 keep_last,
                 reply,
             } => {
                 let res = (|| -> Result<(), String> {
                     let tx = self.conn.transaction().map_err(|e| e.to_string())?;
                     if keep_last == 0 {
-                        // Full session delete (explicit chat removal).
+                        // Full thread delete (explicit chat removal).
                         tx.execute(
-                            "DELETE FROM messages WHERE session_id = ?1",
-                            params![session_id],
+                            "DELETE FROM messages WHERE thread_id = ?1",
+                            params![thread_id],
                         )
                         .map_err(|e| e.to_string())?;
                         tx.execute(
-                            "DELETE FROM session_summaries WHERE session_id = ?1",
-                            params![session_id],
+                            "DELETE FROM session_summaries WHERE thread_id = ?1",
+                            params![thread_id],
                         )
                         .map_err(|e| e.to_string())?;
                         tx.execute(
-                            "DELETE FROM session_metadata WHERE session_id = ?1",
-                            params![session_id],
+                            "DELETE FROM session_metadata WHERE thread_id = ?1",
+                            params![thread_id],
                         )
                         .map_err(|e| e.to_string())?;
                     } else {
@@ -660,12 +748,12 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                             "keep_last is too large for the backing store".to_string()
                         })?;
                         tx.execute(
-                            "DELETE FROM messages WHERE session_id = ?1 AND id NOT IN (
+                            "DELETE FROM messages WHERE thread_id = ?1 AND id NOT IN (
                                 SELECT id FROM (
-                                    SELECT id FROM messages WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2
+                                    SELECT id FROM messages WHERE thread_id = ?1 ORDER BY id DESC LIMIT ?2
                                 )
                             )",
-                            params![session_id, keep],
+                            params![thread_id, keep],
                         )
                         .map_err(|e| e.to_string())?;
                     }
@@ -675,21 +763,21 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 let _ = reply.send(res);
             }
             MemoryMessage::AddSummary {
-                session_id,
+                thread_id,
                 summary,
                 key_info,
                 knowledge_gaps,
                 reply,
             } => {
                 let res = self.conn.execute(
-                    "INSERT INTO session_summaries (session_id, summary, key_info, knowledge_gaps) 
+                    "INSERT INTO session_summaries (thread_id, summary, key_info, knowledge_gaps) 
                      VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(session_id) DO UPDATE SET 
+                     ON CONFLICT(thread_id) DO UPDATE SET 
                         summary=excluded.summary, 
                         key_info=excluded.key_info, 
                         knowledge_gaps=excluded.knowledge_gaps,
                         created_at=CURRENT_TIMESTAMP",
-                    params![session_id, summary, key_info, knowledge_gaps],
+                    params![thread_id, summary, key_info, knowledge_gaps],
                 ).map_err(|e| e.to_string()).map(|_| ());
 
                 let _ = reply.send(res);
@@ -709,17 +797,17 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 let _ = reply.send(res);
             }
             MemoryMessage::GetRecentSummaries {
-                session_id,
+                thread_id,
                 limit,
                 reply,
             } => {
                 let res = (|| -> Result<Vec<String>, String> {
                     let mut stmt = self.conn.prepare(
                         "SELECT summary, key_info, knowledge_gaps, created_at FROM session_summaries 
-                         WHERE session_id LIKE ?1 ORDER BY created_at DESC LIMIT ?2"
+                         WHERE thread_id LIKE ?1 ORDER BY created_at DESC LIMIT ?2"
                     ).map_err(|e| e.to_string())?;
 
-                    let pattern = format!("{}%", session_id);
+                    let pattern = format!("{}%", thread_id);
                     let limit_i64 = limit as i64;
                     let rows = stmt
                         .query_map(params![pattern, limit_i64], |row| {
@@ -743,20 +831,20 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 let _ = reply.send(res);
             }
             MemoryMessage::GetSummaries {
-                session_id,
+                thread_id,
                 limit,
                 reply,
             } => {
                 let res = (|| -> Result<Vec<SummaryEntry>, String> {
-                    let mut stmt = if session_id.is_empty() {
+                    let mut stmt = if thread_id.is_empty() {
                         self.conn.prepare(
-                            "SELECT id, session_id, summary, key_info, knowledge_gaps, created_at FROM session_summaries 
+                            "SELECT id, thread_id, summary, key_info, knowledge_gaps, created_at FROM session_summaries 
                              ORDER BY created_at DESC LIMIT ?1"
                         ).map_err(|e| e.to_string())?
                     } else {
                         self.conn.prepare(
-                            "SELECT id, session_id, summary, key_info, knowledge_gaps, created_at FROM session_summaries 
-                             WHERE session_id LIKE ?1 ORDER BY created_at DESC LIMIT ?2"
+                            "SELECT id, thread_id, summary, key_info, knowledge_gaps, created_at FROM session_summaries 
+                             WHERE thread_id LIKE ?1 ORDER BY created_at DESC LIMIT ?2"
                         ).map_err(|e| e.to_string())?
                     };
 
@@ -764,7 +852,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     let summary_mapper = |row: &rusqlite::Row| {
                         Ok(SummaryEntry {
                             id: row.get(0)?,
-                            session_id: row.get(1)?,
+                            thread_id: row.get(1)?,
                             summary: row.get(2)?,
                             key_info: row.get(3)?,
                             knowledge_gaps: row.get(4)?,
@@ -772,14 +860,14 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                         })
                     };
 
-                    let summaries = if session_id.is_empty() {
+                    let summaries = if thread_id.is_empty() {
                         let rows = stmt
                             .query_map(params![limit_i64], summary_mapper)
                             .map_err(|e| e.to_string())?;
                         rows.collect::<Result<Vec<_>, _>>()
                             .map_err(|e| e.to_string())?
                     } else {
-                        let pattern = format!("{}%", session_id);
+                        let pattern = format!("{}%", thread_id);
                         let rows = stmt
                             .query_map(params![pattern, limit_i64], summary_mapper)
                             .map_err(|e| e.to_string())?;
@@ -799,28 +887,28 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     .map(|_| ());
                 let _ = reply.send(res);
             }
-            MemoryMessage::UpdateSessionMetadata {
-                session_id,
+            MemoryMessage::UpdateThreadMetadata {
+                thread_id,
                 last_reflection_msg_id,
                 reply,
             } => {
                 let res = self.conn.execute(
-                    "INSERT INTO session_metadata (session_id, last_reflection_msg_id, last_reflection_time) 
+                    "INSERT INTO session_metadata (thread_id, last_reflection_msg_id, last_reflection_time) 
                      VALUES (?1, ?2, CURRENT_TIMESTAMP) 
-                     ON CONFLICT(session_id) DO UPDATE SET 
+                     ON CONFLICT(thread_id) DO UPDATE SET 
                         last_reflection_msg_id=excluded.last_reflection_msg_id,
                         last_reflection_time=CURRENT_TIMESTAMP",
-                    params![session_id, last_reflection_msg_id],
+                    params![thread_id, last_reflection_msg_id],
                 ).map_err(|e| e.to_string()).map(|_| ());
                 let _ = reply.send(res);
             }
-            MemoryMessage::GetSessionMetadata { session_id, reply } => {
+            MemoryMessage::GetThreadMetadata { thread_id, reply } => {
                 let res = (|| -> Result<(Option<i64>, String), String> {
                     let mut stmt = self.conn.prepare(
-                        "SELECT last_reflection_msg_id, last_reflection_time FROM session_metadata WHERE session_id = ?1"
+                        "SELECT last_reflection_msg_id, last_reflection_time FROM session_metadata WHERE thread_id = ?1"
                     ).map_err(|e| e.to_string())?;
 
-                    let result = stmt.query_row(params![session_id], |row| {
+                    let result = stmt.query_row(params![thread_id], |row| {
                         let msg_id: Option<i64> = row.get(0)?;
                         let time: String = row.get(1)?;
                         Ok((msg_id, time))
@@ -839,7 +927,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
             MemoryMessage::SearchSummaries { query, reply } => {
                 let res = (|| -> Result<Vec<String>, String> {
                     let mut stmt = self.conn.prepare(
-                        "SELECT session_summaries.session_id, session_summaries.summary, session_summaries.key_info 
+                        "SELECT session_summaries.thread_id, session_summaries.summary, session_summaries.key_info 
                          FROM session_summaries 
                          JOIN session_summaries_fts ON session_summaries.id = session_summaries_fts.rowid
                          WHERE session_summaries_fts MATCH ?1 
@@ -854,7 +942,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                             let sid: String = row.get(0)?;
                             let sum: String = row.get(1)?;
                             let key: String = row.get(2)?;
-                            Ok(format!("Session [{}]: {}\nKey Info: {}", sid, sum, key))
+                            Ok(format!("Thread [{}]: {}\nKey Info: {}", sid, sum, key))
                         })
                         .map_err(|e| e.to_string())?;
 
@@ -873,7 +961,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
             } => {
                 let res = (|| -> Result<Vec<String>, String> {
                     let mut stmt = self.conn.prepare(
-                        "SELECT session_id, summary, key_info, created_at FROM session_summaries 
+                        "SELECT thread_id, summary, key_info, created_at FROM session_summaries 
                          WHERE created_at >= datetime('now', '-' || ?1 || ' days')
                          ORDER BY created_at DESC LIMIT ?2"
                     ).map_err(|e| e.to_string())?;
@@ -887,7 +975,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                             let key: String = row.get(2)?;
                             let created_at: String = row.get(3)?;
                             Ok(format!(
-                                "[{}] Session: {}\nSummary: {}\nKey Info: {}",
+                                "[{}] Thread: {}\nSummary: {}\nKey Info: {}",
                                 created_at, sid, sum, key
                             ))
                         })
@@ -901,17 +989,17 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 })();
                 let _ = reply.send(res);
             }
-            MemoryMessage::GetSessionsNeedingReflection {
+            MemoryMessage::GetThreadsNeedingReflection {
                 threshold_mins,
                 reply,
             } => {
                 let res = (|| -> Result<Vec<String>, String> {
                     let mut stmt = self.conn.prepare(
-                        "SELECT latest.session_id FROM (
-                            SELECT session_id, max(created_at) as last_msg_time, max(id) as max_id
-                            FROM messages GROUP BY session_id
+                        "SELECT latest.thread_id FROM (
+                            SELECT thread_id, max(created_at) as last_msg_time, max(id) as max_id
+                            FROM messages GROUP BY thread_id
                         ) as latest
-                        LEFT JOIN session_metadata md ON latest.session_id = md.session_id
+                        LEFT JOIN session_metadata md ON latest.thread_id = md.thread_id
                         WHERE (md.last_reflection_msg_id IS NULL OR latest.max_id > md.last_reflection_msg_id)
                           AND (julianday('now') - julianday(latest.last_msg_time)) * 1440 >= ?1"
                     ).map_err(|e| e.to_string())?;
@@ -931,20 +1019,20 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 })();
                 let _ = reply.send(res);
             }
-            MemoryMessage::GetMessagesSinceReflection { session_id, reply } => {
+            MemoryMessage::GetMessagesSinceReflection { thread_id, reply } => {
                 let res = (|| -> GetMessagesSinceReflectionResult {
                     let last_msg_id: Option<i64> = self.conn.query_row(
-                        "SELECT last_reflection_msg_id FROM session_metadata WHERE session_id = ?1",
-                        params![session_id],
+                        "SELECT last_reflection_msg_id FROM session_metadata WHERE thread_id = ?1",
+                        params![thread_id],
                         |row| row.get(0)
                     ).unwrap_or(None);
 
                     let mut msg_stmt = self.conn.prepare(
-                        "SELECT id, role, content, name, tool_calls, tool_call_id, reasoning_content FROM messages WHERE session_id = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id ASC"
+                        "SELECT id, role, content, name, tool_calls, tool_call_id, reasoning_content FROM messages WHERE thread_id = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id ASC"
                     ).map_err(|e| e.to_string())?;
 
                     let messages_iter = msg_stmt
-                        .query_map(params![session_id, last_msg_id], |row| {
+                        .query_map(params![thread_id, last_msg_id], |row| {
                             let id: i64 = row.get(0)?;
                             let role: String = row.get(1)?;
                             let content_raw: Option<String> = row.get(2)?;

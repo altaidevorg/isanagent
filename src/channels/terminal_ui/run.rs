@@ -69,7 +69,7 @@ const TOAST_COPY_ERR_SECS: u64 = 5;
 
 const TERMINAL_HELP: &str = r#"Commands (leading slash):
   /exit, /quit   Quit and restore the terminal
-  /new           Start a new session (new chat id)
+  /new           Start a new thread (new chat id)
   /copy          Copy the last assistant reply to the clipboard
   /install-python Install uv (best effort) in the background; UI stays responsive
   /cancel, /stop Stop the in-flight reply for this chat (drops queued prompts)
@@ -626,10 +626,6 @@ fn build_title_line(max_width: usize) -> Line<'static> {
     let groups = vec![
         vec![Span::styled(" isanagent ", Theme::input_prompt())],
         vec![Span::styled(
-            format!(" {} ", env!("CARGO_PKG_VERSION")),
-            dim,
-        )],
-        vec![Span::styled(
             "· /exit · /new · /copy · /cancel · /background · /retry · /tools · /exec · /help · Tab · Esc · wheel · PgUp/PgDn",
             dim,
         )],
@@ -664,7 +660,7 @@ fn build_status_line(
         ],
         vec![
             Span::styled(" · ", dim),
-            Span::styled(format!("session {sid}…"), dim),
+            Span::styled(format!("thread {sid}…"), dim),
         ],
         vec![
             Span::styled(" · ", dim),
@@ -1034,7 +1030,7 @@ fn executions_list_paragraph(app: &App, area: Rect) -> (Paragraph<'static>, usiz
         )));
     } else if app.executions_runs.is_empty() {
         slice.push(Line::from(Span::styled(
-            "No execution runs recorded for this terminal session yet.",
+            "No execution runs recorded for this terminal thread yet.",
             Theme::dim(),
         )));
         slice.push(Line::from(Span::styled(
@@ -1065,7 +1061,7 @@ fn executions_list_paragraph(app: &App, area: Rect) -> (Paragraph<'static>, usiz
     }
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled(" runs (this session) ", Theme::tool_done()))
+        .title(Span::styled(" runs (this thread) ", Theme::tool_done()))
         .border_style(Theme::dim());
     (
         Paragraph::new(Text::from(slice)).block(block),
@@ -1158,7 +1154,7 @@ pub(crate) struct RatatuiMainConfig {
     pub sandbox_dir: PathBuf,
     pub chat_id: String,
     pub channel_name: String,
-    pub session_banner: String,
+    pub opening_banner: String,
     pub status_model: String,
 }
 
@@ -1172,7 +1168,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         sandbox_dir,
         mut chat_id,
         channel_name,
-        session_banner,
+        opening_banner,
         status_model,
     } = config;
 
@@ -1190,7 +1186,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 
     let mut app = App::new();
     app.cells.push(Cell::System {
-        message: session_banner,
+        message: opening_banner,
     });
 
     // Result of a background `install_uv_best_effort` started from `/install-python`.
@@ -1549,7 +1545,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             chat_id = uuid::Uuid::new_v4().to_string();
                             app.thinking = false;
                             app.cells.push(Cell::System {
-                                message: format!("New session: {}", chat_id),
+                                message: format!("New thread: {}", chat_id),
                             });
                             rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
                             last_exec_poll = Instant::now();
@@ -1626,7 +1622,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 app.request_quit();
                             } else {
                                 app.cells.push(Cell::System {
-                                    message: "Cancel sent for this chat (queued prompts cleared)."
+                                    message: "Cancel sent for this thread (queued prompts cleared)."
                                         .into(),
                                 });
                             }
@@ -2028,13 +2024,13 @@ mod width_fit_tests {
     }
 
     #[test]
-    fn title_drops_version_and_hints_when_very_narrow() {
+    fn title_drops_hints_when_very_narrow() {
         let line = build_title_line(14);
         let t = flat(&line);
         assert!(t.contains("isanagent"), "{t}");
         assert!(
             !t.contains("PgUp"),
-            "keyboard hint lives in last chunk: {t}"
+            "keyboard hint chunk dropped when tight: {t}"
         );
     }
 }

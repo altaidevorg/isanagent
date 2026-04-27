@@ -1587,7 +1587,7 @@ impl AgentLogic {
                             let (tx, rx) = tokio::sync::oneshot::channel();
                             let _ = memory_node
                                 .send_packet(crate::memory::MemoryMessage::AddSummary {
-                                    session_id: session_key.clone(),
+                                    thread_id: session_key.clone(),
                                     summary,
                                     key_info,
                                     knowledge_gaps,
@@ -1599,15 +1599,15 @@ impl AgentLogic {
                             // Update metadata
                             let (tx, rx) = tokio::sync::oneshot::channel();
                             let msg = crate::memory::MemoryMessage::GetMessagesSinceReflection {
-                                session_id: session_key.clone(),
+                                thread_id: session_key.clone(),
                                 reply: crate::memory::SharedReply::new(tx),
                             };
                             if memory_node.send_packet(msg).await.is_ok() {
                                 if let Ok(Ok((rows, _))) = rx.await {
                                     if let Some((last_id, _)) = rows.last() {
                                         let (tx, rx) = tokio::sync::oneshot::channel();
-                                        let _ = memory_node.send_packet(crate::memory::MemoryMessage::UpdateSessionMetadata {
-                                            session_id: session_key.clone(),
+                                        let _ = memory_node.send_packet(crate::memory::MemoryMessage::UpdateThreadMetadata {
+                                            thread_id: session_key.clone(),
                                             last_reflection_msg_id: Some(*last_id),
                                             reply: crate::memory::SharedReply::new(tx),
                                         }).await;

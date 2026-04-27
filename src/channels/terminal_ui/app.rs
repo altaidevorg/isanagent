@@ -36,7 +36,7 @@ pub enum TerminalUiFocus {
     #[default]
     Transcript,
     ToolHistory,
-    /// Browse `execution_runs.jsonl` + per-run journals for this terminal session.
+    /// Browse `execution_runs.jsonl` + per-run journals for this terminal thread (`chat_id`).
     Executions,
 }
 
@@ -176,7 +176,7 @@ pub struct App {
     /// Upper bound on `scroll_offset`, set by the renderer from wrapped line counts.
     pub max_scroll: u16,
     pub should_quit: bool,
-    /// LLM loop active for this session (cleared on assistant reply, error, or clarification).
+    /// LLM loop active for this chat thread (cleared on assistant reply, error, or clarification).
     pub thinking: bool,
     /// Last drawn transcript widget area (for mouse wheel hit-testing).
     pub last_transcript_rect: Option<Rect>,

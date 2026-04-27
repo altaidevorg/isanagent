@@ -497,8 +497,8 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
         let sandbox_clone = sandbox_dir.clone();
         let log_clone = logger_tx.clone();
 
-        let session_banner = format!(
-            "isanagent v{} — session {}\n\
+        let opening_banner = format!(
+            "isanagent v{} — thread {}\n\
              Commands: /exit, /new  ·  Images: @path/to/file inside the workspace.",
             env!("CARGO_PKG_VERSION"),
             chat_id_clone
@@ -516,7 +516,7 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
                         sandbox_dir: sandbox_clone,
                         chat_id: chat_id_clone,
                         channel_name,
-                        session_banner,
+                        opening_banner,
                         status_model,
                     },
                 );

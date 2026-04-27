@@ -31,7 +31,7 @@ impl SessionManager {
     ) -> Result<Vec<String>, String> {
         let (tx, rx) = oneshot::channel();
         let msg = MemoryMessage::GetRecentSummaries {
-            session_id: session_prefix.to_string(),
+            thread_id: session_prefix.to_string(),
             limit,
             reply: SharedReply::new(tx),
         };
@@ -48,14 +48,14 @@ impl SessionManager {
 /// while natively interacting with the `SqliteMemoryActor` over the message bus.
 #[derive(Clone)]
 pub struct SessionProxy {
-    session_id: String,
+    thread_id: String,
     memory_node: NodeHandle<MemoryMessage>,
 }
 
 impl SessionProxy {
-    pub fn new(session_id: &str, memory_node: NodeHandle<MemoryMessage>) -> Self {
+    pub fn new(session_key: &str, memory_node: NodeHandle<MemoryMessage>) -> Self {
         Self {
-            session_id: session_id.to_string(),
+            thread_id: session_key.to_string(),
             memory_node,
         }
     }
@@ -66,7 +66,7 @@ impl Memory for SessionProxy {
     async fn add_message(&mut self, message: ChatMessage) -> Result<(), String> {
         let (tx, rx) = oneshot::channel();
         let msg = MemoryMessage::AddMessage {
-            session_id: self.session_id.clone(),
+            thread_id: self.thread_id.clone(),
             message,
             reply: SharedReply::new(tx),
         };
@@ -81,7 +81,7 @@ impl Memory for SessionProxy {
     async fn get_context(&self) -> Result<Vec<ChatMessage>, String> {
         let (tx, rx) = oneshot::channel();
         let msg = MemoryMessage::GetContext {
-            session_id: self.session_id.clone(),
+            thread_id: self.thread_id.clone(),
             reply: SharedReply::new(tx),
         };
         self.memory_node
@@ -95,7 +95,7 @@ impl Memory for SessionProxy {
     async fn get_context_since_reflection(&self) -> Result<Vec<ChatMessage>, String> {
         let (tx, rx) = oneshot::channel();
         let msg = MemoryMessage::GetMessagesSinceReflection {
-            session_id: self.session_id.clone(),
+            thread_id: self.thread_id.clone(),
             reply: SharedReply::new(tx),
         };
         self.memory_node
@@ -112,7 +112,7 @@ impl Memory for SessionProxy {
     async fn clear(&mut self) -> Result<(), String> {
         let (tx, rx) = oneshot::channel();
         let msg = MemoryMessage::Clear {
-            session_id: self.session_id.clone(),
+            thread_id: self.thread_id.clone(),
             keep_last: 0,
             reply: SharedReply::new(tx),
         };
@@ -127,7 +127,7 @@ impl Memory for SessionProxy {
     async fn clear_keep_last(&mut self, keep_last: usize) -> Result<(), String> {
         let (tx, rx) = oneshot::channel();
         let msg = MemoryMessage::Clear {
-            session_id: self.session_id.clone(),
+            thread_id: self.thread_id.clone(),
             keep_last,
             reply: SharedReply::new(tx),
         };
