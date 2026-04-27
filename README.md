@@ -2,7 +2,7 @@
 
 **An always-on, agentic ML engineer for your workspace** — built by [ALTAI](https://altai.dev). isanagent doesn’t just answer prompts: it **pushes work toward something shippable** — research, code, runs, checks, and handoffs you can actually use.
 
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache 2.0-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](./LICENSE)
 
 ---
 
@@ -47,35 +47,38 @@ If that’s the kind of “finish the thing and show your work” energy you wan
 
 ---
 
-## Get running in a few commands
+## Get started
 
-**1. Build the embedded UI** (the Rust binary embeds `ui/dist` at compile time):
+**Fast path:** download a prebuilt binary for your OS, run it, and complete the first-run wizard. The embedded browser UI is baked into the binary.
 
-```bash
-cd ui && npm ci && npm run build && cd ..
-```
+### Prebuilt binary (recommended)
 
-**2. Build isanagent**
+1. Open **[Releases](https://github.com/altaidevorg/isanagent/releases)** and download the asset for your platform from **Latest main build** (tag [`main-latest`](https://github.com/altaidevorg/isanagent/releases/tag/main-latest)): `isanagent-linux-x86_64`, `isanagent-macos-aarch64`, or `isanagent-windows-x86_64.exe`.
+2. On Linux or macOS, mark it executable (example): `chmod +x isanagent-linux-x86_64`.
+3. Run the binary from a terminal (example on Linux): `./isanagent-linux-x86_64`.
+
+If you use the **default workspace** (`~/.isanagent` on Unix, or the equivalent on Windows) and that folder does not exist yet, **the first run starts the interactive onboard wizard** (provider, API key env var, model, and workspace layout), then continues into the agent in the same session. For a custom workspace path, run `isanagent onboard` (add `--interactive` for the full wizard) or `isanagent --workspace /path/to/workspace` once the directory and `config.toml` exist.
+
+Set API credentials the wizard recommends (for example `GEMINI_API_KEY` or your provider’s variable). Turn on **`[api] enabled = true`** and **`serve_ui = true`** in `config.toml` when you want the browser UI on `http://127.0.0.1:<port>/`. For channels, memory, harness options, and sandbox rules, see [`AGENTS.md`](./AGENTS.md).
+
+### Build from source (optional)
+
+From a clone of this repo, **`ui/dist` is already present**, so a normal Rust build is enough unless you edited `ui/`:
 
 ```bash
 cargo build --release
+./target/release/isanagent
 ```
 
-**3. Scaffold a workspace** (config, sandbox, starter `AGENTS.md` / `SOUL.md`, and skills):
+To scaffold a workspace at a specific path without the default first-run flow:
 
 ```bash
-cargo run -- onboard --workspace my_agent
+cargo run --release -- onboard --workspace my_agent
+# then:
+cargo run --release -- --workspace my_agent
 ```
 
-**4. Set your provider** (see `my_agent/config.toml` — e.g. Gemini/OpenAI-compatible URL + `GEMINI_API_KEY` or your provider’s env var).
-
-**5. Run**
-
-```bash
-cargo run -- --workspace my_agent
-```
-
-Turn on **`[api] enabled = true`** and **`serve_ui = true`** when you want the browser UI on `http://127.0.0.1:<port>/`. For channel details, memory reflection, harness options, and sandbox rules, the **authoritative architecture note** is [`AGENTS.md`](./AGENTS.md) in this repo; your onboarded workspace mirrors the same ideas locally.
+You only need `cd ui && npm ci && npm run build` if you are changing the frontend.
 
 ---
 
