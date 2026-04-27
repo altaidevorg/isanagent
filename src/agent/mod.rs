@@ -10,7 +10,7 @@ mod subagent;
 pub use subagent::SubagentHarness;
 
 use crate::clarification::ClarificationHub;
-use crate::tool_runtime::ToolExecCtx;
+use crate::tool_runtime::{with_tool_exec_and_progress_scope, ToolExecCtx, ToolProgressEmitter};
 
 use crate::bus::{BusMessage, LogEvent, OutboundMessage, TelemetryEvent};
 use crate::config::{ResolvedShellPolicy, ShellPolicyMode};
@@ -179,6 +179,7 @@ async fn execute_tool_call_with_activity(
     channel: &str,
     outbound_tx: &mpsc::Sender<BusMessage>,
     tool_name: &str,
+    tool_call_id: Option<String>,
     args: Value,
     cancel_token: Option<&tokio_util::sync::CancellationToken>,
     runtime: ToolCallRuntime,
@@ -192,8 +193,15 @@ async fn execute_tool_call_with_activity(
     let tools = Arc::clone(tools);
     let outbound_tx = outbound_tx.clone();
     let cancel_owned = cancel_token.cloned();
+    let progress_emitter = ToolProgressEmitter {
+        outbound_tx: outbound_tx.clone(),
+        channel: channel.clone(),
+        chat_id: chat_id.clone(),
+        tool_name: tool_name.clone(),
+        tool_call_id,
+    };
 
-    crate::tool_runtime::with_tool_exec_scope(tool_exec_ctx, async move {
+    with_tool_exec_and_progress_scope(tool_exec_ctx, progress_emitter, async move {
         let args = args;
         let activity_handle = tool_execution_activity
             .as_ref()
@@ -741,6 +749,7 @@ impl AgentLogic {
             "test",
             &self.outbound_tx,
             tool_name,
+            None,
             args,
             None,
             ToolCallRuntime {
@@ -1326,6 +1335,7 @@ impl AgentLogic {
                         let shell_policy_for_call = shell_policy.clone();
                         let outbound_for_call = outbound_tx.clone();
                         let channel_for_call = inbound.channel.clone();
+                        let tool_call_id = Some(tc.id.clone());
                         futures_vec.push(async move {
                             execute_tool_call_with_activity(
                                 &tools,
@@ -1334,6 +1344,7 @@ impl AgentLogic {
                                 &channel_for_call,
                                 &outbound_for_call,
                                 &tool_name,
+                                tool_call_id,
                                 args,
                                 Some(&cancel_token),
                                 ToolCallRuntime {
@@ -1415,6 +1426,7 @@ impl AgentLogic {
                             &inbound.channel,
                             &outbound_tx,
                             tool_name,
+                            Some(tc.id.clone()),
                             args,
                             Some(&cancel_token),
                             ToolCallRuntime {
@@ -1575,7 +1587,7 @@ impl AgentLogic {
                             let (tx, rx) = tokio::sync::oneshot::channel();
                             let _ = memory_node
                                 .send_packet(crate::memory::MemoryMessage::AddSummary {
-                                    session_id: session_key.clone(),
+                                    thread_id: session_key.clone(),
                                     summary,
                                     key_info,
                                     knowledge_gaps,
@@ -1587,15 +1599,15 @@ impl AgentLogic {
                             // Update metadata
                             let (tx, rx) = tokio::sync::oneshot::channel();
                             let msg = crate::memory::MemoryMessage::GetMessagesSinceReflection {
-                                session_id: session_key.clone(),
+                                thread_id: session_key.clone(),
                                 reply: crate::memory::SharedReply::new(tx),
                             };
                             if memory_node.send_packet(msg).await.is_ok() {
                                 if let Ok(Ok((rows, _))) = rx.await {
                                     if let Some((last_id, _)) = rows.last() {
                                         let (tx, rx) = tokio::sync::oneshot::channel();
-                                        let _ = memory_node.send_packet(crate::memory::MemoryMessage::UpdateSessionMetadata {
-                                            session_id: session_key.clone(),
+                                        let _ = memory_node.send_packet(crate::memory::MemoryMessage::UpdateThreadMetadata {
+                                            thread_id: session_key.clone(),
                                             last_reflection_msg_id: Some(*last_id),
                                             reply: crate::memory::SharedReply::new(tx),
                                         }).await;
@@ -1969,7 +1981,7 @@ mod tests {
         provider: Box<dyn Provider>,
         clarification_hub: Arc<ClarificationHub>,
     ) -> (AgentLogic, mpsc::Receiver<BusMessage>) {
-        let memory_actor = SqliteMemoryActor::new(":memory:", None).expect("memory actor");
+        let memory_actor = SqliteMemoryActor::new(":memory:").expect("memory actor");
         let memory_node = NodeHandle::new(memory_actor, 16, 1, Duration::from_millis(1));
         let session_manager = SessionManager::new(memory_node);
 
@@ -2025,7 +2037,7 @@ mod tests {
         tool_execution_activity: Option<SharedToolExecutionActivity>,
         tool_delay: Duration,
     ) -> AgentLogic {
-        let memory_actor = SqliteMemoryActor::new(":memory:", None).expect("memory actor");
+        let memory_actor = SqliteMemoryActor::new(":memory:").expect("memory actor");
         let memory_node = NodeHandle::new(memory_actor, 16, 1, Duration::from_millis(1));
         let session_manager = SessionManager::new(memory_node);
 

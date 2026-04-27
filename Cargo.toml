@@ -2,6 +2,7 @@
 name = "isanagent"
 version = "0.1.0"
 edition = "2021"
+license = "AGPL-3.0-only"
 # `russh` (SSH client) requires Rust 1.85+.
 rust-version = "1.85"
 
@@ -53,6 +54,7 @@ base64 = "0.22.1"
 async-stream = "0.3"
 tokio-util = "0.7.18"
 ratatui = "0.29"
+syntect = { version = "5.2", default-features = false, features = ["default-themes", "default-syntaxes", "regex-fancy"] }
 pulldown-cmark = "0.12"
 unicode-width = "0.2"
 arboard = { version = "3.4", default-features = false }

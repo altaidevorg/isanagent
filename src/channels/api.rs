@@ -82,6 +82,10 @@ enum StreamEvent {
         tool_name: String,
         args: String,
     },
+    ToolProgress {
+        tool_name: String,
+        message: String,
+    },
     ToolCallFinished {
         tool_name: String,
         result: String,
@@ -91,7 +95,7 @@ enum StreamEvent {
     },
     Completion {
         content: String,
-        internal_chat_id: String,
+        thread_id: String,
         response_id: String,
     },
     Error {
@@ -129,7 +133,7 @@ struct ResponsesRequest {
     user: Option<String>,
     stream: Option<bool>,
     /// When starting a new chain (no `previous_response_id`), the UI may supply a UUID so cancel works before any SSE is read.
-    internal_chat_id: Option<String>,
+    thread_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,8 +151,8 @@ struct ResponsesResponse {
     model: String,
     status: &'static str,
     previous_response_id: Option<String>,
-    /// Same key as `messages.session_id` in workspace SQLite (terminal-style session).
-    internal_chat_id: String,
+    /// Same key as `messages.thread_id` in workspace SQLite (API thread / chat scope).
+    thread_id: String,
     output: Vec<ResponsesOutputItem>,
 }
 
@@ -162,22 +166,22 @@ struct SessionHistoryMessage {
 }
 
 #[derive(Debug, Deserialize)]
-struct SessionsQueryParams {
+struct ThreadsQueryParams {
     user: String,
-    /// Max sessions to return (default 100, clamped 1–500).
+    /// Max threads to return (default 100, clamped 1–500).
     #[serde(default)]
     limit: Option<u32>,
 }
 
-fn clamp_session_list_limit(raw: Option<u32>) -> u32 {
+fn clamp_thread_list_limit(raw: Option<u32>) -> u32 {
     const DEFAULT: u32 = 100;
     const MAX: u32 = 500;
     raw.unwrap_or(DEFAULT).clamp(1, MAX)
 }
 
 #[derive(Serialize)]
-struct SessionListEntry {
-    internal_chat_id: String,
+struct ThreadListEntry {
+    thread_id: String,
     updated_at: i64,
     latest_response_id: String,
     /// First user line (truncated), ChatGPT-style sidebar label.
@@ -396,11 +400,11 @@ impl Channel for ApiChannel {
                 }
                 PendingRequest::Stream(pending) => {
                     let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
-                    let internal_chat_id = msg.chat_id.clone();
+                    let thread_id = msg.chat_id.clone();
                     if pending.store_response {
                         let now = chrono::Utc::now().timestamp();
                         let stored = StoredResponse {
-                            internal_chat_id: internal_chat_id.clone(),
+                            thread_id: thread_id.clone(),
                             sender_id: pending.sender_id.clone(),
                             model: pending.model.clone(),
                         };
@@ -423,7 +427,7 @@ impl Channel for ApiChannel {
                                         response_id, e
                                     ),
                                 )
-                                .with_chat_id(&internal_chat_id),
+                                .with_chat_id(&thread_id),
                             );
                             if let Err(send_err) = pending.stream_tx.try_send(StreamEvent::Error {
                                 message: "Failed to persist response state.".to_string(),
@@ -446,11 +450,11 @@ impl Channel for ApiChannel {
                                 response_id
                             ),
                         )
-                        .with_chat_id(&internal_chat_id),
+                        .with_chat_id(&thread_id),
                     );
                     if let Err(e) = pending.stream_tx.try_send(StreamEvent::Completion {
                         content: msg.content,
-                        internal_chat_id,
+                        thread_id,
                         response_id,
                     }) {
                         error!("Failed to send completion to stream: {}", e);
@@ -486,6 +490,23 @@ impl ApiChannel {
                             .try_send(StreamEvent::ToolCallStarted { tool_name, args })
                         {
                             error!("Failed to send tool_call_started to stream: {}", e);
+                        }
+                    }
+                }
+            }
+            TelemetryEvent::ToolProgress {
+                chat_id,
+                tool_name,
+                message,
+                ..
+            } => {
+                if let Some(pending) = self.pending_requests.get(&chat_id) {
+                    if let PendingRequest::Stream(pending) = pending.value() {
+                        if let Err(e) = pending
+                            .stream_tx
+                            .try_send(StreamEvent::ToolProgress { tool_name, message })
+                        {
+                            error!("Failed to send tool_progress to stream: {}", e);
                         }
                     }
                 }
@@ -527,15 +548,15 @@ fn build_router(state: ApiState, serve_ui: bool) -> Router {
     let mut app = Router::new()
         .route("/v1/chat/completions", post(handle_chat))
         .route("/v1/responses", post(handle_responses))
-        .route("/v1/sessions", get(handle_list_sessions))
+        .route("/v1/threads", get(handle_list_threads))
         .route(
-            "/v1/sessions/{session_id}/messages",
-            get(handle_session_messages),
+            "/v1/threads/{thread_id}/messages",
+            get(handle_thread_messages),
         )
-        .route("/v1/sessions/{session_id}", delete(handle_delete_session))
+        .route("/v1/threads/{thread_id}", delete(handle_delete_thread))
         .route(
-            "/v1/sessions/{session_id}/summaries",
-            get(handle_get_summaries),
+            "/v1/threads/{thread_id}/summaries",
+            get(handle_get_thread_summaries),
         )
         .route("/v1/summaries", get(handle_get_all_summaries))
         .route("/v1/summaries/{id}", post(handle_update_summary))
@@ -804,7 +825,7 @@ async fn handle_responses(
 
     let stream_requested = payload.stream.unwrap_or(false);
 
-    let (internal_chat_id, sender_id, model, previous_response_id) =
+    let (conv_thread_id, sender_id, model, previous_response_id) =
         match payload.previous_response_id.as_deref() {
             Some(previous_response_id) => {
                 let stored = if let Some(stored) = state.responses_cache.get(previous_response_id) {
@@ -867,20 +888,20 @@ async fn handle_responses(
                 };
 
                 (
-                    stored.internal_chat_id,
+                    stored.thread_id,
                     payload.user.unwrap_or(stored.sender_id),
                     payload.model.unwrap_or(stored.model),
                     Some(previous_response_id.to_string()),
                 )
             }
             None => {
-                let internal_chat_id = if let Some(ref raw) = payload.internal_chat_id {
+                let conv_thread_id = if let Some(ref raw) = payload.thread_id {
                     let trimmed = raw.trim();
                     if trimmed.is_empty() {
                         return ApiError::new(
                             StatusCode::BAD_REQUEST,
-                            "invalid_internal_chat_id",
-                            "internal_chat_id must be a non-empty UUID when provided.",
+                            "invalid_thread_id",
+                            "thread_id must be a non-empty UUID when provided.",
                         )
                         .into_response();
                     }
@@ -889,8 +910,8 @@ async fn handle_responses(
                         Err(_) => {
                             return ApiError::new(
                                 StatusCode::BAD_REQUEST,
-                                "invalid_internal_chat_id",
-                                "internal_chat_id must be a valid UUID.",
+                                "invalid_thread_id",
+                                "thread_id must be a valid UUID.",
                             )
                             .into_response();
                         }
@@ -899,7 +920,7 @@ async fn handle_responses(
                     uuid::Uuid::new_v4().to_string()
                 };
                 (
-                    internal_chat_id,
+                    conv_thread_id,
                     payload.user.unwrap_or_else(|| DEFAULT_API_USER.to_string()),
                     payload
                         .model
@@ -911,7 +932,7 @@ async fn handle_responses(
 
     if stream_requested {
         let (stream_tx, mut stream_rx) = mpsc::channel(100);
-        match state.pending_requests.entry(internal_chat_id.clone()) {
+        match state.pending_requests.entry(conv_thread_id.clone()) {
             Entry::Occupied(_) => {
                 return ApiError::new(
                     StatusCode::CONFLICT,
@@ -931,17 +952,17 @@ async fn handle_responses(
             }
         }
 
-        // Send an initial event with the internal_chat_id so the client can cancel even before completion
+        // Send an initial event with `thread_id` so the client can cancel even before completion
         let _ = stream_tx.try_send(StreamEvent::Completion {
             content: String::new(),
-            internal_chat_id: internal_chat_id.clone(),
+            thread_id: conv_thread_id.clone(),
             response_id: String::new(),
         });
 
         let inbound = InboundMessage {
             channel: state.channel_name.clone(),
             sender_id: sender_id.clone(),
-            chat_id: internal_chat_id.clone(),
+            chat_id: conv_thread_id.clone(),
             thread_id: None,
             content: input.content,
             attachments: input.attachments,
@@ -949,7 +970,7 @@ async fn handle_responses(
         };
 
         if let Err(e) = state.bus_tx.send(BusMessage::Inbound(inbound)).await {
-            state.pending_requests.remove(&internal_chat_id);
+            state.pending_requests.remove(&conv_thread_id);
             return ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "agent_queue_unavailable",
@@ -972,17 +993,16 @@ async fn handle_responses(
         let mut sse_response = Sse::new(stream)
             .keep_alive(axum::response::sse::KeepAlive::default())
             .into_response();
-        if let Ok(hv) = HeaderValue::from_str(&internal_chat_id) {
+        if let Ok(hv) = HeaderValue::from_str(&conv_thread_id) {
             sse_response
                 .headers_mut()
-                .insert(HeaderName::from_static("x-internal-chat-id"), hv);
+                .insert(HeaderName::from_static("x-thread-id"), hv);
         }
         return sse_response;
     }
 
     let outbound =
-        match dispatch_agent_turn(&state, sender_id.clone(), internal_chat_id.clone(), input).await
-        {
+        match dispatch_agent_turn(&state, sender_id.clone(), conv_thread_id.clone(), input).await {
             Ok(outbound) => outbound,
             Err(err) => return err.into_response(),
         };
@@ -990,7 +1010,7 @@ async fn handle_responses(
     let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
     if store_response {
         let stored = StoredResponse {
-            internal_chat_id: internal_chat_id.clone(),
+            thread_id: conv_thread_id.clone(),
             sender_id,
             model: model.clone(),
         };
@@ -1005,7 +1025,7 @@ async fn handle_responses(
                     "ApiChannel",
                     &format!("Failed to persist response {}: {}", response_id, e),
                 )
-                .with_chat_id(&internal_chat_id),
+                .with_chat_id(&conv_thread_id),
             );
             return ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1026,7 +1046,7 @@ async fn handle_responses(
                 response_id
             ),
         )
-        .with_chat_id(&internal_chat_id),
+        .with_chat_id(&conv_thread_id),
     );
 
     Json(ResponsesResponse {
@@ -1036,7 +1056,7 @@ async fn handle_responses(
         model,
         status: "completed",
         previous_response_id,
-        internal_chat_id: internal_chat_id.clone(),
+        thread_id: conv_thread_id.clone(),
         output: vec![ResponsesOutputItem {
             id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
             kind: "message",
@@ -1375,12 +1395,12 @@ fn chat_messages_to_ui_transcript(messages: &[ChatMessage]) -> Vec<SessionHistor
     out
 }
 
-/// Maps a path segment to the SQLite `messages.session_id` key.
+/// Maps a path segment to the SQLite `messages.thread_id` key.
 ///
 /// [`AgentLogic`](crate::agent::AgentLogic) uses `format!("{}:{}:{}", channel, chat_id, thread_id)`;
-/// for API messages with no thread that is `api:<uuid>:` (note trailing colon).
-/// Clients pass the bare `internal_chat_id` (uuid only); we qualify it with this channel name.
-fn resolve_memory_session_id<'a>(state: &ApiState, raw: &'a str) -> Cow<'a, str> {
+/// for API messages with no agent sub-thread that is `api:<uuid>:` (note trailing colon).
+/// Clients pass the bare thread id (uuid only); we qualify it with this channel name.
+fn resolve_memory_thread_id<'a>(state: &ApiState, raw: &'a str) -> Cow<'a, str> {
     let s = raw.trim();
     let prefix = format!("{}:", state.channel_name);
     if s.starts_with(&prefix) {
@@ -1402,11 +1422,11 @@ fn resolve_memory_session_id<'a>(state: &ApiState, raw: &'a str) -> Cow<'a, str>
 
 async fn memory_get_context(
     memory_node: &NodeHandle<MemoryMessage>,
-    session_id: &str,
+    memory_thread_id: &str,
 ) -> Result<Vec<ChatMessage>, String> {
     let (tx, rx) = oneshot::channel();
     let msg = MemoryMessage::GetContext {
-        session_id: session_id.to_string(),
+        thread_id: memory_thread_id.to_string(),
         reply: SharedReply::new(tx),
     };
     memory_node
@@ -1419,14 +1439,14 @@ async fn memory_get_context(
 
 async fn memory_first_user_previews_batch(
     memory_node: &NodeHandle<MemoryMessage>,
-    session_ids: Vec<String>,
+    thread_ids: Vec<String>,
 ) -> Result<Vec<Option<String>>, String> {
-    if session_ids.is_empty() {
+    if thread_ids.is_empty() {
         return Ok(Vec::new());
     }
     let (tx, rx) = oneshot::channel();
     let msg = MemoryMessage::FirstUserMessagePreviewsBatch {
-        session_ids,
+        thread_ids,
         reply: SharedReply::new(tx),
     };
     memory_node
@@ -1437,13 +1457,13 @@ async fn memory_first_user_previews_batch(
         .map_err(|_| "Memory actor channel closed".to_string())?
 }
 
-async fn memory_clear_session(
+async fn memory_clear_thread(
     memory_node: &NodeHandle<MemoryMessage>,
-    memory_session_id: &str,
+    memory_thread_id: &str,
 ) -> Result<(), String> {
     let (tx, rx) = oneshot::channel();
     let msg = MemoryMessage::Clear {
-        session_id: memory_session_id.to_string(),
+        thread_id: memory_thread_id.to_string(),
         keep_last: 0,
         reply: SharedReply::new(tx),
     };
@@ -1455,9 +1475,9 @@ async fn memory_clear_session(
         .map_err(|_| "Memory actor channel closed".to_string())?
 }
 
-async fn handle_list_sessions(
+async fn handle_list_threads(
     State(state): State<ApiState>,
-    Query(params): Query<SessionsQueryParams>,
+    Query(params): Query<ThreadsQueryParams>,
 ) -> Response {
     let user = params.user.trim();
     if user.is_empty() {
@@ -1468,34 +1488,35 @@ async fn handle_list_sessions(
         )
         .into_response();
     }
-    let limit = clamp_session_list_limit(params.limit);
+    let limit = clamp_thread_list_limit(params.limit);
     match state
         .response_store
-        .list_sessions_by_sender(user, limit)
+        .list_threads_by_sender(user, limit)
         .await
     {
         Ok(rows) => {
-            let session_ids: Vec<String> = rows
+            let memory_thread_ids: Vec<String> = rows
                 .iter()
-                .map(|row| resolve_memory_session_id(&state, &row.internal_chat_id).into_owned())
+                .map(|row| resolve_memory_thread_id(&state, &row.thread_id).into_owned())
                 .collect();
             let preview_opts =
-                match memory_first_user_previews_batch(&state.memory_node, session_ids).await {
+                match memory_first_user_previews_batch(&state.memory_node, memory_thread_ids).await
+                {
                     Ok(v) if v.len() == rows.len() => v,
                     Ok(v) => {
                         error!(
-                            "session list preview batch length mismatch: got {} want {}",
+                            "thread list preview batch length mismatch: got {} want {}",
                             v.len(),
                             rows.len()
                         );
                         vec![None; rows.len()]
                     }
                     Err(e) => {
-                        error!("session list preview batch failed: {}", e);
+                        error!("thread list preview batch failed: {}", e);
                         vec![None; rows.len()]
                     }
                 };
-            let body: Vec<SessionListEntry> = rows
+            let body: Vec<ThreadListEntry> = rows
                 .into_iter()
                 .zip(preview_opts)
                 .map(|(row, preview_raw)| {
@@ -1505,8 +1526,8 @@ async fn handle_list_sessions(
                         .map(|s| truncate_chat_preview(&s))
                         .filter(|s| !s.is_empty())
                         .unwrap_or_default();
-                    SessionListEntry {
-                        internal_chat_id: row.internal_chat_id,
+                    ThreadListEntry {
+                        thread_id: row.thread_id,
                         updated_at: row.updated_at,
                         latest_response_id: row.latest_response_id,
                         preview,
@@ -1517,24 +1538,24 @@ async fn handle_list_sessions(
         }
         Err(message) => ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "session_list_unavailable",
+            "thread_list_unavailable",
             message,
         )
         .into_response(),
     }
 }
 
-async fn handle_delete_session(
+async fn handle_delete_thread(
     State(state): State<ApiState>,
-    AxumPath(session_id): AxumPath<String>,
-    Query(params): Query<SessionsQueryParams>,
+    AxumPath(thread_id): AxumPath<String>,
+    Query(params): Query<ThreadsQueryParams>,
 ) -> Response {
-    let session_id = session_id.trim();
-    if session_id.is_empty() {
+    let thread_id = thread_id.trim();
+    if thread_id.is_empty() {
         return ApiError::new(
             StatusCode::BAD_REQUEST,
-            "invalid_session",
-            "Empty session id.",
+            "invalid_thread",
+            "Empty thread id.",
         )
         .into_response();
     }
@@ -1548,22 +1569,22 @@ async fn handle_delete_session(
         .into_response();
     }
 
-    let bare_id = session_id
+    let bare_id = thread_id
         .rsplit(':')
         .find(|s| !s.is_empty())
-        .unwrap_or(session_id);
+        .unwrap_or(thread_id);
 
     // Verify ownership via the API store before touching memory: `delete` only removes rows
-    // where `internal_chat_id` and `sender_id` match, so `removed == 0` means no access.
+    // where `thread_id` and `sender_id` match, so `removed == 0` means no access.
     match state
         .response_store
-        .delete_session_responses(bare_id, user)
+        .delete_thread_responses(bare_id, user)
         .await
     {
         Ok(removed) if removed > 0 => {
-            let memory_session_id = resolve_memory_session_id(&state, session_id);
+            let memory_thread_id = resolve_memory_thread_id(&state, thread_id);
             if let Err(message) =
-                memory_clear_session(&state.memory_node, memory_session_id.as_ref()).await
+                memory_clear_thread(&state.memory_node, memory_thread_id.as_ref()).await
             {
                 return ApiError::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1575,40 +1596,40 @@ async fn handle_delete_session(
             Json(serde_json::json!({
                 "deleted": true,
                 "responses_removed": removed,
-                "internal_chat_id": bare_id,
+                "thread_id": bare_id,
             }))
             .into_response()
         }
         Ok(removed) => Json(serde_json::json!({
             "deleted": false,
             "responses_removed": removed,
-            "internal_chat_id": bare_id,
+            "thread_id": bare_id,
         }))
         .into_response(),
         Err(message) => ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "session_delete_unavailable",
+            "thread_delete_unavailable",
             message,
         )
         .into_response(),
     }
 }
 
-async fn handle_session_messages(
+async fn handle_thread_messages(
     State(state): State<ApiState>,
-    AxumPath(session_id): AxumPath<String>,
+    AxumPath(thread_id): AxumPath<String>,
 ) -> Response {
-    let session_id = session_id.trim();
-    if session_id.is_empty() {
+    let thread_id = thread_id.trim();
+    if thread_id.is_empty() {
         return ApiError::new(
             StatusCode::BAD_REQUEST,
-            "invalid_session",
-            "Empty session id.",
+            "invalid_thread",
+            "Empty thread id.",
         )
         .into_response();
     }
-    let memory_session_id = resolve_memory_session_id(&state, session_id);
-    match memory_get_context(&state.memory_node, memory_session_id.as_ref()).await {
+    let memory_thread_id = resolve_memory_thread_id(&state, thread_id);
+    match memory_get_context(&state.memory_node, memory_thread_id.as_ref()).await {
         Ok(rows) => {
             let body = chat_messages_to_ui_transcript(&rows);
             Json(body).into_response()
@@ -1622,23 +1643,23 @@ async fn handle_session_messages(
     }
 }
 
-async fn handle_get_summaries(
+async fn handle_get_thread_summaries(
     State(state): State<ApiState>,
-    AxumPath(session_id): AxumPath<String>,
+    AxumPath(thread_id): AxumPath<String>,
 ) -> Response {
-    let session_id = session_id.trim();
-    if session_id.is_empty() {
+    let thread_id = thread_id.trim();
+    if thread_id.is_empty() {
         return ApiError::new(
             StatusCode::BAD_REQUEST,
-            "invalid_session",
-            "Empty session id.",
+            "invalid_thread",
+            "Empty thread id.",
         )
         .into_response();
     }
-    let memory_session_id = resolve_memory_session_id(&state, session_id);
+    let memory_thread_id = resolve_memory_thread_id(&state, thread_id);
     let (tx, rx) = oneshot::channel();
     let msg = MemoryMessage::GetSummaries {
-        session_id: memory_session_id.to_string(),
+        thread_id: memory_thread_id.to_string(),
         limit: 50,
         reply: SharedReply::new(tx),
     };
@@ -1702,7 +1723,7 @@ async fn handle_update_summary(
 async fn handle_get_all_summaries(State(state): State<ApiState>) -> Response {
     let (tx, rx) = oneshot::channel();
     let msg = MemoryMessage::GetSummaries {
-        session_id: String::new(), // Empty string means get all
+        thread_id: String::new(), // Empty string means get all
         limit: 100,
         reply: SharedReply::new(tx),
     };
@@ -2299,8 +2320,8 @@ mod tests {
         scheduler: Option<Arc<MultiTenantEdgeCronScheduler>>,
     ) -> ApiState {
         let (logger_tx, _logger_rx) = create_logger_channel(32);
-        let memory_actor = SqliteMemoryActor::new(db_path.to_str().expect("utf8 db path"), None)
-            .expect("memory actor");
+        let memory_actor =
+            SqliteMemoryActor::new(db_path.to_str().expect("utf8 db path")).expect("memory actor");
         let memory_node =
             NodeHandle::<MemoryMessage>::new(memory_actor, 100, 1, Duration::from_millis(5));
         let workspace_sandbox = db_path.parent().expect("db path parent").join("workspace");
@@ -2472,7 +2493,7 @@ bind_address = "127.0.0.1"
     }
 
     #[tokio::test]
-    async fn session_messages_qualifies_bare_chat_id_with_api_channel_prefix() {
+    async fn thread_messages_qualifies_bare_chat_id_with_api_channel_prefix() {
         let temp = LocalTempDir::new();
         let db_path = temp.db_path();
         let (bus_tx, _bus_rx) = mpsc::channel(4);
@@ -2483,7 +2504,7 @@ bind_address = "127.0.0.1"
         state
             .memory_node
             .send_packet(MemoryMessage::AddMessage {
-                session_id: memory_key,
+                thread_id: memory_key,
                 message: ChatMessage::user("hello from test"),
                 reply: SharedReply::new(tx),
             })
@@ -2495,7 +2516,7 @@ bind_address = "127.0.0.1"
         let response = app
             .oneshot(
                 axum::http::Request::builder()
-                    .uri(format!("/v1/sessions/{chat_suffix}/messages"))
+                    .uri(format!("/v1/threads/{chat_suffix}/messages"))
                     .method("GET")
                     .body(Body::empty())
                     .unwrap(),
@@ -2543,8 +2564,8 @@ bind_address = "127.0.0.1"
         let (logger_tx, _logger_rx) = create_logger_channel(32);
         let response_store = Arc::new(ResponseStore::new(temp.db_path()).expect("response store"));
         let (bus_tx, mut bus_rx) = mpsc::channel(4);
-        let memory_actor = SqliteMemoryActor::new(temp.db_path().to_str().expect("utf8"), None)
-            .expect("memory actor");
+        let memory_actor =
+            SqliteMemoryActor::new(temp.db_path().to_str().expect("utf8")).expect("memory actor");
         let memory_node =
             NodeHandle::<MemoryMessage>::new(memory_actor, 100, 1, Duration::from_millis(5));
         let workspace_sandbox = temp.path.join("workspace");

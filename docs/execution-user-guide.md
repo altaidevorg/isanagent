@@ -146,6 +146,8 @@ The **local** harness runs Python in one of two runtime modes:
 - **`local_python_runtime = "uv_managed"`** (default): provisions/reuses a managed interpreter under `.system_generated/uv/envs/` using `uv venv`, then executes runs with that interpreter.
 - **`local_python_runtime = "system"`**: runs **`python_executable`** as a normal process (no automatic venv activation). `python_executable` must be set explicitly in config.
 
+The first time a UV-managed environment is created (and when `uv_requirements` triggers `uv pip install`), work can take tens of seconds. During that time the **terminal** tool strip shows short status lines, and **`POST /v1/responses`** with **`stream: true`** emits **`tool_progress`** SSE events so the UI does not look stuck.
+
 For `system` runtime, you should either:
 
 - Set **`python_executable`** to the interpreter you want (e.g. path to `uv`-managed `.venv\Scripts\python.exe` on Windows, or `.../.venv/bin/python` on Unix), or  
@@ -217,8 +219,9 @@ Ensure your **`[provider]`** API key env is set. The model should see the execut
 
 The Ratatui alternate-screen UI includes:
 
-- **Transcript** — conversation cells (you, agent, tool lines, errors). While the model is still replying, you can send another line: it is **queued** (FIFO per chat) instead of aborting the current turn. Use **`/cancel`** or **`/stop`** to stop the in-flight reply and **discard** queued prompts for this session. Slash commands also include **`/help`**, **`/tools`**, **`/copy`**, **`/new`**, **`/exit`**.  
+- **Transcript** — conversation cells (you, agent, tool lines, errors). While the model is still replying, you can send another line: it is **queued** (FIFO per chat) instead of aborting the current turn. Use **`/cancel`** or **`/stop`** to stop the in-flight reply and **discard** queued prompts for this thread. Slash commands also include **`/help`**, **`/tools`**, **`/exec`**, **`/copy`**, **`/new`**, **`/exit`**.  
 - **Tool activity** — press **Tab** or **Ctrl+T** (or run **`/tools`**) to focus a scrollable pane of recent tool calls and outcomes (ring buffer, capped in the client). **Esc** returns to the transcript when the tool pane is focused. **PgUp** / **PgDn** and the mouse wheel scroll whichever pane is focused.  
+- **Executions** — third focus (cycle **Tab** / **Ctrl+T** after tool activity, or run **`/exec`**). Shows **`execution_runs.jsonl`** lines for **this terminal thread’s `chat_id`** (under **`<workspace>/.system_generated/`**), newest first. **↑** / **↓** select a run; the right side loads **`execution_history/{provider}/<execution_session_id>/{run_id}/source.txt`** and **`run.json`** when the manifest includes **`run_id`** (older JSONL lines without it cannot open journals). **PgUp** / **PgDn** scroll **stdout/stderr**; **Ctrl+PgUp** / **Ctrl+PgDn** scroll **source**; **Shift+PgUp** / **Shift+PgDn** scroll the run list. **F5** refreshes the list. The source pane uses **syntax highlighting** when colors are enabled; with **`NO_COLOR`** set, highlighted code falls back to a single dim style.  
 - **Active tool** strip — one line above **compose** shows the in-flight tool call preview when the model invokes a tool, then **Idle (no running tool)** after the result or when a normal assistant reply arrives.  
 - **Execution strip** — while Jupyter **`execution_run`** is active, stream events still appear in the **execution (jupyter)** block; background job summaries use human-readable exit text (no `Some(0)`-style debug).
 

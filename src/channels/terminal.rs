@@ -16,10 +16,10 @@ const ISANAGENT_TOOL_PHASE: &str = "isanagent_tool_phase";
 
 use crate::channels::terminal_ui::protocol::{
     ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_JOB_STARTED, ISANAGENT_EXECUTION_STREAM,
-    METADATA_EXECUTION_DESCRIPTION, METADATA_EXECUTION_JOB_ID, METADATA_EXECUTION_JOB_STATUS,
-    METADATA_EXECUTION_JOB_TOOL_NAME, METADATA_EXECUTION_RUN_ID, METADATA_EXECUTION_SESSION_ID,
-    METADATA_TOOL_CALL_ID, METADATA_TOOL_CALL_PREVIEW, METADATA_TOOL_NAME,
-    METADATA_TOOL_RESULT_PREVIEW,
+    ISANAGENT_TOOL_PROGRESS, METADATA_EXECUTION_DESCRIPTION, METADATA_EXECUTION_JOB_ID,
+    METADATA_EXECUTION_JOB_STATUS, METADATA_EXECUTION_JOB_TOOL_NAME, METADATA_EXECUTION_RUN_ID,
+    METADATA_EXECUTION_SESSION_ID, METADATA_TOOL_CALL_ID, METADATA_TOOL_CALL_PREVIEW,
+    METADATA_TOOL_NAME, METADATA_TOOL_RESULT_PREVIEW,
 };
 
 /// When true, `main` skips the large colored stdout banner (Ratatui alternate screen owns the TTY).
@@ -284,6 +284,34 @@ pub fn build_execution_job_notice(
     }
 }
 
+/// Ephemeral mid–tool status for the Ratatui tool strip (no transcript cell).
+pub fn build_tool_progress_terminal_notice(
+    chat_id: &str,
+    tool_name: &str,
+    message: &str,
+    tool_call_id: Option<&str>,
+) -> OutboundMessage {
+    let detail = message.trim();
+    let content = if detail.is_empty() {
+        tool_name.to_string()
+    } else {
+        format!("{tool_name} — {detail}")
+    };
+    let mut metadata = HashMap::new();
+    metadata.insert(ISANAGENT_TOOL_PROGRESS.to_string(), json!(true));
+    metadata.insert(METADATA_TOOL_NAME.to_string(), json!(tool_name));
+    if let Some(id) = tool_call_id.filter(|s| !s.is_empty()) {
+        metadata.insert(METADATA_TOOL_CALL_ID.to_string(), json!(id));
+    }
+    OutboundMessage {
+        channel: "terminal".to_string(),
+        chat_id: chat_id.to_string(),
+        thread_id: None,
+        content,
+        metadata,
+    }
+}
+
 /// Live terminal line when a tool is invoked (mirrors telemetry, user-visible).
 pub fn build_tool_call_terminal_notice(
     chat_id: &str,
@@ -392,6 +420,8 @@ pub struct TerminalChannel {
     chat_id: String,
     logger_tx: LoggerHandle,
     shutdown_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    /// Workspace root (`config.toml`, `.system_generated/`, execution journals).
+    workspace_dir: PathBuf,
     /// All user-supplied `@<filepath>` references are resolved relative to this
     /// directory.  Paths that escape the sandbox boundary are silently rejected.
     sandbox_dir: PathBuf,
@@ -406,6 +436,7 @@ impl TerminalChannel {
         chat_id: &str,
         logger_tx: LoggerHandle,
         shutdown_tx: tokio::sync::mpsc::UnboundedSender<()>,
+        workspace_dir: PathBuf,
         sandbox_dir: PathBuf,
         status_model: String,
     ) -> Self {
@@ -413,6 +444,7 @@ impl TerminalChannel {
             chat_id: chat_id.to_string(),
             logger_tx,
             shutdown_tx,
+            workspace_dir,
             sandbox_dir,
             status_model,
             outbound_ui_tx: Arc::new(Mutex::new(None)),
@@ -443,6 +475,7 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
         let logger_tx = self.logger_tx.clone();
         let shutdown_tx = self.shutdown_tx.clone();
         let sandbox_dir = self.sandbox_dir.clone();
+        let workspace_dir = self.workspace_dir.clone();
 
         let _ = logger_tx.send(BusMessage::Log(LogEvent::info(
             "TerminalChannel",
@@ -463,8 +496,8 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
         let sandbox_clone = sandbox_dir.clone();
         let log_clone = logger_tx.clone();
 
-        let session_banner = format!(
-            "isanagent v{} — session {}\n\
+        let opening_banner = format!(
+            "isanagent v{} — thread {}\n\
              Commands: /exit, /new  ·  Images: @path/to/file inside the workspace.",
             env!("CARGO_PKG_VERSION"),
             chat_id_clone
@@ -478,10 +511,11 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
                         bus_tx: bus_tx_clone,
                         outbound_rx: rx,
                         shutdown_tx: shutdown_clone,
+                        workspace_dir,
                         sandbox_dir: sandbox_clone,
                         chat_id: chat_id_clone,
                         channel_name,
-                        session_banner,
+                        opening_banner,
                         status_model,
                     },
                 );

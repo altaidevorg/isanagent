@@ -22,7 +22,7 @@ This document tracks expanding the built-in tool surface toward a strong **code-
 
 | Piece | Implementation |
 |--------|----------------|
-| Session todos | `todo_write` with `chat_id` + `items[]`; persisted in `agent_memory.db` (`harness_todos`). Legacy `todos/*.json` is migrated once if present. |
+| Session todos | `todo_write` with `chat_id` + `items[]`; persisted in `agent_memory.db` (`harness_todos`). |
 | Tool discovery | `search_tools` over a live catalog mirrored on each `ToolRegistry::register`; `list_tools` follows registration order. |
 | Skills | `load_skill_instructions`: `action: list`, `detail: metadata` vs full body; `SkillRegistry::format_skill_directory` / `get_skill_metadata`. |
 

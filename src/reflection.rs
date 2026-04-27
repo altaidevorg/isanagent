@@ -89,7 +89,7 @@ impl ReflectionEngine {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.memory_node
-            .send_packet(MemoryMessage::GetSessionsNeedingReflection {
+            .send_packet(MemoryMessage::GetThreadsNeedingReflection {
                 threshold_mins: self.config.short_term_threshold_mins.unwrap_or(3),
                 reply: SharedReply::new(tx),
             })
@@ -102,7 +102,7 @@ impl ReflectionEngine {
             let (tx, rx) = tokio::sync::oneshot::channel();
             self.memory_node
                 .send_packet(MemoryMessage::GetMessagesSinceReflection {
-                    session_id: session_id.clone(),
+                    thread_id: session_id.clone(),
                     reply: SharedReply::new(tx),
                 })
                 .await
@@ -118,7 +118,7 @@ impl ReflectionEngine {
                 LogEvent::debug(
                     "ReflectionEngine",
                     &format!(
-                        "Session {} reached short-term reflection threshold (idle)",
+                        "Thread {} reached short-term reflection threshold (idle)",
                         session_id
                     ),
                 )
@@ -170,7 +170,7 @@ impl ReflectionEngine {
                         let (tx, rx) = tokio::sync::oneshot::channel();
                         self.memory_node
                             .send_packet(MemoryMessage::AddSummary {
-                                session_id: session_id.clone(),
+                                thread_id: session_id.clone(),
                                 summary,
                                 key_info,
                                 knowledge_gaps,
@@ -183,8 +183,8 @@ impl ReflectionEngine {
                         let highest_id = new_messages.last().unwrap().0;
                         let (tx, rx) = tokio::sync::oneshot::channel();
                         self.memory_node
-                            .send_packet(MemoryMessage::UpdateSessionMetadata {
-                                session_id: session_id.clone(),
+                            .send_packet(MemoryMessage::UpdateThreadMetadata {
+                                thread_id: session_id.clone(),
                                 last_reflection_msg_id: Some(highest_id),
                                 reply: SharedReply::new(tx),
                             })
@@ -195,7 +195,7 @@ impl ReflectionEngine {
                         let _ = self.logger_tx.send(BusMessage::Log(
                             LogEvent::info(
                                 "ReflectionEngine",
-                                &format!("Generated short-term summary for session {}", session_id),
+                                &format!("Generated short-term summary for thread {}", session_id),
                             )
                             .with_chat_id(&session_id),
                         ));

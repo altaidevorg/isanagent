@@ -23,6 +23,7 @@ use super::error::ExecutionError;
 use super::ids::SessionId;
 use super::provider::ExecutionProvider;
 use super::run::{CwdPolicy, RunResult, RunSpec, SessionCreateRequest, SessionHandle};
+use crate::tool_runtime::emit_tool_progress_message;
 use crate::tools::builtin::resolve_path;
 
 /// How user code is executed for a session.
@@ -426,6 +427,7 @@ impl LocalExecutionProvider {
                     .map_err(|e| ExecutionError::Provider(format!("create uv env dir: {e}")))?;
                 let py = uv_env_python_path(&env_dir);
                 if !py.exists() {
+                    emit_tool_progress_message("Creating Python environment with uv…").await;
                     run_uv_command(
                         &self.config.uv_binary,
                         &[
@@ -438,6 +440,7 @@ impl LocalExecutionProvider {
                     )
                     .await?;
                     if !self.config.uv_requirements.is_empty() {
+                        emit_tool_progress_message("Installing Python packages (uv)…").await;
                         let mut args = vec![
                             "pip".to_string(),
                             "install".to_string(),
@@ -447,6 +450,7 @@ impl LocalExecutionProvider {
                         args.extend(self.config.uv_requirements.clone());
                         run_uv_command(&self.config.uv_binary, &args, None).await?;
                     }
+                    emit_tool_progress_message("Python environment ready.").await;
                 }
                 *slot = Some(py.clone());
                 Ok(py.to_string_lossy().to_string())

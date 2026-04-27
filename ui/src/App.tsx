@@ -12,7 +12,7 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 
-const SESSION_CHAT_KEY = "isanagent_internal_chat_id";
+const THREAD_ID_STORAGE_KEY = "isanagent_thread_id";
 const SESSION_RESPONSE_KEY = "isanagent_latest_response_id";
 /** Stable API `user` / sender_id: localStorage (shared across tabs). Session list keys off this. */
 const SESSION_USER_KEY = "isanagent_api_user_id";
@@ -83,12 +83,12 @@ function truncateSidebarTitle(text: string, maxChars = 56): string {
   return `${chars.slice(0, maxChars).join("")}…`;
 }
 
-function sessionSidebarLabel(entry: SessionListEntry, hints: Record<string, string>): string {
+function threadSidebarLabel(entry: ThreadListEntry, hints: Record<string, string>): string {
   const fromServer = entry.preview?.trim() ?? "";
   if (fromServer.length > 0) {
     return fromServer;
   }
-  const fromHint = hints[entry.internal_chat_id]?.trim() ?? "";
+  const fromHint = hints[entry.thread_id]?.trim() ?? "";
   if (fromHint.length > 0) {
     return fromHint;
   }
@@ -111,9 +111,10 @@ type ToolCall = {
 
 type StreamEvent =
   | { type: "tool_call_started"; tool_name: string; args: string }
+  | { type: "tool_progress"; tool_name: string; message: string }
   | { type: "tool_call_finished"; tool_name: string; result: string }
   | { type: "agent_thought"; thought: string }
-  | { type: "completion"; content: string; internal_chat_id: string; response_id: string }
+  | { type: "completion"; content: string; thread_id: string; response_id: string }
   | { type: "error"; message: string };
 
 type HistoryRow = {
@@ -122,8 +123,8 @@ type HistoryRow = {
   image_urls?: string[];
 };
 
-type SessionListEntry = {
-  internal_chat_id: string;
+type ThreadListEntry = {
+  thread_id: string;
   updated_at: number;
   latest_response_id: string;
   /** From API; older servers may omit. */
@@ -132,7 +133,7 @@ type SessionListEntry = {
 
 type SummaryEntry = {
   id: number;
-  session_id: string;
+  thread_id: string;
   summary: string;
   key_info: string;
   knowledge_gaps: string;
@@ -175,22 +176,6 @@ function pickResponseId(raw: unknown): string | null {
   return typeof id === "string" && id.length > 0 ? id : null;
 }
 
-function pickInternalChatId(raw: unknown): string | null {
-  if (!raw || typeof raw !== "object") {
-    return null;
-  }
-  const o = raw as Record<string, unknown>;
-  const snake = o.internal_chat_id;
-  const camel = o.internalChatId;
-  if (typeof snake === "string" && snake.length > 0) {
-    return snake;
-  }
-  if (typeof camel === "string" && camel.length > 0) {
-    return camel;
-  }
-  return null;
-}
-
 function extractOutputText(raw: unknown): string {
   if (!raw || typeof raw !== "object") {
     return "(No assistant text in response.)";
@@ -221,8 +206,8 @@ function createId() {
   return `id_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
-/** UUID for `internal_chat_id` on new API sessions (cancel/stop must work before SSE arrives). */
-function newSessionChatUuid(): string {
+/** UUID for `thread_id` on new API turns (cancel/stop must work before SSE arrives). */
+function newThreadUuid(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return crypto.randomUUID();
   }
@@ -244,14 +229,14 @@ function newSessionChatUuid(): string {
       hex.slice(10, 16).join("")
     );
   }
-  throw new Error("Secure random generator unavailable for chat session UUID.");
+  throw new Error("Secure random generator unavailable for thread UUID.");
 }
 
-function readSessionChatId(): string | null {
+function readPersistedThreadId(): string | null {
   if (typeof window === "undefined") {
     return null;
   }
-  const v = sessionStorage.getItem(SESSION_CHAT_KEY);
+  const v = sessionStorage.getItem(THREAD_ID_STORAGE_KEY);
   return v && v.length > 0 ? v : null;
 }
 
@@ -263,13 +248,13 @@ function readSessionResponseId(): string | null {
   return v && v.length > 0 ? v : null;
 }
 
-function persistSessionPointers(internalChatId: string, latestResponseId: string) {
-  sessionStorage.setItem(SESSION_CHAT_KEY, internalChatId);
+function persistSessionPointers(threadId: string, latestResponseId: string) {
+  sessionStorage.setItem(THREAD_ID_STORAGE_KEY, threadId);
   sessionStorage.setItem(SESSION_RESPONSE_KEY, latestResponseId);
 }
 
 function clearSessionPointers() {
-  sessionStorage.removeItem(SESSION_CHAT_KEY);
+  sessionStorage.removeItem(THREAD_ID_STORAGE_KEY);
   sessionStorage.removeItem(SESSION_RESPONSE_KEY);
 }
 
@@ -570,7 +555,7 @@ function Composer({ disabled: streamingResponse, pending, onStop, onSubmit }: Co
 
 export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
-  const [internalChatId, setInternalChatId] = useState<string | null>(() => readSessionChatId());
+  const [internalChatId, setInternalChatId] = useState<string | null>(() => readPersistedThreadId());
   const [latestResponseId, setLatestResponseId] = useState<string | null>(() => readSessionResponseId());
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
@@ -578,9 +563,9 @@ export default function App() {
   const [currentToolCalls, setCurrentToolCalls] = useState<ToolCall[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [sessionsLoading, setSessionsLoading] = useState(false);
-  const [sessions, setSessions] = useState<SessionListEntry[]>([]);
+  const [sessions, setSessions] = useState<ThreadListEntry[]>([]);
   const [sidebarHints, setSidebarHints] = useState<Record<string, string>>(loadSidebarHints);
-  const [sessionToDelete, setSessionToDelete] = useState<SessionListEntry | null>(null);
+  const [sessionToDelete, setSessionToDelete] = useState<ThreadListEntry | null>(null);
   const [showSummaries, setShowSummaries] = useState(false);
   const [showWorkspaceModal, setShowWorkspaceModal] = useState(false);
   const [workspacePaneNonce, setWorkspacePaneNonce] = useState(0);
@@ -598,7 +583,7 @@ export default function App() {
     setSummariesLoading(true);
     try {
       const url = sessionId 
-        ? `/v1/sessions/${encodeURIComponent(sessionId)}/summaries`
+        ? `/v1/threads/${encodeURIComponent(sessionId)}/summaries`
         : `/v1/summaries`;
       const response = await fetch(url);
       if (!response.ok) {
@@ -651,14 +636,14 @@ export default function App() {
     setSessionsLoading(true);
     try {
       const q = new URLSearchParams({ user: requestUserId, limit: "100" });
-      const response = await fetch(`/v1/sessions?${q.toString()}`);
+      const response = await fetch(`/v1/threads?${q.toString()}`);
       if (!response.ok) {
         const payload = (await response.json().catch(() => null)) as
           | { error?: { message?: string } }
           | null;
-        throw new Error(payload?.error?.message || `Sessions list failed (${response.status}).`);
+        throw new Error(payload?.error?.message || `Thread list failed (${response.status}).`);
       }
-      const rows = (await response.json()) as SessionListEntry[];
+      const rows = (await response.json()) as ThreadListEntry[];
       setSessions(rows);
     } catch {
       /* sidebar is optional if API older */
@@ -676,7 +661,7 @@ export default function App() {
     setHistoryLoading(true);
     setErrorMessage(null);
     try {
-      const response = await fetch(`/v1/sessions/${encodeURIComponent(sessionId)}/messages`);
+      const response = await fetch(`/v1/threads/${encodeURIComponent(sessionId)}/messages`);
       if (!response.ok) {
         const payload = (await response.json().catch(() => null)) as
           | { error?: { message?: string } }
@@ -693,7 +678,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const id = readSessionChatId();
+    const id = readPersistedThreadId();
     if (id) {
       void loadHistory(id);
       void loadSummaries(id);
@@ -715,18 +700,18 @@ export default function App() {
     });
   };
 
-  const openSession = (entry: SessionListEntry) => {
+  const openSession = (entry: ThreadListEntry) => {
     startTransition(() => {
       setErrorMessage(null);
-      persistSessionPointers(entry.internal_chat_id, entry.latest_response_id);
-      setInternalChatId(entry.internal_chat_id);
+      persistSessionPointers(entry.thread_id, entry.latest_response_id);
+      setInternalChatId(entry.thread_id);
       setLatestResponseId(entry.latest_response_id);
-      void loadHistory(entry.internal_chat_id);
-      void loadSummaries(entry.internal_chat_id);
+      void loadHistory(entry.thread_id);
+      void loadSummaries(entry.thread_id);
     });
   };
 
-  const requestDeleteSession = (entry: SessionListEntry, event: MouseEvent<HTMLButtonElement>) => {
+  const requestDeleteSession = (entry: ThreadListEntry, event: MouseEvent<HTMLButtonElement>) => {
     event.stopPropagation();
     setSessionToDelete(entry);
   };
@@ -741,7 +726,7 @@ export default function App() {
     try {
       const q = new URLSearchParams({ user: requestUserId });
       const response = await fetch(
-        `/v1/sessions/${encodeURIComponent(entry.internal_chat_id)}?${q.toString()}`,
+        `/v1/threads/${encodeURIComponent(entry.thread_id)}?${q.toString()}`,
         { method: "DELETE" },
       );
       const payload = (await response.json().catch(() => null)) as
@@ -755,17 +740,17 @@ export default function App() {
           "This conversation was not deleted (not found or not allowed for this user).",
         );
       }
-      setSessions((prev) => prev.filter((s) => s.internal_chat_id !== entry.internal_chat_id));
+      setSessions((prev) => prev.filter((s) => s.thread_id !== entry.thread_id));
       setSidebarHints((prev) => {
-        if (!(entry.internal_chat_id in prev)) {
+        if (!(entry.thread_id in prev)) {
           return prev;
         }
         const next = { ...prev };
-        delete next[entry.internal_chat_id];
+        delete next[entry.thread_id];
         persistSidebarHints(next);
         return next;
       });
-      if (internalChatId === entry.internal_chat_id) {
+      if (internalChatId === entry.thread_id) {
         startNewConversation();
       }
     } catch (error) {
@@ -832,7 +817,7 @@ export default function App() {
     };
 
     const hadSessionBefore = internalChatId !== null;
-    const turnChatId = internalChatId ?? newSessionChatUuid();
+    const turnChatId = internalChatId ?? newThreadUuid();
 
     setErrorMessage(null);
     setMessages((prev) => [...prev, optimisticUser]);
@@ -862,7 +847,7 @@ export default function App() {
           store: true,
           user: requestUserId,
           stream: true,
-          internal_chat_id: turnChatId,
+          thread_id: turnChatId,
         }),
         signal: controller.signal,
       });
@@ -872,7 +857,7 @@ export default function App() {
         throw new Error(payload?.error?.message || `Request failed with ${response.status}.`);
       }
 
-      const hdrChat = response.headers.get("X-Internal-Chat-Id");
+      const hdrChat = response.headers.get("X-Thread-Id");
       if (hdrChat?.trim()) {
         cancelChatIdRef.current = hdrChat.trim();
       }
@@ -914,6 +899,9 @@ export default function App() {
                 currentToolCall = { tool_name: event.tool_name, args: event.args };
                 setCurrentStep(`Using tool: ${event.tool_name}`);
                 break;
+              case "tool_progress":
+                setCurrentStep(`${event.tool_name}: ${event.message}`);
+                break;
               case "tool_call_finished":
                 if (currentToolCall && currentToolCall.tool_name === event.tool_name) {
                   currentToolCall.result = event.result;
@@ -927,13 +915,13 @@ export default function App() {
               case "completion":
                 if (event.content === "" && event.response_id === "") {
                   // Initial ID hint (older servers); client already knows id via header / body.
-                  if (event.internal_chat_id) {
-                    cancelChatIdRef.current = event.internal_chat_id;
+                  if (event.thread_id) {
+                    cancelChatIdRef.current = event.thread_id;
                   }
                   break;
                 }
                 assistantContent = event.content;
-                finalChatId = event.internal_chat_id;
+                finalChatId = event.thread_id;
                 finalResponseId = event.response_id;
                 setCurrentStep(null); // Clear step when completion arrives
                 break;
@@ -1093,7 +1081,7 @@ export default function App() {
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto p-2">
           <p className="px-2 pb-1 text-xs font-medium uppercase tracking-[0.05em] text-muted-foreground">
-            Conversations
+            Threads
           </p>
           {sessionsLoading && sessions.length === 0 ? (
             <p className="px-2 text-xs text-muted-foreground">Loading…</p>
@@ -1102,9 +1090,9 @@ export default function App() {
           ) : (
             <ul className="space-y-1">
               {sessions.map((s) => {
-                const active = internalChatId === s.internal_chat_id;
+                const active = internalChatId === s.thread_id;
                 return (
-                  <li key={s.internal_chat_id}>
+                  <li key={s.thread_id}>
                     <div
                       className={cn(
                         "group flex cursor-pointer items-center gap-1 rounded-xl border border-transparent px-2 py-2 text-left text-sm transition-colors",
@@ -1114,7 +1102,7 @@ export default function App() {
                       )}
                       role="button"
                       tabIndex={0}
-                      title={s.internal_chat_id}
+                      title={s.thread_id}
                       onClick={() => openSession(s)}
                       onKeyDown={(e) => {
                         if (e.key === "Enter" || e.key === " ") {
@@ -1125,7 +1113,7 @@ export default function App() {
                     >
                       <div className="min-w-0 flex-1">
                         <p className="truncate leading-snug text-foreground">
-                          {sessionSidebarLabel(s, sidebarHints)}
+                          {threadSidebarLabel(s, sidebarHints)}
                         </p>
                       </div>
                       <button
@@ -1155,12 +1143,12 @@ export default function App() {
               </p>
               <h1 className="mt-1 text-xl font-semibold tracking-[-0.02em] text-foreground">isanagent</h1>
               <p className="mt-1 max-w-xl text-sm leading-relaxed text-muted-foreground">
-                Workspace-backed memory, multimodal input, and session list for this browser profile.
+                Workspace-backed memory, multimodal input, and a thread list for this browser profile.
               </p>
             </div>
             <div className="flex items-center gap-3">
               <span className="shrink-0 rounded-full border border-[color:var(--ghost-border)] bg-muted px-3 py-1 text-xs font-medium text-muted-foreground">
-                {pending || historyLoading ? "Syncing…" : internalChatId ? "In session" : "New session"}
+                {pending || historyLoading ? "Syncing…" : internalChatId ? "In thread" : "New thread"}
               </span>
             </div>
           </div>
@@ -1185,7 +1173,7 @@ export default function App() {
                       return (
                         <div key={`msg-sum-${s.id}`} className="rounded-xl border border-border bg-muted/10 p-4 shadow-sm">
                           <div className="flex items-center gap-2 mb-2">
-                            <span className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">Session Summary</span>
+                            <span className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">Thread summary</span>
                             <div className="h-px flex-1 bg-border/50"></div>
                           </div>
                           <p className="text-sm leading-relaxed text-foreground/80">{s.summary}</p>
@@ -1789,7 +1777,7 @@ function SummaryList({
               {summaries.map((s) => (
                 <div key={s.id} className="space-y-4 border-b border-border pb-8 last:border-0">
                   <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
-                    <span>Session: {s.session_id.split(":")[1] || s.session_id}</span>
+                    <span>Thread: {s.thread_id.split(":")[1] || s.thread_id}</span>
                     <span>{new Date(s.created_at).toLocaleString()}</span>
                   </div>
 

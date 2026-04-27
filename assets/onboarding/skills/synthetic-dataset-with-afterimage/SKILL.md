@@ -29,6 +29,20 @@ AfterImage is a **Python 3.11+** library and a **Click CLI** entry point named `
 
 ---
 
+## Workflow to create useful datasets
+
+1. Make sure that you fully understand the intended use of the dataset. What is this dataset supposed to teach a model. Is it a certain task or domain knowledge? Is it a kind of structured output? Is it tool calling etc.
+2. If the main goal is to teach a structured output with a certain schema, use `StructuredGenerator` and look for its examples to get inspired.
+3. If you intend to teach tool calling, look for the tool calling generation below, and decide on the tool schemas, e.g., tool names, arguments, return types etc.
+4. If you need to generate high-quality multi-choice questions (MCQs) in a certain domain, look for the MCQ pipeline from the Simula method implemented as OpenSimula in Afterimage.
+5. If you need to generate a high-quality conversational dataset based on a corpus, look for the corpus batch QA example from OpenSimula.
+6. If you work with a very large corpus indexed in a DB, e.g., Qdrant or another indexer, you can look for the `caselaw_rag` example.
+7. If you need to generate DPO-like preference data, look for the DPO example below.
+8. Afterimage has several built-in `DocumentProvider` implementations. You can choose one of based on the condition, or you an implement a custom one based on the protocol.
+9. Afterimage comes with several instruction generator callback implementations. You can adopt one of them based on the condition, or you can implement a custom one if it is required.
+
+---
+
 ## Installation
 
 Check if it's already installed first (most likely), otherwise:
@@ -152,7 +166,7 @@ The following examples (and more) can be found in `<your_sandbox_dir>/skills/syn
 - Customer support data generation with `StructuredGenerator`: `customer_support_data_with_structured_output.py`
 - MCQ generation with `StructuredGenerator`: `generate_chem_mcq_with_structured_output.py`
 - A more advanced way to generate MCQs with the Simula method: `<your_sandbox_dir>/skills/synthetic-dataset-with-afterimage/examples/simula/mcq_pipeline.py`
-- How to generate multiple samples with the Simula method: `<your_sandbox_dir>/skills/synthetic-dataset-with-afterimage/examples/simula/corpus_batch_qa.py`
+- How to generate multiple question-answer pairs  from a corpus with the Simula method: `<your_sandbox_dir>/skills/synthetic-dataset-with-afterimage/examples/simula/corpus_batch_qa.py`
 - Tool-calling dataset generation with tool schemas: `tool_calling_generator.py`
 - RAG-grounded synthetic dataset generation in the legal domain: read `<your_sandbox_dir>/skills/synthetic-dataset-with-afterimage/examples/caselaw_rag/README.md`
 - Simula, a reasoning-driven synthetic dataset generation and evaluation: read `<your_sandbox_dir>/skills/synthetic-dataset-with-afterimage/examples/simula/README.md`. This method may take some time, but it gives state-of-the-art results with hierarachical taxonomy building, probablistic complexification, ELO-based pruning and  double-critic evaluation.

@@ -18,6 +18,8 @@ pub const METADATA_EXECUTION_JOB_STATUS: &str = "execution_job_status";
 pub const METADATA_EXECUTION_JOB_TOOL_NAME: &str = "execution_job_tool_name";
 /// Short human-facing line for Ratatui execution strip (optional on stream/job notices).
 pub const METADATA_EXECUTION_DESCRIPTION: &str = "execution_description";
+/// Ephemeral tool status line (updates active tool strip only; no transcript cell).
+pub const ISANAGENT_TOOL_PROGRESS: &str = "isanagent_tool_progress";
 /// Tool name for Ratatui tool rail / transcript previews (paired with `isanagent_tool_notify`).
 pub const METADATA_TOOL_NAME: &str = "isanagent_tool_name";
 /// Short args preview (no raw JSON dump) for tool call notices.

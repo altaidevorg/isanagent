@@ -72,7 +72,7 @@ impl Tool for TodoWriteTool {
     }
 
     fn description(&self) -> &str {
-        "Replace the structured todo list for this chat. Todos are scoped per chat_id (from RUNTIME CONTEXT) and stored in the agent SQLite database (harness_todos) so they survive restarts. If a legacy todos/ JSON folder exists from an older build, it is migrated once on startup. Use for multi-step work tracking."
+        "Replace the structured todo list for this chat. Todos are scoped per chat_id (from RUNTIME CONTEXT) and stored in the agent SQLite database (harness_todos) so they survive restarts. Use for multi-step work tracking."
     }
 
     fn parameters(&self) -> Value {
@@ -471,7 +471,7 @@ mod tests {
 
     fn spawn_memory_node(db: &Path) -> NodeHandle<MemoryMessage> {
         let actor =
-            SqliteMemoryActor::new(db.to_str().expect("utf8 db path"), None).expect("memory actor");
+            SqliteMemoryActor::new(db.to_str().expect("utf8 db path")).expect("memory actor");
         NodeHandle::new(actor, 100, 1, Duration::from_millis(5))
     }
 
@@ -484,12 +484,6 @@ mod tests {
         .await
         .expect("send LoadHarnessTodos");
         rx.await.expect("LoadHarnessTodos reply").expect("sqlite")
-    }
-
-    #[derive(Debug, serde::Deserialize, serde::Serialize)]
-    struct TodoFile {
-        chat_id: String,
-        items: Vec<TodoRow>,
     }
 
     #[tokio::test]
@@ -651,44 +645,6 @@ mod tests {
         assert_eq!(loaded[0].content, "survive restart");
 
         let _ = fs::remove_file(&db);
-    }
-
-    #[tokio::test]
-    async fn legacy_json_migrates_into_sqlite() {
-        let db = temp_todo_db("migrate");
-        let legacy =
-            std::env::temp_dir().join(format!("isanagent_legacy_todos_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&legacy).unwrap();
-        let legacy_file = legacy.join("abc.json");
-        let payload = TodoFile {
-            chat_id: "migrated-chat".to_string(),
-            items: vec![TodoRow {
-                content: "from json".to_string(),
-                status: "pending".to_string(),
-            }],
-        };
-        fs::write(
-            &legacy_file,
-            serde_json::to_string_pretty(&payload).unwrap(),
-        )
-        .unwrap();
-
-        let actor = SqliteMemoryActor::new(db.to_str().expect("utf8"), Some(legacy.as_path()))
-            .expect("memory with legacy migrate");
-        let memory_node = NodeHandle::new(actor, 100, 1, Duration::from_millis(5));
-        assert!(
-            !legacy_file.exists(),
-            "legacy file should be removed after migrate"
-        );
-
-        let rows = load_todos(&memory_node, "migrated-chat")
-            .await
-            .expect("rows");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].content, "from json");
-
-        let _ = fs::remove_file(&db);
-        let _ = fs::remove_dir_all(&legacy);
     }
 
     #[tokio::test]
