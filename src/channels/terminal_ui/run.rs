@@ -1360,7 +1360,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     app.last_executions_output_rect = None;
                 }
                 TerminalUiFocus::Executions => {
-                    let list_w = (ch[1].width / 3).max(26).min(46);
+                    let list_w = (ch[1].width / 3).clamp(26, 46);
                     let hareas = Layout::default()
                         .direction(Direction::Horizontal)
                         .constraints([Constraint::Length(list_w), Constraint::Min(8)])
