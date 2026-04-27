@@ -239,11 +239,9 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     let db_path_str = db_path
         .to_str()
         .ok_or_else(|| std::io::Error::other("workspace DB path is not valid UTF-8"))?;
-    let memory_actor = isanagent::memory::SqliteMemoryActor::new(
-        db_path_str,
-        Some(workspace.dir.join("todos").as_path()),
-    )
-    .map_err(|e| std::io::Error::other(format!("Failed to initialize SqliteMemoryActor: {}", e)))?;
+    let memory_actor = isanagent::memory::SqliteMemoryActor::new(db_path_str).map_err(|e| {
+        std::io::Error::other(format!("Failed to initialize SqliteMemoryActor: {}", e))
+    })?;
     let memory_node = NodeHandle::<isanagent::memory::MemoryMessage>::new(
         memory_actor,
         100,

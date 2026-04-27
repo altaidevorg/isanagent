@@ -1981,7 +1981,7 @@ mod tests {
         provider: Box<dyn Provider>,
         clarification_hub: Arc<ClarificationHub>,
     ) -> (AgentLogic, mpsc::Receiver<BusMessage>) {
-        let memory_actor = SqliteMemoryActor::new(":memory:", None).expect("memory actor");
+        let memory_actor = SqliteMemoryActor::new(":memory:").expect("memory actor");
         let memory_node = NodeHandle::new(memory_actor, 16, 1, Duration::from_millis(1));
         let session_manager = SessionManager::new(memory_node);
 
@@ -2037,7 +2037,7 @@ mod tests {
         tool_execution_activity: Option<SharedToolExecutionActivity>,
         tool_delay: Duration,
     ) -> AgentLogic {
-        let memory_actor = SqliteMemoryActor::new(":memory:", None).expect("memory actor");
+        let memory_actor = SqliteMemoryActor::new(":memory:").expect("memory actor");
         let memory_node = NodeHandle::new(memory_actor, 16, 1, Duration::from_millis(1));
         let session_manager = SessionManager::new(memory_node);
 

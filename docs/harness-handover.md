@@ -7,7 +7,7 @@ This branch delivers harness **Phases 1–5** (through sub-agents / plans under 
 ## What Was Done
 
 - **Phase 1:** `glob_files`, `search_text` (rg or fallback), `edit_file` (`replace_all`, diff snippet); glob root/canonicalize fix for Windows `\\?\` paths (`src/tools/builtin.rs`).
-- **Phase 2:** `todo_write` → table `harness_todos` in `agent_memory.db`; legacy `<workspace>/todos/*.json` migrated once; `search_tools` + registration-order catalog; `load_skill_instructions` list/metadata (`src/tools/workflow.rs`, `src/tools.rs`, `src/agent/mod.rs`, `src/skills.rs`, `src/memory.rs`, `src/main.rs`).
+- **Phase 2:** `todo_write` → table `harness_todos` in `agent_memory.db`; `search_tools` + registration-order catalog; `load_skill_instructions` list/metadata (`src/tools/workflow.rs`, `src/tools.rs`, `src/agent/mod.rs`, `src/skills.rs`, `src/memory.rs`, `src/main.rs`).
 - **Concurrency:** `configure_agent_sqlite_connection` + `AGENT_SQLITE_BUSY_TIMEOUT_MS` on memory + todo connections (`src/memory.rs`, `src/tools/workflow.rs`).
 - **Phase 3:** `ClarificationHub` (`src/clarification.rs`), `ToolExecCtx` task-local (`src/tool_runtime.rs`), `AskUserTool` (`src/tools/workflow.rs`), `AgentLogic` inbound **early** `try_deliver_reply` before cancel/spawn, `ToolCallRuntime` + scoped tool execution (`src/agent/mod.rs`), terminal `[Question]` for `isanagent_clarification` metadata (`src/channels/terminal.rs`), registration in `src/main.rs`.
 - **Phase 4:** `GitWorktreeTool` (`src/tools/builtin.rs`), `[harness.git_worktree]` in `src/config.rs`, conditional registration in `src/main.rs`.
@@ -44,7 +44,6 @@ This branch delivers harness **Phases 1–5** (through sub-agents / plans under 
 - [ ] Merge or park this branch; open the **other PR** as planned.
 - [ ] When resuming harness: **Phase 6** (notebook, LSP, MCP, remote) per `docs/harness-implementation-plan.md`; **execution plane** (sessions, providers, capabilities) per `docs/execution-implementation-plan.md`.
 - [ ] Optional hardening: API/UI explicitly handle `isanagent_clarification` in SSE or REST responses (currently same as other outbounds + metadata).
-- [ ] Optional: remove empty `todos/` dir after legacy migration; metrics when migration count &gt; 0.
 
 ## Important Files Map
 

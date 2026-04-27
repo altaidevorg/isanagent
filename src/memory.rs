@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use chrono::Utc;
-use log::{debug, info};
+use log::debug;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -9,8 +9,6 @@ use crate::utils::{ChatMessage, ContentPart, MessageContent};
 use crate::{ActorError, ActorLogic};
 use std::collections::HashMap;
 use std::fmt;
-use std::fs;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 pub struct SharedReply<T>(pub Arc<Mutex<Option<oneshot::Sender<T>>>>);
@@ -153,12 +151,6 @@ pub struct TodoRow {
     pub status: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct TodoFile {
-    chat_id: String,
-    items: Vec<TodoRow>,
-}
-
 fn todo_replace_sqlite_conn(
     conn: &Connection,
     chat_id: &str,
@@ -194,42 +186,6 @@ fn todo_load_sqlite_conn(conn: &Connection, chat_id: &str) -> Result<Option<Vec<
             Ok(Some(items))
         }
     }
-}
-
-/// Import `*.json` from a legacy directory into `harness_todos`, then remove each file.
-fn migrate_legacy_json_todos(conn: &Connection, legacy_dir: &Path) -> Result<u32, String> {
-    if !legacy_dir.is_dir() {
-        return Ok(0);
-    }
-    let mut migrated = 0u32;
-    let entries = fs::read_dir(legacy_dir)
-        .map_err(|e| format!("read legacy todos dir {:?}: {}", legacy_dir, e))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("legacy todos entry: {}", e))?;
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
-            continue;
-        }
-        let raw = fs::read_to_string(&path).map_err(|e| format!("read {:?}: {}", path, e))?;
-        let file: TodoFile = match serde_json::from_str(&raw) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        let items_json =
-            serde_json::to_string(&file.items).map_err(|e| format!("serialize items: {}", e))?;
-        let now = Utc::now().timestamp_millis();
-        conn.execute(
-            "INSERT INTO harness_todos (chat_id, items_json, updated_at_ms) VALUES (?1, ?2, ?3)
-             ON CONFLICT(chat_id) DO UPDATE SET
-               items_json = excluded.items_json,
-               updated_at_ms = excluded.updated_at_ms",
-            params![file.chat_id, items_json, now],
-        )
-        .map_err(|e| format!("migrate upsert: {}", e))?;
-        fs::remove_file(&path).map_err(|e| format!("remove migrated {:?}: {}", path, e))?;
-        migrated += 1;
-    }
-    Ok(migrated)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -379,10 +335,7 @@ impl SqliteMemoryActor {
     /// Create a new SqliteMemory.
     ///
     /// `db_path`: Path to the SQLite DB file. Use `:memory:` for in-memory.
-    /// `legacy_todo_json_dir`: If set and the path is a directory, `*.json` legacy todo files are
-    /// imported into `harness_todos` once and then removed (same behavior as the former standalone
-    /// todo store bootstrap).
-    pub fn new(db_path: &str, legacy_todo_json_dir: Option<&Path>) -> Result<Self, String> {
+    pub fn new(db_path: &str) -> Result<Self, String> {
         let conn = (|| -> Result<Connection, rusqlite::Error> {
             let conn = Connection::open(db_path)?;
             configure_agent_sqlite_connection(&conn)?;
@@ -484,16 +437,6 @@ impl SqliteMemoryActor {
             Ok(conn)
         })()
         .map_err(|e| format!("SQLite init ({}): {}", db_path, e))?;
-
-        if let Some(dir) = legacy_todo_json_dir {
-            let n = migrate_legacy_json_todos(&conn, dir)?;
-            if n > 0 {
-                info!(
-                    "Migrated {} todo file(s) from {:?} into {}",
-                    n, dir, db_path
-                );
-            }
-        }
 
         Ok(Self { conn })
     }
