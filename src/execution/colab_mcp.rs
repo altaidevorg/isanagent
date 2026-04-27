@@ -516,12 +516,8 @@ impl ExecutionProvider for ColabMcpExecutionProvider {
                 if let Some(idx_key) = add_cell_index_arg_key {
                     let tools_snap = sess.cached_tools.read().await;
                     let resolved_probe = cell_count_probe.clone().or_else(|| {
-                        pick_append_cell_count_tool(&tools_snap).map(|tdef| {
-                            (
-                                tdef.name.clone(),
-                                build_minimal_query_cells_args(tdef),
-                            )
-                        })
+                        pick_append_cell_count_tool(&tools_snap)
+                            .map(|tdef| (tdef.name.clone(), build_minimal_query_cells_args(tdef)))
                     });
                     drop(tools_snap);
 
@@ -548,10 +544,8 @@ impl ExecutionProvider for ColabMcpExecutionProvider {
                                 truncate_json_for_error(&probe_resp, 800)
                             ))
                         })?;
-                        add_args.insert(
-                            idx_key.clone(),
-                            Value::Number(serde_json::Number::from(n)),
-                        );
+                        add_args
+                            .insert(idx_key.clone(), Value::Number(serde_json::Number::from(n)));
                     }
                     // When the index is optional in the MCP schema, omit it so Colab defaults to
                     // appending after existing cells (passing 0 would insert at the top).
@@ -1100,12 +1094,8 @@ fn detect_execution_mode(
         .as_ref()
         .map(|k| json_schema_property_required(add_tool_def.input_schema.as_ref(), k))
         .unwrap_or(false);
-    let cell_count_probe = pick_append_cell_count_tool(tools).map(|t| {
-        (
-            t.name.clone(),
-            build_minimal_query_cells_args(t),
-        )
-    });
+    let cell_count_probe = pick_append_cell_count_tool(tools)
+        .map(|t| (t.name.clone(), build_minimal_query_cells_args(t)));
     Ok(ColabExecutionMode::NotebookCells {
         add_code_cell_tool_name: add_tool.to_string(),
         add_code_arg_key: add_key,
