@@ -8,9 +8,11 @@
 
 ## Why people reach for it
 
-You have a fuzzy goal (“speed up this encoder”, “stand up a tiny LM in Flax”, “generate a preference dataset”, “figure out why this kernel is slow”). isanagent behaves more like a **senior research engineer who owns the outcome** than a chat window: it reads the repo, hits the web and papers when your intuition is stale, runs code in a **controlled execution harness** (local Python, Jupyter, SSH, Colab MCP — depending on how you configure it), and **iterates with evidence** instead of guessing.
+You have a fuzzy goal (“fine-tune a model for this task”, “Research about new methods and apply them to my model”,  “speed up this model for inference”, “stand up a tiny LM in Flax”, “generate a preference dataset”, “figure out why this kernel is slow” ). isanagent behaves more like a **senior research engineer who owns the outcome** than a chat window: it reads the repo, hits the web and papers when your intuition is stale, runs code in a **controlled execution harness** (local Python, Jupyter, SSH, Colab MCP — depending on how you configure it), and **iterates with evidence** instead of guessing.
 
 **Talk is cheap. So is code that never ran.** The point is deliverables: notebooks, trained or tuned models, working scripts, cleaned-up docs — and an honest story of what worked, what didn’t, and what to try next.
+
+**Zero infra needed.** isanagent can make use of Colab for free!
 
 ---
 
@@ -49,13 +51,30 @@ If that’s the kind of “finish the thing and show your work” energy you wan
 
 ## Get started
 
-**Fast path:** download a prebuilt binary for your OS, run it, and complete the first-run wizard. The embedded browser UI is baked into the binary.
+**Fast path:** download a prebuilt binary from **[Releases](https://github.com/altaidevorg/isanagent/releases)** (Linux, **macOS** Apple silicon, and Windows), run it, and complete the first-run wizard. The embedded browser UI is baked into the binary.
 
 ### Prebuilt binary (recommended)
 
-1. Open **[Releases](https://github.com/altaidevorg/isanagent/releases)** and download the asset for your platform from **Latest main build** (tag [`main-latest`](https://github.com/altaidevorg/isanagent/releases/tag/main-latest)): `isanagent-linux-x86_64`, `isanagent-macos-aarch64`, or `isanagent-windows-x86_64.exe`.
-2. On Linux or macOS, mark it executable (example): `chmod +x isanagent-linux-x86_64`.
-3. Run the binary from a terminal (example on Linux): `./isanagent-linux-x86_64`.
+**One-liner (latest [`main-latest`](https://github.com/altaidevorg/isanagent/releases/tag/main-latest))** — same assets as on the release page; downloads the binary next to you, then runs it (same first-run / onboard behavior as below):
+
+```bash
+# Linux (x86_64)
+curl -fsSL https://github.com/altaidevorg/isanagent/releases/download/main-latest/isanagent-linux-x86_64 -o isanagent && chmod +x isanagent && ./isanagent
+```
+
+```bash
+# macOS (Apple silicon)
+curl -fsSL https://github.com/altaidevorg/isanagent/releases/download/main-latest/isanagent-macos-aarch64 -o isanagent && chmod +x isanagent && ./isanagent
+```
+
+```powershell
+# Windows (x86_64, PowerShell)
+Invoke-WebRequest https://github.com/altaidevorg/isanagent/releases/download/main-latest/isanagent-windows-x86_64.exe -OutFile isanagent.exe; .\isanagent.exe
+```
+
+1. Or open **[Releases](https://github.com/altaidevorg/isanagent/releases)** and download the asset for your platform from **Latest main build** (tag [`main-latest`](https://github.com/altaidevorg/isanagent/releases/tag/main-latest)): `isanagent-linux-x86_64`, `isanagent-macos-aarch64`, or `isanagent-windows-x86_64.exe`.
+2. On Linux or macOS, mark it executable (example): `chmod +x isanagent-linux-x86_64` or `chmod +x isanagent-macos-aarch64`.
+3. Run the binary from a terminal (examples): `./isanagent-linux-x86_64` (Linux) or `./isanagent-macos-aarch64` (macOS); on Windows, run `isanagent-windows-x86_64.exe` from Explorer or `.\isanagent-windows-x86_64.exe` in PowerShell.
 
 If you use the **default workspace** (`~/.isanagent` on Unix, or the equivalent on Windows) and that folder does not exist yet, **the first run starts the interactive onboard wizard** (provider, API key env var, model, and workspace layout), then continues into the agent in the same session. For a custom workspace path, run `isanagent onboard` (add `--interactive` for the full wizard) or `isanagent --workspace /path/to/workspace` once the directory and `config.toml` exist.
 
