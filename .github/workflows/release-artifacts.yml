@@ -1,0 +1,57 @@
+name: Release artifacts
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.artifact }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            artifact: isanagent-linux-x86_64
+          - os: windows-latest
+            artifact: isanagent-windows-x86_64
+          - os: macos-latest
+            artifact: isanagent-macos-aarch64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-artifacts
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            cp target/release/isanagent.exe "dist/${{ matrix.artifact }}.exe"
+          else
+            cp target/release/isanagent "dist/${{ matrix.artifact }}"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
