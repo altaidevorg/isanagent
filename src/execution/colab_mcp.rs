@@ -54,6 +54,10 @@ enum ColabExecutionMode {
         add_code_cell_tool_name: String,
         add_code_arg_key: String,
         add_cell_index_arg_key: Option<String>,
+        /// When true, the MCP schema marks the index field as required; we must supply an index.
+        add_cell_index_required: bool,
+        /// Optional `get_cells`-style tool + minimal args to count cells for append-at-end insertion.
+        cell_count_probe: Option<(String, serde_json::Map<String, Value>)>,
         run_code_cell_tool_name: String,
         run_cell_id_arg_key: String,
     },
@@ -368,6 +372,8 @@ impl ExecutionProvider for ColabMcpExecutionProvider {
                 add_code_cell_tool_name,
                 add_code_arg_key,
                 add_cell_index_arg_key,
+                add_cell_index_required,
+                cell_count_probe,
                 run_code_cell_tool_name,
                 run_cell_id_arg_key,
             } => {
@@ -387,6 +393,16 @@ impl ExecutionProvider for ColabMcpExecutionProvider {
                     ext.insert(
                         "colab_mcp_add_cell_index_arg_key".into(),
                         Value::String(idx_key.clone()),
+                    );
+                }
+                ext.insert(
+                    "colab_mcp_add_cell_index_required".into(),
+                    Value::Bool(*add_cell_index_required),
+                );
+                if let Some((probe_tool, _)) = cell_count_probe {
+                    ext.insert(
+                        "colab_mcp_cell_count_probe_tool".into(),
+                        Value::String(probe_tool.clone()),
                     );
                 }
                 ext.insert(
@@ -487,6 +503,8 @@ impl ExecutionProvider for ColabMcpExecutionProvider {
                 add_code_cell_tool_name,
                 add_code_arg_key,
                 add_cell_index_arg_key,
+                add_cell_index_required,
+                cell_count_probe,
                 run_code_cell_tool_name,
                 run_cell_id_arg_key,
             } => {
@@ -496,8 +514,41 @@ impl ExecutionProvider for ColabMcpExecutionProvider {
                     Value::String(spec.code.to_string()),
                 );
                 if let Some(idx_key) = add_cell_index_arg_key {
-                    // Insert at top by default for tools requiring explicit index.
-                    add_args.insert(idx_key.clone(), Value::Number(serde_json::Number::from(0)));
+                    let tools_snap = sess.cached_tools.read().await;
+                    let resolved_probe = cell_count_probe.clone().or_else(|| {
+                        pick_append_cell_count_tool(&tools_snap)
+                            .map(|tdef| (tdef.name.clone(), build_minimal_query_cells_args(tdef)))
+                    });
+                    drop(tools_snap);
+
+                    if *add_cell_index_required {
+                        let (probe_tool, probe_args) = resolved_probe.ok_or_else(|| {
+                            ExecutionError::Provider(
+                                "colab_mcp: add_code_cell requires a cell index but no get_cells-like \
+                                 tool was found in tools/list; cannot choose an append index"
+                                    .to_string(),
+                            )
+                        })?;
+                        let probe_resp = tokio::time::timeout(
+                            run_timeout,
+                            guard.call_tool_raw(&probe_tool, probe_args),
+                        )
+                        .await
+                        .map_err(|_| ExecutionError::Timeout {
+                            timeout_secs: spec.timeout_secs,
+                        })??;
+                        let n = count_notebook_cells_heuristic(&probe_resp).ok_or_else(|| {
+                            ExecutionError::Provider(format!(
+                                "colab_mcp: {} did not return a usable cells[] length; response={}",
+                                probe_tool,
+                                truncate_json_for_error(&probe_resp, 800)
+                            ))
+                        })?;
+                        add_args
+                            .insert(idx_key.clone(), Value::Number(serde_json::Number::from(n)));
+                    }
+                    // When the index is optional in the MCP schema, omit it so Colab defaults to
+                    // appending after existing cells (passing 0 would insert at the top).
                 }
                 // Hint for Colab editors that expose language selection.
                 add_args.insert("language".to_string(), Value::String("python".to_string()));
@@ -919,6 +970,90 @@ fn pick_arg_key_from_tool_schema(
     None
 }
 
+fn json_schema_property_required(schema: Option<&Value>, prop_name: &str) -> bool {
+    schema
+        .and_then(|s| s.get("required"))
+        .and_then(|r| r.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .any(|s| s == prop_name)
+        })
+        .unwrap_or(false)
+}
+
+fn pick_append_cell_count_tool(tools: &[McpToolDef]) -> Option<&McpToolDef> {
+    const EXACT: &[&str] = &["get_cells", "list_cells", "notebook_get_cells"];
+    for &name in EXACT {
+        if let Some(t) = tools.iter().find(|t| t.name == name) {
+            return Some(t);
+        }
+    }
+    tools.iter().find(|t| {
+        let n = t.name.to_ascii_lowercase();
+        (n.contains("get_cells") || n.ends_with("get_cells")) && !n.contains("add_")
+    })
+}
+
+fn build_minimal_query_cells_args(tool: &McpToolDef) -> serde_json::Map<String, Value> {
+    let Some(props) = tool
+        .input_schema
+        .as_ref()
+        .and_then(|s| s.get("properties"))
+        .and_then(|p| p.as_object())
+    else {
+        return serde_json::Map::new();
+    };
+    let mut m = serde_json::Map::new();
+    for key in ["cellIndexStart", "cell_index_start", "start_cell_index"] {
+        if props.contains_key(key) {
+            m.insert(key.to_string(), Value::Number(0.into()));
+            break;
+        }
+    }
+    for key in ["includeOutputs", "include_outputs"] {
+        if props.contains_key(key) {
+            m.insert(key.to_string(), Value::Bool(false));
+            break;
+        }
+    }
+    m
+}
+
+/// Parses a `get_cells`-style MCP tool result and returns the notebook length (append index).
+fn count_notebook_cells_heuristic(tool_result: &Value) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    fn consider_cells_array(arr: &[Value], best: &mut Option<usize>) {
+        let n = arr.len();
+        let looks_like_cells = n == 0
+            || arr.iter().any(|item| {
+                item.get("cellId").is_some()
+                    || item.get("cell_id").is_some()
+                    || item.get("cell_type").is_some()
+            });
+        if !looks_like_cells {
+            return;
+        }
+        *best = Some(best.map_or(n, |b| b.max(n)));
+    }
+    fn scan(v: &Value, best: &mut Option<usize>) {
+        if let Value::Object(map) = v {
+            if let Some(Value::Array(arr)) = map.get("cells") {
+                consider_cells_array(arr, best);
+            }
+            for nested in map.values() {
+                scan(nested, best);
+            }
+        } else if let Value::Array(arr) = v {
+            for item in arr {
+                scan(item, best);
+            }
+        }
+    }
+    scan(tool_result, &mut best);
+    best
+}
+
 fn detect_execution_mode(
     tools: &[McpToolDef],
     execute_tool_name: &str,
@@ -952,10 +1087,21 @@ fn detect_execution_mode(
         })?;
     let add_cell_index_arg_key =
         pick_arg_key_from_tool_schema(tools, add_tool, &["cellIndex", "cell_index", "index"]);
+    let add_tool_def = tools.iter().find(|t| t.name == add_tool).ok_or_else(|| {
+        ExecutionError::Provider("colab_mcp: internal error: add_code_cell missing".to_string())
+    })?;
+    let add_cell_index_required = add_cell_index_arg_key
+        .as_ref()
+        .map(|k| json_schema_property_required(add_tool_def.input_schema.as_ref(), k))
+        .unwrap_or(false);
+    let cell_count_probe = pick_append_cell_count_tool(tools)
+        .map(|t| (t.name.clone(), build_minimal_query_cells_args(t)));
     Ok(ColabExecutionMode::NotebookCells {
         add_code_cell_tool_name: add_tool.to_string(),
         add_code_arg_key: add_key,
         add_cell_index_arg_key,
+        add_cell_index_required,
+        cell_count_probe,
         run_code_cell_tool_name: execute_tool_name.to_string(),
         run_cell_id_arg_key: execute_code_arg_key.to_string(),
     })
@@ -1155,5 +1301,33 @@ mod tests {
             &["code".to_string(), "source".to_string()],
         );
         assert_eq!(key, "source");
+    }
+
+    #[test]
+    fn json_schema_property_required_detects_required_array() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "cellIndex": {}, "code": {} },
+            "required": ["cellIndex", "code"]
+        });
+        assert!(json_schema_property_required(Some(&schema), "cellIndex"));
+        assert!(!json_schema_property_required(Some(&schema), "language"));
+        assert!(!json_schema_property_required(None, "cellIndex"));
+    }
+
+    #[test]
+    fn count_notebook_cells_heuristic_prefers_cell_like_arrays() {
+        let v = json!({
+            "structuredContent": {
+                "cells": [
+                    { "cellId": "a" },
+                    { "cellId": "b" }
+                ]
+            }
+        });
+        assert_eq!(count_notebook_cells_heuristic(&v), Some(2));
+
+        let empty = json!({ "cells": [] });
+        assert_eq!(count_notebook_cells_heuristic(&empty), Some(0));
     }
 }

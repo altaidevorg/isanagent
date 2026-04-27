@@ -109,6 +109,8 @@ When `default_provider = "colab_mcp"`, add **`[harness.execution.colab_mcp]`**:
 
 Colab MCP requires local browser participation and an active Colab page. If the provider cannot auto-detect the execution tool from `tools/list`, configure `execute_tool_name` explicitly.
 
+In **notebook cell** mode (`add_code_cell` + `run_code_cell`), new code cells are appended after existing cells: optional `cellIndex` arguments are omitted so Colab defaults to the end, and when the schema marks an index as **required**, the provider calls a `get_cells`-style tool first to measure the notebook length. Session capabilities may include `colab_mcp_cell_count_probe_tool` when that probe is available.
+
 Restart the agent after editing config.
 
 ## Workspace layout (important)
