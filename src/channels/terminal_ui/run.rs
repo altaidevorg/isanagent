@@ -31,8 +31,8 @@ use crate::channels::terminal_ui::protocol::{
     METADATA_TOOL_NAME, METADATA_TOOL_RESULT_PREVIEW,
 };
 use crate::channels::terminal_ui::{
-    execution_browser, init_from_env, uses_ansi_color, App, Cell, JobStripStatus, TerminalUiFocus,
-    Theme, ToastKind, ToolNoticePhase, ToolRailEntry,
+    execution_browser, history_browser, init_from_env, uses_ansi_color, App, Cell, JobStripStatus,
+    TerminalUiFocus, Theme, ToastKind, ToolNoticePhase, ToolRailEntry,
 };
 use crate::clarification::{METADATA_CLARIFICATION, METADATA_CLARIFICATION_CHOICES};
 
@@ -76,14 +76,16 @@ const TERMINAL_HELP: &str = r#"Commands (leading slash):
   /retry         Re-submit the last user message after an LLM-failed banner
   /tools         Open the tool activity pane
   /exec          Open the executions browser (workspace execution_runs.jsonl)
+  /history       List sessions and open current session history
+  /history <id>  Switch to that chat session and open its history
   /help, /?      Show this help
 
 Keys:
   Enter             Send the compose line
-  Tab / Ctrl+T      Switch focus: transcript → tool activity → executions → …
-  Esc               From tool activity or executions: return to transcript
+  Tab / Ctrl+T      Switch focus: transcript → tool activity → executions → history → …
+  Esc               From tool activity / executions / history: return to transcript
   PgUp / PgDn       Scroll the focused pane; on executions: output pane (Ctrl+Pg*: code pane)
-  F5                Refresh execution run list (executions pane)
+  F5                Refresh execution list (executions pane) or history list (history pane)
   Mouse wheel       Scroll when the pointer is over the focused pane (horizontal wheel scrolls too)
   Ctrl+Shift+Y      Copy last assistant reply
   Ctrl+W / Ctrl+U   Delete word / clear line
@@ -625,7 +627,7 @@ fn build_title_line(max_width: usize) -> Line<'static> {
     let groups = vec![
         vec![Span::styled(" isanagent ", Theme::input_prompt())],
         vec![Span::styled(
-            "· /exit · /new · /copy · /cancel · /background · /retry · /tools · /exec · /help · Tab · Esc · wheel · PgUp/PgDn",
+            "· /exit · /new · /copy · /cancel · /background · /retry · /tools · /exec · /history · /help · Tab · Esc · wheel · PgUp/PgDn",
             dim,
         )],
     ];
@@ -969,6 +971,48 @@ fn rescan_executions_manifest(workspace_dir: &Path, chat_id: &str, app: &mut App
     }
 }
 
+fn clamp_history_selection(app: &mut App) {
+    if app.history_items.is_empty() {
+        app.history_selected_idx = None;
+        return;
+    }
+    let n = app.history_items.len();
+    match app.history_selected_idx {
+        None => app.history_selected_idx = Some(0),
+        Some(i) if i >= n => app.history_selected_idx = Some(n - 1),
+        _ => {}
+    }
+}
+
+fn load_selected_history_detail(app: &mut App) {
+    app.history_detail = None;
+    let Some(idx) = app.history_selected_idx else {
+        return;
+    };
+    let Some(item) = app.history_items.get(idx) else {
+        return;
+    };
+    app.history_detail_scroll_top = 0;
+    app.history_detail = Some(history_browser::load_history_detail(item));
+}
+
+fn rescan_history_log(workspace_dir: &Path, chat_id: &str, app: &mut App) {
+    match history_browser::load_history_for_chat(workspace_dir, chat_id) {
+        Ok((items, warning)) => {
+            app.history_chat_items = items;
+            app.history_error = warning;
+            app.history_is_session_picker = false;
+            app.history_detail_scroll_top = 0;
+        }
+        Err(e) => {
+            app.history_error = Some(e);
+            app.history_chat_items.clear();
+            app.history_detail_scroll_top = 0;
+            app.history_is_session_picker = false;
+        }
+    }
+}
+
 fn execution_run_list_line(
     item: &execution_browser::ExecutionRunListItem,
     inner_w: usize,
@@ -986,6 +1030,19 @@ fn execution_run_list_line(
     let ts_short: String = item.ts.chars().take(26).collect();
     let raw = format!("{ts_short}  {ex}  {desc}");
     truncate_chars_display(&raw, inner_w.max(12))
+}
+
+fn short_ts(ts: &str) -> String {
+    if ts.eq_ignore_ascii_case("unknown-ts") || ts.starts_with("legacy-") {
+        return "-- --:--".to_string();
+    }
+    if ts.len() >= 19 {
+        // 2026-04-28T13:45:21+03:00 -> 04-28 13:45
+        let mm_dd = &ts[5..10];
+        let hh_mm = &ts[11..16];
+        return format!("{mm_dd} {hh_mm}");
+    }
+    ts.chars().take(16).collect()
 }
 
 fn execution_code_lines(source: &str, inner_w: usize) -> Vec<Line<'static>> {
@@ -1116,6 +1173,265 @@ fn executions_output_paragraph(
     (Paragraph::new(Text::from(slice)).block(block), max_scroll)
 }
 
+fn history_list_paragraph(app: &App, area: Rect) -> (Paragraph<'static>, usize) {
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let visible = area.height.saturating_sub(2) as usize;
+    let max_scroll = if app.history_items.is_empty() {
+        0usize
+    } else {
+        app.history_items.len().saturating_sub(visible.max(1))
+    };
+    let st = app.history_list_scroll_top.min(max_scroll);
+    let mut slice: Vec<Line<'static>> = Vec::new();
+    if app.history_items.is_empty() {
+        let msg = app
+            .history_error
+            .as_deref()
+            .unwrap_or("No history records for this thread yet.");
+        slice.push(Line::from(Span::styled(msg.to_string(), Theme::dim())));
+    } else {
+        if let Some(err) = app.history_error.as_deref() {
+            slice.push(Line::from(Span::styled(err.to_string(), Theme::error())));
+        }
+        for (row, item) in app
+            .history_items
+            .iter()
+            .enumerate()
+            .skip(st)
+            .take(visible.max(1))
+        {
+            let sel = app.history_selected_idx == Some(row);
+            let mark = if sel { "› " } else { "  " };
+            let ts_short = short_ts(&item.ts);
+            let kind = item.kind.label();
+            let kind_col = if kind.is_empty() {
+                "msg".to_string()
+            } else {
+                kind.to_lowercase()
+            };
+            let raw = format!("{ts_short}  {:<10}  {}", kind_col, item.preview.as_str());
+            let body = truncate_chars_display(&raw, inner_w.saturating_sub(4).max(12));
+            let style = if sel {
+                Theme::tool_call()
+            } else {
+                Theme::text()
+            };
+            slice.push(Line::from(vec![
+                Span::styled(mark, Theme::tool_done()),
+                Span::styled(body, style),
+            ]));
+        }
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(" history sessions ", Theme::tool_done()))
+        .border_style(Theme::dim());
+    (Paragraph::new(Text::from(slice)).block(block), max_scroll)
+}
+
+fn history_detail_paragraph(
+    detail: Option<&history_browser::HistoryDetail>,
+    area: Rect,
+    scroll_top: usize,
+) -> (Paragraph<'static>, usize) {
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let visible = area.height.saturating_sub(2) as usize;
+    let lines = if let Some(d) = detail {
+        wrap_text(&d.content, inner_w.max(8))
+            .into_iter()
+            .map(|s| Line::from(Span::styled(s, Theme::text())))
+            .collect::<Vec<_>>()
+    } else {
+        vec![Line::from(Span::styled(
+            "Pick a record from the list (↑↓).",
+            Theme::dim(),
+        ))]
+    };
+    let total = lines.len();
+    let max_scroll = total.saturating_sub(visible.max(1));
+    let st = scroll_top.min(max_scroll);
+    let slice: Vec<Line<'static>> = lines.into_iter().skip(st).take(visible.max(1)).collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(" detail ", Theme::dim()))
+        .border_style(Theme::dim());
+    (Paragraph::new(Text::from(slice)).block(block), max_scroll)
+}
+
+fn history_item_text(item: &history_browser::HistoryListItem) -> String {
+    item.raw
+        .get("content")
+        .and_then(|x| x.as_str())
+        .or_else(|| {
+            item.raw
+                .get("inbound")
+                .and_then(|x| x.get("content"))
+                .and_then(|x| x.as_str())
+        })
+        .or_else(|| {
+            item.raw
+                .get("outbound")
+                .and_then(|x| x.get("content"))
+                .and_then(|x| x.as_str())
+        })
+        .or_else(|| item.raw.get("message").and_then(|x| x.as_str()))
+        .or_else(|| item.raw.get("text").and_then(|x| x.as_str()))
+        .map(str::to_string)
+        .unwrap_or_else(|| item.preview.clone())
+}
+
+fn history_chat_replay_paragraph(
+    app: &App,
+    area: Rect,
+    scroll_top: usize,
+) -> (Paragraph<'static>, usize) {
+    let mut cells: Vec<Cell> = Vec::new();
+    let mut last_user_text: Option<String> = None;
+    let mut last_assistant_text: Option<String> = None;
+    for item in app.history_chat_items.iter().rev() {
+        let text = history_item_text(item);
+        let stamped = format!("[{}] {}", short_ts(&item.ts), text);
+        match item.kind {
+            history_browser::HistoryKind::User => {
+                let dup = last_user_text
+                    .as_deref()
+                    .map(|s| s.trim() == stamped.trim())
+                    .unwrap_or(false);
+                if !dup {
+                    cells.push(Cell::User {
+                        text: stamped.clone(),
+                    });
+                    last_user_text = Some(stamped);
+                }
+            }
+            history_browser::HistoryKind::Assistant => {
+                let dup = last_assistant_text
+                    .as_deref()
+                    .map(|s| s.trim() == stamped.trim())
+                    .unwrap_or(false);
+                if !dup {
+                    cells.push(Cell::Assistant {
+                        markdown: stamped.clone(),
+                    });
+                    last_assistant_text = Some(stamped);
+                }
+            }
+            history_browser::HistoryKind::ToolCall
+            | history_browser::HistoryKind::ToolResult
+            | history_browser::HistoryKind::Error
+            | history_browser::HistoryKind::Other => {}
+        }
+    }
+    if cells.is_empty() {
+        cells.push(Cell::System {
+            message: "No user/assistant messages in this chat history.".to_string(),
+        });
+    }
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let lines = flatten_cells_to_lines(&cells, inner_w.max(8));
+    let visible = area.height.saturating_sub(2) as usize;
+    let total = lines.len();
+    let max_scroll = total.saturating_sub(visible.max(1));
+    let st = scroll_top.min(max_scroll);
+    let slice: Vec<Line<'static>> = lines.into_iter().skip(st).take(visible.max(1)).collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(" chat replay · read-only ", Theme::dim()))
+        .border_style(Theme::dim());
+    (Paragraph::new(Text::from(slice)).block(block), max_scroll)
+}
+
+fn history_ensure_list_shows_selection(app: &mut App, list_inner_height: usize) {
+    let v = list_inner_height.max(1);
+    let Some(sel) = app.history_selected_idx else {
+        return;
+    };
+    if sel < app.history_list_scroll_top {
+        app.history_list_scroll_top = sel;
+    }
+    if sel >= app.history_list_scroll_top.saturating_add(v) {
+        app.history_list_scroll_top = sel.saturating_sub(v.saturating_sub(1));
+    }
+}
+
+fn resolve_chat_id_prefix(workspace_dir: &Path, prefix: &str) -> Result<Option<String>, String> {
+    let (sessions, _) = history_browser::load_recent_chat_sessions(workspace_dir, 500)?;
+    let mut matches = sessions
+        .into_iter()
+        .filter(|s| s.chat_id.starts_with(prefix))
+        .map(|s| s.chat_id)
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches.dedup();
+    if matches.len() == 1 {
+        return Ok(matches.into_iter().next());
+    }
+    if matches.is_empty() {
+        return Ok(None);
+    }
+    Err(format!(
+        "chat_id prefix is ambiguous ({} matches). Use a longer prefix.",
+        matches.len()
+    ))
+}
+
+fn load_history_session_picker(workspace_dir: &Path, current_chat_id: &str, app: &mut App) {
+    app.history_items.clear();
+    app.history_chat_items.clear();
+    app.history_selected_idx = None;
+    app.history_list_scroll_top = 0;
+    app.history_detail_scroll_top = 0;
+    app.history_detail = None;
+    app.history_is_session_picker = true;
+    app.last_history_list_rect = None;
+    app.last_history_detail_rect = None;
+
+    match history_browser::load_recent_chat_sessions(workspace_dir, 200) {
+        Ok((sessions, warning)) => {
+            for s in sessions {
+                let mark = if s.chat_id == current_chat_id {
+                    " *"
+                } else {
+                    ""
+                };
+                let raw = serde_json::json!({
+                    "chat_id": s.chat_id,
+                    "last_ts": s.last_ts,
+                    "record_count": s.record_count,
+                    "current": s.chat_id == current_chat_id
+                });
+                let chat_id = raw
+                    .get("chat_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let ts = raw
+                    .get("last_ts")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown-ts")
+                    .to_string();
+                let cnt = raw
+                    .get("record_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                app.history_items.push(history_browser::HistoryListItem {
+                    ts,
+                    kind: history_browser::HistoryKind::Other,
+                    preview: format!("{chat_id}{mark}  [{cnt} records]  {}", short_ts(&s.last_ts)),
+                    raw,
+                });
+            }
+            app.history_error = warning
+                .or_else(|| Some("Select one via `/history <chat_id_or_prefix>`.".to_string()));
+            clamp_history_selection(app);
+            load_selected_history_detail(app);
+        }
+        Err(e) => {
+            app.history_error = Some(format!("Could not load sessions: {e}"));
+        }
+    }
+}
+
 fn last_assistant_markdown(cells: &[Cell]) -> Option<&str> {
     cells.iter().rev().find_map(|c| {
         if let Cell::Assistant { markdown } = c {
@@ -1188,7 +1504,10 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
     let max_exec_list_scroll_holder = std::cell::Cell::new(0usize);
     let max_exec_code_scroll_holder = std::cell::Cell::new(0usize);
     let max_exec_out_scroll_holder = std::cell::Cell::new(0usize);
+    let max_history_list_scroll_holder = std::cell::Cell::new(0usize);
+    let max_history_detail_scroll_holder = std::cell::Cell::new(0usize);
     let mut last_exec_poll = Instant::now() - Duration::from_secs(60);
+    let mut suppress_next_assistant_echo = false;
 
     loop {
         app.clear_expired_toast();
@@ -1221,6 +1540,9 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         }
 
         while let Ok(msg) = outbound_rx.try_recv() {
+            if msg.chat_id != chat_id {
+                continue;
+            }
             if msg
                 .metadata
                 .get(ISANAGENT_EXECUTION_JOB_STARTED)
@@ -1285,6 +1607,17 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 .and_then(|v| v.as_bool())
                 == Some(true);
             if is_tool_notify {
+                let phase = msg
+                    .metadata
+                    .get(ISANAGENT_TOOL_PHASE)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let tool_name = msg
+                    .metadata
+                    .get(METADATA_TOOL_NAME)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                suppress_next_assistant_echo = phase == "result" && tool_name == "message";
                 apply_terminal_tool_aux(&mut app, &msg);
                 if app.ui_focus == TerminalUiFocus::ToolHistory && app.tool_history_following_tail()
                 {
@@ -1300,7 +1633,18 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 } => {
                     app.upsert_tool_notice(tool_call_id, phase, content);
                 }
+                Cell::Assistant { markdown } => {
+                    let is_dup = suppress_next_assistant_echo
+                        && last_assistant_markdown(&app.cells)
+                            .map(|prev| prev.trim() == markdown.trim())
+                            .unwrap_or(false);
+                    if !is_dup {
+                        append_cell_merging_thought(&mut app.cells, Cell::Assistant { markdown });
+                    }
+                    suppress_next_assistant_echo = false;
+                }
                 other => {
+                    suppress_next_assistant_echo = false;
                     append_cell_merging_thought(&mut app.cells, other);
                 }
             }
@@ -1347,6 +1691,8 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     app.last_executions_list_rect = None;
                     app.last_executions_code_rect = None;
                     app.last_executions_output_rect = None;
+                    app.last_history_list_rect = None;
+                    app.last_history_detail_rect = None;
                 }
                 TerminalUiFocus::ToolHistory => {
                     let (w, max_s) =
@@ -1358,6 +1704,8 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     app.last_executions_list_rect = None;
                     app.last_executions_code_rect = None;
                     app.last_executions_output_rect = None;
+                    app.last_history_list_rect = None;
+                    app.last_history_detail_rect = None;
                 }
                 TerminalUiFocus::Executions => {
                     let list_w = (ch[1].width / 3).clamp(26, 46);
@@ -1419,6 +1767,38 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     app.last_transcript_rect = None;
                     app.last_tool_history_rect = None;
                     app.last_executions_list_rect = Some(list_r);
+                    app.last_history_list_rect = None;
+                    app.last_history_detail_rect = None;
+                }
+                TerminalUiFocus::History => {
+                    let list_w = (ch[1].width / 3).clamp(28, 52);
+                    let hareas = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Length(list_w), Constraint::Min(8)])
+                        .split(ch[1]);
+                    let list_r = hareas[0];
+                    let detail_r = hareas[1];
+                    let (pl, max_l) = history_list_paragraph(&app, list_r);
+                    max_history_list_scroll_holder.set(max_l);
+                    f.render_widget(pl, list_r);
+                    let (pd, max_d) = if app.history_is_session_picker {
+                        history_detail_paragraph(
+                            app.history_detail.as_ref(),
+                            detail_r,
+                            app.history_detail_scroll_top,
+                        )
+                    } else {
+                        history_chat_replay_paragraph(&app, detail_r, app.history_detail_scroll_top)
+                    };
+                    max_history_detail_scroll_holder.set(max_d);
+                    f.render_widget(pd, detail_r);
+                    app.last_transcript_rect = None;
+                    app.last_tool_history_rect = None;
+                    app.last_executions_list_rect = None;
+                    app.last_executions_code_rect = None;
+                    app.last_executions_output_rect = None;
+                    app.last_history_list_rect = Some(list_r);
+                    app.last_history_detail_rect = Some(detail_r);
                 }
             }
 
@@ -1503,6 +1883,13 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             app.executions_output_scroll_top = app
                 .executions_output_scroll_top
                 .min(max_exec_out_scroll_holder.get());
+        } else if app.ui_focus == TerminalUiFocus::History {
+            app.history_list_scroll_top = app
+                .history_list_scroll_top
+                .min(max_history_list_scroll_holder.get());
+            app.history_detail_scroll_top = app
+                .history_detail_scroll_top
+                .min(max_history_detail_scroll_holder.get());
         }
 
         if !event::poll(tick)? {
@@ -1522,6 +1909,32 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     app.clear_line();
                 }
                 KeyCode::Enter => {
+                    if app.ui_focus == TerminalUiFocus::History
+                        && app.history_is_session_picker
+                        && app.input.trim().is_empty()
+                    {
+                        if let Some(idx) = app.history_selected_idx {
+                            if let Some(item) = app.history_items.get(idx) {
+                                if let Some(cid) = item
+                                    .raw
+                                    .get("chat_id")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string)
+                                {
+                                    chat_id = cid.clone();
+                                    app.thinking = false;
+                                    app.focus_history();
+                                    rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
+                                    rescan_history_log(&workspace_dir, &chat_id, &mut app);
+                                    last_exec_poll = Instant::now();
+                                    app.cells.push(Cell::System {
+                                        message: format!("Switched to session history: {cid}"),
+                                    });
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     let raw = app.take_input();
                     let text = raw.trim();
                     if text.is_empty() {
@@ -1599,6 +2012,45 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             app.focus_executions();
                             rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
                             last_exec_poll = Instant::now();
+                            continue;
+                        }
+                        if text.eq_ignore_ascii_case("/history") {
+                            app.focus_history();
+                            load_history_session_picker(&workspace_dir, &chat_id, &mut app);
+                            continue;
+                        }
+                        if let Some(rest) = text.strip_prefix("/history ") {
+                            let target = rest.trim();
+                            if target.is_empty() {
+                                app.cells.push(Cell::System {
+                                    message: "Usage: /history <chat_id_or_prefix>".to_string(),
+                                });
+                                continue;
+                            }
+                            let resolved = if target.contains('-') && target.len() >= 16 {
+                                Ok(Some(target.to_string()))
+                            } else {
+                                resolve_chat_id_prefix(&workspace_dir, target)
+                            };
+                            match resolved {
+                                Ok(Some(cid)) => {
+                                    chat_id = cid.clone();
+                                    app.thinking = false;
+                                    app.focus_history();
+                                    rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
+                                    rescan_history_log(&workspace_dir, &chat_id, &mut app);
+                                    last_exec_poll = Instant::now();
+                                    app.cells.push(Cell::System {
+                                        message: format!("Switched to session history: {cid}"),
+                                    });
+                                }
+                                Ok(None) => app.cells.push(Cell::System {
+                                    message: format!(
+                                        "No session matched `{target}`. Try `/history` first."
+                                    ),
+                                }),
+                                Err(e) => app.cells.push(Cell::System { message: e }),
+                            }
                             continue;
                         }
                         if text.eq_ignore_ascii_case("/cancel")
@@ -1680,7 +2132,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         }
                         app.cells.push(Cell::System {
                             message:
-                                "Unknown command. Try /help, /exit, /new, /copy, /install-python, /cancel, /background, /retry, /tools, /exec."
+                                "Unknown command. Try /help, /exit, /new, /copy, /install-python, /cancel, /background, /retry, /tools, /exec, /history."
                                     .into(),
                         });
                         continue;
@@ -1735,7 +2187,29 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 executions_ensure_list_shows_selection(&mut app, list_h);
                             }
                         }
-                    } else if app.ui_focus != TerminalUiFocus::Executions {
+                    } else if app.ui_focus == TerminalUiFocus::History
+                        && !app.history_items.is_empty()
+                    {
+                        if app.history_is_session_picker {
+                            if let Some(i) = app.history_selected_idx {
+                                if i > 0 {
+                                    app.history_selected_idx = Some(i - 1);
+                                    load_selected_history_detail(&mut app);
+                                    let list_h = app
+                                        .last_history_list_rect
+                                        .map(|r| r.height.saturating_sub(2) as usize)
+                                        .unwrap_or(8);
+                                    history_ensure_list_shows_selection(&mut app, list_h);
+                                }
+                            }
+                        } else {
+                            app.history_detail_scroll_top =
+                                app.history_detail_scroll_top.saturating_sub(1);
+                        }
+                    } else if matches!(
+                        app.ui_focus,
+                        TerminalUiFocus::Transcript | TerminalUiFocus::ToolHistory
+                    ) {
                         app.history_up();
                     }
                 }
@@ -1754,14 +2228,41 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 executions_ensure_list_shows_selection(&mut app, list_h);
                             }
                         }
-                    } else if app.ui_focus != TerminalUiFocus::Executions {
+                    } else if app.ui_focus == TerminalUiFocus::History
+                        && !app.history_items.is_empty()
+                    {
+                        if app.history_is_session_picker {
+                            if let Some(i) = app.history_selected_idx {
+                                if i + 1 < app.history_items.len() {
+                                    app.history_selected_idx = Some(i + 1);
+                                    load_selected_history_detail(&mut app);
+                                    let list_h = app
+                                        .last_history_list_rect
+                                        .map(|r| r.height.saturating_sub(2) as usize)
+                                        .unwrap_or(8);
+                                    history_ensure_list_shows_selection(&mut app, list_h);
+                                }
+                            }
+                        } else {
+                            app.history_detail_scroll_top =
+                                app.history_detail_scroll_top.saturating_add(1);
+                        }
+                    } else if matches!(
+                        app.ui_focus,
+                        TerminalUiFocus::Transcript | TerminalUiFocus::ToolHistory
+                    ) {
                         app.history_down();
                     }
                 }
                 KeyCode::Esc => {
-                    if matches!(
+                    if app.ui_focus == TerminalUiFocus::History && !app.history_is_session_picker {
+                        app.history_is_session_picker = true;
+                        app.history_detail_scroll_top = 0;
+                    } else if matches!(
                         app.ui_focus,
-                        TerminalUiFocus::ToolHistory | TerminalUiFocus::Executions
+                        TerminalUiFocus::ToolHistory
+                            | TerminalUiFocus::Executions
+                            | TerminalUiFocus::History
                     ) {
                         app.focus_transcript();
                     }
@@ -1771,6 +2272,8 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     if app.ui_focus == TerminalUiFocus::Executions {
                         rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
                         last_exec_poll = Instant::now();
+                    } else if app.ui_focus == TerminalUiFocus::History {
+                        load_history_session_picker(&workspace_dir, &chat_id, &mut app);
                     }
                     if app.following_tail() {
                         app.scroll_offset = 0;
@@ -1786,6 +2289,8 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     if app.ui_focus == TerminalUiFocus::Executions {
                         rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
                         last_exec_poll = Instant::now();
+                    } else if app.ui_focus == TerminalUiFocus::History {
+                        load_history_session_picker(&workspace_dir, &chat_id, &mut app);
                     }
                     if app.following_tail() {
                         app.scroll_offset = 0;
@@ -1808,6 +2313,15 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 app.executions_output_scroll_top.saturating_sub(3);
                         }
                     }
+                    TerminalUiFocus::History => {
+                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            app.history_list_scroll_top =
+                                app.history_list_scroll_top.saturating_sub(1);
+                        } else {
+                            app.history_detail_scroll_top =
+                                app.history_detail_scroll_top.saturating_sub(3);
+                        }
+                    }
                     TerminalUiFocus::Transcript => app.scroll_up(8),
                 },
                 KeyCode::PageDown => match app.ui_focus {
@@ -1824,12 +2338,27 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 app.executions_output_scroll_top.saturating_add(3);
                         }
                     }
+                    TerminalUiFocus::History => {
+                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            app.history_list_scroll_top =
+                                app.history_list_scroll_top.saturating_add(1);
+                        } else {
+                            app.history_detail_scroll_top =
+                                app.history_detail_scroll_top.saturating_add(3);
+                        }
+                    }
                     TerminalUiFocus::Transcript => app.scroll_down(8),
                 },
                 KeyCode::F(5) => {
                     if app.ui_focus == TerminalUiFocus::Executions {
                         rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
                         last_exec_poll = Instant::now();
+                    } else if app.ui_focus == TerminalUiFocus::History {
+                        if app.history_is_session_picker {
+                            load_history_session_picker(&workspace_dir, &chat_id, &mut app);
+                        } else {
+                            rescan_history_log(&workspace_dir, &chat_id, &mut app);
+                        }
                     }
                 }
                 KeyCode::Char(c)
@@ -1963,6 +2492,41 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             MouseEventKind::ScrollRight => {
                                 app.executions_output_scroll_top =
                                     app.executions_output_scroll_top.saturating_add(n);
+                            }
+                            _ => {}
+                        }
+                    }
+                } else if app.ui_focus == TerminalUiFocus::History {
+                    let over_list = app
+                        .last_history_list_rect
+                        .map(|r| rect_contains(r, me.column, me.row))
+                        .unwrap_or(false);
+                    let over_detail = app
+                        .last_history_detail_rect
+                        .map(|r| rect_contains(r, me.column, me.row))
+                        .unwrap_or(false);
+                    let n = MOUSE_SCROLL_LINES as usize;
+                    if over_list {
+                        match me.kind {
+                            MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft => {
+                                app.history_list_scroll_top =
+                                    app.history_list_scroll_top.saturating_sub(1);
+                            }
+                            MouseEventKind::ScrollDown | MouseEventKind::ScrollRight => {
+                                app.history_list_scroll_top =
+                                    app.history_list_scroll_top.saturating_add(1);
+                            }
+                            _ => {}
+                        }
+                    } else if over_detail {
+                        match me.kind {
+                            MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft => {
+                                app.history_detail_scroll_top =
+                                    app.history_detail_scroll_top.saturating_sub(n);
+                            }
+                            MouseEventKind::ScrollDown | MouseEventKind::ScrollRight => {
+                                app.history_detail_scroll_top =
+                                    app.history_detail_scroll_top.saturating_add(n);
                             }
                             _ => {}
                         }

@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use ratatui::layout::Rect;
 
 use super::execution_browser::{ExecutionRunDetail, ExecutionRunListItem};
+use super::history_browser::{HistoryDetail, HistoryListItem};
 
 /// High-level UI mode for the terminal front-end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -38,6 +39,7 @@ pub enum TerminalUiFocus {
     ToolHistory,
     /// Browse `execution_runs.jsonl` + per-run journals for this terminal thread (`chat_id`).
     Executions,
+    History,
 }
 
 const TOOL_RAIL_CAP: usize = 150;
@@ -209,6 +211,16 @@ pub struct App {
     pub last_executions_list_rect: Option<Rect>,
     pub last_executions_code_rect: Option<Rect>,
     pub last_executions_output_rect: Option<Rect>,
+    pub history_items: Vec<HistoryListItem>,
+    pub history_chat_items: Vec<HistoryListItem>,
+    pub history_selected_idx: Option<usize>,
+    pub history_list_scroll_top: usize,
+    pub history_detail_scroll_top: usize,
+    pub history_detail: Option<HistoryDetail>,
+    pub history_error: Option<String>,
+    pub history_is_session_picker: bool,
+    pub last_history_list_rect: Option<Rect>,
+    pub last_history_detail_rect: Option<Rect>,
 }
 
 impl Default for App {
@@ -256,6 +268,16 @@ impl App {
             last_executions_list_rect: None,
             last_executions_code_rect: None,
             last_executions_output_rect: None,
+            history_items: Vec::new(),
+            history_chat_items: Vec::new(),
+            history_selected_idx: None,
+            history_list_scroll_top: 0,
+            history_detail_scroll_top: 0,
+            history_detail: None,
+            history_error: None,
+            history_is_session_picker: false,
+            last_history_list_rect: None,
+            last_history_detail_rect: None,
         }
     }
 
@@ -294,7 +316,8 @@ impl App {
         self.ui_focus = match self.ui_focus {
             TerminalUiFocus::Transcript => TerminalUiFocus::ToolHistory,
             TerminalUiFocus::ToolHistory => TerminalUiFocus::Executions,
-            TerminalUiFocus::Executions => TerminalUiFocus::Transcript,
+            TerminalUiFocus::Executions => TerminalUiFocus::History,
+            TerminalUiFocus::History => TerminalUiFocus::Transcript,
         };
         self.tool_history_scroll = 0;
     }
@@ -311,6 +334,11 @@ impl App {
 
     pub fn focus_executions(&mut self) {
         self.ui_focus = TerminalUiFocus::Executions;
+        self.tool_history_scroll = 0;
+    }
+
+    pub fn focus_history(&mut self) {
+        self.ui_focus = TerminalUiFocus::History;
         self.tool_history_scroll = 0;
     }
 
@@ -623,6 +651,20 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ui_focus_cycles_with_history() {
+        let mut app = App::new();
+        assert_eq!(app.ui_focus, TerminalUiFocus::Transcript);
+        app.toggle_ui_focus();
+        assert_eq!(app.ui_focus, TerminalUiFocus::ToolHistory);
+        app.toggle_ui_focus();
+        assert_eq!(app.ui_focus, TerminalUiFocus::Executions);
+        app.toggle_ui_focus();
+        assert_eq!(app.ui_focus, TerminalUiFocus::History);
+        app.toggle_ui_focus();
+        assert_eq!(app.ui_focus, TerminalUiFocus::Transcript);
+    }
 
     #[test]
     fn scroll_clamps() {

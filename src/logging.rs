@@ -186,16 +186,36 @@ impl LoggingActor {
     }
 
     fn write_conversation(&mut self, packet: &BusMessage) -> Result<(), ActorError> {
-        let json_line = match packet {
-            BusMessage::Inbound(inv) => serde_json::to_string(inv),
-            BusMessage::Outbound(out) => serde_json::to_string(out),
-            BusMessage::Telemetry(tel) => serde_json::to_string(tel),
+        let mut value = match packet {
+            BusMessage::Inbound(inv) => serde_json::to_value(inv),
+            BusMessage::Outbound(out) => serde_json::to_value(out),
+            BusMessage::Telemetry(tel) => serde_json::to_value(tel),
             BusMessage::Log(_) => return Ok(()),
             BusMessage::LoggerControl(_) => return Ok(()),
             BusMessage::Cancel(_) => return Ok(()),
             BusMessage::PromoteSyncToBackground(_) => return Ok(()),
         }
         .map_err(|e| ActorError::from(format!("Failed to serialize conversation event: {}", e)))?;
+
+        let ts = chrono::Local::now().to_rfc3339();
+        match &mut value {
+            serde_json::Value::Object(map) => {
+                map.insert("ts".to_string(), serde_json::Value::String(ts));
+            }
+            _ => {
+                value = json!({
+                    "ts": ts,
+                    "payload": value,
+                });
+            }
+        }
+
+        let json_line = serde_json::to_string(&value).map_err(|e| {
+            ActorError::from(format!(
+                "Failed to serialize conversation event with timestamp: {}",
+                e
+            ))
+        })?;
 
         writeln!(self.conversation_writer, "{}", json_line)
             .map_err(|e| ActorError::from(format!("Failed to write conversation log: {}", e)))
