@@ -105,6 +105,10 @@ uv_requirements = ["afterimage>=0.15.0"]
 # between 5 and max_wall_secs. Default: 120.
 # auto_promote_after_secs = 120
 
+# When true (default), terminal background jobs enqueue a synthetic inbound so the agent can
+# fetch results without waiting for the user. Set false for strict API control.
+# wake_on_job_terminal = true
+
 [harness.execution.jupyter]
 base_url = "http://127.0.0.1:8888"
 token = "<changethis>"

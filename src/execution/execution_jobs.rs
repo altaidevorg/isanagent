@@ -1,5 +1,6 @@
 //! In-process background execution jobs (`execution_run_background`). Jobs end when the agent process exits.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -16,7 +17,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::{AbortHandle, JoinHandle};
 
-use crate::bus::{BusMessage, TelemetryEvent};
+use crate::bus::{BusMessage, InboundMessage, TelemetryEvent, METADATA_SYNTHETIC_JOB_FOLLOWUP};
 use crate::channels::terminal::{
     build_execution_job_notice, build_execution_job_started_notice, build_execution_stream_notice,
 };
@@ -182,9 +183,60 @@ impl ExecutionJobRecord {
 struct ExecutionJobManagerInner {
     harness: Arc<ExecutionHarness>,
     outbound_tx: mpsc::Sender<BusMessage>,
+    /// When set and `wake_on_job_terminal` is true, terminal jobs enqueue a synthetic [`BusMessage::Inbound`].
+    inbound_bus_tx: Option<mpsc::Sender<BusMessage>>,
+    wake_on_job_terminal: bool,
     jobs: DashMap<String, Arc<ExecutionJobRecord>>,
     session_busy: Arc<DashMap<String, ()>>,
     max_jobs: usize,
+}
+
+/// Enqueue a synthetic user message so the agent can call `execution_job_result` without waiting for the user.
+async fn send_job_terminal_followup_inbound_if_configured(
+    inner: &ExecutionJobManagerInner,
+    chat_id: &str,
+    channel: &str,
+    job_id: &str,
+    status_label: &str,
+    session_id: &str,
+    tool_name: &str,
+) {
+    if !inner.wake_on_job_terminal {
+        return;
+    }
+    let Some(ref tx) = inner.inbound_bus_tx else {
+        return;
+    };
+    let content = format!(
+        "System: Background execution job `{job_id}` finished with status `{status_label}` (session `{session_id}`, tool `{tool_name}`). \
+Call `execution_job_status` if you are unsure of the state, then `execution_job_result` (and `execution_artifact_list` when relevant). \
+Summarize outcomes or errors for the user and update `todo_write` if you use it for this work."
+    );
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        METADATA_SYNTHETIC_JOB_FOLLOWUP.to_string(),
+        serde_json::Value::Bool(true),
+    );
+    metadata.insert(
+        "execution_job_id".to_string(),
+        serde_json::Value::String(job_id.to_string()),
+    );
+    metadata.insert(
+        "isanagent_autonomous_forbid_final_without_tools".to_string(),
+        serde_json::Value::Bool(true),
+    );
+    let inbound = InboundMessage {
+        channel: channel.to_string(),
+        sender_id: "execution_job".to_string(),
+        chat_id: chat_id.to_string(),
+        thread_id: None,
+        content,
+        attachments: vec![],
+        metadata,
+    };
+    if let Err(e) = tx.send(BusMessage::Inbound(inbound)).await {
+        warn!("execution job follow-up inbound: bus send failed: {e}");
+    }
 }
 
 /// Arguments for [`ExecutionJobManager::spawn_run`].
@@ -201,16 +253,24 @@ pub struct SpawnBackgroundRunRequest {
 }
 
 /// Process-local registry for background runs.
+#[derive(Clone)]
 pub struct ExecutionJobManager {
     inner: Arc<ExecutionJobManagerInner>,
 }
 
 impl ExecutionJobManager {
-    pub fn new(harness: Arc<ExecutionHarness>, outbound_tx: mpsc::Sender<BusMessage>) -> Self {
+    pub fn new(
+        harness: Arc<ExecutionHarness>,
+        outbound_tx: mpsc::Sender<BusMessage>,
+        inbound_bus_tx: Option<mpsc::Sender<BusMessage>>,
+        wake_on_job_terminal: bool,
+    ) -> Self {
         Self {
             inner: Arc::new(ExecutionJobManagerInner {
                 harness,
                 outbound_tx,
+                inbound_bus_tx,
+                wake_on_job_terminal,
                 jobs: DashMap::new(),
                 session_busy: Arc::new(DashMap::new()),
                 max_jobs: 512,
@@ -598,6 +658,16 @@ impl ExecutionJobManager {
                         Some(rec.tool_name.as_str()),
                     );
                     let _ = inner.outbound_tx.send(BusMessage::Outbound(notice)).await;
+                    send_job_terminal_followup_inbound_if_configured(
+                        &inner,
+                        &chat_id,
+                        &channel,
+                        &job_id_for_task,
+                        "completed",
+                        &sid_spawn.to_string(),
+                        &rec.tool_name,
+                    )
+                    .await;
                     if let Err(e) = append_job_audit_line(
                         &ws,
                         &JobAuditLine {
@@ -668,6 +738,16 @@ impl ExecutionJobManager {
                         Some(rec.tool_name.as_str()),
                     );
                     let _ = inner.outbound_tx.send(BusMessage::Outbound(notice)).await;
+                    send_job_terminal_followup_inbound_if_configured(
+                        &inner,
+                        &chat_id,
+                        &channel,
+                        &job_id_for_task,
+                        status_label,
+                        &sid_spawn.to_string(),
+                        &rec.tool_name,
+                    )
+                    .await;
                     if let Err(log_e) = append_job_audit_line(
                         &ws,
                         &JobAuditLine {
@@ -1059,6 +1139,16 @@ async fn finalize_arbitrary_job(p: FinalizeArbitraryParams) {
                 Some(rec.tool_name.as_str()),
             );
             let _ = inner.outbound_tx.send(BusMessage::Outbound(notice)).await;
+            send_job_terminal_followup_inbound_if_configured(
+                &inner,
+                &chat_id,
+                &channel,
+                &job_id,
+                "completed",
+                &sid.to_string(),
+                &rec.tool_name,
+            )
+            .await;
             if let Err(e) = append_job_audit_line(
                 &ws,
                 &JobAuditLine {
@@ -1146,6 +1236,16 @@ async fn finalize_arbitrary_job(p: FinalizeArbitraryParams) {
                 Some(rec.tool_name.as_str()),
             );
             let _ = inner.outbound_tx.send(BusMessage::Outbound(notice)).await;
+            send_job_terminal_followup_inbound_if_configured(
+                &inner,
+                &chat_id,
+                &channel,
+                &job_id,
+                status_label,
+                &sid.to_string(),
+                &rec.tool_name,
+            )
+            .await;
             if let Err(log_e) = append_job_audit_line(
                 &ws,
                 &JobAuditLine {
@@ -1299,7 +1399,11 @@ mod tests {
             0,
         ));
         let (otx, orx) = mpsc::channel::<BusMessage>(64);
-        (Arc::new(ExecutionJobManager::new(harness, otx)), orx, ws)
+        (
+            Arc::new(ExecutionJobManager::new(harness, otx, None, false)),
+            orx,
+            ws,
+        )
     }
 
     fn fake_session() -> SessionId {
