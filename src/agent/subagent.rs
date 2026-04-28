@@ -85,7 +85,11 @@ fn truncate_sqlite_field(s: String, max: usize) -> String {
         return s;
     }
     let mut t = s;
-    t.truncate(max);
+    let mut end = max;
+    while end > 0 && !t.is_char_boundary(end) {
+        end -= 1;
+    }
+    t.truncate(end);
     t.push_str("\n… [truncated for sqlite]");
     t
 }

@@ -417,7 +417,11 @@ impl ExecutionJobManager {
             Some(result) => {
                 let mut s = serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?;
                 if s.len() > max_chars {
-                    s.truncate(max_chars);
+                    let mut end = max_chars;
+                    while end > 0 && !s.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    s.truncate(end);
                     s.push_str("\n\n… (truncated to configured max_tool_output_chars)\n");
                 }
                 Ok(s)

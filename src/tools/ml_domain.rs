@@ -87,7 +87,11 @@ impl Tool for ArxivSearchTool {
 
         let mut out = body;
         if out.len() > self.max_output_chars {
-            out.truncate(self.max_output_chars);
+            let mut end = self.max_output_chars;
+            while end > 0 && !out.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.truncate(end);
             out.push_str("\n... [TRUNCATED]");
         }
         Ok(out)
@@ -152,7 +156,11 @@ impl Tool for ArxivFetchTool {
             .await
             .map_err(|e| format!("arxiv_fetch body: {}", e))?;
         if body.len() > self.max_output_chars {
-            body.truncate(self.max_output_chars);
+            let mut end = self.max_output_chars;
+            while end > 0 && !body.is_char_boundary(end) {
+                end -= 1;
+            }
+            body.truncate(end);
             body.push_str("\n... [TRUNCATED]");
         }
         Ok(body)
@@ -272,7 +280,11 @@ impl Tool for HfHubFileFetchTool {
             .await
             .map_err(|e| format!("hf_hub_file_fetch body: {}", e))?;
         if body.len() > self.max_output_chars {
-            body.truncate(self.max_output_chars);
+            let mut end = self.max_output_chars;
+            while end > 0 && !body.is_char_boundary(end) {
+                end -= 1;
+            }
+            body.truncate(end);
             body.push_str("\n... [TRUNCATED]");
         }
         Ok(body)

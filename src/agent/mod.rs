@@ -1331,7 +1331,11 @@ impl AgentLogic {
                     match res {
                         Ok(mut output) => {
                             if output.len() > max_tool_output_chars {
-                                output.truncate(max_tool_output_chars);
+                                let mut end = max_tool_output_chars;
+                                while end > 0 && !output.is_char_boundary(end) {
+                                    end -= 1;
+                                }
+                                output.truncate(end);
                                 output.push_str("\n... [TRUNCATED FOR LENGTH]");
                             }
                             output
