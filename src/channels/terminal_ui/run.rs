@@ -61,10 +61,15 @@ pub(crate) fn execution_strip_subtitle(description: Option<&str>, id: &str) -> S
 
 const ISANAGENT_TOOL_NOTIFY: &str = "isanagent_tool_notify";
 const ISANAGENT_TOOL_PHASE: &str = "isanagent_tool_phase";
+/// If set to a truthy value, start with application mouse capture (wheel in TUI; may block
+/// native selection). Default off; use **Ctrl+Shift+M** to toggle in-session.
+const ISANAGENT_TUI_MOUSE: &str = "ISANAGENT_TUI_MOUSE";
 /// Lines to scroll per mouse wheel notch over the transcript.
 const MOUSE_SCROLL_LINES: u16 = 3;
 const TOAST_COPY_OK_SECS: u64 = 3;
 const TOAST_COPY_ERR_SECS: u64 = 5;
+const TOAST_MOUSE_TOGGLE_OK_SECS: u64 = 4;
+const TOAST_MOUSE_TOGGLE_ERR_SECS: u64 = 5;
 
 const TERMINAL_HELP: &str = r#"Commands (leading slash):
   /exit, /quit   Quit and restore the terminal
@@ -84,14 +89,43 @@ Keys:
   Esc               From tool activity or executions: return to transcript
   PgUp / PgDn       Scroll the focused pane; on executions: output pane (Ctrl+Pg*: code pane)
   F5                Refresh execution run list (executions pane)
-  Mouse wheel       Scroll when the pointer is over the focused pane (horizontal wheel scrolls too)
+  Ctrl+Shift+M      Toggle application mouse: on = wheel scrolls panes; off = native selection/copy
   Ctrl+Shift+Y      Copy last assistant reply
   Ctrl+W / Ctrl+U   Delete word / clear line
-  Ctrl+C            Exit (same idea as /exit)
+  Ctrl+C            Cancel in-flight work (same as /cancel; does not exit)
+  Ctrl+D            Exit if compose line is empty (like /exit); else delete forward (readline-style)
 
 Environment:
-  NO_COLOR          If set to a non-empty value, ANSI foreground colors in the TUI are disabled.
+  NO_COLOR            If set to a non-empty value, ANSI foreground colors in the TUI are disabled.
+  ISANAGENT_TUI_MOUSE 1 / true / yes / on: start with mouse wheel enabled in the TUI (optional)
 "#;
+
+fn env_truthy(var: &str) -> bool {
+    std::env::var_os(var).is_some_and(|v| {
+        matches!(
+            v.to_string_lossy().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+/// Same as `/cancel`: cancel in-flight work; quit only if the bus is gone.
+fn try_cancel_inflight(app: &mut App, bus_tx: &Sender<BusMessage>, chat_id: &str) {
+    app.thinking = false;
+    if bus_tx
+        .blocking_send(BusMessage::Cancel(chat_id.to_string()))
+        .is_err()
+    {
+        app.cells.push(Cell::System {
+            message: "Bus closed; exiting.".into(),
+        });
+        app.request_quit();
+    } else {
+        app.cells.push(Cell::System {
+            message: "Cancel sent for this thread (queued prompts cleared).".into(),
+        });
+    }
+}
 
 /// Coalesce consecutive model-thought lines into one cell (streaming-style UX).
 fn tool_notice_display_content(msg: &OutboundMessage, phase_str: &str) -> String {
@@ -625,7 +659,7 @@ fn build_title_line(max_width: usize) -> Line<'static> {
     let groups = vec![
         vec![Span::styled(" isanagent ", Theme::input_prompt())],
         vec![Span::styled(
-            "· /exit · /new · /copy · /cancel · /background · /retry · /tools · /exec · /help · Tab · Esc · wheel · PgUp/PgDn",
+            "· /exit · /new · /copy · /cancel · /background · /retry · /tools · /exec · /help · Tab · Esc · ^Shift+M wheel · PgUp/PgDn",
             dim,
         )],
     ];
@@ -668,7 +702,7 @@ fn build_status_line(
         vec![
             Span::styled(" · ", dim),
             Span::styled(
-                "Enter send · ^Shift+Y copy last · wheel · ^W word · ^U clear · ^C exit",
+                "Enter send · ^Shift+Y copy last · ^Shift+M wheel · ^W word · ^U clear · ^C cancel · ^D exit",
                 Theme::status_bar(),
             ),
         ],
@@ -1170,8 +1204,14 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    if let Err(e) = execute!(terminal.backend_mut(), EnableMouseCapture) {
-        log::warn!("Terminal UI: mouse capture unavailable ({e}); wheel scroll disabled.");
+    let mut application_mouse_enabled = env_truthy(ISANAGENT_TUI_MOUSE);
+    if application_mouse_enabled {
+        if let Err(e) = execute!(terminal.backend_mut(), EnableMouseCapture) {
+            log::warn!(
+                "Terminal UI: mouse capture unavailable ({e}); start with native selection."
+            );
+            application_mouse_enabled = false;
+        }
     }
 
     let mut app = App::new();
@@ -1511,9 +1551,19 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.request_quit();
-                    let _ = shutdown_tx.send(());
+                KeyCode::Char('c')
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::SHIFT) =>
+                {
+                    try_cancel_inflight(&mut app, &bus_tx, &chat_id);
+                }
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if app.input.is_empty() {
+                        app.request_quit();
+                        let _ = shutdown_tx.send(());
+                    } else {
+                        app.delete_forward();
+                    }
                 }
                 KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.delete_word();
@@ -1604,22 +1654,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         if text.eq_ignore_ascii_case("/cancel")
                             || text.eq_ignore_ascii_case("/stop")
                         {
-                            app.thinking = false;
-                            if bus_tx
-                                .blocking_send(BusMessage::Cancel(chat_id.clone()))
-                                .is_err()
-                            {
-                                app.cells.push(Cell::System {
-                                    message: "Bus closed; exiting.".into(),
-                                });
-                                app.request_quit();
-                            } else {
-                                app.cells.push(Cell::System {
-                                    message:
-                                        "Cancel sent for this thread (queued prompts cleared)."
-                                            .into(),
-                                });
-                            }
+                            try_cancel_inflight(&mut app, &bus_tx, &chat_id);
                             continue;
                         }
                         if text.eq_ignore_ascii_case("/background")
@@ -1857,6 +1892,50 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         }
                     }
                 }
+                KeyCode::Char(mch)
+                    if matches!(mch, 'm' | 'M')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                {
+                    if application_mouse_enabled {
+                        match execute!(terminal.backend_mut(), DisableMouseCapture) {
+                            Ok(()) => {
+                                application_mouse_enabled = false;
+                                app.set_toast(
+                                    ToastKind::Ok,
+                                    "Mouse wheel off — native selection works.".into(),
+                                    Duration::from_secs(TOAST_MOUSE_TOGGLE_OK_SECS),
+                                );
+                            }
+                            Err(e) => {
+                                app.set_toast(
+                                    ToastKind::Err,
+                                    format!("Could not release mouse: {e}"),
+                                    Duration::from_secs(TOAST_MOUSE_TOGGLE_ERR_SECS),
+                                );
+                            }
+                        }
+                    } else {
+                        match execute!(terminal.backend_mut(), EnableMouseCapture) {
+                            Ok(()) => {
+                                application_mouse_enabled = true;
+                                app.set_toast(
+                                    ToastKind::Ok,
+                                    "Mouse wheel on — Ctrl+Shift+M again for native selection."
+                                        .into(),
+                                    Duration::from_secs(TOAST_MOUSE_TOGGLE_OK_SECS),
+                                );
+                            }
+                            Err(e) => {
+                                app.set_toast(
+                                    ToastKind::Err,
+                                    format!("Mouse capture failed: {e}"),
+                                    Duration::from_secs(TOAST_MOUSE_TOGGLE_ERR_SECS),
+                                );
+                            }
+                        }
+                    }
+                }
                 KeyCode::Char(c) => app.insert_char(c),
                 _ => {}
             },
@@ -1975,7 +2054,9 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
     }
 
     disable_raw_mode()?;
-    let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
+    if application_mouse_enabled {
+        let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
+    }
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
