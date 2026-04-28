@@ -490,6 +490,21 @@ pub fn resolve_path(sandbox_dir: &Path, agent_path: &str) -> Option<PathBuf> {
     }
 }
 
+/// Truncate a `String` to at most `max_bytes` bytes without splitting a multi-byte
+/// UTF-8 character, then append `suffix`. The truncation point is adjusted so the
+/// **total** result (truncated content + suffix) stays within `max_bytes`.
+pub fn truncate_utf8_safe(s: &mut String, max_bytes: usize, suffix: &str) {
+    if s.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes.saturating_sub(suffix.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    s.push_str(suffix);
+}
+
 /// Robustly extracts a JSON object from a raw LLM text response.
 /// Intended to handle markdown formatting (` ```json ... ``` `)
 /// or conversational wrappers around the core `{ ... }` payload.

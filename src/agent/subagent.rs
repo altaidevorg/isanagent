@@ -81,16 +81,8 @@ const ST_FAILED: u8 = 3;
 const ST_CANCELLED: u8 = 4;
 
 fn truncate_sqlite_field(s: String, max: usize) -> String {
-    if s.len() <= max {
-        return s;
-    }
     let mut t = s;
-    let mut end = max;
-    while end > 0 && !t.is_char_boundary(end) {
-        end -= 1;
-    }
-    t.truncate(end);
-    t.push_str("\n… [truncated for sqlite]");
+    crate::utils::truncate_utf8_safe(&mut t, max, "\n… [truncated for sqlite]");
     t
 }
 
