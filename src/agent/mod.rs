@@ -15,15 +15,45 @@ use crate::tool_runtime::{with_tool_exec_and_progress_scope, ToolExecCtx, ToolPr
 use crate::bus::{BusMessage, LogEvent, OutboundMessage, TelemetryEvent};
 use crate::config::{ResolvedShellPolicy, ShellPolicyMode};
 use crate::logging::LoggerHandle;
+use crate::memory::{MemoryMessage, SharedReply, TodoRow};
 use crate::session::SessionManager;
 use crate::skills::SkillRegistry;
 use crate::tool_activity::SharedToolExecutionActivity;
 use crate::tools::ToolRegistry;
 use crate::traits::{Memory, Provider, Tool};
+use crate::NodeHandle;
 use crate::{ActorError, ActorLogic};
 use futures::future::join_all;
 
 static REDACTED_THINKING_STRIP_RE: OnceLock<Regex> = OnceLock::new();
+
+async fn load_harness_todos_for_step(
+    memory: &NodeHandle<MemoryMessage>,
+    chat_id: &str,
+) -> Option<Vec<TodoRow>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    memory
+        .send_packet(MemoryMessage::LoadHarnessTodos {
+            chat_id: chat_id.to_string(),
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .ok()?;
+    rx.await.ok()?.ok().flatten()
+}
+
+fn format_harness_todos_step_block(rows: &[TodoRow]) -> String {
+    let mut s = String::from("\n\n--- Harness todos (this step) ---\n");
+    for (i, row) in rows.iter().enumerate() {
+        let icon = match row.status.as_str() {
+            "completed" => "[x]",
+            "in_progress" => "[~]",
+            _ => "[ ]",
+        };
+        s.push_str(&format!("{}. {} {}\n", i + 1, icon, row.content));
+    }
+    s
+}
 
 fn metadata_truthy(meta: &HashMap<String, serde_json::Value>, key: &str) -> bool {
     meta.get(key)
@@ -1153,6 +1183,19 @@ impl AgentLogic {
                     harness_runtime_summary.trim()
                 )
             };
+            let todo_block = if !is_subagent {
+                match load_harness_todos_for_step(
+                    &session_manager.get_memory_node(),
+                    &inbound.chat_id,
+                )
+                .await
+                {
+                    Some(rows) if !rows.is_empty() => format_harness_todos_step_block(&rows),
+                    _ => String::new(),
+                }
+            } else {
+                String::new()
+            };
             let iteration_line = format!(
                 "\n--- Reasoning budget ---\nYou are on tool/LLM step {} of {} for this user turn.\n",
                 iterations, max_iterations
@@ -1163,11 +1206,12 @@ impl AgentLogic {
                 ""
             };
             let mut system_body = format!(
-                "{}\n\n{}\n{}{}{}",
+                "{}\n\n{}\n{}{}{}{}",
                 system_prompt,
                 summaries_text,
                 skills.get_capabilities_summary(),
                 harness_block,
+                todo_block,
                 iteration_line
             )
             .trim_end()

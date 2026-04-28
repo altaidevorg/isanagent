@@ -116,6 +116,10 @@ pub struct ExecutionHarnessConfig {
     pub ssh: Option<SshExecutionConfig>,
     /// Required when `default_provider = "colab_mcp"`.
     pub colab_mcp: Option<ColabMcpExecutionConfig>,
+    /// When true (default), enqueue a synthetic inbound when a background execution job reaches a terminal state
+    /// so the agent can call `execution_job_result` without waiting for the user. Set to false for API-only or
+    /// headless runs that must not auto-continue the reasoning loop.
+    pub wake_on_job_terminal: Option<bool>,
 }
 
 /// Sub-agent / task harness. Disabled unless `[harness.subagents] enabled = true`.
@@ -532,6 +536,10 @@ impl AppConfig {
                 self.execution_artifact_max_total_bytes_per_run(),
                 self.execution_artifact_max_files_per_run()
             ));
+            lines.push(format!(
+                "execution_wake_on_job_terminal={}",
+                self.execution_wake_on_job_terminal()
+            ));
         }
         lines.push(format!(
             "subagent_harness_enabled={}",
@@ -807,6 +815,15 @@ impl AppConfig {
             .and_then(|e| e.artifact_max_files_per_run)
             .unwrap_or(DEFAULT)
             .clamp(MIN, MAX)
+    }
+
+    /// Default true: when `[harness.execution] wake_on_job_terminal` is omitted or true, background jobs enqueue a synthetic inbound at terminal state.
+    pub fn execution_wake_on_job_terminal(&self) -> bool {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.wake_on_job_terminal)
+            .unwrap_or(true)
     }
 
     /// When `allowed_providers` is missing or empty, any implemented provider id is allowed.

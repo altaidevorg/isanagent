@@ -20,9 +20,11 @@ always: false
 
 1. **`execution_session_create`** as usual.
 2. Start work with **`execution_run_background`** (same args as **`execution_run`**, plus optional **`label`** and strongly recommended **`description`**). You receive **`job_id`** immediately.
-3. Poll **`execution_job_status`** until **`terminal`** is true (or use channel/UI notices if present).
-4. Fetch output with **`execution_job_result`** ( **`RunResult`** JSON; may truncate to **`max_tool_output_chars`** ).
+3. **Default path:** when the job finishes, the harness enqueues a synthetic follow-up message (unless **`[harness.execution] wake_on_job_terminal = false`**). On that turn, call **`execution_job_result`** (and **`execution_artifact_list`** when needed), summarize for the user, and refresh **`todo_write`** if you use it.
+4. **Manual path** (e.g. wake disabled or you are between turns): poll **`execution_job_status`** until **`terminal`** is true, or rely on channel/UI notices; then fetch output with **`execution_job_result`** ( **`RunResult`** JSON; may truncate to **`max_tool_output_chars`** ).
 5. Interrupt with **`execution_job_cancel`** or **`execution_cancel`** on the session when **`supports_interrupt`** is true.
+
+**Harness todos:** `todo_write` items for this chat appear under **Harness todos (this step)** in the system context each LLM step, so you can keep multi-step plans visible without re-calling **`todo_write`** every turn.
 
 ## Constraints
 

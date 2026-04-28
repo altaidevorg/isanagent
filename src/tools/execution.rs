@@ -487,7 +487,7 @@ impl Tool for ExecutionRunBackgroundTool {
     }
 
     fn description(&self) -> &str {
-        "Same as execution_run (session_id, code, optional timeout_secs, description, cwd_*) but returns immediately with a job_id. Poll execution_job_status / execution_job_result; use execution_job_cancel or execution_cancel on the session to interrupt when supported. One active run or background job per session. Jobs are process-local and lost on agent exit. Always pass description for runs expected to take more than ~30s so the terminal strip stays readable."
+        "Same as execution_run (session_id, code, optional timeout_secs, description, cwd_*) but returns immediately with a job_id. When the job reaches a terminal state, the harness may enqueue a synthetic follow-up message (unless wake_on_job_terminal is false in config) so you can call execution_job_status / execution_job_result without waiting for the user; otherwise poll manually. Use execution_job_cancel or execution_cancel on the session to interrupt when supported. One active run or background job per session. Jobs are process-local and lost on agent exit. Always pass description for runs expected to take more than ~30s so the terminal strip stays readable."
     }
 
     fn parameters(&self) -> Value {
@@ -591,7 +591,7 @@ impl Tool for ExecutionJobResultTool {
     }
 
     fn description(&self) -> &str {
-        "When the job is terminal, return the RunResult-shaped JSON (stdout/stderr/attachments). While running, returns a short JSON message. Output may be truncated to the session max_tool_output_chars cap."
+        "When the job is terminal, return the RunResult-shaped JSON (stdout/stderr/attachments). While running, returns a short JSON message. Output may be truncated to the session max_tool_output_chars cap. After a background job finishes, a follow-up user turn may be injected automatically—call this tool to fetch the full result."
     }
 
     fn parameters(&self) -> Value {
@@ -1499,7 +1499,7 @@ mod tests {
         let v: Value = serde_json::from_str(&out).expect("json");
         let sid = v["session_id"].as_str().expect("session id");
         let (otx, _orx) = mpsc::channel::<BusMessage>(8);
-        let jobs = Arc::new(ExecutionJobManager::new(harness.clone(), otx));
+        let jobs = Arc::new(ExecutionJobManager::new(harness.clone(), otx, None, false));
         let bg = ExecutionRunBackgroundTool {
             harness: harness.clone(),
             jobs: jobs.clone(),
@@ -1578,7 +1578,12 @@ mod tests {
         let v: Value = serde_json::from_str(&out).expect("json");
         let sid = v["session_id"].as_str().expect("session id");
         let (otx, _orx) = mpsc::channel::<BusMessage>(64);
-        let jobs = Arc::new(ExecutionJobManager::new(harness.clone(), otx.clone()));
+        let jobs = Arc::new(ExecutionJobManager::new(
+            harness.clone(),
+            otx.clone(),
+            None,
+            false,
+        ));
         let inflight = Arc::new(InflightSyncRegistry::new());
         let run = ExecutionRunTool {
             harness: harness.clone(),
@@ -1683,7 +1688,7 @@ mod tests {
         let v: Value = serde_json::from_str(&out).expect("json");
         let sid = v["session_id"].as_str().expect("session id");
         let (otx, _orx) = mpsc::channel::<BusMessage>(8);
-        let jobs = Arc::new(ExecutionJobManager::new(harness.clone(), otx));
+        let jobs = Arc::new(ExecutionJobManager::new(harness.clone(), otx, None, false));
         let bg = ExecutionRunBackgroundTool {
             harness: harness.clone(),
             jobs: jobs.clone(),
@@ -1748,7 +1753,7 @@ mod tests {
         let v: Value = serde_json::from_str(&out).expect("json");
         let sid = v["session_id"].as_str().expect("session id");
         let (otx, _orx) = mpsc::channel::<BusMessage>(8);
-        let jobs = Arc::new(ExecutionJobManager::new(harness.clone(), otx));
+        let jobs = Arc::new(ExecutionJobManager::new(harness.clone(), otx, None, false));
         let bg = ExecutionRunBackgroundTool {
             harness: harness.clone(),
             jobs: jobs.clone(),

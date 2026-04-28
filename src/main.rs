@@ -63,7 +63,7 @@ const EXECUTION_HARNESS_SYSTEM_GUIDANCE: &str = r#"
 --- Execution harness ---
 - Call execution_env_info to read max_wall_secs and default_run_timeout_secs before long runs.
 - Set timeout_secs explicitly for generation, training, or heavy I/O (up to max_wall_secs). Omit timeout_secs only for quick checks; use smaller values for tight polling loops.
-- Prefer execution_run_background when work may block the reasoning loop for many minutes; poll execution_job_status then execution_job_result.
+- Prefer execution_run_background when work may block the reasoning loop for many minutes. When a job finishes, the harness may enqueue a synthetic follow-up message so you can call execution_job_status / execution_job_result without waiting for the user; if wake_on_job_terminal is off in config, poll manually.
 - Pass description on execution_run and execution_run_background for runs that may exceed ~30 seconds or whenever you want a clear label in the terminal UI and audit logs.
 - Pilot with a short execution_run, then scale; do not launch many parallel heavy jobs until one path succeeds.
 - Prefer grep-friendly logging in training scripts (plain text lines) so stdout stays searchable in captured logs.
@@ -253,6 +253,9 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
 
     // 4. Setup Tools
     let (global_outbound_tx, mut global_outbound_rx) = mpsc::channel(100);
+    // Inbound bus: created early so execution job completion can enqueue synthetic follow-up messages
+    // before channel setup; the forwarder to the agent is spawned after `agent_node` exists.
+    let (bus_tx, mut bus_rx) = mpsc::channel(100);
     let clarification_hub = ClarificationHub::shared();
 
     // 2. Setup Skills
@@ -367,6 +370,8 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         let execution_jobs = Arc::new(ExecutionJobManager::new(
             harness.clone(),
             global_outbound_tx.clone(),
+            Some(bus_tx.clone()),
+            workspace.config.execution_wake_on_job_terminal(),
         ));
         let inflight_sync = Arc::new(InflightSyncRegistry::new());
         inflight_sync_outer = Some(inflight_sync.clone());
@@ -643,7 +648,6 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     let agent_node = NodeHandle::<BusMessage>::new(agent_logic, 100, 3, Duration::from_millis(50));
 
     // 10. Setup channels (terminal is optional for headless / Docker API-only runs)
-    let (bus_tx, mut bus_rx) = mpsc::channel(100);
     let mut out_channels: HashMap<String, Arc<dyn Channel>> = HashMap::new();
 
     let terminal_chat_id = if workspace.config.terminal_enabled() {
