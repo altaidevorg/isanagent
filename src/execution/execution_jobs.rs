@@ -1406,6 +1406,38 @@ mod tests {
         )
     }
 
+    fn build_jobs_with_followup_wake(
+        wake_on_job_terminal: bool,
+    ) -> (
+        Arc<ExecutionJobManager>,
+        mpsc::Receiver<BusMessage>,
+        mpsc::Receiver<BusMessage>,
+    ) {
+        let (ws, dir) = temp_workspace();
+        let cfg = LocalExecutionConfig::new(dir.clone(), true);
+        let prov: Arc<dyn crate::execution::ExecutionProvider> =
+            Arc::new(LocalExecutionProvider::new(cfg).expect("local provider"));
+        let harness = Arc::new(ExecutionHarness::new(
+            prov,
+            "python",
+            ws,
+            dir,
+            ArtifactLimits::default(),
+            60,
+            3600,
+            0,
+        ));
+        let (outbound_tx, outbound_rx) = mpsc::channel::<BusMessage>(64);
+        let (inbound_tx, inbound_rx) = mpsc::channel::<BusMessage>(64);
+        let jobs = Arc::new(ExecutionJobManager::new(
+            harness,
+            outbound_tx,
+            Some(inbound_tx),
+            wake_on_job_terminal,
+        ));
+        (jobs, outbound_rx, inbound_rx)
+    }
+
     fn fake_session() -> SessionId {
         SessionId::new("test-session")
     }
@@ -1512,5 +1544,85 @@ mod tests {
             .await
             .expect_err("terminal cancel must error");
         assert!(err.contains("already finished"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn terminal_job_emits_synthetic_followup_inbound_with_metadata() {
+        let (jobs, _outbound_rx, mut inbound_rx) = build_jobs_with_followup_wake(true);
+        let work: ArbitraryWork = Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok(RunResult::new("done", "", Some(0)))
+        });
+        let job_id = jobs
+            .spawn_arbitrary(SpawnArbitraryRequest {
+                sid: fake_session(),
+                tool_name: "colab_mcp_tool_call".to_string(),
+                label: None,
+                description: Some("followup-test".to_string()),
+                chat_id: "chat-followup".to_string(),
+                channel: "terminal".to_string(),
+                work,
+            })
+            .expect("spawn_arbitrary ok");
+
+        let msg = tokio::time::timeout(Duration::from_secs(3), inbound_rx.recv())
+            .await
+            .expect("expected synthetic followup inbound")
+            .expect("channel closed before followup");
+
+        let inbound = match msg {
+            BusMessage::Inbound(inbound) => inbound,
+            other => panic!("expected inbound followup, got: {other:?}"),
+        };
+        assert_eq!(inbound.channel, "terminal");
+        assert_eq!(inbound.chat_id, "chat-followup");
+        assert_eq!(inbound.sender_id, "execution_job");
+        assert_eq!(
+            inbound
+                .metadata
+                .get(crate::bus::METADATA_SYNTHETIC_JOB_FOLLOWUP),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            inbound
+                .metadata
+                .get("isanagent_autonomous_forbid_final_without_tools"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            inbound.metadata.get("execution_job_id"),
+            Some(&serde_json::Value::String(job_id))
+        );
+        assert!(
+            inbound.content.contains("execution_job_result"),
+            "followup content should direct result retrieval: {}",
+            inbound.content
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_disabled_does_not_emit_synthetic_followup_inbound() {
+        let (jobs, _outbound_rx, mut inbound_rx) = build_jobs_with_followup_wake(false);
+        let work: ArbitraryWork = Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok(RunResult::new("done", "", Some(0)))
+        });
+        let _job_id = jobs
+            .spawn_arbitrary(SpawnArbitraryRequest {
+                sid: fake_session(),
+                tool_name: "colab_mcp_tool_call".to_string(),
+                label: None,
+                description: Some("followup-disabled".to_string()),
+                chat_id: "chat-no-followup".to_string(),
+                channel: "terminal".to_string(),
+                work,
+            })
+            .expect("spawn_arbitrary ok");
+
+        let no_msg = tokio::time::timeout(Duration::from_millis(250), inbound_rx.recv()).await;
+        assert!(
+            no_msg.is_err(),
+            "unexpected synthetic followup inbound when wake_on_job_terminal=false"
+        );
     }
 }
