@@ -31,8 +31,8 @@ use crate::channels::terminal_ui::protocol::{
     METADATA_TOOL_NAME, METADATA_TOOL_RESULT_PREVIEW,
 };
 use crate::channels::terminal_ui::{
-    execution_browser, init_from_env, uses_ansi_color, App, Cell, JobStripStatus, TerminalUiFocus,
-    Theme, ToastKind, ToolNoticePhase, ToolRailEntry,
+    execution_browser, history_browser, init_from_env, uses_ansi_color, App, Cell, JobStripStatus,
+    TerminalUiFocus, Theme, ToastKind, ToolNoticePhase, ToolRailEntry,
 };
 use crate::clarification::{METADATA_CLARIFICATION, METADATA_CLARIFICATION_CHOICES};
 
@@ -81,14 +81,15 @@ const TERMINAL_HELP: &str = r#"Commands (leading slash):
   /retry         Re-submit the last user message after an LLM-failed banner
   /tools         Open the tool activity pane
   /exec          Open the executions browser (workspace execution_runs.jsonl)
+  /history       Open the history browser (agent_memory.db sessions)
   /help, /?      Show this help
 
 Keys:
   Enter             Send the compose line
-  Tab / Ctrl+T      Switch focus: transcript → tool activity → executions → …
-  Esc               From tool activity or executions: return to transcript
+  Tab / Ctrl+T      Switch focus: transcript → tool activity → executions → history → …
+  Esc               From non-transcript panes: return to transcript
   PgUp / PgDn       Scroll the focused pane; on executions: output pane (Ctrl+Pg*: code pane)
-  F5                Refresh execution run list (executions pane)
+  F5                Refresh focused browser list (executions/history pane)
   Ctrl+Shift+M      Toggle application mouse: on = wheel scrolls panes; off = native selection/copy
   Ctrl+Shift+Y      Copy last assistant reply
   Ctrl+W / Ctrl+U   Delete word / clear line
@@ -523,8 +524,7 @@ fn jobs_strip_lines(app: &App, max_width: usize, include_stream_tail: bool) -> V
         if let Some(last) = app
             .execution_stream_recent
             .lines()
-            .filter(|s| !s.trim().is_empty())
-            .next_back()
+            .rfind(|s| !s.trim().is_empty())
         {
             let label = app
                 .execution_stream_label
@@ -659,7 +659,7 @@ fn build_title_line(max_width: usize) -> Line<'static> {
     let groups = vec![
         vec![Span::styled(" isanagent ", Theme::input_prompt())],
         vec![Span::styled(
-            "· /exit · /new · /copy · /cancel · /background · /retry · /tools · /exec · /help · Tab · Esc · ^Shift+M wheel · PgUp/PgDn",
+            "· /exit · /new · /copy · /cancel · /background · /retry · /tools · /exec · /history · /help · Tab · Esc · ^Shift+M wheel · PgUp/PgDn",
             dim,
         )],
     ];
@@ -1150,6 +1150,194 @@ fn executions_output_paragraph(
     (Paragraph::new(Text::from(slice)).block(block), max_scroll)
 }
 
+fn clamp_history_selection(app: &mut App) {
+    if app.history_sessions.is_empty() {
+        app.history_selected_session_idx = None;
+        return;
+    }
+    let n = app.history_sessions.len();
+    match app.history_selected_session_idx {
+        None => app.history_selected_session_idx = Some(0),
+        Some(i) if i >= n => app.history_selected_session_idx = Some(n - 1),
+        _ => {}
+    }
+}
+
+fn load_history_sessions(workspace_dir: &Path, app: &mut App) {
+    match history_browser::load_terminal_sessions(workspace_dir) {
+        Ok(sessions) => {
+            app.history_sessions_error = None;
+            app.history_sessions = sessions;
+            clamp_history_selection(app);
+        }
+        Err(e) => app.history_sessions_error = Some(e),
+    }
+}
+
+fn open_selected_history_session(workspace_dir: &Path, app: &mut App) {
+    app.history_open_chat_id = None;
+    app.history_open_messages.clear();
+    app.history_open_error = None;
+    app.history_messages_scroll_top = 0;
+    let Some(idx) = app.history_selected_session_idx else {
+        return;
+    };
+    let Some(item) = app.history_sessions.get(idx) else {
+        return;
+    };
+    let chat_id = item.chat_id.clone();
+    match history_browser::load_chat_messages(workspace_dir, &chat_id) {
+        Ok(messages) => {
+            app.history_open_chat_id = Some(chat_id);
+            app.history_open_messages = messages;
+        }
+        Err(e) => app.history_open_error = Some(e),
+    }
+}
+
+fn open_history_session_by_chat_id(workspace_dir: &Path, app: &mut App, chat_id: &str) {
+    app.history_open_chat_id = None;
+    app.history_open_messages.clear();
+    app.history_open_error = None;
+    app.history_messages_scroll_top = 0;
+    match history_browser::load_chat_messages(workspace_dir, chat_id) {
+        Ok(messages) => {
+            app.history_open_chat_id = Some(chat_id.to_string());
+            app.history_open_messages = messages;
+        }
+        Err(e) => app.history_open_error = Some(e),
+    }
+}
+
+fn history_ensure_list_shows_selection(app: &mut App, list_inner_height: usize) {
+    let v = list_inner_height.max(1);
+    let Some(sel) = app.history_selected_session_idx else {
+        return;
+    };
+    if sel < app.history_sessions_scroll_top {
+        app.history_sessions_scroll_top = sel;
+    }
+    if sel >= app.history_sessions_scroll_top.saturating_add(v) {
+        app.history_sessions_scroll_top = sel.saturating_sub(v.saturating_sub(1));
+    }
+}
+
+fn history_session_line(item: &history_browser::HistorySessionListItem, inner_w: usize) -> String {
+    let short_id = item.chat_id.chars().take(8).collect::<String>();
+    let short_ts = item
+        .last_ts
+        .as_deref()
+        .map(|ts| {
+            let mut out = String::new();
+            for ch in ts.chars().take(16) {
+                if ch == 'T' {
+                    out.push(' ');
+                } else {
+                    out.push(ch);
+                }
+            }
+            out
+        })
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "-".to_string());
+    let raw = format!("{short_id}  {short_ts}");
+    truncate_chars_display(&raw, inner_w.max(16))
+}
+
+fn history_sessions_paragraph(app: &App, area: Rect) -> (Paragraph<'static>, usize) {
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let visible = area.height.saturating_sub(2) as usize;
+    let max_scroll = if app.history_sessions.is_empty() {
+        0usize
+    } else {
+        app.history_sessions.len().saturating_sub(visible.max(1))
+    };
+    let st = app.history_sessions_scroll_top.min(max_scroll);
+    let mut slice: Vec<Line<'static>> = Vec::new();
+    if let Some(err) = app.history_sessions_error.as_deref() {
+        slice.push(Line::from(Span::styled(
+            format!("Could not load sessions from agent_memory.db: {err}"),
+            Theme::error(),
+        )));
+    } else if app.history_sessions.is_empty() {
+        slice.push(Line::from(Span::styled(
+            "No terminal chat sessions found in memory DB yet.",
+            Theme::dim(),
+        )));
+    } else {
+        for (row, item) in app
+            .history_sessions
+            .iter()
+            .enumerate()
+            .skip(st)
+            .take(visible.max(1))
+        {
+            let sel = app.history_selected_session_idx == Some(row);
+            let mark = if sel { "› " } else { "  " };
+            let body = history_session_line(item, inner_w.saturating_sub(4));
+            let style = if sel {
+                Theme::tool_call()
+            } else {
+                Theme::text()
+            };
+            slice.push(Line::from(vec![
+                Span::styled(mark, Theme::tool_done()),
+                Span::styled(body, style),
+            ]));
+        }
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(" sessions ", Theme::tool_done()))
+        .border_style(Theme::dim());
+    (Paragraph::new(Text::from(slice)).block(block), max_scroll)
+}
+
+fn history_messages_paragraph(app: &App, area: Rect) -> (Paragraph<'static>, usize) {
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let visible = area.height.saturating_sub(2) as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if let Some(err) = app.history_open_error.as_deref() {
+        lines.push(Line::from(Span::styled(err.to_string(), Theme::error())));
+    } else if app.history_open_chat_id.is_none() {
+        lines.push(Line::from(Span::styled(
+            "Pick a session and press Enter to open replay.",
+            Theme::dim(),
+        )));
+    } else {
+        for m in &app.history_open_messages {
+            let (role, role_style) = match m.role.as_str() {
+                "user" => ("you:", Theme::user_prefix()),
+                "assistant" => ("agent:", Theme::assistant_bullet()),
+                _ => continue,
+            };
+            lines.push(Line::from(Span::styled(role.to_string(), role_style)));
+            let content = if m.content.trim().is_empty() {
+                "(empty)".to_string()
+            } else {
+                m.content.clone()
+            };
+            for ln in wrap_text(&content, inner_w.max(8)) {
+                lines.push(Line::from(Span::styled(format!("  {ln}"), Theme::text())));
+            }
+            lines.push(Line::from(""));
+        }
+    }
+    let total = lines.len();
+    let max_scroll = total.saturating_sub(visible.max(1));
+    let st = app.history_messages_scroll_top.min(max_scroll);
+    let slice: Vec<Line<'static>> = lines.into_iter().skip(st).take(visible.max(1)).collect();
+    let title = match app.history_open_chat_id.as_deref() {
+        Some(id) => format!(" messages {id} "),
+        None => " messages ".to_string(),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(title, Theme::dim()))
+        .border_style(Theme::dim());
+    (Paragraph::new(Text::from(slice)).block(block), max_scroll)
+}
+
 fn last_assistant_markdown(cells: &[Cell]) -> Option<&str> {
     cells.iter().rev().find_map(|c| {
         if let Cell::Assistant { markdown } = c {
@@ -1228,6 +1416,8 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
     let max_exec_list_scroll_holder = std::cell::Cell::new(0usize);
     let max_exec_code_scroll_holder = std::cell::Cell::new(0usize);
     let max_exec_out_scroll_holder = std::cell::Cell::new(0usize);
+    let max_history_sessions_scroll_holder = std::cell::Cell::new(0usize);
+    let max_history_messages_scroll_holder = std::cell::Cell::new(0usize);
     let mut last_exec_poll = Instant::now() - Duration::from_secs(60);
 
     loop {
@@ -1238,6 +1428,12 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         {
             last_exec_poll = Instant::now();
             rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
+        }
+        if app.ui_focus == TerminalUiFocus::History
+            && last_exec_poll.elapsed() >= Duration::from_secs(2)
+        {
+            last_exec_poll = Instant::now();
+            load_history_sessions(&workspace_dir, &mut app);
         }
 
         if let Some(ref rx) = uv_install_rx {
@@ -1387,6 +1583,8 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     app.last_executions_list_rect = None;
                     app.last_executions_code_rect = None;
                     app.last_executions_output_rect = None;
+                    app.last_history_sessions_rect = None;
+                    app.last_history_messages_rect = None;
                 }
                 TerminalUiFocus::ToolHistory => {
                     let (w, max_s) =
@@ -1398,6 +1596,8 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     app.last_executions_list_rect = None;
                     app.last_executions_code_rect = None;
                     app.last_executions_output_rect = None;
+                    app.last_history_sessions_rect = None;
+                    app.last_history_messages_rect = None;
                 }
                 TerminalUiFocus::Executions => {
                     let list_w = (ch[1].width / 3).clamp(26, 46);
@@ -1459,6 +1659,30 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     app.last_transcript_rect = None;
                     app.last_tool_history_rect = None;
                     app.last_executions_list_rect = Some(list_r);
+                    app.last_history_sessions_rect = None;
+                    app.last_history_messages_rect = None;
+                }
+                TerminalUiFocus::History => {
+                    let list_w = (ch[1].width / 3).clamp(26, 50);
+                    let hareas = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Length(list_w), Constraint::Min(8)])
+                        .split(ch[1]);
+                    let sessions_r = hareas[0];
+                    let replay_r = hareas[1];
+                    let (pl, max_l) = history_sessions_paragraph(&app, sessions_r);
+                    max_history_sessions_scroll_holder.set(max_l);
+                    f.render_widget(pl, sessions_r);
+                    let (pr, max_r) = history_messages_paragraph(&app, replay_r);
+                    max_history_messages_scroll_holder.set(max_r);
+                    f.render_widget(pr, replay_r);
+                    app.last_transcript_rect = None;
+                    app.last_tool_history_rect = None;
+                    app.last_executions_list_rect = None;
+                    app.last_executions_code_rect = None;
+                    app.last_executions_output_rect = None;
+                    app.last_history_sessions_rect = Some(sessions_r);
+                    app.last_history_messages_rect = Some(replay_r);
                 }
             }
 
@@ -1544,6 +1768,14 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 .executions_output_scroll_top
                 .min(max_exec_out_scroll_holder.get());
         }
+        if app.ui_focus == TerminalUiFocus::History {
+            app.history_sessions_scroll_top = app
+                .history_sessions_scroll_top
+                .min(max_history_sessions_scroll_holder.get());
+            app.history_messages_scroll_top = app
+                .history_messages_scroll_top
+                .min(max_history_messages_scroll_holder.get());
+        }
 
         if !event::poll(tick)? {
             continue;
@@ -1572,6 +1804,10 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     app.clear_line();
                 }
                 KeyCode::Enter => {
+                    if app.ui_focus == TerminalUiFocus::History && app.input.trim().is_empty() {
+                        open_selected_history_session(&workspace_dir, &mut app);
+                        continue;
+                    }
                     let raw = app.take_input();
                     let text = raw.trim();
                     if text.is_empty() {
@@ -1651,6 +1887,12 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             last_exec_poll = Instant::now();
                             continue;
                         }
+                        if text.eq_ignore_ascii_case("/history") {
+                            app.focus_history();
+                            load_history_sessions(&workspace_dir, &mut app);
+                            last_exec_poll = Instant::now();
+                            continue;
+                        }
                         if text.eq_ignore_ascii_case("/cancel")
                             || text.eq_ignore_ascii_case("/stop")
                         {
@@ -1715,7 +1957,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         }
                         app.cells.push(Cell::System {
                             message:
-                                "Unknown command. Try /help, /exit, /new, /copy, /install-python, /cancel, /background, /retry, /tools, /exec."
+                                "Unknown command. Try /help, /exit, /new, /copy, /install-python, /cancel, /background, /retry, /tools, /exec, /history."
                                     .into(),
                         });
                         continue;
@@ -1770,6 +2012,17 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 executions_ensure_list_shows_selection(&mut app, list_h);
                             }
                         }
+                    } else if app.ui_focus == TerminalUiFocus::History {
+                        if let Some(i) = app.history_selected_session_idx {
+                            if i > 0 {
+                                app.history_selected_session_idx = Some(i - 1);
+                                let list_h = app
+                                    .last_history_sessions_rect
+                                    .map(|r| r.height.saturating_sub(2) as usize)
+                                    .unwrap_or(8);
+                                history_ensure_list_shows_selection(&mut app, list_h);
+                            }
+                        }
                     } else if app.ui_focus != TerminalUiFocus::Executions {
                         app.history_up();
                     }
@@ -1789,14 +2042,34 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 executions_ensure_list_shows_selection(&mut app, list_h);
                             }
                         }
+                    } else if app.ui_focus == TerminalUiFocus::History {
+                        if let Some(i) = app.history_selected_session_idx {
+                            if i + 1 < app.history_sessions.len() {
+                                app.history_selected_session_idx = Some(i + 1);
+                                let list_h = app
+                                    .last_history_sessions_rect
+                                    .map(|r| r.height.saturating_sub(2) as usize)
+                                    .unwrap_or(8);
+                                history_ensure_list_shows_selection(&mut app, list_h);
+                            }
+                        }
                     } else if app.ui_focus != TerminalUiFocus::Executions {
                         app.history_down();
                     }
                 }
                 KeyCode::Esc => {
-                    if matches!(
+                    if app.ui_focus == TerminalUiFocus::History
+                        && app.history_open_chat_id.is_some()
+                    {
+                        app.history_open_chat_id = None;
+                        app.history_open_messages.clear();
+                        app.history_open_error = None;
+                        app.history_messages_scroll_top = 0;
+                    } else if matches!(
                         app.ui_focus,
-                        TerminalUiFocus::ToolHistory | TerminalUiFocus::Executions
+                        TerminalUiFocus::ToolHistory
+                            | TerminalUiFocus::Executions
+                            | TerminalUiFocus::History
                     ) {
                         app.focus_transcript();
                     }
@@ -1805,6 +2078,9 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     app.toggle_ui_focus();
                     if app.ui_focus == TerminalUiFocus::Executions {
                         rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
+                        last_exec_poll = Instant::now();
+                    } else if app.ui_focus == TerminalUiFocus::History {
+                        load_history_sessions(&workspace_dir, &mut app);
                         last_exec_poll = Instant::now();
                     }
                     if app.following_tail() {
@@ -1820,6 +2096,9 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     app.toggle_ui_focus();
                     if app.ui_focus == TerminalUiFocus::Executions {
                         rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
+                        last_exec_poll = Instant::now();
+                    } else if app.ui_focus == TerminalUiFocus::History {
+                        load_history_sessions(&workspace_dir, &mut app);
                         last_exec_poll = Instant::now();
                     }
                     if app.following_tail() {
@@ -1843,6 +2122,10 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 app.executions_output_scroll_top.saturating_sub(3);
                         }
                     }
+                    TerminalUiFocus::History => {
+                        app.history_messages_scroll_top =
+                            app.history_messages_scroll_top.saturating_sub(4);
+                    }
                     TerminalUiFocus::Transcript => app.scroll_up(8),
                 },
                 KeyCode::PageDown => match app.ui_focus {
@@ -1859,11 +2142,25 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 app.executions_output_scroll_top.saturating_add(3);
                         }
                     }
+                    TerminalUiFocus::History => {
+                        app.history_messages_scroll_top =
+                            app.history_messages_scroll_top.saturating_add(4);
+                    }
                     TerminalUiFocus::Transcript => app.scroll_down(8),
                 },
                 KeyCode::F(5) => {
                     if app.ui_focus == TerminalUiFocus::Executions {
                         rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
+                        last_exec_poll = Instant::now();
+                    } else if app.ui_focus == TerminalUiFocus::History {
+                        load_history_sessions(&workspace_dir, &mut app);
+                        if let Some(open_chat_id) = app.history_open_chat_id.clone() {
+                            open_history_session_by_chat_id(
+                                &workspace_dir,
+                                &mut app,
+                                open_chat_id.as_str(),
+                            );
+                        }
                         last_exec_poll = Instant::now();
                     }
                 }
@@ -2042,6 +2339,40 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             MouseEventKind::ScrollRight => {
                                 app.executions_output_scroll_top =
                                     app.executions_output_scroll_top.saturating_add(n);
+                            }
+                            _ => {}
+                        }
+                    }
+                } else if app.ui_focus == TerminalUiFocus::History {
+                    let over_sessions = app
+                        .last_history_sessions_rect
+                        .map(|r| rect_contains(r, me.column, me.row))
+                        .unwrap_or(false);
+                    let over_messages = app
+                        .last_history_messages_rect
+                        .map(|r| rect_contains(r, me.column, me.row))
+                        .unwrap_or(false);
+                    if over_sessions {
+                        match me.kind {
+                            MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft => {
+                                app.history_sessions_scroll_top =
+                                    app.history_sessions_scroll_top.saturating_sub(1);
+                            }
+                            MouseEventKind::ScrollDown | MouseEventKind::ScrollRight => {
+                                app.history_sessions_scroll_top =
+                                    app.history_sessions_scroll_top.saturating_add(1);
+                            }
+                            _ => {}
+                        }
+                    } else if over_messages {
+                        match me.kind {
+                            MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft => {
+                                app.history_messages_scroll_top =
+                                    app.history_messages_scroll_top.saturating_sub(3);
+                            }
+                            MouseEventKind::ScrollDown | MouseEventKind::ScrollRight => {
+                                app.history_messages_scroll_top =
+                                    app.history_messages_scroll_top.saturating_add(3);
                             }
                             _ => {}
                         }

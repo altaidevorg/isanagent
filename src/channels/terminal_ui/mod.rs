@@ -6,6 +6,7 @@
 mod app;
 mod attachments;
 mod execution_browser;
+mod history_browser;
 mod markdown;
 pub(crate) mod protocol;
 mod run;

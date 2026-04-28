@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use ratatui::layout::Rect;
 
 use super::execution_browser::{ExecutionRunDetail, ExecutionRunListItem};
+use super::history_browser::{HistoryMessage, HistorySessionListItem};
 
 /// High-level UI mode for the terminal front-end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -38,6 +39,7 @@ pub enum TerminalUiFocus {
     ToolHistory,
     /// Browse `execution_runs.jsonl` + per-run journals for this terminal thread (`chat_id`).
     Executions,
+    History,
 }
 
 const TOOL_RAIL_CAP: usize = 150;
@@ -209,6 +211,18 @@ pub struct App {
     pub last_executions_list_rect: Option<Rect>,
     pub last_executions_code_rect: Option<Rect>,
     pub last_executions_output_rect: Option<Rect>,
+    /// Chat sessions grouped by `chat_id` from `agent_memory.db` (newest first).
+    pub history_sessions: Vec<HistorySessionListItem>,
+    pub history_sessions_error: Option<String>,
+    pub history_selected_session_idx: Option<usize>,
+    pub history_sessions_scroll_top: usize,
+    /// Opened history detail (right pane), loaded on Enter.
+    pub history_open_chat_id: Option<String>,
+    pub history_open_messages: Vec<HistoryMessage>,
+    pub history_open_error: Option<String>,
+    pub history_messages_scroll_top: usize,
+    pub last_history_sessions_rect: Option<Rect>,
+    pub last_history_messages_rect: Option<Rect>,
 }
 
 impl Default for App {
@@ -256,6 +270,16 @@ impl App {
             last_executions_list_rect: None,
             last_executions_code_rect: None,
             last_executions_output_rect: None,
+            history_sessions: Vec::new(),
+            history_sessions_error: None,
+            history_selected_session_idx: None,
+            history_sessions_scroll_top: 0,
+            history_open_chat_id: None,
+            history_open_messages: Vec::new(),
+            history_open_error: None,
+            history_messages_scroll_top: 0,
+            last_history_sessions_rect: None,
+            last_history_messages_rect: None,
         }
     }
 
@@ -294,7 +318,8 @@ impl App {
         self.ui_focus = match self.ui_focus {
             TerminalUiFocus::Transcript => TerminalUiFocus::ToolHistory,
             TerminalUiFocus::ToolHistory => TerminalUiFocus::Executions,
-            TerminalUiFocus::Executions => TerminalUiFocus::Transcript,
+            TerminalUiFocus::Executions => TerminalUiFocus::History,
+            TerminalUiFocus::History => TerminalUiFocus::Transcript,
         };
         self.tool_history_scroll = 0;
     }
@@ -311,6 +336,11 @@ impl App {
 
     pub fn focus_executions(&mut self) {
         self.ui_focus = TerminalUiFocus::Executions;
+        self.tool_history_scroll = 0;
+    }
+
+    pub fn focus_history(&mut self) {
+        self.ui_focus = TerminalUiFocus::History;
         self.tool_history_scroll = 0;
     }
 
@@ -680,6 +710,20 @@ mod tests {
     fn display_width_counts_wide_chars() {
         assert!(super::super::display_width("你好") >= 4);
         assert_eq!(super::super::display_width("ab"), 2);
+    }
+
+    #[test]
+    fn ui_focus_cycles_with_history() {
+        let mut app = App::new();
+        assert_eq!(app.ui_focus, TerminalUiFocus::Transcript);
+        app.toggle_ui_focus();
+        assert_eq!(app.ui_focus, TerminalUiFocus::ToolHistory);
+        app.toggle_ui_focus();
+        assert_eq!(app.ui_focus, TerminalUiFocus::Executions);
+        app.toggle_ui_focus();
+        assert_eq!(app.ui_focus, TerminalUiFocus::History);
+        app.toggle_ui_focus();
+        assert_eq!(app.ui_focus, TerminalUiFocus::Transcript);
     }
 
     #[test]
