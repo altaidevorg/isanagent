@@ -86,10 +86,7 @@ impl Tool for ArxivSearchTool {
             .map_err(|e| format!("arxiv_search body: {}", e))?;
 
         let mut out = body;
-        if out.len() > self.max_output_chars {
-            out.truncate(self.max_output_chars);
-            out.push_str("\n... [TRUNCATED]");
-        }
+        crate::utils::truncate_utf8_safe(&mut out, self.max_output_chars, "\n... [TRUNCATED]");
         Ok(out)
     }
 }
@@ -151,10 +148,7 @@ impl Tool for ArxivFetchTool {
             .text()
             .await
             .map_err(|e| format!("arxiv_fetch body: {}", e))?;
-        if body.len() > self.max_output_chars {
-            body.truncate(self.max_output_chars);
-            body.push_str("\n... [TRUNCATED]");
-        }
+        crate::utils::truncate_utf8_safe(&mut body, self.max_output_chars, "\n... [TRUNCATED]");
         Ok(body)
     }
 }
@@ -271,10 +265,7 @@ impl Tool for HfHubFileFetchTool {
             .text()
             .await
             .map_err(|e| format!("hf_hub_file_fetch body: {}", e))?;
-        if body.len() > self.max_output_chars {
-            body.truncate(self.max_output_chars);
-            body.push_str("\n... [TRUNCATED]");
-        }
+        crate::utils::truncate_utf8_safe(&mut body, self.max_output_chars, "\n... [TRUNCATED]");
         Ok(body)
     }
 }

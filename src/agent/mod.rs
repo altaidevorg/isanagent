@@ -1330,10 +1330,11 @@ impl AgentLogic {
                 let finalize_tool_output = |res: Result<String, String>| -> String {
                     match res {
                         Ok(mut output) => {
-                            if output.len() > max_tool_output_chars {
-                                output.truncate(max_tool_output_chars);
-                                output.push_str("\n... [TRUNCATED FOR LENGTH]");
-                            }
+                            crate::utils::truncate_utf8_safe(
+                                &mut output,
+                                max_tool_output_chars,
+                                "\n... [TRUNCATED FOR LENGTH]",
+                            );
                             output
                         }
                         Err(e) => format!("Error: {}", e),

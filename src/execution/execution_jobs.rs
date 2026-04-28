@@ -416,10 +416,11 @@ impl ExecutionJobManager {
         match res {
             Some(result) => {
                 let mut s = serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?;
-                if s.len() > max_chars {
-                    s.truncate(max_chars);
-                    s.push_str("\n\n… (truncated to configured max_tool_output_chars)\n");
-                }
+                crate::utils::truncate_utf8_safe(
+                    &mut s,
+                    max_chars,
+                    "\n\n… (truncated to configured max_tool_output_chars)\n",
+                );
                 Ok(s)
             }
             None => {
