@@ -2,6 +2,8 @@ use crate::bus::{BusMessage, LogEvent, OutboundMessage};
 use crate::channels::Channel;
 use crate::config::AppConfig;
 use crate::logging::LoggerHandle;
+use crate::memory::MemoryMessage;
+use crate::NodeHandle;
 use async_trait::async_trait;
 use log::error;
 use serde_json::{json, Value};
@@ -427,6 +429,8 @@ pub struct TerminalChannel {
     sandbox_dir: PathBuf,
     /// Provider model id for the status line (e.g. from config).
     status_model: String,
+    /// Workspace memory actor (for past-session list + transcript load in the TUI thread).
+    memory_node: NodeHandle<MemoryMessage>,
     /// Outbound messages for the Ratatui thread (set when `start` succeeds).
     outbound_ui_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<OutboundMessage>>>>,
 }
@@ -439,6 +443,7 @@ impl TerminalChannel {
         workspace_dir: PathBuf,
         sandbox_dir: PathBuf,
         status_model: String,
+        memory_node: NodeHandle<MemoryMessage>,
     ) -> Self {
         Self {
             chat_id: chat_id.to_string(),
@@ -447,6 +452,7 @@ impl TerminalChannel {
             workspace_dir,
             sandbox_dir,
             status_model,
+            memory_node,
             outbound_ui_tx: Arc::new(Mutex::new(None)),
         }
     }
@@ -495,6 +501,7 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
         let shutdown_clone = shutdown_tx.clone();
         let sandbox_clone = sandbox_dir.clone();
         let log_clone = logger_tx.clone();
+        let memory_node_clone = self.memory_node.clone();
 
         let opening_banner = format!(
             "isanagent v{} — thread {}\n\
@@ -517,6 +524,7 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
                         channel_name,
                         opening_banner,
                         status_model,
+                        memory_node: memory_node_clone,
                     },
                 );
                 if let Ok(mut g) = bridge.lock() {

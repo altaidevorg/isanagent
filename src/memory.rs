@@ -5,7 +5,7 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-use crate::utils::{ChatMessage, ContentPart, MessageContent};
+use crate::utils::{ChatMessage, ContentPart, MessageContent, RUNTIME_CONTEXT_END_SUFFIX};
 use crate::{ActorError, ActorLogic};
 use std::collections::HashMap;
 use std::fmt;
@@ -82,6 +82,63 @@ type GetMessagesSinceReflectionResult =
 
 /// How long SQLite waits on `SQLITE_BUSY` before failing (memory + `harness_todos` share one file).
 pub const AGENT_SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
+
+/// One persisted root session row for a channel (e.g. `terminal` → `thread_id` = `terminal:<chat_uuid>:`).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RootThreadListItem {
+    /// Full `messages.thread_id` (see [`crate::bus::clarification_session_key`] for root keys).
+    pub thread_id: String,
+    /// Latest `messages.id` in this thread (for ordering; recency).
+    pub last_message_id: i64,
+    /// Truncated first user line, runtime prefix stripped.
+    pub preview: String,
+}
+
+/// True when `thread_id` is a main session for `channel` (`<channel>:<id>:` with empty sub-thread part).
+/// Sub-threads such as `terminal:uuid:subagent-…` return false.
+pub fn is_root_session_thread_id(channel: &str, thread_id: &str) -> bool {
+    let parts: Vec<&str> = thread_id.split(':').collect();
+    if parts.len() != 3 {
+        return false;
+    }
+    if parts[0] != channel {
+        return false;
+    }
+    if uuid::Uuid::parse_str(parts[1]).is_err() {
+        return false;
+    }
+    parts[2].is_empty()
+}
+
+/// Parse `chat_id` (UUID) from a root `thread_id`, or return `None`.
+pub fn chat_id_from_root_thread_id(channel: &str, thread_id: &str) -> Option<String> {
+    if !is_root_session_thread_id(channel, thread_id) {
+        return None;
+    }
+    let parts: Vec<&str> = thread_id.split(':').collect();
+    parts.get(1).map(std::string::ToString::to_string)
+}
+
+fn strip_user_preview_for_thread_list(s: &str) -> String {
+    if let Some(idx) = s.find(RUNTIME_CONTEXT_END_SUFFIX) {
+        s[idx + RUNTIME_CONTEXT_END_SUFFIX.len()..]
+            .trim_start()
+            .to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+fn truncate_thread_preview_line(text: &str) -> String {
+    let line = text.split('\n').next().unwrap_or(text).trim();
+    let mut iter = line.chars();
+    let chunk: String = iter.by_ref().take(56).collect();
+    if iter.next().is_some() {
+        format!("{}…", chunk)
+    } else {
+        chunk
+    }
+}
 
 /// PRAGMAs for file-backed agent DB handles (`SqliteMemoryActor`, harness todos in the same file).
 pub fn configure_agent_sqlite_connection(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -323,6 +380,12 @@ pub enum MemoryMessage {
         parent_chat_id: String,
         limit: usize,
         reply: SharedReply<Result<Vec<SubagentTaskRecord>, String>>,
+    },
+    /// Root `messages.thread_id` rows for a channel prefix (e.g. `terminal` → `terminal:…`), with previews.
+    ListRootThreadsForChannelWithPreviews {
+        channel: String,
+        limit: u32,
+        reply: SharedReply<Result<Vec<RootThreadListItem>, String>>,
     },
 }
 
@@ -1103,7 +1166,125 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 })();
                 let _ = reply.send(res);
             }
+            MemoryMessage::ListRootThreadsForChannelWithPreviews {
+                channel,
+                limit,
+                reply,
+            } => {
+                let res = (|| -> Result<Vec<RootThreadListItem>, String> {
+                    let ch = channel.trim();
+                    if ch.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    let lim = limit.clamp(1, 500) as i64;
+                    // Over-fetch: sub-threads are filtered out; keep a generous cap.
+                    let overfetch: i64 = (lim * 4).min(2_000);
+                    let like_pat = format!("{ch}:%");
+                    let mut stmt = self
+                        .conn
+                        .prepare(
+                            "SELECT thread_id, MAX(id) AS last_id
+                             FROM messages
+                             WHERE thread_id LIKE ?1
+                             GROUP BY thread_id
+                             ORDER BY last_id DESC
+                             LIMIT ?2",
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let mut candidates: Vec<(String, i64)> = Vec::new();
+                    let rows = stmt
+                        .query_map(params![like_pat, overfetch], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                        })
+                        .map_err(|e| e.to_string())?;
+                    for r in rows {
+                        let (tid, last_id) = r.map_err(|e| e.to_string())?;
+                        if is_root_session_thread_id(ch, &tid) {
+                            candidates.push((tid, last_id));
+                        }
+                        if candidates.len() as i64 >= lim {
+                            break;
+                        }
+                    }
+
+                    if candidates.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    let thread_ids: Vec<String> =
+                        candidates.iter().map(|(t, _)| t.clone()).collect();
+
+                    if thread_ids.is_empty() {
+                        return Ok(Vec::new());
+                    }
+
+                    let placeholders = thread_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                    let sql = format!(
+                        "SELECT m.thread_id, m.content FROM messages m
+                         INNER JOIN (
+                             SELECT thread_id, MIN(id) AS min_id
+                             FROM messages
+                             WHERE role = 'user' AND thread_id IN ({placeholders})
+                             GROUP BY thread_id
+                         ) t ON m.thread_id = t.thread_id AND m.id = t.min_id AND m.role = 'user'"
+                    );
+                    let mut pst = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
+                    let mut q = pst
+                        .query(params_from_iter(thread_ids.iter()))
+                        .map_err(|e| e.to_string())?;
+
+                    let mut preview_map: HashMap<String, Option<String>> = HashMap::new();
+                    while let Some(row) = q.next().map_err(|e| e.to_string())? {
+                        let sid: String = row.get(0).map_err(|e| e.to_string())?;
+                        let content: String = row.get(1).map_err(|e| e.to_string())?;
+                        preview_map.insert(sid, first_user_preview_from_content(content));
+                    }
+
+                    let mut out = Vec::new();
+                    for (thread_id, last_message_id) in candidates.into_iter().take(lim as usize) {
+                        let raw_prev = match preview_map.get(&thread_id) {
+                            None | Some(None) => String::new(),
+                            Some(Some(s)) => truncate_thread_preview_line(
+                                strip_user_preview_for_thread_list(s).trim(),
+                            ),
+                        };
+                        let preview = if raw_prev.is_empty() {
+                            "(no preview)".into()
+                        } else {
+                            raw_prev
+                        };
+                        out.push(RootThreadListItem {
+                            thread_id,
+                            last_message_id,
+                            preview,
+                        });
+                    }
+                    Ok(out)
+                })();
+                let _ = reply.send(res);
+            }
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod root_thread_id_tests {
+    use super::is_root_session_thread_id;
+
+    #[test]
+    fn root_main_terminal_thread() {
+        let tid = "terminal:550e8400-e29b-41d4-a716-446655440000:";
+        assert!(is_root_session_thread_id("terminal", tid));
+    }
+
+    #[test]
+    fn not_root_when_subthread() {
+        let tid = "terminal:550e8400-e29b-41d4-a716-446655440000:subagent-abc";
+        assert!(!is_root_session_thread_id("terminal", tid));
+    }
+
+    #[test]
+    fn not_root_short_string() {
+        assert!(!is_root_session_thread_id("terminal", "nope"));
     }
 }

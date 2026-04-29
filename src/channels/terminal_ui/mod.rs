@@ -6,10 +6,13 @@
 mod app;
 mod attachments;
 mod execution_browser;
+mod history_cells;
 mod markdown;
+pub mod panes;
 pub(crate) mod protocol;
 mod run;
 mod syntect_highlight;
+mod text_format;
 mod theme;
 
 pub use app::{
