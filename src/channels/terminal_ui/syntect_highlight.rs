@@ -206,7 +206,7 @@ pub fn highlight_source_wrapped(source: &str, width: usize) -> Vec<Line<'static>
 }
 
 fn fallback_dim_lines(source: &str, width: usize, truncated: bool) -> Vec<Line<'static>> {
-    use crate::channels::terminal_ui::run::wrap_text;
+    use crate::channels::terminal_ui::panes::wrap_text;
     let mut lines: Vec<Line<'static>> = wrap_text(source, width)
         .into_iter()
         .map(|s| Line::from(Span::styled(s, Theme::dim())))

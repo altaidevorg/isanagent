@@ -2,7 +2,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::channels::terminal_ui::text_format::truncate_chars_display;
+use crate::channels::terminal_ui::text_format::{format_last_activity, truncate_chars_display};
 use crate::channels::terminal_ui::App;
 use crate::channels::terminal_ui::Theme;
 
@@ -38,16 +38,11 @@ pub fn conversations_list_paragraph(app: &App, area: Rect) -> (Paragraph<'static
         {
             let sel = app.conversations_selected_idx == Some(row);
             let mark = if sel { "› " } else { "  " };
-            let short = item
-                .thread_id
-                .split(':')
-                .nth(1)
-                .map(|u| &u[..8.min(u.len())])
-                .unwrap_or("—");
+            let ts = format_last_activity(item.last_activity_ms);
             let line = format!(
                 "{} | {}",
-                short,
-                truncate_chars_display(&item.preview, inner_w.saturating_sub(8).max(12))
+                ts,
+                truncate_chars_display(&item.preview, inner_w.saturating_sub(24).max(12))
             );
             let style = if sel {
                 Theme::tool_call()

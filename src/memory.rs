@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, NaiveDateTime, Utc};
 use log::debug;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -90,8 +90,29 @@ pub struct RootThreadListItem {
     pub thread_id: String,
     /// Latest `messages.id` in this thread (for ordering; recency).
     pub last_message_id: i64,
+    /// UTC millis from `messages.created_at` on the row with `last_message_id` (`0` if missing).
+    pub last_activity_ms: i64,
     /// Truncated first user line, runtime prefix stripped.
     pub preview: String,
+}
+
+fn sqlite_datetime_to_unix_ms(s: &str) -> i64 {
+    let t = s.trim();
+    if t.is_empty() {
+        return 0;
+    }
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S%.3f",
+        "%Y-%m-%d %H:%M:%S%.6f",
+    ] {
+        if let Ok(na) = NaiveDateTime::parse_from_str(t, fmt) {
+            return na.and_utc().timestamp_millis();
+        }
+    }
+    DateTime::parse_from_rfc3339(t)
+        .map(|d| d.timestamp_millis())
+        .unwrap_or(0)
 }
 
 /// True when `thread_id` is a main session for `channel` (`<channel>:<id>:` with empty sub-thread part).
@@ -1183,24 +1204,32 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     let mut stmt = self
                         .conn
                         .prepare(
-                            "SELECT thread_id, MAX(id) AS last_id
-                             FROM messages
-                             WHERE thread_id LIKE ?1
-                             GROUP BY thread_id
-                             ORDER BY last_id DESC
+                            "SELECT m.thread_id, m.id, COALESCE(m.created_at, '') AS ca
+                             FROM messages m
+                             INNER JOIN (
+                                 SELECT thread_id, MAX(id) AS max_id
+                                 FROM messages
+                                 WHERE thread_id LIKE ?1
+                                 GROUP BY thread_id
+                             ) t ON m.thread_id = t.thread_id AND m.id = t.max_id
+                             ORDER BY m.id DESC
                              LIMIT ?2",
                         )
                         .map_err(|e| e.to_string())?;
-                    let mut candidates: Vec<(String, i64)> = Vec::new();
+                    let mut candidates: Vec<(String, i64, String)> = Vec::new();
                     let rows = stmt
                         .query_map(params![like_pat, overfetch], |row| {
-                            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
                         })
                         .map_err(|e| e.to_string())?;
                     for r in rows {
-                        let (tid, last_id) = r.map_err(|e| e.to_string())?;
+                        let (tid, last_id, ca) = r.map_err(|e| e.to_string())?;
                         if is_root_session_thread_id(ch, &tid) {
-                            candidates.push((tid, last_id));
+                            candidates.push((tid, last_id, ca));
                         }
                         if candidates.len() as i64 >= lim {
                             break;
@@ -1211,7 +1240,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                         return Ok(Vec::new());
                     }
                     let thread_ids: Vec<String> =
-                        candidates.iter().map(|(t, _)| t.clone()).collect();
+                        candidates.iter().map(|(t, _, _)| t.clone()).collect();
 
                     if thread_ids.is_empty() {
                         return Ok(Vec::new());
@@ -1240,7 +1269,9 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     }
 
                     let mut out = Vec::new();
-                    for (thread_id, last_message_id) in candidates.into_iter().take(lim as usize) {
+                    for (thread_id, last_message_id, created_at) in
+                        candidates.into_iter().take(lim as usize)
+                    {
                         let raw_prev = match preview_map.get(&thread_id) {
                             None | Some(None) => String::new(),
                             Some(Some(s)) => truncate_thread_preview_line(
@@ -1255,6 +1286,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                         out.push(RootThreadListItem {
                             thread_id,
                             last_message_id,
+                            last_activity_ms: sqlite_datetime_to_unix_ms(&created_at),
                             preview,
                         });
                     }

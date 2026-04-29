@@ -37,11 +37,11 @@ pub enum ToolNoticePhase {
 pub enum TerminalUiFocus {
     #[default]
     Transcript,
-    ToolHistory,
-    /// Browse `execution_runs.jsonl` + per-run journals for this terminal thread (`chat_id`).
-    Executions,
     /// List root terminal sessions from workspace memory; Enter loads and continues.
     Conversations,
+    /// Browse `execution_runs.jsonl` + per-run journals for this terminal thread (`chat_id`).
+    Executions,
+    ToolHistory,
 }
 
 const TOOL_RAIL_CAP: usize = 150;
@@ -307,6 +307,16 @@ impl App {
     }
 
     pub fn toggle_ui_focus(&mut self) {
+        self.ui_focus = match self.ui_focus {
+            TerminalUiFocus::Transcript => TerminalUiFocus::Conversations,
+            TerminalUiFocus::Conversations => TerminalUiFocus::Executions,
+            TerminalUiFocus::Executions => TerminalUiFocus::ToolHistory,
+            TerminalUiFocus::ToolHistory => TerminalUiFocus::Transcript,
+        };
+        self.tool_history_scroll = 0;
+    }
+
+    pub fn toggle_ui_focus_back(&mut self) {
         self.ui_focus = match self.ui_focus {
             TerminalUiFocus::Transcript => TerminalUiFocus::ToolHistory,
             TerminalUiFocus::ToolHistory => TerminalUiFocus::Executions,

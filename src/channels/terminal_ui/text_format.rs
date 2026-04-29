@@ -1,3 +1,17 @@
+use chrono::{DateTime, Local};
+
+/// Compact local time for past-session rows (`last_activity_ms` from SQLite `created_at`).
+pub fn format_last_activity(last_activity_ms: i64) -> String {
+    if last_activity_ms <= 0 {
+        return "—".to_string();
+    }
+    let Some(utc) = DateTime::from_timestamp_millis(last_activity_ms) else {
+        return "—".to_string();
+    };
+    let local = utc.with_timezone(&Local);
+    local.format("%Y-%m-%d %H:%M").to_string()
+}
+
 /// Truncate `s` to at most `max` display columns; appends `…` when shortened (`…` uses one column).
 pub fn truncate_chars_display(s: &str, max: usize) -> String {
     use unicode_width::UnicodeWidthChar;

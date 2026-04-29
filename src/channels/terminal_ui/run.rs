@@ -15,16 +15,16 @@ use crossterm::{
 };
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::prelude::*;
-use ratatui::style::Modifier;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use tokio::sync::mpsc::Sender;
 
 use crate::bus::{BusMessage, InboundMessage, OutboundMessage};
 use crate::channels::terminal_ui::attachments::parse_terminal_attachments;
 use crate::channels::terminal_ui::history_cells;
-use crate::channels::terminal_ui::markdown;
 use crate::channels::terminal_ui::panes::{
     conversations_ensure_list_shows_selection, conversations_list_paragraph,
+    executions_code_paragraph, executions_ensure_list_shows_selection, executions_list_paragraph,
+    executions_output_paragraph, tool_history_paragraph, transcript_paragraph,
 };
 use crate::channels::terminal_ui::protocol::{
     ISANAGENT_AGENT_THOUGHT, ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_JOB_STARTED,
@@ -93,7 +93,8 @@ const TERMINAL_HELP: &str = r#"Commands (leading slash):
 
 Keys:
   Enter             Send the compose line; in past-sessions pane: load selected and continue
-  Tab / Ctrl+T      Switch focus: transcript → tool activity → executions → past sessions
+  Tab / Ctrl+T      Next pane: transcript → past sessions → executions → tool activity
+  Shift+Tab         Previous pane (reverse of Tab)
   Esc               From tool/executions/past-sessions: return to transcript
   PgUp / PgDn       Scroll the focused pane; on executions: output pane (Ctrl+Pg*: code pane)
   F5                Refresh list (executions or past-sessions pane)
@@ -293,174 +294,6 @@ fn outbound_to_cell(msg: &OutboundMessage) -> Cell {
     }
 }
 
-/// Greedy wrap by display width (`unicode_width`); preserves explicit newlines.
-pub(crate) fn wrap_text(text: &str, width: usize) -> Vec<String> {
-    if width < 4 {
-        return vec![text.to_string()];
-    }
-    let mut lines: Vec<String> = Vec::new();
-    for paragraph in text.split('\n') {
-        if paragraph.is_empty() {
-            lines.push(String::new());
-            continue;
-        }
-        let mut line = String::new();
-        let mut col = 0usize;
-        for ch in paragraph.chars() {
-            let w = unicode_width::UnicodeWidthChar::width(ch)
-                .unwrap_or(0)
-                .max(1);
-            if col + w > width && !line.is_empty() {
-                lines.push(std::mem::take(&mut line));
-                col = 0;
-            }
-            if col == 0 && ch.is_whitespace() {
-                continue;
-            }
-            line.push(ch);
-            col += w;
-        }
-        if !line.is_empty() || paragraph.is_empty() {
-            lines.push(line);
-        }
-    }
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines
-}
-
-fn cell_block_lines(cell: &Cell, inner_width: usize) -> Vec<Line<'static>> {
-    let w = inner_width.max(8);
-    match cell {
-        Cell::User { text } => {
-            let mut v = vec![Line::from(vec![
-                Span::styled(" ● ", Theme::user_prefix()),
-                Span::styled("you", Theme::user_prefix()),
-            ])];
-            for ln in wrap_text(text, w.saturating_sub(2)) {
-                v.push(Line::from(Span::styled(ln, Theme::text())));
-            }
-            v.push(Line::from(""));
-            v
-        }
-        Cell::Assistant { markdown } => {
-            let mut v = vec![Line::from(vec![
-                Span::styled(" ◆ ", Theme::assistant_bullet()),
-                Span::styled("agent", Theme::dim()),
-            ])];
-            v.extend(markdown::assistant_markdown_lines(
-                markdown,
-                w.saturating_sub(2),
-            ));
-            v.push(Line::from(""));
-            v
-        }
-        Cell::Thinking { text } => {
-            let mut v = vec![Line::from(Span::styled(" … thought", Theme::thinking()))];
-            for ln in wrap_text(text, w) {
-                v.push(Line::from(Span::styled(ln, Theme::thinking())));
-            }
-            v.push(Line::from(""));
-            v
-        }
-        Cell::ToolNotice {
-            phase,
-            content,
-            tool_call_id: _,
-        } => {
-            let label_style = match phase {
-                ToolNoticePhase::Pending => Theme::tool_pending().add_modifier(Modifier::BOLD),
-                ToolNoticePhase::Call => Theme::tool_call().add_modifier(Modifier::BOLD),
-                ToolNoticePhase::Result => Theme::tool_done().add_modifier(Modifier::BOLD),
-                ToolNoticePhase::Failed => Theme::error().add_modifier(Modifier::BOLD),
-                ToolNoticePhase::Other => Theme::tool_call().add_modifier(Modifier::BOLD),
-            };
-            let label = match phase {
-                ToolNoticePhase::Pending => "tool",
-                ToolNoticePhase::Call => "tool",
-                ToolNoticePhase::Result => "done",
-                ToolNoticePhase::Failed => "fail",
-                ToolNoticePhase::Other => "tool",
-            };
-            let mut v = vec![Line::from(vec![
-                Span::styled(" ⚡ ", label_style),
-                Span::styled(label, label_style),
-            ])];
-            let body_style = match phase {
-                ToolNoticePhase::Pending => Theme::tool_pending(),
-                ToolNoticePhase::Failed => Theme::error(),
-                _ => Theme::text(),
-            };
-            for ln in wrap_text(content, w.saturating_sub(2)) {
-                v.push(Line::from(Span::styled(ln, body_style)));
-            }
-            v.push(Line::from(""));
-            v
-        }
-        Cell::Clarification { text, choices } => {
-            let inner = w.saturating_sub(2).max(8);
-            let mut v = vec![Line::from(vec![
-                Span::styled(" ? ", Theme::clarification()),
-                Span::styled("question", Theme::clarification()),
-            ])];
-            for ln in wrap_text(text, inner) {
-                v.push(Line::from(Span::styled(ln, Theme::clarification())));
-            }
-            if !choices.is_empty() {
-                v.push(Line::from(Span::styled(
-                    "Reply with a number (1–n) or the exact option text.",
-                    Theme::dim(),
-                )));
-                let indent = "   ";
-                for (i, choice) in choices.iter().enumerate() {
-                    let n = i + 1;
-                    let head = format!("{n}. ");
-                    let first = format!("{head}{choice}");
-                    let lines = wrap_text(&first, inner);
-                    for (li, seg) in lines.iter().enumerate() {
-                        let line = if li == 0 {
-                            seg.clone()
-                        } else {
-                            format!("{indent}{seg}")
-                        };
-                        v.push(Line::from(Span::styled(line, Theme::clarification())));
-                    }
-                }
-            }
-            v.push(Line::from(""));
-            v
-        }
-        Cell::System { message } => {
-            let mut v = vec![Line::from(Span::styled(" — system —", Theme::dim()))];
-            for ln in wrap_text(message, w) {
-                v.push(Line::from(Span::styled(ln, Theme::dim())));
-            }
-            v.push(Line::from(""));
-            v
-        }
-        Cell::Error { message } => {
-            let mut v = vec![Line::from(vec![
-                Span::styled(" ! ", Theme::error()),
-                Span::styled("error", Theme::error().add_modifier(Modifier::BOLD)),
-            ])];
-            for ln in wrap_text(message, w.saturating_sub(2)) {
-                v.push(Line::from(Span::styled(ln, Theme::error())));
-            }
-            v.push(Line::from(""));
-            v
-        }
-    }
-}
-
-fn flatten_cells_to_lines(cells: &[Cell], inner_width: usize) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    for cell in cells {
-        lines.extend(cell_block_lines(cell, inner_width));
-    }
-    lines
-}
-
 fn layout_chunks(area: Rect, exec_panel_h: u16, active_tool_h: u16) -> [Rect; 6] {
     let exec_constraint = if exec_panel_h > 0 {
         Constraint::Length(exec_panel_h)
@@ -636,7 +469,7 @@ fn build_title_line(max_width: usize) -> Line<'static> {
     let groups = vec![
         vec![Span::styled(" isanagent ", Theme::input_prompt())],
         vec![Span::styled(
-            "· /exit · /new · /chats · /copy · /cancel · /background · /retry · /tools · /exec · /help · Tab · Esc · ^Shift+M wheel · PgUp/PgDn",
+            "· /exit · /new · /chats · /copy · /cancel · /background · /retry · /tools · /exec · /help · Tab · Shift+Tab · Esc · ^Shift+M wheel · PgUp/PgDn",
             dim,
         )],
     ];
@@ -693,88 +526,6 @@ fn build_status_line(
         groups.insert(0, vec![Span::styled(t, style), Span::styled(" · ", dim)]);
     }
     line_from_chunk_groups(groups, max_width)
-}
-
-fn transcript_paragraph(
-    cells: &[Cell],
-    transcript_area: Rect,
-    scroll_from_bottom: u16,
-) -> (Paragraph<'static>, u16) {
-    let inner_w = transcript_area.width.saturating_sub(2) as usize;
-    let lines = flatten_cells_to_lines(cells, inner_w.max(8));
-    let visible = transcript_area.height.saturating_sub(2) as usize;
-    let total = lines.len();
-    let max_scroll = total.saturating_sub(visible).min(u16::MAX as usize) as u16;
-    let start = total
-        .saturating_sub(visible)
-        .saturating_sub(scroll_from_bottom as usize);
-    let take = visible.max(1);
-    let slice: Vec<Line<'static>> = lines.into_iter().skip(start).take(take).collect();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(" transcript ", Theme::dim()))
-        .border_style(Theme::dim());
-    (Paragraph::new(Text::from(slice)).block(block), max_scroll)
-}
-
-fn tool_history_paragraph(
-    entries: &[ToolRailEntry],
-    area: Rect,
-    scroll_from_bottom: u16,
-) -> (Paragraph<'static>, u16) {
-    let inner_w = area.width.saturating_sub(2) as usize;
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    if entries.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "No tool calls yet. Invoke the agent with tools enabled to see activity here.",
-            Theme::dim(),
-        )));
-    } else {
-        for e in entries {
-            let label_style = match e.phase {
-                ToolNoticePhase::Pending => Theme::tool_pending().add_modifier(Modifier::BOLD),
-                ToolNoticePhase::Call => Theme::tool_call().add_modifier(Modifier::BOLD),
-                ToolNoticePhase::Result => Theme::tool_done().add_modifier(Modifier::BOLD),
-                ToolNoticePhase::Failed => Theme::error().add_modifier(Modifier::BOLD),
-                ToolNoticePhase::Other => Theme::tool_call().add_modifier(Modifier::BOLD),
-            };
-            let label = match e.phase {
-                ToolNoticePhase::Pending => "wait",
-                ToolNoticePhase::Call => "call",
-                ToolNoticePhase::Result => "done",
-                ToolNoticePhase::Failed => "fail",
-                ToolNoticePhase::Other => "tool",
-            };
-            let body_w = inner_w.max(8).saturating_sub(8);
-            let wrapped = wrap_text(&e.summary, body_w);
-            for (i, seg) in wrapped.into_iter().enumerate() {
-                if i == 0 {
-                    lines.push(Line::from(vec![
-                        Span::styled(format!(" {label} "), label_style),
-                        Span::styled(seg, Theme::text()),
-                    ]));
-                } else {
-                    lines.push(Line::from(Span::styled(
-                        format!("       {seg}"),
-                        Theme::dim(),
-                    )));
-                }
-            }
-        }
-    }
-    let visible = area.height.saturating_sub(2) as usize;
-    let total = lines.len();
-    let max_scroll = total.saturating_sub(visible).min(u16::MAX as usize) as u16;
-    let start = total
-        .saturating_sub(visible)
-        .saturating_sub(scroll_from_bottom as usize);
-    let take = visible.max(1);
-    let slice: Vec<Line<'static>> = lines.into_iter().skip(start).take(take).collect();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(" tool activity ", Theme::tool_call()))
-        .border_style(Theme::dim());
-    (Paragraph::new(Text::from(slice)).block(block), max_scroll)
 }
 
 fn outbound_clears_thinking(msg: &OutboundMessage) -> bool {
@@ -980,151 +731,36 @@ fn rescan_executions_manifest(workspace_dir: &Path, chat_id: &str, app: &mut App
     }
 }
 
-fn execution_run_list_line(
-    item: &execution_browser::ExecutionRunListItem,
-    inner_w: usize,
-) -> String {
-    let ex = item
-        .exit_code
-        .map(|c| format!("exit {c}"))
-        .unwrap_or_else(|| "exit ?".to_string());
-    let desc = item
-        .description
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("—");
-    let ts_short: String = item.ts.chars().take(26).collect();
-    let raw = format!("{ts_short}  {ex}  {desc}");
-    truncate_chars_display(&raw, inner_w.max(12))
-}
-
-fn execution_code_lines(source: &str, inner_w: usize) -> Vec<Line<'static>> {
-    crate::channels::terminal_ui::syntect_highlight::highlight_source_wrapped(
-        source,
-        inner_w.max(8),
-    )
-}
-
-fn execution_output_lines(j: &crate::execution::RunJournal, inner_w: usize) -> Vec<Line<'static>> {
-    let w = inner_w.max(8);
-    let mut v: Vec<Line<'static>> = Vec::new();
-    v.push(Line::from(vec![Span::styled(
-        "— stdout —",
-        Theme::tool_call(),
-    )]));
-    for ln in wrap_text(&j.stdout, w) {
-        v.push(Line::from(Span::styled(ln, Theme::text())));
-    }
-    v.push(Line::from(vec![Span::styled("— stderr —", Theme::error())]));
-    for ln in wrap_text(&j.stderr, w) {
-        v.push(Line::from(Span::styled(ln, Theme::error())));
-    }
-    v
-}
-
-fn executions_list_paragraph(app: &App, area: Rect) -> (Paragraph<'static>, usize) {
-    let inner_w = area.width.saturating_sub(2) as usize;
-    let visible = area.height.saturating_sub(2) as usize;
-    let max_scroll = if app.executions_runs.is_empty() {
-        0usize
+#[allow(clippy::too_many_arguments)]
+fn apply_ui_focus_cycle(
+    app: &mut App,
+    forward: bool,
+    workspace_dir: &Path,
+    chat_id: &str,
+    rt: &tokio::runtime::Runtime,
+    memory_node: &NodeHandle<MemoryMessage>,
+    last_exec_poll: &mut Instant,
+    last_conversations_poll: &mut Instant,
+) {
+    if forward {
+        app.toggle_ui_focus();
     } else {
-        app.executions_runs.len().saturating_sub(visible.max(1))
-    };
-    let st = app.executions_list_scroll_top.min(max_scroll);
-    let mut slice: Vec<Line<'static>> = Vec::new();
-    if let Some(err) = app.executions_runs_error.as_deref() {
-        slice.push(Line::from(Span::styled(
-            format!("Could not load execution_runs.jsonl: {err}"),
-            Theme::error(),
-        )));
-    } else if app.executions_runs.is_empty() {
-        slice.push(Line::from(Span::styled(
-            "No execution runs recorded for this terminal thread yet.",
-            Theme::dim(),
-        )));
-        slice.push(Line::from(Span::styled(
-            "Runs append after each successful execution_run (workspace .system_generated/).",
-            Theme::dim(),
-        )));
-    } else {
-        for (row, item) in app
-            .executions_runs
-            .iter()
-            .enumerate()
-            .skip(st)
-            .take(visible.max(1))
-        {
-            let sel = app.executions_selected_idx == Some(row);
-            let mark = if sel { "› " } else { "  " };
-            let body = execution_run_list_line(item, inner_w.saturating_sub(4));
-            let style = if sel {
-                Theme::tool_call()
-            } else {
-                Theme::text()
-            };
-            slice.push(Line::from(vec![
-                Span::styled(mark, Theme::tool_done()),
-                Span::styled(body, style),
-            ]));
-        }
+        app.toggle_ui_focus_back();
     }
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(" runs (this thread) ", Theme::tool_done()))
-        .border_style(Theme::dim());
-    (Paragraph::new(Text::from(slice)).block(block), max_scroll)
-}
-
-fn executions_ensure_list_shows_selection(app: &mut App, list_inner_height: usize) {
-    let v = list_inner_height.max(1);
-    let Some(sel) = app.executions_selected_idx else {
-        return;
-    };
-    if sel < app.executions_list_scroll_top {
-        app.executions_list_scroll_top = sel;
+    if app.ui_focus == TerminalUiFocus::Executions {
+        rescan_executions_manifest(workspace_dir, chat_id, app);
+        *last_exec_poll = Instant::now();
     }
-    if sel >= app.executions_list_scroll_top.saturating_add(v) {
-        app.executions_list_scroll_top = sel.saturating_sub(v.saturating_sub(1));
+    if app.ui_focus == TerminalUiFocus::Conversations {
+        refresh_conversations_list(rt, memory_node, app);
+        *last_conversations_poll = Instant::now();
     }
-}
-
-fn executions_code_paragraph(
-    detail: &execution_browser::ExecutionRunDetail,
-    area: Rect,
-    scroll_top: usize,
-) -> (Paragraph<'static>, usize) {
-    let inner_w = area.width.saturating_sub(2) as usize;
-    let lines = execution_code_lines(&detail.source, inner_w.max(8));
-    let visible = area.height.saturating_sub(2) as usize;
-    let total = lines.len();
-    let max_scroll = total.saturating_sub(visible.max(1));
-    let st = scroll_top.min(max_scroll);
-    let slice: Vec<Line<'static>> = lines.into_iter().skip(st).take(visible.max(1)).collect();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(" source ", Theme::dim()))
-        .border_style(Theme::dim());
-    (Paragraph::new(Text::from(slice)).block(block), max_scroll)
-}
-
-fn executions_output_paragraph(
-    journal: &crate::execution::RunJournal,
-    area: Rect,
-    scroll_top: usize,
-) -> (Paragraph<'static>, usize) {
-    let inner_w = area.width.saturating_sub(2) as usize;
-    let lines = execution_output_lines(journal, inner_w.max(8));
-    let visible = area.height.saturating_sub(2) as usize;
-    let total = lines.len();
-    let max_scroll = total.saturating_sub(visible.max(1));
-    let st = scroll_top.min(max_scroll);
-    let slice: Vec<Line<'static>> = lines.into_iter().skip(st).take(visible.max(1)).collect();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(" output ", Theme::dim()))
-        .border_style(Theme::dim());
-    (Paragraph::new(Text::from(slice)).block(block), max_scroll)
+    if app.following_tail() {
+        app.scroll_offset = 0;
+    }
+    if app.tool_history_following_tail() {
+        app.tool_history_scroll = 0;
+    }
 }
 
 fn last_assistant_markdown(cells: &[Cell]) -> Option<&str> {
@@ -1458,17 +1094,16 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     app.last_executions_output_rect = None;
                     app.last_conversations_list_rect = None;
                 }
-                TerminalUiFocus::ToolHistory => {
-                    let (w, max_s) =
-                        tool_history_paragraph(&app.tool_rail, ch[1], app.tool_history_scroll);
-                    max_tool_history_scroll_holder.set(max_s);
+                TerminalUiFocus::Conversations => {
+                    let (w, max_s) = conversations_list_paragraph(&app, ch[1]);
+                    max_conversations_list_scroll_holder.set(max_s);
                     f.render_widget(w, ch[1]);
-                    app.last_tool_history_rect = Some(ch[1]);
+                    app.last_conversations_list_rect = Some(ch[1]);
                     app.last_transcript_rect = None;
+                    app.last_tool_history_rect = None;
                     app.last_executions_list_rect = None;
                     app.last_executions_code_rect = None;
                     app.last_executions_output_rect = None;
-                    app.last_conversations_list_rect = None;
                 }
                 TerminalUiFocus::Executions => {
                     let list_w = (ch[1].width / 3).clamp(26, 46);
@@ -1532,16 +1167,17 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     app.last_executions_list_rect = Some(list_r);
                     app.last_conversations_list_rect = None;
                 }
-                TerminalUiFocus::Conversations => {
-                    let (w, max_s) = conversations_list_paragraph(&app, ch[1]);
-                    max_conversations_list_scroll_holder.set(max_s);
+                TerminalUiFocus::ToolHistory => {
+                    let (w, max_s) =
+                        tool_history_paragraph(&app.tool_rail, ch[1], app.tool_history_scroll);
+                    max_tool_history_scroll_holder.set(max_s);
                     f.render_widget(w, ch[1]);
-                    app.last_conversations_list_rect = Some(ch[1]);
+                    app.last_tool_history_rect = Some(ch[1]);
                     app.last_transcript_rect = None;
-                    app.last_tool_history_rect = None;
                     app.last_executions_list_rect = None;
                     app.last_executions_code_rect = None;
                     app.last_executions_output_rect = None;
+                    app.last_conversations_list_rect = None;
                 }
             }
 
@@ -1990,41 +1626,44 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         app.focus_transcript();
                     }
                 }
+                KeyCode::BackTab => {
+                    apply_ui_focus_cycle(
+                        &mut app,
+                        false,
+                        &workspace_dir,
+                        &chat_id,
+                        &rt,
+                        &memory_node,
+                        &mut last_exec_poll,
+                        &mut last_conversations_poll,
+                    );
+                }
                 KeyCode::Tab => {
-                    app.toggle_ui_focus();
-                    if app.ui_focus == TerminalUiFocus::Executions {
-                        rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
-                        last_exec_poll = Instant::now();
-                    }
-                    if app.ui_focus == TerminalUiFocus::Conversations {
-                        refresh_conversations_list(&rt, &memory_node, &mut app);
-                        last_conversations_poll = Instant::now();
-                    }
-                    if app.following_tail() {
-                        app.scroll_offset = 0;
-                    }
-                    if app.tool_history_following_tail() {
-                        app.tool_history_scroll = 0;
-                    }
+                    let forward = !key.modifiers.contains(KeyModifiers::SHIFT);
+                    apply_ui_focus_cycle(
+                        &mut app,
+                        forward,
+                        &workspace_dir,
+                        &chat_id,
+                        &rt,
+                        &memory_node,
+                        &mut last_exec_poll,
+                        &mut last_conversations_poll,
+                    );
                 }
                 KeyCode::Char('t') | KeyCode::Char('T')
                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
-                    app.toggle_ui_focus();
-                    if app.ui_focus == TerminalUiFocus::Executions {
-                        rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
-                        last_exec_poll = Instant::now();
-                    }
-                    if app.ui_focus == TerminalUiFocus::Conversations {
-                        refresh_conversations_list(&rt, &memory_node, &mut app);
-                        last_conversations_poll = Instant::now();
-                    }
-                    if app.following_tail() {
-                        app.scroll_offset = 0;
-                    }
-                    if app.tool_history_following_tail() {
-                        app.tool_history_scroll = 0;
-                    }
+                    apply_ui_focus_cycle(
+                        &mut app,
+                        true,
+                        &workspace_dir,
+                        &chat_id,
+                        &rt,
+                        &memory_node,
+                        &mut last_exec_poll,
+                        &mut last_conversations_poll,
+                    );
                 }
                 KeyCode::PageUp => match app.ui_focus {
                     TerminalUiFocus::ToolHistory => app.tool_history_scroll_up(8),
