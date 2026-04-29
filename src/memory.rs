@@ -140,6 +140,9 @@ pub fn chat_id_from_root_thread_id(channel: &str, thread_id: &str) -> Option<Str
     parts.get(1).map(std::string::ToString::to_string)
 }
 
+/// Max characters taken from the first line of user content for root-thread list previews.
+const THREAD_PREVIEW_MAX_CHARS: usize = 56;
+
 fn strip_user_preview_for_thread_list(s: &str) -> String {
     if let Some(idx) = s.find(RUNTIME_CONTEXT_END_SUFFIX) {
         s[idx + RUNTIME_CONTEXT_END_SUFFIX.len()..]
@@ -153,7 +156,7 @@ fn strip_user_preview_for_thread_list(s: &str) -> String {
 fn truncate_thread_preview_line(text: &str) -> String {
     let line = text.split('\n').next().unwrap_or(text).trim();
     let mut iter = line.chars();
-    let chunk: String = iter.by_ref().take(56).collect();
+    let chunk: String = iter.by_ref().take(THREAD_PREVIEW_MAX_CHARS).collect();
     if iter.next().is_some() {
         format!("{}…", chunk)
     } else {

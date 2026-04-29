@@ -731,29 +731,48 @@ fn rescan_executions_manifest(workspace_dir: &Path, chat_id: &str, app: &mut App
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn apply_ui_focus_cycle(
-    app: &mut App,
-    forward: bool,
-    workspace_dir: &Path,
-    chat_id: &str,
-    rt: &tokio::runtime::Runtime,
-    memory_node: &NodeHandle<MemoryMessage>,
-    last_exec_poll: &mut Instant,
-    last_conversations_poll: &mut Instant,
-) {
+struct FocusCycleContext<'a> {
+    workspace_dir: &'a Path,
+    chat_id: &'a str,
+    rt: &'a tokio::runtime::Runtime,
+    memory_node: &'a NodeHandle<MemoryMessage>,
+    last_exec_poll: &'a mut Instant,
+    last_conversations_poll: &'a mut Instant,
+}
+
+impl<'a> FocusCycleContext<'a> {
+    fn new(
+        workspace_dir: &'a Path,
+        chat_id: &'a str,
+        rt: &'a tokio::runtime::Runtime,
+        memory_node: &'a NodeHandle<MemoryMessage>,
+        last_exec_poll: &'a mut Instant,
+        last_conversations_poll: &'a mut Instant,
+    ) -> Self {
+        Self {
+            workspace_dir,
+            chat_id,
+            rt,
+            memory_node,
+            last_exec_poll,
+            last_conversations_poll,
+        }
+    }
+}
+
+fn apply_ui_focus_cycle(app: &mut App, forward: bool, ctx: &mut FocusCycleContext<'_>) {
     if forward {
         app.toggle_ui_focus();
     } else {
         app.toggle_ui_focus_back();
     }
     if app.ui_focus == TerminalUiFocus::Executions {
-        rescan_executions_manifest(workspace_dir, chat_id, app);
-        *last_exec_poll = Instant::now();
+        rescan_executions_manifest(ctx.workspace_dir, ctx.chat_id, app);
+        *ctx.last_exec_poll = Instant::now();
     }
     if app.ui_focus == TerminalUiFocus::Conversations {
-        refresh_conversations_list(rt, memory_node, app);
-        *last_conversations_poll = Instant::now();
+        refresh_conversations_list(ctx.rt, ctx.memory_node, app);
+        *ctx.last_conversations_poll = Instant::now();
     }
     if app.following_tail() {
         app.scroll_offset = 0;
@@ -1627,9 +1646,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     }
                 }
                 KeyCode::BackTab => {
-                    apply_ui_focus_cycle(
-                        &mut app,
-                        false,
+                    let mut focus_ctx = FocusCycleContext::new(
                         &workspace_dir,
                         &chat_id,
                         &rt,
@@ -1637,12 +1654,11 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         &mut last_exec_poll,
                         &mut last_conversations_poll,
                     );
+                    apply_ui_focus_cycle(&mut app, false, &mut focus_ctx);
                 }
                 KeyCode::Tab => {
                     let forward = !key.modifiers.contains(KeyModifiers::SHIFT);
-                    apply_ui_focus_cycle(
-                        &mut app,
-                        forward,
+                    let mut focus_ctx = FocusCycleContext::new(
                         &workspace_dir,
                         &chat_id,
                         &rt,
@@ -1650,13 +1666,12 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         &mut last_exec_poll,
                         &mut last_conversations_poll,
                     );
+                    apply_ui_focus_cycle(&mut app, forward, &mut focus_ctx);
                 }
                 KeyCode::Char('t') | KeyCode::Char('T')
                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
-                    apply_ui_focus_cycle(
-                        &mut app,
-                        true,
+                    let mut focus_ctx = FocusCycleContext::new(
                         &workspace_dir,
                         &chat_id,
                         &rt,
@@ -1664,6 +1679,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         &mut last_exec_poll,
                         &mut last_conversations_poll,
                     );
+                    apply_ui_focus_cycle(&mut app, true, &mut focus_ctx);
                 }
                 KeyCode::PageUp => match app.ui_focus {
                     TerminalUiFocus::ToolHistory => app.tool_history_scroll_up(8),

@@ -6,6 +6,11 @@ use crate::channels::terminal_ui::text_format::{format_last_activity, truncate_c
 use crate::channels::terminal_ui::App;
 use crate::channels::terminal_ui::Theme;
 
+/// Display columns reserved for last-activity time, ` | `, and list selection mark before the preview.
+const SESSION_LIST_PREFIX_WIDTH: usize = 24;
+/// Minimum display columns for the truncated preview when the pane is very narrow.
+const MIN_PREVIEW_WIDTH: usize = 12;
+
 /// Scrollable list of past root terminal sessions (memory).
 pub fn conversations_list_paragraph(app: &App, area: Rect) -> (Paragraph<'static>, usize) {
     let inner_w = area.width.saturating_sub(2) as usize;
@@ -42,7 +47,12 @@ pub fn conversations_list_paragraph(app: &App, area: Rect) -> (Paragraph<'static
             let line = format!(
                 "{} | {}",
                 ts,
-                truncate_chars_display(&item.preview, inner_w.saturating_sub(24).max(12))
+                truncate_chars_display(
+                    &item.preview,
+                    inner_w
+                        .saturating_sub(SESSION_LIST_PREFIX_WIDTH)
+                        .max(MIN_PREVIEW_WIDTH),
+                )
             );
             let style = if sel {
                 Theme::tool_call()
