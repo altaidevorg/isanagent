@@ -15,13 +15,17 @@ use crossterm::{
 };
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::prelude::*;
-use ratatui::style::Modifier;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use tokio::sync::mpsc::Sender;
 
 use crate::bus::{BusMessage, InboundMessage, OutboundMessage};
 use crate::channels::terminal_ui::attachments::parse_terminal_attachments;
-use crate::channels::terminal_ui::markdown;
+use crate::channels::terminal_ui::history_cells;
+use crate::channels::terminal_ui::panes::{
+    conversations_ensure_list_shows_selection, conversations_list_paragraph,
+    executions_code_paragraph, executions_ensure_list_shows_selection, executions_list_paragraph,
+    executions_output_paragraph, tool_history_paragraph, transcript_paragraph,
+};
 use crate::channels::terminal_ui::protocol::{
     ISANAGENT_AGENT_THOUGHT, ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_JOB_STARTED,
     ISANAGENT_EXECUTION_STREAM, ISANAGENT_LLM_RETRY_AVAILABLE, ISANAGENT_TERMINAL_ERROR,
@@ -30,11 +34,14 @@ use crate::channels::terminal_ui::protocol::{
     METADATA_EXECUTION_SESSION_ID, METADATA_TOOL_CALL_ID, METADATA_TOOL_CALL_PREVIEW,
     METADATA_TOOL_NAME, METADATA_TOOL_RESULT_PREVIEW,
 };
+use crate::channels::terminal_ui::text_format::truncate_chars_display;
 use crate::channels::terminal_ui::{
     execution_browser, init_from_env, uses_ansi_color, App, Cell, JobStripStatus, TerminalUiFocus,
     Theme, ToastKind, ToolNoticePhase, ToolRailEntry,
 };
 use crate::clarification::{METADATA_CLARIFICATION, METADATA_CLARIFICATION_CHOICES};
+use crate::memory::{chat_id_from_root_thread_id, MemoryMessage, SharedReply};
+use crate::NodeHandle;
 
 /// Second component of `execution_stream_label`: prefer model-provided description, else short id.
 pub(crate) fn execution_strip_subtitle(description: Option<&str>, id: &str) -> String {
@@ -81,14 +88,16 @@ const TERMINAL_HELP: &str = r#"Commands (leading slash):
   /retry         Re-submit the last user message after an LLM-failed banner
   /tools         Open the tool activity pane
   /exec          Open the executions browser (workspace execution_runs.jsonl)
+  /chats         Open past sessions (saved terminal threads from workspace memory)
   /help, /?      Show this help
 
 Keys:
-  Enter             Send the compose line
-  Tab / Ctrl+T      Switch focus: transcript → tool activity → executions → …
-  Esc               From tool activity or executions: return to transcript
+  Enter             Send the compose line; in past-sessions pane: load selected and continue
+  Tab / Ctrl+T      Next pane: transcript → past sessions → executions → tool activity
+  Shift+Tab         Previous pane (reverse of Tab)
+  Esc               From tool/executions/past-sessions: return to transcript
   PgUp / PgDn       Scroll the focused pane; on executions: output pane (Ctrl+Pg*: code pane)
-  F5                Refresh execution run list (executions pane)
+  F5                Refresh list (executions or past-sessions pane)
   Ctrl+Shift+M      Toggle application mouse: on = wheel scrolls panes; off = native selection/copy
   Ctrl+Shift+Y      Copy last assistant reply
   Ctrl+W / Ctrl+U   Delete word / clear line
@@ -285,174 +294,6 @@ fn outbound_to_cell(msg: &OutboundMessage) -> Cell {
     }
 }
 
-/// Greedy wrap by display width (`unicode_width`); preserves explicit newlines.
-pub(crate) fn wrap_text(text: &str, width: usize) -> Vec<String> {
-    if width < 4 {
-        return vec![text.to_string()];
-    }
-    let mut lines: Vec<String> = Vec::new();
-    for paragraph in text.split('\n') {
-        if paragraph.is_empty() {
-            lines.push(String::new());
-            continue;
-        }
-        let mut line = String::new();
-        let mut col = 0usize;
-        for ch in paragraph.chars() {
-            let w = unicode_width::UnicodeWidthChar::width(ch)
-                .unwrap_or(0)
-                .max(1);
-            if col + w > width && !line.is_empty() {
-                lines.push(std::mem::take(&mut line));
-                col = 0;
-            }
-            if col == 0 && ch.is_whitespace() {
-                continue;
-            }
-            line.push(ch);
-            col += w;
-        }
-        if !line.is_empty() || paragraph.is_empty() {
-            lines.push(line);
-        }
-    }
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines
-}
-
-fn cell_block_lines(cell: &Cell, inner_width: usize) -> Vec<Line<'static>> {
-    let w = inner_width.max(8);
-    match cell {
-        Cell::User { text } => {
-            let mut v = vec![Line::from(vec![
-                Span::styled(" ● ", Theme::user_prefix()),
-                Span::styled("you", Theme::user_prefix()),
-            ])];
-            for ln in wrap_text(text, w.saturating_sub(2)) {
-                v.push(Line::from(Span::styled(ln, Theme::text())));
-            }
-            v.push(Line::from(""));
-            v
-        }
-        Cell::Assistant { markdown } => {
-            let mut v = vec![Line::from(vec![
-                Span::styled(" ◆ ", Theme::assistant_bullet()),
-                Span::styled("agent", Theme::dim()),
-            ])];
-            v.extend(markdown::assistant_markdown_lines(
-                markdown,
-                w.saturating_sub(2),
-            ));
-            v.push(Line::from(""));
-            v
-        }
-        Cell::Thinking { text } => {
-            let mut v = vec![Line::from(Span::styled(" … thought", Theme::thinking()))];
-            for ln in wrap_text(text, w) {
-                v.push(Line::from(Span::styled(ln, Theme::thinking())));
-            }
-            v.push(Line::from(""));
-            v
-        }
-        Cell::ToolNotice {
-            phase,
-            content,
-            tool_call_id: _,
-        } => {
-            let label_style = match phase {
-                ToolNoticePhase::Pending => Theme::tool_pending().add_modifier(Modifier::BOLD),
-                ToolNoticePhase::Call => Theme::tool_call().add_modifier(Modifier::BOLD),
-                ToolNoticePhase::Result => Theme::tool_done().add_modifier(Modifier::BOLD),
-                ToolNoticePhase::Failed => Theme::error().add_modifier(Modifier::BOLD),
-                ToolNoticePhase::Other => Theme::tool_call().add_modifier(Modifier::BOLD),
-            };
-            let label = match phase {
-                ToolNoticePhase::Pending => "tool",
-                ToolNoticePhase::Call => "tool",
-                ToolNoticePhase::Result => "done",
-                ToolNoticePhase::Failed => "fail",
-                ToolNoticePhase::Other => "tool",
-            };
-            let mut v = vec![Line::from(vec![
-                Span::styled(" ⚡ ", label_style),
-                Span::styled(label, label_style),
-            ])];
-            let body_style = match phase {
-                ToolNoticePhase::Pending => Theme::tool_pending(),
-                ToolNoticePhase::Failed => Theme::error(),
-                _ => Theme::text(),
-            };
-            for ln in wrap_text(content, w.saturating_sub(2)) {
-                v.push(Line::from(Span::styled(ln, body_style)));
-            }
-            v.push(Line::from(""));
-            v
-        }
-        Cell::Clarification { text, choices } => {
-            let inner = w.saturating_sub(2).max(8);
-            let mut v = vec![Line::from(vec![
-                Span::styled(" ? ", Theme::clarification()),
-                Span::styled("question", Theme::clarification()),
-            ])];
-            for ln in wrap_text(text, inner) {
-                v.push(Line::from(Span::styled(ln, Theme::clarification())));
-            }
-            if !choices.is_empty() {
-                v.push(Line::from(Span::styled(
-                    "Reply with a number (1–n) or the exact option text.",
-                    Theme::dim(),
-                )));
-                let indent = "   ";
-                for (i, choice) in choices.iter().enumerate() {
-                    let n = i + 1;
-                    let head = format!("{n}. ");
-                    let first = format!("{head}{choice}");
-                    let lines = wrap_text(&first, inner);
-                    for (li, seg) in lines.iter().enumerate() {
-                        let line = if li == 0 {
-                            seg.clone()
-                        } else {
-                            format!("{indent}{seg}")
-                        };
-                        v.push(Line::from(Span::styled(line, Theme::clarification())));
-                    }
-                }
-            }
-            v.push(Line::from(""));
-            v
-        }
-        Cell::System { message } => {
-            let mut v = vec![Line::from(Span::styled(" — system —", Theme::dim()))];
-            for ln in wrap_text(message, w) {
-                v.push(Line::from(Span::styled(ln, Theme::dim())));
-            }
-            v.push(Line::from(""));
-            v
-        }
-        Cell::Error { message } => {
-            let mut v = vec![Line::from(vec![
-                Span::styled(" ! ", Theme::error()),
-                Span::styled("error", Theme::error().add_modifier(Modifier::BOLD)),
-            ])];
-            for ln in wrap_text(message, w.saturating_sub(2)) {
-                v.push(Line::from(Span::styled(ln, Theme::error())));
-            }
-            v.push(Line::from(""));
-            v
-        }
-    }
-}
-
-fn flatten_cells_to_lines(cells: &[Cell], inner_width: usize) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    for cell in cells {
-        lines.extend(cell_block_lines(cell, inner_width));
-    }
-    lines
-}
-
 fn layout_chunks(area: Rect, exec_panel_h: u16, active_tool_h: u16) -> [Rect; 6] {
     let exec_constraint = if exec_panel_h > 0 {
         Constraint::Length(exec_panel_h)
@@ -481,37 +322,6 @@ fn chunks_line_width(spans: &[Span<'static>]) -> usize {
         .iter()
         .map(|s| super::display_width(s.content.as_ref()))
         .sum()
-}
-
-/// Truncate `s` to at most `max` display columns; appends `…` when shortened (`…` uses one column).
-fn truncate_chars_display(s: &str, max: usize) -> String {
-    use unicode_width::UnicodeWidthChar;
-    if max == 0 {
-        return String::new();
-    }
-    if super::display_width(s) <= max {
-        return s.to_string();
-    }
-    if max == 1 {
-        return "…".to_string();
-    }
-    let budget = max.saturating_sub(1);
-    let mut out = String::new();
-    let mut col = 0usize;
-    for ch in s.chars() {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
-        if col + cw > budget {
-            break;
-        }
-        out.push(ch);
-        col += cw;
-    }
-    if out.is_empty() {
-        "…".to_string()
-    } else {
-        out.push('…');
-        out
-    }
 }
 
 /// Build one line per job in the multi-job strip, plus an optional Jupyter-stream tail
@@ -659,7 +469,7 @@ fn build_title_line(max_width: usize) -> Line<'static> {
     let groups = vec![
         vec![Span::styled(" isanagent ", Theme::input_prompt())],
         vec![Span::styled(
-            "· /exit · /new · /copy · /cancel · /background · /retry · /tools · /exec · /help · Tab · Esc · ^Shift+M wheel · PgUp/PgDn",
+            "· /exit · /new · /chats · /copy · /cancel · /background · /retry · /tools · /exec · /help · Tab · Shift+Tab · Esc · ^Shift+M wheel · PgUp/PgDn",
             dim,
         )],
     ];
@@ -716,88 +526,6 @@ fn build_status_line(
         groups.insert(0, vec![Span::styled(t, style), Span::styled(" · ", dim)]);
     }
     line_from_chunk_groups(groups, max_width)
-}
-
-fn transcript_paragraph(
-    cells: &[Cell],
-    transcript_area: Rect,
-    scroll_from_bottom: u16,
-) -> (Paragraph<'static>, u16) {
-    let inner_w = transcript_area.width.saturating_sub(2) as usize;
-    let lines = flatten_cells_to_lines(cells, inner_w.max(8));
-    let visible = transcript_area.height.saturating_sub(2) as usize;
-    let total = lines.len();
-    let max_scroll = total.saturating_sub(visible).min(u16::MAX as usize) as u16;
-    let start = total
-        .saturating_sub(visible)
-        .saturating_sub(scroll_from_bottom as usize);
-    let take = visible.max(1);
-    let slice: Vec<Line<'static>> = lines.into_iter().skip(start).take(take).collect();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(" transcript ", Theme::dim()))
-        .border_style(Theme::dim());
-    (Paragraph::new(Text::from(slice)).block(block), max_scroll)
-}
-
-fn tool_history_paragraph(
-    entries: &[ToolRailEntry],
-    area: Rect,
-    scroll_from_bottom: u16,
-) -> (Paragraph<'static>, u16) {
-    let inner_w = area.width.saturating_sub(2) as usize;
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    if entries.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "No tool calls yet. Invoke the agent with tools enabled to see activity here.",
-            Theme::dim(),
-        )));
-    } else {
-        for e in entries {
-            let label_style = match e.phase {
-                ToolNoticePhase::Pending => Theme::tool_pending().add_modifier(Modifier::BOLD),
-                ToolNoticePhase::Call => Theme::tool_call().add_modifier(Modifier::BOLD),
-                ToolNoticePhase::Result => Theme::tool_done().add_modifier(Modifier::BOLD),
-                ToolNoticePhase::Failed => Theme::error().add_modifier(Modifier::BOLD),
-                ToolNoticePhase::Other => Theme::tool_call().add_modifier(Modifier::BOLD),
-            };
-            let label = match e.phase {
-                ToolNoticePhase::Pending => "wait",
-                ToolNoticePhase::Call => "call",
-                ToolNoticePhase::Result => "done",
-                ToolNoticePhase::Failed => "fail",
-                ToolNoticePhase::Other => "tool",
-            };
-            let body_w = inner_w.max(8).saturating_sub(8);
-            let wrapped = wrap_text(&e.summary, body_w);
-            for (i, seg) in wrapped.into_iter().enumerate() {
-                if i == 0 {
-                    lines.push(Line::from(vec![
-                        Span::styled(format!(" {label} "), label_style),
-                        Span::styled(seg, Theme::text()),
-                    ]));
-                } else {
-                    lines.push(Line::from(Span::styled(
-                        format!("       {seg}"),
-                        Theme::dim(),
-                    )));
-                }
-            }
-        }
-    }
-    let visible = area.height.saturating_sub(2) as usize;
-    let total = lines.len();
-    let max_scroll = total.saturating_sub(visible).min(u16::MAX as usize) as u16;
-    let start = total
-        .saturating_sub(visible)
-        .saturating_sub(scroll_from_bottom as usize);
-    let take = visible.max(1);
-    let slice: Vec<Line<'static>> = lines.into_iter().skip(start).take(take).collect();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(" tool activity ", Theme::tool_call()))
-        .border_style(Theme::dim());
-    (Paragraph::new(Text::from(slice)).block(block), max_scroll)
 }
 
 fn outbound_clears_thinking(msg: &OutboundMessage) -> bool {
@@ -1003,151 +731,55 @@ fn rescan_executions_manifest(workspace_dir: &Path, chat_id: &str, app: &mut App
     }
 }
 
-fn execution_run_list_line(
-    item: &execution_browser::ExecutionRunListItem,
-    inner_w: usize,
-) -> String {
-    let ex = item
-        .exit_code
-        .map(|c| format!("exit {c}"))
-        .unwrap_or_else(|| "exit ?".to_string());
-    let desc = item
-        .description
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("—");
-    let ts_short: String = item.ts.chars().take(26).collect();
-    let raw = format!("{ts_short}  {ex}  {desc}");
-    truncate_chars_display(&raw, inner_w.max(12))
+struct FocusCycleContext<'a> {
+    workspace_dir: &'a Path,
+    chat_id: &'a str,
+    rt: &'a tokio::runtime::Runtime,
+    memory_node: &'a NodeHandle<MemoryMessage>,
+    last_exec_poll: &'a mut Instant,
+    last_conversations_poll: &'a mut Instant,
 }
 
-fn execution_code_lines(source: &str, inner_w: usize) -> Vec<Line<'static>> {
-    crate::channels::terminal_ui::syntect_highlight::highlight_source_wrapped(
-        source,
-        inner_w.max(8),
-    )
-}
-
-fn execution_output_lines(j: &crate::execution::RunJournal, inner_w: usize) -> Vec<Line<'static>> {
-    let w = inner_w.max(8);
-    let mut v: Vec<Line<'static>> = Vec::new();
-    v.push(Line::from(vec![Span::styled(
-        "— stdout —",
-        Theme::tool_call(),
-    )]));
-    for ln in wrap_text(&j.stdout, w) {
-        v.push(Line::from(Span::styled(ln, Theme::text())));
-    }
-    v.push(Line::from(vec![Span::styled("— stderr —", Theme::error())]));
-    for ln in wrap_text(&j.stderr, w) {
-        v.push(Line::from(Span::styled(ln, Theme::error())));
-    }
-    v
-}
-
-fn executions_list_paragraph(app: &App, area: Rect) -> (Paragraph<'static>, usize) {
-    let inner_w = area.width.saturating_sub(2) as usize;
-    let visible = area.height.saturating_sub(2) as usize;
-    let max_scroll = if app.executions_runs.is_empty() {
-        0usize
-    } else {
-        app.executions_runs.len().saturating_sub(visible.max(1))
-    };
-    let st = app.executions_list_scroll_top.min(max_scroll);
-    let mut slice: Vec<Line<'static>> = Vec::new();
-    if let Some(err) = app.executions_runs_error.as_deref() {
-        slice.push(Line::from(Span::styled(
-            format!("Could not load execution_runs.jsonl: {err}"),
-            Theme::error(),
-        )));
-    } else if app.executions_runs.is_empty() {
-        slice.push(Line::from(Span::styled(
-            "No execution runs recorded for this terminal thread yet.",
-            Theme::dim(),
-        )));
-        slice.push(Line::from(Span::styled(
-            "Runs append after each successful execution_run (workspace .system_generated/).",
-            Theme::dim(),
-        )));
-    } else {
-        for (row, item) in app
-            .executions_runs
-            .iter()
-            .enumerate()
-            .skip(st)
-            .take(visible.max(1))
-        {
-            let sel = app.executions_selected_idx == Some(row);
-            let mark = if sel { "› " } else { "  " };
-            let body = execution_run_list_line(item, inner_w.saturating_sub(4));
-            let style = if sel {
-                Theme::tool_call()
-            } else {
-                Theme::text()
-            };
-            slice.push(Line::from(vec![
-                Span::styled(mark, Theme::tool_done()),
-                Span::styled(body, style),
-            ]));
+impl<'a> FocusCycleContext<'a> {
+    fn new(
+        workspace_dir: &'a Path,
+        chat_id: &'a str,
+        rt: &'a tokio::runtime::Runtime,
+        memory_node: &'a NodeHandle<MemoryMessage>,
+        last_exec_poll: &'a mut Instant,
+        last_conversations_poll: &'a mut Instant,
+    ) -> Self {
+        Self {
+            workspace_dir,
+            chat_id,
+            rt,
+            memory_node,
+            last_exec_poll,
+            last_conversations_poll,
         }
     }
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(" runs (this thread) ", Theme::tool_done()))
-        .border_style(Theme::dim());
-    (Paragraph::new(Text::from(slice)).block(block), max_scroll)
 }
 
-fn executions_ensure_list_shows_selection(app: &mut App, list_inner_height: usize) {
-    let v = list_inner_height.max(1);
-    let Some(sel) = app.executions_selected_idx else {
-        return;
-    };
-    if sel < app.executions_list_scroll_top {
-        app.executions_list_scroll_top = sel;
+fn apply_ui_focus_cycle(app: &mut App, forward: bool, ctx: &mut FocusCycleContext<'_>) {
+    if forward {
+        app.toggle_ui_focus();
+    } else {
+        app.toggle_ui_focus_back();
     }
-    if sel >= app.executions_list_scroll_top.saturating_add(v) {
-        app.executions_list_scroll_top = sel.saturating_sub(v.saturating_sub(1));
+    if app.ui_focus == TerminalUiFocus::Executions {
+        rescan_executions_manifest(ctx.workspace_dir, ctx.chat_id, app);
+        *ctx.last_exec_poll = Instant::now();
     }
-}
-
-fn executions_code_paragraph(
-    detail: &execution_browser::ExecutionRunDetail,
-    area: Rect,
-    scroll_top: usize,
-) -> (Paragraph<'static>, usize) {
-    let inner_w = area.width.saturating_sub(2) as usize;
-    let lines = execution_code_lines(&detail.source, inner_w.max(8));
-    let visible = area.height.saturating_sub(2) as usize;
-    let total = lines.len();
-    let max_scroll = total.saturating_sub(visible.max(1));
-    let st = scroll_top.min(max_scroll);
-    let slice: Vec<Line<'static>> = lines.into_iter().skip(st).take(visible.max(1)).collect();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(" source ", Theme::dim()))
-        .border_style(Theme::dim());
-    (Paragraph::new(Text::from(slice)).block(block), max_scroll)
-}
-
-fn executions_output_paragraph(
-    journal: &crate::execution::RunJournal,
-    area: Rect,
-    scroll_top: usize,
-) -> (Paragraph<'static>, usize) {
-    let inner_w = area.width.saturating_sub(2) as usize;
-    let lines = execution_output_lines(journal, inner_w.max(8));
-    let visible = area.height.saturating_sub(2) as usize;
-    let total = lines.len();
-    let max_scroll = total.saturating_sub(visible.max(1));
-    let st = scroll_top.min(max_scroll);
-    let slice: Vec<Line<'static>> = lines.into_iter().skip(st).take(visible.max(1)).collect();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(" output ", Theme::dim()))
-        .border_style(Theme::dim());
-    (Paragraph::new(Text::from(slice)).block(block), max_scroll)
+    if app.ui_focus == TerminalUiFocus::Conversations {
+        refresh_conversations_list(ctx.rt, ctx.memory_node, app);
+        *ctx.last_conversations_poll = Instant::now();
+    }
+    if app.following_tail() {
+        app.scroll_offset = 0;
+    }
+    if app.tool_history_following_tail() {
+        app.tool_history_scroll = 0;
+    }
 }
 
 fn last_assistant_markdown(cells: &[Cell]) -> Option<&str> {
@@ -1169,6 +801,79 @@ fn copy_last_assistant_to_clipboard(cells: &[Cell]) -> Result<usize, String> {
     Ok(text.len())
 }
 
+fn sync_terminal_session_chat(bus_tx: &Sender<BusMessage>, chat_id: &str) {
+    let _ = bus_tx.blocking_send(BusMessage::SetTerminalSessionChat {
+        chat_id: chat_id.to_string(),
+    });
+}
+
+fn load_thread_transcript_cells(
+    rt: &tokio::runtime::Runtime,
+    memory_node: &NodeHandle<MemoryMessage>,
+    thread_id: &str,
+) -> Result<Vec<Cell>, String> {
+    use tokio::sync::oneshot;
+    let messages: Result<Vec<crate::utils::ChatMessage>, String> = rt.block_on(async {
+        let (tx, rx) = oneshot::channel();
+        let msg = MemoryMessage::GetContext {
+            thread_id: thread_id.to_string(),
+            reply: SharedReply::new(tx),
+        };
+        memory_node
+            .send_packet(msg)
+            .await
+            .map_err(|e| e.to_string())?;
+        rx.await
+            .map_err(|_| "memory actor channel closed".to_string())?
+    });
+    let messages = messages?;
+    Ok(history_cells::chat_messages_to_terminal_cells(&messages))
+}
+
+fn refresh_conversations_list(
+    rt: &tokio::runtime::Runtime,
+    memory_node: &NodeHandle<MemoryMessage>,
+    app: &mut App,
+) {
+    use tokio::sync::oneshot;
+    let res: Result<Vec<crate::memory::RootThreadListItem>, String> = rt.block_on(async {
+        let (tx, rx) = oneshot::channel();
+        let msg = MemoryMessage::ListRootThreadsForChannelWithPreviews {
+            channel: "terminal".to_string(),
+            limit: 100,
+            reply: SharedReply::new(tx),
+        };
+        memory_node
+            .send_packet(msg)
+            .await
+            .map_err(|e| e.to_string())?;
+        rx.await
+            .map_err(|_| "memory actor channel closed".to_string())?
+    });
+    match res {
+        Ok(rows) => {
+            app.conversations_error = None;
+            app.conversations_items = rows;
+            if !app.conversations_items.is_empty() {
+                if app.conversations_selected_idx.is_none() {
+                    app.conversations_selected_idx = Some(0);
+                } else {
+                    let max = app.conversations_items.len().saturating_sub(1);
+                    if let Some(i) = app.conversations_selected_idx.as_mut() {
+                        *i = (*i).min(max);
+                    }
+                }
+            } else {
+                app.conversations_selected_idx = None;
+            }
+        }
+        Err(e) => {
+            app.conversations_error = Some(e);
+            app.conversations_items.clear();
+        }
+    }
+}
+
 /// Arguments for [`run_ratatui_main`].
 pub(crate) struct RatatuiMainConfig {
     pub bus_tx: Sender<BusMessage>,
@@ -1180,6 +885,8 @@ pub(crate) struct RatatuiMainConfig {
     pub channel_name: String,
     pub opening_banner: String,
     pub status_model: String,
+    /// Workspace memory (same as agent) for past-session list and transcript load.
+    pub memory_node: NodeHandle<MemoryMessage>,
 }
 
 /// Run until user quits. Restores terminal on exit.
@@ -1194,7 +901,13 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         channel_name,
         opening_banner,
         status_model,
+        memory_node,
     } = config;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(io::Error::other)?;
 
     init_from_env();
 
@@ -1219,6 +932,9 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         message: opening_banner,
     });
 
+    sync_terminal_session_chat(&bus_tx, &chat_id);
+    refresh_conversations_list(&rt, &memory_node, &mut app);
+
     // Result of a background `install_uv_best_effort` started from `/install-python`.
     let mut uv_install_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>> = None;
 
@@ -1228,7 +944,9 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
     let max_exec_list_scroll_holder = std::cell::Cell::new(0usize);
     let max_exec_code_scroll_holder = std::cell::Cell::new(0usize);
     let max_exec_out_scroll_holder = std::cell::Cell::new(0usize);
+    let max_conversations_list_scroll_holder = std::cell::Cell::new(0usize);
     let mut last_exec_poll = Instant::now() - Duration::from_secs(60);
+    let mut last_conversations_poll = Instant::now() - Duration::from_secs(60);
 
     loop {
         app.clear_expired_toast();
@@ -1238,6 +956,12 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         {
             last_exec_poll = Instant::now();
             rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
+        }
+        if app.ui_focus == TerminalUiFocus::Conversations
+            && last_conversations_poll.elapsed() >= Duration::from_secs(2)
+        {
+            last_conversations_poll = Instant::now();
+            refresh_conversations_list(&rt, &memory_node, &mut app);
         }
 
         if let Some(ref rx) = uv_install_rx {
@@ -1387,14 +1111,15 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     app.last_executions_list_rect = None;
                     app.last_executions_code_rect = None;
                     app.last_executions_output_rect = None;
+                    app.last_conversations_list_rect = None;
                 }
-                TerminalUiFocus::ToolHistory => {
-                    let (w, max_s) =
-                        tool_history_paragraph(&app.tool_rail, ch[1], app.tool_history_scroll);
-                    max_tool_history_scroll_holder.set(max_s);
+                TerminalUiFocus::Conversations => {
+                    let (w, max_s) = conversations_list_paragraph(&app, ch[1]);
+                    max_conversations_list_scroll_holder.set(max_s);
                     f.render_widget(w, ch[1]);
-                    app.last_tool_history_rect = Some(ch[1]);
+                    app.last_conversations_list_rect = Some(ch[1]);
                     app.last_transcript_rect = None;
+                    app.last_tool_history_rect = None;
                     app.last_executions_list_rect = None;
                     app.last_executions_code_rect = None;
                     app.last_executions_output_rect = None;
@@ -1459,6 +1184,19 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     app.last_transcript_rect = None;
                     app.last_tool_history_rect = None;
                     app.last_executions_list_rect = Some(list_r);
+                    app.last_conversations_list_rect = None;
+                }
+                TerminalUiFocus::ToolHistory => {
+                    let (w, max_s) =
+                        tool_history_paragraph(&app.tool_rail, ch[1], app.tool_history_scroll);
+                    max_tool_history_scroll_holder.set(max_s);
+                    f.render_widget(w, ch[1]);
+                    app.last_tool_history_rect = Some(ch[1]);
+                    app.last_transcript_rect = None;
+                    app.last_executions_list_rect = None;
+                    app.last_executions_code_rect = None;
+                    app.last_executions_output_rect = None;
+                    app.last_conversations_list_rect = None;
                 }
             }
 
@@ -1544,6 +1282,11 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 .executions_output_scroll_top
                 .min(max_exec_out_scroll_holder.get());
         }
+        if app.ui_focus == TerminalUiFocus::Conversations {
+            app.conversations_list_scroll_top = app
+                .conversations_list_scroll_top
+                .min(max_conversations_list_scroll_holder.get());
+        }
 
         if !event::poll(tick)? {
             continue;
@@ -1572,6 +1315,66 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     app.clear_line();
                 }
                 KeyCode::Enter => {
+                    if app.ui_focus == TerminalUiFocus::Conversations {
+                        if let Some(idx) = app.conversations_selected_idx {
+                            if idx >= app.conversations_items.len() {
+                                continue;
+                            }
+                            let thread_id = app.conversations_items[idx].thread_id.clone();
+                            let new_cid = match chat_id_from_root_thread_id(
+                                channel_name.as_str(),
+                                &thread_id,
+                            ) {
+                                Some(c) => c,
+                                None => {
+                                    app.set_toast(
+                                        ToastKind::Err,
+                                        "Invalid session row.".into(),
+                                        Duration::from_secs(4),
+                                    );
+                                    continue;
+                                }
+                            };
+                            try_cancel_inflight(&mut app, &bus_tx, &chat_id);
+                            match load_thread_transcript_cells(&rt, &memory_node, &thread_id) {
+                                Ok(mut cells) => {
+                                    chat_id = new_cid;
+                                    sync_terminal_session_chat(&bus_tx, &chat_id);
+                                    let sid = &chat_id[..8.min(chat_id.len())];
+                                    cells.insert(
+                                        0,
+                                        Cell::System {
+                                            message: format!(
+                                                "Resumed session {sid}… — loaded from workspace memory."
+                                            ),
+                                        },
+                                    );
+                                    app.cells = cells;
+                                    app.thinking = false;
+                                    app.llm_retry_available = false;
+                                    app.last_inbound_text = None;
+                                    app.tool_rail.clear();
+                                    app.scroll_offset = 0;
+                                    rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
+                                    last_exec_poll = Instant::now();
+                                    app.focus_transcript();
+                                    app.set_toast(
+                                        ToastKind::Ok,
+                                        format!("Continuing session {sid}…"),
+                                        Duration::from_secs(2),
+                                    );
+                                }
+                                Err(e) => {
+                                    app.set_toast(
+                                        ToastKind::Err,
+                                        format!("Could not load history: {e}"),
+                                        Duration::from_secs(5),
+                                    );
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     let raw = app.take_input();
                     let text = raw.trim();
                     if text.is_empty() {
@@ -1586,6 +1389,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         }
                         if text.eq_ignore_ascii_case("/new") {
                             chat_id = uuid::Uuid::new_v4().to_string();
+                            sync_terminal_session_chat(&bus_tx, &chat_id);
                             app.thinking = false;
                             app.cells.push(Cell::System {
                                 message: format!("New thread: {}", chat_id),
@@ -1649,6 +1453,12 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             app.focus_executions();
                             rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
                             last_exec_poll = Instant::now();
+                            continue;
+                        }
+                        if text.eq_ignore_ascii_case("/chats") {
+                            app.focus_conversations();
+                            refresh_conversations_list(&rt, &memory_node, &mut app);
+                            last_conversations_poll = Instant::now();
                             continue;
                         }
                         if text.eq_ignore_ascii_case("/cancel")
@@ -1715,7 +1525,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         }
                         app.cells.push(Cell::System {
                             message:
-                                "Unknown command. Try /help, /exit, /new, /copy, /install-python, /cancel, /background, /retry, /tools, /exec."
+                                "Unknown command. Try /help, /exit, /new, /chats, /copy, /install-python, /cancel, /background, /retry, /tools, /exec."
                                     .into(),
                         });
                         continue;
@@ -1756,7 +1566,20 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 KeyCode::Home => app.home(),
                 KeyCode::End => app.end(),
                 KeyCode::Up => {
-                    if app.ui_focus == TerminalUiFocus::Executions
+                    if app.ui_focus == TerminalUiFocus::Conversations
+                        && !app.conversations_items.is_empty()
+                    {
+                        if let Some(i) = app.conversations_selected_idx {
+                            if i > 0 {
+                                app.conversations_selected_idx = Some(i - 1);
+                                let list_h = app
+                                    .last_conversations_list_rect
+                                    .map(|r| r.height.saturating_sub(2) as usize)
+                                    .unwrap_or(8);
+                                conversations_ensure_list_shows_selection(&mut app, list_h);
+                            }
+                        }
+                    } else if app.ui_focus == TerminalUiFocus::Executions
                         && !app.executions_runs.is_empty()
                     {
                         if let Some(i) = app.executions_selected_idx {
@@ -1770,12 +1593,28 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 executions_ensure_list_shows_selection(&mut app, list_h);
                             }
                         }
-                    } else if app.ui_focus != TerminalUiFocus::Executions {
+                    } else if !matches!(
+                        app.ui_focus,
+                        TerminalUiFocus::Executions | TerminalUiFocus::Conversations
+                    ) {
                         app.history_up();
                     }
                 }
                 KeyCode::Down => {
-                    if app.ui_focus == TerminalUiFocus::Executions
+                    if app.ui_focus == TerminalUiFocus::Conversations
+                        && !app.conversations_items.is_empty()
+                    {
+                        if let Some(i) = app.conversations_selected_idx {
+                            if i + 1 < app.conversations_items.len() {
+                                app.conversations_selected_idx = Some(i + 1);
+                                let list_h = app
+                                    .last_conversations_list_rect
+                                    .map(|r| r.height.saturating_sub(2) as usize)
+                                    .unwrap_or(8);
+                                conversations_ensure_list_shows_selection(&mut app, list_h);
+                            }
+                        }
+                    } else if app.ui_focus == TerminalUiFocus::Executions
                         && !app.executions_runs.is_empty()
                     {
                         if let Some(i) = app.executions_selected_idx {
@@ -1789,45 +1628,58 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 executions_ensure_list_shows_selection(&mut app, list_h);
                             }
                         }
-                    } else if app.ui_focus != TerminalUiFocus::Executions {
+                    } else if !matches!(
+                        app.ui_focus,
+                        TerminalUiFocus::Executions | TerminalUiFocus::Conversations
+                    ) {
                         app.history_down();
                     }
                 }
                 KeyCode::Esc => {
                     if matches!(
                         app.ui_focus,
-                        TerminalUiFocus::ToolHistory | TerminalUiFocus::Executions
+                        TerminalUiFocus::ToolHistory
+                            | TerminalUiFocus::Executions
+                            | TerminalUiFocus::Conversations
                     ) {
                         app.focus_transcript();
                     }
                 }
+                KeyCode::BackTab => {
+                    let mut focus_ctx = FocusCycleContext::new(
+                        &workspace_dir,
+                        &chat_id,
+                        &rt,
+                        &memory_node,
+                        &mut last_exec_poll,
+                        &mut last_conversations_poll,
+                    );
+                    apply_ui_focus_cycle(&mut app, false, &mut focus_ctx);
+                }
                 KeyCode::Tab => {
-                    app.toggle_ui_focus();
-                    if app.ui_focus == TerminalUiFocus::Executions {
-                        rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
-                        last_exec_poll = Instant::now();
-                    }
-                    if app.following_tail() {
-                        app.scroll_offset = 0;
-                    }
-                    if app.tool_history_following_tail() {
-                        app.tool_history_scroll = 0;
-                    }
+                    let forward = !key.modifiers.contains(KeyModifiers::SHIFT);
+                    let mut focus_ctx = FocusCycleContext::new(
+                        &workspace_dir,
+                        &chat_id,
+                        &rt,
+                        &memory_node,
+                        &mut last_exec_poll,
+                        &mut last_conversations_poll,
+                    );
+                    apply_ui_focus_cycle(&mut app, forward, &mut focus_ctx);
                 }
                 KeyCode::Char('t') | KeyCode::Char('T')
                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
-                    app.toggle_ui_focus();
-                    if app.ui_focus == TerminalUiFocus::Executions {
-                        rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
-                        last_exec_poll = Instant::now();
-                    }
-                    if app.following_tail() {
-                        app.scroll_offset = 0;
-                    }
-                    if app.tool_history_following_tail() {
-                        app.tool_history_scroll = 0;
-                    }
+                    let mut focus_ctx = FocusCycleContext::new(
+                        &workspace_dir,
+                        &chat_id,
+                        &rt,
+                        &memory_node,
+                        &mut last_exec_poll,
+                        &mut last_conversations_poll,
+                    );
+                    apply_ui_focus_cycle(&mut app, true, &mut focus_ctx);
                 }
                 KeyCode::PageUp => match app.ui_focus {
                     TerminalUiFocus::ToolHistory => app.tool_history_scroll_up(8),
@@ -1842,6 +1694,10 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             app.executions_output_scroll_top =
                                 app.executions_output_scroll_top.saturating_sub(3);
                         }
+                    }
+                    TerminalUiFocus::Conversations => {
+                        app.conversations_list_scroll_top =
+                            app.conversations_list_scroll_top.saturating_sub(1);
                     }
                     TerminalUiFocus::Transcript => app.scroll_up(8),
                 },
@@ -1859,12 +1715,20 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 app.executions_output_scroll_top.saturating_add(3);
                         }
                     }
+                    TerminalUiFocus::Conversations => {
+                        app.conversations_list_scroll_top =
+                            app.conversations_list_scroll_top.saturating_add(1);
+                    }
                     TerminalUiFocus::Transcript => app.scroll_down(8),
                 },
                 KeyCode::F(5) => {
                     if app.ui_focus == TerminalUiFocus::Executions {
                         rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
                         last_exec_poll = Instant::now();
+                    }
+                    if app.ui_focus == TerminalUiFocus::Conversations {
+                        refresh_conversations_list(&rt, &memory_node, &mut app);
+                        last_conversations_poll = Instant::now();
                     }
                 }
                 KeyCode::Char(c)
@@ -1971,6 +1835,30 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         }
                         _ => {}
                     }
+                } else if app
+                    .last_conversations_list_rect
+                    .map(|r| rect_contains(r, me.column, me.row))
+                    .unwrap_or(false)
+                {
+                    match me.kind {
+                        MouseEventKind::ScrollUp => {
+                            app.conversations_list_scroll_top =
+                                app.conversations_list_scroll_top.saturating_sub(1);
+                        }
+                        MouseEventKind::ScrollDown => {
+                            app.conversations_list_scroll_top =
+                                app.conversations_list_scroll_top.saturating_add(1);
+                        }
+                        MouseEventKind::ScrollLeft => {
+                            app.conversations_list_scroll_top =
+                                app.conversations_list_scroll_top.saturating_sub(1);
+                        }
+                        MouseEventKind::ScrollRight => {
+                            app.conversations_list_scroll_top =
+                                app.conversations_list_scroll_top.saturating_add(1);
+                        }
+                        _ => {}
+                    }
                 } else if app.ui_focus == TerminalUiFocus::Executions {
                     let over_list = app
                         .last_executions_list_rect
@@ -2067,8 +1955,9 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 
 #[cfg(test)]
 mod width_fit_tests {
-    use super::{build_status_line, build_title_line, truncate_chars_display};
+    use super::{build_status_line, build_title_line};
     use crate::channels::terminal_ui::display_width;
+    use crate::channels::terminal_ui::text_format::truncate_chars_display;
     use ratatui::text::Line;
 
     fn flat(line: &Line) -> String {

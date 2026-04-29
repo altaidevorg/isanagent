@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
 
+use crate::memory::RootThreadListItem;
+
 use super::execution_browser::{ExecutionRunDetail, ExecutionRunListItem};
 
 /// High-level UI mode for the terminal front-end.
@@ -35,9 +37,11 @@ pub enum ToolNoticePhase {
 pub enum TerminalUiFocus {
     #[default]
     Transcript,
-    ToolHistory,
+    /// List root terminal sessions from workspace memory; Enter loads and continues.
+    Conversations,
     /// Browse `execution_runs.jsonl` + per-run journals for this terminal thread (`chat_id`).
     Executions,
+    ToolHistory,
 }
 
 const TOOL_RAIL_CAP: usize = 150;
@@ -209,6 +213,13 @@ pub struct App {
     pub last_executions_list_rect: Option<Rect>,
     pub last_executions_code_rect: Option<Rect>,
     pub last_executions_output_rect: Option<Rect>,
+    /// Root terminal threads from `messages` (newest activity first).
+    pub conversations_items: Vec<RootThreadListItem>,
+    pub conversations_error: Option<String>,
+    pub conversations_selected_idx: Option<usize>,
+    /// Lines hidden above the past-sessions list viewport.
+    pub conversations_list_scroll_top: usize,
+    pub last_conversations_list_rect: Option<Rect>,
 }
 
 impl Default for App {
@@ -256,6 +267,11 @@ impl App {
             last_executions_list_rect: None,
             last_executions_code_rect: None,
             last_executions_output_rect: None,
+            conversations_items: Vec::new(),
+            conversations_error: None,
+            conversations_selected_idx: None,
+            conversations_list_scroll_top: 0,
+            last_conversations_list_rect: None,
         }
     }
 
@@ -292,9 +308,20 @@ impl App {
 
     pub fn toggle_ui_focus(&mut self) {
         self.ui_focus = match self.ui_focus {
+            TerminalUiFocus::Transcript => TerminalUiFocus::Conversations,
+            TerminalUiFocus::Conversations => TerminalUiFocus::Executions,
+            TerminalUiFocus::Executions => TerminalUiFocus::ToolHistory,
+            TerminalUiFocus::ToolHistory => TerminalUiFocus::Transcript,
+        };
+        self.tool_history_scroll = 0;
+    }
+
+    pub fn toggle_ui_focus_back(&mut self) {
+        self.ui_focus = match self.ui_focus {
             TerminalUiFocus::Transcript => TerminalUiFocus::ToolHistory,
             TerminalUiFocus::ToolHistory => TerminalUiFocus::Executions,
-            TerminalUiFocus::Executions => TerminalUiFocus::Transcript,
+            TerminalUiFocus::Executions => TerminalUiFocus::Conversations,
+            TerminalUiFocus::Conversations => TerminalUiFocus::Transcript,
         };
         self.tool_history_scroll = 0;
     }
@@ -311,6 +338,11 @@ impl App {
 
     pub fn focus_executions(&mut self) {
         self.ui_focus = TerminalUiFocus::Executions;
+        self.tool_history_scroll = 0;
+    }
+
+    pub fn focus_conversations(&mut self) {
+        self.ui_focus = TerminalUiFocus::Conversations;
         self.tool_history_scroll = 0;
     }
 

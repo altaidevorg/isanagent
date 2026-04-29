@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, RwLock};
 
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use colored::Colorize;
@@ -650,8 +650,11 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     // 10. Setup channels (terminal is optional for headless / Docker API-only runs)
     let mut out_channels: HashMap<String, Arc<dyn Channel>> = HashMap::new();
 
+    let active_terminal_session_chat: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
+
     let terminal_chat_id = if workspace.config.terminal_enabled() {
         let id = uuid::Uuid::new_v4().to_string();
+        *active_terminal_session_chat.write().await = id.clone();
         let terminal = Arc::new(TerminalChannel::new(
             &id,
             logger_bus_tx.clone(),
@@ -659,6 +662,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             workspace.dir.clone(),
             workspace.sandbox_dir.clone(),
             model_name.clone(),
+            memory_node.clone(),
         ));
         terminal.start(bus_tx.clone()).await?;
         out_channels.insert(terminal.name().to_string(), terminal);
@@ -771,6 +775,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     let agent_tx = agent_node.clone();
     let logger_tx = logger_bus_tx.clone();
     let inflight_promote = inflight_sync_outer.clone();
+    let active_terminal_session_for_bus = active_terminal_session_chat.clone();
     tokio::spawn(async move {
         while let Some(msg) = bus_rx.recv().await {
             let _ = logger_tx.send(msg.clone());
@@ -780,6 +785,10 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                     let promoted = reg.promote(chat_id);
                     log::debug!("PromoteSyncToBackground chat={chat_id} promoted={promoted}");
                 }
+                continue;
+            }
+            if let BusMessage::SetTerminalSessionChat { chat_id } = &msg {
+                *active_terminal_session_for_bus.write().await = chat_id.clone();
                 continue;
             }
             // Only route Inbound and Cancel messages to the agent logic.
@@ -863,7 +872,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
 
     let logger_tx_outbound = logger_bus_tx.clone();
     let delivery_channels = out_channels.clone();
-    let terminal_session_for_telemetry = terminal_chat_id.clone();
+    let active_terminal_for_outbound = active_terminal_session_chat.clone();
     tokio::spawn(async move {
         while let Some(msg) = global_outbound_rx.recv().await {
             // Deliver user-visible terminal traffic first. `LoggerHandle::send` uses a blocking
@@ -882,7 +891,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                     }
                 }
                 BusMessage::Telemetry(TelemetryEvent::AgentThought { chat_id, thought }) => {
-                    if terminal_session_for_telemetry.as_deref() == Some(chat_id.as_str()) {
+                    if active_terminal_for_outbound.read().await.as_str() == chat_id.as_str() {
                         let notice = build_agent_thought_terminal_notice(chat_id, thought);
                         if let Some(chan) = delivery_channels.get("terminal") {
                             if let Err(e) = chan.send(notice).await {
@@ -909,7 +918,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                     message,
                 }) => {
                     if channel == "terminal"
-                        && terminal_session_for_telemetry.as_deref() == Some(chat_id.as_str())
+                        && active_terminal_for_outbound.read().await.as_str() == chat_id.as_str()
                     {
                         let notice = build_tool_progress_terminal_notice(
                             chat_id,

@@ -404,4 +404,9 @@ pub enum BusMessage {
     /// a background `ExecutionJobManager` job for the given chat. Triggered by
     /// the `/background` slash command.
     PromoteSyncToBackground(String),
+    /// TUI `/new`, past-session resume, and startup: updates which `chat_id` receives
+    /// terminal-scoped thought/progress telemetry (see main outbound router).
+    SetTerminalSessionChat {
+        chat_id: String,
+    },
 }
