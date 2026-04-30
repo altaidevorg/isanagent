@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -294,7 +294,7 @@ fn outbound_to_cell(msg: &OutboundMessage) -> Cell {
     }
 }
 
-fn layout_chunks(area: Rect, exec_panel_h: u16, active_tool_h: u16) -> [Rect; 6] {
+fn layout_chunks(area: Rect, exec_panel_h: u16, active_tool_h: u16, input_h: u16) -> [Rect; 6] {
     let exec_constraint = if exec_panel_h > 0 {
         Constraint::Length(exec_panel_h)
     } else {
@@ -309,7 +309,7 @@ fn layout_chunks(area: Rect, exec_panel_h: u16, active_tool_h: u16) -> [Rect; 6]
             exec_constraint,
             Constraint::Length(1),
             Constraint::Length(active_tool_h),
-            Constraint::Length(3),
+            Constraint::Length(input_h),
         ])
         .split(area);
     [
@@ -913,7 +913,12 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 
     let mut stdout = stdout();
     enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen, crossterm::cursor::Hide)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        crossterm::cursor::Hide
+    )?;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -1095,7 +1100,9 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 }
             };
             let active_strip_h: u16 = 1;
-            let ch = layout_chunks(area, exec_h, active_strip_h);
+            let input_lines = app.input.split('\n').count() as u16;
+            let input_h = (input_lines + 2).clamp(3, 10);
+            let ch = layout_chunks(area, exec_h, active_strip_h, input_h);
 
             let title_w = ch[0].width as usize;
             let title = Paragraph::new(build_title_line(title_w.max(1)));
@@ -1244,22 +1251,45 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 .borders(Borders::ALL)
                 .title(Span::styled(" compose ", Theme::dim()))
                 .border_style(Theme::dim());
-            let input_para = Paragraph::new(Line::from(vec![
-                Span::styled("> ", Theme::input_prompt()),
-                Span::styled(app.input.as_str(), Theme::text()),
-            ]))
-            .block(input_block);
+            
+            let mut text_lines = Vec::new();
+            for (i, line) in app.input.split('\n').enumerate() {
+                let prefix = if i == 0 { "> " } else { "  " };
+                text_lines.push(Line::from(vec![
+                    Span::styled(prefix, Theme::input_prompt()),
+                    Span::styled(line, Theme::text()),
+                ]));
+            }
+            if text_lines.is_empty() {
+                text_lines.push(Line::from(vec![
+                    Span::styled("> ", Theme::input_prompt()),
+                    Span::styled("", Theme::text()),
+                ]));
+            }
+            
+            let inner_area = ch[5].inner(Margin::new(1, 1));
+            let (cursor_line_idx, cursor_col) = app.cursor_line_col();
+            let mut input_v_scroll = 0;
+            let available_h = input_h.saturating_sub(2);
+            if cursor_line_idx as u16 >= available_h {
+                input_v_scroll = (cursor_line_idx as u16 + 1).saturating_sub(available_h);
+            }
+            
+            let mut input_h_scroll = 0;
+            let display_col = cursor_col as u16 + 2;
+            if display_col >= inner_area.width {
+                input_h_scroll = display_col.saturating_sub(inner_area.width) + 1;
+            }
+
+            let input_para = Paragraph::new(Text::from(text_lines))
+                .block(input_block)
+                .scroll((input_v_scroll, input_h_scroll));
             f.render_widget(input_para, ch[5]);
 
-            let inner_area = ch[5].inner(Margin::new(1, 1));
-            let prefix_w = crate::channels::terminal_ui::display_width("> ")
-                + crate::channels::terminal_ui::display_width(
-                    &app.input[..app.cursor.min(app.input.len())],
-                );
-            let cx = inner_area
-                .x
-                .saturating_add((prefix_w.min(inner_area.width.saturating_sub(1) as usize)) as u16);
-            let cy = inner_area.y;
+            let cx = inner_area.x.saturating_add(display_col.saturating_sub(input_h_scroll));
+            let cy = inner_area.y.saturating_add((cursor_line_idx as u16).saturating_sub(input_v_scroll));
+            let cx = cx.clamp(inner_area.x, inner_area.x.saturating_add(inner_area.width.saturating_sub(1)));
+            let cy = cy.clamp(inner_area.y, inner_area.y.saturating_add(inner_area.height.saturating_sub(1)));
             f.set_cursor_position((cx, cy));
         })?;
 
@@ -1313,6 +1343,13 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 }
                 KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.clear_line();
+                }
+                KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => app.move_left_word(),
+                KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => app.move_right_word(),
+                KeyCode::Char('b') | KeyCode::Char('B') if key.modifiers.contains(KeyModifiers::ALT) => app.move_left_word(),
+                KeyCode::Char('f') | KeyCode::Char('F') if key.modifiers.contains(KeyModifiers::ALT) => app.move_right_word(),
+                KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    app.insert_char('\n');
                 }
                 KeyCode::Enter => {
                     if app.ui_focus == TerminalUiFocus::Conversations {
@@ -1936,6 +1973,14 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     }
                 }
             }
+            Event::Paste(ref s) => {
+                for c in s.chars() {
+                    // Filter out carriage returns to avoid issues, just keep newlines
+                    if c != '\r' {
+                        app.insert_char(c);
+                    }
+                }
+            }
             Event::Resize(_, _) => {}
             _ => {}
         }
@@ -1947,6 +1992,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
     }
     execute!(
         terminal.backend_mut(),
+        DisableBracketedPaste,
         LeaveAlternateScreen,
         crossterm::cursor::Show
     )?;

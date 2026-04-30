@@ -220,6 +220,7 @@ pub struct App {
     /// Lines hidden above the past-sessions list viewport.
     pub conversations_list_scroll_top: usize,
     pub last_conversations_list_rect: Option<Rect>,
+    pub draft_input: Option<String>,
 }
 
 impl Default for App {
@@ -272,6 +273,7 @@ impl App {
             conversations_selected_idx: None,
             conversations_list_scroll_top: 0,
             last_conversations_list_rect: None,
+            draft_input: None,
         }
     }
 
@@ -447,11 +449,53 @@ impl App {
         let before = &self.input[..self.cursor];
         let trimmed = before.trim_end();
         let new_end = trimmed
-            .rfind(|c: char| c.is_whitespace())
+            .rfind(|c: char| c.is_whitespace() || c == '/')
             .map(|i| i + 1)
             .unwrap_or(0);
         self.input.drain(new_end..self.cursor);
         self.cursor = new_end;
+    }
+
+    pub fn move_left_word(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let before = &self.input[..self.cursor];
+        let trimmed = before.trim_end();
+        let new_end = trimmed
+            .rfind(|c: char| c.is_whitespace() || c == '/')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        self.cursor = new_end;
+    }
+
+    pub fn move_right_word(&mut self) {
+        if self.cursor >= self.input.len() {
+            return;
+        }
+        let after = &self.input[self.cursor..];
+        let mut found_non_whitespace = false;
+        let mut adv = 0;
+        for c in after.chars() {
+            let is_ws = c.is_whitespace() || c == '/';
+            if found_non_whitespace && is_ws {
+                break;
+            }
+            if !is_ws {
+                found_non_whitespace = true;
+            }
+            adv += c.len_utf8();
+        }
+        self.cursor += adv;
+    }
+
+    /// Returns (line_index, display_col) for the current cursor position.
+    pub fn cursor_line_col(&self) -> (usize, usize) {
+        let before = &self.input[..self.cursor.min(self.input.len())];
+        let lines: Vec<&str> = before.split('\n').collect();
+        let line_idx = lines.len().saturating_sub(1);
+        let col = super::display_width(lines.last().unwrap_or(&""));
+        (line_idx, col)
     }
 
     pub fn clear_line(&mut self) {
@@ -462,11 +506,12 @@ impl App {
     /// Take the current input for submission; records history when non-empty.
     pub fn take_input(&mut self) -> String {
         let text = self.input.clone();
-        if !text.is_empty() {
+        if !text.trim().is_empty() {
             self.history.push(text.clone());
         }
         self.clear_line();
         self.history_idx = None;
+        self.draft_input = None;
         text
     }
 
@@ -477,7 +522,10 @@ impl App {
         let idx = match self.history_idx {
             Some(0) => 0,
             Some(i) => i.saturating_sub(1),
-            None => self.history.len() - 1,
+            None => {
+                self.draft_input = Some(self.input.clone());
+                self.history.len() - 1
+            }
         };
         self.history_idx = Some(idx);
         self.input = self.history[idx].clone();
@@ -494,7 +542,12 @@ impl App {
             }
             Some(_) => {
                 self.history_idx = None;
-                self.clear_line();
+                if let Some(draft) = self.draft_input.take() {
+                    self.input = draft;
+                } else {
+                    self.clear_line();
+                }
+                self.cursor = self.input.len();
             }
             None => {}
         }
