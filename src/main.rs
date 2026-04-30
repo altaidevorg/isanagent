@@ -306,6 +306,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         db_path_str,
         logger_bus_tx.clone(),
         cron_mode,
+        bus_tx.clone(),
     )
     .map_err(std::io::Error::other)?;
     let cron_node = NodeHandle::new(cron_logic, 10, 3, Duration::from_millis(50));

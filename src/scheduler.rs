@@ -116,6 +116,7 @@ pub struct CronActor {
     store: CronStore,
     logger_tx: LoggerHandle,
     scheduling_mode: CronSchedulingMode,
+    bus_tx: tokio::sync::mpsc::Sender<crate::bus::BusMessage>,
 }
 
 impl CronStore {
@@ -590,6 +591,7 @@ impl CronActor {
         db_path: &str,
         logger_tx: LoggerHandle,
         scheduling_mode: CronSchedulingMode,
+        bus_tx: tokio::sync::mpsc::Sender<crate::bus::BusMessage>,
     ) -> Result<Self, String> {
         let store = CronStore::new(db_path)?;
         let jobs = store.load_jobs()?;
@@ -605,6 +607,7 @@ impl CronActor {
             store,
             logger_tx,
             scheduling_mode,
+            bus_tx,
         })
     }
 
@@ -786,26 +789,12 @@ impl ActorLogic<String> for CronActor {
                 }
 
                 if should_trigger {
-                    let payload = CronTriggerPayload {
-                        job_id: job.id.clone(),
-                        message: job.message.clone(),
-                        chat_id: job.chat_id.clone(),
-                        channel: job.channel.clone(),
-                    };
-                    match serde_json::to_string(&payload) {
-                        Ok(serialized) => triggered.push(serialized),
-                        Err(error) => {
-                            let _ = logger_tx.send(crate::bus::BusMessage::Log(
-                                crate::bus::LogEvent::error(
-                                    &actor_name,
-                                    &format!(
-                                        "Failed to serialize cron trigger payload for {}: {}",
-                                        job.id, error
-                                    ),
-                                ),
-                            ));
-                        }
-                    }
+                    triggered.push((
+                        job.id.clone(),
+                        job.channel.clone(),
+                        job.chat_id.clone(),
+                        job.message.clone(),
+                    ));
                 }
             }
         }
@@ -820,8 +809,46 @@ impl ActorLogic<String> for CronActor {
             }
         }
 
-        if let Some(first) = triggered.into_iter().next() {
-            return Ok(Some(("trigger".to_string(), first)));
+        for (job_id, channel, chat_id, message) in triggered {
+            let mut metadata = HashMap::new();
+            metadata.insert(
+                "cron_job_id".to_string(),
+                serde_json::Value::String(job_id.clone()),
+            );
+            metadata.insert(
+                "trigger_source".to_string(),
+                serde_json::Value::String("local".to_string()),
+            );
+            metadata.insert(
+                crate::bus::METADATA_SYNTHETIC_CRON_TRIGGER.to_string(),
+                serde_json::Value::Bool(true),
+            );
+            metadata.insert(
+                "isanagent_autonomous_forbid_final_without_tools".to_string(),
+                serde_json::Value::Bool(true),
+            );
+
+            let inbound = crate::bus::InboundMessage {
+                channel,
+                sender_id: "cron".to_string(),
+                chat_id,
+                thread_id: None,
+                content: message,
+                attachments: Vec::new(),
+                metadata,
+            };
+
+            if let Err(error) = self.bus_tx.send(crate::bus::BusMessage::Inbound(inbound)).await {
+                self.log_error(format!(
+                    "Failed to send cron trigger message to bus for {}: {}",
+                    job_id, error
+                ));
+            } else {
+                let _ = self.logger_tx.send(crate::bus::BusMessage::Log(crate::bus::LogEvent::info(
+                    &self.name,
+                    &format!("Fired local cron job {}", job_id),
+                )));
+            }
         }
 
         Ok(None)
