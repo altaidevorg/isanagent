@@ -29,7 +29,7 @@ use isanagent::onboarding::{
 use isanagent::onboarding_interactive;
 use isanagent::provider::OpenAIProvider;
 use isanagent::scheduler::{
-    validate_multi_tenant_edge_runtime, CronActor, CronSchedulingMode, CronTriggerPayload,
+    validate_multi_tenant_edge_runtime, CronActor, CronSchedulingMode,
     MultiTenantEdgeCronScheduler,
 };
 use isanagent::session::SessionManager;
@@ -805,54 +805,6 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         NodeHandle::<BusMessage>::create_listener("completion", 100);
     let _ = (&agent_node - "completion") >> &listener_node;
 
-    // Listen to cron triggers
-    let (cron_listener_node, mut cron_rx) = NodeHandle::<String>::create_listener("trigger", 100);
-    let _ = (&cron_node - "trigger") >> &cron_listener_node;
-
-    let cron_bus_tx = bus_tx.clone();
-    let cron_logger_tx = logger_bus_tx.clone();
-    tokio::spawn(async move {
-        while let Some(msg) = cron_rx.recv().await {
-            if let isanagent::Message::Packet(payload) = msg {
-                let Ok(trigger) = serde_json::from_str::<CronTriggerPayload>(&payload) else {
-                    let _ = cron_logger_tx.send(BusMessage::Log(isanagent::bus::LogEvent::warn(
-                        "Altbot",
-                        "Failed to parse cron trigger payload emitted by scheduler",
-                    )));
-                    continue;
-                };
-
-                let inbound = isanagent::bus::InboundMessage {
-                    channel: trigger.channel.clone(),
-                    sender_id: "cron".to_string(),
-                    chat_id: trigger.chat_id.clone(),
-                    thread_id: None,
-                    content: trigger.message.clone(),
-                    attachments: Vec::new(),
-                    metadata: HashMap::from([
-                        (
-                            "cron_job_id".to_string(),
-                            serde_json::Value::String(trigger.job_id.clone()),
-                        ),
-                        (
-                            "trigger_source".to_string(),
-                            serde_json::Value::String("local_scheduler".to_string()),
-                        ),
-                    ]),
-                };
-
-                // Also emit a telemetry event so loggers see the trigger fired
-                let tel = isanagent::bus::TelemetryEvent::CronTrigger {
-                    job_id: trigger.job_id.clone(),
-                    message: trigger.message.clone(),
-                };
-                let _ = cron_logger_tx.send(BusMessage::Telemetry(tel));
-
-                // Fire into the agent
-                let _ = cron_bus_tx.send(BusMessage::Inbound(inbound)).await;
-            }
-        }
-    });
 
     let agent_outbound_tx = global_outbound_tx.clone();
     tokio::spawn(async move {

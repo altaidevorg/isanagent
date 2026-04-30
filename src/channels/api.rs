@@ -717,7 +717,7 @@ async fn handle_mte_cron_webhook(
         serde_json::Value::Bool(true),
     );
     metadata.insert(
-        "isanagent_autonomous_forbid_final_without_tools".to_string(),
+        crate::bus::METADATA_AUTONOMOUS_FORBID_FINAL_WITHOUT_TOOLS.to_string(),
         serde_json::Value::Bool(true),
     );
     let inbound = InboundMessage {

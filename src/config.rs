@@ -144,7 +144,7 @@ pub struct MlEngineerHarnessConfig {
     pub enabled: Option<bool>,
     /// Append research-oriented instructions to **sub-agent** system prompts when `enabled` (default: true when enabled).
     pub subagent_research_overlay: Option<bool>,
-    /// When true, if an inbound message sets no metadata override, autonomous sessions may still use config default (see inbound metadata `isanagent_autonomous_forbid_final_without_tools`).
+    /// When true, if an inbound message sets no metadata override, autonomous sessions may still use config default (see inbound metadata `crate::bus::METADATA_AUTONOMOUS_FORBID_FINAL_WITHOUT_TOOLS`).
     pub forbid_final_without_tools: Option<bool>,
 }
 

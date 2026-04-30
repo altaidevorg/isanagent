@@ -222,7 +222,7 @@ Summarize outcomes or errors for the user and update `todo_write` if you use it 
         serde_json::Value::String(job_id.to_string()),
     );
     metadata.insert(
-        "isanagent_autonomous_forbid_final_without_tools".to_string(),
+        crate::bus::METADATA_AUTONOMOUS_FORBID_FINAL_WITHOUT_TOOLS.to_string(),
         serde_json::Value::Bool(true),
     );
     let inbound = InboundMessage {
@@ -1587,7 +1587,7 @@ mod tests {
         assert_eq!(
             inbound
                 .metadata
-                .get("isanagent_autonomous_forbid_final_without_tools"),
+                .get(crate::bus::METADATA_AUTONOMOUS_FORBID_FINAL_WITHOUT_TOOLS),
             Some(&serde_json::Value::Bool(true))
         );
         assert_eq!(

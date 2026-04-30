@@ -585,7 +585,7 @@ pub struct AgentLogicParams {
     pub harness_runtime_summary: String,
     /// System prompt used for `subagent_spawn` / plan runs (may include research appendix).
     pub subagent_system_prompt: String,
-    /// Config default; inbound metadata `isanagent_autonomous_forbid_final_without_tools` can override.
+    /// Config default; inbound metadata `crate::bus::METADATA_AUTONOMOUS_FORBID_FINAL_WITHOUT_TOOLS` can override.
     pub forbid_final_without_tools: bool,
     /// Shell command safety policy (`exec`) resolved from config.
     pub shell_policy: ResolvedShellPolicy,
@@ -1041,7 +1041,7 @@ impl AgentLogic {
             && (forbid_final_without_tools
                 || metadata_truthy(
                     &inbound.metadata,
-                    "isanagent_autonomous_forbid_final_without_tools",
+                    crate::bus::METADATA_AUTONOMOUS_FORBID_FINAL_WITHOUT_TOOLS,
                 ));
         let unattended_session = metadata_truthy(&inbound.metadata, "isanagent_autonomous_session")
             || inbound.metadata.contains_key("isanagent_autonomous_until");
