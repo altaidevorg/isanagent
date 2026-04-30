@@ -221,6 +221,9 @@ pub struct App {
     pub conversations_list_scroll_top: usize,
     pub last_conversations_list_rect: Option<Rect>,
     pub draft_input: Option<String>,
+    pub spinner_tick: usize,
+    pub todos_count: usize,
+    pub crons_count: usize,
 }
 
 impl Default for App {
@@ -274,6 +277,9 @@ impl App {
             conversations_list_scroll_top: 0,
             last_conversations_list_rect: None,
             draft_input: None,
+            spinner_tick: 0,
+            todos_count: 0,
+            crons_count: 0,
         }
     }
 
@@ -306,6 +312,11 @@ impl App {
 
     pub fn following_tail(&self) -> bool {
         self.scroll_offset == 0
+    }
+
+    pub fn get_spinner_frame(&self) -> char {
+        const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        FRAMES[self.spinner_tick % FRAMES.len()]
     }
 
     pub fn toggle_ui_focus(&mut self) {

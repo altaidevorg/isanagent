@@ -838,7 +838,11 @@ impl ActorLogic<String> for CronActor {
                 metadata,
             };
 
-            if let Err(error) = self.bus_tx.send(crate::bus::BusMessage::Inbound(inbound)).await {
+            if let Err(error) = self
+                .bus_tx
+                .send(crate::bus::BusMessage::Inbound(inbound))
+                .await
+            {
                 self.log_error(format!(
                     "Failed to send cron trigger message to bus for {}: {}",
                     job_id, error
@@ -850,10 +854,12 @@ impl ActorLogic<String> for CronActor {
                         message: message.clone(),
                     },
                 ));
-                let _ = self.logger_tx.send(crate::bus::BusMessage::Log(crate::bus::LogEvent::info(
-                    &self.name,
-                    &format!("Fired local cron job {}", job_id),
-                )));
+                let _ =
+                    self.logger_tx
+                        .send(crate::bus::BusMessage::Log(crate::bus::LogEvent::info(
+                            &self.name,
+                            &format!("Fired local cron job {}", job_id),
+                        )));
             }
         }
 

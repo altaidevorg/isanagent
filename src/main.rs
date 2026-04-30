@@ -29,8 +29,7 @@ use isanagent::onboarding::{
 use isanagent::onboarding_interactive;
 use isanagent::provider::OpenAIProvider;
 use isanagent::scheduler::{
-    validate_multi_tenant_edge_runtime, CronActor, CronSchedulingMode,
-    MultiTenantEdgeCronScheduler,
+    validate_multi_tenant_edge_runtime, CronActor, CronSchedulingMode, MultiTenantEdgeCronScheduler,
 };
 use isanagent::session::SessionManager;
 use isanagent::skills::SkillRegistry;
@@ -804,7 +803,6 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     let (listener_node, mut agent_rx) =
         NodeHandle::<BusMessage>::create_listener("completion", 100);
     let _ = (&agent_node - "completion") >> &listener_node;
-
 
     let agent_outbound_tx = global_outbound_tx.clone();
     tokio::spawn(async move {

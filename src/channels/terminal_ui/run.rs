@@ -352,16 +352,17 @@ fn jobs_strip_lines(app: &App, max_width: usize, include_stream_tail: bool) -> V
             ));
         }
     }
+    let spinner_str = app.get_spinner_frame().to_string();
     for entry in app.jobs_strip.iter() {
-        let style = match entry.status {
-            JobStripStatus::Running => Theme::tool_call(),
-            JobStripStatus::Completed => Theme::dim(),
-            JobStripStatus::Failed | JobStripStatus::Timeout => Theme::input_prompt(),
-            JobStripStatus::Cancelled => Theme::dim(),
+        let (style, icon) = match entry.status {
+            JobStripStatus::Running => (Theme::tool_call(), spinner_str.as_str()),
+            JobStripStatus::Completed => (Theme::dim(), "✓"),
+            JobStripStatus::Failed | JobStripStatus::Timeout => (Theme::input_prompt(), "✗"),
+            JobStripStatus::Cancelled => (Theme::dim(), "⨯"),
         };
         let age = entry.started_at.elapsed();
         out.push(job_strip_line(
-            entry.status.icon(),
+            icon,
             &entry.tool_name,
             entry.description.as_deref(),
             entry.last_line.as_str(),
@@ -483,12 +484,18 @@ fn build_status_line(
     chat_id: &str,
     cell_count: usize,
     toast: Option<(&str, ToastKind)>,
+    app: &App,
 ) -> Line<'static> {
     let dim = Theme::dim();
-    let (activity_label, activity_style) = if thinking {
-        ("thinking", Theme::tool_call())
+    let activity_label = if thinking {
+        format!("{} thinking", app.get_spinner_frame())
     } else {
-        ("idle", Theme::dim())
+        "🤖 idle".to_string()
+    };
+    let activity_style = if thinking {
+        Theme::tool_call()
+    } else {
+        Theme::dim()
     };
     let sid = &chat_id[..8.min(chat_id.len())];
     let mut first_row = vec![Span::styled(status_model.to_string(), Theme::text())];
@@ -500,6 +507,18 @@ fn build_status_line(
         vec![
             Span::styled(" · ", dim),
             Span::styled(activity_label, activity_style),
+        ],
+        vec![
+            Span::styled(" · ", dim),
+            Span::styled(format!("[ 📋 {} Todos ]", app.todos_count), dim),
+        ],
+        vec![
+            Span::styled(" · ", dim),
+            Span::styled(format!("[ 🕒 {} Crons ]", app.crons_count), dim),
+        ],
+        vec![
+            Span::styled(" · ", dim),
+            Span::styled(format!("[ 🛠 {} Jobs ]", app.jobs_strip.len()), dim),
         ],
         vec![
             Span::styled(" · ", dim),
@@ -952,8 +971,38 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
     let max_conversations_list_scroll_holder = std::cell::Cell::new(0usize);
     let mut last_exec_poll = Instant::now() - Duration::from_secs(60);
     let mut last_conversations_poll = Instant::now() - Duration::from_secs(60);
+    let mut last_todos_poll = Instant::now() - Duration::from_secs(60);
+
+    let start_time = Instant::now();
+    let (todos_tx, todos_rx) = std::sync::mpsc::channel();
 
     loop {
+        app.spinner_tick = (start_time.elapsed().as_millis() / 80) as usize;
+
+        while let Ok(active_count) = todos_rx.try_recv() {
+            app.todos_count = active_count;
+        }
+
+        if last_todos_poll.elapsed() >= Duration::from_secs(2) {
+            last_todos_poll = Instant::now();
+            let memory_node = memory_node.clone();
+            let tx = todos_tx.clone();
+            let cid = chat_id.clone();
+            rt.spawn(async move {
+                let (otx, orx) = tokio::sync::oneshot::channel();
+                let _ = memory_node.send_packet(crate::memory::MemoryMessage::LoadHarnessTodos {
+                    chat_id: cid,
+                    reply: crate::memory::SharedReply::new(otx),
+                }).await;
+                if let Ok(Ok(Some(todos))) = orx.await {
+                    let active = todos.into_iter().filter(|t| t.status != "completed").count();
+                    let _ = tx.send(active);
+                } else {
+                    let _ = tx.send(0);
+                }
+            });
+        }
+
         app.clear_expired_toast();
 
         if app.ui_focus == TerminalUiFocus::Executions
@@ -1233,6 +1282,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 &chat_id,
                 app.cells.len(),
                 app.active_toast(),
+                &app,
             );
             let status_w = Paragraph::new(status_line);
             f.render_widget(status_w, ch[3]);
@@ -1240,9 +1290,10 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             let active_w = ch[4].width as usize;
             let idle = "Idle (no running tool)";
             let active_text = app.active_tool_line.as_deref().unwrap_or(idle);
+            let icon = if app.active_tool_line.is_some() { app.get_spinner_frame().to_string() } else { "·".to_string() };
             let t = truncate_chars_display(active_text, active_w.max(8).saturating_sub(6));
             let active_row = Line::from(vec![
-                Span::styled(" tool ", Theme::tool_call()),
+                Span::styled(format!(" {} ", icon), Theme::tool_call()),
                 Span::styled(t, Theme::dim()),
             ]);
             f.render_widget(Paragraph::new(active_row), ch[4]);
@@ -1251,7 +1302,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 .borders(Borders::ALL)
                 .title(Span::styled(" compose ", Theme::dim()))
                 .border_style(Theme::dim());
-            
+
             let mut text_lines = Vec::new();
             for (i, line) in app.input.split('\n').enumerate() {
                 let prefix = if i == 0 { "> " } else { "  " };
@@ -1266,7 +1317,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     Span::styled("", Theme::text()),
                 ]));
             }
-            
+
             let inner_area = ch[5].inner(Margin::new(1, 1));
             let (cursor_line_idx, cursor_col) = app.cursor_line_col();
             let mut input_v_scroll = 0;
@@ -1274,7 +1325,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             if cursor_line_idx as u16 >= available_h {
                 input_v_scroll = (cursor_line_idx as u16 + 1).saturating_sub(available_h);
             }
-            
+
             let mut input_h_scroll = 0;
             let display_col = cursor_col as u16 + 2;
             if display_col >= inner_area.width {
@@ -1286,10 +1337,24 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 .scroll((input_v_scroll, input_h_scroll));
             f.render_widget(input_para, ch[5]);
 
-            let cx = inner_area.x.saturating_add(display_col.saturating_sub(input_h_scroll));
-            let cy = inner_area.y.saturating_add((cursor_line_idx as u16).saturating_sub(input_v_scroll));
-            let cx = cx.clamp(inner_area.x, inner_area.x.saturating_add(inner_area.width.saturating_sub(1)));
-            let cy = cy.clamp(inner_area.y, inner_area.y.saturating_add(inner_area.height.saturating_sub(1)));
+            let cx = inner_area
+                .x
+                .saturating_add(display_col.saturating_sub(input_h_scroll));
+            let cy = inner_area
+                .y
+                .saturating_add((cursor_line_idx as u16).saturating_sub(input_v_scroll));
+            let cx = cx.clamp(
+                inner_area.x,
+                inner_area
+                    .x
+                    .saturating_add(inner_area.width.saturating_sub(1)),
+            );
+            let cy = cy.clamp(
+                inner_area.y,
+                inner_area
+                    .y
+                    .saturating_add(inner_area.height.saturating_sub(1)),
+            );
             f.set_cursor_position((cx, cy));
         })?;
 
@@ -1345,9 +1410,19 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     app.clear_line();
                 }
                 KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => app.move_left_word(),
-                KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => app.move_right_word(),
-                KeyCode::Char('b') | KeyCode::Char('B') if key.modifiers.contains(KeyModifiers::ALT) => app.move_left_word(),
-                KeyCode::Char('f') | KeyCode::Char('F') if key.modifiers.contains(KeyModifiers::ALT) => app.move_right_word(),
+                KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
+                    app.move_right_word()
+                }
+                KeyCode::Char('b') | KeyCode::Char('B')
+                    if key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    app.move_left_word()
+                }
+                KeyCode::Char('f') | KeyCode::Char('F')
+                    if key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    app.move_right_word()
+                }
                 KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                     app.insert_char('\n');
                 }

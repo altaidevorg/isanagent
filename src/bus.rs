@@ -8,7 +8,8 @@ pub const METADATA_SYNTHETIC_JOB_FOLLOWUP: &str = "isanagent_synthetic_job_follo
 /// Inbound metadata: synthetic user message enqueued when a cron job fires.
 pub const METADATA_SYNTHETIC_CRON_TRIGGER: &str = "isanagent_synthetic_cron_trigger";
 /// Inbound metadata: hint to the agent to avoid finishing without using tools.
-pub const METADATA_AUTONOMOUS_FORBID_FINAL_WITHOUT_TOOLS: &str = "isanagent_autonomous_forbid_final_without_tools";
+pub const METADATA_AUTONOMOUS_FORBID_FINAL_WITHOUT_TOOLS: &str =
+    "isanagent_autonomous_forbid_final_without_tools";
 
 /// An inbound message received from a Channel (e.g. Slack, Email).
 #[derive(Debug, Clone, Serialize, Deserialize)]
