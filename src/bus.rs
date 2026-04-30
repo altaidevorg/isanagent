@@ -5,6 +5,9 @@ use std::collections::HashMap;
 /// Inbound metadata: synthetic user message enqueued when a background execution job finishes (`execution_jobs`).
 pub const METADATA_SYNTHETIC_JOB_FOLLOWUP: &str = "isanagent_synthetic_job_followup";
 
+/// Inbound metadata: synthetic user message enqueued when a cron job fires.
+pub const METADATA_SYNTHETIC_CRON_TRIGGER: &str = "isanagent_synthetic_cron_trigger";
+
 /// An inbound message received from a Channel (e.g. Slack, Email).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboundMessage {

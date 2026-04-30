@@ -702,7 +702,7 @@ async fn handle_mte_cron_webhook(
     };
     let trigger = pending_trigger.payload().clone();
 
-    let metadata = HashMap::from([
+    let mut metadata = HashMap::from([
         (
             "cron_job_id".to_string(),
             Value::String(trigger.job_id.clone()),
@@ -712,6 +712,14 @@ async fn handle_mte_cron_webhook(
             Value::String("multi_tenant_edge".to_string()),
         ),
     ]);
+    metadata.insert(
+        crate::bus::METADATA_SYNTHETIC_CRON_TRIGGER.to_string(),
+        serde_json::Value::Bool(true),
+    );
+    metadata.insert(
+        "isanagent_autonomous_forbid_final_without_tools".to_string(),
+        serde_json::Value::Bool(true),
+    );
     let inbound = InboundMessage {
         channel: trigger.channel.clone(),
         sender_id: "cron".to_string(),
