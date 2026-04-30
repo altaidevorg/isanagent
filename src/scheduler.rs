@@ -824,7 +824,7 @@ impl ActorLogic<String> for CronActor {
                 serde_json::Value::Bool(true),
             );
             metadata.insert(
-                "isanagent_autonomous_forbid_final_without_tools".to_string(),
+                crate::bus::METADATA_AUTONOMOUS_FORBID_FINAL_WITHOUT_TOOLS.to_string(),
                 serde_json::Value::Bool(true),
             );
 
@@ -833,7 +833,7 @@ impl ActorLogic<String> for CronActor {
                 sender_id: "cron".to_string(),
                 chat_id,
                 thread_id: None,
-                content: message,
+                content: message.clone(),
                 attachments: Vec::new(),
                 metadata,
             };
@@ -844,6 +844,12 @@ impl ActorLogic<String> for CronActor {
                     job_id, error
                 ));
             } else {
+                let _ = self.logger_tx.send(crate::bus::BusMessage::Telemetry(
+                    crate::bus::TelemetryEvent::CronTrigger {
+                        job_id: job_id.clone(),
+                        message: message.clone(),
+                    },
+                ));
                 let _ = self.logger_tx.send(crate::bus::BusMessage::Log(crate::bus::LogEvent::info(
                     &self.name,
                     &format!("Fired local cron job {}", job_id),
