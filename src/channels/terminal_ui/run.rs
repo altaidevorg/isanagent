@@ -514,7 +514,7 @@ fn build_status_line(
         ],
         vec![
             Span::styled(" · ", dim),
-            Span::styled(format!("[ 🕒 {} ]", app.crons_debug_text), dim),
+            Span::styled(format!("[ 🕒 {} Crons ]", app.crons_count), dim),
         ],
         vec![
             Span::styled(" · ", dim),
@@ -975,7 +975,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 
     let start_time = Instant::now();
     let (todos_tx, todos_rx) = std::sync::mpsc::channel();
-    let (crons_tx, crons_rx) = std::sync::mpsc::channel::<(usize, String)>();
+    let (crons_tx, crons_rx) = std::sync::mpsc::channel::<usize>();
 
     loop {
         app.spinner_tick = (start_time.elapsed().as_millis() / 80) as usize;
@@ -983,9 +983,8 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         while let Ok(active_count) = todos_rx.try_recv() {
             app.todos_count = active_count;
         }
-        while let Ok((active_count, debug_text)) = crons_rx.try_recv() {
+        while let Ok(active_count) = crons_rx.try_recv() {
             app.crons_count = active_count;
-            app.crons_debug_text = debug_text;
         }
 
         if last_todos_poll.elapsed() >= Duration::from_secs(2) {
@@ -995,32 +994,39 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             let crons_tx_clone = crons_tx.clone();
             let cid = chat_id.clone();
             let rt_handle = rt.handle().clone();
-            
+
             std::thread::spawn(move || {
                 rt_handle.block_on(async move {
                     let (otx, orx) = tokio::sync::oneshot::channel();
-                    let _ = memory_node.send_packet(crate::memory::MemoryMessage::LoadHarnessTodos {
-                        chat_id: cid,
-                        reply: crate::memory::SharedReply::new(otx),
-                    }).await;
-                    
+                    let _ = memory_node
+                        .send_packet(crate::memory::MemoryMessage::LoadHarnessTodos {
+                            chat_id: cid,
+                            reply: crate::memory::SharedReply::new(otx),
+                        })
+                        .await;
+
                     if let Ok(Ok(Some(todos))) = orx.await {
-                        let active = todos.into_iter().filter(|t| t.status != "completed").count();
+                        let active = todos
+                            .into_iter()
+                            .filter(|t| t.status != "completed")
+                            .count();
                         let _ = tx.send(active);
                     } else {
                         let _ = tx.send(0);
                     }
 
                     let (ctx, crx) = tokio::sync::oneshot::channel();
-                    let _ = memory_node.send_packet(crate::memory::MemoryMessage::GetActiveCronsCount {
-                        reply: crate::memory::SharedReply::new(ctx),
-                    }).await;
-                    
+                    let _ = memory_node
+                        .send_packet(crate::memory::MemoryMessage::GetActiveCronsCount {
+                            reply: crate::memory::SharedReply::new(ctx),
+                        })
+                        .await;
+
                     let res = crx.await;
                     if let Ok(Ok(count)) = &res {
-                        let _ = crons_tx_clone.send((*count, format!("{} Crons", count)));
+                        let _ = crons_tx_clone.send(*count);
                     } else {
-                        let _ = crons_tx_clone.send((0, "0 Crons".to_string()));
+                        let _ = crons_tx_clone.send(0);
                     }
                 });
             });
@@ -1313,7 +1319,11 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             let active_w = ch[4].width as usize;
             let idle = "Idle (no running tool)";
             let active_text = app.active_tool_line.as_deref().unwrap_or(idle);
-            let icon = if app.active_tool_line.is_some() { app.get_spinner_frame().to_string() } else { "·".to_string() };
+            let icon = if app.active_tool_line.is_some() {
+                app.get_spinner_frame().to_string()
+            } else {
+                "·".to_string()
+            };
             let t = truncate_chars_display(active_text, active_w.max(8).saturating_sub(6));
             let active_row = Line::from(vec![
                 Span::styled(format!(" {} ", icon), Theme::tool_call()),
@@ -1342,28 +1352,29 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             }
 
             let inner_area = ch[5].inner(Margin::new(1, 1));
-            
+
             // Calculate visual line of cursor for wrapping
             let text_before_cursor = &app.input[..app.cursor];
             let mut cursor_visual_line: u16 = 0;
             let mut cursor_col_visual: u16 = 0;
-            let mut current_logical_line = 0;
             let lines_before_cursor: Vec<&str> = text_before_cursor.split('\n').collect();
             let total_lines = lines_before_cursor.len();
-            
             for (i, line) in lines_before_cursor.into_iter().enumerate() {
-                let prefix_len = if current_logical_line == 0 { 2 } else { 0 }; // "> "
+                let prefix_len = if i == 0 { 2 } else { 0 }; // "> "
                 let char_count = line.chars().count() as u16;
                 let total_chars = prefix_len + char_count;
-                
+
                 if i == total_lines - 1 {
                     cursor_visual_line += total_chars / inner_area.width;
                     cursor_col_visual = total_chars % inner_area.width;
                 } else {
-                    let visual_lines = if total_chars == 0 { 1 } else { (total_chars + inner_area.width - 1) / inner_area.width };
+                    let visual_lines = if total_chars == 0 {
+                        1
+                    } else {
+                        total_chars.div_ceil(inner_area.width)
+                    };
                     cursor_visual_line += visual_lines;
                 }
-                current_logical_line += 1;
             }
 
             let mut input_v_scroll = 0;
@@ -1379,7 +1390,9 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             f.render_widget(input_para, ch[5]);
 
             let cx = inner_area.x.saturating_add(cursor_col_visual);
-            let cy = inner_area.y.saturating_add(cursor_visual_line.saturating_sub(input_v_scroll));
+            let cy = inner_area
+                .y
+                .saturating_add(cursor_visual_line.saturating_sub(input_v_scroll));
             let cx = cx.clamp(
                 inner_area.x,
                 inner_area

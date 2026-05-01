@@ -778,10 +778,20 @@ impl ActorLogic<String> for CronActor {
                         }
 
                         if let Some(schedule) = cron_schedule_cache.get(cron_expr) {
-                            let a_second_ago = now - chrono::Duration::seconds(1);
-                            if let Some(next) = schedule.after(&a_second_ago).next() {
+                            // Use last_run_at_ms as the lookback point so we catch
+                            // triggers that were missed while the app was shut down.
+                            // Falls back to a 1-second window when last_run_at_ms is
+                            // not yet set (brand-new job that hasn't fired yet).
+                            let lookback = match job.last_run_at_ms {
+                                Some(ms) => DateTime::from_timestamp_millis(ms)
+                                    .unwrap_or(now - chrono::Duration::seconds(1)),
+                                None => now - chrono::Duration::seconds(1),
+                            };
+                            if let Some(next) = schedule.after(&lookback).next() {
                                 if next <= now {
                                     should_trigger = true;
+                                    job.last_run_at_ms = Some(now_ms);
+                                    let _ = store.update_last_run_at_ms(&job.id, Some(now_ms));
                                 }
                             }
                         }

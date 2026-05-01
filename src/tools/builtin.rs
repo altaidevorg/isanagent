@@ -1386,13 +1386,21 @@ impl Tool for CronTool {
             for job in jobs {
                 let sched_str = match &job.schedule {
                     crate::scheduler::ScheduleKind::At { at_ms } => {
-                        let dt = chrono::DateTime::from_timestamp_millis(*at_ms).unwrap_or_default();
+                        let dt =
+                            chrono::DateTime::from_timestamp_millis(*at_ms).unwrap_or_default();
                         format!("At: {}", dt.to_rfc3339())
-                    },
-                    crate::scheduler::ScheduleKind::Every { every_ms } => format!("Every: {}s", every_ms / 1000),
-                    crate::scheduler::ScheduleKind::Cron { cron_expr } => format!("Cron: {}", cron_expr),
+                    }
+                    crate::scheduler::ScheduleKind::Every { every_ms } => {
+                        format!("Every: {}s", every_ms / 1000)
+                    }
+                    crate::scheduler::ScheduleKind::Cron { cron_expr } => {
+                        format!("Cron: {}", cron_expr)
+                    }
                 };
-                out.push_str(&format!("- Job ID: {} | Schedule: {} | Target: {}:{} | Message: {}\n", job.id, sched_str, job.channel, job.chat_id, job.message));
+                out.push_str(&format!(
+                    "- Job ID: {} | Schedule: {} | Target: {}:{} | Message: {}\n",
+                    job.id, sched_str, job.channel, job.chat_id, job.message
+                ));
             }
             return Ok(out);
         }
