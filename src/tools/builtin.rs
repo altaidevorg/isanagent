@@ -1308,6 +1308,7 @@ pub struct CronTool {
     pub cron_node: NodeHandle<String>,
     pub multi_tenant_edge_cron_enabled: bool,
     pub mte_cron_scheduler: Option<std::sync::Arc<crate::scheduler::MultiTenantEdgeCronScheduler>>,
+    pub db_path: String,
 }
 
 #[async_trait]
@@ -1326,7 +1327,7 @@ impl Tool for CronTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "description": "The action to perform: 'add' or 'remove'. 'list' is not yet supported."
+                    "description": "The action to perform: 'add', 'remove', or 'list'."
                 },
                 "job_id": {
                     "type": "string",
@@ -1338,11 +1339,11 @@ impl Tool for CronTool {
                 },
                 "chat_id": {
                     "type": "string",
-                    "description": "The target chat ID. You must extract this explicitly from the RUNTIME CONTEXT block."
+                    "description": "The target chat ID. You must extract this explicitly from the RUNTIME CONTEXT block. Required for 'add' action."
                 },
                 "channel": {
                     "type": "string",
-                    "description": "The target channel (e.g., 'terminal', 'slack'). Extract this from the RUNTIME CONTEXT block."
+                    "description": "The target channel (e.g., 'terminal', 'slack'). Extract this from the RUNTIME CONTEXT block. Required for 'add' action."
                 },
                 "every_seconds": {
                     "type": "integer",
@@ -1365,12 +1366,44 @@ impl Tool for CronTool {
                     }
                 }
             },
-            "required": ["action", "chat_id", "channel"]
+            "required": ["action"]
         })
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("add");
+
+        if action == "list" {
+            let store = crate::scheduler::CronStore::new(&self.db_path)?;
+            let jobs = store.load_jobs()?;
+
+            if jobs.is_empty() {
+                return Ok("No active cron jobs found.".to_string());
+            }
+
+            let mut out = String::new();
+            out.push_str(&format!("Found {} active cron job(s):\n", jobs.len()));
+            for job in jobs {
+                let sched_str = match &job.schedule {
+                    crate::scheduler::ScheduleKind::At { at_ms } => {
+                        let dt =
+                            chrono::DateTime::from_timestamp_millis(*at_ms).unwrap_or_default();
+                        format!("At: {}", dt.to_rfc3339())
+                    }
+                    crate::scheduler::ScheduleKind::Every { every_ms } => {
+                        format!("Every: {}s", every_ms / 1000)
+                    }
+                    crate::scheduler::ScheduleKind::Cron { cron_expr } => {
+                        format!("Cron: {}", cron_expr)
+                    }
+                };
+                out.push_str(&format!(
+                    "- Job ID: {} | Schedule: {} | Target: {}:{} | Message: {}\n",
+                    job.id, sched_str, job.channel, job.chat_id, job.message
+                ));
+            }
+            return Ok(out);
+        }
 
         if action == "remove" {
             let job_id = args

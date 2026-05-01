@@ -122,22 +122,7 @@ pub struct CronActor {
 impl CronStore {
     pub fn new(db_path: &str) -> Result<Self, String> {
         let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS cron_jobs (
-                id TEXT PRIMARY KEY,
-                schedule TEXT NOT NULL,
-                message TEXT NOT NULL,
-                last_run_at_ms INTEGER,
-                chat_id TEXT NOT NULL DEFAULT 'unknown',
-                channel TEXT NOT NULL DEFAULT 'unknown',
-                webhook_token TEXT NOT NULL DEFAULT '',
-                trigger_claim_token TEXT NOT NULL DEFAULT '',
-                trigger_claimed_at_ms INTEGER,
-                completed_at_ms INTEGER
-            )",
-            [],
-        )
-        .map_err(|e| e.to_string())?;
+        crate::memory::ensure_cron_jobs_schema(&conn).map_err(|e| e.to_string())?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -778,10 +763,20 @@ impl ActorLogic<String> for CronActor {
                         }
 
                         if let Some(schedule) = cron_schedule_cache.get(cron_expr) {
-                            let a_second_ago = now - chrono::Duration::seconds(1);
-                            if let Some(next) = schedule.after(&a_second_ago).next() {
+                            // Use last_run_at_ms as the lookback point so we catch
+                            // triggers that were missed while the app was shut down.
+                            // Falls back to a 1-second window when last_run_at_ms is
+                            // not yet set (brand-new job that hasn't fired yet).
+                            let lookback = match job.last_run_at_ms {
+                                Some(ms) => DateTime::from_timestamp_millis(ms)
+                                    .unwrap_or(now - chrono::Duration::seconds(1)),
+                                None => now - chrono::Duration::seconds(1),
+                            };
+                            if let Some(next) = schedule.after(&lookback).next() {
                                 if next <= now {
                                     should_trigger = true;
+                                    job.last_run_at_ms = Some(now_ms);
+                                    let _ = store.update_last_run_at_ms(&job.id, Some(now_ms));
                                 }
                             }
                         }
@@ -838,7 +833,11 @@ impl ActorLogic<String> for CronActor {
                 metadata,
             };
 
-            if let Err(error) = self.bus_tx.send(crate::bus::BusMessage::Inbound(inbound)).await {
+            if let Err(error) = self
+                .bus_tx
+                .send(crate::bus::BusMessage::Inbound(inbound))
+                .await
+            {
                 self.log_error(format!(
                     "Failed to send cron trigger message to bus for {}: {}",
                     job_id, error
@@ -850,10 +849,12 @@ impl ActorLogic<String> for CronActor {
                         message: message.clone(),
                     },
                 ));
-                let _ = self.logger_tx.send(crate::bus::BusMessage::Log(crate::bus::LogEvent::info(
-                    &self.name,
-                    &format!("Fired local cron job {}", job_id),
-                )));
+                let _ =
+                    self.logger_tx
+                        .send(crate::bus::BusMessage::Log(crate::bus::LogEvent::info(
+                            &self.name,
+                            &format!("Fired local cron job {}", job_id),
+                        )));
             }
         }
 

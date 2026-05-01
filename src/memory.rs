@@ -225,6 +225,25 @@ pub fn ensure_subagent_tasks_schema(conn: &Connection) -> Result<(), rusqlite::E
     Ok(())
 }
 
+pub fn ensure_cron_jobs_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS cron_jobs (
+            id TEXT PRIMARY KEY,
+            schedule TEXT NOT NULL,
+            message TEXT NOT NULL,
+            last_run_at_ms INTEGER,
+            chat_id TEXT NOT NULL DEFAULT 'unknown',
+            channel TEXT NOT NULL DEFAULT 'unknown',
+            webhook_token TEXT NOT NULL DEFAULT '',
+            trigger_claim_token TEXT NOT NULL DEFAULT '',
+            trigger_claimed_at_ms INTEGER,
+            completed_at_ms INTEGER
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
 /// One row in a session todo list (`harness_todos`, via [`SqliteMemoryActor`]).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TodoRow {
@@ -411,6 +430,10 @@ pub enum MemoryMessage {
         limit: u32,
         reply: SharedReply<Result<Vec<RootThreadListItem>, String>>,
     },
+    /// Count active cron jobs (completed_at_ms IS NULL)
+    GetActiveCronsCount {
+        reply: SharedReply<Result<usize, String>>,
+    },
 }
 
 /// Persistent SQLite-based memory Actor for agents.
@@ -520,6 +543,7 @@ impl SqliteMemoryActor {
 
         ensure_harness_todos_schema(&conn)?;
         ensure_subagent_tasks_schema(&conn)?;
+        ensure_cron_jobs_schema(&conn)?;
 
             Ok(conn)
         })()
@@ -1294,6 +1318,19 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                         });
                     }
                     Ok(out)
+                })();
+                let _ = reply.send(res);
+            }
+            MemoryMessage::GetActiveCronsCount { reply } => {
+                let res = (|| -> Result<usize, String> {
+                    let mut stmt = self
+                        .conn
+                        .prepare("SELECT count(*) FROM cron_jobs WHERE completed_at_ms IS NULL")
+                        .map_err(|e| e.to_string())?;
+                    let count: i64 = stmt
+                        .query_row([], |row| row.get(0))
+                        .map_err(|e| e.to_string())?;
+                    Ok(count as usize)
                 })();
                 let _ = reply.send(res);
             }

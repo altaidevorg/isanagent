@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -294,7 +294,7 @@ fn outbound_to_cell(msg: &OutboundMessage) -> Cell {
     }
 }
 
-fn layout_chunks(area: Rect, exec_panel_h: u16, active_tool_h: u16) -> [Rect; 6] {
+fn layout_chunks(area: Rect, exec_panel_h: u16, active_tool_h: u16, input_h: u16) -> [Rect; 6] {
     let exec_constraint = if exec_panel_h > 0 {
         Constraint::Length(exec_panel_h)
     } else {
@@ -309,7 +309,7 @@ fn layout_chunks(area: Rect, exec_panel_h: u16, active_tool_h: u16) -> [Rect; 6]
             exec_constraint,
             Constraint::Length(1),
             Constraint::Length(active_tool_h),
-            Constraint::Length(3),
+            Constraint::Length(input_h),
         ])
         .split(area);
     [
@@ -352,16 +352,17 @@ fn jobs_strip_lines(app: &App, max_width: usize, include_stream_tail: bool) -> V
             ));
         }
     }
+    let spinner_str = app.get_spinner_frame().to_string();
     for entry in app.jobs_strip.iter() {
-        let style = match entry.status {
-            JobStripStatus::Running => Theme::tool_call(),
-            JobStripStatus::Completed => Theme::dim(),
-            JobStripStatus::Failed | JobStripStatus::Timeout => Theme::input_prompt(),
-            JobStripStatus::Cancelled => Theme::dim(),
+        let (style, icon) = match entry.status {
+            JobStripStatus::Running => (Theme::tool_call(), spinner_str.as_str()),
+            JobStripStatus::Completed => (Theme::dim(), "✓"),
+            JobStripStatus::Failed | JobStripStatus::Timeout => (Theme::input_prompt(), "✗"),
+            JobStripStatus::Cancelled => (Theme::dim(), "⨯"),
         };
         let age = entry.started_at.elapsed();
         out.push(job_strip_line(
-            entry.status.icon(),
+            icon,
             &entry.tool_name,
             entry.description.as_deref(),
             entry.last_line.as_str(),
@@ -483,12 +484,18 @@ fn build_status_line(
     chat_id: &str,
     cell_count: usize,
     toast: Option<(&str, ToastKind)>,
+    app: &App,
 ) -> Line<'static> {
     let dim = Theme::dim();
-    let (activity_label, activity_style) = if thinking {
-        ("thinking", Theme::tool_call())
+    let activity_label = if thinking {
+        format!("{} thinking", app.get_spinner_frame())
     } else {
-        ("idle", Theme::dim())
+        "🤖 idle".to_string()
+    };
+    let activity_style = if thinking {
+        Theme::tool_call()
+    } else {
+        Theme::dim()
     };
     let sid = &chat_id[..8.min(chat_id.len())];
     let mut first_row = vec![Span::styled(status_model.to_string(), Theme::text())];
@@ -500,6 +507,18 @@ fn build_status_line(
         vec![
             Span::styled(" · ", dim),
             Span::styled(activity_label, activity_style),
+        ],
+        vec![
+            Span::styled(" · ", dim),
+            Span::styled(format!("[ 📋 {} Todos ]", app.todos_count), dim),
+        ],
+        vec![
+            Span::styled(" · ", dim),
+            Span::styled(format!("[ 🕒 {} Crons ]", app.crons_count), dim),
+        ],
+        vec![
+            Span::styled(" · ", dim),
+            Span::styled(format!("[ 🛠 {} Jobs ]", app.jobs_strip.len()), dim),
         ],
         vec![
             Span::styled(" · ", dim),
@@ -913,7 +932,12 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 
     let mut stdout = stdout();
     enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen, crossterm::cursor::Hide)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        crossterm::cursor::Hide
+    )?;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -947,8 +971,78 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
     let max_conversations_list_scroll_holder = std::cell::Cell::new(0usize);
     let mut last_exec_poll = Instant::now() - Duration::from_secs(60);
     let mut last_conversations_poll = Instant::now() - Duration::from_secs(60);
+    let mut last_todos_poll = Instant::now() - Duration::from_secs(60);
+
+    let start_time = Instant::now();
+    let (todos_tx, todos_rx) = std::sync::mpsc::channel();
+    let (crons_tx, crons_rx) = std::sync::mpsc::channel::<usize>();
+
+    // Spawn a single long-lived background thread for periodic DB polling (todos + crons).
+    // Receives tick signals via a channel; avoids spawning a new OS thread every poll interval.
+    let (poll_trigger_tx, poll_trigger_rx) = std::sync::mpsc::channel::<String>();
+    {
+        let rt_handle = rt.handle().clone();
+        let memory_node = memory_node.clone();
+        let todos_tx = todos_tx.clone();
+        let crons_tx = crons_tx.clone();
+        let spawn_result = std::thread::Builder::new()
+            .name("ui-db-poller".into())
+            .spawn(move || {
+                while let Ok(cid) = poll_trigger_rx.recv() {
+                    rt_handle.block_on(async {
+                        let (otx, orx) = tokio::sync::oneshot::channel();
+                        let _ = memory_node
+                            .send_packet(crate::memory::MemoryMessage::LoadHarnessTodos {
+                                chat_id: cid,
+                                reply: crate::memory::SharedReply::new(otx),
+                            })
+                            .await;
+
+                        if let Ok(Ok(Some(todos))) = orx.await {
+                            let active = todos
+                                .into_iter()
+                                .filter(|t| t.status != "completed")
+                                .count();
+                            let _ = todos_tx.send(active);
+                        } else {
+                            let _ = todos_tx.send(0);
+                        }
+
+                        let (ctx, crx) = tokio::sync::oneshot::channel();
+                        let _ = memory_node
+                            .send_packet(crate::memory::MemoryMessage::GetActiveCronsCount {
+                                reply: crate::memory::SharedReply::new(ctx),
+                            })
+                            .await;
+
+                        if let Ok(Ok(count)) = crx.await {
+                            let _ = crons_tx.send(count);
+                        } else {
+                            let _ = crons_tx.send(0);
+                        }
+                    });
+                }
+            });
+        if let Err(e) = spawn_result {
+            log::error!("Failed to spawn ui-db-poller thread: {e}");
+        }
+    }
 
     loop {
+        app.spinner_tick = (start_time.elapsed().as_millis() / 80) as usize;
+
+        while let Ok(active_count) = todos_rx.try_recv() {
+            app.todos_count = active_count;
+        }
+        while let Ok(active_count) = crons_rx.try_recv() {
+            app.crons_count = active_count;
+        }
+
+        if last_todos_poll.elapsed() >= Duration::from_secs(2) {
+            last_todos_poll = Instant::now();
+            let _ = poll_trigger_tx.send(chat_id.clone());
+        }
+
         app.clear_expired_toast();
 
         if app.ui_focus == TerminalUiFocus::Executions
@@ -1095,7 +1189,9 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 }
             };
             let active_strip_h: u16 = 1;
-            let ch = layout_chunks(area, exec_h, active_strip_h);
+            let input_lines = app.input.split('\n').count() as u16;
+            let input_h = (input_lines + 2).clamp(3, 10);
+            let ch = layout_chunks(area, exec_h, active_strip_h, input_h);
 
             let title_w = ch[0].width as usize;
             let title = Paragraph::new(build_title_line(title_w.max(1)));
@@ -1226,6 +1322,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 &chat_id,
                 app.cells.len(),
                 app.active_toast(),
+                &app,
             );
             let status_w = Paragraph::new(status_line);
             f.render_widget(status_w, ch[3]);
@@ -1233,9 +1330,14 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             let active_w = ch[4].width as usize;
             let idle = "Idle (no running tool)";
             let active_text = app.active_tool_line.as_deref().unwrap_or(idle);
+            let icon = if app.active_tool_line.is_some() {
+                app.get_spinner_frame().to_string()
+            } else {
+                "·".to_string()
+            };
             let t = truncate_chars_display(active_text, active_w.max(8).saturating_sub(6));
             let active_row = Line::from(vec![
-                Span::styled(" tool ", Theme::tool_call()),
+                Span::styled(format!(" {} ", icon), Theme::tool_call()),
                 Span::styled(t, Theme::dim()),
             ]);
             f.render_widget(Paragraph::new(active_row), ch[4]);
@@ -1244,22 +1346,79 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 .borders(Borders::ALL)
                 .title(Span::styled(" compose ", Theme::dim()))
                 .border_style(Theme::dim());
-            let input_para = Paragraph::new(Line::from(vec![
-                Span::styled("> ", Theme::input_prompt()),
-                Span::styled(app.input.as_str(), Theme::text()),
-            ]))
-            .block(input_block);
-            f.render_widget(input_para, ch[5]);
+
+            let mut text_lines = Vec::new();
+            for (i, line) in app.input.split('\n').enumerate() {
+                let prefix = if i == 0 { "> " } else { "  " };
+                text_lines.push(Line::from(vec![
+                    Span::styled(prefix, Theme::input_prompt()),
+                    Span::styled(line, Theme::text()),
+                ]));
+            }
+            if text_lines.is_empty() {
+                text_lines.push(Line::from(vec![
+                    Span::styled("> ", Theme::input_prompt()),
+                    Span::styled("", Theme::text()),
+                ]));
+            }
 
             let inner_area = ch[5].inner(Margin::new(1, 1));
-            let prefix_w = crate::channels::terminal_ui::display_width("> ")
-                + crate::channels::terminal_ui::display_width(
-                    &app.input[..app.cursor.min(app.input.len())],
-                );
-            let cx = inner_area
-                .x
-                .saturating_add((prefix_w.min(inner_area.width.saturating_sub(1) as usize)) as u16);
-            let cy = inner_area.y;
+            let inner_w = inner_area.width.max(1); // guard against zero-width after margin
+
+            // Calculate visual line of cursor for wrapping.
+            // Uses display_width (Unicode column width) instead of char count so that
+            // CJK characters and emoji that occupy two cells are measured correctly.
+            let text_before_cursor = &app.input[..app.cursor];
+            let mut cursor_visual_line: u16 = 0;
+            let mut cursor_col_visual: u16 = 0;
+            let lines_before_cursor: Vec<&str> = text_before_cursor.split('\n').collect();
+            let total_lines = lines_before_cursor.len();
+            for (i, line) in lines_before_cursor.into_iter().enumerate() {
+                let prefix_len: u16 = if i == 0 { 2 } else { 0 }; // "> "
+                let col_width = super::display_width(line) as u16;
+                let total_cols = prefix_len + col_width;
+
+                if i == total_lines - 1 {
+                    cursor_visual_line += total_cols / inner_w;
+                    cursor_col_visual = total_cols % inner_w;
+                } else {
+                    let visual_lines = if total_cols == 0 {
+                        1
+                    } else {
+                        total_cols.div_ceil(inner_w)
+                    };
+                    cursor_visual_line += visual_lines;
+                }
+            }
+
+            let mut input_v_scroll = 0;
+            let available_h = input_h.saturating_sub(2);
+            if cursor_visual_line >= available_h {
+                input_v_scroll = (cursor_visual_line + 1).saturating_sub(available_h);
+            }
+
+            let input_para = Paragraph::new(Text::from(text_lines))
+                .block(input_block)
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .scroll((input_v_scroll, 0));
+            f.render_widget(input_para, ch[5]);
+
+            let cx = inner_area.x.saturating_add(cursor_col_visual);
+            let cy = inner_area
+                .y
+                .saturating_add(cursor_visual_line.saturating_sub(input_v_scroll));
+            let cx = cx.clamp(
+                inner_area.x,
+                inner_area
+                    .x
+                    .saturating_add(inner_area.width.saturating_sub(1)),
+            );
+            let cy = cy.clamp(
+                inner_area.y,
+                inner_area
+                    .y
+                    .saturating_add(inner_area.height.saturating_sub(1)),
+            );
             f.set_cursor_position((cx, cy));
         })?;
 
@@ -1314,7 +1473,33 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.clear_line();
                 }
+                KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => app.move_left_word(),
+                KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
+                    app.move_right_word()
+                }
+                KeyCode::Char('b') | KeyCode::Char('B')
+                    if key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    app.move_left_word()
+                }
+                KeyCode::Char('f') | KeyCode::Char('F')
+                    if key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    app.move_right_word()
+                }
+                KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    app.insert_char('\n');
+                }
                 KeyCode::Enter => {
+                    // Windows Terminal / Conhost simulated paste detection.
+                    // If another event is queued immediately within 2ms, it is mathematically impossible
+                    // to be a human typing. It must be a simulated paste chunk, so we insert a newline
+                    // instead of submitting the prompt.
+                    if let Ok(true) = event::poll(Duration::from_millis(2)) {
+                        app.insert_char('\n');
+                        continue;
+                    }
+
                     if app.ui_focus == TerminalUiFocus::Conversations {
                         if let Some(idx) = app.conversations_selected_idx {
                             if idx >= app.conversations_items.len() {
@@ -1936,6 +2121,14 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     }
                 }
             }
+            Event::Paste(ref s) => {
+                for c in s.chars() {
+                    // Filter out carriage returns to avoid issues, just keep newlines
+                    if c != '\r' {
+                        app.insert_char(c);
+                    }
+                }
+            }
             Event::Resize(_, _) => {}
             _ => {}
         }
@@ -1947,6 +2140,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
     }
     execute!(
         terminal.backend_mut(),
+        DisableBracketedPaste,
         LeaveAlternateScreen,
         crossterm::cursor::Show
     )?;
