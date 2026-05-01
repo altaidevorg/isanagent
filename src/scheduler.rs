@@ -122,22 +122,7 @@ pub struct CronActor {
 impl CronStore {
     pub fn new(db_path: &str) -> Result<Self, String> {
         let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS cron_jobs (
-                id TEXT PRIMARY KEY,
-                schedule TEXT NOT NULL,
-                message TEXT NOT NULL,
-                last_run_at_ms INTEGER,
-                chat_id TEXT NOT NULL DEFAULT 'unknown',
-                channel TEXT NOT NULL DEFAULT 'unknown',
-                webhook_token TEXT NOT NULL DEFAULT '',
-                trigger_claim_token TEXT NOT NULL DEFAULT '',
-                trigger_claimed_at_ms INTEGER,
-                completed_at_ms INTEGER
-            )",
-            [],
-        )
-        .map_err(|e| e.to_string())?;
+        crate::memory::ensure_cron_jobs_schema(&conn).map_err(|e| e.to_string())?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),

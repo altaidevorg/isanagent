@@ -977,6 +977,55 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
     let (todos_tx, todos_rx) = std::sync::mpsc::channel();
     let (crons_tx, crons_rx) = std::sync::mpsc::channel::<usize>();
 
+    // Spawn a single long-lived background thread for periodic DB polling (todos + crons).
+    // Receives tick signals via a channel; avoids spawning a new OS thread every poll interval.
+    let (poll_trigger_tx, poll_trigger_rx) = std::sync::mpsc::channel::<String>();
+    {
+        let rt_handle = rt.handle().clone();
+        let memory_node = memory_node.clone();
+        let todos_tx = todos_tx.clone();
+        let crons_tx = crons_tx.clone();
+        std::thread::Builder::new()
+            .name("ui-db-poller".into())
+            .spawn(move || {
+                while let Ok(cid) = poll_trigger_rx.recv() {
+                    rt_handle.block_on(async {
+                        let (otx, orx) = tokio::sync::oneshot::channel();
+                        let _ = memory_node
+                            .send_packet(crate::memory::MemoryMessage::LoadHarnessTodos {
+                                chat_id: cid,
+                                reply: crate::memory::SharedReply::new(otx),
+                            })
+                            .await;
+
+                        if let Ok(Ok(Some(todos))) = orx.await {
+                            let active = todos
+                                .into_iter()
+                                .filter(|t| t.status != "completed")
+                                .count();
+                            let _ = todos_tx.send(active);
+                        } else {
+                            let _ = todos_tx.send(0);
+                        }
+
+                        let (ctx, crx) = tokio::sync::oneshot::channel();
+                        let _ = memory_node
+                            .send_packet(crate::memory::MemoryMessage::GetActiveCronsCount {
+                                reply: crate::memory::SharedReply::new(ctx),
+                            })
+                            .await;
+
+                        if let Ok(Ok(count)) = crx.await {
+                            let _ = crons_tx.send(count);
+                        } else {
+                            let _ = crons_tx.send(0);
+                        }
+                    });
+                }
+            })
+            .ok();
+    }
+
     loop {
         app.spinner_tick = (start_time.elapsed().as_millis() / 80) as usize;
 
@@ -989,47 +1038,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 
         if last_todos_poll.elapsed() >= Duration::from_secs(2) {
             last_todos_poll = Instant::now();
-            let memory_node = memory_node.clone();
-            let tx = todos_tx.clone();
-            let crons_tx_clone = crons_tx.clone();
-            let cid = chat_id.clone();
-            let rt_handle = rt.handle().clone();
-
-            std::thread::spawn(move || {
-                rt_handle.block_on(async move {
-                    let (otx, orx) = tokio::sync::oneshot::channel();
-                    let _ = memory_node
-                        .send_packet(crate::memory::MemoryMessage::LoadHarnessTodos {
-                            chat_id: cid,
-                            reply: crate::memory::SharedReply::new(otx),
-                        })
-                        .await;
-
-                    if let Ok(Ok(Some(todos))) = orx.await {
-                        let active = todos
-                            .into_iter()
-                            .filter(|t| t.status != "completed")
-                            .count();
-                        let _ = tx.send(active);
-                    } else {
-                        let _ = tx.send(0);
-                    }
-
-                    let (ctx, crx) = tokio::sync::oneshot::channel();
-                    let _ = memory_node
-                        .send_packet(crate::memory::MemoryMessage::GetActiveCronsCount {
-                            reply: crate::memory::SharedReply::new(ctx),
-                        })
-                        .await;
-
-                    let res = crx.await;
-                    if let Ok(Ok(count)) = &res {
-                        let _ = crons_tx_clone.send(*count);
-                    } else {
-                        let _ = crons_tx_clone.send(0);
-                    }
-                });
-            });
+            let _ = poll_trigger_tx.send(chat_id.clone());
         }
 
         app.clear_expired_toast();
@@ -1352,26 +1361,29 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             }
 
             let inner_area = ch[5].inner(Margin::new(1, 1));
+            let inner_w = inner_area.width.max(1); // guard against zero-width after margin
 
-            // Calculate visual line of cursor for wrapping
+            // Calculate visual line of cursor for wrapping.
+            // Uses display_width (Unicode column width) instead of char count so that
+            // CJK characters and emoji that occupy two cells are measured correctly.
             let text_before_cursor = &app.input[..app.cursor];
             let mut cursor_visual_line: u16 = 0;
             let mut cursor_col_visual: u16 = 0;
             let lines_before_cursor: Vec<&str> = text_before_cursor.split('\n').collect();
             let total_lines = lines_before_cursor.len();
             for (i, line) in lines_before_cursor.into_iter().enumerate() {
-                let prefix_len = if i == 0 { 2 } else { 0 }; // "> "
-                let char_count = line.chars().count() as u16;
-                let total_chars = prefix_len + char_count;
+                let prefix_len: u16 = if i == 0 { 2 } else { 0 }; // "> "
+                let col_width = super::display_width(line) as u16;
+                let total_cols = prefix_len + col_width;
 
                 if i == total_lines - 1 {
-                    cursor_visual_line += total_chars / inner_area.width;
-                    cursor_col_visual = total_chars % inner_area.width;
+                    cursor_visual_line += total_cols / inner_w;
+                    cursor_col_visual = total_cols % inner_w;
                 } else {
-                    let visual_lines = if total_chars == 0 {
+                    let visual_lines = if total_cols == 0 {
                         1
                     } else {
-                        total_chars.div_ceil(inner_area.width)
+                        total_cols.div_ceil(inner_w)
                     };
                     cursor_visual_line += visual_lines;
                 }
