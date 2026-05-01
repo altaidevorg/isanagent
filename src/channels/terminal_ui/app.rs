@@ -453,31 +453,29 @@ impl App {
         self.cursor = self.input.len();
     }
 
-    pub fn delete_word(&mut self) {
+    /// Byte offset of the previous word boundary before `self.cursor`.
+    fn prev_word_boundary(&self) -> usize {
         if self.cursor == 0 {
-            return;
+            return 0;
         }
         let before = &self.input[..self.cursor];
         let trimmed = before.trim_end();
-        let new_end = trimmed
+        trimmed
             .rfind(|c: char| c.is_whitespace() || c == '/')
             .map(|i| i + 1)
-            .unwrap_or(0);
-        self.input.drain(new_end..self.cursor);
-        self.cursor = new_end;
+            .unwrap_or(0)
+    }
+
+    pub fn delete_word(&mut self) {
+        let boundary = self.prev_word_boundary();
+        if boundary < self.cursor {
+            self.input.drain(boundary..self.cursor);
+            self.cursor = boundary;
+        }
     }
 
     pub fn move_left_word(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let before = &self.input[..self.cursor];
-        let trimmed = before.trim_end();
-        let new_end = trimmed
-            .rfind(|c: char| c.is_whitespace() || c == '/')
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        self.cursor = new_end;
+        self.cursor = self.prev_word_boundary();
     }
 
     pub fn move_right_word(&mut self) {

@@ -985,7 +985,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         let memory_node = memory_node.clone();
         let todos_tx = todos_tx.clone();
         let crons_tx = crons_tx.clone();
-        std::thread::Builder::new()
+        let spawn_result = std::thread::Builder::new()
             .name("ui-db-poller".into())
             .spawn(move || {
                 while let Ok(cid) = poll_trigger_rx.recv() {
@@ -1022,8 +1022,10 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         }
                     });
                 }
-            })
-            .ok();
+            });
+        if let Err(e) = spawn_result {
+            log::error!("Failed to spawn ui-db-poller thread: {e}");
+        }
     }
 
     loop {
