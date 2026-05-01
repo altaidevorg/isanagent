@@ -24,6 +24,7 @@ Always copy **`chat_id`** and **`channel`** from the **RUNTIME CONTEXT** block y
 
 ## Hygiene
 
+- **`list`** allows you to view all currently active cron jobs across all chats and channels. Use this when you need to verify if a job is running or retrieve a lost `job_id`.
 - **`add`** assigns the **`job_id`** (returned in the success string, e.g. `Successfully scheduled job abcdef12 …`). Store it in your reasoning if you may need **`remove`** later; you cannot choose the id yourself today.
 - When the user asks to stop a schedule, call **`remove`** with that exact **`job_id`**.
 - Write **`message`** so a future turn knows what to do when the job fires—include intent, constraints, and any ids/paths the follow‑up needs.

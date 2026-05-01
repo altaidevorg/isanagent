@@ -470,6 +470,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         cron_node: cron_node.clone(),
         multi_tenant_edge_cron_enabled: mte_cron_scheduler.is_some(),
         mte_cron_scheduler: mte_cron_scheduler.clone(),
+        db_path: db_path_str.to_string(),
     }));
     tools.register(Box::new(MessageTool {
         outbound_tx: global_outbound_tx.clone(),

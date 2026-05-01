@@ -224,6 +224,7 @@ pub struct App {
     pub spinner_tick: usize,
     pub todos_count: usize,
     pub crons_count: usize,
+    pub crons_debug_text: String,
 }
 
 impl Default for App {
@@ -280,6 +281,7 @@ impl App {
             spinner_tick: 0,
             todos_count: 0,
             crons_count: 0,
+            crons_debug_text: "Init".to_string(),
         }
     }
 

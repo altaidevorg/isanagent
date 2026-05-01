@@ -514,7 +514,7 @@ fn build_status_line(
         ],
         vec![
             Span::styled(" · ", dim),
-            Span::styled(format!("[ 🕒 {} Crons ]", app.crons_count), dim),
+            Span::styled(format!("[ 🕒 {} ]", app.crons_debug_text), dim),
         ],
         vec![
             Span::styled(" · ", dim),
@@ -975,6 +975,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 
     let start_time = Instant::now();
     let (todos_tx, todos_rx) = std::sync::mpsc::channel();
+    let (crons_tx, crons_rx) = std::sync::mpsc::channel::<(usize, String)>();
 
     loop {
         app.spinner_tick = (start_time.elapsed().as_millis() / 80) as usize;
@@ -982,24 +983,46 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         while let Ok(active_count) = todos_rx.try_recv() {
             app.todos_count = active_count;
         }
+        while let Ok((active_count, debug_text)) = crons_rx.try_recv() {
+            app.crons_count = active_count;
+            app.crons_debug_text = debug_text;
+        }
 
         if last_todos_poll.elapsed() >= Duration::from_secs(2) {
             last_todos_poll = Instant::now();
             let memory_node = memory_node.clone();
             let tx = todos_tx.clone();
+            let crons_tx_clone = crons_tx.clone();
             let cid = chat_id.clone();
-            rt.spawn(async move {
-                let (otx, orx) = tokio::sync::oneshot::channel();
-                let _ = memory_node.send_packet(crate::memory::MemoryMessage::LoadHarnessTodos {
-                    chat_id: cid,
-                    reply: crate::memory::SharedReply::new(otx),
-                }).await;
-                if let Ok(Ok(Some(todos))) = orx.await {
-                    let active = todos.into_iter().filter(|t| t.status != "completed").count();
-                    let _ = tx.send(active);
-                } else {
-                    let _ = tx.send(0);
-                }
+            let rt_handle = rt.handle().clone();
+            
+            std::thread::spawn(move || {
+                rt_handle.block_on(async move {
+                    let (otx, orx) = tokio::sync::oneshot::channel();
+                    let _ = memory_node.send_packet(crate::memory::MemoryMessage::LoadHarnessTodos {
+                        chat_id: cid,
+                        reply: crate::memory::SharedReply::new(otx),
+                    }).await;
+                    
+                    if let Ok(Ok(Some(todos))) = orx.await {
+                        let active = todos.into_iter().filter(|t| t.status != "completed").count();
+                        let _ = tx.send(active);
+                    } else {
+                        let _ = tx.send(0);
+                    }
+
+                    let (ctx, crx) = tokio::sync::oneshot::channel();
+                    let _ = memory_node.send_packet(crate::memory::MemoryMessage::GetActiveCronsCount {
+                        reply: crate::memory::SharedReply::new(ctx),
+                    }).await;
+                    
+                    let res = crx.await;
+                    if let Ok(Ok(count)) = &res {
+                        let _ = crons_tx_clone.send((*count, format!("{} Crons", count)));
+                    } else {
+                        let _ = crons_tx_clone.send((0, "0 Crons".to_string()));
+                    }
+                });
             });
         }
 
@@ -1319,30 +1342,44 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             }
 
             let inner_area = ch[5].inner(Margin::new(1, 1));
-            let (cursor_line_idx, cursor_col) = app.cursor_line_col();
-            let mut input_v_scroll = 0;
-            let available_h = input_h.saturating_sub(2);
-            if cursor_line_idx as u16 >= available_h {
-                input_v_scroll = (cursor_line_idx as u16 + 1).saturating_sub(available_h);
+            
+            // Calculate visual line of cursor for wrapping
+            let text_before_cursor = &app.input[..app.cursor];
+            let mut cursor_visual_line: u16 = 0;
+            let mut cursor_col_visual: u16 = 0;
+            let mut current_logical_line = 0;
+            let lines_before_cursor: Vec<&str> = text_before_cursor.split('\n').collect();
+            let total_lines = lines_before_cursor.len();
+            
+            for (i, line) in lines_before_cursor.into_iter().enumerate() {
+                let prefix_len = if current_logical_line == 0 { 2 } else { 0 }; // "> "
+                let char_count = line.chars().count() as u16;
+                let total_chars = prefix_len + char_count;
+                
+                if i == total_lines - 1 {
+                    cursor_visual_line += total_chars / inner_area.width;
+                    cursor_col_visual = total_chars % inner_area.width;
+                } else {
+                    let visual_lines = if total_chars == 0 { 1 } else { (total_chars + inner_area.width - 1) / inner_area.width };
+                    cursor_visual_line += visual_lines;
+                }
+                current_logical_line += 1;
             }
 
-            let mut input_h_scroll = 0;
-            let display_col = cursor_col as u16 + 2;
-            if display_col >= inner_area.width {
-                input_h_scroll = display_col.saturating_sub(inner_area.width) + 1;
+            let mut input_v_scroll = 0;
+            let available_h = input_h.saturating_sub(2);
+            if cursor_visual_line >= available_h {
+                input_v_scroll = (cursor_visual_line + 1).saturating_sub(available_h);
             }
 
             let input_para = Paragraph::new(Text::from(text_lines))
                 .block(input_block)
-                .scroll((input_v_scroll, input_h_scroll));
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .scroll((input_v_scroll, 0));
             f.render_widget(input_para, ch[5]);
 
-            let cx = inner_area
-                .x
-                .saturating_add(display_col.saturating_sub(input_h_scroll));
-            let cy = inner_area
-                .y
-                .saturating_add((cursor_line_idx as u16).saturating_sub(input_v_scroll));
+            let cx = inner_area.x.saturating_add(cursor_col_visual);
+            let cy = inner_area.y.saturating_add(cursor_visual_line.saturating_sub(input_v_scroll));
             let cx = cx.clamp(
                 inner_area.x,
                 inner_area
@@ -1427,6 +1464,15 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     app.insert_char('\n');
                 }
                 KeyCode::Enter => {
+                    // Windows Terminal / Conhost simulated paste detection.
+                    // If another event is queued immediately within 2ms, it is mathematically impossible
+                    // to be a human typing. It must be a simulated paste chunk, so we insert a newline
+                    // instead of submitting the prompt.
+                    if let Ok(true) = event::poll(Duration::from_millis(2)) {
+                        app.insert_char('\n');
+                        continue;
+                    }
+
                     if app.ui_focus == TerminalUiFocus::Conversations {
                         if let Some(idx) = app.conversations_selected_idx {
                             if idx >= app.conversations_items.len() {
