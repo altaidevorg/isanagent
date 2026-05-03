@@ -27,6 +27,7 @@ mod mcp_call_history;
 mod post_run;
 mod preflight;
 mod provider;
+mod repl_framing;
 mod run;
 mod run_events;
 mod run_history;
@@ -66,4 +67,6 @@ pub use run::{
 };
 pub use run_events::RunEvent;
 pub use run_history::{run_history_dir, write_run_journal, RunJournal, RunJournalParams};
-pub use ssh::{validate_remote_workdir, SshExecutionProvider, SshExecutionProviderConfig};
+pub use ssh::{
+    resolve_ssh_run_cwd, validate_remote_workdir, SshExecutionProvider, SshExecutionProviderConfig,
+};

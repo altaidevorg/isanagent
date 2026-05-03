@@ -23,7 +23,8 @@ pub struct SshExecutionConfig {
     /// Path to a private key file (OpenSSH PEM). Tilde expansion applied. Optional if
     /// **`SSH_PASSWORD`** is set in the environment.
     pub identity_file: Option<String>,
-    /// Absolute path on the **remote** host used as `cd` before running code (required).
+    /// Absolute path on the **remote** host used as the default cwd before running code (required).
+    /// The SSH execution provider runs `mkdir -p` for the resolved cwd on each run so the path may be absent at first connect.
     pub remote_workdir: Option<String>,
     /// Remote Python interpreter for `language: python` (default `python3`).
     pub remote_python: Option<String>,

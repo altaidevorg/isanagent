@@ -866,7 +866,8 @@ impl Tool for ShellExecTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command and return its output (60s timeout). Host details (OS/shell/path style) are provided in RUNTIME CONTEXT each turn; write commands for that host. Prefer first-class tools (`search_text`, `read_file`, `glob_files`, `web_fetch`) before shell one-liners, especially for grep/cat/wc style tasks."
+        "Execute a shell command and return its output (60s timeout). Host details (OS/shell/path style) are provided in RUNTIME CONTEXT each turn; write commands for that host. Prefer first-class tools (`search_text`, `read_file`, `glob_files`, `web_fetch`) before shell one-liners, especially for grep/cat/wc style tasks. \
+         On **Windows** this runs under **cmd /C** one string: nested double-quotes often break remote **ssh** compound commands (e.g. `ssh user@host \"mkdir -p /tmp/x && cmd\"`). Prefer a **single** remote argument without inner double-quotes, use **execution_* / SSH harness** for remote work, or run **two** short exec calls instead of one over-quoted line."
     }
 
     fn parameters(&self) -> Value {

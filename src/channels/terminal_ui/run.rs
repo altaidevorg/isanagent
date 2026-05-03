@@ -2150,6 +2150,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 #[cfg(test)]
 mod width_fit_tests {
     use super::{build_status_line, build_title_line};
+    use crate::channels::terminal_ui::app::App;
     use crate::channels::terminal_ui::display_width;
     use crate::channels::terminal_ui::text_format::truncate_chars_display;
     use ratatui::text::Line;
@@ -2175,7 +2176,8 @@ mod width_fit_tests {
 
     #[test]
     fn status_drops_low_priority_when_narrow() {
-        let line = build_status_line(26, "gemini-2.5-flash", false, "uuid-here-ok", 3, None);
+        let app = App::new();
+        let line = build_status_line(26, "gemini-2.5-flash", false, "uuid-here-ok", 3, None, &app);
         let t = flat(&line);
         assert!(t.contains("gemini"));
         assert!(t.contains("idle"));

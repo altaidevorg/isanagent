@@ -134,7 +134,7 @@ Materialized run artifacts live under **`sandbox_dir/.execution_artifacts/`** (s
 
 2. **`execution_run`** — required: `session_id`, `code`. Optional: `timeout_secs`, **`description`** (short human summary for the terminal strip and `execution_runs.jsonl`), `cwd_mode` (`session_default` or `sandbox_relative`), and `cwd_relative` when using `sandbox_relative`. Call **`execution_env_info`** first in a session if you need exact **`max_wall_secs`** / **`default_run_timeout_secs`**.  
    - **`jupyter`:** only **`session_default`** is supported for `cwd_mode` (no per-run sandbox cwd); use notebook magics such as `%cd` inside `code` if you must change directory on the server.  
-   - **`ssh`:** only **`session_default`** is supported; the remote working directory is always **`remote_workdir`** from config.
+   - **`ssh`:** `cwd_mode` applies on the **remote host** (not the agent workspace). **`session_default`** uses **`[harness.execution.ssh].remote_workdir`**. **`sandbox_relative`** means: if `cwd_relative` starts with `/`, use that absolute path on the remote (same path character rules as `remote_workdir`); otherwise treat `cwd_relative` as a path under `remote_workdir` (no `..` segments). Before every run the provider runs **`mkdir -p`** for that remote cwd, then **`cd`**, so a missing `remote_workdir` no longer fails shell or Python startup. Python sessions use a **persistent REPL** (same framed worker as local): variables and imports survive across `execution_run` calls until you change remote cwd or the run errors/times out; the REPL performs a short self-test when opened and retries once on failure. Shell mode still runs a fresh `bash -s` per run. For unattended connects to new hosts, set **`accept_unknown_host_keys = true`** (understand the MITM tradeoff) or pre-populate known_hosts—otherwise the TCP session may hang waiting for a host-key prompt that never reaches the agent.
 
 3. **Long runs (optional):** use **`execution_run_background`** with the same arguments (plus optional **`label`** and recommended **`description`**). Poll **`execution_job_status`** until **`terminal`** is true, then read **`execution_job_result`**. Jobs are **process-local** (lost if the agent exits). Only **one** active run or background job may use a session at a time; for overlapping long work, use **separate execution sessions** (or providers that allow it).
 
@@ -194,8 +194,8 @@ The client requests WebSocket subprotocol **`v1.kernel.websocket.jupyter.org`** 
 
 ## Working directory for a run
 
-- **`cwd_mode`: `session_default`** (default) — run in the session’s root (sandbox root).  
-- **`cwd_mode`: `sandbox_relative`** — requires **`cwd_relative`** (e.g. `pkg`); resolved under the sandbox like other tools.
+- **`cwd_mode`: `session_default`** (default) — run in the session’s root (sandbox root for **`local`**; Jupyter kernel cwd for **`jupyter`**; **`[harness.execution.ssh].remote_workdir`** for **`ssh`**).  
+- **`cwd_mode`: `sandbox_relative`** — requires **`cwd_relative`**. For **`local`**, resolved under the agent sandbox like other tools. For **`ssh`**, resolved on the **remote** only: absolute `cwd_relative` is used as-is (when valid); a relative value is joined under `remote_workdir` (see the **`ssh`** bullet under step 2 above).
 
 ## Sub-agents
 

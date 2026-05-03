@@ -1,17 +1,22 @@
 //! SSH remote execution (Phase 4): one **TCP+SSH session per provider session** (connect on
-//! `create_session`); each `execution_run` opens a new channel, **`exec`**s a short fixed shell line,
-//! streams user code on **channel stdin** (no `ARG_MAX`-sized argv), then drains stdout/stderr.
+//! `create_session`); Python uses the same framed REPL worker as local (variables persist across
+//! `execution_run` calls). Shell mode runs `bash -s` with stdin per run. `cwd_mode` /
+//! `cwd_relative` refer to **remote** paths only (never the agent workspace sandbox).
 
 use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD as B64_ENGINE;
+use base64::Engine as _;
 use dashmap::DashMap;
 use russh::client;
 use russh::keys::{self, PrivateKeyWithHashAlg};
 use russh::ChannelMsg;
+use russh::ChannelStream;
 use russh::Disconnect;
+use tokio::io::{split, ReadHalf, WriteHalf};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -21,6 +26,7 @@ use super::capabilities::{
 use super::error::ExecutionError;
 use super::ids::SessionId;
 use super::provider::ExecutionProvider;
+use super::repl_framing;
 use super::run::{CwdPolicy, RunResult, RunSpec, SessionCreateRequest, SessionHandle};
 
 /// SSH RFC 4254: stderr extended data stream.
@@ -62,11 +68,21 @@ enum SshExecMode {
     Shell,
 }
 
+struct SshPythonRepl {
+    cwd: String,
+    read: ReadHalf<ChannelStream<client::Msg>>,
+    write: WriteHalf<ChannelStream<client::Msg>>,
+}
+
+struct SshConnected {
+    handle: client::Handle<SshClientHandler>,
+    python_repl: Option<SshPythonRepl>,
+}
+
 struct SshSession {
     mode: SshExecMode,
     run_cancel: Mutex<Option<CancellationToken>>,
-    /// One authenticated SSH session per execution session (reused across `run` calls).
-    handle: Arc<Mutex<Option<client::Handle<SshClientHandler>>>>,
+    connected: Mutex<Option<SshConnected>>,
 }
 
 /// SSH-backed [`ExecutionProvider`] (Linux-oriented remote: `bash` + stdin-fed `python` / `bash -s`).
@@ -149,6 +165,10 @@ impl SshExecutionProvider {
             SshExecMode::Shell => Some("shell".into()),
         };
         let wd = &self.config.remote_workdir;
+        let mut ext = std::collections::BTreeMap::new();
+        if matches!(mode, SshExecMode::Python) {
+            ext.insert("ssh_python_repl".into(), serde_json::Value::Bool(true));
+        }
         SessionCapabilities {
             session_id: id.clone(),
             schema_version: 1,
@@ -156,7 +176,7 @@ impl SshExecutionProvider {
             active_language,
             gpu_visible: None,
             working_directory_display: Some(format!(
-                "ssh {}@{}:{} (cwd {})",
+                "ssh {}@{}:{} (session_default cwd {}; each run mkdir -p that path on the remote before cd; sandbox_relative = remote path under that dir or absolute on remote)",
                 self.config.user, self.config.host, self.config.port, wd
             )),
             provider_snapshot: ProviderCapabilitiesSnapshot {
@@ -166,23 +186,82 @@ impl SshExecutionProvider {
                 jupyter_kernel: self.caps.jupyter_kernel,
                 network_policy: self.caps.network_policy,
             },
-            extensions: Default::default(),
+            extensions: ext,
         }
     }
 }
 
-/// Short `exec` line: `cd` + `exec` into interpreter; user source is written to session stdin.
-fn ssh_remote_exec_line(wd: &str, py: &str, mode: &SshExecMode) -> Result<String, ExecutionError> {
-    let line = match mode {
-        SshExecMode::Python => format!("cd '{wd}' && exec '{py}' -u -"),
-        SshExecMode::Shell => format!("cd '{wd}' && exec bash -s"),
-    };
-    if line.contains('"') || line.contains('$') || line.contains('`') {
+/// Resolve remote working directory for one run. `sandbox_relative` is **not** the agent sandbox:
+/// absolute paths are used as-is on the remote; relative paths join `[harness.execution.ssh].remote_workdir`.
+pub fn resolve_ssh_run_cwd(remote_root: &str, cwd: &CwdPolicy) -> Result<String, ExecutionError> {
+    match cwd {
+        CwdPolicy::SessionDefault => Ok(remote_root.to_string()),
+        CwdPolicy::SandboxRelative(rel) => {
+            let t = rel.trim();
+            if t.is_empty() {
+                return Err(ExecutionError::InvalidArgument(
+                    "ssh: cwd_relative must be non-empty when cwd_mode is sandbox_relative".into(),
+                ));
+            }
+            if t.starts_with('/') {
+                validate_remote_workdir(t)
+            } else {
+                for seg in t.split('/') {
+                    if seg == ".." {
+                        return Err(ExecutionError::InvalidArgument(
+                            "ssh: cwd_relative must not contain '..' path segments".into(),
+                        ));
+                    }
+                }
+                let root = remote_root.trim_end_matches('/');
+                let rel = t.trim_start_matches('/');
+                let joined = format!("{root}/{rel}");
+                validate_remote_workdir(&joined)
+            }
+        }
+    }
+}
+
+/// `mkdir -p` then `cd` into `wd` (must already pass [`validate_remote_workdir`] so it contains no `'`.
+fn remote_mkdir_cd_prefix(wd: &str) -> Result<String, ExecutionError> {
+    if wd.contains('\'') {
+        return Err(ExecutionError::InvalidArgument(
+            "ssh: remote path must not contain single quotes".into(),
+        ));
+    }
+    Ok(format!("mkdir -p '{wd}' && cd '{wd}' && "))
+}
+
+/// One-shot shell: ensure remote cwd exists, then `exec bash -s`; user source is written to session stdin.
+fn ssh_remote_shell_line(wd: &str) -> Result<String, ExecutionError> {
+    let prefix = remote_mkdir_cd_prefix(wd)?;
+    let line = format!("{prefix}exec bash -s");
+    validate_safe_remote_exec_line(&line)?;
+    Ok(line)
+}
+
+fn ssh_python_repl_exec_line(wd: &str, py: &str) -> Result<String, ExecutionError> {
+    let enc = B64_ENGINE.encode(repl_framing::PYTHON_REPL_BOOTSTRAP.as_bytes());
+    if enc.len() > 400_000 {
+        return Err(ExecutionError::InvalidArgument(
+            "ssh: repl bootstrap encoding unexpectedly large".into(),
+        ));
+    }
+    let prefix = remote_mkdir_cd_prefix(wd)?;
+    let line = format!(
+        "{prefix}exec '{py}' -u -c 'import base64;exec(compile(__import__(\"base64\").standard_b64decode(\"{enc}\"),\"<isanagent>\",\"exec\"))'"
+    );
+    validate_safe_remote_exec_line(&line)?;
+    Ok(line)
+}
+
+fn validate_safe_remote_exec_line(line: &str) -> Result<(), ExecutionError> {
+    if line.contains('`') {
         return Err(ExecutionError::InvalidArgument(
             "ssh: unexpected shell metacharacters in remote exec line".into(),
         ));
     }
-    Ok(line)
+    Ok(())
 }
 
 /// Absolute POSIX path on the remote: `/` + safe characters only, no `..`.
@@ -342,7 +421,69 @@ async fn open_ssh_handle(
     Ok(handle)
 }
 
-async fn run_ssh_channel_exec(
+const SSH_REPL_PROBE_MAX_EACH: usize = 8192;
+
+async fn open_ssh_python_repl_once(
+    conn: &mut SshConnected,
+    cwd: &str,
+    py: &str,
+) -> Result<SshPythonRepl, ExecutionError> {
+    let ch = conn
+        .handle
+        .channel_open_session()
+        .await
+        .map_err(|e| ExecutionError::Provider(format!("ssh: open session channel: {e}")))?;
+    let line = ssh_python_repl_exec_line(cwd, py)?;
+    ch.exec(true, line)
+        .await
+        .map_err(|e| ExecutionError::Provider(format!("ssh: exec: {e}")))?;
+    let stream = ch.into_stream();
+    let (mut read, mut write) = split(stream);
+    match repl_framing::repl_round_trip(&mut write, &mut read, "pass", SSH_REPL_PROBE_MAX_EACH).await
+    {
+        Ok((_stdout, _stderr, code)) if code == 0 => Ok(SshPythonRepl {
+            cwd: cwd.to_string(),
+            read,
+            write,
+        }),
+        Ok((stdout, stderr, code)) => Err(ExecutionError::Provider(format!(
+            "ssh: Python REPL failed self-test on remote (exit {code}); stdout={stdout:?} stderr={stderr:?}. \
+             Check [harness.execution.ssh].remote_python and disk permissions for the cwd."
+        ))),
+        Err(e) => Err(ExecutionError::Provider(format!(
+            "ssh: Python REPL dropped during startup ({e}). \
+             Typical causes: remote_python missing on PATH, shell exec line rejected by sshd, or mkdir/cd failing for the cwd. \
+             If the host was never seen before, set accept_unknown_host_keys or add the host key."
+        ))),
+    }
+}
+
+async fn ensure_ssh_python_repl(
+    conn: &mut SshConnected,
+    cwd: &str,
+    py: &str,
+) -> Result<(), ExecutionError> {
+    let same = conn.python_repl.as_ref().is_some_and(|r| r.cwd == cwd);
+    if same {
+        return Ok(());
+    }
+    conn.python_repl.take();
+    let mut last = None::<ExecutionError>;
+    for _ in 0..2 {
+        match open_ssh_python_repl_once(conn, cwd, py).await {
+            Ok(repl) => {
+                conn.python_repl = Some(repl);
+                return Ok(());
+            }
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        ExecutionError::Provider("ssh: Python REPL could not be started".into())
+    }))
+}
+
+async fn run_ssh_channel_oneway(
     handle: &mut client::Handle<SshClientHandler>,
     remote_exec_line: &str,
     stdin_body: Vec<u8>,
@@ -451,9 +592,12 @@ impl ExecutionProvider for SshExecutionProvider {
         let id = SessionId::new(uuid::Uuid::new_v4().to_string());
         let caps = self.session_caps(&id, &mode);
         let session = Arc::new(SshSession {
-            mode,
+            mode: mode.clone(),
             run_cancel: Mutex::new(None),
-            handle: Arc::new(Mutex::new(Some(handle))),
+            connected: Mutex::new(Some(SshConnected {
+                handle,
+                python_repl: None,
+            })),
         });
         self.sessions.insert(id.clone(), session);
         Ok(SessionHandle {
@@ -467,8 +611,10 @@ impl ExecutionProvider for SshExecutionProvider {
             if let Some(t) = sess.run_cancel.lock().await.take() {
                 t.cancel();
             }
-            if let Some(h) = sess.handle.lock().await.take() {
-                let _ = h.disconnect(Disconnect::ByApplication, "", "").await;
+            let mut cg = sess.connected.lock().await;
+            if let Some(mut c) = cg.take() {
+                c.python_repl.take();
+                let _ = c.handle.disconnect(Disconnect::ByApplication, "", "").await;
             }
             return Ok(());
         }
@@ -480,18 +626,12 @@ impl ExecutionProvider for SshExecutionProvider {
         session_id: &SessionId,
         spec: RunSpec,
     ) -> Result<RunResult, ExecutionError> {
-        if !matches!(spec.cwd, CwdPolicy::SessionDefault) {
-            return Err(ExecutionError::unsupported(
-                "run",
-                "ssh provider only supports cwd_mode session_default (remote cwd is fixed in config)",
-            ));
-        }
-
         let session = self
             .sessions
             .get(session_id)
             .ok_or_else(|| ExecutionError::InvalidSession(session_id.to_string()))?;
         let session = session.value().clone();
+        let sess = session.clone();
         let mode = session.mode.clone();
 
         let cancel = CancellationToken::new();
@@ -511,22 +651,39 @@ impl ExecutionProvider for SshExecutionProvider {
             .min(self.config.max_run_timeout_secs)
             .max(1);
 
-        let remote_line = ssh_remote_exec_line(
-            &self.config.remote_workdir,
-            &self.config.remote_python,
-            &mode,
-        )?;
-        let code_bytes = spec.code.into_bytes();
-        let handle_arc = session.handle.clone();
-        let sid = session_id.to_string();
+        let cwd = resolve_ssh_run_cwd(&self.config.remote_workdir, &spec.cwd)?;
+        let code = spec.code;
+        let remote_py = self.config.remote_python.clone();
         let max_out = self.config.max_output_bytes;
+        let sid = session_id.to_string();
 
         let work = async move {
-            let mut guard = handle_arc.lock().await;
-            let h = guard.as_mut().ok_or_else(|| {
+            let mut cg = sess.connected.lock().await;
+            let conn = cg.as_mut().ok_or_else(|| {
                 ExecutionError::InvalidSession(format!("{sid} (ssh session is not connected)"))
             })?;
-            run_ssh_channel_exec(h, &remote_line, code_bytes, max_out).await
+            match mode {
+                SshExecMode::Python => {
+                    ensure_ssh_python_repl(conn, &cwd, &remote_py).await?;
+                    let repl = conn.python_repl.as_mut().ok_or_else(|| {
+                        ExecutionError::Provider("ssh: repl failed to start".into())
+                    })?;
+                    let max_each = (max_out / 2).max(1024);
+                    let (stdout, stderr, st) = repl_framing::repl_round_trip(
+                        &mut repl.write,
+                        &mut repl.read,
+                        &code,
+                        max_each,
+                    )
+                    .await?;
+                    Ok(RunResult::new(stdout, stderr, Some(st)))
+                }
+                SshExecMode::Shell => {
+                    let line = ssh_remote_shell_line(&cwd)?;
+                    run_ssh_channel_oneway(&mut conn.handle, &line, code.into_bytes(), max_out)
+                        .await
+                }
+            }
         };
 
         let mut jh = tokio::spawn(work);
@@ -549,6 +706,13 @@ impl ExecutionProvider for SshExecutionProvider {
                 Err(e) => Err(ExecutionError::Provider(format!("ssh run join: {e}"))),
             },
         };
+
+        if result.is_err() {
+            let mut cg = session.connected.lock().await;
+            if let Some(c) = cg.as_mut() {
+                c.python_repl.take();
+            }
+        }
 
         *session.run_cancel.lock().await = None;
         result
@@ -590,10 +754,43 @@ mod tests {
     }
 
     #[test]
-    fn remote_exec_line_python() {
-        let s = ssh_remote_exec_line("/tmp/w", "python3", &SshExecMode::Python).unwrap();
+    fn resolve_sandbox_relative_joins_root() {
+        assert_eq!(
+            resolve_ssh_run_cwd(
+                "/home/ubuntu",
+                &CwdPolicy::SandboxRelative("proj/gpu".into())
+            )
+            .unwrap(),
+            "/home/ubuntu/proj/gpu"
+        );
+    }
+
+    #[test]
+    fn resolve_absolute_in_sandbox_relative() {
+        assert_eq!(
+            resolve_ssh_run_cwd(
+                "/home/ubuntu",
+                &CwdPolicy::SandboxRelative("/var/log".into())
+            )
+            .unwrap(),
+            "/var/log"
+        );
+    }
+
+    #[test]
+    fn remote_shell_line() {
+        let s = ssh_remote_shell_line("/tmp/w").unwrap();
+        assert!(s.contains("mkdir -p '/tmp/w'"));
+        assert!(s.contains("cd '/tmp/w'"));
+        assert!(s.contains("bash -s"));
+    }
+
+    #[test]
+    fn python_repl_line_contains_b64() {
+        let s = ssh_python_repl_exec_line("/tmp/w", "python3").unwrap();
+        assert!(s.contains("mkdir -p '/tmp/w'"));
         assert!(s.contains("cd '/tmp/w'"));
         assert!(s.contains("python3"));
-        assert!(s.contains("-u -"));
+        assert!(s.contains("standard_b64decode"));
     }
 }

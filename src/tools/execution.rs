@@ -143,8 +143,9 @@ impl Tool for ExecutionSessionCreateTool {
          Defaults to [harness.execution] default_provider; pass `provider` to pick another \
          currently-available provider when multiple are configured. Provider semantics: \
          local runs under the workspace sandbox; jupyter uses a Jupyter Server kernel \
-         (new or `resume_jupyter_kernel_id`); ssh opens one SSH session to a configured host \
-         (reused until execution_session_close); colab_mcp launches a local Colab MCP bridge \
+         (new or `resume_jupyter_kernel_id`); ssh opens one SSH connection to a configured host \
+         (reused until execution_session_close; Python keeps a persistent remote REPL; shell is one-off per run; \
+         execution_run cwd fields refer to remote paths only for ssh); colab_mcp launches a local Colab MCP bridge \
          process and targets a notebook execution tool exposed by the browser session \
          (CPU/GPU/TPU runtime is chosen in the Colab browser; see `colab_mcp` in the tool \
          result when this provider is active). Misconfigured providers are pruned at startup \
@@ -246,7 +247,7 @@ impl Tool for ExecutionRunTool {
     }
 
     fn description(&self) -> &str {
-        "Run code in an execution_session_create session. Args: session_id, code, timeout_secs (optional — omit only for quick runs; for generation/training set explicitly up to max_wall_secs; use smaller values for probes), description (optional, strongly recommended for Ratatui and logs: short human summary of intent), cwd_mode, cwd_relative. stdout/stderr may be truncated per [harness.execution] limits. Jupyter: live stream events are emitted on the bus for the terminal UI; binary plots and large CSV/JSON are saved under `.execution_artifacts/{session_id}/<run>/` and returned in `attachments`. Each run writes a journal under workspace `.system_generated/execution_history/{provider}/{session_id}/{run_id}/` (`run.json` + `source.txt`). A metadata line is appended to `.system_generated/execution_runs.jsonl` (no code)."
+        "Run code in an execution_session_create session. Args: session_id, code, timeout_secs (optional — omit only for quick runs; for generation/training set explicitly up to max_wall_secs; use smaller values for probes), description (optional, strongly recommended for Ratatui and logs: short human summary of intent), cwd_mode, cwd_relative. stdout/stderr may be truncated per [harness.execution] limits. Jupyter: live stream events are emitted on the bus for the terminal UI; binary plots and large CSV/JSON are saved under `.execution_artifacts/{session_id}/<run>/` and returned in `attachments`. SSH: cwd_mode applies on the remote host (sandbox_relative joins under [harness.execution.ssh].remote_workdir or uses an absolute remote path); Python variables persist across runs in the same session. Each run writes a journal under workspace `.system_generated/execution_history/{provider}/{session_id}/{run_id}/` (`run.json` + `source.txt`). A metadata line is appended to `.system_generated/execution_runs.jsonl` (no code)."
     }
 
     fn parameters(&self) -> Value {
