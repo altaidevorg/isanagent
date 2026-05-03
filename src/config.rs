@@ -174,6 +174,48 @@ pub struct ResolvedShellPolicy {
     pub approval_patterns: Vec<String>,
 }
 
+/// Async JSONL / webhook observation (`[harness.hooks.observation]`).
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HarnessHooksObservationConfig {
+    pub enabled: Option<bool>,
+    /// Path relative to workspace root; append-only JSONL.
+    pub jsonl_path: Option<String>,
+    pub webhook_url: Option<String>,
+    pub webhook_hmac_secret: Option<String>,
+    /// Bounded queue before events are dropped (default 256).
+    pub queue_capacity: Option<usize>,
+    /// Inbound metadata keys copied into each envelope (`hook_metadata`).
+    pub metadata_keys: Option<Vec<String>>,
+}
+
+/// Synchronous command hooks — JSON on stdin, JSON on stdout (see `docs/hooks.md`).
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HarnessHooksSteeringConfig {
+    pub enabled: Option<bool>,
+    pub max_stdout_bytes: Option<usize>,
+    pub default_timeout_ms: Option<u64>,
+    pub pre_tool: Option<Vec<HarnessHookCommandConfig>>,
+    pub post_tool: Option<Vec<HarnessHookCommandConfig>>,
+    pub user_prompt: Option<Vec<HarnessHookCommandConfig>>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct HarnessHookCommandConfig {
+    /// Regex matched against tool name; omit or empty = all tools.
+    pub matcher: Option<String>,
+    pub command: String,
+    pub timeout_ms: Option<u64>,
+    /// Sandbox-relative working directory for the hook subprocess.
+    pub cwd: Option<String>,
+}
+
+/// Lifecycle hooks for observability and policy (`[harness.hooks]`).
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HarnessHooksConfig {
+    pub observation: Option<HarnessHooksObservationConfig>,
+    pub steering: Option<HarnessHooksSteeringConfig>,
+}
+
 /// Optional harness features (see `docs/harness-implementation-plan.md`).
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct HarnessConfig {
@@ -186,6 +228,8 @@ pub struct HarnessConfig {
     pub execution: Option<ExecutionHarnessConfig>,
     /// ML engineer prompt overlay and related defaults.
     pub ml_engineer: Option<MlEngineerHarnessConfig>,
+    /// Observation + steering hooks (disabled unless sub-tables set `enabled = true`).
+    pub hooks: Option<HarnessHooksConfig>,
 }
 
 /// Git worktree helpers (`git_worktree` tool). Disabled unless `[harness.git_worktree] enabled = true`.
@@ -572,6 +616,22 @@ impl AppConfig {
             shell_policy.interactive_mode,
             shell_policy.unattended_mode,
             shell_policy.approval_patterns.len()
+        ));
+        let hooks_obs = self
+            .harness
+            .as_ref()
+            .and_then(|h| h.hooks.as_ref())
+            .and_then(|x| x.observation.as_ref())
+            .is_some_and(|o| o.enabled.unwrap_or(false));
+        let hooks_steer = self
+            .harness
+            .as_ref()
+            .and_then(|h| h.hooks.as_ref())
+            .and_then(|x| x.steering.as_ref())
+            .is_some_and(|s| s.enabled.unwrap_or(false));
+        lines.push(format!(
+            "hooks_observation_enabled={} hooks_steering_enabled={}",
+            hooks_obs, hooks_steer
         ));
         lines
     }

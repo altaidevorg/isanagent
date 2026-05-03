@@ -61,6 +61,8 @@ pub struct SubagentSpawnDeps {
     pub harness_runtime_summary: String,
     /// Shell policy inherited from the parent agent.
     pub shell_policy: std::sync::Arc<ResolvedShellPolicy>,
+    /// Optional hooks (observation + steering), same as parent.
+    pub hook_tool_ctx: Option<std::sync::Arc<crate::hooks::ToolCallHookContext>>,
 }
 
 struct TaskRecord {
@@ -308,6 +310,7 @@ impl SubagentHarness {
             attachments: vec![],
             metadata: HashMap::new(),
         };
+        let inbound_metadata = std::sync::Arc::new(inbound.metadata.clone());
 
         let tool_exec_ctx = ToolExecCtx::new(
             parent_channel.clone(),
@@ -341,6 +344,8 @@ impl SubagentHarness {
             harness_runtime_summary: self.inner.deps.harness_runtime_summary.clone(),
             forbid_final_without_tools: false,
             shell_policy: self.inner.deps.shell_policy.clone(),
+            hook_tool_ctx: self.inner.deps.hook_tool_ctx.clone(),
+            inbound_metadata,
         };
 
         record

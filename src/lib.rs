@@ -12,6 +12,7 @@ pub mod channels;
 pub mod clarification;
 pub mod config;
 pub mod execution;
+pub mod hooks;
 pub mod logging;
 pub mod memory;
 pub mod ml_engineer;
