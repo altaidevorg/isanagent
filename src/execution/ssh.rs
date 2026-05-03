@@ -548,23 +548,9 @@ async fn run_ssh_channel_oneway(
 
 fn truncate_run_result(mut r: RunResult, max_total: usize) -> RunResult {
     let max_each = (max_total / 2).max(1024);
-    r.stdout = truncate_utf8_string(&r.stdout, max_each);
-    r.stderr = truncate_utf8_string(&r.stderr, max_each);
+    r.stdout = repl_framing::truncate_utf8_str_cap(&r.stdout, max_each);
+    r.stderr = repl_framing::truncate_utf8_str_cap(&r.stderr, max_each);
     r
-}
-
-fn truncate_utf8_string(s: &str, max: usize) -> String {
-    let mut o = s.to_string();
-    if o.len() <= max {
-        return o;
-    }
-    let mut end = max;
-    while end > 0 && !o.is_char_boundary(end) {
-        end -= 1;
-    }
-    o.truncate(end);
-    o.push_str("\n... (truncated)");
-    o
 }
 
 #[async_trait]

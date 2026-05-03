@@ -126,15 +126,21 @@ pub async fn repl_round_trip<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     Ok((stdout, stderr, st as i32))
 }
 
-fn string_from_utf8_lossy_trim_cap(raw: Vec<u8>, max_each: usize) -> String {
-    let mut s = String::from_utf8_lossy(&raw).into_owned();
-    if s.len() > max_each {
-        let mut end = max_each;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        s.truncate(end);
-        s.push_str("\n... (truncated)");
+/// Truncate UTF-8 text to at most `max` **bytes** (not graphemes), on a char boundary, appending a marker when truncated.
+pub fn truncate_utf8_str_cap(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
     }
-    s
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut o = s[..end].to_string();
+    o.push_str("\n... (truncated)");
+    o
+}
+
+/// Lossy UTF-8 decode then [`truncate_utf8_str_cap`].
+pub fn string_from_utf8_lossy_trim_cap(raw: Vec<u8>, max_each: usize) -> String {
+    truncate_utf8_str_cap(&String::from_utf8_lossy(&raw), max_each)
 }

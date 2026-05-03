@@ -62,6 +62,10 @@ pub use mcp_call_history::{
 pub use post_run::{persist_successful_execution_run, PersistSuccessfulExecutionRunParams};
 pub use preflight::{allowed_optional_tool_tags, PREFLIGHT_MARKDOWN};
 pub use provider::{ExecutionProvider, PackageOperations, SshRemoteShell};
+pub use repl_framing::{
+    repl_round_trip, string_from_utf8_lossy_trim_cap, truncate_utf8_str_cap, MAX_REPL_SOURCE_BYTES,
+    PYTHON_REPL_BOOTSTRAP,
+};
 pub use run::{
     CwdPolicy, RunAttachmentRef, RunResult, RunSpec, SessionCreateRequest, SessionHandle,
 };

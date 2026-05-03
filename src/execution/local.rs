@@ -22,7 +22,7 @@ use super::capabilities::{
 use super::error::ExecutionError;
 use super::ids::SessionId;
 use super::provider::ExecutionProvider;
-use super::repl_framing::{self, PYTHON_REPL_BOOTSTRAP};
+use super::repl_framing::{self, string_from_utf8_lossy_trim_cap, PYTHON_REPL_BOOTSTRAP};
 use super::run::{CwdPolicy, RunResult, RunSpec, SessionCreateRequest, SessionHandle};
 use crate::tool_runtime::emit_tool_progress_message;
 use crate::tools::builtin::resolve_path;
@@ -888,20 +888,6 @@ async fn drain_child_pipes(
     let stdout = string_from_utf8_lossy_trim_cap(out, max_each);
     let stderr = string_from_utf8_lossy_trim_cap(err, max_each);
     Ok(RunResult::new(stdout, stderr, status.code()))
-}
-
-fn string_from_utf8_lossy_trim_cap(bytes: Vec<u8>, max_chars: usize) -> String {
-    let mut s = String::from_utf8_lossy(&bytes).into_owned();
-    if s.len() <= max_chars {
-        return s;
-    }
-    let mut end = max_chars;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s.truncate(end);
-    s.push_str("\n... (truncated)");
-    s
 }
 
 fn compute_uv_env_key(config: &LocalExecutionConfig) -> String {
