@@ -441,7 +441,7 @@ async fn open_ssh_python_repl_once(
     let (mut read, mut write) = split(stream);
     match repl_framing::repl_round_trip(&mut write, &mut read, "pass", SSH_REPL_PROBE_MAX_EACH).await
     {
-        Ok((_stdout, _stderr, code)) if code == 0 => Ok(SshPythonRepl {
+        Ok((_stdout, _stderr, 0)) => Ok(SshPythonRepl {
             cwd: cwd.to_string(),
             read,
             write,

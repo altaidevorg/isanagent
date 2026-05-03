@@ -14,6 +14,10 @@ use crate::tool_runtime::{with_tool_exec_and_progress_scope, ToolExecCtx, ToolPr
 
 use crate::bus::{BusMessage, LogEvent, OutboundMessage, TelemetryEvent};
 use crate::config::{ResolvedShellPolicy, ShellPolicyMode};
+use crate::hooks::{
+    run_post_tool_hooks, run_pre_tool_hooks, run_user_prompt_hooks, HookObservationMeta,
+    HookSessionInfo, PreToolOutcome, ToolCallHookContext, UserPromptHookOutcome,
+};
 use crate::logging::LoggerHandle;
 use crate::memory::{MemoryMessage, SharedReply, TodoRow};
 use crate::session::SessionManager;
@@ -150,6 +154,28 @@ fn command_preview(command: &str) -> String {
     }
 }
 
+fn hook_observe_telemetry(
+    hook_tool_ctx: Option<&Arc<ToolCallHookContext>>,
+    inbound: &crate::bus::InboundMessage,
+    is_subagent: bool,
+    event: TelemetryEvent,
+) {
+    let Some(hc) = hook_tool_ctx else {
+        return;
+    };
+    let Some(obs) = hc.observation.as_ref() else {
+        return;
+    };
+    let meta = HookObservationMeta {
+        channel: inbound.channel.as_str(),
+        chat_id: inbound.chat_id.as_str(),
+        thread_id: inbound.thread_id.as_deref(),
+        is_subagent,
+        metadata: &inbound.metadata,
+    };
+    obs.try_emit(event, meta);
+}
+
 fn shell_command_uses_grep_like(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
     lower.contains("grep ")
@@ -161,9 +187,11 @@ fn shell_command_uses_grep_like(command: &str) -> bool {
 async fn log_tool_invocation_start(
     logger_tx: &LoggerHandle,
     outbound_tx: &mpsc::Sender<BusMessage>,
+    hook_tool_ctx: Option<&Arc<ToolCallHookContext>>,
     agent_name: &str,
     inbound: &crate::bus::InboundMessage,
     tc: &crate::utils::ToolCallRequest,
+    is_subagent: bool,
 ) {
     let tool_name = &tc.function.name;
     let args_str = &tc.function.arguments;
@@ -187,6 +215,28 @@ async fn log_tool_invocation_start(
             args: args_str.clone(),
         }))
         .await;
+    hook_observe_telemetry(
+        hook_tool_ctx,
+        inbound,
+        is_subagent,
+        TelemetryEvent::ToolCall {
+            chat_id: inbound.chat_id.clone(),
+            channel: inbound.channel.clone(),
+            tool_name: tool_name.to_string(),
+            args: args_str.clone(),
+            tool_call_id: Some(tc.id.clone()),
+        },
+    );
+    hook_observe_telemetry(
+        hook_tool_ctx,
+        inbound,
+        is_subagent,
+        TelemetryEvent::ToolCallStarted {
+            chat_id: inbound.chat_id.clone(),
+            tool_name: tool_name.to_string(),
+            args: args_str.clone(),
+        },
+    );
 }
 
 /// Session-scoped wiring for tools that need the active chat (e.g. `ask_user`).
@@ -198,6 +248,8 @@ struct ToolCallRuntime {
     subagent_allowlist: Option<Arc<HashSet<String>>>,
     shell_policy: Arc<ResolvedShellPolicy>,
     unattended_session: bool,
+    hook_tool_ctx: Option<Arc<ToolCallHookContext>>,
+    inbound_metadata: Arc<HashMap<String, serde_json::Value>>,
 }
 
 /// Runs a tool with optional per-call activity heartbeats and optional cooperative cancellation.
@@ -217,12 +269,14 @@ async fn execute_tool_call_with_activity(
     let session_key = runtime.session.session_key.clone();
     let hub = Arc::clone(&runtime.hub);
     let tool_exec_ctx = runtime.session;
+    let thread_id_for_hooks = tool_exec_ctx.thread_id.clone();
     let chat_id = chat_id.to_string();
     let tool_name = tool_name.to_string();
     let channel = channel.to_string();
     let tools = Arc::clone(tools);
     let outbound_tx = outbound_tx.clone();
     let cancel_owned = cancel_token.cloned();
+    let tool_call_id_for_hooks = tool_call_id.clone();
     let progress_emitter = ToolProgressEmitter {
         outbound_tx: outbound_tx.clone(),
         channel: channel.clone(),
@@ -232,7 +286,7 @@ async fn execute_tool_call_with_activity(
     };
 
     with_tool_exec_and_progress_scope(tool_exec_ctx, progress_emitter, async move {
-        let args = args;
+        let mut args = args;
         let activity_handle = tool_execution_activity
             .as_ref()
             .map(|a| a.start(chat_id.as_str(), tool_name.as_str()));
@@ -338,6 +392,36 @@ async fn execute_tool_call_with_activity(
                 }
             }
         }
+
+        if let Some(ref hc) = runtime.hook_tool_ctx {
+            if let Some(st) = &hc.steering {
+                let hook_session = HookSessionInfo {
+                    channel: channel.as_str(),
+                    chat_id: chat_id.as_str(),
+                    thread_id: thread_id_for_hooks.as_deref(),
+                    metadata: runtime.inbound_metadata.as_ref(),
+                    is_subagent: runtime.is_subagent,
+                };
+                match run_pre_tool_hooks(
+                    st.as_ref(),
+                    &tool_name,
+                    tool_call_id_for_hooks.as_deref(),
+                    args.clone(),
+                    hook_session,
+                )
+                .await
+                {
+                    PreToolOutcome::Block(msg) => {
+                        return ToolExecutionFinished::Completed(Err(msg));
+                    }
+                    PreToolOutcome::Proceed(new_args) => {
+                        args = new_args;
+                    }
+                }
+            }
+        }
+
+        let args_for_post = args.clone();
         let completed = match cancel_owned.as_ref() {
             None => Some(
                 tools
@@ -356,6 +440,31 @@ async fn execute_tool_call_with_activity(
                 }
             }
         };
+
+        if let Some(ref hc) = runtime.hook_tool_ctx {
+            if let Some(st) = &hc.steering {
+                let res_for_hook = match &completed {
+                    Some(r) => r.clone(),
+                    None => Err("tool call cancelled".to_string()),
+                };
+                let hook_session = HookSessionInfo {
+                    channel: channel.as_str(),
+                    chat_id: chat_id.as_str(),
+                    thread_id: thread_id_for_hooks.as_deref(),
+                    metadata: runtime.inbound_metadata.as_ref(),
+                    is_subagent: runtime.is_subagent,
+                };
+                run_post_tool_hooks(
+                    st.as_ref(),
+                    &tool_name,
+                    tool_call_id_for_hooks.as_deref(),
+                    &args_for_post,
+                    &res_for_hook,
+                    hook_session,
+                )
+                .await;
+            }
+        }
 
         if let Some(handle) = activity_handle {
             handle.stop().await;
@@ -397,6 +506,7 @@ struct ReasoningSpawnArgs {
     harness_runtime_summary: String,
     forbid_final_without_tools: bool,
     shell_policy: Arc<ResolvedShellPolicy>,
+    hook_tool_ctx: Option<Arc<ToolCallHookContext>>,
 }
 
 fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus::InboundMessage) {
@@ -435,6 +545,8 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
     .with_reasoning_cancel(cancel_token.as_ref().clone());
     let inbound_channel = inbound.channel.clone();
     let inbound_thread_id = inbound.thread_id.clone();
+    let inbound_metadata = Arc::new(inbound.metadata.clone());
+    let hook_tool_ctx = args.hook_tool_ctx.clone();
 
     tokio::spawn(async move {
         let task_chat_id = chat_id.clone();
@@ -474,6 +586,8 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
             harness_runtime_summary: harness_runtime_summary.clone(),
             forbid_final_without_tools,
             shell_policy: shell_policy.clone(),
+            hook_tool_ctx,
+            inbound_metadata,
         })
         .await;
 
@@ -559,6 +673,8 @@ pub(crate) struct ReasoningLoopCtx {
     pub(crate) harness_runtime_summary: String,
     pub(crate) forbid_final_without_tools: bool,
     pub(crate) shell_policy: Arc<ResolvedShellPolicy>,
+    pub(crate) hook_tool_ctx: Option<Arc<ToolCallHookContext>>,
+    pub(crate) inbound_metadata: Arc<HashMap<String, serde_json::Value>>,
 }
 
 /// Constructor arguments for [`AgentLogic`], grouped to keep call sites readable.
@@ -589,6 +705,8 @@ pub struct AgentLogicParams {
     pub forbid_final_without_tools: bool,
     /// Shell command safety policy (`exec`) resolved from config.
     pub shell_policy: ResolvedShellPolicy,
+    /// Optional observation + steering hooks (`[harness.hooks]`).
+    pub hook_tool_ctx: Option<Arc<ToolCallHookContext>>,
 }
 
 /// Build-time options for the Phase 5 sub-agent harness (see `[harness.subagents]`).
@@ -626,6 +744,7 @@ pub struct AgentLogic {
     harness_runtime_summary: String,
     forbid_final_without_tools: bool,
     shell_policy: Arc<ResolvedShellPolicy>,
+    hook_tool_ctx: Option<Arc<ToolCallHookContext>>,
 }
 
 impl AgentLogic {
@@ -651,6 +770,7 @@ impl AgentLogic {
             subagent_system_prompt,
             forbid_final_without_tools,
             shell_policy,
+            hook_tool_ctx,
         } = params;
 
         let harness_for_subagent = harness_runtime_summary.clone();
@@ -684,6 +804,7 @@ impl AgentLogic {
                 memory_node: memory_node.clone(),
                 harness_runtime_summary: harness_for_subagent.clone(),
                 shell_policy: shell_policy.clone(),
+                hook_tool_ctx: hook_tool_ctx.clone(),
             }))
         });
 
@@ -710,6 +831,7 @@ impl AgentLogic {
             harness_runtime_summary,
             forbid_final_without_tools,
             shell_policy: shell_policy.clone(),
+            hook_tool_ctx,
         };
 
         let tools_mut = Arc::get_mut(&mut agent.tools)
@@ -762,6 +884,7 @@ impl AgentLogic {
             harness_runtime_summary: self.harness_runtime_summary.clone(),
             forbid_final_without_tools: self.forbid_final_without_tools,
             shell_policy: self.shell_policy.clone(),
+            hook_tool_ctx: self.hook_tool_ctx.clone(),
         }
     }
 
@@ -789,6 +912,8 @@ impl AgentLogic {
                 subagent_allowlist: None,
                 shell_policy: self.shell_policy.clone(),
                 unattended_session: false,
+                hook_tool_ctx: None,
+                inbound_metadata: Arc::new(HashMap::new()),
             },
         )
         .await
@@ -1031,6 +1156,8 @@ impl AgentLogic {
             harness_runtime_summary,
             forbid_final_without_tools,
             shell_policy,
+            hook_tool_ctx,
+            inbound_metadata,
         } = ctx;
 
         let session_key = tool_exec_ctx.session_key.clone();
@@ -1102,7 +1229,31 @@ impl AgentLogic {
         }
         runtime_context.push_str(crate::utils::RUNTIME_CONTEXT_END_SUFFIX);
 
-        let contextualized_content = format!("{}{}", runtime_context, inbound.content);
+        let mut contextualized_content = format!("{}{}", runtime_context, inbound.content);
+        if let Some(ref hc) = hook_tool_ctx {
+            if let Some(st) = &hc.steering {
+                let hook_session = HookSessionInfo {
+                    channel: inbound.channel.as_str(),
+                    chat_id: inbound.chat_id.as_str(),
+                    thread_id: inbound.thread_id.as_deref(),
+                    metadata: &inbound.metadata,
+                    is_subagent,
+                };
+                match run_user_prompt_hooks(
+                    st.as_ref(),
+                    contextualized_content.as_str(),
+                    hook_session,
+                )
+                .await
+                {
+                    UserPromptHookOutcome::Block(msg) => return Err(msg),
+                    UserPromptHookOutcome::InjectPrefix(prefix) => {
+                        contextualized_content = format!("{}\n{}", prefix, contextualized_content);
+                    }
+                    UserPromptHookOutcome::Proceed => {}
+                }
+            }
+        }
 
         // Build the user message – multimodal when attachments are present
         let user_msg = if inbound.attachments.is_empty() {
@@ -1282,15 +1433,17 @@ impl AgentLogic {
 
             // Log USAGE telemetry
             if let Some(usage) = &response.usage {
+                let usage_evt = TelemetryEvent::AgentUsage {
+                    chat_id: inbound.chat_id.clone(),
+                    model: "llm_provider".to_string(),
+                    prompt_tokens: usage.prompt_tokens,
+                    completion_tokens: usage.completion_tokens,
+                    total_tokens: usage.total_tokens,
+                };
                 let _ = outbound_tx
-                    .send(BusMessage::Telemetry(TelemetryEvent::AgentUsage {
-                        chat_id: inbound.chat_id.clone(),
-                        model: "llm_provider".to_string(),
-                        prompt_tokens: usage.prompt_tokens,
-                        completion_tokens: usage.completion_tokens,
-                        total_tokens: usage.total_tokens,
-                    }))
+                    .send(BusMessage::Telemetry(usage_evt.clone()))
                     .await;
+                hook_observe_telemetry(hook_tool_ctx.as_ref(), &inbound, is_subagent, usage_evt);
             }
 
             // Emit REASONING block as telemetry
@@ -1347,13 +1500,23 @@ impl AgentLogic {
                         if cancel_token.is_cancelled() {
                             return Ok(String::new());
                         }
-                        log_tool_invocation_start(&logger_tx, &outbound_tx, &name, &inbound, tc)
-                            .await;
+                        log_tool_invocation_start(
+                            &logger_tx,
+                            &outbound_tx,
+                            hook_tool_ctx.as_ref(),
+                            &name,
+                            &inbound,
+                            tc,
+                            is_subagent,
+                        )
+                        .await;
                     }
                     let mut futures_vec = Vec::with_capacity(tool_calls.len());
                     for tc in tool_calls.iter() {
                         let tools = Arc::clone(&tools);
                         let tool_execution_activity = tool_execution_activity.clone();
+                        let hook_for_tool = hook_tool_ctx.clone();
+                        let inbound_meta_for_tool = inbound_metadata.clone();
                         let chat_id = inbound.chat_id.clone();
                         let tool_name = tc.function.name.clone();
                         let args =
@@ -1400,6 +1563,8 @@ impl AgentLogic {
                                     subagent_allowlist,
                                     shell_policy: shell_policy_for_call,
                                     unattended_session,
+                                    hook_tool_ctx: hook_for_tool,
+                                    inbound_metadata: inbound_meta_for_tool,
                                 },
                             )
                             .await
@@ -1416,22 +1581,22 @@ impl AgentLogic {
                         };
                         let tool_result_text = finalize_tool_output(tool_result);
                         let tool_name = tc.function.name.clone();
-                        let _ = outbound_tx
-                            .send(BusMessage::Telemetry(TelemetryEvent::ToolResult {
-                                chat_id: inbound.chat_id.clone(),
-                                channel: inbound.channel.clone(),
-                                tool_name: tool_name.clone(),
-                                result: tool_result_text.clone(),
-                                tool_call_id: Some(tc.id.clone()),
-                            }))
-                            .await;
-                        let _ = outbound_tx
-                            .send(BusMessage::Telemetry(TelemetryEvent::ToolCallFinished {
-                                chat_id: inbound.chat_id.clone(),
-                                tool_name,
-                                result: tool_result_text.clone(),
-                            }))
-                            .await;
+                        let tr = TelemetryEvent::ToolResult {
+                            chat_id: inbound.chat_id.clone(),
+                            channel: inbound.channel.clone(),
+                            tool_name: tool_name.clone(),
+                            result: tool_result_text.clone(),
+                            tool_call_id: Some(tc.id.clone()),
+                        };
+                        let _ = outbound_tx.send(BusMessage::Telemetry(tr.clone())).await;
+                        hook_observe_telemetry(hook_tool_ctx.as_ref(), &inbound, is_subagent, tr);
+                        let tfin = TelemetryEvent::ToolCallFinished {
+                            chat_id: inbound.chat_id.clone(),
+                            tool_name,
+                            result: tool_result_text.clone(),
+                        };
+                        let _ = outbound_tx.send(BusMessage::Telemetry(tfin.clone())).await;
+                        hook_observe_telemetry(hook_tool_ctx.as_ref(), &inbound, is_subagent, tfin);
                         mem.add_message(crate::utils::ChatMessage::tool(&tool_result_text, &tc.id))
                             .await?;
                     }
@@ -1442,8 +1607,16 @@ impl AgentLogic {
                             return Ok(String::new());
                         }
 
-                        log_tool_invocation_start(&logger_tx, &outbound_tx, &name, &inbound, tc)
-                            .await;
+                        log_tool_invocation_start(
+                            &logger_tx,
+                            &outbound_tx,
+                            hook_tool_ctx.as_ref(),
+                            &name,
+                            &inbound,
+                            tc,
+                            is_subagent,
+                        )
+                        .await;
 
                         let tool_name = &tc.function.name;
                         let args_str = &tc.function.arguments;
@@ -1482,6 +1655,8 @@ impl AgentLogic {
                                 subagent_allowlist: subagent_allowlist.clone(),
                                 shell_policy: shell_policy.clone(),
                                 unattended_session,
+                                hook_tool_ctx: hook_tool_ctx.clone(),
+                                inbound_metadata: inbound_metadata.clone(),
                             },
                         )
                         .await
@@ -1492,22 +1667,23 @@ impl AgentLogic {
 
                         let tool_result_text = finalize_tool_output(tool_result);
 
-                        let _ = outbound_tx
-                            .send(BusMessage::Telemetry(TelemetryEvent::ToolResult {
-                                chat_id: inbound.chat_id.clone(),
-                                channel: inbound.channel.clone(),
-                                tool_name: tool_name.to_string(),
-                                result: tool_result_text.clone(),
-                                tool_call_id: Some(tc.id.clone()),
-                            }))
-                            .await;
-                        let _ = outbound_tx
-                            .send(BusMessage::Telemetry(TelemetryEvent::ToolCallFinished {
-                                chat_id: inbound.chat_id.clone(),
-                                tool_name: tool_name.to_string(),
-                                result: tool_result_text.clone(),
-                            }))
-                            .await;
+                        let tr = TelemetryEvent::ToolResult {
+                            chat_id: inbound.chat_id.clone(),
+                            channel: inbound.channel.clone(),
+                            tool_name: tool_name.to_string(),
+                            result: tool_result_text.clone(),
+                            tool_call_id: Some(tc.id.clone()),
+                        };
+                        let _ = outbound_tx.send(BusMessage::Telemetry(tr.clone())).await;
+                        hook_observe_telemetry(hook_tool_ctx.as_ref(), &inbound, is_subagent, tr);
+                        let tn = tool_name.to_string();
+                        let tfin = TelemetryEvent::ToolCallFinished {
+                            chat_id: inbound.chat_id.clone(),
+                            tool_name: tn,
+                            result: tool_result_text.clone(),
+                        };
+                        let _ = outbound_tx.send(BusMessage::Telemetry(tfin.clone())).await;
+                        hook_observe_telemetry(hook_tool_ctx.as_ref(), &inbound, is_subagent, tfin);
 
                         mem.add_message(crate::utils::ChatMessage::tool(&tool_result_text, &tc.id))
                             .await?;
@@ -2068,6 +2244,7 @@ mod tests {
                 unattended_mode: crate::config::ShellPolicyMode::Deny,
                 approval_patterns: Vec::new(),
             },
+            hook_tool_ctx: None,
         });
 
         (agent, outbound_rx)
@@ -2124,6 +2301,7 @@ mod tests {
                 unattended_mode: crate::config::ShellPolicyMode::Deny,
                 approval_patterns: Vec::new(),
             },
+            hook_tool_ctx: None,
         });
 
         if let Some(tool_execution_activity) = tool_execution_activity {
