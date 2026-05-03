@@ -22,6 +22,7 @@ use super::capabilities::{
 use super::error::ExecutionError;
 use super::ids::SessionId;
 use super::provider::ExecutionProvider;
+use super::repl_framing::{self, string_from_utf8_lossy_trim_cap, PYTHON_REPL_BOOTSTRAP};
 use super::run::{CwdPolicy, RunResult, RunSpec, SessionCreateRequest, SessionHandle};
 use crate::tool_runtime::emit_tool_progress_message;
 use crate::tools::builtin::resolve_path;
@@ -126,33 +127,6 @@ struct ReplPythonChild {
     stdout: tokio::process::ChildStdout,
     child: Child,
 }
-
-/// Max UTF-8 source bytes per REPL round-trip (defense in depth; matches Python worker bound).
-const MAX_REPL_SOURCE_BYTES: usize = 16 * 1024 * 1024;
-
-/// Embedded worker: read `>I` length + UTF-8 source, `exec` in shared namespace, reply `>III` + payloads.
-const PYTHON_REPL_BOOTSTRAP: &str = r#"import struct,sys,traceback,io,contextlib
-_g={}
-while 1:
- h=sys.stdin.buffer.read(4)
- if len(h)<4:
-  sys.exit(0)
- n=int.from_bytes(h,'big')
- if n>16777216 or n<0:
-  sys.exit(2)
- s=sys.stdin.buffer.read(n).decode('utf-8','replace')
- o,e=io.StringIO(),io.StringIO()
- c=0
- try:
-  with contextlib.redirect_stdout(o),contextlib.redirect_stderr(e):
-   exec(compile(s,'<isanagent>','exec'),_g,_g)
- except Exception:
-  traceback.print_exc(file=e)
-  c=1
- ob,eb=o.getvalue().encode('utf-8','backslashreplace'),e.getvalue().encode('utf-8','backslashreplace')
- sys.stdout.buffer.write(struct.pack('>III',c,len(ob),len(eb))+ob+eb)
- sys.stdout.buffer.flush()
-"#;
 
 /// Host `python` invocation for REPL and subprocess runs. On Windows, bare `python` / `python3`
 /// often resolve to Store stubs that exit immediately; use the `py -3` launcher instead.
@@ -602,48 +576,6 @@ async fn shutdown_repl_locked(m: &Mutex<Option<ReplPythonChild>>) {
     }
 }
 
-async fn read_exact<R: tokio::io::AsyncRead + Unpin>(
-    r: &mut R,
-    buf: &mut [u8],
-) -> Result<(), ExecutionError> {
-    let mut off = 0;
-    while off < buf.len() {
-        let n = r
-            .read(&mut buf[off..])
-            .await
-            .map_err(|e| ExecutionError::Provider(format!("repl read: {e}")))?;
-        if n == 0 {
-            return Err(ExecutionError::Provider(
-                "repl: unexpected EOF from child".into(),
-            ));
-        }
-        off += n;
-    }
-    Ok(())
-}
-
-/// Read `total` bytes from `r`, keeping at most `cap` bytes in the returned buffer (rest discarded).
-async fn read_exact_capped<R: tokio::io::AsyncRead + Unpin>(
-    r: &mut R,
-    total: usize,
-    cap: usize,
-) -> Result<Vec<u8>, ExecutionError> {
-    let mut out = Vec::new();
-    let mut remaining = total;
-    let mut buf = [0u8; 16384];
-    while remaining > 0 {
-        let chunk = remaining.min(buf.len());
-        read_exact(r, &mut buf[..chunk]).await?;
-        if out.len() < cap {
-            let room = cap.saturating_sub(out.len());
-            let take = chunk.min(room);
-            out.extend_from_slice(&buf[..take]);
-        }
-        remaining -= chunk;
-    }
-    Ok(out)
-}
-
 #[async_trait]
 impl ExecutionProvider for LocalExecutionProvider {
     fn provider_id(&self) -> &str {
@@ -759,41 +691,14 @@ impl ExecutionProvider for LocalExecutionProvider {
                     let repl = g
                         .as_mut()
                         .ok_or_else(|| ExecutionError::Provider("local repl unavailable".into()))?;
-                    let cbytes = code.as_bytes();
-                    if cbytes.len() > MAX_REPL_SOURCE_BYTES {
-                        return Err(ExecutionError::InvalidArgument(format!(
-                            "code exceeds max repl bytes ({MAX_REPL_SOURCE_BYTES})"
-                        )));
-                    }
-                    let len_u = cbytes.len() as u32;
-                    repl.stdin
-                        .write_all(&len_u.to_be_bytes())
-                        .await
-                        .map_err(|e| ExecutionError::Provider(format!("repl stdin: {e}")))?;
-                    repl.stdin
-                        .write_all(cbytes)
-                        .await
-                        .map_err(|e| ExecutionError::Provider(format!("repl stdin: {e}")))?;
-                    repl.stdin
-                        .flush()
-                        .await
-                        .map_err(|e| ExecutionError::Provider(format!("repl stdin: {e}")))?;
-                    let mut hdr = [0u8; 12];
-                    read_exact(&mut repl.stdout, &mut hdr).await?;
-                    let st = u32::from_be_bytes(hdr[0..4].try_into().unwrap());
-                    let olen = u32::from_be_bytes(hdr[4..8].try_into().unwrap()) as usize;
-                    let elen = u32::from_be_bytes(hdr[8..12].try_into().unwrap()) as usize;
-                    const MAX_REPLY: usize = 64 * 1024 * 1024;
-                    if olen > MAX_REPLY || elen > MAX_REPLY {
-                        return Err(ExecutionError::Provider(
-                            "repl: invalid output length from worker".into(),
-                        ));
-                    }
-                    let out_raw = read_exact_capped(&mut repl.stdout, olen, max_each).await?;
-                    let err_raw = read_exact_capped(&mut repl.stdout, elen, max_each).await?;
-                    let stdout = string_from_utf8_lossy_trim_cap(out_raw, max_each);
-                    let stderr = string_from_utf8_lossy_trim_cap(err_raw, max_each);
-                    Ok(RunResult::new(stdout, stderr, Some(st as i32)))
+                    let (stdout, stderr, st) = repl_framing::repl_round_trip(
+                        &mut repl.stdin,
+                        &mut repl.stdout,
+                        &code,
+                        max_each,
+                    )
+                    .await?;
+                    Ok(RunResult::new(stdout, stderr, Some(st)))
                 };
 
                 tokio::select! {
@@ -983,20 +888,6 @@ async fn drain_child_pipes(
     let stdout = string_from_utf8_lossy_trim_cap(out, max_each);
     let stderr = string_from_utf8_lossy_trim_cap(err, max_each);
     Ok(RunResult::new(stdout, stderr, status.code()))
-}
-
-fn string_from_utf8_lossy_trim_cap(bytes: Vec<u8>, max_chars: usize) -> String {
-    let mut s = String::from_utf8_lossy(&bytes).into_owned();
-    if s.len() <= max_chars {
-        return s;
-    }
-    let mut end = max_chars;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s.truncate(end);
-    s.push_str("\n... (truncated)");
-    s
 }
 
 fn compute_uv_env_key(config: &LocalExecutionConfig) -> String {

@@ -27,6 +27,7 @@ mod mcp_call_history;
 mod post_run;
 mod preflight;
 mod provider;
+mod repl_framing;
 mod run;
 mod run_events;
 mod run_history;
@@ -61,9 +62,15 @@ pub use mcp_call_history::{
 pub use post_run::{persist_successful_execution_run, PersistSuccessfulExecutionRunParams};
 pub use preflight::{allowed_optional_tool_tags, PREFLIGHT_MARKDOWN};
 pub use provider::{ExecutionProvider, PackageOperations, SshRemoteShell};
+pub use repl_framing::{
+    repl_round_trip, string_from_utf8_lossy_trim_cap, truncate_utf8_str_cap, MAX_REPL_SOURCE_BYTES,
+    PYTHON_REPL_BOOTSTRAP,
+};
 pub use run::{
     CwdPolicy, RunAttachmentRef, RunResult, RunSpec, SessionCreateRequest, SessionHandle,
 };
 pub use run_events::RunEvent;
 pub use run_history::{run_history_dir, write_run_journal, RunJournal, RunJournalParams};
-pub use ssh::{validate_remote_workdir, SshExecutionProvider, SshExecutionProviderConfig};
+pub use ssh::{
+    resolve_ssh_run_cwd, validate_remote_workdir, SshExecutionProvider, SshExecutionProviderConfig,
+};
