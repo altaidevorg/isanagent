@@ -11,6 +11,7 @@ When `enabled = true`, non-blocking events are written to optional **JSONL** (pa
 - **`metadata_keys`**: list of inbound metadata keys copied into each envelope under `hook_metadata` (for tenant routing). Only keys present on the inbound message are included.
 - **`queue_capacity`**: bounded async queue (default 256); when full, additional events are dropped silently.
 - **`webhook_hmac_secret`**: when set, requests include header `X-Isanagent-Hook-Signature: sha256=<hex>` (HMAC-SHA256 over the raw POST body).
+- **Webhook retries**: up to **3** POST attempts; on failure, waits with **exponential backoff** (250ms base, doubling per retry, capped at 15s) plus **jitter** (derived from wall-clock time) before the next attempt, to avoid hammering a sick endpoint.
 
 ### Envelope (`schema_version` = 1)
 
@@ -48,7 +49,7 @@ queue_capacity = 512
 
 When `enabled = true`, the agent runs external **shell commands** at fixed lifecycle points. Commands receive **JSON on stdin** (UTF-8). On success (exit code 0), **stdout** may contain a small JSON object to influence behavior.
 
-- **`default_timeout_ms`**, **`max_stdout_bytes`**: bounds per hook (defaults 30_000 ms, 64 KiB stdout).
+- **`default_timeout_ms`**, **`max_stdout_bytes`**: bounds per hook (defaults 30_000 ms, 64 KiB stdout). Per-hook and default `timeout_ms` values are **clamped to at least 1000 ms** (and the subprocess wait uses the same floor) so hooks stay usable under load.
 - **`matcher`**: optional regex against **tool name** for `pre_tool` / `post_tool`; omitted or empty matches all tools.
 - **`cwd`**: optional path relative to **sandbox** (`workspace/.agents`); default is sandbox root. Paths are joined lexically under the sandbox (no escape via `..`).
 

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
 use hmac::{Hmac, Mac};
@@ -138,15 +139,37 @@ async fn append_jsonl(path: &Path, envelope: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Milliseconds to wait after webhook attempt `attempt_index` fails (`0` = first backoff).
+/// Uses exponential backoff (capped) plus jitter from wall-clock nanos (no extra RNG dependency).
+fn webhook_retry_delay_ms(attempt_index: usize) -> u64 {
+    const BASE_MS: u64 = 250;
+    const MAX_BACKOFF_MS: u64 = 15_000;
+    let shift = attempt_index.min(16) as u32;
+    let exp = BASE_MS
+        .saturating_mul(1u64.checked_shl(shift).unwrap_or(u64::MAX))
+        .min(MAX_BACKOFF_MS);
+    let jitter_span = (exp / 5).clamp(25, 5_000);
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| {
+            let mix =
+                (d.subsec_nanos() as u64).wrapping_add(d.as_secs().wrapping_mul(1_000_000_037));
+            mix % (jitter_span + 1)
+        })
+        .unwrap_or(0);
+    exp.saturating_add(jitter)
+}
+
 async fn post_webhook(
     client: &reqwest::Client,
     url: &str,
     hmac_secret: &Option<String>,
     envelope: &Value,
 ) -> Result<(), String> {
+    const MAX_ATTEMPTS: usize = 3;
     let body = serde_json::to_vec(envelope).map_err(|e| format!("encode body: {}", e))?;
-    let mut retries = 0usize;
-    loop {
+
+    for attempt in 0..MAX_ATTEMPTS {
         let mut req = client.post(url).body(body.clone());
         if let Some(secret) = hmac_secret {
             if !secret.is_empty() {
@@ -160,19 +183,20 @@ async fn post_webhook(
         match req.send().await {
             Ok(response) if response.status().is_success() => return Ok(()),
             Ok(response) => {
-                if retries >= 2 {
+                if attempt + 1 >= MAX_ATTEMPTS {
                     return Err(format!("webhook status {}", response.status()));
                 }
             }
             Err(err) => {
-                if retries >= 2 {
+                if attempt + 1 >= MAX_ATTEMPTS {
                     return Err(format!("webhook request: {}", err));
                 }
             }
         }
-        retries += 1;
-        tokio::time::sleep(std::time::Duration::from_millis(200 * retries as u64)).await;
+        let delay_ms = webhook_retry_delay_ms(attempt);
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
+    Err("webhook: exhausted retries".to_string())
 }
 
 /// Build params with workspace-relative jsonl path resolution.

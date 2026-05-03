@@ -14,6 +14,13 @@ use crate::utils::{join_lexically_under_root, normalize_sandbox_relative_input};
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_MAX_STDOUT: usize = 64 * 1024;
+/// Minimum wall-clock budget for a steering hook subprocess (config may not go below this).
+const MIN_HOOK_TIMEOUT_MS: u64 = 1_000;
+
+#[inline]
+fn hook_command_timeout_ms(timeout_ms: u64) -> u64 {
+    timeout_ms.max(MIN_HOOK_TIMEOUT_MS)
+}
 
 #[derive(Debug, Clone)]
 pub struct HookHandlerResolved {
@@ -138,7 +145,7 @@ async fn run_hook_command(
     let read_out = read_bounded(stdout, max_stdout);
 
     let status = tokio::time::timeout(
-        std::time::Duration::from_millis(timeout_ms.max(1)),
+        std::time::Duration::from_millis(hook_command_timeout_ms(timeout_ms)),
         child.wait(),
     )
     .await
@@ -263,7 +270,7 @@ pub async fn run_pre_tool_hooks(
             "workspace_dir": engine.workspace_dir.to_string_lossy(),
             "sandbox_dir": engine.sandbox_dir.to_string_lossy(),
         });
-        let timeout = h.timeout_ms.max(1);
+        let timeout = hook_command_timeout_ms(h.timeout_ms);
         let out = match run_hook_command(&h.command, &cwd, &stdin, timeout, engine.max_stdout_bytes)
             .await
         {
@@ -323,7 +330,7 @@ pub async fn run_post_tool_hooks(
             "workspace_dir": engine.workspace_dir.to_string_lossy(),
             "sandbox_dir": engine.sandbox_dir.to_string_lossy(),
         });
-        let timeout = h.timeout_ms.max(1);
+        let timeout = hook_command_timeout_ms(h.timeout_ms);
         if let Err(e) =
             run_hook_command(&h.command, &cwd, &stdin, timeout, engine.max_stdout_bytes).await
         {
@@ -358,7 +365,7 @@ pub async fn run_user_prompt_hooks(
             "workspace_dir": engine.workspace_dir.to_string_lossy(),
             "sandbox_dir": engine.sandbox_dir.to_string_lossy(),
         });
-        let timeout = h.timeout_ms.max(1);
+        let timeout = hook_command_timeout_ms(h.timeout_ms);
         let out = match run_hook_command(&h.command, &cwd, &stdin, timeout, engine.max_stdout_bytes)
             .await
         {
@@ -418,7 +425,7 @@ fn compile_hook_handlers(
                 timeout_ms: h
                     .timeout_ms
                     .unwrap_or(default_timeout_ms)
-                    .clamp(100, 3_600_000),
+                    .clamp(MIN_HOOK_TIMEOUT_MS, 3_600_000),
                 cwd_relative: h
                     .cwd
                     .as_ref()
@@ -437,7 +444,7 @@ pub fn build_steering_engine(
     let default_timeout_ms = cfg
         .default_timeout_ms
         .unwrap_or(DEFAULT_TIMEOUT_MS)
-        .clamp(100, 3_600_000);
+        .clamp(MIN_HOOK_TIMEOUT_MS, 3_600_000);
     let max_stdout_bytes = cfg
         .max_stdout_bytes
         .unwrap_or(DEFAULT_MAX_STDOUT)
