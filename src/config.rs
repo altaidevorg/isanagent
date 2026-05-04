@@ -136,6 +136,55 @@ pub struct SubagentHarnessConfig {
     pub max_tasks: Option<usize>,
     /// Max seconds `subagent_spawn` may block when `wait` is true (default 300, clamped 10–3600).
     pub max_wait_secs: Option<u64>,
+    /// When true (default), auto-enqueue a synthetic inbound when a subagent finishes so the
+    /// parent agent can consume the result without polling.
+    pub wake_on_completion: Option<bool>,
+    /// Max completed tasks retained in SQLite per parent chat (default 200, clamped 10–2000).
+    pub task_history_retention: Option<usize>,
+}
+
+/// A named agent definition from `[agents.<name>]` in config.toml.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct AgentDefinition {
+    /// Short description of when to use this agent.
+    pub description: String,
+    /// `subagent` (default) — invoked by the coordinator via tools.
+    #[serde(default)]
+    pub mode: AgentMode,
+    /// Optional custom system prompt (inline or `{file:./path}` resolved at load time).
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    /// Optional path to a markdown file containing the system prompt.
+    #[serde(default)]
+    pub system_prompt_file: Option<String>,
+    /// Tool names this agent may call. `None` or `["*"]` means inherit the harness allowlist.
+    /// An empty list means no tools (read-only manual reasoning).
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
+    /// Optional model override (`provider/model-id`). When absent the parent model is used.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional temperature override (0.0–1.0).
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    /// Optional max reasoning iterations (clamped to parent max when larger).
+    #[serde(default)]
+    pub max_iterations: Option<usize>,
+    /// Hide from `@mention` autocomplete (still invokable via tools).
+    #[serde(default)]
+    pub hidden: bool,
+    /// Hex colour or theme token for TUI rendering (e.g. `"#4CAF50"` or `"accent"`).
+    #[serde(default)]
+    pub color: Option<String>,
+}
+
+/// Agent visibility mode.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentMode {
+    /// Invoked by the coordinator via tools.
+    #[default]
+    Subagent,
 }
 
 /// HF ml-intern–style ML policy overlay + optional autonomy hints (see `assets/ml_engineer_overlay.md`).
@@ -222,6 +271,9 @@ pub struct HarnessConfig {
     pub git_worktree: Option<GitWorktreeConfig>,
     /// Background sub-agents, task tools, and optional plan execution (Phase 5).
     pub subagents: Option<SubagentHarnessConfig>,
+    /// Named agent definitions loaded from `[agents.<name>]` (Phase 5b).
+    #[serde(default)]
+    pub agents: std::collections::HashMap<String, AgentDefinition>,
     /// Shell command policy (`exec`), including approval-vs-deny behavior.
     pub shell_policy: Option<ShellPolicyConfig>,
     /// Local / future execution providers (`execution_*` tools). See `docs/execution-implementation-plan.md`.
@@ -265,6 +317,10 @@ pub struct AppConfig {
     /// When `enabled`, `web_search` / `web_fetch` use [Jina Reader](https://r.jina.ai/) and search (`s.jina.ai`).
     pub jina: Option<JinaConfig>,
     pub harness: Option<HarnessConfig>,
+    /// Named agent definitions (`[agents.<name>]` in config.toml). Top-level alias for
+    /// `harness.agents` when the user keeps agents in the root of config.toml.
+    #[serde(default)]
+    pub agents: std::collections::HashMap<String, AgentDefinition>,
 }
 
 /// Optional Jina Reader / Search backend for web tools (see https://jina.ai/reader ).
@@ -457,6 +513,40 @@ impl AppConfig {
             .clamp(MIN, MAX)
     }
 
+    /// When true (default), auto-enqueue a synthetic inbound when a subagent finishes.
+    pub fn subagent_wake_on_completion(&self) -> bool {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.subagents.as_ref())
+            .and_then(|s| s.wake_on_completion)
+            .unwrap_or(true)
+    }
+
+    /// Max completed tasks retained in SQLite per parent chat (default 200).
+    pub fn subagent_task_history_retention(&self) -> usize {
+        const DEFAULT: usize = 200;
+        const MIN: usize = 10;
+        const MAX: usize = 2000;
+        self.harness
+            .as_ref()
+            .and_then(|h| h.subagents.as_ref())
+            .and_then(|s| s.task_history_retention)
+            .unwrap_or(DEFAULT)
+            .clamp(MIN, MAX)
+    }
+
+    /// Returns merged agent definitions from `[agents.<name>]` and `[harness.agents.<name>]`.
+    /// Harness-level definitions override top-level ones of the same name.
+    pub fn agent_definitions(&self) -> std::collections::HashMap<String, AgentDefinition> {
+        let mut merged = self.agents.clone();
+        if let Some(h) = self.harness.as_ref() {
+            for (k, v) in &h.agents {
+                merged.insert(k.clone(), v.clone());
+            }
+        }
+        merged
+    }
+
     /// When false under `[harness.execution]`, execution tools are not registered. Otherwise on (including when the table is omitted).
     pub fn execution_harness_enabled(&self) -> bool {
         match self.harness.as_ref().and_then(|h| h.execution.as_ref()) {
@@ -596,12 +686,18 @@ impl AppConfig {
                 "subagent_max_wait_secs={}",
                 self.subagent_max_wait_secs()
             ));
+            lines.push(format!(
+                "subagent_wake_on_completion={}",
+                self.subagent_wake_on_completion()
+            ));
             let allow = self.subagent_allowed_tools_set();
             lines.push(format!(
                 "subagent_allowlist_active={} (count={})",
                 allow.is_some(),
                 allow.map(|s| s.len()).unwrap_or(0)
             ));
+            let agent_count = self.agent_definitions().len();
+            lines.push(format!("named_agents={}", agent_count));
         }
         lines.push(format!(
             "ml_engineer_harness_enabled={}",
@@ -1598,6 +1694,69 @@ default_provider = "colab_mcp"
             c.execution_colab_mcp_extra_mcp_tool_allowlist(),
             vec!["*".to_string()]
         );
+    }
+
+    #[test]
+    fn agent_definitions_toml() {
+        let s = r#"
+[agents.researcher]
+description = "Research topics and gather context"
+allowed_tools = ["web_search", "web_fetch", "read_file"]
+temperature = 0.1
+hidden = false
+
+[agents.coder]
+description = "Implement code changes"
+allowed_tools = ["*"]
+model = "gemini-2.5-pro"
+color = "4CAF50"
+"#;
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        let agents = c.agent_definitions();
+        assert_eq!(agents.len(), 2);
+        let r = agents.get("researcher").expect("researcher");
+        assert_eq!(r.description, "Research topics and gather context");
+        assert_eq!(r.mode, AgentMode::Subagent);
+        assert_eq!(
+            r.allowed_tools.as_deref(),
+            Some(
+                &[
+                    "web_search".to_string(),
+                    "web_fetch".to_string(),
+                    "read_file".to_string()
+                ][..]
+            )
+        );
+        assert!(!r.hidden);
+        let c2 = agents.get("coder").expect("coder");
+        assert_eq!(c2.model.as_deref(), Some("gemini-2.5-pro"));
+        assert_eq!(c2.color.as_deref(), Some("4CAF50"));
+    }
+
+    #[test]
+    fn agent_definitions_harness_merge() {
+        let s = r#"
+[agents.shared]
+description = "Top-level agent"
+
+[harness.agents.shared]
+description = "Harness-level agent"
+allowed_tools = ["read_file"]
+
+[harness.agents.harness_only]
+description = "Only in harness"
+"#;
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        let agents = c.agent_definitions();
+        // Harness-level wins over top-level for same name
+        let shared = agents.get("shared").expect("shared");
+        assert_eq!(shared.description, "Harness-level agent");
+        assert_eq!(
+            shared.allowed_tools.as_deref(),
+            Some(&["read_file".to_string()][..])
+        );
+        // Harness-only entry surfaces
+        assert!(agents.contains_key("harness_only"));
     }
 
     #[test]

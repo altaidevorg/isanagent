@@ -191,6 +191,8 @@ pub struct SubagentTaskRecord {
     pub parent_chat_id: String,
     pub child_chat_id: String,
     pub display_name: Option<String>,
+    /// Named agent type (e.g. "researcher", "coder"). None for legacy generic spawns.
+    pub agent_name: Option<String>,
     pub prompt: String,
     pub status: String,
     pub result: Option<String>,
@@ -207,6 +209,7 @@ pub fn ensure_subagent_tasks_schema(conn: &Connection) -> Result<(), rusqlite::E
             parent_chat_id TEXT NOT NULL,
             child_chat_id TEXT NOT NULL,
             display_name TEXT,
+            agent_name TEXT,
             prompt TEXT NOT NULL,
             status TEXT NOT NULL,
             result TEXT,
@@ -405,6 +408,7 @@ pub enum MemoryMessage {
         parent_chat_id: String,
         child_chat_id: String,
         display_name: Option<String>,
+        agent_name: Option<String>,
         prompt: String,
         reply: SharedReply<Result<(), String>>,
     },
@@ -1107,6 +1111,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 parent_chat_id,
                 child_chat_id,
                 display_name,
+                agent_name,
                 prompt,
                 reply,
             } => {
@@ -1115,14 +1120,15 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     self.conn
                         .execute(
                             "INSERT INTO subagent_tasks (
-                                task_id, parent_chat_id, child_chat_id, display_name, prompt,
+                                task_id, parent_chat_id, child_chat_id, display_name, agent_name, prompt,
                                 status, result, error, execution_job_id, created_at_ms, updated_at_ms
-                            ) VALUES (?1, ?2, ?3, ?4, ?5, 'running', NULL, NULL, NULL, ?6, ?6)",
+                            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', NULL, NULL, NULL, ?7, ?7)",
                             params![
                                 task_id,
                                 parent_chat_id,
                                 child_chat_id,
                                 display_name,
+                                agent_name,
                                 prompt,
                                 now
                             ],
@@ -1181,7 +1187,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     let mut stmt = self
                         .conn
                         .prepare(
-                            "SELECT task_id, parent_chat_id, child_chat_id, display_name, prompt,
+                            "SELECT task_id, parent_chat_id, child_chat_id, display_name, agent_name, prompt,
                                     status, result, error, execution_job_id, created_at_ms, updated_at_ms
                              FROM subagent_tasks
                              WHERE parent_chat_id = ?1
@@ -1196,13 +1202,14 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                                 parent_chat_id: row.get(1)?,
                                 child_chat_id: row.get(2)?,
                                 display_name: row.get(3)?,
-                                prompt: row.get(4)?,
-                                status: row.get(5)?,
-                                result: row.get(6)?,
-                                error: row.get(7)?,
-                                execution_job_id: row.get(8)?,
-                                created_at_ms: row.get(9)?,
-                                updated_at_ms: row.get(10)?,
+                                agent_name: row.get(4)?,
+                                prompt: row.get(5)?,
+                                status: row.get(6)?,
+                                result: row.get(7)?,
+                                error: row.get(8)?,
+                                execution_job_id: row.get(9)?,
+                                created_at_ms: row.get(10)?,
+                                updated_at_ms: row.get(11)?,
                             })
                         })
                         .map_err(|e| e.to_string())?;

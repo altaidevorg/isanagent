@@ -10,7 +10,12 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use super::ReasoningLoopCtx;
-use crate::bus::{BusMessage, InboundMessage, TelemetryEvent};
+use crate::bus::{BusMessage, InboundMessage, OutboundMessage, TelemetryEvent};
+use crate::channels::terminal_ui::protocol::{
+    ISANAGENT_SUBAGENT_TASK_FINISHED, ISANAGENT_SUBAGENT_TASK_STARTED,
+    METADATA_SUBAGENT_AGENT_NAME, METADATA_SUBAGENT_CHILD_CHAT_ID, METADATA_SUBAGENT_DISPLAY_NAME,
+    METADATA_SUBAGENT_STATUS, METADATA_SUBAGENT_TASK_ID,
+};
 use crate::clarification::ClarificationHub;
 use crate::config::ResolvedShellPolicy;
 use crate::logging::LoggerHandle;
@@ -33,6 +38,8 @@ pub struct SubagentSpawnSpec {
     pub prompt: String,
     pub wait: bool,
     pub display_name: Option<String>,
+    /// Named agent to invoke (e.g. "researcher", "coder"). Uses per-agent prompt/tools/model.
+    pub agent_name: Option<String>,
 }
 
 /// Shared wiring for each spawned sub-agent run.
@@ -63,12 +70,21 @@ pub struct SubagentSpawnDeps {
     pub shell_policy: std::sync::Arc<ResolvedShellPolicy>,
     /// Optional hooks (observation + steering), same as parent.
     pub hook_tool_ctx: Option<std::sync::Arc<crate::hooks::ToolCallHookContext>>,
+    /// Optional agent registry for named-agent spawns (Phase 5b).
+    pub agent_registry: Option<Arc<super::registry::AgentRegistry>>,
+    /// When true, auto-enqueue a synthetic inbound when a subagent finishes.
+    pub wake_on_completion: bool,
+    /// Max completed tasks retained in SQLite per parent chat.
+    pub task_history_retention: usize,
+    /// Optional extra bus sender for enqueuing synthetic follow-up messages.
+    pub bus_tx: Option<tokio::sync::mpsc::Sender<BusMessage>>,
 }
 
 struct TaskRecord {
     parent_chat_id: String,
     child_chat_id: String,
     prompt: String,
+    agent_name: Option<String>,
     cancel: CancellationToken,
     status: std::sync::atomic::AtomicU8,
     result: tokio::sync::RwLock<Option<String>>,
@@ -88,12 +104,23 @@ fn truncate_sqlite_field(s: String, max: usize) -> String {
     t
 }
 
+fn truncate_for_tui(s: &str, max: usize) -> String {
+    let t = s.trim();
+    let n = t.chars().count();
+    if n <= max {
+        return t.to_string();
+    }
+    let shortened: String = t.chars().take(max.saturating_sub(1)).collect();
+    format!("{shortened}…")
+}
+
 async fn persist_subagent_start(
     memory: &NodeHandle<MemoryMessage>,
     task_id: String,
     parent_chat_id: String,
     child_chat_id: String,
     display_name: Option<String>,
+    agent_name: Option<String>,
     prompt: String,
 ) -> Result<(), String> {
     let prompt = truncate_sqlite_field(prompt, 150_000);
@@ -104,6 +131,7 @@ async fn persist_subagent_start(
             parent_chat_id,
             child_chat_id,
             display_name,
+            agent_name,
             prompt,
             reply: SharedReply::new(tx),
         })
@@ -168,6 +196,7 @@ impl TaskRecord {
         serde_json::json!({
             "child_chat_id": self.child_chat_id,
             "parent_chat_id": self.parent_chat_id,
+            "agent_name": self.agent_name,
             "status": status,
             "prompt": self.prompt,
             "result": result,
@@ -236,12 +265,27 @@ impl SubagentHarness {
             prompt,
             wait,
             display_name,
+            agent_name,
         } = spec;
 
         if self.inner.tasks.len() >= self.inner.deps.max_tasks {
             return Err(format!(
                 "Maximum number of sub-agent tasks ({}) reached",
                 self.inner.deps.max_tasks
+            ));
+        }
+
+        // Resolve named agent manifest if specified
+        let manifest = agent_name
+            .as_deref()
+            .and_then(|_n| self.inner.deps.agent_registry.as_ref())
+            .and_then(|reg| reg.get(agent_name.as_deref().unwrap()).cloned());
+
+        // Validate agent name if specified but not found
+        if agent_name.is_some() && manifest.is_none() {
+            return Err(format!(
+                "Named agent '{}' not found in registry. Use `agent_list` to see available agents.",
+                agent_name.as_deref().unwrap()
             ));
         }
 
@@ -255,6 +299,7 @@ impl SubagentHarness {
             parent_chat_id.clone(),
             child_chat_id.clone(),
             display_name.clone(),
+            agent_name.clone(),
             prompt.clone(),
         )
         .await?;
@@ -271,6 +316,7 @@ impl SubagentHarness {
             parent_chat_id: parent_chat_id.clone(),
             child_chat_id: child_chat_id.clone(),
             prompt: prompt.clone(),
+            agent_name: agent_name.clone(),
             cancel: task_cancel.clone(),
             status: std::sync::atomic::AtomicU8::new(ST_PENDING),
             result: tokio::sync::RwLock::new(None),
@@ -289,24 +335,90 @@ impl SubagentHarness {
                 child_chat_id: child_chat_id.clone(),
                 task_id: task_id.clone(),
                 display_name: display_name.clone(),
+                agent_name: agent_name.clone(),
             }))
             .await;
 
+        // Emit TUI notice for the agent-tasks strip
+        {
+            let mut meta = HashMap::new();
+            meta.insert(
+                ISANAGENT_SUBAGENT_TASK_STARTED.to_string(),
+                serde_json::json!(true),
+            );
+            meta.insert(
+                METADATA_SUBAGENT_TASK_ID.to_string(),
+                serde_json::json!(task_id),
+            );
+            meta.insert(
+                METADATA_SUBAGENT_CHILD_CHAT_ID.to_string(),
+                serde_json::json!(&child_chat_id),
+            );
+            if let Some(ref a) = agent_name {
+                meta.insert(
+                    METADATA_SUBAGENT_AGENT_NAME.to_string(),
+                    serde_json::json!(a),
+                );
+            }
+            if let Some(ref d) = display_name {
+                meta.insert(
+                    METADATA_SUBAGENT_DISPLAY_NAME.to_string(),
+                    serde_json::json!(d),
+                );
+            }
+            let label = match (&agent_name, &display_name) {
+                (Some(a), Some(d)) => format!("{a}: {d}"),
+                (Some(a), None) => a.clone(),
+                (None, Some(d)) => d.clone(),
+                (None, None) => {
+                    let short = &task_id[..8.min(task_id.len())];
+                    format!("task-{short}")
+                }
+            };
+            let _ = self
+                .inner
+                .deps
+                .outbound_tx
+                .send(BusMessage::Outbound(OutboundMessage {
+                    channel: "terminal".to_string(),
+                    chat_id: parent_chat_id.clone(),
+                    thread_id: parent_thread_id.clone(),
+                    content: format!("Sub-agent started: {label}"),
+                    metadata: meta,
+                }))
+                .await;
+        }
+
+        // Build agent-specific system prompt and provider when manifest exists
+        let agent_system_prompt = match &manifest {
+            Some(m) => m.system_prompt.clone(),
+            None => self.inner.deps.system_prompt.clone(),
+        };
+        let agent_allowlist: Option<Arc<HashSet<String>>> = match &manifest {
+            Some(m) => match m.allowed_tools_set() {
+                Some(v) if v.is_empty() => Some(Arc::new(HashSet::new())),
+                Some(v) => Some(Arc::new(v.into_iter().collect())),
+                None => self.inner.deps.default_allowlist.clone(),
+            },
+            None => self.inner.deps.default_allowlist.clone(),
+        };
+        let agent_max_iterations = manifest
+            .as_ref()
+            .and_then(|m| m.max_iterations)
+            .unwrap_or(self.inner.deps.max_iterations);
+
         let provider = dyn_clone::clone_box(&*self.inner.deps.provider_template);
+
+        let label = display_name
+            .clone()
+            .or_else(|| agent_name.clone())
+            .unwrap_or_else(|| format!("task-{}", &task_id[..8.min(task_id.len())]));
         let inbound = InboundMessage {
             channel: parent_channel.clone(),
             sender_id: parent_chat_id.clone(),
             chat_id: child_chat_id.clone(),
             thread_id: parent_thread_id.clone(),
-            content: if let Some(ref n) = display_name.as_ref().filter(|s| !s.is_empty()) {
-                format!("[Sub-agent: {}]\n\n{}", n, prompt)
-            } else {
-                format!(
-                    "[Sub-agent task {}]\n\n{}",
-                    &task_id[..8.min(task_id.len())],
-                    prompt
-                )
-            },
+            content: format!("[Sub-agent: {}]\n\n{}", label, prompt),
             attachments: vec![],
             metadata: HashMap::new(),
         };
@@ -325,8 +437,8 @@ impl SubagentHarness {
             session_manager: self.inner.deps.session_manager.clone(),
             tools,
             skills: self.inner.deps.skills.clone(),
-            system_prompt: self.inner.deps.system_prompt.clone(),
-            max_iterations: self.inner.deps.max_iterations,
+            system_prompt: agent_system_prompt,
+            max_iterations: agent_max_iterations,
             max_tool_output_chars: self.inner.deps.max_tool_output_chars,
             max_recent_summaries: self.inner.deps.max_recent_summaries,
             short_term_threshold_turns: self.inner.deps.short_term_threshold_turns,
@@ -339,7 +451,7 @@ impl SubagentHarness {
             clarification_hub: self.inner.deps.clarification_hub.clone(),
             tool_exec_ctx,
             is_subagent: true,
-            subagent_allowlist: self.inner.deps.default_allowlist.clone(),
+            subagent_allowlist: agent_allowlist,
             doom_loop_enabled: self.inner.deps.doom_loop_enabled,
             harness_runtime_summary: self.inner.deps.harness_runtime_summary.clone(),
             forbid_final_without_tools: false,
@@ -358,6 +470,10 @@ impl SubagentHarness {
         let memory = self.inner.deps.memory_node.clone();
         let outbound = self.inner.deps.outbound_tx.clone();
         let parent_for_db = parent_chat_id.clone();
+        let wake_on_completion = self.inner.deps.wake_on_completion;
+        let bus_tx = self.inner.deps.bus_tx.clone();
+        let parent_channel_for_wake = parent_channel.clone();
+        let parent_thread_for_wake = parent_thread_id.clone();
         tokio::spawn(async move {
             let outcome = super::AgentLogic::run_reasoning_loop(ctx).await;
             let (status_str, result_opt, err_opt) = match outcome {
@@ -384,6 +500,8 @@ impl SubagentHarness {
                 }
             };
 
+            let result_for_wake = result_opt.clone();
+            let err_for_tui = err_opt.clone();
             persist_subagent_end(
                 &memory,
                 tid.clone(),
@@ -397,12 +515,107 @@ impl SubagentHarness {
 
             let _ = outbound
                 .send(BusMessage::Telemetry(TelemetryEvent::SubagentFinished {
-                    parent_chat_id: parent_for_db,
+                    parent_chat_id: parent_for_db.clone(),
                     child_chat_id: rec.child_chat_id.clone(),
                     task_id: tid.clone(),
-                    status: status_str,
+                    status: status_str.clone(),
+                    agent_name: rec.agent_name.clone(),
                 }))
                 .await;
+
+            // Emit TUI notice for the agent-tasks strip
+            {
+                let mut meta = HashMap::new();
+                meta.insert(
+                    ISANAGENT_SUBAGENT_TASK_FINISHED.to_string(),
+                    serde_json::json!(true),
+                );
+                meta.insert(
+                    METADATA_SUBAGENT_TASK_ID.to_string(),
+                    serde_json::json!(tid),
+                );
+                meta.insert(
+                    METADATA_SUBAGENT_CHILD_CHAT_ID.to_string(),
+                    serde_json::json!(&rec.child_chat_id),
+                );
+                meta.insert(
+                    METADATA_SUBAGENT_STATUS.to_string(),
+                    serde_json::json!(status_str),
+                );
+                if let Some(ref a) = rec.agent_name {
+                    meta.insert(
+                        METADATA_SUBAGENT_AGENT_NAME.to_string(),
+                        serde_json::json!(a),
+                    );
+                }
+                let label = match &rec.agent_name {
+                    Some(a) => a.clone(),
+                    None => {
+                        let short = &tid[..8.min(tid.len())];
+                        format!("task-{short}")
+                    }
+                };
+                let summary = result_for_wake
+                    .as_deref()
+                    .unwrap_or(err_for_tui.as_deref().unwrap_or(""))
+                    .trim()
+                    .to_string();
+                let content = if summary.is_empty() {
+                    format!("Sub-agent finished ({status_str}): {label}")
+                } else {
+                    format!(
+                        "Sub-agent finished ({status_str}): {label} — {}",
+                        truncate_for_tui(&summary, 120)
+                    )
+                };
+                let _ = outbound
+                    .send(BusMessage::Outbound(OutboundMessage {
+                        channel: "terminal".to_string(),
+                        chat_id: parent_for_db.clone(),
+                        thread_id: None,
+                        content,
+                        metadata: meta,
+                    }))
+                    .await;
+            }
+
+            // Wake-on-completion: enqueue a synthetic inbound so the parent agent sees the result
+            if wake_on_completion {
+                if let Some(ref bus_tx) = bus_tx {
+                    let synthetic_content = if let Some(ref name) = rec.agent_name {
+                        format!(
+                            "[Sub-agent {} task {} completed — {}]\n\n{}",
+                            name,
+                            &tid[..8.min(tid.len())],
+                            status_str,
+                            result_for_wake.as_deref().unwrap_or("(no output)")
+                        )
+                    } else {
+                        format!(
+                            "[Sub-agent task {} completed — {}]\n\n{}",
+                            &tid[..8.min(tid.len())],
+                            status_str,
+                            result_for_wake.as_deref().unwrap_or("(no output)")
+                        )
+                    };
+                    let mut meta = HashMap::new();
+                    meta.insert(
+                        crate::bus::METADATA_SYNTHETIC_SUBAGENT_COMPLETION.to_string(),
+                        serde_json::Value::Bool(true),
+                    );
+                    let _ = bus_tx
+                        .send(BusMessage::Inbound(crate::bus::InboundMessage {
+                            channel: parent_channel_for_wake.clone(),
+                            sender_id: "subagent-harness".to_string(),
+                            chat_id: parent_for_db,
+                            thread_id: parent_thread_for_wake.clone(),
+                            content: synthetic_content,
+                            attachments: vec![],
+                            metadata: meta,
+                        }))
+                        .await;
+                }
+            }
 
             // Drop from the index before waking `wait=true` callers so `task_list` does not
             // briefly show a finished task after a blocking spawn returns.
@@ -501,7 +714,7 @@ impl Tool for SubagentSpawnTool {
     }
 
     fn description(&self) -> &str {
-        "Spawn a background sub-agent that runs a separate reasoning loop with its own chat id (prefixed subagent-). Use wait=false for fire-and-forget; wait=true blocks until completion or timeout and includes the assistant-facing final text in the JSON field \"result\". Sub-agents inherit config allowlists and cannot spawn nested sub-agents."
+        "Spawn a background sub-agent that runs a separate reasoning loop with its own chat id (prefixed subagent-). Use wait=false for fire-and-forget; wait=true blocks until completion or timeout and includes the assistant-facing final text in the JSON field \"result\". Optionally specify `agent` to use a named agent (researcher, coder, evaluator) with its own system prompt and tool allowlist. Sub-agents cannot spawn nested sub-agents."
     }
 
     fn parameters(&self) -> Value {
@@ -510,7 +723,8 @@ impl Tool for SubagentSpawnTool {
             "properties": {
                 "prompt": { "type": "string", "description": "User task for the sub-agent" },
                 "wait": { "type": "boolean", "description": "If true, block until the run finishes or times out (see harness max_wait_secs)." },
-                "name": { "type": "string", "description": "Optional short label for logs / context." }
+                "name": { "type": "string", "description": "Optional short label for logs / context." },
+                "agent": { "type": "string", "description": "Optional named agent to invoke (e.g. researcher, coder). Use agent_list to see available agents." }
             },
             "required": ["prompt"]
         })
@@ -527,6 +741,11 @@ impl Tool for SubagentSpawnTool {
             .get("name")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let agent_name = args
+            .get("agent")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
         let (ch, parent_chat, thread, parent_cancel) = current_parent_ids()?;
         self.harness
             .spawn(SubagentSpawnSpec {
@@ -537,6 +756,7 @@ impl Tool for SubagentSpawnTool {
                 prompt,
                 wait,
                 display_name: name,
+                agent_name,
             })
             .await
     }
@@ -734,6 +954,7 @@ impl Tool for SubagentPlanTool {
                         prompt: body,
                         wait: true,
                         display_name: Some(label),
+                        agent_name: None,
                     })
                     .await?;
                 let step_output = serde_json::from_str::<serde_json::Value>(&spawn_json)
@@ -801,6 +1022,118 @@ impl Tool for TaskHistoryListTool {
     }
 }
 
+pub struct AgentListTool {
+    pub harness: Arc<SubagentHarness>,
+}
+
+#[async_trait]
+impl Tool for AgentListTool {
+    fn name(&self) -> &str {
+        "agent_list"
+    }
+
+    fn description(&self) -> &str {
+        "List available named sub-agents and their capabilities (description, tools, model). Use to discover which agents are available for delegation via subagent_spawn or agent_spawn."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({ "type": "object", "properties": {} })
+    }
+
+    async fn execute(&self, _: Value) -> Result<String, String> {
+        let registry = match &self.harness.inner.deps.agent_registry {
+            Some(r) => r,
+            None => return Ok("No named agents configured. Use default `subagent_spawn` without an `agent` parameter for a generic sub-agent, or configure `[agents.<name>]` in config.toml.".to_string()),
+        };
+        let agents = registry.list_visible();
+        if agents.is_empty() {
+            return Ok("No visible named agents configured. Use `subagent_spawn` without `agent` for a generic sub-agent.".to_string());
+        }
+        let mut lines = vec!["Available named agents:".to_string(), String::new()];
+        for m in &agents {
+            let tools = match &m.allowed_tools {
+                None => "inherits harness allowlist".to_string(),
+                Some(v) if v.is_empty() => "none (read-only)".to_string(),
+                Some(v) => v.join(", "),
+            };
+            let model = m.model.as_deref().unwrap_or("(parent model)");
+            let temp = m
+                .temperature
+                .map(|t| format!("{:.2}", t))
+                .unwrap_or_else(|| "default".to_string());
+            let iter = m
+                .max_iterations
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "default".to_string());
+            lines.push(format!(
+                "- **{}**: {}\n  tools: [{}]\n  model: {}  temperature: {}  max_iterations: {}",
+                m.name, m.description, tools, model, temp, iter
+            ));
+        }
+        Ok(lines.join("\n"))
+    }
+}
+
+pub struct TaskDashboardTool {
+    pub harness: Arc<SubagentHarness>,
+    pub memory_node: NodeHandle<MemoryMessage>,
+}
+
+#[async_trait]
+impl Tool for TaskDashboardTool {
+    fn name(&self) -> &str {
+        "task_dashboard"
+    }
+
+    fn description(&self) -> &str {
+        "Unified view of active and recently completed sub-agent tasks for this chat. Combines in-memory active tasks with SQLite history. Use after parallel subagent_spawn runs to see all statuses at once."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "limit": { "type": "integer", "description": "Max history rows (default 10, max 50)" }
+            }
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, String> {
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10)
+            .clamp(1, 50) as usize;
+        let (_, parent_chat, _, _) = current_parent_ids()?;
+
+        let mut out = String::from("# Task Dashboard\n\n## Active\n\n");
+        let active = self.harness.list_for_parent(&parent_chat);
+        if active == "No active sub-agent tasks for this chat." {
+            out.push_str("(none)\n");
+        } else {
+            out.push_str(&active);
+        }
+
+        out.push_str("\n\n## Recent History\n\n");
+        let (tx, rx) = oneshot::channel();
+        self.memory_node
+            .send_packet(MemoryMessage::ListSubagentTasksForParent {
+                parent_chat_id: parent_chat,
+                limit,
+                reply: SharedReply::new(tx),
+            })
+            .await
+            .map_err(|e| format!("memory: {}", e))?;
+        let rows = rx.await.map_err(|_| "memory actor closed".to_string())??;
+        if rows.is_empty() {
+            out.push_str("(no history)\n");
+        } else {
+            out.push_str(&serde_json::to_string_pretty(&rows).map_err(|e| e.to_string())?);
+        }
+        Ok(out)
+    }
+}
+
 pub fn register_subagent_tools(
     registry: &mut ToolRegistry,
     harness: Arc<SubagentHarness>,
@@ -821,5 +1154,14 @@ pub fn register_subagent_tools(
     registry.register(Box::new(TaskHistoryListTool {
         memory_node: memory_node.clone(),
     }));
-    registry.register(Box::new(SubagentPlanTool { harness }));
+    registry.register(Box::new(SubagentPlanTool {
+        harness: harness.clone(),
+    }));
+    registry.register(Box::new(AgentListTool {
+        harness: harness.clone(),
+    }));
+    registry.register(Box::new(TaskDashboardTool {
+        harness: harness.clone(),
+        memory_node: memory_node.clone(),
+    }));
 }

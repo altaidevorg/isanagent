@@ -42,6 +42,8 @@ pub enum TerminalUiFocus {
     /// Browse `execution_runs.jsonl` + per-run journals for this terminal thread (`chat_id`).
     Executions,
     ToolHistory,
+    /// Sub-agent task lifecycle pane (running / finished named agents, plan steps).
+    AgentTasks,
 }
 
 const TOOL_RAIL_CAP: usize = 150;
@@ -88,6 +90,52 @@ impl JobStripStatus {
     pub fn is_terminal(&self) -> bool {
         !matches!(self, JobStripStatus::Running)
     }
+}
+
+/// Lifecycle of a sub-agent task tracked by the agent-tasks pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentTaskStatus {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl AgentTaskStatus {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "completed" => AgentTaskStatus::Completed,
+            "failed" => AgentTaskStatus::Failed,
+            "cancelled" => AgentTaskStatus::Cancelled,
+            _ => AgentTaskStatus::Running,
+        }
+    }
+
+    pub fn icon(&self) -> &'static str {
+        match self {
+            AgentTaskStatus::Running => "·",
+            AgentTaskStatus::Completed => "✓",
+            AgentTaskStatus::Failed => "✗",
+            AgentTaskStatus::Cancelled => "⨯",
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self, AgentTaskStatus::Running)
+    }
+}
+
+/// One row in the agent-tasks pane (sub-agent lifecycle).
+#[derive(Debug, Clone)]
+pub struct AgentTaskEntry {
+    pub task_id: String,
+    pub child_chat_id: String,
+    pub agent_name: Option<String>,
+    pub display_name: Option<String>,
+    pub started_at: Instant,
+    pub status: AgentTaskStatus,
+    pub last_line: String,
+    pub terminal_at: Option<Instant>,
 }
 
 /// One row in the multi-job execution strip below the transcript.
@@ -191,6 +239,11 @@ pub struct App {
     pub execution_stream_label: Option<(String, String)>,
     /// Multi-job execution strip rows (Colab MCP background calls, auto-promoted runs, etc.).
     pub jobs_strip: VecDeque<JobStripEntry>,
+    /// Sub-agent task rows (named agents, plan steps) — shown in the AgentTasks pane.
+    pub agent_tasks: VecDeque<AgentTaskEntry>,
+    /// Lines hidden below the agent-tasks viewport top (`0` = follow tail).
+    pub agent_tasks_scroll_top: usize,
+    pub last_agent_tasks_rect: Option<Rect>,
     /// True when the most recent reasoning turn ended with an exhausted-retry LLM failure
     /// banner. Cleared once the next user message (or `/retry`) is sent.
     pub llm_retry_available: bool,
@@ -258,6 +311,9 @@ impl App {
             execution_stream_recent: String::new(),
             execution_stream_label: None,
             jobs_strip: VecDeque::new(),
+            agent_tasks: VecDeque::new(),
+            agent_tasks_scroll_top: 0,
+            last_agent_tasks_rect: None,
             llm_retry_available: false,
             last_inbound_text: None,
             executions_runs: Vec::new(),
@@ -324,14 +380,16 @@ impl App {
             TerminalUiFocus::Transcript => TerminalUiFocus::Conversations,
             TerminalUiFocus::Conversations => TerminalUiFocus::Executions,
             TerminalUiFocus::Executions => TerminalUiFocus::ToolHistory,
-            TerminalUiFocus::ToolHistory => TerminalUiFocus::Transcript,
+            TerminalUiFocus::ToolHistory => TerminalUiFocus::AgentTasks,
+            TerminalUiFocus::AgentTasks => TerminalUiFocus::Transcript,
         };
         self.tool_history_scroll = 0;
     }
 
     pub fn toggle_ui_focus_back(&mut self) {
         self.ui_focus = match self.ui_focus {
-            TerminalUiFocus::Transcript => TerminalUiFocus::ToolHistory,
+            TerminalUiFocus::Transcript => TerminalUiFocus::AgentTasks,
+            TerminalUiFocus::AgentTasks => TerminalUiFocus::ToolHistory,
             TerminalUiFocus::ToolHistory => TerminalUiFocus::Executions,
             TerminalUiFocus::Executions => TerminalUiFocus::Conversations,
             TerminalUiFocus::Conversations => TerminalUiFocus::Transcript,
@@ -664,6 +722,82 @@ impl App {
         self.jobs_strip
             .iter()
             .any(|e| e.status == JobStripStatus::Running)
+    }
+
+    /// Insert (or refresh) a Running row for `task_id` in the agent-tasks pane.
+    pub fn agent_task_started(
+        &mut self,
+        task_id: &str,
+        child_chat_id: &str,
+        agent_name: Option<&str>,
+        display_name: Option<&str>,
+    ) {
+        if let Some(existing) = self.agent_tasks.iter_mut().find(|e| e.task_id == task_id) {
+            existing.status = AgentTaskStatus::Running;
+            existing.terminal_at = None;
+            existing.child_chat_id = child_chat_id.to_string();
+            existing.agent_name = agent_name.map(|s| s.to_string());
+            existing.display_name = display_name.map(|s| s.to_string());
+            return;
+        }
+        self.agent_tasks.push_back(AgentTaskEntry {
+            task_id: task_id.to_string(),
+            child_chat_id: child_chat_id.to_string(),
+            agent_name: agent_name.map(|s| s.to_string()),
+            display_name: display_name.map(|s| s.to_string()),
+            started_at: Instant::now(),
+            status: AgentTaskStatus::Running,
+            last_line: String::new(),
+            terminal_at: None,
+        });
+        self.cap_agent_tasks();
+    }
+
+    /// Mark a task as finished with its terminal status and a short summary.
+    pub fn agent_task_finished(&mut self, task_id: &str, status: &str, summary: &str) {
+        let new_status = AgentTaskStatus::from_str(status);
+        if let Some(existing) = self.agent_tasks.iter_mut().find(|e| e.task_id == task_id) {
+            existing.status = new_status;
+            existing.terminal_at = Some(Instant::now());
+            let trimmed = summary.trim_end();
+            if !trimmed.is_empty() {
+                existing.last_line = trimmed.to_string();
+            }
+        } else {
+            self.agent_tasks.push_back(AgentTaskEntry {
+                task_id: task_id.to_string(),
+                child_chat_id: String::new(),
+                agent_name: None,
+                display_name: None,
+                started_at: Instant::now(),
+                status: new_status,
+                last_line: summary.trim_end().to_string(),
+                terminal_at: Some(Instant::now()),
+            });
+            self.cap_agent_tasks();
+        }
+    }
+
+    /// Drop terminal rows older than `linger`.
+    pub fn evict_expired_agent_tasks(&mut self, linger: Duration) {
+        let now = Instant::now();
+        self.agent_tasks.retain(|e| match e.terminal_at {
+            Some(t) => now.saturating_duration_since(t) < linger,
+            None => true,
+        });
+    }
+
+    fn cap_agent_tasks(&mut self) {
+        const MAX_ROWS: usize = 32;
+        while self.agent_tasks.len() > MAX_ROWS {
+            self.agent_tasks.pop_front();
+        }
+    }
+
+    pub fn agent_tasks_has_running(&self) -> bool {
+        self.agent_tasks
+            .iter()
+            .any(|e| e.status == AgentTaskStatus::Running)
     }
 
     /// Insert or mutate a `Cell::ToolNotice` keyed by `tool_call_id`.

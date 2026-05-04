@@ -454,6 +454,7 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             child_chat_id,
             task_id,
             display_name,
+            ..
         } => LogEvent::info(
             "Telemetry",
             &format!(
@@ -470,6 +471,7 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             child_chat_id,
             task_id,
             status,
+            ..
         } => LogEvent::info(
             "Telemetry",
             &format!(

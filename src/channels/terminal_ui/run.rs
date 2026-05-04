@@ -28,16 +28,18 @@ use crate::channels::terminal_ui::panes::{
 };
 use crate::channels::terminal_ui::protocol::{
     ISANAGENT_AGENT_THOUGHT, ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_JOB_STARTED,
-    ISANAGENT_EXECUTION_STREAM, ISANAGENT_LLM_RETRY_AVAILABLE, ISANAGENT_TERMINAL_ERROR,
-    ISANAGENT_TOOL_PROGRESS, METADATA_EXECUTION_DESCRIPTION, METADATA_EXECUTION_JOB_ID,
-    METADATA_EXECUTION_JOB_STATUS, METADATA_EXECUTION_JOB_TOOL_NAME, METADATA_EXECUTION_RUN_ID,
-    METADATA_EXECUTION_SESSION_ID, METADATA_TOOL_CALL_ID, METADATA_TOOL_CALL_PREVIEW,
-    METADATA_TOOL_NAME, METADATA_TOOL_RESULT_PREVIEW,
+    ISANAGENT_EXECUTION_STREAM, ISANAGENT_LLM_RETRY_AVAILABLE, ISANAGENT_SUBAGENT_TASK_FINISHED,
+    ISANAGENT_SUBAGENT_TASK_STARTED, ISANAGENT_TERMINAL_ERROR, ISANAGENT_TOOL_PROGRESS,
+    METADATA_EXECUTION_DESCRIPTION, METADATA_EXECUTION_JOB_ID, METADATA_EXECUTION_JOB_STATUS,
+    METADATA_EXECUTION_JOB_TOOL_NAME, METADATA_EXECUTION_RUN_ID, METADATA_EXECUTION_SESSION_ID,
+    METADATA_SUBAGENT_AGENT_NAME, METADATA_SUBAGENT_CHILD_CHAT_ID, METADATA_SUBAGENT_DISPLAY_NAME,
+    METADATA_SUBAGENT_STATUS, METADATA_SUBAGENT_TASK_ID, METADATA_TOOL_CALL_ID,
+    METADATA_TOOL_CALL_PREVIEW, METADATA_TOOL_NAME, METADATA_TOOL_RESULT_PREVIEW,
 };
 use crate::channels::terminal_ui::text_format::truncate_chars_display;
 use crate::channels::terminal_ui::{
-    execution_browser, init_from_env, uses_ansi_color, App, Cell, JobStripStatus, TerminalUiFocus,
-    Theme, ToastKind, ToolNoticePhase, ToolRailEntry,
+    execution_browser, init_from_env, uses_ansi_color, AgentTaskStatus, App, Cell, JobStripStatus,
+    TerminalUiFocus, Theme, ToastKind, ToolNoticePhase, ToolRailEntry,
 };
 use crate::clarification::{METADATA_CLARIFICATION, METADATA_CLARIFICATION_CHOICES};
 use crate::memory::{chat_id_from_root_thread_id, MemoryMessage, SharedReply};
@@ -88,14 +90,15 @@ const TERMINAL_HELP: &str = r#"Commands (leading slash):
   /retry         Re-submit the last user message after an LLM-failed banner
   /tools         Open the tool activity pane
   /exec          Open the executions browser (workspace execution_runs.jsonl)
+  /agents        Open the sub-agent task pane (running / finished named agents, plan steps)
   /chats         Open past sessions (saved terminal threads from workspace memory)
   /help, /?      Show this help
 
 Keys:
   Enter             Send the compose line; in past-sessions pane: load selected and continue
-  Tab / Ctrl+T      Next pane: transcript → past sessions → executions → tool activity
+  Tab / Ctrl+T      Next pane: transcript → past sessions → executions → tool activity → sub-agents
   Shift+Tab         Previous pane (reverse of Tab)
-  Esc               From tool/executions/past-sessions: return to transcript
+  Esc               From any pane: return to transcript
   PgUp / PgDn       Scroll the focused pane; on executions: output pane (Ctrl+Pg*: code pane)
   F5                Refresh list (executions or past-sessions pane)
   Ctrl+Shift+M      Toggle application mouse: on = wheel scrolls panes; off = native selection/copy
@@ -324,6 +327,45 @@ fn chunks_line_width(spans: &[Span<'static>]) -> usize {
         .sum()
 }
 
+/// Build lines for the agent-tasks pane (sub-agent lifecycle).
+fn agent_tasks_paragraph(app: &App) -> Vec<Line<'static>> {
+    if app.agent_tasks.is_empty() {
+        return vec![Line::from(Span::styled(
+            "No sub-agent tasks yet. Use subagent_spawn or subagent_plan_execute.",
+            Theme::dim(),
+        ))];
+    }
+    let spinner_str = app.get_spinner_frame().to_string();
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for entry in app.agent_tasks.iter() {
+        let (style, icon) = match entry.status {
+            AgentTaskStatus::Running => (Theme::tool_call(), spinner_str.as_str()),
+            AgentTaskStatus::Completed => (Theme::dim(), "✓"),
+            AgentTaskStatus::Failed => (Theme::input_prompt(), "✗"),
+            AgentTaskStatus::Cancelled => (Theme::dim(), "⨯"),
+        };
+        let label = match (&entry.agent_name, &entry.display_name) {
+            (Some(a), Some(d)) => format!("{a}: {d}"),
+            (Some(a), None) => a.clone(),
+            (None, Some(d)) => d.clone(),
+            (None, None) => {
+                let short = &entry.task_id[..8.min(entry.task_id.len())];
+                format!("task-{short}")
+            }
+        };
+        let age = entry.started_at.elapsed();
+        let mut line = format!("{icon} {label}");
+        if !entry.last_line.is_empty() {
+            line.push_str("  ·  ");
+            line.push_str(&entry.last_line);
+        }
+        line.push_str("  ·  ");
+        line.push_str(&format_age(age));
+        out.push(Line::from(Span::styled(line, style)));
+    }
+    out
+}
+
 /// Build one line per job in the multi-job strip, plus an optional Jupyter-stream tail
 /// (the latest line of `execution_stream_recent`) so single-stream UX is preserved when
 /// there are no Colab jobs racing.
@@ -522,6 +564,16 @@ fn build_status_line(
         ],
         vec![
             Span::styled(" · ", dim),
+            Span::styled(
+                format!(
+                    "[ 🤖 {} Agents ]",
+                    app.agent_tasks.iter().filter(|e| !e.status.is_terminal()).count()
+                ),
+                dim,
+            ),
+        ],
+        vec![
+            Span::styled(" · ", dim),
             Span::styled(format!("thread {sid}…"), dim),
         ],
         vec![
@@ -624,6 +676,49 @@ fn handle_execution_job_finished_notice(app: &mut App, msg: &OutboundMessage) {
         .unwrap_or("completed");
     let summary = msg.content.trim();
     app.job_strip_finished(jid, status, summary);
+}
+
+fn handle_subagent_task_started_notice(app: &mut App, msg: &OutboundMessage) {
+    let tid = msg
+        .metadata
+        .get(METADATA_SUBAGENT_TASK_ID)
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if tid.is_empty() {
+        return;
+    }
+    let cid = msg
+        .metadata
+        .get(METADATA_SUBAGENT_CHILD_CHAT_ID)
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let agent = msg
+        .metadata
+        .get(METADATA_SUBAGENT_AGENT_NAME)
+        .and_then(|v| v.as_str());
+    let display = msg
+        .metadata
+        .get(METADATA_SUBAGENT_DISPLAY_NAME)
+        .and_then(|v| v.as_str());
+    app.agent_task_started(tid, cid, agent, display);
+}
+
+fn handle_subagent_task_finished_notice(app: &mut App, msg: &OutboundMessage) {
+    let tid = msg
+        .metadata
+        .get(METADATA_SUBAGENT_TASK_ID)
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if tid.is_empty() {
+        return;
+    }
+    let status = msg
+        .metadata
+        .get(METADATA_SUBAGENT_STATUS)
+        .and_then(|v| v.as_str())
+        .unwrap_or("completed");
+    let summary = msg.content.trim();
+    app.agent_task_finished(tid, status, summary);
 }
 
 fn append_execution_job_panel(app: &mut App, msg: &OutboundMessage) {
@@ -1081,6 +1176,24 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         while let Ok(msg) = outbound_rx.try_recv() {
             if msg
                 .metadata
+                .get(ISANAGENT_SUBAGENT_TASK_STARTED)
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
+                handle_subagent_task_started_notice(&mut app, &msg);
+                continue;
+            }
+            if msg
+                .metadata
+                .get(ISANAGENT_SUBAGENT_TASK_FINISHED)
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
+                handle_subagent_task_finished_notice(&mut app, &msg);
+                continue;
+            }
+            if msg
+                .metadata
                 .get(ISANAGENT_EXECUTION_JOB_STARTED)
                 .and_then(|v| v.as_bool())
                 == Some(true)
@@ -1173,6 +1286,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 
         // Drop terminal strip rows that are older than the linger window.
         app.evict_expired_jobs(Duration::from_secs(10));
+        app.evict_expired_agent_tasks(Duration::from_secs(30));
 
         terminal.draw(|f| {
             let area = f.area();
@@ -1208,6 +1322,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     app.last_executions_code_rect = None;
                     app.last_executions_output_rect = None;
                     app.last_conversations_list_rect = None;
+                    app.last_agent_tasks_rect = None;
                 }
                 TerminalUiFocus::Conversations => {
                     let (w, max_s) = conversations_list_paragraph(&app, ch[1]);
@@ -1219,6 +1334,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     app.last_executions_list_rect = None;
                     app.last_executions_code_rect = None;
                     app.last_executions_output_rect = None;
+                    app.last_agent_tasks_rect = None;
                 }
                 TerminalUiFocus::Executions => {
                     let list_w = (ch[1].width / 3).clamp(26, 46);
@@ -1281,6 +1397,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     app.last_tool_history_rect = None;
                     app.last_executions_list_rect = Some(list_r);
                     app.last_conversations_list_rect = None;
+                    app.last_agent_tasks_rect = None;
                 }
                 TerminalUiFocus::ToolHistory => {
                     let (w, max_s) =
@@ -1289,6 +1406,26 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     f.render_widget(w, ch[1]);
                     app.last_tool_history_rect = Some(ch[1]);
                     app.last_transcript_rect = None;
+                    app.last_executions_list_rect = None;
+                    app.last_executions_code_rect = None;
+                    app.last_executions_output_rect = None;
+                    app.last_conversations_list_rect = None;
+                    app.last_agent_tasks_rect = None;
+                }
+                TerminalUiFocus::AgentTasks => {
+                    let list = agent_tasks_paragraph(&app);
+                    let w = Paragraph::new(Text::from(list))
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .title(Span::styled(" sub-agents ", Theme::tool_call()))
+                                .border_style(Theme::dim()),
+                        )
+                        .scroll((app.agent_tasks_scroll_top as u16, 0));
+                    f.render_widget(w, ch[1]);
+                    app.last_agent_tasks_rect = Some(ch[1]);
+                    app.last_transcript_rect = None;
+                    app.last_tool_history_rect = None;
                     app.last_executions_list_rect = None;
                     app.last_executions_code_rect = None;
                     app.last_executions_output_rect = None;
@@ -1640,6 +1777,10 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             last_exec_poll = Instant::now();
                             continue;
                         }
+                        if text.eq_ignore_ascii_case("/agents") {
+                            app.ui_focus = TerminalUiFocus::AgentTasks;
+                            continue;
+                        }
                         if text.eq_ignore_ascii_case("/chats") {
                             app.focus_conversations();
                             refresh_conversations_list(&rt, &memory_node, &mut app);
@@ -1710,7 +1851,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         }
                         app.cells.push(Cell::System {
                             message:
-                                "Unknown command. Try /help, /exit, /new, /chats, /copy, /install-python, /cancel, /background, /retry, /tools, /exec."
+                                "Unknown command. Try /help, /exit, /new, /chats, /copy, /install-python, /cancel, /background, /retry, /tools, /exec, /agents."
                                     .into(),
                         });
                         continue;
@@ -1826,6 +1967,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         TerminalUiFocus::ToolHistory
                             | TerminalUiFocus::Executions
                             | TerminalUiFocus::Conversations
+                            | TerminalUiFocus::AgentTasks
                     ) {
                         app.focus_transcript();
                     }
@@ -1868,6 +2010,9 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 }
                 KeyCode::PageUp => match app.ui_focus {
                     TerminalUiFocus::ToolHistory => app.tool_history_scroll_up(8),
+                    TerminalUiFocus::AgentTasks => {
+                        app.agent_tasks_scroll_top = app.agent_tasks_scroll_top.saturating_sub(1);
+                    }
                     TerminalUiFocus::Executions => {
                         if key.modifiers.contains(KeyModifiers::CONTROL) {
                             app.executions_code_scroll_top =
@@ -1888,6 +2033,9 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 },
                 KeyCode::PageDown => match app.ui_focus {
                     TerminalUiFocus::ToolHistory => app.tool_history_scroll_down(8),
+                    TerminalUiFocus::AgentTasks => {
+                        app.agent_tasks_scroll_top = app.agent_tasks_scroll_top.saturating_add(1);
+                    }
                     TerminalUiFocus::Executions => {
                         if key.modifiers.contains(KeyModifiers::CONTROL) {
                             app.executions_code_scroll_top =
@@ -2041,6 +2189,30 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         MouseEventKind::ScrollRight => {
                             app.conversations_list_scroll_top =
                                 app.conversations_list_scroll_top.saturating_add(1);
+                        }
+                        _ => {}
+                    }
+                } else if app
+                    .last_agent_tasks_rect
+                    .map(|r| rect_contains(r, me.column, me.row))
+                    .unwrap_or(false)
+                {
+                    match me.kind {
+                        MouseEventKind::ScrollUp => {
+                            app.agent_tasks_scroll_top =
+                                app.agent_tasks_scroll_top.saturating_sub(1);
+                        }
+                        MouseEventKind::ScrollDown => {
+                            app.agent_tasks_scroll_top =
+                                app.agent_tasks_scroll_top.saturating_add(1);
+                        }
+                        MouseEventKind::ScrollLeft => {
+                            app.agent_tasks_scroll_top =
+                                app.agent_tasks_scroll_top.saturating_sub(1);
+                        }
+                        MouseEventKind::ScrollRight => {
+                            app.agent_tasks_scroll_top =
+                                app.agent_tasks_scroll_top.saturating_add(1);
                         }
                         _ => {}
                     }

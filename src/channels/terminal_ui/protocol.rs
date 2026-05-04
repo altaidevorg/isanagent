@@ -33,3 +33,12 @@ pub const METADATA_TOOL_CALL_ID: &str = "isanagent_tool_call_id";
 /// Set on `ISANAGENT_TERMINAL_ERROR` outbounds emitted after exhausted LLM retries. When the
 /// terminal UI sees this, it activates a `/retry` banner that re-injects the last user inbound.
 pub const ISANAGENT_LLM_RETRY_AVAILABLE: &str = "isanagent_llm_retry_available";
+/// One-line notice when a sub-agent task is spawned (Ratatui agent-tasks strip).
+pub const ISANAGENT_SUBAGENT_TASK_STARTED: &str = "isanagent_subagent_task_started";
+/// One-line notice when a sub-agent task finishes (completed / failed / cancelled).
+pub const ISANAGENT_SUBAGENT_TASK_FINISHED: &str = "isanagent_subagent_task_finished";
+pub const METADATA_SUBAGENT_TASK_ID: &str = "subagent_task_id";
+pub const METADATA_SUBAGENT_CHILD_CHAT_ID: &str = "subagent_child_chat_id";
+pub const METADATA_SUBAGENT_AGENT_NAME: &str = "subagent_agent_name";
+pub const METADATA_SUBAGENT_DISPLAY_NAME: &str = "subagent_display_name";
+pub const METADATA_SUBAGENT_STATUS: &str = "subagent_status";
