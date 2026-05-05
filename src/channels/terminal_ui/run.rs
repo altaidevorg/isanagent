@@ -1774,49 +1774,44 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             if let Some(config_key) = selection {
                                 if let Some(cfg) = providers.get(&config_key) {
                                     let resolved_url = cfg.resolved_base_url().unwrap_or_default();
-                                    let env_var = cfg.resolved_api_key_env();
-                                    let api_key_val = std::env::var(&env_var).ok()
-                                        .filter(|s| !s.is_empty())
-                                        .or_else(|| cfg.api_key.clone());
-
-                                    if let Some(api_key) = api_key_val {
-                                        let msg = BusMessage::SwitchModel {
-                                            provider_name: cfg.provider_name.clone(),
-                                            model_name: cfg.model_name.clone(),
-                                            base_url: resolved_url,
-                                            api_key,
-                                        };
-                                        if bus_tx.blocking_send(msg).is_err() {
-                                            app.cells.push(Cell::System {
-                                                message: "Bus closed; exiting.".into(),
+                                    match cfg.resolve_api_key() {
+                                        Ok(api_key) => {
+                                            let msg = BusMessage::SwitchModel {
+                                                provider_name: cfg.provider_name.clone(),
+                                                model_name: cfg.model_name.clone(),
+                                                base_url: resolved_url,
+                                                api_key,
+                                            };
+                                            if bus_tx.blocking_send(msg).is_err() {
+                                                app.cells.push(Cell::System {
+                                                    message: "Bus closed; exiting.".into(),
+                                                });
+                                                app.request_quit();
+                                            } else {
+                                                app.status_model = cfg.model_name.clone();
+                                                persist_last_model(&workspace_dir, &config_key);
+                                                app.set_toast(
+                                                    ToastKind::Ok,
+                                                    format!("Model: {}", app.status_model),
+                                                    Duration::from_secs(3),
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            let err_msg = format!(
+                                                "No API key for '{}': {}\n\
+                                                Set the env var or add api_key = \"...\" under [providers.{}] in config.toml.",
+                                                config_key, e, config_key
+                                            );
+                                            app.cells.push(Cell::Error {
+                                                message: err_msg,
                                             });
-                                            app.request_quit();
-                                        } else {
-                                            app.status_model = cfg.model_name.clone();
-                                            persist_last_model(&workspace_dir, &config_key);
                                             app.set_toast(
-                                                ToastKind::Ok,
-                                                format!("Model: {}", app.status_model),
-                                                Duration::from_secs(3),
+                                                ToastKind::Err,
+                                                format!("No API key for {}", config_key),
+                                                Duration::from_secs(5),
                                             );
                                         }
-                                    } else {
-                                        let has_config_key = cfg.api_key.is_some();
-                                        let err_msg = format!(
-                                            "No API key for '{}' (checked ${}, config api_key: {}).\n\
-                                            Set the env var or add api_key = \"...\" under [providers.{}] in config.toml.",
-                                            config_key, env_var,
-                                            if has_config_key { "set but empty" } else { "not set" },
-                                            config_key
-                                        );
-                                        app.cells.push(Cell::Error {
-                                            message: err_msg,
-                                        });
-                                        app.set_toast(
-                                            ToastKind::Err,
-                                            format!("No API key for {}", config_key),
-                                            Duration::from_secs(5),
-                                        );
                                     }
                                 }
                             }
@@ -2103,45 +2098,43 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 }
                             } else if let Some(cfg) = providers.get(arg) {
                                 let resolved_url = cfg.resolved_base_url().unwrap_or_default();
-                                let env_var = cfg.resolved_api_key_env();
-                                let key = std::env::var(&env_var).ok()
-                                    .filter(|s| !s.is_empty())
-                                    .or_else(|| cfg.api_key.clone());
-
-                                if let Some(api_key) = key {
-                                    let msg = BusMessage::SwitchModel {
-                                        provider_name: cfg.provider_name.clone(),
-                                        model_name: cfg.model_name.clone(),
-                                        base_url: resolved_url,
-                                        api_key,
-                                    };
-                                    if bus_tx.blocking_send(msg).is_err() {
-                                        app.cells.push(Cell::System {
-                                            message: "Bus closed; exiting.".into(),
+                                match cfg.resolve_api_key() {
+                                    Ok(api_key) => {
+                                        let msg = BusMessage::SwitchModel {
+                                            provider_name: cfg.provider_name.clone(),
+                                            model_name: cfg.model_name.clone(),
+                                            base_url: resolved_url,
+                                            api_key,
+                                        };
+                                        if bus_tx.blocking_send(msg).is_err() {
+                                            app.cells.push(Cell::System {
+                                                message: "Bus closed; exiting.".into(),
+                                            });
+                                            app.request_quit();
+                                        } else {
+                                            app.status_model = cfg.model_name.clone();
+                                            persist_last_model(&workspace_dir, arg);
+                                            app.set_toast(
+                                                ToastKind::Ok,
+                                                format!("Model: {}", app.status_model),
+                                                Duration::from_secs(3),
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let err_msg = format!(
+                                            "No API key for '{}': {}",
+                                            arg, e
+                                        );
+                                        app.cells.push(Cell::Error {
+                                            message: err_msg.clone(),
                                         });
-                                        app.request_quit();
-                                    } else {
-                                        app.status_model = cfg.model_name.clone();
-                                        persist_last_model(&workspace_dir, arg);
                                         app.set_toast(
-                                            ToastKind::Ok,
-                                            format!("Model: {}", app.status_model),
-                                            Duration::from_secs(3),
+                                            ToastKind::Err,
+                                            err_msg,
+                                            Duration::from_secs(5),
                                         );
                                     }
-                                } else {
-                                    let err_msg = format!(
-                                        "No API key for '{}'. Set ${} or add api_key in config.",
-                                        arg, env_var
-                                    );
-                                    app.cells.push(Cell::Error {
-                                        message: err_msg.clone(),
-                                    });
-                                    app.set_toast(
-                                        ToastKind::Err,
-                                        err_msg,
-                                        Duration::from_secs(5),
-                                    );
                                 }
                             } else {
                                 let available: Vec<&str> =
