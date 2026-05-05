@@ -128,21 +128,33 @@ fn resolve_system_prompt(def: &AgentDefinition, sandbox_dir: &std::path::Path) -
                 .strip_prefix("{file:")
                 .and_then(|s| s.strip_suffix('}'))
             {
-                let resolved = sandbox_dir.join(path.trim());
-                if let Ok(content) = std::fs::read_to_string(&resolved) {
-                    return content;
+                if let Some(resolved) = crate::utils::resolve_path(sandbox_dir, path.trim()) {
+                    if let Ok(content) = std::fs::read_to_string(&resolved) {
+                        return content;
+                    }
+                    log::warn!("Agent system_prompt file not found: {}", resolved.display());
+                } else {
+                    log::warn!(
+                        "Agent system_prompt file path is outside sandbox or does not exist: {}",
+                        path.trim()
+                    );
                 }
-                log::warn!("Agent system_prompt file not found: {}", resolved.display());
             }
             return trimmed.to_string();
         }
     }
     if let Some(ref file_path) = def.system_prompt_file {
-        let resolved = sandbox_dir.join(file_path.trim());
-        if let Ok(content) = std::fs::read_to_string(&resolved) {
-            return content;
+        if let Some(resolved) = crate::utils::resolve_path(sandbox_dir, file_path.trim()) {
+            if let Ok(content) = std::fs::read_to_string(&resolved) {
+                return content;
+            }
+            log::warn!("Agent system_prompt_file not found: {}", resolved.display());
+        } else {
+            log::warn!(
+                "Agent system_prompt_file path is outside sandbox or does not exist: {}",
+                file_path.trim()
+            );
         }
-        log::warn!("Agent system_prompt_file not found: {}", resolved.display());
     }
     if def.description.is_empty() {
         "You are a specialized sub-agent. Complete the assigned task thoroughly.".to_string()

@@ -409,10 +409,15 @@ impl SubagentHarness {
 
         let provider = dyn_clone::clone_box(&*self.inner.deps.provider_template);
 
-        let label = display_name
-            .clone()
-            .or_else(|| agent_name.clone())
-            .unwrap_or_else(|| format!("task-{}", &task_id[..8.min(task_id.len())]));
+        let label = match (&agent_name, &display_name) {
+            (Some(a), Some(d)) => format!("{a}: {d}"),
+            (Some(a), None) => a.clone(),
+            (None, Some(d)) => d.clone(),
+            (None, None) => {
+                let short = &task_id[..8.min(task_id.len())];
+                format!("task-{short}")
+            }
+        };
         let inbound = InboundMessage {
             channel: parent_channel.clone(),
             sender_id: parent_chat_id.clone(),
@@ -474,6 +479,7 @@ impl SubagentHarness {
         let bus_tx = self.inner.deps.bus_tx.clone();
         let parent_channel_for_wake = parent_channel.clone();
         let parent_thread_for_wake = parent_thread_id.clone();
+        let display_name_for_finish = display_name.clone();
         tokio::spawn(async move {
             let outcome = super::AgentLogic::run_reasoning_loop(ctx).await;
             let (status_str, result_opt, err_opt) = match outcome {
@@ -548,9 +554,11 @@ impl SubagentHarness {
                         serde_json::json!(a),
                     );
                 }
-                let label = match &rec.agent_name {
-                    Some(a) => a.clone(),
-                    None => {
+                let label = match (&rec.agent_name, &display_name_for_finish) {
+                    (Some(a), Some(d)) => format!("{a}: {d}"),
+                    (Some(a), None) => a.clone(),
+                    (None, Some(d)) => d.clone(),
+                    (None, None) => {
                         let short = &tid[..8.min(tid.len())];
                         format!("task-{short}")
                     }
