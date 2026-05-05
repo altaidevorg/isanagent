@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -24,7 +24,8 @@ use crate::channels::terminal_ui::history_cells;
 use crate::channels::terminal_ui::panes::{
     conversations_ensure_list_shows_selection, conversations_list_paragraph,
     executions_code_paragraph, executions_ensure_list_shows_selection, executions_list_paragraph,
-    executions_output_paragraph, tool_history_paragraph, transcript_paragraph,
+    executions_output_paragraph, extract_selection_text, tool_history_paragraph,
+    transcript_paragraph,
 };
 use crate::channels::terminal_ui::protocol::{
     ISANAGENT_AGENT_THOUGHT, ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_JOB_STARTED,
@@ -39,7 +40,7 @@ use crate::channels::terminal_ui::protocol::{
 use crate::channels::terminal_ui::text_format::truncate_chars_display;
 use crate::channels::terminal_ui::{
     execution_browser, init_from_env, uses_ansi_color, AgentTaskStatus, App, Cell, JobStripStatus,
-    TerminalUiFocus, Theme, ToastKind, ToolNoticePhase, ToolRailEntry,
+    TerminalUiFocus, Theme, ToastKind, ToolNoticePhase, ToolRailEntry, TranscriptSelection,
 };
 use crate::clarification::{METADATA_CLARIFICATION, METADATA_CLARIFICATION_CHOICES};
 use crate::memory::{chat_id_from_root_thread_id, MemoryMessage, SharedReply};
@@ -101,6 +102,7 @@ Keys:
   Esc               From any pane: return to transcript
   PgUp / PgDn       Scroll the focused pane; on executions: output pane (Ctrl+Pg*: code pane)
   F5                Refresh list (executions or past-sessions pane)
+  Mouse drag         Select text in the transcript pane; copies to clipboard on release
   Ctrl+Shift+M      Toggle application mouse: on = wheel scrolls panes; off = native selection/copy
   Ctrl+Shift+Y      Copy last assistant reply
   Ctrl+W / Ctrl+U   Delete word / clear line
@@ -801,6 +803,24 @@ fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
     col >= r.x && col < x1 && row >= r.y && row < y1
 }
 
+/// Map terminal (col, row) to transcript `(line_index, display_column)`.
+fn mouse_to_transcript_coords(
+    mouse_col: u16,
+    mouse_row: u16,
+    rect: Rect,
+    visible_start: usize,
+) -> (usize, usize) {
+    let content_y = rect.y.saturating_add(1);
+    let content_x = rect.x.saturating_add(1);
+    let max_row = rect.y.saturating_add(rect.height).saturating_sub(2);
+    let max_col = rect.x.saturating_add(rect.width).saturating_sub(2);
+    let row = mouse_row.clamp(content_y, max_row);
+    let col = mouse_col.clamp(content_x, max_col);
+    let content_row = (row - content_y) as usize;
+    let content_col = (col - content_x) as usize;
+    (visible_start + content_row, content_col)
+}
+
 fn clamp_executions_selection(app: &mut App) {
     if app.executions_runs.is_empty() {
         app.executions_selected_idx = None;
@@ -1313,8 +1333,14 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 
             match app.ui_focus {
                 TerminalUiFocus::Transcript => {
-                    let (w, max_s) = transcript_paragraph(&app.cells, ch[1], app.scroll_offset);
+                    let (w, max_s, vis_start) = transcript_paragraph(
+                        &app.cells,
+                        ch[1],
+                        app.scroll_offset,
+                        app.transcript_selection.as_ref(),
+                    );
                     max_transcript_scroll_holder.set(max_s);
+                    app.last_transcript_visible_start = vis_start;
                     f.render_widget(w, ch[1]);
                     app.last_transcript_rect = Some(ch[1]);
                     app.last_tool_history_rect = None;
@@ -2137,6 +2163,74 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 _ => {}
             },
             Event::Mouse(me) => {
+                // ── Selection: drag / release (handled even outside transcript) ──
+                if app.selecting {
+                    match me.kind {
+                        MouseEventKind::Drag(MouseButton::Left) => {
+                            if let Some(rect) = app.last_transcript_rect {
+                                let (line_idx, col) = mouse_to_transcript_coords(
+                                    me.column,
+                                    me.row,
+                                    rect,
+                                    app.last_transcript_visible_start,
+                                );
+                                if let Some(sel) = &mut app.transcript_selection {
+                                    sel.end_line = line_idx;
+                                    sel.end_col = col;
+                                }
+                            }
+                            continue;
+                        }
+                        MouseEventKind::Up(MouseButton::Left) => {
+                            // Update end position from release coordinates.
+                            if let Some(rect) = app.last_transcript_rect {
+                                let (line_idx, col) = mouse_to_transcript_coords(
+                                    me.column,
+                                    me.row,
+                                    rect,
+                                    app.last_transcript_visible_start,
+                                );
+                                if let Some(sel) = &mut app.transcript_selection {
+                                    sel.end_line = line_idx;
+                                    sel.end_col = col;
+                                }
+                            }
+                            app.selecting = false;
+                            // Copy to clipboard if non-empty.
+                            if let Some(sel) = &app.transcript_selection {
+                                if !sel.is_empty() {
+                                    let inner_w = app
+                                        .last_transcript_rect
+                                        .map(|r| r.width.saturating_sub(2) as usize)
+                                        .unwrap_or(80);
+                                    let text =
+                                        extract_selection_text(&app.cells, inner_w, sel);
+                                    match arboard::Clipboard::new()
+                                        .and_then(|mut cb| cb.set_text(text.clone()))
+                                    {
+                                        Ok(_) => {
+                                            let chars = text.chars().count();
+                                            app.set_toast(
+                                                ToastKind::Ok,
+                                                format!("Copied {chars} chars"),
+                                                Duration::from_secs(TOAST_COPY_OK_SECS),
+                                            );
+                                        }
+                                        Err(e) => {
+                                            app.set_toast(
+                                                ToastKind::Err,
+                                                format!("Copy failed: {e}"),
+                                                Duration::from_secs(TOAST_COPY_ERR_SECS),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
                 let over_transcript = app
                     .last_transcript_rect
                     .map(|r| rect_contains(r, me.column, me.row))
@@ -2152,6 +2246,23 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         // Trackpads: horizontal wheel maps to vertical transcript scroll.
                         MouseEventKind::ScrollLeft => app.scroll_up(MOUSE_SCROLL_LINES),
                         MouseEventKind::ScrollRight => app.scroll_down(MOUSE_SCROLL_LINES),
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            if let Some(rect) = app.last_transcript_rect {
+                                let (line_idx, col) = mouse_to_transcript_coords(
+                                    me.column,
+                                    me.row,
+                                    rect,
+                                    app.last_transcript_visible_start,
+                                );
+                                app.transcript_selection = Some(TranscriptSelection {
+                                    anchor_line: line_idx,
+                                    anchor_col: col,
+                                    end_line: line_idx,
+                                    end_col: col,
+                                });
+                                app.selecting = true;
+                            }
+                        }
                         _ => {}
                     }
                 } else if over_tool_history {

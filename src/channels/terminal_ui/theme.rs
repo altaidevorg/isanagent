@@ -98,4 +98,9 @@ impl Theme {
     pub fn input_prompt() -> Style {
         fg_mod(Color::Green, Modifier::BOLD)
     }
+
+    /// Highlight style for mouse-selected text in the transcript.
+    pub fn selection() -> Style {
+        Style::default().add_modifier(Modifier::REVERSED)
+    }
 }

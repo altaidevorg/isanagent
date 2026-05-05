@@ -189,6 +189,32 @@ pub enum Cell {
     },
 }
 
+/// Mouse text-selection state for the transcript pane.
+#[derive(Debug, Clone, Copy)]
+pub struct TranscriptSelection {
+    pub anchor_line: usize,
+    pub anchor_col: usize,
+    pub end_line: usize,
+    pub end_col: usize,
+}
+
+impl TranscriptSelection {
+    /// Return `(start_line, start_col, end_line, end_col)` with start <= end.
+    pub fn normalized(&self) -> (usize, usize, usize, usize) {
+        if self.anchor_line < self.end_line
+            || (self.anchor_line == self.end_line && self.anchor_col <= self.end_col)
+        {
+            (self.anchor_line, self.anchor_col, self.end_line, self.end_col)
+        } else {
+            (self.end_line, self.end_col, self.anchor_line, self.anchor_col)
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.anchor_line == self.end_line && self.anchor_col == self.end_col
+    }
+}
+
 /// Ephemeral status-strip message (e.g. copy confirmation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToastKind {
@@ -232,6 +258,12 @@ pub struct App {
     pub thinking: bool,
     /// Last drawn transcript widget area (for mouse wheel hit-testing).
     pub last_transcript_rect: Option<Rect>,
+    /// First visible line index in the transcript (set by renderer for mouse coordinate mapping).
+    pub last_transcript_visible_start: usize,
+    /// Active mouse text selection in the transcript pane.
+    pub transcript_selection: Option<TranscriptSelection>,
+    /// True while the left mouse button is held during a drag selection.
+    pub selecting: bool,
     /// Short-lived message shown in the status strip (not stored in the transcript).
     pub toast: Option<Toast>,
     /// Latest `execution_run` stream (Jupyter); shown in a dedicated strip below the transcript.
@@ -307,6 +339,9 @@ impl App {
             should_quit: false,
             thinking: false,
             last_transcript_rect: None,
+            last_transcript_visible_start: 0,
+            transcript_selection: None,
+            selecting: false,
             toast: None,
             execution_stream_recent: String::new(),
             execution_stream_label: None,

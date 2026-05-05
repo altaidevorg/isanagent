@@ -13,4 +13,4 @@ pub use executions::{
     executions_output_paragraph,
 };
 pub use tool_history::tool_history_paragraph;
-pub use transcript::transcript_paragraph;
+pub use transcript::{extract_selection_text, transcript_paragraph};
