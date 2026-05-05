@@ -312,11 +312,11 @@ pub struct App {
     pub thinking: bool,
     /// Last drawn transcript widget area (for mouse wheel hit-testing).
     pub last_transcript_rect: Option<Rect>,
-    /// Index of the first visible line in the flattened transcript (set during rendering).
+    /// First visible line index in the transcript (set by renderer for mouse coordinate mapping).
     pub last_transcript_visible_start: usize,
     /// Active mouse text selection in the transcript pane.
     pub transcript_selection: Option<TranscriptSelection>,
-    /// Whether a mouse drag selection is currently in progress.
+    /// True while the left mouse button is held during a drag selection.
     pub selecting: bool,
     /// Short-lived message shown in the status strip (not stored in the transcript).
     pub toast: Option<Toast>,
