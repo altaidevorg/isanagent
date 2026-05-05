@@ -195,6 +195,7 @@ impl LoggingActor {
             BusMessage::Cancel(_) => return Ok(()),
             BusMessage::PromoteSyncToBackground(_) => return Ok(()),
             BusMessage::SetTerminalSessionChat { .. } => return Ok(()),
+            BusMessage::SwitchModel { .. } => return Ok(()),
         }
         .map_err(|e| ActorError::from(format!("Failed to serialize conversation event: {}", e)))?;
 
@@ -256,6 +257,14 @@ impl LoggingActor {
                 &format!("SetTerminalSessionChat chat_id={}", chat_id),
             )
             .with_chat_id(chat_id),
+            BusMessage::SwitchModel {
+                provider_name,
+                model_name,
+                ..
+            } => LogEvent::info(
+                "BusMessage",
+                &format!("SwitchModel provider={} model={}", provider_name, model_name),
+            ),
         };
 
         self.write_runtime_event(&event)

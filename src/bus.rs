@@ -423,4 +423,11 @@ pub enum BusMessage {
     SetTerminalSessionChat {
         chat_id: String,
     },
+    /// Runtime model/provider switch triggered by the `/model` slash command.
+    SwitchModel {
+        provider_name: String,
+        model_name: String,
+        base_url: String,
+        api_key: String,
+    },
 }

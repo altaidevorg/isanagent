@@ -11,15 +11,123 @@ max_web_tool_output_chars = 50000
 [terminal]
 enabled = true
 
-# LLM provider. `provider_name` selects a built-in entry from the registry (gemini, openai,
-# deepseek, openrouter) so the chat-completions URL stays in code. Set `provider_name =
-# "openai_compatible"` to point at any other OpenAI-compatible endpoint and supply `base_url`
-# explicitly. `base_url` is also accepted as an optional override for known names (e.g. a proxy
-# or self-hosted relay).
-[provider]
-provider_name = "gemini"
-model_name = "gemini-3.1-pro-preview-customtools"
-api_key_env = "GEMINI_API_KEY"
+# LLM providers. At startup, isanagent picks the first provider with a valid API key.
+# Use `/model` in the TUI to switch between them at runtime.
+#
+# `provider_name` selects a built-in registry entry (anthropic, gemini, openai, deepseek,
+# openrouter). API key resolution order:
+#   1. Environment variable ($<PROVIDER>_API_KEY, e.g. $OPENAI_API_KEY for "openai")
+#   2. Direct `api_key` value in config (fallback when env var is not set)
+# Override the env var name with `api_key_env` if needed.
+#
+# Set `provider_name = "openai_compatible"` + `base_url` for any other endpoint.
+#
+# ─── Anthropic (Claude) ─── $ANTHROPIC_API_KEY or api_key below ───────────────
+#
+# [providers.claude-opus-4-7]
+# provider_name = "anthropic"
+# model_name = "claude-opus-4-7"
+# api_key = "sk-ant-..."          # optional: omit to use $ANTHROPIC_API_KEY
+#
+# [providers.claude-opus-4-6]
+# provider_name = "anthropic"
+# model_name = "claude-opus-4-6"
+#
+# [providers.claude-sonnet-4-6]
+# provider_name = "anthropic"
+# model_name = "claude-sonnet-4-6"
+#
+# [providers.claude-haiku-4-5]
+# provider_name = "anthropic"
+# model_name = "claude-haiku-4-5-20251001"
+#
+# ─── OpenAI ─── $OPENAI_API_KEY or api_key below ─────────────────────────────
+#
+# [providers.gpt-5-5]
+# provider_name = "openai"
+# model_name = "gpt-5.5"
+# api_key = "sk-..."              # optional: omit to use $OPENAI_API_KEY
+#
+# [providers.gpt-5-4-mini]
+# provider_name = "openai"
+# model_name = "gpt-5.4-mini"
+#
+# [providers.gpt-5-4-nano]
+# provider_name = "openai"
+# model_name = "gpt-5.4-nano"
+#
+# [providers.gpt-4-1]
+# provider_name = "openai"
+# model_name = "gpt-4.1"
+#
+# [providers.gpt-4-1-mini]
+# provider_name = "openai"
+# model_name = "gpt-4.1-mini"
+#
+# [providers.gpt-4o]
+# provider_name = "openai"
+# model_name = "gpt-4o"
+#
+# [providers.o3]
+# provider_name = "openai"
+# model_name = "o3"
+#
+# [providers.o4-mini]
+# provider_name = "openai"
+# model_name = "o4-mini"
+#
+# ─── Google Gemini ─── $GEMINI_API_KEY or api_key below ───────────────────────
+#
+# [providers.gemini-3-1-pro]
+# provider_name = "gemini"
+# model_name = "gemini-3.1-pro-preview"
+# api_key = "AIza..."
+#
+# [providers.gemini-3-flash]
+# provider_name = "gemini"
+# model_name = "gemini-3-flash-preview"
+#
+# [providers.gemini-2-5-pro]
+# provider_name = "gemini"
+# model_name = "gemini-2.5-pro"
+#
+# [providers.gemini-2-5-flash]
+# provider_name = "gemini"
+# model_name = "gemini-2.5-flash"
+#
+# [providers.gemini-2-5-flash-lite]
+# provider_name = "gemini"
+# model_name = "gemini-2.5-flash-lite"
+#
+# ─── DeepSeek ─── $DEEPSEEK_API_KEY or api_key below ─────────────────────────
+#
+# [providers.deepseek-v4-pro]
+# provider_name = "deepseek"
+# model_name = "deepseek-v4-pro"
+# api_key = "sk-..."              # optional: omit to use $DEEPSEEK_API_KEY
+#
+# [providers.deepseek-v4-flash]
+# provider_name = "deepseek"
+# model_name = "deepseek-v4-flash"
+#
+# [providers.deepseek-reasoner]
+# provider_name = "deepseek"
+# model_name = "deepseek-reasoner"
+#
+# ─── OpenRouter (unified gateway) ─── $OPENROUTER_API_KEY or api_key below ───
+#
+# [providers.or-claude-opus]
+# provider_name = "openrouter"
+# model_name = "anthropic/claude-opus-4-7"
+# api_key = "sk-or-..."           # optional: omit to use $OPENROUTER_API_KEY
+#
+# [providers.or-gpt-5-5]
+# provider_name = "openrouter"
+# model_name = "openai/gpt-5.5"
+#
+# [providers.or-gemini-3-1-pro]
+# provider_name = "openrouter"
+# model_name = "google/gemini-3.1-pro-preview"
 
 [slack]
 enabled = false

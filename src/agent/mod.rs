@@ -728,7 +728,7 @@ pub struct SubagentHarnessParams {
 /// It holds a LLM Provider, a persistent Memory context, and available Tools.
 pub struct AgentLogic {
     name: String,
-    provider: Box<dyn Provider>,
+    provider: Arc<tokio::sync::RwLock<Box<dyn Provider>>>,
     session_manager: Arc<SessionManager>,
     tools: Arc<ToolRegistry>,
     skills: Arc<SkillRegistry>,
@@ -786,10 +786,13 @@ impl AgentLogic {
         let memory_node = session_manager.get_memory_node();
         let shell_policy = Arc::new(shell_policy);
 
+        let provider_for_subagent = dyn_clone::clone_box(&*provider);
+        let provider = Arc::new(tokio::sync::RwLock::new(provider));
+
         let subagent_harness = subagent.map(|p| {
             Arc::new(SubagentHarness::new(subagent::SubagentSpawnDeps {
                 agent_name: name.clone(),
-                provider_template: dyn_clone::clone_box(&*provider),
+                provider_template: provider_for_subagent,
                 session_manager: session_manager.clone(),
                 skills: skills.clone(),
                 system_prompt: subagent_system_prompt,
@@ -863,6 +866,11 @@ impl AgentLogic {
         agent
     }
 
+    /// Hot-swap the LLM provider at runtime (used by `/model` command).
+    pub async fn switch_provider(&self, new_provider: Box<dyn Provider>) {
+        *self.provider.write().await = new_provider;
+    }
+
     pub fn with_tool_execution_activity(
         mut self,
         tool_execution_activity: SharedToolExecutionActivity,
@@ -871,10 +879,11 @@ impl AgentLogic {
         self
     }
 
-    fn reasoning_spawn_args(&self) -> ReasoningSpawnArgs {
+    async fn reasoning_spawn_args(&self) -> ReasoningSpawnArgs {
+        let provider_guard = self.provider.read().await;
         ReasoningSpawnArgs {
             name: self.name.clone(),
-            provider: dyn_clone::clone_box(&*self.provider),
+            provider: dyn_clone::clone_box(&**provider_guard),
             session_manager: self.session_manager.clone(),
             tools: self.tools.clone(),
             skills: self.skills.clone(),
@@ -968,6 +977,32 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 self.pending_inbound.remove(&chat_id);
                 return Ok(None);
             }
+            BusMessage::SwitchModel {
+                provider_name,
+                model_name,
+                base_url,
+                api_key,
+            } => {
+                let new_provider: Box<dyn Provider> = if provider_name == "anthropic" {
+                    Box::new(crate::provider::AnthropicProvider::new(
+                        &base_url, &api_key, &model_name,
+                    ))
+                } else {
+                    let client = crate::utils::LLMClient::new_openai_compatible(
+                        &base_url, &api_key, &model_name,
+                    )
+                    .with_temperature(0.3);
+                    Box::new(crate::provider::OpenAIProvider::new(client))
+                };
+                self.switch_provider(new_provider).await;
+                let _ = self.logger_tx.send(BusMessage::Log(
+                    LogEvent::info(
+                        &self.name,
+                        &format!("Switched to provider={} model={}", provider_name, model_name),
+                    ),
+                ));
+                return Ok(None);
+            }
             BusMessage::Inbound(inbound) => {
                 let chat_id = inbound.chat_id.clone();
                 let session_key = inbound.clarification_session_key();
@@ -1017,7 +1052,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                     return Ok(None);
                 }
 
-                spawn_main_chat_reasoning_turn(self.reasoning_spawn_args(), inbound);
+                spawn_main_chat_reasoning_turn(self.reasoning_spawn_args().await, inbound);
 
                 Ok(None)
             }
@@ -1707,6 +1742,14 @@ impl AgentLogic {
             }
 
             if !tool_invoked {
+                // If the model returned empty text after tool calls, re-prompt once so the
+                // user sees an actual response instead of an invisible empty cell.
+                if response_text.trim().is_empty() && iterations > 1 && iterations < max_iterations {
+                    let nudge = "[SYSTEM: You used tools but did not produce a text reply for the user. Please summarize your findings or answer the user's question now.]";
+                    let correction = crate::utils::ChatMessage::user(nudge);
+                    mem.add_message(correction).await?;
+                    continue;
+                }
                 let research_nudge =
                     iterations < max_iterations && should_nudge_research_depth(&inbound, &context);
                 if forbid_final_effective && iterations < max_iterations {

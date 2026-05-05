@@ -8,14 +8,14 @@ use std::time::{Duration, Instant};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use tokio::sync::mpsc::Sender;
 
 use crate::bus::{BusMessage, InboundMessage, OutboundMessage};
@@ -24,7 +24,8 @@ use crate::channels::terminal_ui::history_cells;
 use crate::channels::terminal_ui::panes::{
     conversations_ensure_list_shows_selection, conversations_list_paragraph,
     executions_code_paragraph, executions_ensure_list_shows_selection, executions_list_paragraph,
-    executions_output_paragraph, tool_history_paragraph, transcript_paragraph,
+    executions_output_paragraph, extract_selection_text, tool_history_paragraph,
+    transcript_paragraph,
 };
 use crate::channels::terminal_ui::protocol::{
     ISANAGENT_AGENT_THOUGHT, ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_JOB_STARTED,
@@ -39,7 +40,8 @@ use crate::channels::terminal_ui::protocol::{
 use crate::channels::terminal_ui::text_format::truncate_chars_display;
 use crate::channels::terminal_ui::{
     execution_browser, init_from_env, uses_ansi_color, AgentTaskStatus, App, Cell, JobStripStatus,
-    TerminalUiFocus, Theme, ToastKind, ToolNoticePhase, ToolRailEntry,
+    ModelSelector, TerminalUiFocus, Theme, ToastKind, ToolNoticePhase, ToolRailEntry,
+    TranscriptSelection,
 };
 use crate::clarification::{METADATA_CLARIFICATION, METADATA_CLARIFICATION_CHOICES};
 use crate::memory::{chat_id_from_root_thread_id, MemoryMessage, SharedReply};
@@ -70,8 +72,8 @@ pub(crate) fn execution_strip_subtitle(description: Option<&str>, id: &str) -> S
 
 const ISANAGENT_TOOL_NOTIFY: &str = "isanagent_tool_notify";
 const ISANAGENT_TOOL_PHASE: &str = "isanagent_tool_phase";
-/// If set to a truthy value, start with application mouse capture (wheel in TUI; may block
-/// native selection). Default off; use **Ctrl+Shift+M** to toggle in-session.
+/// If set to a falsy value (0/false/no/off), disable application mouse capture at start.
+/// Default ON; use **Ctrl+Shift+M** to toggle in-session.
 const ISANAGENT_TUI_MOUSE: &str = "ISANAGENT_TUI_MOUSE";
 /// Lines to scroll per mouse wheel notch over the transcript.
 const MOUSE_SCROLL_LINES: u16 = 3;
@@ -79,6 +81,14 @@ const TOAST_COPY_OK_SECS: u64 = 3;
 const TOAST_COPY_ERR_SECS: u64 = 5;
 const TOAST_MOUSE_TOGGLE_OK_SECS: u64 = 4;
 const TOAST_MOUSE_TOGGLE_ERR_SECS: u64 = 5;
+/// Relative path inside workspace_dir where we persist the last chosen model config key.
+const LAST_MODEL_FILE: &str = ".system_generated/last_model";
+
+/// Best-effort write of the chosen config key so the next startup remembers it.
+fn persist_last_model(workspace_dir: &Path, config_key: &str) {
+    let path = workspace_dir.join(LAST_MODEL_FILE);
+    let _ = std::fs::write(&path, config_key);
+}
 
 const TERMINAL_HELP: &str = r#"Commands (leading slash):
   /exit, /quit   Quit and restore the terminal
@@ -101,6 +111,7 @@ Keys:
   Esc               From any pane: return to transcript
   PgUp / PgDn       Scroll the focused pane; on executions: output pane (Ctrl+Pg*: code pane)
   F5                Refresh list (executions or past-sessions pane)
+  Mouse drag        Select text in transcript; auto-copies to clipboard on release
   Ctrl+Shift+M      Toggle application mouse: on = wheel scrolls panes; off = native selection/copy
   Ctrl+Shift+Y      Copy last assistant reply
   Ctrl+W / Ctrl+U   Delete word / clear line
@@ -109,7 +120,7 @@ Keys:
 
 Environment:
   NO_COLOR            If set to a non-empty value, ANSI foreground colors in the TUI are disabled.
-  ISANAGENT_TUI_MOUSE 1 / true / yes / on: start with mouse wheel enabled in the TUI (optional)
+  ISANAGENT_TUI_MOUSE Mouse wheel scroll is ON by default. Set to 0/false/no/off to disable.
 "#;
 
 fn env_truthy(var: &str) -> bool {
@@ -120,6 +131,32 @@ fn env_truthy(var: &str) -> bool {
         )
     })
 }
+
+fn env_falsy(var: &str) -> bool {
+    std::env::var_os(var).is_some_and(|v| {
+        matches!(
+            v.to_string_lossy().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    })
+}
+
+/// Slash commands with descriptions for the autocomplete popup.
+const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/model", "Switch LLM model"),
+    ("/new", "Start a new thread"),
+    ("/exit", "Quit the terminal"),
+    ("/copy", "Copy last reply to clipboard"),
+    ("/retry", "Re-submit after LLM failure"),
+    ("/cancel", "Cancel in-flight work"),
+    ("/background", "Promote to background job"),
+    ("/tools", "Open tool activity pane"),
+    ("/exec", "Open executions browser"),
+    ("/agents", "Open sub-agent tasks"),
+    ("/chats", "Open past sessions"),
+    ("/help", "Show full help"),
+    ("/install-python", "Install uv runtime"),
+];
 
 /// Same as `/cancel`: cancel in-flight work; quit only if the bus is gone.
 fn try_cancel_inflight(app: &mut App, bus_tx: &Sender<BusMessage>, chat_id: &str) {
@@ -801,6 +838,27 @@ fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
     col >= r.x && col < x1 && row >= r.y && row < y1
 }
 
+/// Map mouse screen coordinates to (flattened_line_index, display_col) in the transcript,
+/// clamping to the inner content area (excluding borders).
+fn mouse_to_transcript_coords(
+    mouse_col: u16,
+    mouse_row: u16,
+    rect: Rect,
+    visible_start: usize,
+) -> (usize, usize) {
+    let content_y = rect.y.saturating_add(1);
+    let content_x = rect.x.saturating_add(1);
+    let max_row = rect.y.saturating_add(rect.height).saturating_sub(2);
+    let max_col = rect.x.saturating_add(rect.width).saturating_sub(2);
+
+    let row = mouse_row.clamp(content_y, max_row);
+    let col = mouse_col.clamp(content_x, max_col);
+
+    let content_row = (row - content_y) as usize;
+    let content_col = (col - content_x) as usize;
+    (visible_start + content_row, content_col)
+}
+
 fn clamp_executions_selection(app: &mut App) {
     if app.executions_runs.is_empty() {
         app.executions_selected_idx = None;
@@ -896,21 +954,29 @@ fn apply_ui_focus_cycle(app: &mut App, forward: bool, ctx: &mut FocusCycleContex
     }
 }
 
-fn last_assistant_markdown(cells: &[Cell]) -> Option<&str> {
-    cells.iter().rev().find_map(|c| {
-        if let Cell::Assistant { markdown } = c {
-            Some(markdown.as_str())
-        } else {
-            None
-        }
+fn last_copyable_text(cells: &[Cell], streaming_assistant: &str) -> Option<String> {
+    // 1. If there's an active streaming assistant buffer, copy that.
+    if !streaming_assistant.is_empty() {
+        return Some(streaming_assistant.to_string());
+    }
+    // 2. Search cells in reverse for the last copyable cell.
+    cells.iter().rev().find_map(|c| match c {
+        Cell::Assistant { markdown } => Some(markdown.clone()),
+        Cell::Thinking { text } => Some(text.clone()),
+        Cell::Error { message } => Some(message.clone()),
+        Cell::System { message } => Some(message.clone()),
+        _ => None,
     })
 }
 
-fn copy_last_assistant_to_clipboard(cells: &[Cell]) -> Result<usize, String> {
-    let text = last_assistant_markdown(cells)
+fn copy_last_assistant_to_clipboard(
+    cells: &[Cell],
+    streaming_assistant: &str,
+) -> Result<usize, String> {
+    let text = last_copyable_text(cells, streaming_assistant)
         .ok_or_else(|| "No assistant reply in this transcript yet.".to_string())?;
     let mut clip = arboard::Clipboard::new().map_err(|e| format!("clipboard init: {e}"))?;
-    clip.set_text(text)
+    clip.set_text(&text)
         .map_err(|e| format!("clipboard set: {e}"))?;
     Ok(text.len())
 }
@@ -1001,6 +1067,8 @@ pub(crate) struct RatatuiMainConfig {
     pub status_model: String,
     /// Workspace memory (same as agent) for past-session list and transcript load.
     pub memory_node: NodeHandle<MemoryMessage>,
+    /// Named alternative providers for `/model` switching.
+    pub providers: std::collections::HashMap<String, crate::config::ProviderConfig>,
 }
 
 /// Run until user quits. Restores terminal on exit.
@@ -1016,6 +1084,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         opening_banner,
         status_model,
         memory_node,
+        providers,
     } = config;
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -1036,7 +1105,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let mut application_mouse_enabled = env_truthy(ISANAGENT_TUI_MOUSE);
+    let mut application_mouse_enabled = !env_falsy(ISANAGENT_TUI_MOUSE);
     if application_mouse_enabled {
         if let Err(e) = execute!(terminal.backend_mut(), EnableMouseCapture) {
             log::warn!(
@@ -1047,6 +1116,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
     }
 
     let mut app = App::new();
+    app.status_model = status_model;
     app.cells.push(Cell::System {
         message: opening_banner,
     });
@@ -1303,8 +1373,22 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 }
             };
             let active_strip_h: u16 = 1;
-            let input_lines = app.input.split('\n').count() as u16;
-            let input_h = (input_lines + 2).clamp(3, 10);
+            // Calculate visual line count accounting for wrapping at inner width.
+            let compose_inner_w = area.width.saturating_sub(2).max(1) as usize; // borders
+            let mut visual_lines: u16 = 0;
+            for (i, line) in app.input.split('\n').enumerate() {
+                let prefix_len: usize = if i == 0 { 2 } else { 2 }; // "> " or "  "
+                let cols = prefix_len + super::display_width(line);
+                if cols == 0 {
+                    visual_lines += 1;
+                } else {
+                    visual_lines += ((cols as u16).div_ceil(compose_inner_w as u16)).max(1);
+                }
+            }
+            if visual_lines == 0 {
+                visual_lines = 1;
+            }
+            let input_h = (visual_lines + 2).clamp(3, 12);
             let ch = layout_chunks(area, exec_h, active_strip_h, input_h);
 
             let title_w = ch[0].width as usize;
@@ -1313,8 +1397,14 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 
             match app.ui_focus {
                 TerminalUiFocus::Transcript => {
-                    let (w, max_s) = transcript_paragraph(&app.cells, ch[1], app.scroll_offset);
+                    let (w, max_s, vis_start) = transcript_paragraph(
+                        &app.cells,
+                        ch[1],
+                        app.scroll_offset,
+                        app.transcript_selection.as_ref(),
+                    );
                     max_transcript_scroll_holder.set(max_s);
+                    app.last_transcript_visible_start = vis_start;
                     f.render_widget(w, ch[1]);
                     app.last_transcript_rect = Some(ch[1]);
                     app.last_tool_history_rect = None;
@@ -1454,7 +1544,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             let status_w_px = ch[3].width as usize;
             let status_line = build_status_line(
                 status_w_px.max(1),
-                status_model.as_str(),
+                app.status_model.as_str(),
                 app.thinking,
                 &chat_id,
                 app.cells.len(),
@@ -1556,6 +1646,79 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     .y
                     .saturating_add(inner_area.height.saturating_sub(1)),
             );
+            // Model selector popup overlay.
+            if let Some(selector) = &app.model_selector {
+                let popup_h = (selector.items.len() as u16 + 4).min(area.height.saturating_sub(4));
+                let popup_w = 50u16.min(area.width.saturating_sub(4));
+                let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
+                let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 2;
+                let popup_area = Rect::new(popup_x, popup_y, popup_w, popup_h);
+
+                f.render_widget(Clear, popup_area);
+
+                let inner_block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(Span::styled(" Select Model (↑↓ Enter Esc) ", Theme::tool_call()))
+                    .border_style(Style::default().fg(Color::Cyan));
+                let inner = inner_block.inner(popup_area);
+                f.render_widget(inner_block, popup_area);
+
+                let visible_h = inner.height as usize;
+                let scroll_offset = if selector.selected >= visible_h {
+                    selector.selected - visible_h + 1
+                } else {
+                    0
+                };
+
+                let mut lines: Vec<Line> = Vec::new();
+                for (i, entry) in selector.items.iter().enumerate().skip(scroll_offset).take(visible_h) {
+                    let marker = if i == selector.selected { "▶ " } else { "  " };
+                    let style = if i == selector.selected {
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    let line_text = format!("{}{}", marker, entry.label);
+                    lines.push(Line::from(Span::styled(line_text, style)));
+                }
+                let list_para = Paragraph::new(Text::from(lines));
+                f.render_widget(list_para, inner);
+            }
+
+            // Slash command hint popup (shown when input starts with "/" and no model selector).
+            if app.model_selector.is_none() && app.input.starts_with('/') && !app.input.contains(' ') {
+                let prefix = app.input.to_ascii_lowercase();
+                let matching: Vec<(&str, &str)> = SLASH_COMMANDS
+                    .iter()
+                    .filter(|(cmd, _)| cmd.starts_with(&prefix))
+                    .copied()
+                    .collect();
+                if !matching.is_empty() {
+                    let popup_h = (matching.len() as u16 + 2).min(16);
+                    let popup_w = 40u16.min(area.width.saturating_sub(4));
+                    // Position above the compose box
+                    let popup_y = ch[5].y.saturating_sub(popup_h);
+                    let popup_x = ch[5].x + 1;
+                    let popup_area = Rect::new(popup_x, popup_y, popup_w, popup_h);
+
+                    f.render_widget(Clear, popup_area);
+                    let hint_block = Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::DarkGray));
+                    let hint_inner = hint_block.inner(popup_area);
+                    f.render_widget(hint_block, popup_area);
+
+                    let mut lines: Vec<Line> = Vec::new();
+                    for (cmd, desc) in matching.iter().take(hint_inner.height as usize) {
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("{:<16}", cmd), Style::default().fg(Color::Cyan)),
+                            Span::styled(*desc, Style::default().fg(Color::Gray)),
+                        ]));
+                    }
+                    f.render_widget(Paragraph::new(Text::from(lines)), hint_inner);
+                }
+            }
+
             f.set_cursor_position((cx, cy));
         })?;
 
@@ -1589,7 +1752,83 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         }
 
         match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                // Model selector popup intercepts all keys when active.
+                if app.model_selector.is_some() {
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if let Some(sel) = &mut app.model_selector {
+                                sel.move_up();
+                            }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if let Some(sel) = &mut app.model_selector {
+                                sel.move_down();
+                            }
+                        }
+                        KeyCode::Enter => {
+                            let selection = app.model_selector.as_ref().and_then(|s| {
+                                s.selected_entry().map(|e| e.config_key.clone())
+                            });
+                            app.model_selector = None;
+                            if let Some(config_key) = selection {
+                                if let Some(cfg) = providers.get(&config_key) {
+                                    let resolved_url = cfg.resolved_base_url().unwrap_or_default();
+                                    let env_var = cfg.resolved_api_key_env();
+                                    let api_key_val = std::env::var(&env_var).ok()
+                                        .filter(|s| !s.is_empty())
+                                        .or_else(|| cfg.api_key.clone());
+
+                                    if let Some(api_key) = api_key_val {
+                                        let msg = BusMessage::SwitchModel {
+                                            provider_name: cfg.provider_name.clone(),
+                                            model_name: cfg.model_name.clone(),
+                                            base_url: resolved_url,
+                                            api_key,
+                                        };
+                                        if bus_tx.blocking_send(msg).is_err() {
+                                            app.cells.push(Cell::System {
+                                                message: "Bus closed; exiting.".into(),
+                                            });
+                                            app.request_quit();
+                                        } else {
+                                            app.status_model = cfg.model_name.clone();
+                                            persist_last_model(&workspace_dir, &config_key);
+                                            app.set_toast(
+                                                ToastKind::Ok,
+                                                format!("Model: {}", app.status_model),
+                                                Duration::from_secs(3),
+                                            );
+                                        }
+                                    } else {
+                                        let has_config_key = cfg.api_key.is_some();
+                                        let err_msg = format!(
+                                            "No API key for '{}' (checked ${}, config api_key: {}).\n\
+                                            Set the env var or add api_key = \"...\" under [providers.{}] in config.toml.",
+                                            config_key, env_var,
+                                            if has_config_key { "set but empty" } else { "not set" },
+                                            config_key
+                                        );
+                                        app.cells.push(Cell::Error {
+                                            message: err_msg,
+                                        });
+                                        app.set_toast(
+                                            ToastKind::Err,
+                                            format!("No API key for {}", config_key),
+                                            Duration::from_secs(5),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Esc | KeyCode::Char('q') => {
+                            app.model_selector = None;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                match key.code {
                 KeyCode::Char('c')
                     if key.modifiers.contains(KeyModifiers::CONTROL)
                         && !key.modifiers.contains(KeyModifiers::SHIFT) =>
@@ -1721,7 +1960,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             continue;
                         }
                         if text.eq_ignore_ascii_case("/copy") {
-                            match copy_last_assistant_to_clipboard(&app.cells) {
+                            match copy_last_assistant_to_clipboard(&app.cells, &app.streaming_assistant) {
                                 Ok(n) => {
                                     app.set_toast(
                                         ToastKind::Ok,
@@ -1849,9 +2088,77 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             app.scroll_to_bottom();
                             continue;
                         }
+                        if text.eq_ignore_ascii_case("/model")
+                            || text.to_ascii_lowercase().starts_with("/model ")
+                        {
+                            let arg = text.strip_prefix("/model").unwrap_or("").trim();
+                            if arg.is_empty() {
+                                // Open interactive model selector popup
+                                if providers.is_empty() {
+                                    app.cells.push(Cell::System {
+                                        message: "No models configured. Add [providers.*] sections to config.toml.".into(),
+                                    });
+                                } else {
+                                    app.model_selector = Some(ModelSelector::from_providers(&providers));
+                                }
+                            } else if let Some(cfg) = providers.get(arg) {
+                                let resolved_url = cfg.resolved_base_url().unwrap_or_default();
+                                let env_var = cfg.resolved_api_key_env();
+                                let key = std::env::var(&env_var).ok()
+                                    .filter(|s| !s.is_empty())
+                                    .or_else(|| cfg.api_key.clone());
+
+                                if let Some(api_key) = key {
+                                    let msg = BusMessage::SwitchModel {
+                                        provider_name: cfg.provider_name.clone(),
+                                        model_name: cfg.model_name.clone(),
+                                        base_url: resolved_url,
+                                        api_key,
+                                    };
+                                    if bus_tx.blocking_send(msg).is_err() {
+                                        app.cells.push(Cell::System {
+                                            message: "Bus closed; exiting.".into(),
+                                        });
+                                        app.request_quit();
+                                    } else {
+                                        app.status_model = cfg.model_name.clone();
+                                        persist_last_model(&workspace_dir, arg);
+                                        app.set_toast(
+                                            ToastKind::Ok,
+                                            format!("Model: {}", app.status_model),
+                                            Duration::from_secs(3),
+                                        );
+                                    }
+                                } else {
+                                    let err_msg = format!(
+                                        "No API key for '{}'. Set ${} or add api_key in config.",
+                                        arg, env_var
+                                    );
+                                    app.cells.push(Cell::Error {
+                                        message: err_msg.clone(),
+                                    });
+                                    app.set_toast(
+                                        ToastKind::Err,
+                                        err_msg,
+                                        Duration::from_secs(5),
+                                    );
+                                }
+                            } else {
+                                let available: Vec<&str> =
+                                    providers.keys().map(|s| s.as_str()).collect();
+                                app.cells.push(Cell::System {
+                                    message: format!(
+                                        "Unknown model '{}'. Available: {}",
+                                        arg,
+                                        available.join(", ")
+                                    ),
+                                });
+                            }
+                            continue;
+                        }
                         app.cells.push(Cell::System {
                             message:
-                                "Unknown command. Try /help, /exit, /new, /chats, /copy, /install-python, /cancel, /background, /retry, /tools, /exec, /agents."
+                                "Unknown command. Try /help, /exit, /new, /chats, /copy, /install-python, /cancel, /background, /retry, /tools, /exec, /agents, /model."
                                     .into(),
                         });
                         continue;
@@ -2069,7 +2376,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                         && key.modifiers.contains(KeyModifiers::SHIFT) =>
                 {
-                    match copy_last_assistant_to_clipboard(&app.cells) {
+                    match copy_last_assistant_to_clipboard(&app.cells, &app.streaming_assistant) {
                         Ok(n) => {
                             app.set_toast(
                                 ToastKind::Ok,
@@ -2135,8 +2442,85 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 }
                 KeyCode::Char(c) => app.insert_char(c),
                 _ => {}
-            },
+            }
+            } // end Event::Key block
             Event::Mouse(me) => {
+                // ── Text selection: drag / release (fires regardless of position) ──
+                if app.selecting {
+                    match me.kind {
+                        MouseEventKind::Drag(MouseButton::Left) => {
+                            if let Some(rect) = app.last_transcript_rect {
+                                let (line_idx, col) = mouse_to_transcript_coords(
+                                    me.column,
+                                    me.row,
+                                    rect,
+                                    app.last_transcript_visible_start,
+                                );
+                                if let Some(sel) = &mut app.transcript_selection {
+                                    sel.end_line = line_idx;
+                                    sel.end_col = col;
+                                }
+                            }
+                        }
+                        MouseEventKind::Up(MouseButton::Left) => {
+                            // Update end position from release coordinates
+                            // (handles terminals that don't send Drag events).
+                            if let Some(rect) = app.last_transcript_rect {
+                                let (line_idx, col) = mouse_to_transcript_coords(
+                                    me.column,
+                                    me.row,
+                                    rect,
+                                    app.last_transcript_visible_start,
+                                );
+                                if let Some(sel) = &mut app.transcript_selection {
+                                    sel.end_line = line_idx;
+                                    sel.end_col = col;
+                                }
+                            }
+                            app.selecting = false;
+                            if let Some(sel) = &app.transcript_selection {
+                                if !sel.is_empty() {
+                                    if let Some(rect) = app.last_transcript_rect {
+                                        let inner_w =
+                                            rect.width.saturating_sub(2) as usize;
+                                        let text = extract_selection_text(
+                                            &app.cells, inner_w, sel,
+                                        );
+                                        let n = text.len();
+                                        match arboard::Clipboard::new()
+                                            .and_then(|mut c| c.set_text(&text))
+                                        {
+                                            Ok(()) => {
+                                                app.set_toast(
+                                                    ToastKind::Ok,
+                                                    format!(
+                                                        "Copied selection ({n} chars)"
+                                                    ),
+                                                    Duration::from_secs(
+                                                        TOAST_COPY_OK_SECS,
+                                                    ),
+                                                );
+                                            }
+                                            Err(e) => {
+                                                app.set_toast(
+                                                    ToastKind::Err,
+                                                    format!("Copy failed: {e}"),
+                                                    Duration::from_secs(
+                                                        TOAST_COPY_ERR_SECS,
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    app.transcript_selection = None;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
                 let over_transcript = app
                     .last_transcript_rect
                     .map(|r| rect_contains(r, me.column, me.row))
@@ -2152,6 +2536,23 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         // Trackpads: horizontal wheel maps to vertical transcript scroll.
                         MouseEventKind::ScrollLeft => app.scroll_up(MOUSE_SCROLL_LINES),
                         MouseEventKind::ScrollRight => app.scroll_down(MOUSE_SCROLL_LINES),
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            if let Some(rect) = app.last_transcript_rect {
+                                let (line_idx, col) = mouse_to_transcript_coords(
+                                    me.column,
+                                    me.row,
+                                    rect,
+                                    app.last_transcript_visible_start,
+                                );
+                                app.transcript_selection = Some(TranscriptSelection {
+                                    anchor_line: line_idx,
+                                    anchor_col: col,
+                                    end_line: line_idx,
+                                    end_col: col,
+                                });
+                                app.selecting = true;
+                            }
+                        }
                         _ => {}
                     }
                 } else if over_tool_history {
@@ -2290,6 +2691,15 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             }
                             _ => {}
                         }
+                    }
+                } else {
+                    // Fallback: scroll transcript for any unhandled area (e.g. compose box).
+                    match me.kind {
+                        MouseEventKind::ScrollUp => app.scroll_up(MOUSE_SCROLL_LINES),
+                        MouseEventKind::ScrollDown => app.scroll_down(MOUSE_SCROLL_LINES),
+                        MouseEventKind::ScrollLeft => app.scroll_up(MOUSE_SCROLL_LINES),
+                        MouseEventKind::ScrollRight => app.scroll_down(MOUSE_SCROLL_LINES),
+                        _ => {}
                     }
                 }
             }
