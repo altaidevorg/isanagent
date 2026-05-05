@@ -570,9 +570,9 @@ impl SubagentHarness {
                 };
                 let _ = outbound
                     .send(BusMessage::Outbound(OutboundMessage {
-                        channel: "terminal".to_string(),
+                        channel: parent_channel_for_wake.clone(),
                         chat_id: parent_for_db.clone(),
-                        thread_id: None,
+                        thread_id: parent_thread_for_wake.clone(),
                         content,
                         metadata: meta,
                     }))
