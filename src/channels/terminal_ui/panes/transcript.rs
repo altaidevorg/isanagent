@@ -63,7 +63,7 @@ pub fn extract_selection_text(
         let mut byte_start = plain.len();
         let mut byte_end = plain.len();
         for (bi, ch) in plain.char_indices() {
-            if col == start_col {
+            if col >= start_col && byte_start == plain.len() {
                 byte_start = bi;
             }
             col += ch.width().unwrap_or(0);
@@ -71,12 +71,6 @@ pub fn extract_selection_text(
                 byte_end = bi + ch.len_utf8();
                 break;
             }
-        }
-        if byte_start == plain.len() {
-            byte_start = plain.len();
-        }
-        if byte_end < byte_start {
-            byte_end = byte_start;
         }
         if i > sl {
             out.push('\n');

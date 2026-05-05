@@ -814,8 +814,8 @@ fn mouse_to_transcript_coords(
     let content_x = rect.x.saturating_add(1);
     let max_row = rect.y.saturating_add(rect.height).saturating_sub(2);
     let max_col = rect.x.saturating_add(rect.width).saturating_sub(2);
-    let row = mouse_row.clamp(content_y, max_row);
-    let col = mouse_col.clamp(content_x, max_col);
+    let row = mouse_row.clamp(content_y, content_y.max(max_row));
+    let col = mouse_col.clamp(content_x, content_x.max(max_col));
     let content_row = (row - content_y) as usize;
     let content_col = (col - content_x) as usize;
     (visible_start + content_row, content_col)
