@@ -1310,6 +1310,29 @@ impl ProviderConfig {
         format!("{}_API_KEY", self.provider_name.to_uppercase())
     }
 
+    /// Resolve the API key: env var (from `resolved_api_key_env()`) first, then the inline
+    /// `api_key` field in config.toml. Returns `Err` when neither source provides a non-empty key.
+    pub fn resolve_api_key(&self) -> Result<String, String> {
+        let env_var = self.resolved_api_key_env();
+        if !env_var.is_empty() {
+            if let Ok(key) = std::env::var(&env_var) {
+                if !key.is_empty() {
+                    return Ok(key);
+                }
+            }
+        }
+        if let Some(key) = &self.api_key {
+            let trimmed = key.trim();
+            if !trimmed.is_empty() {
+                return Ok(trimmed.to_string());
+            }
+        }
+        Err(format!(
+            "No API key found (checked env ${} and config api_key)",
+            env_var
+        ))
+    }
+
     /// Resolve the chat-completions URL using the registry-then-override rules described on
     /// [`ProviderConfig::base_url`].
     ///

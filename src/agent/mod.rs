@@ -786,13 +786,12 @@ impl AgentLogic {
         let memory_node = session_manager.get_memory_node();
         let shell_policy = Arc::new(shell_policy);
 
-        let provider_for_subagent = dyn_clone::clone_box(&*provider);
         let provider = Arc::new(tokio::sync::RwLock::new(provider));
 
         let subagent_harness = subagent.map(|p| {
             Arc::new(SubagentHarness::new(subagent::SubagentSpawnDeps {
                 agent_name: name.clone(),
-                provider_template: provider_for_subagent,
+                provider: provider.clone(),
                 session_manager: session_manager.clone(),
                 skills: skills.clone(),
                 system_prompt: subagent_system_prompt,
@@ -983,17 +982,8 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 base_url,
                 api_key,
             } => {
-                let new_provider: Box<dyn Provider> = if provider_name == "anthropic" {
-                    Box::new(crate::provider::AnthropicProvider::new(
-                        &base_url, &api_key, &model_name,
-                    ))
-                } else {
-                    let client = crate::utils::LLMClient::new_openai_compatible(
-                        &base_url, &api_key, &model_name,
-                    )
-                    .with_temperature(0.3);
-                    Box::new(crate::provider::OpenAIProvider::new(client))
-                };
+                let new_provider =
+                    crate::provider::create_provider(&provider_name, &base_url, &api_key, &model_name);
                 self.switch_provider(new_provider).await;
                 let _ = self.logger_tx.send(BusMessage::Log(
                     LogEvent::info(

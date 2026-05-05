@@ -3,6 +3,27 @@ use crate::utils::{
     build_reqwest_client, ChatMessage, LLMClient, LLMError, LLMResponse, MessageContent,
     TokenUsage, ToolCallFunction, ToolCallRequest,
 };
+
+/// Create a boxed [`Provider`] for the given provider name.
+///
+/// Routes `"anthropic"` to [`AnthropicProvider`] (Messages API) and everything else to
+/// [`OpenAIProvider`] (OpenAI-compatible chat completions). Temperature is set to 0.3.
+pub fn create_provider(
+    provider_name: &str,
+    base_url: &str,
+    api_key: &str,
+    model_name: &str,
+) -> Box<dyn Provider> {
+    if provider_name == "anthropic" {
+        Box::new(
+            AnthropicProvider::new(base_url, api_key, model_name).with_temperature(0.3),
+        )
+    } else {
+        let client =
+            LLMClient::new_openai_compatible(base_url, api_key, model_name).with_temperature(0.3);
+        Box::new(OpenAIProvider::new(client))
+    }
+}
 use async_trait::async_trait;
 use log::debug;
 use serde_json::{json, Value};
@@ -145,13 +166,9 @@ impl AnthropicProvider {
                                                 json!({"type": "text", "text": "[image]"})
                                             }
                                         } else {
-                                            json!({
-                                                "type": "image",
-                                                "source": {
-                                                    "type": "url",
-                                                    "url": image_url.url
-                                                }
-                                            })
+                                            // Anthropic only supports base64 image sources;
+                                            // non-data URIs fall back to a text placeholder.
+                                            json!({"type": "text", "text": format!("[image: {}]", image_url.url)})
                                         }
                                     }
                                 })

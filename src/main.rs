@@ -27,7 +27,7 @@ use isanagent::onboarding::{
     build_interactive_config_toml, onboard_workspace, BootstrapReport, OnboardOptions,
 };
 use isanagent::onboarding_interactive;
-use isanagent::provider::OpenAIProvider;
+
 use isanagent::scheduler::{
     validate_multi_tenant_edge_runtime, CronActor, CronSchedulingMode, MultiTenantEdgeCronScheduler,
 };
@@ -522,8 +522,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         if let Some(ref key_name) = remembered_key {
             if let Some(providers_map) = &workspace.config.providers {
                 if let Some(cfg) = providers_map.get(key_name) {
-                    let env_var = cfg.resolved_api_key_env();
-                    if let Ok(key) = resolve_api_key(&env_var, cfg.api_key.as_deref()) {
+                    if let Ok(key) = cfg.resolve_api_key() {
                         found_remembered = Some((cfg.clone(), key));
                     }
                 }
@@ -533,28 +532,24 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             (Some(cfg), Some(key))
         }
         // 1. Try default [provider]
-        else {
-            let env_var = default_provider_cfg.resolved_api_key_env();
-            if let Ok(key) = resolve_api_key(&env_var, default_provider_cfg.api_key.as_deref()) {
-                (Some(default_provider_cfg.clone()), Some(key))
-            } else {
-                // 2. Try any [providers.*] entry
-                let mut found: Option<(isanagent::config::ProviderConfig, String)> = None;
-                if let Some(providers_map) = &workspace.config.providers {
-                    for (_name, cfg) in providers_map {
-                        let alt_env = cfg.resolved_api_key_env();
-                        if let Ok(key) = resolve_api_key(&alt_env, cfg.api_key.as_deref()) {
-                            found = Some((cfg.clone(), key));
-                            break;
-                        }
+        else if let Ok(key) = default_provider_cfg.resolve_api_key() {
+            (Some(default_provider_cfg.clone()), Some(key))
+        } else {
+            // 2. Try any [providers.*] entry
+            let mut found: Option<(isanagent::config::ProviderConfig, String)> = None;
+            if let Some(providers_map) = &workspace.config.providers {
+                for (_name, cfg) in providers_map {
+                    if let Ok(key) = cfg.resolve_api_key() {
+                        found = Some((cfg.clone(), key));
+                        break;
                     }
                 }
-                if let Some((cfg, key)) = found {
-                    (Some(cfg), Some(key))
-                } else {
-                    // No key anywhere — start without one (NoKeyProvider)
-                    (None, None)
-                }
+            }
+            if let Some((cfg, key)) = found {
+                (Some(cfg), Some(key))
+            } else {
+                // No key anywhere — start without one (NoKeyProvider)
+                (None, None)
             }
         }
     };
@@ -569,19 +564,9 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         Box<dyn isanagent::traits::Provider>,
     ) = if let (Some(cfg), Some(key)) = (&provider_cfg, &api_key) {
         let base_url = cfg.resolved_base_url().map_err(std::io::Error::other)?;
-        if cfg.provider_name == "anthropic" {
-            let p = isanagent::provider::AnthropicProvider::new(&base_url, key, &model_name)
-                .with_temperature(0.3);
-            (Box::new(p.clone()), Box::new(p))
-        } else {
-            let client =
-                isanagent::utils::LLMClient::new_openai_compatible(&base_url, key, &model_name)
-                    .with_temperature(0.3);
-            (
-                Box::new(OpenAIProvider::new(client.clone())),
-                Box::new(OpenAIProvider::new(client)),
-            )
-        }
+        let p1 = isanagent::provider::create_provider(&cfg.provider_name, &base_url, key, &model_name);
+        let p2 = isanagent::provider::create_provider(&cfg.provider_name, &base_url, key, &model_name);
+        (p1, p2)
     } else {
         // No API key found — start with placeholder; user can switch via /model
         eprintln!("No API key found. Starting without a model. Use /model to configure one.");
@@ -1501,26 +1486,6 @@ fn paths_equivalent(a: &std::path::Path, b: &std::path::Path) -> bool {
         (Some(a), Some(b)) => a == b,
         _ => a == b,
     }
-}
-
-/// Resolve the API key: env var first, then config `api_key` field.
-fn resolve_api_key(env_var_name: &str, config_key: Option<&str>) -> Result<String, String> {
-    // 1. Try env var
-    if !env_var_name.is_empty() {
-        if let Ok(key) = std::env::var(env_var_name) {
-            if !key.is_empty() {
-                return Ok(key);
-            }
-        }
-    }
-    // 2. Try config api_key field
-    if let Some(key) = config_key {
-        let trimmed = key.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
-        }
-    }
-    Err(format!("No API key found (checked env ${env_var_name} and config api_key)"))
 }
 
 #[cfg(test)]
