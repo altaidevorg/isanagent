@@ -380,7 +380,7 @@ impl SubagentHarness {
                 .deps
                 .outbound_tx
                 .send(BusMessage::Outbound(OutboundMessage {
-                    channel: "terminal".to_string(),
+                    channel: parent_channel.clone(),
                     chat_id: parent_chat_id.clone(),
                     thread_id: parent_thread_id.clone(),
                     content: format!("Sub-agent started: {label}"),
