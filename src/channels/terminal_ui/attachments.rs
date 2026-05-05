@@ -21,9 +21,13 @@ pub(crate) fn image_mime_from_extension(path: &std::path::Path) -> Option<&'stat
 
 /// Parses a terminal input string for `@<filepath>` references.
 ///
-/// Each `@<path>` token is removed from the returned text and the referenced
-/// file is read from disk, base64-encoded, and returned as an
-/// `ContentPart::ImageUrl` attachment using a data URI.
+/// Each `@<path>` token that resolves to a supported image file (png/jpeg/gif/webp)
+/// inside the sandbox is consumed: removed from the returned text, base64-encoded,
+/// and returned as a `ContentPart::ImageUrl` attachment using a data URI.
+///
+/// `@<token>` references that do NOT resolve to an image (missing files, non-image
+/// extensions, outside sandbox) are preserved in the text so they can serve as
+/// agent mentions or other syntax.
 pub(crate) fn parse_terminal_attachments(
     input: &str,
     sandbox_dir: &std::path::Path,
@@ -38,8 +42,6 @@ pub(crate) fn parse_terminal_attachments(
     let mut i = 0;
     while i < input.len() {
         if bytes[i] == b'@' {
-            clean_parts.push(&input[last_end..i]);
-
             let path_start = i + 1;
             let mut path_end = path_start;
             while path_end < input.len() && !bytes[path_end].is_ascii_whitespace() {
@@ -51,39 +53,48 @@ pub(crate) fn parse_terminal_attachments(
 
             let expanded_path = std::path::Path::new(&expanded);
             let path_exists = expanded_path.exists() || sandbox_dir.join(expanded_path).exists();
+
+            // Only strip @token from text when it resolves to a supported image file.
+            // Unresolvable tokens (missing files, non-image types, outside sandbox) are
+            // preserved as regular text so that @agent mentions and similar syntax survive.
+            let mut consumed = false;
             match resolve_path(sandbox_dir, &expanded) {
                 None if path_exists => {
                     eprintln!("Warning: @<path> is outside the sandbox boundary, skipping.");
                 }
                 None => {
-                    eprintln!("Warning: @<path> does not exist or is not accessible, skipping.");
+                    // File doesn't exist — leave @token as text (may be an agent mention).
                 }
                 Some(file_path) => match image_mime_from_extension(&file_path) {
                     None => {
-                        eprintln!(
-                            "Warning: @<path> is not a supported image type (jpeg/png/gif/webp), skipping."
-                        );
+                        // Not a supported image type — leave @token as text.
                     }
                     Some(mime) => match std::fs::read(&file_path) {
                         Err(_) => {
                             eprintln!("Warning: could not read @<path>, skipping.");
                         }
-                        Ok(bytes) => {
+                        Ok(file_bytes) => {
                             let data_uri =
-                                format!("data:{};base64,{}", mime, engine.encode(&bytes));
+                                format!("data:{};base64,{}", mime, engine.encode(&file_bytes));
                             attachments.push(ContentPart::ImageUrl {
                                 image_url: ImageUrl {
                                     url: data_uri,
                                     detail: None,
                                 },
                             });
+                            consumed = true;
                         }
                     },
                 },
             }
 
-            last_end = path_end;
-            i = path_end;
+            if consumed {
+                clean_parts.push(&input[last_end..i]);
+                last_end = path_end;
+                i = path_end;
+            } else {
+                i += 1;
+            }
         } else {
             i += 1;
         }
@@ -114,7 +125,10 @@ mod tests {
         std::fs::write(&path, b"hello").ok();
         let input = format!("show @{} please", path.display());
         let (text, attachments) = parse_terminal_attachments(&input, &sandbox);
-        assert!(!text.contains('@'));
+        assert!(
+            text.contains('@'),
+            "non-image @reference must stay in text (may be an agent mention)"
+        );
         assert!(attachments.is_empty(), "non-image files must be skipped");
         let _ = std::fs::remove_file(&path);
     }
@@ -126,7 +140,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let input = format!("see @{} thanks", path.display());
         let (text, attachments) = parse_terminal_attachments(&input, &sandbox);
-        assert!(!text.contains('@'));
+        assert!(
+            text.contains('@'),
+            "unresolved @reference must stay in text (may be an agent mention)"
+        );
         assert!(
             attachments.is_empty(),
             "missing file must be skipped gracefully"

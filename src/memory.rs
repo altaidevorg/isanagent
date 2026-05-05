@@ -225,6 +225,12 @@ pub fn ensure_subagent_tasks_schema(conn: &Connection) -> Result<(), rusqlite::E
          ON subagent_tasks(parent_chat_id, updated_at_ms DESC)",
         [],
     )?;
+    // Migrate existing tables that were created before display_name / agent_name were added.
+    let _ = conn.execute(
+        "ALTER TABLE subagent_tasks ADD COLUMN display_name TEXT",
+        [],
+    );
+    let _ = conn.execute("ALTER TABLE subagent_tasks ADD COLUMN agent_name TEXT", []);
     Ok(())
 }
 
