@@ -16,8 +16,8 @@ mod text_format;
 mod theme;
 
 pub use app::{
-    App, Cell, JobStripEntry, JobStripStatus, TerminalUiFocus, TerminalUiMode, ToastKind,
-    ToolNoticePhase, ToolRailEntry,
+    AgentTaskEntry, AgentTaskStatus, App, Cell, JobStripEntry, JobStripStatus, TerminalUiFocus,
+    TerminalUiMode, ToastKind, ToolNoticePhase, ToolRailEntry,
 };
 pub use theme::{init_from_env, uses_ansi_color, Theme};
 

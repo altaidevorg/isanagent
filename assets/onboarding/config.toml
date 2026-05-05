@@ -75,6 +75,28 @@ enabled = true
 enabled = true
 # cancel_children_on_parent_cancel = false  # default true: explicit cancel (/cancel, BusMessage::Cancel) also stops sub-tasks
 # allowed_tools = ["read_file", "glob_files", "search_text", "edit_file"]  # omit = all tools except nested spawn/plan
+# wake_on_completion = true    # default true: auto-notify parent when a subagent finishes
+# task_history_retention = 200 # default 200: max completed tasks retained in SQLite per parent chat
+
+# Named agents (Phase 5b): specialized sub-agents with per-agent system prompts, tool sets,
+# and optional model/temperature overrides. When no agents are defined, three built-in
+# defaults are auto-registered: researcher, coder, evaluator.
+#
+# [agents.researcher]
+# description = "Research topics, find papers, and gather context from web and files"
+# allowed_tools = ["web_search", "web_fetch", "arxiv_search", "arxiv_fetch", "read_file", "search_text"]
+# temperature = 0.1
+#
+# [agents.coder]
+# description = "Implement code changes, write tests, refactor, and fix bugs"
+# # allowed_tools omitted = inherit harness allowlist
+# temperature = 0.2
+#
+# [agents.evaluator]
+# description = "Review code, find bugs, assess quality, and audit changes"
+# allowed_tools = ["read_file", "search_text", "glob_files", "list_dir", "web_search"]
+# temperature = 0.0
+# hidden = false
 
 # Shell policy for `exec` safety. mode applies to interactive sessions; unattended_default applies
 # when inbound metadata indicates autonomous/headless execution.

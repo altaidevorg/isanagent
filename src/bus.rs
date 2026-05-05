@@ -7,6 +7,8 @@ pub const METADATA_SYNTHETIC_JOB_FOLLOWUP: &str = "isanagent_synthetic_job_follo
 
 /// Inbound metadata: synthetic user message enqueued when a cron job fires.
 pub const METADATA_SYNTHETIC_CRON_TRIGGER: &str = "isanagent_synthetic_cron_trigger";
+/// Inbound metadata: synthetic user message enqueued when a subagent task finishes.
+pub const METADATA_SYNTHETIC_SUBAGENT_COMPLETION: &str = "isanagent_synthetic_subagent_completion";
 /// Inbound metadata: hint to the agent to avoid finishing without using tools.
 pub const METADATA_AUTONOMOUS_FORBID_FINAL_WITHOUT_TOOLS: &str =
     "isanagent_autonomous_forbid_final_without_tools";
@@ -153,6 +155,9 @@ pub enum TelemetryEvent {
         task_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display_name: Option<String>,
+        /// Named agent type (e.g. "researcher", "coder"). None for legacy generic spawns.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_name: Option<String>,
     },
     /// Sub-agent task reached a terminal state (also persisted in SQLite).
     SubagentFinished {
@@ -161,6 +166,9 @@ pub enum TelemetryEvent {
         task_id: String,
         /// `completed`, `failed`, or `cancelled`.
         status: String,
+        /// Named agent type. None for legacy generic spawns.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_name: Option<String>,
     },
     /// Shell policy decision before executing `exec`.
     ShellPolicyDecision {

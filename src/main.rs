@@ -612,6 +612,24 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         None
     };
 
+    // Load agent definitions from config; use built-in defaults when none configured.
+    let agent_defs = workspace.config.agent_definitions();
+    let agent_defs = if agent_defs.is_empty() {
+        isanagent::agent::registry::default_agent_definitions()
+    } else {
+        agent_defs
+    };
+    let agent_registry = std::sync::Arc::new(isanagent::agent::AgentRegistry::from_definitions(
+        &agent_defs,
+        &workspace.sandbox_dir,
+    ));
+
+    // Inject agent descriptions into the system prompt
+    let agent_prompt_section = agent_registry.compile_agent_prompt_section();
+    if !agent_prompt_section.is_empty() {
+        system_prompt.push_str(&agent_prompt_section);
+    }
+
     let subagent = if workspace.config.subagent_harness_enabled() {
         Some(isanagent::agent::SubagentHarnessParams {
             cancel_children_on_parent_cancel: workspace
@@ -623,6 +641,10 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                 .map(std::sync::Arc::new),
             max_tasks: workspace.config.subagent_max_tasks(),
             max_wait_secs: workspace.config.subagent_max_wait_secs(),
+            agent_registry: Some(agent_registry),
+            wake_on_completion: workspace.config.subagent_wake_on_completion(),
+            task_history_retention: workspace.config.subagent_task_history_retention(),
+            bus_tx: Some(bus_tx.clone()),
         })
     } else {
         None

@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::mpsc;
 
 mod doom_loop;
+pub mod registry;
 mod subagent;
+pub use registry::AgentRegistry;
 pub use subagent::SubagentHarness;
 
 use crate::clarification::ClarificationHub;
@@ -716,6 +718,10 @@ pub struct SubagentHarnessParams {
     pub allowed_tools: Option<Arc<HashSet<String>>>,
     pub max_tasks: usize,
     pub max_wait_secs: u64,
+    pub agent_registry: Option<Arc<AgentRegistry>>,
+    pub wake_on_completion: bool,
+    pub task_history_retention: usize,
+    pub bus_tx: Option<tokio::sync::mpsc::Sender<crate::bus::BusMessage>>,
 }
 
 /// The central logic for an autonomous Agent running inside an ActorNode.
@@ -805,6 +811,10 @@ impl AgentLogic {
                 harness_runtime_summary: harness_for_subagent.clone(),
                 shell_policy: shell_policy.clone(),
                 hook_tool_ctx: hook_tool_ctx.clone(),
+                agent_registry: p.agent_registry.clone(),
+                wake_on_completion: p.wake_on_completion,
+                task_history_retention: p.task_history_retention,
+                bus_tx: p.bus_tx.clone(),
             }))
         });
 

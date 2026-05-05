@@ -18,10 +18,12 @@ const ISANAGENT_TOOL_PHASE: &str = "isanagent_tool_phase";
 
 use crate::channels::terminal_ui::protocol::{
     ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_JOB_STARTED, ISANAGENT_EXECUTION_STREAM,
-    ISANAGENT_TOOL_PROGRESS, METADATA_EXECUTION_DESCRIPTION, METADATA_EXECUTION_JOB_ID,
-    METADATA_EXECUTION_JOB_STATUS, METADATA_EXECUTION_JOB_TOOL_NAME, METADATA_EXECUTION_RUN_ID,
-    METADATA_EXECUTION_SESSION_ID, METADATA_TOOL_CALL_ID, METADATA_TOOL_CALL_PREVIEW,
-    METADATA_TOOL_NAME, METADATA_TOOL_RESULT_PREVIEW,
+    ISANAGENT_SUBAGENT_TASK_FINISHED, ISANAGENT_SUBAGENT_TASK_STARTED, ISANAGENT_TOOL_PROGRESS,
+    METADATA_EXECUTION_DESCRIPTION, METADATA_EXECUTION_JOB_ID, METADATA_EXECUTION_JOB_STATUS,
+    METADATA_EXECUTION_JOB_TOOL_NAME, METADATA_EXECUTION_RUN_ID, METADATA_EXECUTION_SESSION_ID,
+    METADATA_SUBAGENT_AGENT_NAME, METADATA_SUBAGENT_CHILD_CHAT_ID, METADATA_SUBAGENT_DISPLAY_NAME,
+    METADATA_SUBAGENT_STATUS, METADATA_SUBAGENT_TASK_ID, METADATA_TOOL_CALL_ID,
+    METADATA_TOOL_CALL_PREVIEW, METADATA_TOOL_NAME, METADATA_TOOL_RESULT_PREVIEW,
 };
 
 /// When true, `main` skips the large colored stdout banner (Ratatui alternate screen owns the TTY).
@@ -282,6 +284,94 @@ pub fn build_execution_job_notice(
         chat_id: chat_id.to_string(),
         thread_id: None,
         content: summary.to_string(),
+        metadata,
+    }
+}
+
+/// Short user-visible line when a sub-agent task is spawned.
+pub fn build_subagent_task_started_notice(
+    chat_id: &str,
+    task_id: &str,
+    child_chat_id: &str,
+    agent_name: Option<&str>,
+    display_name: Option<&str>,
+) -> OutboundMessage {
+    let mut metadata = HashMap::new();
+    metadata.insert(ISANAGENT_SUBAGENT_TASK_STARTED.to_string(), json!(true));
+    metadata.insert(METADATA_SUBAGENT_TASK_ID.to_string(), json!(task_id));
+    metadata.insert(
+        METADATA_SUBAGENT_CHILD_CHAT_ID.to_string(),
+        json!(child_chat_id),
+    );
+    if let Some(a) = agent_name.filter(|s| !s.is_empty()) {
+        metadata.insert(METADATA_SUBAGENT_AGENT_NAME.to_string(), json!(a));
+    }
+    if let Some(d) = display_name.filter(|s| !s.is_empty()) {
+        metadata.insert(METADATA_SUBAGENT_DISPLAY_NAME.to_string(), json!(d));
+    }
+    let label = match (agent_name, display_name) {
+        (Some(a), Some(d)) => format!("{a}: {d}"),
+        (Some(a), None) => a.to_string(),
+        (None, Some(d)) => d.to_string(),
+        (None, None) => {
+            let short = &task_id[..8.min(task_id.len())];
+            format!("task-{short}")
+        }
+    };
+    let content = format!("Sub-agent started: {label}");
+    OutboundMessage {
+        channel: "terminal".to_string(),
+        chat_id: chat_id.to_string(),
+        thread_id: None,
+        content,
+        metadata,
+    }
+}
+
+/// Short user-visible line when a sub-agent task finishes (completed / failed / cancelled).
+pub fn build_subagent_task_finished_notice(
+    chat_id: &str,
+    task_id: &str,
+    child_chat_id: &str,
+    status: &str,
+    summary: &str,
+    agent_name: Option<&str>,
+    display_name: Option<&str>,
+) -> OutboundMessage {
+    let mut metadata = HashMap::new();
+    metadata.insert(ISANAGENT_SUBAGENT_TASK_FINISHED.to_string(), json!(true));
+    metadata.insert(METADATA_SUBAGENT_TASK_ID.to_string(), json!(task_id));
+    metadata.insert(
+        METADATA_SUBAGENT_CHILD_CHAT_ID.to_string(),
+        json!(child_chat_id),
+    );
+    metadata.insert(METADATA_SUBAGENT_STATUS.to_string(), json!(status));
+    if let Some(a) = agent_name.filter(|s| !s.is_empty()) {
+        metadata.insert(METADATA_SUBAGENT_AGENT_NAME.to_string(), json!(a));
+    }
+    if let Some(d) = display_name.filter(|s| !s.is_empty()) {
+        metadata.insert(METADATA_SUBAGENT_DISPLAY_NAME.to_string(), json!(d));
+    }
+    let label = match (agent_name, display_name) {
+        (Some(a), Some(d)) => format!("{a}: {d}"),
+        (Some(a), None) => a.to_string(),
+        (None, Some(d)) => d.to_string(),
+        (None, None) => {
+            let short = &task_id[..8.min(task_id.len())];
+            format!("task-{short}")
+        }
+    };
+    let summary = summary.trim();
+    let content = if summary.is_empty() {
+        format!("Sub-agent finished ({status}): {label}")
+    } else {
+        format!("Sub-agent finished ({status}): {label} — {summary}")
+    };
+    OutboundMessage {
+        channel: "terminal".to_string(),
+        chat_id: chat_id.to_string(),
+        thread_id: None,
+        content,
         metadata,
     }
 }
