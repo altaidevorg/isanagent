@@ -335,7 +335,7 @@ pub fn build_reqwest_client() -> reqwest::Client {
 }
 
 impl LLMClient {
-    /// Create a new client with default settings (temp=0.7, timeout=30s).
+    /// Create a new client with default settings (temp=0.7, timeout=600s).
     pub fn new_openai_compatible(base_url: &str, api_key: &str, model: &str) -> Self {
         // Ensure base_url ends with slash if needed, or handle path joining correctly
         // For simplicity, we assume user gives enough of the path or we append standardized paths.
@@ -349,7 +349,7 @@ impl LLMClient {
             api_key: api_key.to_string(),
             model: model.to_string(),
             temperature: 0.7,
-            timeout: Duration::from_secs(30),
+            timeout: Duration::from_secs(600),
             client: build_reqwest_client(),
         }
     }
