@@ -1,4 +1,4 @@
-use log::{debug, info};
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::{Component, Path, PathBuf};
@@ -435,7 +435,7 @@ impl LLMClient {
                 .collect::<Vec<_>>()
                 .join("")
         } else {
-            "".to_string()
+            return Err(LLMError::NoContent);
         };
 
         // Parse tool calls — normalize `arguments` from object to string for providers
@@ -458,7 +458,7 @@ impl LLMClient {
             match serde_json::from_value::<Vec<ToolCallRequest>>(tc_json) {
                 Ok(calls) => Some(calls),
                 Err(e) => {
-                    log::warn!(
+                    warn!(
                         "Failed to parse tool_calls from provider response: {}",
                         e
                     );
