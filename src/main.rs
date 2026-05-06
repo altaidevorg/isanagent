@@ -11,7 +11,7 @@ use isanagent::bus::{BusMessage, LoggerControlMessage, TelemetryEvent};
 use isanagent::channels::terminal::{
     build_agent_thought_terminal_notice, build_tool_call_terminal_notice,
     build_tool_progress_terminal_notice, build_tool_result_terminal_notice,
-    terminal_startup_suppresses_plain_banner,
+    terminal_startup_suppresses_plain_banner, TerminalChannelConfig,
 };
 use isanagent::channels::{
     api::ApiChannel, email::EmailChannel, slack::SlackChannel, terminal::TerminalChannel, Channel,
@@ -538,7 +538,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             // 2. Try any [providers.*] entry
             let mut found: Option<(isanagent::config::ProviderConfig, String)> = None;
             if let Some(providers_map) = &workspace.config.providers {
-                for (_name, cfg) in providers_map {
+                for cfg in providers_map.values() {
                     if let Ok(key) = cfg.resolve_api_key() {
                         found = Some((cfg.clone(), key));
                         break;
@@ -750,15 +750,15 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     let terminal_chat_id = if workspace.config.terminal_enabled() {
         let id = uuid::Uuid::new_v4().to_string();
         *active_terminal_session_chat.write().await = id.clone();
-        let terminal = Arc::new(TerminalChannel::new(
-            &id,
-            logger_bus_tx.clone(),
-            shutdown_tx.clone(),
-            workspace.dir.clone(),
-            workspace.sandbox_dir.clone(),
-            model_name.clone(),
-            memory_node.clone(),
-            {
+        let terminal = Arc::new(TerminalChannel::new(TerminalChannelConfig {
+            chat_id: id.clone(),
+            logger_tx: logger_bus_tx.clone(),
+            shutdown_tx: shutdown_tx.clone(),
+            workspace_dir: workspace.dir.clone(),
+            sandbox_dir: workspace.sandbox_dir.clone(),
+            status_model: model_name.clone(),
+            memory_node: memory_node.clone(),
+            providers: {
                 // Merge default [provider] + all [providers.*] into one map for /model selector
                 let mut all_providers = workspace.config.providers.clone().unwrap_or_default();
                 if let Some(def) = &workspace.config.provider {
@@ -767,7 +767,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                 }
                 all_providers
             },
-        ));
+        }));
         terminal.start(bus_tx.clone()).await?;
         out_channels.insert(terminal.name().to_string(), terminal);
         Some(id)

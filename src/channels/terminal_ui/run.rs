@@ -1427,8 +1427,8 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             // Calculate visual line count accounting for wrapping at inner width.
             let compose_inner_w = area.width.saturating_sub(2).max(1) as usize; // borders
             let mut visual_lines: u16 = 0;
-            for (i, line) in app.input.split('\n').enumerate() {
-                let prefix_len: usize = if i == 0 { 2 } else { 2 }; // "> " or "  "
+            for line in app.input.split('\n') {
+                let prefix_len: usize = 2; // "> " or "  "
                 let cols = prefix_len + super::display_width(line);
                 if cols == 0 {
                     visual_lines += 1;
@@ -2175,7 +2175,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                             Some(ModelSelector::from_providers(&providers));
                                     }
                                 } else if providers.contains_key(arg) {
-                                    try_switch_model(app, &bus_tx, &providers, &workspace_dir, arg);
+                                    try_switch_model(&mut app, &bus_tx, &providers, &workspace_dir, arg);
                                 } else {
                                     let available: Vec<&str> =
                                         providers.keys().map(|s| s.as_str()).collect();

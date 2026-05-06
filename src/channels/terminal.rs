@@ -507,6 +507,18 @@ pub fn build_channel_error_notice(
     }
 }
 
+/// Constructor parameters for `TerminalChannel`.
+pub struct TerminalChannelConfig {
+    pub chat_id: String,
+    pub logger_tx: LoggerHandle,
+    pub shutdown_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    pub workspace_dir: PathBuf,
+    pub sandbox_dir: PathBuf,
+    pub status_model: String,
+    pub memory_node: NodeHandle<MemoryMessage>,
+    pub providers: std::collections::HashMap<String, crate::config::ProviderConfig>,
+}
+
 /// Stdin/stdout terminal: always Ratatui (alternate screen). Requires an interactive TTY.
 pub struct TerminalChannel {
     chat_id: String,
@@ -528,26 +540,17 @@ pub struct TerminalChannel {
 }
 
 impl TerminalChannel {
-    pub fn new(
-        chat_id: &str,
-        logger_tx: LoggerHandle,
-        shutdown_tx: tokio::sync::mpsc::UnboundedSender<()>,
-        workspace_dir: PathBuf,
-        sandbox_dir: PathBuf,
-        status_model: String,
-        memory_node: NodeHandle<MemoryMessage>,
-        providers: std::collections::HashMap<String, crate::config::ProviderConfig>,
-    ) -> Self {
+    pub fn new(config: TerminalChannelConfig) -> Self {
         Self {
-            chat_id: chat_id.to_string(),
-            logger_tx,
-            shutdown_tx,
-            workspace_dir,
-            sandbox_dir,
-            status_model,
-            memory_node,
+            chat_id: config.chat_id,
+            logger_tx: config.logger_tx,
+            shutdown_tx: config.shutdown_tx,
+            workspace_dir: config.workspace_dir,
+            sandbox_dir: config.sandbox_dir,
+            status_model: config.status_model,
+            memory_node: config.memory_node,
             outbound_ui_tx: Arc::new(Mutex::new(None)),
-            providers,
+            providers: config.providers,
         }
     }
 }
