@@ -1289,6 +1289,20 @@ impl AgentLogic {
 
         let mut mem = session_manager.get_session(&session_key).await?;
 
+        macro_rules! persist_and_cancel {
+            () => {{
+                persist_terminal_assistant_message(
+                    &mut mem,
+                    &logger_tx,
+                    &name,
+                    &inbound.chat_id,
+                    cancel_notice,
+                )
+                .await;
+                return Ok(String::new());
+            }};
+        }
+
         let forbid_final_effective = !is_subagent
             && (forbid_final_without_tools
                 || metadata_truthy(
@@ -1409,19 +1423,11 @@ impl AgentLogic {
 
         while iterations < max_iterations {
             if cancel_token.is_cancelled() {
-                persist_terminal_assistant_message(
-                    &mut mem,
-                    &logger_tx,
-                    &name,
-                    &inbound.chat_id,
-                    cancel_notice,
-                )
-                .await;
                 let _ = logger_tx.send(BusMessage::Log(
                     LogEvent::info(&name, "Reasoning loop cancelled before iteration start.")
                         .with_chat_id(&inbound.chat_id),
                 ));
-                return Ok(String::new());
+                persist_and_cancel!();
             }
             iterations += 1;
 
@@ -1546,15 +1552,7 @@ impl AgentLogic {
             {
                 ChatRetryOutcome::Ok(resp) => resp,
                 ChatRetryOutcome::Cancelled => {
-                    persist_terminal_assistant_message(
-                        &mut mem,
-                        &logger_tx,
-                        &name,
-                        &inbound.chat_id,
-                        cancel_notice,
-                    )
-                    .await;
-                    return Ok(String::new());
+                    persist_and_cancel!();
                 }
                 ChatRetryOutcome::Failed(err) => {
                     let persisted = format!(
@@ -1650,15 +1648,7 @@ impl AgentLogic {
                 if parallel_ok {
                     for tc in tool_calls.iter() {
                         if cancel_token.is_cancelled() {
-                            persist_terminal_assistant_message(
-                                &mut mem,
-                                &logger_tx,
-                                &name,
-                                &inbound.chat_id,
-                                cancel_notice,
-                            )
-                            .await;
-                            return Ok(String::new());
+                            persist_and_cancel!();
                         }
                         log_tool_invocation_start(
                             &logger_tx,
@@ -1733,28 +1723,12 @@ impl AgentLogic {
                     let outcomes = join_all(futures_vec).await;
                     for (tc, fin) in tool_calls.iter().zip(outcomes) {
                         if cancel_token.is_cancelled() {
-                            persist_terminal_assistant_message(
-                                &mut mem,
-                                &logger_tx,
-                                &name,
-                                &inbound.chat_id,
-                                cancel_notice,
-                            )
-                            .await;
-                            return Ok(String::new());
+                            persist_and_cancel!();
                         }
                         let tool_result = match fin {
                             ToolExecutionFinished::Completed(res) => res,
                             ToolExecutionFinished::Cancelled => {
-                                persist_terminal_assistant_message(
-                                    &mut mem,
-                                    &logger_tx,
-                                    &name,
-                                    &inbound.chat_id,
-                                    cancel_notice,
-                                )
-                                .await;
-                                return Ok(String::new());
+                                persist_and_cancel!();
                             }
                         };
                         let tool_result_text = finalize_tool_output(tool_result);
@@ -1782,15 +1756,7 @@ impl AgentLogic {
                 } else {
                     for tc in tool_calls {
                         if cancel_token.is_cancelled() {
-                            persist_terminal_assistant_message(
-                                &mut mem,
-                                &logger_tx,
-                                &name,
-                                &inbound.chat_id,
-                                cancel_notice,
-                            )
-                            .await;
-                            return Ok(String::new());
+                            persist_and_cancel!();
                         }
 
                         log_tool_invocation_start(
@@ -1849,15 +1815,7 @@ impl AgentLogic {
                         {
                             ToolExecutionFinished::Completed(res) => res,
                             ToolExecutionFinished::Cancelled => {
-                                persist_terminal_assistant_message(
-                                    &mut mem,
-                                    &logger_tx,
-                                    &name,
-                                    &inbound.chat_id,
-                                    cancel_notice,
-                                )
-                                .await;
-                                return Ok(String::new());
+                                persist_and_cancel!();
                             }
                         };
 
@@ -1987,15 +1945,7 @@ impl AgentLogic {
                     let response = tokio::select! {
                         res = provider.chat(&summary_context, None) => res,
                         _ = cancel_token.cancelled() => {
-                            persist_terminal_assistant_message(
-                                &mut mem,
-                                &logger_tx,
-                                &name,
-                                &inbound.chat_id,
-                                cancel_notice,
-                            )
-                            .await;
-                            return Ok(String::new());
+                            persist_and_cancel!();
                         }
                     };
 
