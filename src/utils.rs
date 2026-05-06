@@ -670,12 +670,17 @@ mod tests {
 
     #[test]
     fn llm_error_transience_classification() {
-        assert!(LLMError::ApiError("Status 500: ...".into()).is_transient());
-        assert!(LLMError::ApiError("Status 503 service unavailable".into()).is_transient());
-        assert!(LLMError::ApiError("Status 429 too many requests".into()).is_transient());
+        // format_api_error produces "(STATUS [code]) ..." — test against actual format
+        assert!(LLMError::ApiError("(500 []) Server error...".into()).is_transient());
+        assert!(LLMError::ApiError("(503 []) Server error...".into()).is_transient());
+        assert!(LLMError::ApiError("(429 []) Rate limit...".into()).is_transient());
+        // Free-text fallback for non-standard error formats
         assert!(LLMError::ApiError("rate limit exceeded".into()).is_transient());
-        assert!(!LLMError::ApiError("Status 400 bad request".into()).is_transient());
-        assert!(!LLMError::ApiError("Status 401 unauthorized".into()).is_transient());
+        assert!(LLMError::ApiError("server error occurred".into()).is_transient());
+        // 4xx errors are NOT transient
+        assert!(!LLMError::ApiError("(400 []) Bad request...".into()).is_transient());
+        assert!(!LLMError::ApiError("(401 []) Unauthorized...".into()).is_transient());
+        // Parse/NoContent errors are NOT transient
         assert!(!LLMError::NoContent.is_transient());
     }
 }
