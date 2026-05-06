@@ -35,7 +35,8 @@ use crate::channels::terminal_ui::protocol::{
     METADATA_EXECUTION_JOB_TOOL_NAME, METADATA_EXECUTION_RUN_ID, METADATA_EXECUTION_SESSION_ID,
     METADATA_SUBAGENT_AGENT_NAME, METADATA_SUBAGENT_CHILD_CHAT_ID, METADATA_SUBAGENT_DISPLAY_NAME,
     METADATA_SUBAGENT_STATUS, METADATA_SUBAGENT_TASK_ID, METADATA_TOOL_CALL_ID,
-    METADATA_TOOL_CALL_PREVIEW, METADATA_TOOL_NAME, METADATA_TOOL_RESULT_PREVIEW,
+    METADATA_TOOL_CALL_PREVIEW, METADATA_TOOL_NAME, METADATA_TOOL_RESULT_CHAR_COUNT,
+    METADATA_TOOL_RESULT_PREVIEW,
 };
 use crate::channels::terminal_ui::text_format::truncate_chars_display;
 use crate::channels::terminal_ui::{
@@ -246,12 +247,23 @@ fn tool_notice_display_content(msg: &OutboundMessage, phase_str: &str) -> String
                 }
             })
             .unwrap_or_else(|| msg.content.clone()),
-        (Some(name), "result" | "fail") => msg
-            .metadata
-            .get(METADATA_TOOL_RESULT_PREVIEW)
-            .and_then(|v| v.as_str())
-            .map(|pv| format!("{name} → {pv}"))
-            .unwrap_or_else(|| msg.content.clone()),
+        (Some(name), "result" | "fail") => {
+            let core = msg
+                .metadata
+                .get(METADATA_TOOL_RESULT_PREVIEW)
+                .and_then(|v| v.as_str())
+                .map(|pv| format!("{name} → {pv}"))
+                .unwrap_or_else(|| msg.content.clone());
+            let char_count = msg
+                .metadata
+                .get(METADATA_TOOL_RESULT_CHAR_COUNT)
+                .and_then(|v| v.as_u64());
+            if let Some(n) = char_count {
+                format!("{core} ({n} chars)")
+            } else {
+                core
+            }
+        }
         _ => msg.content.clone(),
     }
 }
@@ -595,29 +607,11 @@ fn line_from_chunk_groups(groups: Vec<Vec<Span<'static>>>, max_width: usize) -> 
     }
 }
 
-fn truncate_leading_ellipsis(input: &str, max_chars: usize) -> String {
-    let count = input.chars().count();
-    if count <= max_chars {
-        return input.to_string();
-    }
-    if max_chars <= 1 {
-        return "…".to_string();
-    }
-    let tail: String = input.chars().skip(count - (max_chars - 1)).collect();
-    format!("…{}", tail)
-}
-
-fn build_title_line(max_width: usize, chat_id: &str) -> Line<'static> {
-    let dim = Theme::dim();
-    let thread_short = truncate_leading_ellipsis(chat_id, 13);
-    let groups = vec![
-        vec![Span::styled(" ALTAI isanagent ", Theme::input_prompt())],
-        vec![Span::styled(
-            format!("· v{} ", env!("CARGO_PKG_VERSION")),
-            dim,
-        )],
-        vec![Span::styled(format!("· thread {}", thread_short), dim)],
-    ];
+fn build_title_line(max_width: usize) -> Line<'static> {
+    let groups = vec![vec![Span::styled(
+        " ALTAI isanagent ",
+        Theme::input_prompt(),
+    )]];
     line_from_chunk_groups(groups, max_width)
 }
 
@@ -630,9 +624,9 @@ fn build_status_line(
 ) -> Line<'static> {
     let dim = Theme::dim();
     let activity_label = if thinking {
-        format!("{} thinking", app.get_spinner_frame())
+        format!("🦾 {} thinking", app.get_spinner_frame())
     } else {
-        "🤖 idle".to_string()
+        "🦾 idle".to_string()
     };
     let activity_style = if thinking {
         Theme::tool_call()
@@ -1446,7 +1440,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             let ch = layout_chunks(area, exec_h, active_strip_h, input_h);
 
             let title_w = ch[0].width as usize;
-            let title = Paragraph::new(build_title_line(title_w.max(1), &chat_id));
+            let title = Paragraph::new(build_title_line(title_w.max(1)));
             f.render_widget(title, ch[0]);
 
             match app.ui_focus {
@@ -2796,7 +2790,9 @@ mod width_fit_tests {
         let app = App::new();
         let line = build_status_line(26, false, 3, None, &app);
         let t = flat(&line);
+        assert!(t.contains("🦾"), "{t}");
         assert!(t.contains("idle"));
+        assert!(!t.contains("thread"), "{t}");
         assert!(
             !t.contains("Enter send"),
             "hints should drop first when tight: {t}"
@@ -2804,12 +2800,11 @@ mod width_fit_tests {
     }
 
     #[test]
-    fn title_shows_brand_version_and_truncated_thread() {
-        let line = build_title_line(120, "12345678-1234-1234-1234-123456789abc");
+    fn title_shows_brand_only() {
+        let line = build_title_line(120);
         let t = flat(&line);
         assert!(t.contains("ALTAI isanagent"), "{t}");
-        assert!(t.contains(env!("CARGO_PKG_VERSION")), "{t}");
-        assert!(t.contains("thread …"), "{t}");
+        assert!(!t.contains("thread "), "{t}");
     }
 }
 
