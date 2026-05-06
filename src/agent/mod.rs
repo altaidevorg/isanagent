@@ -122,6 +122,50 @@ fn context_has_tool_call(context: &[crate::utils::ChatMessage], tool_name: &str)
     })
 }
 
+/// Repair context so every assistant message with `tool_calls` is followed by a tool-role
+/// response for each `tool_call_id`. This prevents 400 errors from strict providers (e.g.
+/// DeepSeek) when a previous reasoning loop was cancelled mid-tool-execution, leaving
+/// orphaned assistant messages in memory without their corresponding tool responses.
+fn repair_tool_call_context(context: &mut Vec<crate::utils::ChatMessage>) {
+    let mut i = 0;
+    while i < context.len() {
+        let tool_call_ids: Vec<String> = match &context[i].tool_calls {
+            Some(calls) if context[i].role == "assistant" && !calls.is_empty() => {
+                calls.iter().map(|tc| tc.id.clone()).collect()
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+
+        // Collect the set of tool_call_ids that have responses immediately following
+        let mut responded: HashSet<String> = HashSet::new();
+        let mut j = i + 1;
+        while j < context.len() && context[j].role == "tool" {
+            if let Some(ref id) = context[j].tool_call_id {
+                responded.insert(id.clone());
+            }
+            j += 1;
+        }
+
+        // Append placeholder tool responses for any missing tool_call_ids at end of tool block
+        let missing: Vec<String> = tool_call_ids
+            .into_iter()
+            .filter(|id| !responded.contains(id))
+            .collect();
+        for id in missing {
+            context.insert(
+                j,
+                crate::utils::ChatMessage::tool("[Cancelled — tool execution interrupted]", &id),
+            );
+            j += 1;
+        }
+
+        i = j;
+    }
+}
+
 fn should_nudge_research_depth(
     inbound: &crate::bus::InboundMessage,
     context: &[crate::utils::ChatMessage],
@@ -1444,6 +1488,9 @@ impl AgentLogic {
 
             // Strip any legacy static system prompts that SQLite may have persisted
             context.retain(|msg| msg.role != "system");
+
+            // Repair any orphaned tool_calls (e.g. from a cancelled previous iteration)
+            repair_tool_call_context(&mut context);
 
             // Fetch short term memory summaries
             let prefix = format!("{}:{}", inbound.channel, inbound.chat_id);
