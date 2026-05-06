@@ -595,23 +595,35 @@ fn line_from_chunk_groups(groups: Vec<Vec<Span<'static>>>, max_width: usize) -> 
     }
 }
 
-fn build_title_line(max_width: usize) -> Line<'static> {
+fn truncate_leading_ellipsis(input: &str, max_chars: usize) -> String {
+    let count = input.chars().count();
+    if count <= max_chars {
+        return input.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+    let tail: String = input.chars().skip(count - (max_chars - 1)).collect();
+    format!("…{}", tail)
+}
+
+fn build_title_line(max_width: usize, chat_id: &str) -> Line<'static> {
     let dim = Theme::dim();
+    let thread_short = truncate_leading_ellipsis(chat_id, 13);
     let groups = vec![
-        vec![Span::styled(" isanagent ", Theme::input_prompt())],
+        vec![Span::styled(" ALTAI isanagent ", Theme::input_prompt())],
         vec![Span::styled(
-            "· /exit · /new · /chats · /copy · /cancel · /background · /retry · /tools · /exec · /help · Tab · Shift+Tab · Esc · ^Shift+M wheel · PgUp/PgDn",
+            format!("· v{} ", env!("CARGO_PKG_VERSION")),
             dim,
         )],
+        vec![Span::styled(format!("· thread {}", thread_short), dim)],
     ];
     line_from_chunk_groups(groups, max_width)
 }
 
 fn build_status_line(
     max_width: usize,
-    status_model: &str,
     thinking: bool,
-    chat_id: &str,
     cell_count: usize,
     toast: Option<(&str, ToastKind)>,
     app: &App,
@@ -627,17 +639,12 @@ fn build_status_line(
     } else {
         Theme::dim()
     };
-    let sid = &chat_id[..8.min(chat_id.len())];
-    let mut first_row = vec![Span::styled(status_model.to_string(), Theme::text())];
+    let mut first_row = vec![Span::styled(activity_label, activity_style)];
     if !uses_ansi_color() {
         first_row.push(Span::styled(" [plain]", Theme::dim()));
     }
     let mut groups: Vec<Vec<Span<'static>>> = vec![
         first_row,
-        vec![
-            Span::styled(" · ", dim),
-            Span::styled(activity_label, activity_style),
-        ],
         vec![
             Span::styled(" · ", dim),
             Span::styled(format!("[ 📋 {} Todos ]", app.todos_count), dim),
@@ -659,10 +666,6 @@ fn build_status_line(
                 ),
                 dim,
             ),
-        ],
-        vec![
-            Span::styled(" · ", dim),
-            Span::styled(format!("thread {sid}…"), dim),
         ],
         vec![
             Span::styled(" · ", dim),
@@ -1443,7 +1446,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             let ch = layout_chunks(area, exec_h, active_strip_h, input_h);
 
             let title_w = ch[0].width as usize;
-            let title = Paragraph::new(build_title_line(title_w.max(1)));
+            let title = Paragraph::new(build_title_line(title_w.max(1), &chat_id));
             f.render_widget(title, ch[0]);
 
             match app.ui_focus {
@@ -1595,9 +1598,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             let status_w_px = ch[3].width as usize;
             let status_line = build_status_line(
                 status_w_px.max(1),
-                app.status_model.as_str(),
                 app.thinking,
-                &chat_id,
                 app.cells.len(),
                 app.active_toast(),
                 &app,
@@ -2175,7 +2176,13 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                             Some(ModelSelector::from_providers(&providers));
                                     }
                                 } else if providers.contains_key(arg) {
-                                    try_switch_model(&mut app, &bus_tx, &providers, &workspace_dir, arg);
+                                    try_switch_model(
+                                        &mut app,
+                                        &bus_tx,
+                                        &providers,
+                                        &workspace_dir,
+                                        arg,
+                                    );
                                 } else {
                                     let available: Vec<&str> =
                                         providers.keys().map(|s| s.as_str()).collect();
@@ -2787,9 +2794,8 @@ mod width_fit_tests {
     #[test]
     fn status_drops_low_priority_when_narrow() {
         let app = App::new();
-        let line = build_status_line(26, "gemini-2.5-flash", false, "uuid-here-ok", 3, None, &app);
+        let line = build_status_line(26, false, 3, None, &app);
         let t = flat(&line);
-        assert!(t.contains("gemini"));
         assert!(t.contains("idle"));
         assert!(
             !t.contains("Enter send"),
@@ -2798,14 +2804,12 @@ mod width_fit_tests {
     }
 
     #[test]
-    fn title_drops_hints_when_very_narrow() {
-        let line = build_title_line(14);
+    fn title_shows_brand_version_and_truncated_thread() {
+        let line = build_title_line(120, "12345678-1234-1234-1234-123456789abc");
         let t = flat(&line);
-        assert!(t.contains("isanagent"), "{t}");
-        assert!(
-            !t.contains("PgUp"),
-            "keyboard hint chunk dropped when tight: {t}"
-        );
+        assert!(t.contains("ALTAI isanagent"), "{t}");
+        assert!(t.contains(env!("CARGO_PKG_VERSION")), "{t}");
+        assert!(t.contains("thread …"), "{t}");
     }
 }
 

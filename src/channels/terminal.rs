@@ -42,6 +42,18 @@ fn truncate_display(s: &str, max_chars: usize) -> String {
     format!("{shortened}…")
 }
 
+fn truncate_leading_ellipsis(s: &str, max_chars: usize) -> String {
+    let n = s.chars().count();
+    if n <= max_chars {
+        return s.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+    let tail: String = s.chars().skip(n - (max_chars - 1)).collect();
+    format!("…{tail}")
+}
+
 fn tool_result_looks_like_failure(result: &str) -> bool {
     let t = result.trim_start();
     t.starts_with("Error:") || t.starts_with("error:")
@@ -602,10 +614,10 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
         let memory_node_clone = self.memory_node.clone();
 
         let opening_banner = format!(
-            "isanagent v{} — thread {}\n\
+            "ALTAI isanagent v{} — thread {}\n\
              Commands: /exit, /new  ·  Images: @path/to/file inside the workspace.",
             env!("CARGO_PKG_VERSION"),
-            chat_id_clone
+            truncate_leading_ellipsis(&chat_id_clone, 13)
         );
 
         std::thread::Builder::new()
