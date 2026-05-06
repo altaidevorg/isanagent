@@ -330,8 +330,18 @@ pub struct LLMClient {
 pub fn build_reqwest_client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
-        // Force HTTP/1.1 to avoid body-framing issues with some providers (e.g. DeepSeek/CloudFront)
-        // on long-running reasoning responses.
+        .build()
+        .expect("failed to build reqwest client")
+}
+
+/// Build a reqwest client forced to HTTP/1.1.
+///
+/// Some providers (notably DeepSeek behind CloudFront) have HTTP/2 body-framing
+/// issues on long-running responses. Use this builder only for providers known
+/// to require HTTP/1.1.
+pub fn build_reqwest_client_http1() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
         .http1_only()
         .build()
         .expect("failed to build reqwest client")
@@ -340,20 +350,32 @@ pub fn build_reqwest_client() -> reqwest::Client {
 impl LLMClient {
     /// Create a new client with default settings (temp=0.7, timeout=600s).
     pub fn new_openai_compatible(base_url: &str, api_key: &str, model: &str) -> Self {
-        // Ensure base_url ends with slash if needed, or handle path joining correctly
-        // For simplicity, we assume user gives enough of the path or we append standardized paths.
-        // However, OpenAI-compatible APIs often vary in suffix.
-        // We'll treat `base_url` as the full endpoint URL for completions for maximum flexibility,
-        // OR we can default to adding "/chat/completions" if the user provided base domain.
-        // Let's go with robust: User provides full endpoint or we construct.
-        // Actually, simplest usage: base_url is the helper.
+        Self::new_openai_compatible_with_http1(base_url, api_key, model, false)
+    }
+
+    /// Create a new client with HTTP/1.1 forced (for providers with HTTP/2 framing issues).
+    pub fn new_openai_compatible_http1(base_url: &str, api_key: &str, model: &str) -> Self {
+        Self::new_openai_compatible_with_http1(base_url, api_key, model, true)
+    }
+
+    fn new_openai_compatible_with_http1(
+        base_url: &str,
+        api_key: &str,
+        model: &str,
+        http1_only: bool,
+    ) -> Self {
+        let client = if http1_only {
+            build_reqwest_client_http1()
+        } else {
+            build_reqwest_client()
+        };
         Self {
             base_url: base_url.to_string(),
             api_key: api_key.to_string(),
             model: model.to_string(),
             temperature: 0.7,
             timeout: Duration::from_secs(600),
-            client: build_reqwest_client(),
+            client,
         }
     }
 

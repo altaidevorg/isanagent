@@ -8,6 +8,9 @@ use crate::utils::{
 ///
 /// Routes `"anthropic"` to [`AnthropicProvider`] (Messages API) and everything else to
 /// [`OpenAIProvider`] (OpenAI-compatible chat completions). Temperature is set to 0.3.
+///
+/// DeepSeek providers get an HTTP/1.1-only reqwest client to avoid HTTP/2 body-framing
+/// issues with CloudFront on long-running reasoning responses.
 pub fn create_provider(
     provider_name: &str,
     base_url: &str,
@@ -17,8 +20,13 @@ pub fn create_provider(
     if provider_name == "anthropic" {
         Box::new(AnthropicProvider::new(base_url, api_key, model_name).with_temperature(0.3))
     } else {
-        let client =
-            LLMClient::new_openai_compatible(base_url, api_key, model_name).with_temperature(0.3);
+        let is_deepseek = provider_name.to_lowercase().contains("deepseek");
+        let client = if is_deepseek {
+            LLMClient::new_openai_compatible_http1(base_url, api_key, model_name)
+        } else {
+            LLMClient::new_openai_compatible(base_url, api_key, model_name)
+        }
+        .with_temperature(0.3);
         Box::new(OpenAIProvider::new(client))
     }
 }
