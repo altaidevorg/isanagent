@@ -426,16 +426,45 @@ impl LLMClient {
         let content_val = &json_resp["choices"][0]["message"]["content"];
         let content = if content_val.is_null() {
             "".to_string()
+        } else if let Some(s) = content_val.as_str() {
+            s.to_string()
+        } else if let Some(arr) = content_val.as_array() {
+            // Some providers (Gemini, OpenRouter) return content as an array of parts
+            arr.iter()
+                .filter_map(|part| part.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("")
         } else {
-            content_val.as_str().ok_or(LLMError::NoContent)?.to_string()
+            "".to_string()
         };
 
-        // Parse tool calls
+        // Parse tool calls — normalize `arguments` from object to string for providers
+        // (e.g. Gemini) that return it as a JSON object instead of a JSON-encoded string.
         let tool_calls_val = &json_resp["choices"][0]["message"]["tool_calls"];
         let tool_calls = if tool_calls_val.is_null() {
             None
         } else {
-            serde_json::from_value::<Vec<ToolCallRequest>>(tool_calls_val.clone()).ok()
+            let mut tc_json = tool_calls_val.clone();
+            if let Some(arr) = tc_json.as_array_mut() {
+                for tc in arr.iter_mut() {
+                    if let Some(args) = tc.get_mut("function").and_then(|f| f.get_mut("arguments"))
+                    {
+                        if args.is_object() || args.is_array() {
+                            *args = serde_json::Value::String(args.to_string());
+                        }
+                    }
+                }
+            }
+            match serde_json::from_value::<Vec<ToolCallRequest>>(tc_json) {
+                Ok(calls) => Some(calls),
+                Err(e) => {
+                    log::warn!(
+                        "Failed to parse tool_calls from provider response: {}",
+                        e
+                    );
+                    None
+                }
+            }
         };
 
         let reasoning_content = json_resp["choices"][0]["message"]["reasoning_content"]
