@@ -26,6 +26,8 @@ pub const METADATA_TOOL_NAME: &str = "isanagent_tool_name";
 pub const METADATA_TOOL_CALL_PREVIEW: &str = "isanagent_tool_call_preview";
 /// Short result summary for tool result / fail notices.
 pub const METADATA_TOOL_RESULT_PREVIEW: &str = "isanagent_tool_result_preview";
+/// Auxiliary full result size in characters (used as suffix, not primary display text).
+pub const METADATA_TOOL_RESULT_CHAR_COUNT: &str = "isanagent_tool_result_char_count";
 /// LLM-supplied stable id correlating a tool-call notice with its result/fail notice.
 /// Used by the terminal UI to upsert the same Cell::ToolNotice in place (pending → done/failed)
 /// instead of appending two separate cells per invocation.

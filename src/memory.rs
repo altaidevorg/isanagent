@@ -31,7 +31,11 @@ impl<T> SharedReply<T> {
     }
 
     pub fn send(&self, msg: T) -> Result<(), T> {
-        if let Some(tx) = self.0.lock().unwrap().take() {
+        let mut guard = match self.0.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(tx) = guard.take() {
             tx.send(msg)
         } else {
             Err(msg)
@@ -597,7 +601,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
             MemoryMessage::GetContext { thread_id, reply } => {
                 let res = (|| -> Result<Vec<ChatMessage>, String> {
                     let mut stmt = self.conn.prepare(
-                        "SELECT role, content, name, tool_calls, tool_call_id, reasoning_content FROM messages WHERE thread_id = ?1 ORDER BY created_at ASC"
+                        "SELECT role, content, name, tool_calls, tool_call_id, reasoning_content FROM messages WHERE thread_id = ?1 ORDER BY id ASC"
                     ).map_err(|e| e.to_string())?;
 
                     let message_iter = stmt
@@ -1354,7 +1358,11 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
 
 #[cfg(test)]
 mod root_thread_id_tests {
-    use super::is_root_session_thread_id;
+    use super::{is_root_session_thread_id, SqliteMemoryActor};
+    use crate::session::SessionManager;
+    use crate::traits::Memory;
+    use crate::NodeHandle;
+    use std::time::Duration;
 
     #[test]
     fn root_main_terminal_thread() {
@@ -1371,5 +1379,37 @@ mod root_thread_id_tests {
     #[test]
     fn not_root_short_string() {
         assert!(!is_root_session_thread_id("terminal", "nope"));
+    }
+
+    #[tokio::test]
+    async fn get_context_returns_messages_in_insert_order() {
+        let actor = SqliteMemoryActor::new(":memory:").expect("memory actor");
+        let node = NodeHandle::new(actor, 16, 1, Duration::from_millis(1));
+        let manager = SessionManager::new(node);
+        let mut session = manager
+            .get_session("terminal:550e8400-e29b-41d4-a716-446655440000:")
+            .await
+            .expect("session");
+
+        session
+            .add_message(crate::utils::ChatMessage::user("first"))
+            .await
+            .expect("add first");
+        session
+            .add_message(crate::utils::ChatMessage::assistant("second"))
+            .await
+            .expect("add second");
+
+        let msgs = session.get_context().await.expect("context");
+        let contents: Vec<String> = msgs
+            .iter()
+            .map(|m| {
+                m.content
+                    .as_ref()
+                    .map(|c| c.text_content())
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(contents, vec!["first".to_string(), "second".to_string()]);
     }
 }

@@ -277,18 +277,25 @@ impl SubagentHarness {
         }
 
         // Resolve named agent manifest if specified
-        let manifest = agent_name
-            .as_deref()
-            .and_then(|_n| self.inner.deps.agent_registry.as_ref())
-            .and_then(|reg| reg.get(agent_name.as_deref().unwrap()).cloned());
-
-        // Validate agent name if specified but not found
-        if agent_name.is_some() && manifest.is_none() {
-            return Err(format!(
-                "Named agent '{}' not found in registry. Use `agent_list` to see available agents.",
-                agent_name.as_deref().unwrap()
-            ));
-        }
+        let manifest = match agent_name.as_deref() {
+            Some(agent) => {
+                let Some(registry) = self.inner.deps.agent_registry.as_ref() else {
+                    return Err(
+                        "Named agents are not configured. Use `agent_list` to inspect availability."
+                            .to_string(),
+                    );
+                };
+                let maybe = registry.get(agent).cloned();
+                if maybe.is_none() {
+                    return Err(format!(
+                        "Named agent '{}' not found in registry. Use `agent_list` to see available agents.",
+                        agent
+                    ));
+                }
+                maybe
+            }
+            None => None,
+        };
 
         let tools = self.tools()?;
         let task_id = uuid::Uuid::new_v4().simple().to_string();
@@ -1173,4 +1180,128 @@ pub fn register_subagent_tools(
         harness: harness.clone(),
         memory_node: memory_node.clone(),
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bus::BusMessage;
+    use crate::clarification::ClarificationHub;
+    use crate::config::ResolvedShellPolicy;
+    use crate::logging::create_logger_channel;
+    use crate::memory::SqliteMemoryActor;
+    use crate::session::SessionManager;
+    use crate::skills::SkillRegistry;
+    use crate::traits::Provider;
+    use crate::utils::{ChatMessage, LLMError, LLMResponse};
+    use crate::NodeHandle;
+    use async_trait::async_trait;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tokio::sync::mpsc;
+
+    struct TempDir {
+        path: std::path::PathBuf,
+    }
+
+    impl TempDir {
+        fn new() -> Self {
+            let unique = format!(
+                "isanagent-subagent-test-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system time")
+                    .as_nanos()
+            );
+            let path = std::env::temp_dir().join(unique);
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            Self { path }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[derive(Clone)]
+    struct NeverUsedProvider;
+
+    #[async_trait]
+    impl Provider for NeverUsedProvider {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<serde_json::Value>,
+        ) -> Result<LLMResponse, LLMError> {
+            panic!("provider should not be called in this test")
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_with_named_agent_and_no_registry_returns_error_without_panic() {
+        let memory_actor = SqliteMemoryActor::new(":memory:").expect("memory actor");
+        let memory_node = NodeHandle::new(memory_actor, 16, 1, Duration::from_millis(1));
+        let session_manager = Arc::new(SessionManager::new(memory_node.clone()));
+        let skills_dir = TempDir::new();
+        let skills = Arc::new(SkillRegistry::new(skills_dir.path().to_path_buf()));
+        let (outbound_tx, _outbound_rx) = mpsc::channel::<BusMessage>(8);
+        let (logger_tx, _logger_rx) = create_logger_channel(16);
+        let harness = Arc::new(SubagentHarness::new(SubagentSpawnDeps {
+            agent_name: "SubagentTest".to_string(),
+            provider: Arc::new(tokio::sync::RwLock::new(Box::new(NeverUsedProvider))),
+            session_manager,
+            skills,
+            system_prompt: "test system prompt".to_string(),
+            max_iterations: 2,
+            max_tool_output_chars: 4_000,
+            max_recent_summaries: 0,
+            short_term_threshold_turns: 10,
+            short_term_threshold_tokens: 10_000,
+            tool_execution_activity: None,
+            outbound_tx,
+            logger_tx,
+            clarification_hub: Arc::new(ClarificationHub::new()),
+            cancel_children_on_parent_cancel: true,
+            default_allowlist: None,
+            max_tasks: 5,
+            max_wait_secs: 5,
+            doom_loop_enabled: false,
+            memory_node,
+            harness_runtime_summary: String::new(),
+            shell_policy: Arc::new(ResolvedShellPolicy {
+                interactive_mode: crate::config::ShellPolicyMode::Ask,
+                unattended_mode: crate::config::ShellPolicyMode::Deny,
+                approval_patterns: Vec::new(),
+            }),
+            hook_tool_ctx: None,
+            agent_registry: None,
+            wake_on_completion: false,
+            task_history_retention: 20,
+            bus_tx: None,
+        }));
+
+        let err = harness
+            .spawn(SubagentSpawnSpec {
+                parent_channel: "terminal".to_string(),
+                parent_chat_id: "test-chat".to_string(),
+                parent_thread_id: None,
+                parent_reasoning_cancel: None,
+                prompt: "do work".to_string(),
+                wait: false,
+                display_name: None,
+                agent_name: Some("researcher".to_string()),
+            })
+            .await
+            .expect_err("named agent without registry should fail");
+        assert!(
+            err.contains("Named agents are not configured"),
+            "unexpected error: {err}"
+        );
+    }
 }

@@ -35,7 +35,8 @@ use crate::channels::terminal_ui::protocol::{
     METADATA_EXECUTION_JOB_TOOL_NAME, METADATA_EXECUTION_RUN_ID, METADATA_EXECUTION_SESSION_ID,
     METADATA_SUBAGENT_AGENT_NAME, METADATA_SUBAGENT_CHILD_CHAT_ID, METADATA_SUBAGENT_DISPLAY_NAME,
     METADATA_SUBAGENT_STATUS, METADATA_SUBAGENT_TASK_ID, METADATA_TOOL_CALL_ID,
-    METADATA_TOOL_CALL_PREVIEW, METADATA_TOOL_NAME, METADATA_TOOL_RESULT_PREVIEW,
+    METADATA_TOOL_CALL_PREVIEW, METADATA_TOOL_NAME, METADATA_TOOL_RESULT_CHAR_COUNT,
+    METADATA_TOOL_RESULT_PREVIEW,
 };
 use crate::channels::terminal_ui::text_format::truncate_chars_display;
 use crate::channels::terminal_ui::{
@@ -246,12 +247,23 @@ fn tool_notice_display_content(msg: &OutboundMessage, phase_str: &str) -> String
                 }
             })
             .unwrap_or_else(|| msg.content.clone()),
-        (Some(name), "result" | "fail") => msg
-            .metadata
-            .get(METADATA_TOOL_RESULT_PREVIEW)
-            .and_then(|v| v.as_str())
-            .map(|pv| format!("{name} → {pv}"))
-            .unwrap_or_else(|| msg.content.clone()),
+        (Some(name), "result" | "fail") => {
+            let core = msg
+                .metadata
+                .get(METADATA_TOOL_RESULT_PREVIEW)
+                .and_then(|v| v.as_str())
+                .map(|pv| format!("{name} → {pv}"))
+                .unwrap_or_else(|| msg.content.clone());
+            let char_count = msg
+                .metadata
+                .get(METADATA_TOOL_RESULT_CHAR_COUNT)
+                .and_then(|v| v.as_u64());
+            if let Some(n) = char_count {
+                format!("{core} ({n} chars)")
+            } else {
+                core
+            }
+        }
         _ => msg.content.clone(),
     }
 }
@@ -596,48 +608,37 @@ fn line_from_chunk_groups(groups: Vec<Vec<Span<'static>>>, max_width: usize) -> 
 }
 
 fn build_title_line(max_width: usize) -> Line<'static> {
-    let dim = Theme::dim();
-    let groups = vec![
-        vec![Span::styled(" isanagent ", Theme::input_prompt())],
-        vec![Span::styled(
-            "· /exit · /new · /chats · /copy · /cancel · /background · /retry · /tools · /exec · /help · Tab · Shift+Tab · Esc · ^Shift+M wheel · PgUp/PgDn",
-            dim,
-        )],
-    ];
+    let groups = vec![vec![Span::styled(
+        " ALTAI isanagent ",
+        Theme::input_prompt(),
+    )]];
     line_from_chunk_groups(groups, max_width)
 }
 
 fn build_status_line(
     max_width: usize,
-    status_model: &str,
     thinking: bool,
-    chat_id: &str,
     cell_count: usize,
     toast: Option<(&str, ToastKind)>,
     app: &App,
 ) -> Line<'static> {
     let dim = Theme::dim();
     let activity_label = if thinking {
-        format!("{} thinking", app.get_spinner_frame())
+        format!("🦾 {} thinking", app.get_spinner_frame())
     } else {
-        "🤖 idle".to_string()
+        "🦾 idle".to_string()
     };
     let activity_style = if thinking {
         Theme::tool_call()
     } else {
         Theme::dim()
     };
-    let sid = &chat_id[..8.min(chat_id.len())];
-    let mut first_row = vec![Span::styled(status_model.to_string(), Theme::text())];
+    let mut first_row = vec![Span::styled(activity_label, activity_style)];
     if !uses_ansi_color() {
         first_row.push(Span::styled(" [plain]", Theme::dim()));
     }
     let mut groups: Vec<Vec<Span<'static>>> = vec![
         first_row,
-        vec![
-            Span::styled(" · ", dim),
-            Span::styled(activity_label, activity_style),
-        ],
         vec![
             Span::styled(" · ", dim),
             Span::styled(format!("[ 📋 {} Todos ]", app.todos_count), dim),
@@ -659,10 +660,6 @@ fn build_status_line(
                 ),
                 dim,
             ),
-        ],
-        vec![
-            Span::styled(" · ", dim),
-            Span::styled(format!("thread {sid}…"), dim),
         ],
         vec![
             Span::styled(" · ", dim),
@@ -1595,9 +1592,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             let status_w_px = ch[3].width as usize;
             let status_line = build_status_line(
                 status_w_px.max(1),
-                app.status_model.as_str(),
                 app.thinking,
-                &chat_id,
                 app.cells.len(),
                 app.active_toast(),
                 &app,
@@ -2175,7 +2170,13 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                             Some(ModelSelector::from_providers(&providers));
                                     }
                                 } else if providers.contains_key(arg) {
-                                    try_switch_model(&mut app, &bus_tx, &providers, &workspace_dir, arg);
+                                    try_switch_model(
+                                        &mut app,
+                                        &bus_tx,
+                                        &providers,
+                                        &workspace_dir,
+                                        arg,
+                                    );
                                 } else {
                                     let available: Vec<&str> =
                                         providers.keys().map(|s| s.as_str()).collect();
@@ -2787,10 +2788,11 @@ mod width_fit_tests {
     #[test]
     fn status_drops_low_priority_when_narrow() {
         let app = App::new();
-        let line = build_status_line(26, "gemini-2.5-flash", false, "uuid-here-ok", 3, None, &app);
+        let line = build_status_line(26, false, 3, None, &app);
         let t = flat(&line);
-        assert!(t.contains("gemini"));
+        assert!(t.contains("🦾"), "{t}");
         assert!(t.contains("idle"));
+        assert!(!t.contains("thread"), "{t}");
         assert!(
             !t.contains("Enter send"),
             "hints should drop first when tight: {t}"
@@ -2798,14 +2800,11 @@ mod width_fit_tests {
     }
 
     #[test]
-    fn title_drops_hints_when_very_narrow() {
-        let line = build_title_line(14);
+    fn title_shows_brand_only() {
+        let line = build_title_line(120);
         let t = flat(&line);
-        assert!(t.contains("isanagent"), "{t}");
-        assert!(
-            !t.contains("PgUp"),
-            "keyboard hint chunk dropped when tight: {t}"
-        );
+        assert!(t.contains("ALTAI isanagent"), "{t}");
+        assert!(!t.contains("thread "), "{t}");
     }
 }
 

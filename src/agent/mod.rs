@@ -29,7 +29,8 @@ use crate::tools::ToolRegistry;
 use crate::traits::{Memory, Provider, Tool};
 use crate::NodeHandle;
 use crate::{ActorError, ActorLogic};
-use futures::future::join_all;
+use futures::{future::join_all, FutureExt};
+use std::panic::AssertUnwindSafe;
 
 static REDACTED_THINKING_STRIP_RE: OnceLock<Regex> = OnceLock::new();
 
@@ -59,6 +60,27 @@ fn format_harness_todos_step_block(rows: &[TodoRow]) -> String {
         s.push_str(&format!("{}. {} {}\n", i + 1, icon, row.content));
     }
     s
+}
+
+async fn persist_terminal_assistant_message(
+    mem: &mut impl Memory,
+    logger_tx: &LoggerHandle,
+    name: &str,
+    chat_id: &str,
+    text: &str,
+) {
+    if let Err(e) = mem
+        .add_message(crate::utils::ChatMessage::assistant(text))
+        .await
+    {
+        let _ = logger_tx.send(BusMessage::Log(
+            LogEvent::warn(
+                name,
+                &format!("Failed to persist terminal assistant message: {}", e),
+            )
+            .with_chat_id(chat_id),
+        ));
+    }
 }
 
 fn metadata_truthy(meta: &HashMap<String, serde_json::Value>, key: &str) -> bool {
@@ -523,6 +545,7 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
     let name = args.name.clone();
     let provider = dyn_clone::clone_box(&*args.provider);
     let session_manager = args.session_manager.clone();
+    let session_manager_for_chain = session_manager.clone();
     let tools = args.tools.clone();
     let skills = args.skills.clone();
     let system_prompt = args.system_prompt.clone();
@@ -547,6 +570,11 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
     .with_reasoning_cancel(cancel_token.as_ref().clone());
     let inbound_channel = inbound.channel.clone();
     let inbound_thread_id = inbound.thread_id.clone();
+    let session_key = crate::bus::clarification_session_key(
+        &inbound_channel,
+        &chat_id,
+        inbound_thread_id.as_deref(),
+    );
     let inbound_metadata = Arc::new(inbound.metadata.clone());
     let hook_tool_ctx = args.hook_tool_ctx.clone();
 
@@ -563,7 +591,7 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
             .with_chat_id(&task_chat_id),
         ));
 
-        let res = AgentLogic::run_reasoning_loop(ReasoningLoopCtx {
+        let res = AssertUnwindSafe(AgentLogic::run_reasoning_loop(ReasoningLoopCtx {
             name,
             provider,
             session_manager,
@@ -590,46 +618,80 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
             shell_policy: shell_policy.clone(),
             hook_tool_ctx,
             inbound_metadata,
-        })
+        }))
+        .catch_unwind()
         .await;
 
-        if let Err(e) = res {
-            let _ = logger_tx.send(BusMessage::Log(
-                LogEvent::error(
-                    "AgentLogic",
-                    &format!("Reasoning loop failed for chat_id {}: {}", task_chat_id, e),
-                )
-                .with_chat_id(&task_chat_id),
-            ));
-            let notice = crate::channels::terminal::build_channel_error_notice(
-                &inbound_channel,
-                &task_chat_id,
-                inbound_thread_id.as_deref(),
-                &e,
-            );
-            let _ = outbound_tx.send(BusMessage::Outbound(notice)).await;
-        } else if task_token_arc.is_cancelled() {
-            let _ = logger_tx.send(BusMessage::Log(
-                LogEvent::info(
-                    &agent_name,
-                    &format!(
-                        "Reasoning task for chat_id {} finished via cancellation.",
-                        task_chat_id
-                    ),
-                )
-                .with_chat_id(&task_chat_id),
-            ));
-        } else {
-            let _ = logger_tx.send(BusMessage::Log(
-                LogEvent::debug(
-                    &agent_name,
-                    &format!(
-                        "Reasoning task for chat_id {} finished successfully.",
-                        task_chat_id
-                    ),
-                )
-                .with_chat_id(&task_chat_id),
-            ));
+        match res {
+            Ok(Err(e)) => {
+                let _ = logger_tx.send(BusMessage::Log(
+                    LogEvent::error(
+                        "AgentLogic",
+                        &format!("Reasoning loop failed for chat_id {}: {}", task_chat_id, e),
+                    )
+                    .with_chat_id(&task_chat_id),
+                ));
+                let notice = crate::channels::terminal::build_channel_error_notice(
+                    &inbound_channel,
+                    &task_chat_id,
+                    inbound_thread_id.as_deref(),
+                    &e,
+                );
+                let _ = outbound_tx.send(BusMessage::Outbound(notice)).await;
+            }
+            Ok(Ok(_)) if task_token_arc.is_cancelled() => {
+                let _ = logger_tx.send(BusMessage::Log(
+                    LogEvent::info(
+                        &agent_name,
+                        &format!(
+                            "Reasoning task for chat_id {} finished via cancellation.",
+                            task_chat_id
+                        ),
+                    )
+                    .with_chat_id(&task_chat_id),
+                ));
+            }
+            Ok(Ok(_)) => {
+                let _ = logger_tx.send(BusMessage::Log(
+                    LogEvent::debug(
+                        &agent_name,
+                        &format!(
+                            "Reasoning task for chat_id {} finished successfully.",
+                            task_chat_id
+                        ),
+                    )
+                    .with_chat_id(&task_chat_id),
+                ));
+            }
+            Err(_) => {
+                let panic_msg = "Internal error: reasoning loop panicked and was stopped.";
+                let _ = logger_tx.send(BusMessage::Log(
+                    LogEvent::error(
+                        "AgentLogic",
+                        &format!("Reasoning loop panicked for chat_id {}", task_chat_id),
+                    )
+                    .with_chat_id(&task_chat_id),
+                ));
+
+                if let Ok(mut mem) = session_manager_for_chain.get_session(&session_key).await {
+                    persist_terminal_assistant_message(
+                        &mut mem,
+                        &logger_tx,
+                        &agent_name,
+                        &task_chat_id,
+                        panic_msg,
+                    )
+                    .await;
+                }
+
+                let notice = crate::channels::terminal::build_channel_error_notice(
+                    &inbound_channel,
+                    &task_chat_id,
+                    inbound_thread_id.as_deref(),
+                    panic_msg,
+                );
+                let _ = outbound_tx.send(BusMessage::Outbound(notice)).await;
+            }
         }
 
         let _ = cancellation_tokens.remove_if(&task_chat_id, |_key, stored| {
@@ -637,9 +699,19 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
         });
 
         let next_inbound = pending_inbound.get(&task_chat_id).and_then(|r| {
-            let mut g = r
-                .lock()
-                .expect("pending_inbound mutex poisoned after reasoning turn");
+            let mut g = match r.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    let _ = logger_tx.send(BusMessage::Log(
+                        LogEvent::warn(
+                            "AgentLogic",
+                            "pending_inbound mutex poisoned after reasoning turn; recovering queue.",
+                        )
+                        .with_chat_id(&task_chat_id),
+                    ));
+                    poisoned.into_inner()
+                }
+            };
             g.pop_front()
         });
 
@@ -938,7 +1010,7 @@ impl AgentLogic {
         {
             ToolExecutionFinished::Completed(res) => res,
             ToolExecutionFinished::Cancelled => {
-                unreachable!("no cancellation token in execute_tool_call")
+                Err("tool call cancelled without cancellation token".to_string())
             }
         }
     }
@@ -1028,12 +1100,24 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 ));
 
                 if self.cancellation_tokens.contains_key(&chat_id) {
-                    self.pending_inbound
+                    let queue = self
+                        .pending_inbound
                         .entry(chat_id.clone())
-                        .or_insert_with(|| Mutex::new(VecDeque::new()))
-                        .lock()
-                        .expect("pending_inbound mutex poisoned")
-                        .push_back(inbound);
+                        .or_insert_with(|| Mutex::new(VecDeque::new()));
+                    let mut guard = match queue.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => {
+                            let _ = self.logger_tx.send(BusMessage::Log(
+                                LogEvent::warn(
+                                    &self.name,
+                                    "pending_inbound mutex poisoned; recovering queued inbound state.",
+                                )
+                                .with_chat_id(&chat_id),
+                            ));
+                            poisoned.into_inner()
+                        }
+                    };
+                    guard.push_back(inbound);
                     let _ = self.logger_tx.send(BusMessage::Log(
                         LogEvent::debug(
                             &self.name,
@@ -1201,8 +1285,23 @@ impl AgentLogic {
         } = ctx;
 
         let session_key = tool_exec_ctx.session_key.clone();
+        let cancel_notice = "Request cancelled while the agent was processing this turn.";
 
         let mut mem = session_manager.get_session(&session_key).await?;
+
+        macro_rules! persist_and_cancel {
+            () => {{
+                persist_terminal_assistant_message(
+                    &mut mem,
+                    &logger_tx,
+                    &name,
+                    &inbound.chat_id,
+                    cancel_notice,
+                )
+                .await;
+                return Ok(String::new());
+            }};
+        }
 
         let forbid_final_effective = !is_subagent
             && (forbid_final_without_tools
@@ -1328,7 +1427,7 @@ impl AgentLogic {
                     LogEvent::info(&name, "Reasoning loop cancelled before iteration start.")
                         .with_chat_id(&inbound.chat_id),
                 ));
-                return Ok(String::new());
+                persist_and_cancel!();
             }
             iterations += 1;
 
@@ -1453,9 +1552,20 @@ impl AgentLogic {
             {
                 ChatRetryOutcome::Ok(resp) => resp,
                 ChatRetryOutcome::Cancelled => {
-                    return Ok(String::new());
+                    persist_and_cancel!();
                 }
                 ChatRetryOutcome::Failed(err) => {
+                    let persisted = format!(
+                        "LLM call failed after 3 attempts: {err}\nPress /retry to try again or /cancel to abandon."
+                    );
+                    persist_terminal_assistant_message(
+                        &mut mem,
+                        &logger_tx,
+                        &name,
+                        &inbound.chat_id,
+                        &persisted,
+                    )
+                    .await;
                     let banner = build_llm_failed_banner(
                         &inbound.channel,
                         &inbound.chat_id,
@@ -1538,7 +1648,7 @@ impl AgentLogic {
                 if parallel_ok {
                     for tc in tool_calls.iter() {
                         if cancel_token.is_cancelled() {
-                            return Ok(String::new());
+                            persist_and_cancel!();
                         }
                         log_tool_invocation_start(
                             &logger_tx,
@@ -1613,11 +1723,13 @@ impl AgentLogic {
                     let outcomes = join_all(futures_vec).await;
                     for (tc, fin) in tool_calls.iter().zip(outcomes) {
                         if cancel_token.is_cancelled() {
-                            return Ok(String::new());
+                            persist_and_cancel!();
                         }
                         let tool_result = match fin {
                             ToolExecutionFinished::Completed(res) => res,
-                            ToolExecutionFinished::Cancelled => return Ok(String::new()),
+                            ToolExecutionFinished::Cancelled => {
+                                persist_and_cancel!();
+                            }
                         };
                         let tool_result_text = finalize_tool_output(tool_result);
                         let tool_name = tc.function.name.clone();
@@ -1644,7 +1756,7 @@ impl AgentLogic {
                 } else {
                     for tc in tool_calls {
                         if cancel_token.is_cancelled() {
-                            return Ok(String::new());
+                            persist_and_cancel!();
                         }
 
                         log_tool_invocation_start(
@@ -1702,7 +1814,9 @@ impl AgentLogic {
                         .await
                         {
                             ToolExecutionFinished::Completed(res) => res,
-                            ToolExecutionFinished::Cancelled => return Ok(String::new()),
+                            ToolExecutionFinished::Cancelled => {
+                                persist_and_cancel!();
+                            }
                         };
 
                         let tool_result_text = finalize_tool_output(tool_result);
@@ -1831,7 +1945,7 @@ impl AgentLogic {
                     let response = tokio::select! {
                         res = provider.chat(&summary_context, None) => res,
                         _ = cancel_token.cancelled() => {
-                            return Ok(String::new());
+                            persist_and_cancel!();
                         }
                     };
 
@@ -1896,6 +2010,14 @@ impl AgentLogic {
         }
 
         let max_iter_msg = "Agent reached max reasoning iterations.".to_string();
+        persist_terminal_assistant_message(
+            &mut mem,
+            &logger_tx,
+            &name,
+            &inbound.chat_id,
+            &max_iter_msg,
+        )
+        .await;
         let fallback = OutboundMessage {
             channel: inbound.channel,
             chat_id: inbound.chat_id,
@@ -1976,7 +2098,7 @@ impl Tool for LoadSkillTool {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentLogic, AgentLogicParams};
+    use super::{AgentLogic, AgentLogicParams, ReasoningLoopCtx};
     use async_trait::async_trait;
     use axum::{
         body::Body,
@@ -2001,8 +2123,9 @@ mod tests {
     use crate::session::SessionManager;
     use crate::skills::SkillRegistry;
     use crate::tool_activity::SharedToolExecutionActivity;
+    use crate::tool_runtime::ToolExecCtx;
     use crate::tools::ToolRegistry;
-    use crate::traits::{Provider, Tool};
+    use crate::traits::{Memory, Provider, Tool};
     use crate::utils::{ChatMessage, LLMError, LLMResponse};
     use crate::{ActorLogic, NodeHandle};
 
@@ -2218,6 +2341,97 @@ mod tests {
                 "LongSleepProvider should have been cancelled".into(),
             ))
         }
+    }
+
+    #[derive(Clone)]
+    struct NonTransientErrorProvider;
+
+    #[async_trait]
+    impl Provider for NonTransientErrorProvider {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<serde_json::Value>,
+        ) -> Result<LLMResponse, LLMError> {
+            Err(LLMError::ApiError("Status 400 bad request".into()))
+        }
+    }
+
+    #[derive(Clone)]
+    struct PanicProvider;
+
+    #[async_trait]
+    impl Provider for PanicProvider {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<serde_json::Value>,
+        ) -> Result<LLMResponse, LLMError> {
+            panic!("panic provider exploded")
+        }
+    }
+
+    async fn run_loop_once_for_test(
+        provider: Box<dyn Provider>,
+        max_iterations: usize,
+        cancelled_before_start: bool,
+    ) -> (Result<String, String>, Vec<ChatMessage>) {
+        let memory_actor = SqliteMemoryActor::new(":memory:").expect("memory actor");
+        let memory_node = NodeHandle::new(memory_actor, 16, 1, Duration::from_millis(1));
+        let session_manager = Arc::new(SessionManager::new(memory_node));
+        let tools = Arc::new(ToolRegistry::new());
+        let skills_temp = LocalTempDir::new();
+        let skills = Arc::new(SkillRegistry::new(skills_temp.path().clone()));
+        let (outbound_tx, _outbound_rx) = mpsc::channel::<BusMessage>(8);
+        let (logger_tx, _logger_rx) = create_logger_channel(32);
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        if cancelled_before_start {
+            cancel_token.cancel();
+        }
+        let inbound = test_inbound("loop-test-chat", "hello");
+        let session_key = inbound.clarification_session_key();
+        let inbound_metadata = Arc::new(inbound.metadata.clone());
+        let result = AgentLogic::run_reasoning_loop(ReasoningLoopCtx {
+            name: "LoopTestAgent".to_string(),
+            provider,
+            session_manager: session_manager.clone(),
+            tools,
+            skills,
+            system_prompt: "test system prompt".to_string(),
+            max_iterations,
+            max_tool_output_chars: 4_000,
+            max_recent_summaries: 0,
+            short_term_threshold_turns: 10,
+            short_term_threshold_tokens: 10_000,
+            tool_execution_activity: None,
+            outbound_tx,
+            logger_tx,
+            inbound,
+            cancel_token: cancel_token.clone(),
+            clarification_hub: ClarificationHub::shared(),
+            tool_exec_ctx: ToolExecCtx::new("terminal", "loop-test-chat", None)
+                .with_reasoning_cancel(cancel_token),
+            is_subagent: false,
+            subagent_allowlist: None,
+            doom_loop_enabled: false,
+            harness_runtime_summary: String::new(),
+            forbid_final_without_tools: false,
+            shell_policy: Arc::new(crate::config::ResolvedShellPolicy {
+                interactive_mode: crate::config::ShellPolicyMode::Ask,
+                unattended_mode: crate::config::ShellPolicyMode::Deny,
+                approval_patterns: Vec::new(),
+            }),
+            hook_tool_ctx: None,
+            inbound_metadata,
+        })
+        .await;
+
+        let session = session_manager
+            .get_session(&session_key)
+            .await
+            .expect("session");
+        let context = session.get_context().await.expect("context");
+        (result, context)
     }
 
     struct SlowTool {
@@ -2617,6 +2831,86 @@ mod tests {
             .expect("timeout waiting clarification")
             .expect("clarification channel closed");
         assert_eq!(delivered, "clarification reply text");
+    }
+
+    #[tokio::test]
+    async fn run_reasoning_loop_persists_terminal_message_on_llm_failure() {
+        let (result, context) =
+            run_loop_once_for_test(Box::new(NonTransientErrorProvider), 2, false).await;
+        assert!(result.is_err(), "expected llm failure");
+        let last = context.last().expect("last message");
+        assert_eq!(last.role, "assistant");
+        let text = last
+            .content
+            .as_ref()
+            .map(|c| c.text_content())
+            .unwrap_or_default();
+        assert!(
+            text.contains("LLM call failed after 3 attempts"),
+            "persisted terminal failure not found: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_reasoning_loop_persists_terminal_message_on_max_iterations() {
+        let (result, context) = run_loop_once_for_test(Box::new(DummyProvider), 0, false).await;
+        assert_eq!(
+            result.expect("max iterations fallback"),
+            "Agent reached max reasoning iterations."
+        );
+        let last = context.last().expect("last message");
+        assert_eq!(last.role, "assistant");
+        let text = last
+            .content
+            .as_ref()
+            .map(|c| c.text_content())
+            .unwrap_or_default();
+        assert_eq!(text, "Agent reached max reasoning iterations.");
+    }
+
+    #[tokio::test]
+    async fn run_reasoning_loop_persists_terminal_message_on_cancel() {
+        let (result, context) = run_loop_once_for_test(Box::new(DummyProvider), 2, true).await;
+        assert_eq!(result.expect("cancelled run"), "");
+        let last = context.last().expect("last message");
+        assert_eq!(last.role, "assistant");
+        let text = last
+            .content
+            .as_ref()
+            .map(|c| c.text_content())
+            .unwrap_or_default();
+        assert!(
+            text.contains("Request cancelled while the agent was processing this turn."),
+            "persisted cancel marker missing: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn panic_in_provider_is_caught_and_surfaces_channel_notice() {
+        let (mut agent, mut outbound_rx) = build_agent_with_provider(Box::new(PanicProvider));
+        let cid = "panic-chat";
+        agent
+            .process(BusMessage::Inbound(test_inbound(cid, "first")))
+            .await
+            .expect("process");
+        let notice = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match outbound_rx.recv().await {
+                    Some(BusMessage::Outbound(msg)) if msg.chat_id == cid => break msg,
+                    Some(_) => continue,
+                    None => panic!("outbound channel closed"),
+                }
+            }
+        })
+        .await
+        .expect("timeout waiting panic notice");
+        assert!(
+            notice
+                .content
+                .contains("Internal error: reasoning loop panicked and was stopped."),
+            "unexpected panic notice: {}",
+            notice.content
+        );
     }
 
     #[tokio::test]
