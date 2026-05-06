@@ -330,6 +330,8 @@ pub struct LLMClient {
 pub fn build_reqwest_client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
+        // Force HTTP/1.1 to avoid body-framing issues with some providers (e.g. DeepSeek/CloudFront)
+        // on long-running reasoning responses.
         .http1_only()
         .build()
         .expect("failed to build reqwest client")
