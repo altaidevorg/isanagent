@@ -83,18 +83,29 @@ pub struct AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn new(base_url: &str, api_key: &str, model: &str) -> Self {
+        // Use a higher default for newer models that support longer output
+        let max_tokens = if model.contains("opus") || model.contains("sonnet") {
+            16384
+        } else {
+            8192
+        };
         Self {
             api_key: api_key.to_string(),
             model: model.to_string(),
             base_url: base_url.to_string(),
             temperature: 0.3,
-            max_tokens: 8192,
+            max_tokens,
             client: build_reqwest_client(),
         }
     }
 
     pub fn with_temperature(mut self, temperature: f32) -> Self {
         self.temperature = temperature;
+        self
+    }
+
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
         self
     }
 
@@ -364,6 +375,16 @@ impl Provider for AnthropicProvider {
                     _ => {}
                 }
             }
+        }
+
+        // Check if response was truncated due to max_tokens
+        let stop_reason = json_resp["stop_reason"].as_str().unwrap_or("");
+        if stop_reason == "max_tokens" {
+            log::warn!(
+                "Anthropic response truncated (stop_reason=max_tokens, max_tokens={}). \
+                 Tool calls may be incomplete.",
+                self.max_tokens
+            );
         }
 
         let usage = json_resp.get("usage").map(|u| TokenUsage {
