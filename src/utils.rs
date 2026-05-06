@@ -330,6 +330,7 @@ pub struct LLMClient {
 pub fn build_reqwest_client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
+        .http1_only()
         .build()
         .expect("failed to build reqwest client")
 }
