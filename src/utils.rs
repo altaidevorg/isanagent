@@ -211,7 +211,11 @@ impl LLMError {
             LLMError::RequestError(_) => true,
             LLMError::ApiError(msg) => {
                 let m = msg.to_lowercase();
-                m.contains("status 5") || m.contains("status 429") || m.contains("rate limit")
+                // format_api_error produces "(STATUS_CODE [code]) ..." so match the prefix
+                m.starts_with("(5")
+                    || m.starts_with("(429")
+                    || m.contains("rate limit")
+                    || m.contains("server error")
             }
             LLMError::ParseError(_) | LLMError::NoContent => false,
         }
