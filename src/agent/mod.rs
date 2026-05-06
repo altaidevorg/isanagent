@@ -127,16 +127,17 @@ fn repair_tool_call_context(context: &mut Vec<crate::utils::ChatMessage>) {
             j += 1;
         }
 
-        // Inject placeholder tool responses for any missing tool_call_ids
+        // Append placeholder tool responses for any missing tool_call_ids at end of tool block
         let missing: Vec<String> = tool_call_ids
             .into_iter()
             .filter(|id| !responded.contains(id))
             .collect();
-        for id in missing.into_iter().rev() {
+        for id in missing {
             context.insert(
-                i + 1,
+                j,
                 crate::utils::ChatMessage::tool("[Cancelled — tool execution interrupted]", &id),
             );
+            j += 1;
         }
 
         i = j;
