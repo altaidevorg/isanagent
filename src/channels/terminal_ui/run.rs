@@ -90,6 +90,57 @@ fn persist_last_model(workspace_dir: &Path, config_key: &str) {
     let _ = std::fs::write(&path, config_key);
 }
 
+/// Shared helper: resolve a provider config by key, send SwitchModel, and update UI.
+/// Used by both the interactive model selector (Enter key) and the `/model <name>` command.
+fn try_switch_model(
+    app: &mut App,
+    bus_tx: &Sender<BusMessage>,
+    providers: &std::collections::HashMap<String, crate::config::ProviderConfig>,
+    workspace_dir: &Path,
+    config_key: &str,
+) {
+    if let Some(cfg) = providers.get(config_key) {
+        let resolved_url = cfg.resolved_base_url().unwrap_or_default();
+        match cfg.resolve_api_key() {
+            Ok(api_key) => {
+                let msg = BusMessage::SwitchModel {
+                    provider_name: cfg.provider_name.clone(),
+                    model_name: cfg.model_name.clone(),
+                    base_url: resolved_url,
+                    api_key,
+                };
+                if bus_tx.blocking_send(msg).is_err() {
+                    app.cells.push(Cell::System {
+                        message: "Bus closed; exiting.".into(),
+                    });
+                    app.request_quit();
+                } else {
+                    app.status_model = cfg.model_name.clone();
+                    persist_last_model(workspace_dir, config_key);
+                    app.set_toast(
+                        ToastKind::Ok,
+                        format!("Model: {}", app.status_model),
+                        Duration::from_secs(3),
+                    );
+                }
+            }
+            Err(e) => {
+                let err_msg = format!(
+                    "No API key for '{}': {}\n\
+                     Set the env var or add api_key = \"...\" under [providers.{}] in config.toml.",
+                    config_key, e, config_key
+                );
+                app.cells.push(Cell::Error { message: err_msg });
+                app.set_toast(
+                    ToastKind::Err,
+                    format!("No API key for {}", config_key),
+                    Duration::from_secs(5),
+                );
+            }
+        }
+    }
+}
+
 const TERMINAL_HELP: &str = r#"Commands (leading slash):
   /exit, /quit   Quit and restore the terminal
   /new           Start a new thread (new chat id)
@@ -2096,46 +2147,8 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 } else {
                                     app.model_selector = Some(ModelSelector::from_providers(&providers));
                                 }
-                            } else if let Some(cfg) = providers.get(arg) {
-                                let resolved_url = cfg.resolved_base_url().unwrap_or_default();
-                                match cfg.resolve_api_key() {
-                                    Ok(api_key) => {
-                                        let msg = BusMessage::SwitchModel {
-                                            provider_name: cfg.provider_name.clone(),
-                                            model_name: cfg.model_name.clone(),
-                                            base_url: resolved_url,
-                                            api_key,
-                                        };
-                                        if bus_tx.blocking_send(msg).is_err() {
-                                            app.cells.push(Cell::System {
-                                                message: "Bus closed; exiting.".into(),
-                                            });
-                                            app.request_quit();
-                                        } else {
-                                            app.status_model = cfg.model_name.clone();
-                                            persist_last_model(&workspace_dir, arg);
-                                            app.set_toast(
-                                                ToastKind::Ok,
-                                                format!("Model: {}", app.status_model),
-                                                Duration::from_secs(3),
-                                            );
-                                        }
-                                    }
-                                    Err(e) => {
-                                        let err_msg = format!(
-                                            "No API key for '{}': {}",
-                                            arg, e
-                                        );
-                                        app.cells.push(Cell::Error {
-                                            message: err_msg.clone(),
-                                        });
-                                        app.set_toast(
-                                            ToastKind::Err,
-                                            err_msg,
-                                            Duration::from_secs(5),
-                                        );
-                                    }
-                                }
+                            } else if providers.contains_key(arg) {
+                                try_switch_model(app, &bus_tx, &providers, &workspace_dir, arg);
                             } else {
                                 let available: Vec<&str> =
                                     providers.keys().map(|s| s.as_str()).collect();
