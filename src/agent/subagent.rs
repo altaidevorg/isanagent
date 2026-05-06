@@ -45,7 +45,8 @@ pub struct SubagentSpawnSpec {
 /// Shared wiring for each spawned sub-agent run.
 pub struct SubagentSpawnDeps {
     pub agent_name: String,
-    pub provider_template: Box<dyn Provider>,
+    /// Shared provider reference — reads the current provider (updates with `/model` switch).
+    pub provider: Arc<tokio::sync::RwLock<Box<dyn Provider>>>,
     pub session_manager: Arc<SessionManager>,
     pub skills: Arc<SkillRegistry>,
     pub system_prompt: String,
@@ -407,7 +408,7 @@ impl SubagentHarness {
             .and_then(|m| m.max_iterations)
             .unwrap_or(self.inner.deps.max_iterations);
 
-        let provider = dyn_clone::clone_box(&*self.inner.deps.provider_template);
+        let provider = dyn_clone::clone_box(&**self.inner.deps.provider.read().await);
 
         let label = match (&agent_name, &display_name) {
             (Some(a), Some(d)) => format!("{a}: {d}"),

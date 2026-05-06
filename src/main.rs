@@ -27,7 +27,7 @@ use isanagent::onboarding::{
     build_interactive_config_toml, onboard_workspace, BootstrapReport, OnboardOptions,
 };
 use isanagent::onboarding_interactive;
-use isanagent::provider::OpenAIProvider;
+
 use isanagent::scheduler::{
     validate_multi_tenant_edge_runtime, CronActor, CronSchedulingMode, MultiTenantEdgeCronScheduler,
 };
@@ -213,8 +213,8 @@ async fn run_isanagent(
     log::info!("Starting Advanced isanagent System.");
 
     let workspace = IsanagentWorkspace::new(workspace_arg.as_deref(), config_arg.as_deref())?;
-    println!("Loading Altbot workspace at: {:?}", workspace.dir);
-    log::info!("Loading Altbot workspace at {:?}", workspace.dir);
+    println!("Loading isanagent workspace at: {:?}", workspace.dir);
+    log::info!("Loading isanagent workspace at {:?}", workspace.dir);
 
     if !workspace.config.terminal_enabled() && !workspace.config.has_non_terminal_inbound_channel()
     {
@@ -495,7 +495,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     }));
 
     // 5. Setup Provider (Dynamic from config)
-    let provider_cfg =
+    let default_provider_cfg =
         workspace
             .config
             .provider
@@ -504,27 +504,86 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                 provider_name: DEFAULT_PROVIDER_NAME.to_string(),
                 model_name: DEFAULT_PROVIDER_MODEL_NAME.to_string(),
                 api_key_env: DEFAULT_PROVIDER_API_KEY_ENV.to_string(),
+                api_key: None,
                 base_url: None,
             });
-    let base_url = provider_cfg
-        .resolved_base_url()
-        .map_err(std::io::Error::other)?;
-    let model_name = provider_cfg.model_name.clone();
-    let api_key_env = provider_cfg.api_key_env.clone();
 
-    let api_key = std::env::var(&api_key_env)
-        .map_err(|_| std::io::Error::other(format!("{} must be set", api_key_env)))?;
-    let client =
-        isanagent::utils::LLMClient::new_openai_compatible(&base_url, &api_key, &model_name)
-            .with_temperature(0.3);
-    let provider = Box::new(OpenAIProvider::new(client.clone()));
+    // Try to find any provider with a valid API key. No key = start with NoKeyProvider.
+    // Priority: last_model file (remembers /model choice) → [provider] → first [providers.*] with key.
+    let last_model_path = workspace.dir.join(".system_generated/last_model");
+    let remembered_key = std::fs::read_to_string(&last_model_path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let (provider_cfg, api_key): (Option<isanagent::config::ProviderConfig>, Option<String>) = {
+        // 0. Try remembered last model choice
+        let mut found_remembered = None;
+        if let Some(ref key_name) = remembered_key {
+            if let Some(providers_map) = &workspace.config.providers {
+                if let Some(cfg) = providers_map.get(key_name) {
+                    if let Ok(key) = cfg.resolve_api_key() {
+                        found_remembered = Some((cfg.clone(), key));
+                    }
+                }
+            }
+        }
+        if let Some((cfg, key)) = found_remembered {
+            (Some(cfg), Some(key))
+        }
+        // 1. Try default [provider]
+        else if let Ok(key) = default_provider_cfg.resolve_api_key() {
+            (Some(default_provider_cfg.clone()), Some(key))
+        } else {
+            // 2. Try any [providers.*] entry
+            let mut found: Option<(isanagent::config::ProviderConfig, String)> = None;
+            if let Some(providers_map) = &workspace.config.providers {
+                for (_name, cfg) in providers_map {
+                    if let Ok(key) = cfg.resolve_api_key() {
+                        found = Some((cfg.clone(), key));
+                        break;
+                    }
+                }
+            }
+            if let Some((cfg, key)) = found {
+                (Some(cfg), Some(key))
+            } else {
+                // No key anywhere — start without one (NoKeyProvider)
+                (None, None)
+            }
+        }
+    };
+
+    let model_name = provider_cfg
+        .as_ref()
+        .map(|c| c.model_name.clone())
+        .unwrap_or_else(|| "(no model)".to_string());
+
+    let (provider, reflection_provider): (
+        Box<dyn isanagent::traits::Provider>,
+        Box<dyn isanagent::traits::Provider>,
+    ) = if let (Some(cfg), Some(key)) = (&provider_cfg, &api_key) {
+        let base_url = cfg.resolved_base_url().map_err(std::io::Error::other)?;
+        let p1 =
+            isanagent::provider::create_provider(&cfg.provider_name, &base_url, key, &model_name);
+        let p2 =
+            isanagent::provider::create_provider(&cfg.provider_name, &base_url, key, &model_name);
+        (p1, p2)
+    } else {
+        // No API key found — start with placeholder; user can switch via /model
+        eprintln!("No API key found. Starting without a model. Use /model to configure one.");
+        (
+            Box::new(isanagent::provider::NoKeyProvider),
+            Box::new(isanagent::provider::NoKeyProvider),
+        )
+    };
 
     // 5.5 Setup Reflection Engine
     let memory_config = workspace.config.memory.clone().unwrap_or_default();
     let reflection_engine = isanagent::reflection::ReflectionEngine::new(
         memory_node.clone(),
         workspace.sandbox_dir.clone(),
-        Box::new(OpenAIProvider::new(client.clone())),
+        reflection_provider,
         memory_config,
         logger_bus_tx.clone(),
         app_shutdown_rx.clone(),
@@ -603,7 +662,8 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             Ok(client) => Some(std::sync::Arc::new(client)),
             Err(error) => {
                 let _ = logger_bus_tx.send(BusMessage::Log(isanagent::bus::LogEvent::warn(
-                    "Altbot", &error,
+                    "isanagent",
+                    &error,
                 )));
                 None
             }
@@ -651,7 +711,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     };
 
     let agent_logic = AgentLogic::new(AgentLogicParams {
-        name: "Altbot".to_string(),
+        name: "isanagent".to_string(),
         provider,
         session_manager,
         tools,
@@ -698,6 +758,15 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             workspace.sandbox_dir.clone(),
             model_name.clone(),
             memory_node.clone(),
+            {
+                // Merge default [provider] + all [providers.*] into one map for /model selector
+                let mut all_providers = workspace.config.providers.clone().unwrap_or_default();
+                if let Some(def) = &workspace.config.provider {
+                    let key = format!("{}/{}", def.provider_name, def.model_name);
+                    all_providers.entry(key).or_insert_with(|| def.clone());
+                }
+                all_providers
+            },
         ));
         terminal.start(bus_tx.clone()).await?;
         out_channels.insert(terminal.name().to_string(), terminal);
@@ -826,9 +895,12 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                 *active_terminal_session_for_bus.write().await = chat_id.clone();
                 continue;
             }
-            // Only route Inbound and Cancel messages to the agent logic.
+            // Only route Inbound, Cancel, and SwitchModel messages to the agent logic.
             // This prevents the agent from being flooded with its own telemetry or other system messages.
-            if matches!(msg, BusMessage::Inbound(_) | BusMessage::Cancel(_)) {
+            if matches!(
+                msg,
+                BusMessage::Inbound(_) | BusMessage::Cancel(_) | BusMessage::SwitchModel { .. }
+            ) {
                 let _ = agent_tx.send_packet(msg).await;
             }
         }

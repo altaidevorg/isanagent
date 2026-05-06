@@ -26,6 +26,7 @@ You have a fuzzy goal (“fine-tune a model for this task”, “Research about 
 | **Parallel or staged research** | Subagents for forked investigation, with history you can audit. |
 | **Structured habits** | Bundled **skills** (after `onboard`): execution research, long-running jobs, scientific Python debugging, synthetic datasets with [**Afterimage**](https://github.com/altaidevorg/afterimage), cron-style automation, skill authoring, and more — loaded on demand so context stays lean. |
 | **Where you already work** | **Terminal** for a focused dev loop, **HTTP API + optional embedded UI** for browser chat, plus **Slack** and **email** when you wire them in. |
+| **Multi-provider, hot-swappable models** | Configure multiple LLM providers (Gemini, OpenAI, Anthropic, DeepSeek, OpenRouter) in `config.toml` and switch between them at runtime with `/model`. Your last choice is remembered across restarts. |
 
 ---
 
@@ -79,6 +80,28 @@ Invoke-WebRequest https://github.com/altaidevorg/isanagent/releases/download/mai
 If you use the **default workspace** (`~/.isanagent` on Unix, or the equivalent on Windows) and that folder does not exist yet, **the first run starts the interactive onboard wizard** (provider, API key env var, model, and workspace layout), then continues into the agent in the same session. For a custom workspace path, run `isanagent onboard` (add `--interactive` for the full wizard) or `isanagent --workspace /path/to/workspace` once the directory and `config.toml` exist.
 
 Set API credentials the wizard recommends (for example `GEMINI_API_KEY` or your provider’s variable). Turn on **`[api] enabled = true`** and **`serve_ui = true`** in `config.toml` when you want the browser UI on `http://127.0.0.1:<port>/`. For channels, memory, harness options, and sandbox rules, see [`AGENTS.md`](./AGENTS.md).
+
+### Multi-provider setup
+
+Configure multiple providers in `config.toml` and switch between them at runtime:
+
+```toml
+[providers.gemini-2-5-flash]
+provider_name = "gemini"
+model_name = "gemini-2.5-flash"
+api_key = "AIza..."
+
+[providers.gpt-4o]
+provider_name = "openai"
+model_name = "gpt-4o"
+# Uses $OPENAI_API_KEY automatically
+
+[providers.claude-sonnet]
+provider_name = "anthropic"
+model_name = "claude-sonnet-4-6"
+```
+
+Use `/model` in the TUI to open the interactive model selector, or `/model gemini-2-5-flash` to switch directly. Your choice is remembered across restarts.
 
 ### Build from source (optional)
 

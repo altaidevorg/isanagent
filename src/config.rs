@@ -299,6 +299,10 @@ pub struct GitWorktreeConfig {
 pub struct AppConfig {
     pub restrict_to_workspace: Option<bool>,
     pub provider: Option<ProviderConfig>,
+    /// Named alternative provider configs for runtime switching via `/model`.
+    /// Keys are short labels (e.g. `"openai"`, `"claude"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub providers: Option<std::collections::HashMap<String, ProviderConfig>>,
     pub api: Option<ApiConfig>,
     pub slack: Option<SlackConfig>,
     pub email: Option<EmailConfig>,
@@ -1277,12 +1281,17 @@ pub struct ApiConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ProviderConfig {
-    /// One of `KNOWN_PROVIDERS` (e.g. `"gemini"`, `"openai"`, `"deepseek"`, `"openrouter"`) or
-    /// the `OPENAI_COMPATIBLE` sentinel for any third-party endpoint speaking the OpenAI Chat
-    /// Completions protocol.
+    /// One of `KNOWN_PROVIDERS` (e.g. `"gemini"`, `"openai"`, `"deepseek"`, `"openrouter"`,
+    /// `"anthropic"`) or the `OPENAI_COMPATIBLE` sentinel for any third-party endpoint speaking
+    /// the OpenAI Chat Completions protocol.
     pub provider_name: String,
     pub model_name: String,
+    /// Name of the environment variable holding the API key. Checked first during resolution.
+    #[serde(default)]
     pub api_key_env: String,
+    /// Direct API key value. Used as fallback when the env var named by `api_key_env` is not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
     /// Optional explicit chat-completions URL. Always wins when set, including for known
     /// provider names (lets users point a known provider at a proxy / Azure-OpenAI / self-hosted
     /// gateway). Required when `provider_name == "openai_compatible"`.
@@ -1291,6 +1300,39 @@ pub struct ProviderConfig {
 }
 
 impl ProviderConfig {
+    /// Resolve the API key env var name. If `api_key_env` is explicitly set, use that.
+    /// Otherwise, infer from `provider_name` (e.g. "openai" → "OPENAI_API_KEY").
+    pub fn resolved_api_key_env(&self) -> String {
+        if !self.api_key_env.is_empty() {
+            return self.api_key_env.clone();
+        }
+        // Infer from provider_name
+        format!("{}_API_KEY", self.provider_name.to_uppercase())
+    }
+
+    /// Resolve the API key: env var (from `resolved_api_key_env()`) first, then the inline
+    /// `api_key` field in config.toml. Returns `Err` when neither source provides a non-empty key.
+    pub fn resolve_api_key(&self) -> Result<String, String> {
+        let env_var = self.resolved_api_key_env();
+        if !env_var.is_empty() {
+            if let Ok(key) = std::env::var(&env_var) {
+                if !key.is_empty() {
+                    return Ok(key);
+                }
+            }
+        }
+        if let Some(key) = &self.api_key {
+            let trimmed = key.trim();
+            if !trimmed.is_empty() {
+                return Ok(trimmed.to_string());
+            }
+        }
+        Err(format!(
+            "No API key found (checked env ${} and config api_key)",
+            env_var
+        ))
+    }
+
     /// Resolve the chat-completions URL using the registry-then-override rules described on
     /// [`ProviderConfig::base_url`].
     ///
@@ -1333,6 +1375,7 @@ mod provider_config_tests {
             provider_name: name.to_string(),
             model_name: "m".to_string(),
             api_key_env: "X".to_string(),
+            api_key: None,
             base_url: base.map(str::to_string),
         }
     }

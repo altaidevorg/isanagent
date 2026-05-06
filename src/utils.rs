@@ -218,6 +218,103 @@ impl LLMError {
     }
 }
 
+/// Produce a user-friendly error message for HTTP API errors.
+pub fn format_api_error(status: u16, body: &str, base_url: &str, model: &str) -> String {
+    // Parse JSON; Gemini wraps errors in an array: [{...}] — unwrap to the first element.
+    let parsed = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .map(|v| {
+            if let Some(arr) = v.as_array() {
+                arr.first().cloned().unwrap_or(v)
+            } else {
+                v
+            }
+        });
+
+    // Try to extract a message from JSON error body
+    let msg = parsed.as_ref().and_then(|v| {
+        v.get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str().map(|s| s.to_string()))
+    });
+
+    // Also try to extract error code/status string (e.g. "PERMISSION_DENIED")
+    let error_code = parsed.as_ref().and_then(|v| {
+        // Gemini: {"error":{"code":403,"status":"PERMISSION_DENIED"}}
+        // OpenAI: {"error":{"code":"model_not_found","type":"invalid_request_error"}}
+        let err = v.get("error")?;
+        err.get("status")
+            .or_else(|| err.get("code"))
+            .and_then(|c| {
+                if c.is_string() {
+                    c.as_str().map(|s| s.to_string())
+                } else {
+                    None // skip numeric codes, we already have `status`
+                }
+            })
+            .or_else(|| {
+                err.get("type")
+                    .and_then(|t| t.as_str().map(|s| s.to_string()))
+            })
+    });
+
+    let code_tag = error_code
+        .as_deref()
+        .map(|c| format!(" [{}]", c))
+        .unwrap_or_default();
+
+    match status {
+        401 => {
+            let hint = if base_url.contains("openrouter") {
+                "Check your OPENROUTER_API_KEY."
+            } else if base_url.contains("openai") || base_url.contains("api.openai.com") {
+                "Check your OPENAI_API_KEY."
+            } else if base_url.contains("anthropic") {
+                "Check your ANTHROPIC_API_KEY."
+            } else if base_url.contains("googleapis") || base_url.contains("generativelanguage") {
+                "Check your GEMINI_API_KEY."
+            } else if base_url.contains("deepseek") {
+                "Check your DEEPSEEK_API_KEY."
+            } else {
+                "Check that the correct API key is set for this provider."
+            };
+            format!(
+                "({}{}) Authentication failed for model '{}'. {}",
+                status, code_tag, model, hint
+            )
+        }
+        403 => {
+            let detail = msg
+                .as_deref()
+                .map(|m| format!(" {}", m))
+                .unwrap_or_default();
+            format!(
+                "({}{}) Access denied for model '{}'.{} Your API key may not have permission to use this model.",
+                status, code_tag, model, detail
+            )
+        }
+        404 => format!(
+            "({}{}) Model '{}' not found at {}. It may not exist or is not available on your plan.",
+            status, code_tag, model, base_url
+        ),
+        429 => format!(
+            "({}{}) Rate limit exceeded for model '{}'. Try again in a moment.",
+            status, code_tag, model
+        ),
+        _ if status >= 500 => format!(
+            "({}{}) Server error from provider while using model '{}'. Try again later.",
+            status, code_tag, model
+        ),
+        _ => {
+            let detail = msg.unwrap_or_else(|| body.chars().take(200).collect());
+            format!(
+                "({}{}) API error for model '{}': {}",
+                status, code_tag, model, detail
+            )
+        }
+    }
+}
+
 // --- Client ---
 
 #[derive(Clone)]
@@ -315,7 +412,8 @@ impl LLMClient {
         let status = res.status();
         if !status.is_success() {
             let text = res.text().await.unwrap_or_default();
-            return Err(LLMError::ApiError(format!("Status {}: {}", status, text)));
+            let friendly = format_api_error(status.as_u16(), &text, &self.base_url, &self.model);
+            return Err(LLMError::ApiError(friendly));
         }
 
         let raw_text = res

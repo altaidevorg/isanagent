@@ -5,9 +5,62 @@ use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
 
+use crate::config::ProviderConfig;
 use crate::memory::RootThreadListItem;
 
 use super::execution_browser::{ExecutionRunDetail, ExecutionRunListItem};
+
+/// An entry in the model selector popup.
+#[derive(Debug, Clone)]
+pub struct ModelSelectorEntry {
+    /// Display label (e.g. "claude-opus-4-7")
+    pub label: String,
+    /// Config key in `[providers.*]` map
+    pub config_key: String,
+    /// Provider name (e.g. "anthropic")
+    pub provider_name: String,
+    /// Model ID (e.g. "claude-opus-4-7")
+    pub model_name: String,
+}
+
+/// Popup state for interactive model selection via `/model`.
+#[derive(Debug, Clone)]
+pub struct ModelSelector {
+    pub items: Vec<ModelSelectorEntry>,
+    pub selected: usize,
+}
+
+impl ModelSelector {
+    pub fn from_providers(providers: &std::collections::HashMap<String, ProviderConfig>) -> Self {
+        let mut items: Vec<ModelSelectorEntry> = providers
+            .iter()
+            .map(|(key, cfg)| ModelSelectorEntry {
+                label: format!("{} ({})", cfg.model_name, cfg.provider_name),
+                config_key: key.clone(),
+                provider_name: cfg.provider_name.clone(),
+                model_name: cfg.model_name.clone(),
+            })
+            .collect();
+        items.sort_by(|a, b| a.config_key.cmp(&b.config_key));
+        Self { items, selected: 0 }
+    }
+
+    pub fn move_up(&mut self) {
+        if self.selected > 0 {
+            self.selected -= 1;
+        }
+    }
+
+    pub fn move_down(&mut self) {
+        if self.selected + 1 < self.items.len() {
+            self.selected += 1;
+        }
+    }
+
+    pub fn selected_entry(&self) -> Option<&ModelSelectorEntry> {
+        self.items.get(self.selected)
+    }
+}
 
 /// High-level UI mode for the terminal front-end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -189,7 +242,8 @@ pub enum Cell {
     },
 }
 
-/// Mouse text-selection state for the transcript pane.
+/// Mouse text selection state within the transcript pane.
+/// Coordinates are (line_index, display_col) in flattened transcript lines.
 #[derive(Debug, Clone, Copy)]
 pub struct TranscriptSelection {
     pub anchor_line: usize,
@@ -199,14 +253,24 @@ pub struct TranscriptSelection {
 }
 
 impl TranscriptSelection {
-    /// Return `(start_line, start_col, end_line, end_col)` with start <= end.
+    /// Returns (start_line, start_col, end_line, end_col) normalized so start <= end.
     pub fn normalized(&self) -> (usize, usize, usize, usize) {
         if self.anchor_line < self.end_line
             || (self.anchor_line == self.end_line && self.anchor_col <= self.end_col)
         {
-            (self.anchor_line, self.anchor_col, self.end_line, self.end_col)
+            (
+                self.anchor_line,
+                self.anchor_col,
+                self.end_line,
+                self.end_col,
+            )
         } else {
-            (self.end_line, self.end_col, self.anchor_line, self.anchor_col)
+            (
+                self.end_line,
+                self.end_col,
+                self.anchor_line,
+                self.anchor_col,
+            )
         }
     }
 
@@ -309,6 +373,10 @@ pub struct App {
     pub spinner_tick: usize,
     pub todos_count: usize,
     pub crons_count: usize,
+    /// Active model selector popup (shown via `/model`).
+    pub model_selector: Option<ModelSelector>,
+    /// Active model name displayed in the status bar (updated on `/model` switch).
+    pub status_model: String,
 }
 
 impl Default for App {
@@ -371,6 +439,8 @@ impl App {
             spinner_tick: 0,
             todos_count: 0,
             crons_count: 0,
+            model_selector: None,
+            status_model: String::new(),
         }
     }
 

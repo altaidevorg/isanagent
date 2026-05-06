@@ -523,6 +523,8 @@ pub struct TerminalChannel {
     memory_node: NodeHandle<MemoryMessage>,
     /// Outbound messages for the Ratatui thread (set when `start` succeeds).
     outbound_ui_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<OutboundMessage>>>>,
+    /// Named alternative providers for `/model` switching.
+    providers: std::collections::HashMap<String, crate::config::ProviderConfig>,
 }
 
 impl TerminalChannel {
@@ -534,6 +536,7 @@ impl TerminalChannel {
         sandbox_dir: PathBuf,
         status_model: String,
         memory_node: NodeHandle<MemoryMessage>,
+        providers: std::collections::HashMap<String, crate::config::ProviderConfig>,
     ) -> Self {
         Self {
             chat_id: chat_id.to_string(),
@@ -544,6 +547,7 @@ impl TerminalChannel {
             status_model,
             memory_node,
             outbound_ui_tx: Arc::new(Mutex::new(None)),
+            providers,
         }
     }
 }
@@ -572,6 +576,7 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
         let shutdown_tx = self.shutdown_tx.clone();
         let sandbox_dir = self.sandbox_dir.clone();
         let workspace_dir = self.workspace_dir.clone();
+        let providers_clone = self.providers.clone();
 
         let _ = logger_tx.send(BusMessage::Log(LogEvent::info(
             "TerminalChannel",
@@ -615,6 +620,7 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
                         opening_banner,
                         status_model,
                         memory_node: memory_node_clone,
+                        providers: providers_clone,
                     },
                 );
                 if let Ok(mut g) = bridge.lock() {
