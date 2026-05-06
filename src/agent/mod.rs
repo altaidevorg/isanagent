@@ -106,43 +106,56 @@ const MAX_CONTEXT_TOKENS_DEFAULT: usize = 120_000;
 
 /// Trim context from the front (oldest messages) to stay within a token budget.
 /// Preserves the system message at index 0 and never splits tool_call/tool pairs.
+/// A marker message is inserted only when messages were actually removed.
 fn trim_context_to_budget(context: &mut Vec<crate::utils::ChatMessage>, max_tokens: usize) {
-    let estimate_tokens = |msgs: &[crate::utils::ChatMessage]| -> usize {
-        msgs.iter()
-            .map(|m| {
-                m.content.as_ref().map_or(0, |c| c.text_content().len()) / 4
-                    + m.tool_calls
-                        .as_ref()
-                        .map_or(0, |tcs| tcs.iter().map(|t| t.function.arguments.len() / 4).sum())
-            })
-            .sum()
+    // Token estimation heuristic: 1 token ≈ 4 characters for English text.
+    // This is the same heuristic used by the existing compaction logic.
+    let estimate_msg_tokens = |msg: &crate::utils::ChatMessage| -> usize {
+        let text_len = msg.content.as_ref().map_or(0, |c| c.text_content().len());
+        let args_len = msg
+            .tool_calls
+            .as_ref()
+            .map_or(0, |tcs| tcs.iter().map(|t| t.function.arguments.len()).sum());
+        (text_len + args_len) / 4
     };
 
-    if estimate_tokens(context) <= max_tokens || context.len() <= 2 {
+    // Quick check: under budget or too small to trim
+    if context.len() <= 2 {
+        return;
+    }
+    let total: usize = context.iter().map(&estimate_msg_tokens).sum();
+    if total <= max_tokens {
         return;
     }
 
-    // Find the first safe trim point (after index 0 system message).
-    // We remove messages from the front (after system msg) until under budget,
-    // but never remove half of a tool_call/tool pair.
-    let trim_end = 1; // start after system message
-    while estimate_tokens(context) > max_tokens && trim_end < context.len().saturating_sub(2) {
-        // Skip over tool_call+tool sequences atomically
-        if context[trim_end].role == "assistant" && context[trim_end].tool_calls.is_some() {
-            // Find end of the tool response block
-            let mut block_end = trim_end + 1;
+    // Always remove from index 1 (after system message).
+    // Tool call/response pairs are removed atomically.
+    // Track remaining tokens to avoid O(N^2) re-computation.
+    let mut remaining = total;
+    let trim_pos: usize = 1;
+    let mut trimmed = false;
+    while remaining > max_tokens && trim_pos + 1 < context.len() {
+        if context[trim_pos].role == "assistant" && context[trim_pos].tool_calls.is_some() {
+            // Find the end of the tool response block
+            let mut block_end = trim_pos + 1;
             while block_end < context.len() && context[block_end].role == "tool" {
                 block_end += 1;
             }
-            // Remove the entire assistant + tool block
-            context.drain(trim_end..block_end);
+            // Subtract the tokens for this entire block
+            for idx in trim_pos..block_end {
+                remaining = remaining.saturating_sub(estimate_msg_tokens(&context[idx]));
+            }
+            context.drain(trim_pos..block_end);
+            trimmed = true;
         } else {
-            context.remove(trim_end);
+            remaining = remaining.saturating_sub(estimate_msg_tokens(&context[trim_pos]));
+            context.remove(trim_pos);
+            trimmed = true;
         }
     }
 
-    // Insert a marker so the model knows context was trimmed
-    if trim_end > 1 || context.len() > 2 {
+    // Only insert marker when we actually removed something
+    if trimmed {
         context.insert(
             1,
             crate::utils::ChatMessage::user(
