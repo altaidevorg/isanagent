@@ -122,6 +122,71 @@ fn context_has_tool_call(context: &[crate::utils::ChatMessage], tool_name: &str)
     })
 }
 
+/// Default context token budget (conservative for most models).
+/// Uses char_count / 4 as the token estimate (same heuristic as compaction logic).
+const MAX_CONTEXT_TOKENS_DEFAULT: usize = 120_000;
+
+/// Trim context from the front (oldest messages) to stay within a token budget.
+/// Preserves the system message at index 0 and never splits tool_call/tool pairs.
+/// A marker message is inserted only when messages were actually removed.
+fn trim_context_to_budget(context: &mut Vec<crate::utils::ChatMessage>, max_tokens: usize) {
+    // Token estimation heuristic: 1 token ≈ 4 characters for English text.
+    // This is the same heuristic used by the existing compaction logic.
+    let estimate_msg_tokens = |msg: &crate::utils::ChatMessage| -> usize {
+        let text_len = msg.content.as_ref().map_or(0, |c| c.text_content().len());
+        let args_len = msg
+            .tool_calls
+            .as_ref()
+            .map_or(0, |tcs| tcs.iter().map(|t| t.function.arguments.len()).sum());
+        (text_len + args_len) / 4
+    };
+
+    // Quick check: under budget or too small to trim
+    if context.len() <= 2 {
+        return;
+    }
+    let total: usize = context.iter().map(&estimate_msg_tokens).sum();
+    if total <= max_tokens {
+        return;
+    }
+
+    // Always remove from index 1 (after system message).
+    // Tool call/response pairs are removed atomically.
+    // Track remaining tokens to avoid O(N^2) re-computation.
+    let mut remaining = total;
+    let trim_pos: usize = 1;
+    let mut trimmed = false;
+    while remaining > max_tokens && trim_pos + 1 < context.len() {
+        if context[trim_pos].role == "assistant" && context[trim_pos].tool_calls.is_some() {
+            // Find the end of the tool response block
+            let mut block_end = trim_pos + 1;
+            while block_end < context.len() && context[block_end].role == "tool" {
+                block_end += 1;
+            }
+            // Subtract the tokens for this entire block
+            for idx in trim_pos..block_end {
+                remaining = remaining.saturating_sub(estimate_msg_tokens(&context[idx]));
+            }
+            context.drain(trim_pos..block_end);
+            trimmed = true;
+        } else {
+            remaining = remaining.saturating_sub(estimate_msg_tokens(&context[trim_pos]));
+            context.remove(trim_pos);
+            trimmed = true;
+        }
+    }
+
+    // Only insert marker when we actually removed something
+    if trimmed {
+        context.insert(
+            1,
+            crate::utils::ChatMessage::user(
+                "[Earlier conversation messages were trimmed to fit context window]",
+            ),
+        );
+    }
+}
+
 /// Repair context so every assistant message with `tool_calls` is followed by a tool-role
 /// response for each `tool_call_id`. This prevents 400 errors from strict providers (e.g.
 /// DeepSeek) when a previous reasoning loop was cancelled mid-tool-execution, leaving
@@ -1572,6 +1637,9 @@ impl AgentLogic {
                     ));
                 }
             }
+
+            // Trim context to stay within token budget before calling the provider
+            trim_context_to_budget(&mut context, MAX_CONTEXT_TOKENS_DEFAULT);
 
             let _ = logger_tx.send(BusMessage::Log(
                 LogEvent::debug(
