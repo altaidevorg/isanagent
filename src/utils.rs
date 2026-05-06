@@ -385,6 +385,20 @@ impl LLMClient {
             "temperature": self.temperature
         });
 
+        // Strip `reasoning_content` from messages for providers that reject unknown fields.
+        // Only DeepSeek models use this field; others (OpenAI, Gemini, OpenRouter) return 400.
+        let model_lower = self.model.to_lowercase();
+        let supports_reasoning = model_lower.contains("deepseek");
+        if !supports_reasoning {
+            if let Some(msgs) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+                for msg in msgs.iter_mut() {
+                    if let Some(obj) = msg.as_object_mut() {
+                        obj.remove("reasoning_content");
+                    }
+                }
+            }
+        }
+
         if let Some(t) = tools {
             if let Some(obj) = body.as_object_mut() {
                 obj.insert("tools".to_string(), t);
