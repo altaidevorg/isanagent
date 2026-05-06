@@ -17,10 +17,7 @@ pub const OPENAI_COMPATIBLE: &str = "openai_compatible";
 /// Kept alphabetical so `known_names()` returns a deterministic order suitable for help text
 /// and error messages.
 pub const KNOWN_PROVIDERS: &[(&str, &str)] = &[
-    (
-        "anthropic",
-        "https://api.anthropic.com/v1/messages",
-    ),
+    ("anthropic", "https://api.anthropic.com/v1/messages"),
     ("deepseek", "https://api.deepseek.com/v1/chat/completions"),
     (
         "gemini",

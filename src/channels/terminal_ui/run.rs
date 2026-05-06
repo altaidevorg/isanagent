@@ -1709,7 +1709,10 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 
                 let inner_block = Block::default()
                     .borders(Borders::ALL)
-                    .title(Span::styled(" Select Model (↑↓ Enter Esc) ", Theme::tool_call()))
+                    .title(Span::styled(
+                        " Select Model (↑↓ Enter Esc) ",
+                        Theme::tool_call(),
+                    ))
                     .border_style(Style::default().fg(Color::Cyan));
                 let inner = inner_block.inner(popup_area);
                 f.render_widget(inner_block, popup_area);
@@ -1722,10 +1725,18 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 };
 
                 let mut lines: Vec<Line> = Vec::new();
-                for (i, entry) in selector.items.iter().enumerate().skip(scroll_offset).take(visible_h) {
+                for (i, entry) in selector
+                    .items
+                    .iter()
+                    .enumerate()
+                    .skip(scroll_offset)
+                    .take(visible_h)
+                {
                     let marker = if i == selector.selected { "▶ " } else { "  " };
                     let style = if i == selector.selected {
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(Color::White)
                     };
@@ -1737,7 +1748,10 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             }
 
             // Slash command hint popup (shown when input starts with "/" and no model selector).
-            if app.model_selector.is_none() && app.input.starts_with('/') && !app.input.contains(' ') {
+            if app.model_selector.is_none()
+                && app.input.starts_with('/')
+                && !app.input.contains(' ')
+            {
                 let prefix = app.input.to_ascii_lowercase();
                 let matching: Vec<(&str, &str)> = SLASH_COMMANDS
                     .iter()
@@ -1818,9 +1832,10 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             }
                         }
                         KeyCode::Enter => {
-                            let selection = app.model_selector.as_ref().and_then(|s| {
-                                s.selected_entry().map(|e| e.config_key.clone())
-                            });
+                            let selection = app
+                                .model_selector
+                                .as_ref()
+                                .and_then(|s| s.selected_entry().map(|e| e.config_key.clone()));
                             app.model_selector = None;
                             if let Some(config_key) = selection {
                                 if let Some(cfg) = providers.get(&config_key) {
@@ -1854,9 +1869,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                                 Set the env var or add api_key = \"...\" under [providers.{}] in config.toml.",
                                                 config_key, e, config_key
                                             );
-                                            app.cells.push(Cell::Error {
-                                                message: err_msg,
-                                            });
+                                            app.cells.push(Cell::Error { message: err_msg });
                                             app.set_toast(
                                                 ToastKind::Err,
                                                 format!("No API key for {}", config_key),
@@ -1875,80 +1888,82 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     continue;
                 }
                 match key.code {
-                KeyCode::Char('c')
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && !key.modifiers.contains(KeyModifiers::SHIFT) =>
-                {
-                    try_cancel_inflight(&mut app, &bus_tx, &chat_id);
-                }
-                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if app.input.is_empty() {
-                        app.request_quit();
-                        let _ = shutdown_tx.send(());
-                    } else {
-                        app.delete_forward();
+                    KeyCode::Char('c')
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::SHIFT) =>
+                    {
+                        try_cancel_inflight(&mut app, &bus_tx, &chat_id);
                     }
-                }
-                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.delete_word();
-                }
-                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.clear_line();
-                }
-                KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => app.move_left_word(),
-                KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
-                    app.move_right_word()
-                }
-                KeyCode::Char('b') | KeyCode::Char('B')
-                    if key.modifiers.contains(KeyModifiers::ALT) =>
-                {
-                    app.move_left_word()
-                }
-                KeyCode::Char('f') | KeyCode::Char('F')
-                    if key.modifiers.contains(KeyModifiers::ALT) =>
-                {
-                    app.move_right_word()
-                }
-                KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    app.insert_char('\n');
-                }
-                KeyCode::Enter => {
-                    // Windows Terminal / Conhost simulated paste detection.
-                    // If another event is queued immediately within 2ms, it is mathematically impossible
-                    // to be a human typing. It must be a simulated paste chunk, so we insert a newline
-                    // instead of submitting the prompt.
-                    if let Ok(true) = event::poll(Duration::from_millis(2)) {
+                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if app.input.is_empty() {
+                            app.request_quit();
+                            let _ = shutdown_tx.send(());
+                        } else {
+                            app.delete_forward();
+                        }
+                    }
+                    KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.delete_word();
+                    }
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.clear_line();
+                    }
+                    KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
+                        app.move_left_word()
+                    }
+                    KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
+                        app.move_right_word()
+                    }
+                    KeyCode::Char('b') | KeyCode::Char('B')
+                        if key.modifiers.contains(KeyModifiers::ALT) =>
+                    {
+                        app.move_left_word()
+                    }
+                    KeyCode::Char('f') | KeyCode::Char('F')
+                        if key.modifiers.contains(KeyModifiers::ALT) =>
+                    {
+                        app.move_right_word()
+                    }
+                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                         app.insert_char('\n');
-                        continue;
                     }
+                    KeyCode::Enter => {
+                        // Windows Terminal / Conhost simulated paste detection.
+                        // If another event is queued immediately within 2ms, it is mathematically impossible
+                        // to be a human typing. It must be a simulated paste chunk, so we insert a newline
+                        // instead of submitting the prompt.
+                        if let Ok(true) = event::poll(Duration::from_millis(2)) {
+                            app.insert_char('\n');
+                            continue;
+                        }
 
-                    if app.ui_focus == TerminalUiFocus::Conversations {
-                        if let Some(idx) = app.conversations_selected_idx {
-                            if idx >= app.conversations_items.len() {
-                                continue;
-                            }
-                            let thread_id = app.conversations_items[idx].thread_id.clone();
-                            let new_cid = match chat_id_from_root_thread_id(
-                                channel_name.as_str(),
-                                &thread_id,
-                            ) {
-                                Some(c) => c,
-                                None => {
-                                    app.set_toast(
-                                        ToastKind::Err,
-                                        "Invalid session row.".into(),
-                                        Duration::from_secs(4),
-                                    );
+                        if app.ui_focus == TerminalUiFocus::Conversations {
+                            if let Some(idx) = app.conversations_selected_idx {
+                                if idx >= app.conversations_items.len() {
                                     continue;
                                 }
-                            };
-                            try_cancel_inflight(&mut app, &bus_tx, &chat_id);
-                            match load_thread_transcript_cells(&rt, &memory_node, &thread_id) {
-                                Ok(mut cells) => {
-                                    chat_id = new_cid;
-                                    sync_terminal_session_chat(&bus_tx, &chat_id);
-                                    let sid = &chat_id[..8.min(chat_id.len())];
-                                    cells.insert(
+                                let thread_id = app.conversations_items[idx].thread_id.clone();
+                                let new_cid = match chat_id_from_root_thread_id(
+                                    channel_name.as_str(),
+                                    &thread_id,
+                                ) {
+                                    Some(c) => c,
+                                    None => {
+                                        app.set_toast(
+                                            ToastKind::Err,
+                                            "Invalid session row.".into(),
+                                            Duration::from_secs(4),
+                                        );
+                                        continue;
+                                    }
+                                };
+                                try_cancel_inflight(&mut app, &bus_tx, &chat_id);
+                                match load_thread_transcript_cells(&rt, &memory_node, &thread_id) {
+                                    Ok(mut cells) => {
+                                        chat_id = new_cid;
+                                        sync_terminal_session_chat(&bus_tx, &chat_id);
+                                        let sid = &chat_id[..8.min(chat_id.len())];
+                                        cells.insert(
                                         0,
                                         Cell::System {
                                             message: format!(
@@ -1956,499 +1971,515 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                             ),
                                         },
                                     );
-                                    app.cells = cells;
-                                    app.thinking = false;
-                                    app.llm_retry_available = false;
-                                    app.last_inbound_text = None;
-                                    app.tool_rail.clear();
-                                    app.scroll_offset = 0;
-                                    rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
-                                    last_exec_poll = Instant::now();
-                                    app.focus_transcript();
-                                    app.set_toast(
-                                        ToastKind::Ok,
-                                        format!("Continuing session {sid}…"),
-                                        Duration::from_secs(2),
-                                    );
-                                }
-                                Err(e) => {
-                                    app.set_toast(
-                                        ToastKind::Err,
-                                        format!("Could not load history: {e}"),
-                                        Duration::from_secs(5),
-                                    );
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    let raw = app.take_input();
-                    let text = raw.trim();
-                    if text.is_empty() {
-                        continue;
-                    }
-                    if text.starts_with('/') {
-                        if text.eq_ignore_ascii_case("/exit") || text.eq_ignore_ascii_case("/quit")
-                        {
-                            app.request_quit();
-                            let _ = shutdown_tx.send(());
-                            continue;
-                        }
-                        if text.eq_ignore_ascii_case("/new") {
-                            chat_id = uuid::Uuid::new_v4().to_string();
-                            sync_terminal_session_chat(&bus_tx, &chat_id);
-                            app.thinking = false;
-                            app.cells.push(Cell::System {
-                                message: format!("New thread: {}", chat_id),
-                            });
-                            rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
-                            last_exec_poll = Instant::now();
-                            continue;
-                        }
-                        if text.eq_ignore_ascii_case("/copy") {
-                            match copy_last_assistant_to_clipboard(&app.cells, &app.streaming_assistant) {
-                                Ok(n) => {
-                                    app.set_toast(
-                                        ToastKind::Ok,
-                                        format!("Copied last reply ({n} chars)"),
-                                        Duration::from_secs(TOAST_COPY_OK_SECS),
-                                    );
-                                }
-                                Err(e) => {
-                                    app.set_toast(
-                                        ToastKind::Err,
-                                        format!("Copy failed: {e}"),
-                                        Duration::from_secs(TOAST_COPY_ERR_SECS),
-                                    );
+                                        app.cells = cells;
+                                        app.thinking = false;
+                                        app.llm_retry_available = false;
+                                        app.last_inbound_text = None;
+                                        app.tool_rail.clear();
+                                        app.scroll_offset = 0;
+                                        rescan_executions_manifest(
+                                            &workspace_dir,
+                                            &chat_id,
+                                            &mut app,
+                                        );
+                                        last_exec_poll = Instant::now();
+                                        app.focus_transcript();
+                                        app.set_toast(
+                                            ToastKind::Ok,
+                                            format!("Continuing session {sid}…"),
+                                            Duration::from_secs(2),
+                                        );
+                                    }
+                                    Err(e) => {
+                                        app.set_toast(
+                                            ToastKind::Err,
+                                            format!("Could not load history: {e}"),
+                                            Duration::from_secs(5),
+                                        );
+                                    }
                                 }
                             }
                             continue;
                         }
-                        if text.eq_ignore_ascii_case("/install-python") {
-                            if uv_install_rx.is_some() {
+                        let raw = app.take_input();
+                        let text = raw.trim();
+                        if text.is_empty() {
+                            continue;
+                        }
+                        if text.starts_with('/') {
+                            if text.eq_ignore_ascii_case("/exit")
+                                || text.eq_ignore_ascii_case("/quit")
+                            {
+                                app.request_quit();
+                                let _ = shutdown_tx.send(());
+                                continue;
+                            }
+                            if text.eq_ignore_ascii_case("/new") {
+                                chat_id = uuid::Uuid::new_v4().to_string();
+                                sync_terminal_session_chat(&bus_tx, &chat_id);
+                                app.thinking = false;
+                                app.cells.push(Cell::System {
+                                    message: format!("New thread: {}", chat_id),
+                                });
+                                rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
+                                last_exec_poll = Instant::now();
+                                continue;
+                            }
+                            if text.eq_ignore_ascii_case("/copy") {
+                                match copy_last_assistant_to_clipboard(
+                                    &app.cells,
+                                    &app.streaming_assistant,
+                                ) {
+                                    Ok(n) => {
+                                        app.set_toast(
+                                            ToastKind::Ok,
+                                            format!("Copied last reply ({n} chars)"),
+                                            Duration::from_secs(TOAST_COPY_OK_SECS),
+                                        );
+                                    }
+                                    Err(e) => {
+                                        app.set_toast(
+                                            ToastKind::Err,
+                                            format!("Copy failed: {e}"),
+                                            Duration::from_secs(TOAST_COPY_ERR_SECS),
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
+                            if text.eq_ignore_ascii_case("/install-python") {
+                                if uv_install_rx.is_some() {
+                                    app.set_toast(
+                                        ToastKind::Err,
+                                        "uv install already running".into(),
+                                        Duration::from_secs(4),
+                                    );
+                                    continue;
+                                }
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                uv_install_rx = Some(rx);
+                                std::thread::spawn(move || {
+                                    let out = crate::execution::install_uv_best_effort();
+                                    let _ = tx.send(out);
+                                });
                                 app.set_toast(
-                                    ToastKind::Err,
-                                    "uv install already running".into(),
-                                    Duration::from_secs(4),
+                                    ToastKind::Ok,
+                                    "Installing uv in the background…".into(),
+                                    Duration::from_secs(5),
                                 );
                                 continue;
                             }
-                            let (tx, rx) = std::sync::mpsc::channel();
-                            uv_install_rx = Some(rx);
-                            std::thread::spawn(move || {
-                                let out = crate::execution::install_uv_best_effort();
-                                let _ = tx.send(out);
-                            });
-                            app.set_toast(
-                                ToastKind::Ok,
-                                "Installing uv in the background…".into(),
-                                Duration::from_secs(5),
-                            );
-                            continue;
-                        }
-                        if text.eq_ignore_ascii_case("/help") || text.eq_ignore_ascii_case("/?") {
-                            app.cells.push(Cell::System {
-                                message: TERMINAL_HELP.trim().to_string(),
-                            });
-                            continue;
-                        }
-                        if text.eq_ignore_ascii_case("/tools") {
-                            app.focus_tool_history();
-                            continue;
-                        }
-                        if text.eq_ignore_ascii_case("/exec") {
-                            app.focus_executions();
-                            rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
-                            last_exec_poll = Instant::now();
-                            continue;
-                        }
-                        if text.eq_ignore_ascii_case("/agents") {
-                            app.ui_focus = TerminalUiFocus::AgentTasks;
-                            continue;
-                        }
-                        if text.eq_ignore_ascii_case("/chats") {
-                            app.focus_conversations();
-                            refresh_conversations_list(&rt, &memory_node, &mut app);
-                            last_conversations_poll = Instant::now();
-                            continue;
-                        }
-                        if text.eq_ignore_ascii_case("/cancel")
-                            || text.eq_ignore_ascii_case("/stop")
-                        {
-                            try_cancel_inflight(&mut app, &bus_tx, &chat_id);
-                            continue;
-                        }
-                        if text.eq_ignore_ascii_case("/background")
-                            || text.eq_ignore_ascii_case("/bg")
-                        {
-                            if bus_tx
-                                .blocking_send(BusMessage::PromoteSyncToBackground(chat_id.clone()))
-                                .is_err()
+                            if text.eq_ignore_ascii_case("/help") || text.eq_ignore_ascii_case("/?")
                             {
                                 app.cells.push(Cell::System {
-                                    message: "Bus closed; exiting.".into(),
+                                    message: TERMINAL_HELP.trim().to_string(),
                                 });
-                                app.request_quit();
-                            } else {
-                                app.cells.push(Cell::System {
+                                continue;
+                            }
+                            if text.eq_ignore_ascii_case("/tools") {
+                                app.focus_tool_history();
+                                continue;
+                            }
+                            if text.eq_ignore_ascii_case("/exec") {
+                                app.focus_executions();
+                                rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
+                                last_exec_poll = Instant::now();
+                                continue;
+                            }
+                            if text.eq_ignore_ascii_case("/agents") {
+                                app.ui_focus = TerminalUiFocus::AgentTasks;
+                                continue;
+                            }
+                            if text.eq_ignore_ascii_case("/chats") {
+                                app.focus_conversations();
+                                refresh_conversations_list(&rt, &memory_node, &mut app);
+                                last_conversations_poll = Instant::now();
+                                continue;
+                            }
+                            if text.eq_ignore_ascii_case("/cancel")
+                                || text.eq_ignore_ascii_case("/stop")
+                            {
+                                try_cancel_inflight(&mut app, &bus_tx, &chat_id);
+                                continue;
+                            }
+                            if text.eq_ignore_ascii_case("/background")
+                                || text.eq_ignore_ascii_case("/bg")
+                            {
+                                if bus_tx
+                                    .blocking_send(BusMessage::PromoteSyncToBackground(
+                                        chat_id.clone(),
+                                    ))
+                                    .is_err()
+                                {
+                                    app.cells.push(Cell::System {
+                                        message: "Bus closed; exiting.".into(),
+                                    });
+                                    app.request_quit();
+                                } else {
+                                    app.cells.push(Cell::System {
                                     message: "Promote-to-background requested. If a sync execution_run / colab_mcp_tool_call is in flight it will return a job_id you can poll with execution_job_status.".into(),
                                 });
+                                }
+                                continue;
                             }
-                            continue;
-                        }
-                        if text.eq_ignore_ascii_case("/retry") {
-                            if !app.llm_retry_available {
-                                app.cells.push(Cell::System {
+                            if text.eq_ignore_ascii_case("/retry") {
+                                if !app.llm_retry_available {
+                                    app.cells.push(Cell::System {
                                     message: "Nothing to retry. /retry is only available right after an LLM-failed banner.".into(),
                                 });
-                                continue;
-                            }
-                            let Some(prev) = app.last_inbound_text.clone() else {
-                                app.llm_retry_available = false;
-                                app.cells.push(Cell::System {
-                                    message: "No previous user message to re-submit.".into(),
-                                });
-                                continue;
-                            };
-                            app.llm_retry_available = false;
-                            app.cells.push(Cell::User { text: prev.clone() });
-                            app.thinking = true;
-                            let (clean_text, attachments) =
-                                parse_terminal_attachments(&prev, &sandbox_dir);
-                            let msg = InboundMessage {
-                                channel: channel_name.clone(),
-                                sender_id: "local_user".to_string(),
-                                chat_id: chat_id.clone(),
-                                thread_id: None,
-                                content: clean_text,
-                                attachments,
-                                metadata: Default::default(),
-                            };
-                            if bus_tx.blocking_send(BusMessage::Inbound(msg)).is_err() {
-                                app.thinking = false;
-                                app.cells.push(Cell::System {
-                                    message: "Bus closed; exiting.".into(),
-                                });
-                                app.request_quit();
-                            }
-                            app.scroll_to_bottom();
-                            continue;
-                        }
-                        if text.eq_ignore_ascii_case("/model")
-                            || text.to_ascii_lowercase().starts_with("/model ")
-                        {
-                            let arg = text.strip_prefix("/model").unwrap_or("").trim();
-                            if arg.is_empty() {
-                                // Open interactive model selector popup
-                                if providers.is_empty() {
+                                    continue;
+                                }
+                                let Some(prev) = app.last_inbound_text.clone() else {
+                                    app.llm_retry_available = false;
                                     app.cells.push(Cell::System {
+                                        message: "No previous user message to re-submit.".into(),
+                                    });
+                                    continue;
+                                };
+                                app.llm_retry_available = false;
+                                app.cells.push(Cell::User { text: prev.clone() });
+                                app.thinking = true;
+                                let (clean_text, attachments) =
+                                    parse_terminal_attachments(&prev, &sandbox_dir);
+                                let msg = InboundMessage {
+                                    channel: channel_name.clone(),
+                                    sender_id: "local_user".to_string(),
+                                    chat_id: chat_id.clone(),
+                                    thread_id: None,
+                                    content: clean_text,
+                                    attachments,
+                                    metadata: Default::default(),
+                                };
+                                if bus_tx.blocking_send(BusMessage::Inbound(msg)).is_err() {
+                                    app.thinking = false;
+                                    app.cells.push(Cell::System {
+                                        message: "Bus closed; exiting.".into(),
+                                    });
+                                    app.request_quit();
+                                }
+                                app.scroll_to_bottom();
+                                continue;
+                            }
+                            if text.eq_ignore_ascii_case("/model")
+                                || text.to_ascii_lowercase().starts_with("/model ")
+                            {
+                                let arg = text.strip_prefix("/model").unwrap_or("").trim();
+                                if arg.is_empty() {
+                                    // Open interactive model selector popup
+                                    if providers.is_empty() {
+                                        app.cells.push(Cell::System {
                                         message: "No models configured. Add [providers.*] sections to config.toml.".into(),
                                     });
+                                    } else {
+                                        app.model_selector =
+                                            Some(ModelSelector::from_providers(&providers));
+                                    }
+                                } else if providers.contains_key(arg) {
+                                    try_switch_model(app, &bus_tx, &providers, &workspace_dir, arg);
                                 } else {
-                                    app.model_selector = Some(ModelSelector::from_providers(&providers));
+                                    let available: Vec<&str> =
+                                        providers.keys().map(|s| s.as_str()).collect();
+                                    app.cells.push(Cell::System {
+                                        message: format!(
+                                            "Unknown model '{}'. Available: {}",
+                                            arg,
+                                            available.join(", ")
+                                        ),
+                                    });
                                 }
-                            } else if providers.contains_key(arg) {
-                                try_switch_model(app, &bus_tx, &providers, &workspace_dir, arg);
-                            } else {
-                                let available: Vec<&str> =
-                                    providers.keys().map(|s| s.as_str()).collect();
-                                app.cells.push(Cell::System {
-                                    message: format!(
-                                        "Unknown model '{}'. Available: {}",
-                                        arg,
-                                        available.join(", ")
-                                    ),
-                                });
+                                continue;
                             }
-                            continue;
-                        }
-                        app.cells.push(Cell::System {
+                            app.cells.push(Cell::System {
                             message:
                                 "Unknown command. Try /help, /exit, /new, /chats, /copy, /install-python, /cancel, /background, /retry, /tools, /exec, /agents, /model."
                                     .into(),
                         });
-                        continue;
-                    }
-                    if text.eq_ignore_ascii_case("exit") || text.eq_ignore_ascii_case("quit") {
-                        app.request_quit();
-                        let _ = shutdown_tx.send(());
-                        continue;
-                    }
+                            continue;
+                        }
+                        if text.eq_ignore_ascii_case("exit") || text.eq_ignore_ascii_case("quit") {
+                            app.request_quit();
+                            let _ = shutdown_tx.send(());
+                            continue;
+                        }
 
-                    app.cells.push(Cell::User { text: raw.clone() });
-                    app.thinking = true;
-                    app.last_inbound_text = Some(text.to_string());
-                    app.llm_retry_available = false;
-                    let (clean_text, attachments) = parse_terminal_attachments(text, &sandbox_dir);
-                    let msg = InboundMessage {
-                        channel: channel_name.clone(),
-                        sender_id: "local_user".to_string(),
-                        chat_id: chat_id.clone(),
-                        thread_id: None,
-                        content: clean_text,
-                        attachments,
-                        metadata: Default::default(),
-                    };
-                    if bus_tx.blocking_send(BusMessage::Inbound(msg)).is_err() {
-                        app.thinking = false;
-                        app.cells.push(Cell::System {
-                            message: "Bus closed; exiting.".into(),
-                        });
-                        app.request_quit();
+                        app.cells.push(Cell::User { text: raw.clone() });
+                        app.thinking = true;
+                        app.last_inbound_text = Some(text.to_string());
+                        app.llm_retry_available = false;
+                        let (clean_text, attachments) =
+                            parse_terminal_attachments(text, &sandbox_dir);
+                        let msg = InboundMessage {
+                            channel: channel_name.clone(),
+                            sender_id: "local_user".to_string(),
+                            chat_id: chat_id.clone(),
+                            thread_id: None,
+                            content: clean_text,
+                            attachments,
+                            metadata: Default::default(),
+                        };
+                        if bus_tx.blocking_send(BusMessage::Inbound(msg)).is_err() {
+                            app.thinking = false;
+                            app.cells.push(Cell::System {
+                                message: "Bus closed; exiting.".into(),
+                            });
+                            app.request_quit();
+                        }
+                        app.scroll_to_bottom();
                     }
-                    app.scroll_to_bottom();
-                }
-                KeyCode::Backspace => app.backspace(),
-                KeyCode::Delete => app.delete_forward(),
-                KeyCode::Left => app.move_left(),
-                KeyCode::Right => app.move_right(),
-                KeyCode::Home => app.home(),
-                KeyCode::End => app.end(),
-                KeyCode::Up => {
-                    if app.ui_focus == TerminalUiFocus::Conversations
-                        && !app.conversations_items.is_empty()
+                    KeyCode::Backspace => app.backspace(),
+                    KeyCode::Delete => app.delete_forward(),
+                    KeyCode::Left => app.move_left(),
+                    KeyCode::Right => app.move_right(),
+                    KeyCode::Home => app.home(),
+                    KeyCode::End => app.end(),
+                    KeyCode::Up => {
+                        if app.ui_focus == TerminalUiFocus::Conversations
+                            && !app.conversations_items.is_empty()
+                        {
+                            if let Some(i) = app.conversations_selected_idx {
+                                if i > 0 {
+                                    app.conversations_selected_idx = Some(i - 1);
+                                    let list_h = app
+                                        .last_conversations_list_rect
+                                        .map(|r| r.height.saturating_sub(2) as usize)
+                                        .unwrap_or(8);
+                                    conversations_ensure_list_shows_selection(&mut app, list_h);
+                                }
+                            }
+                        } else if app.ui_focus == TerminalUiFocus::Executions
+                            && !app.executions_runs.is_empty()
+                        {
+                            if let Some(i) = app.executions_selected_idx {
+                                if i > 0 {
+                                    app.executions_selected_idx = Some(i - 1);
+                                    load_selected_execution_detail(&workspace_dir, &mut app);
+                                    let list_h = app
+                                        .last_executions_list_rect
+                                        .map(|r| r.height.saturating_sub(2) as usize)
+                                        .unwrap_or(8);
+                                    executions_ensure_list_shows_selection(&mut app, list_h);
+                                }
+                            }
+                        } else if !matches!(
+                            app.ui_focus,
+                            TerminalUiFocus::Executions | TerminalUiFocus::Conversations
+                        ) {
+                            app.history_up();
+                        }
+                    }
+                    KeyCode::Down => {
+                        if app.ui_focus == TerminalUiFocus::Conversations
+                            && !app.conversations_items.is_empty()
+                        {
+                            if let Some(i) = app.conversations_selected_idx {
+                                if i + 1 < app.conversations_items.len() {
+                                    app.conversations_selected_idx = Some(i + 1);
+                                    let list_h = app
+                                        .last_conversations_list_rect
+                                        .map(|r| r.height.saturating_sub(2) as usize)
+                                        .unwrap_or(8);
+                                    conversations_ensure_list_shows_selection(&mut app, list_h);
+                                }
+                            }
+                        } else if app.ui_focus == TerminalUiFocus::Executions
+                            && !app.executions_runs.is_empty()
+                        {
+                            if let Some(i) = app.executions_selected_idx {
+                                if i + 1 < app.executions_runs.len() {
+                                    app.executions_selected_idx = Some(i + 1);
+                                    load_selected_execution_detail(&workspace_dir, &mut app);
+                                    let list_h = app
+                                        .last_executions_list_rect
+                                        .map(|r| r.height.saturating_sub(2) as usize)
+                                        .unwrap_or(8);
+                                    executions_ensure_list_shows_selection(&mut app, list_h);
+                                }
+                            }
+                        } else if !matches!(
+                            app.ui_focus,
+                            TerminalUiFocus::Executions | TerminalUiFocus::Conversations
+                        ) {
+                            app.history_down();
+                        }
+                    }
+                    KeyCode::Esc => {
+                        if matches!(
+                            app.ui_focus,
+                            TerminalUiFocus::ToolHistory
+                                | TerminalUiFocus::Executions
+                                | TerminalUiFocus::Conversations
+                                | TerminalUiFocus::AgentTasks
+                        ) {
+                            app.focus_transcript();
+                        }
+                    }
+                    KeyCode::BackTab => {
+                        let mut focus_ctx = FocusCycleContext::new(
+                            &workspace_dir,
+                            &chat_id,
+                            &rt,
+                            &memory_node,
+                            &mut last_exec_poll,
+                            &mut last_conversations_poll,
+                        );
+                        apply_ui_focus_cycle(&mut app, false, &mut focus_ctx);
+                    }
+                    KeyCode::Tab => {
+                        let forward = !key.modifiers.contains(KeyModifiers::SHIFT);
+                        let mut focus_ctx = FocusCycleContext::new(
+                            &workspace_dir,
+                            &chat_id,
+                            &rt,
+                            &memory_node,
+                            &mut last_exec_poll,
+                            &mut last_conversations_poll,
+                        );
+                        apply_ui_focus_cycle(&mut app, forward, &mut focus_ctx);
+                    }
+                    KeyCode::Char('t') | KeyCode::Char('T')
+                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
                     {
-                        if let Some(i) = app.conversations_selected_idx {
-                            if i > 0 {
-                                app.conversations_selected_idx = Some(i - 1);
-                                let list_h = app
-                                    .last_conversations_list_rect
-                                    .map(|r| r.height.saturating_sub(2) as usize)
-                                    .unwrap_or(8);
-                                conversations_ensure_list_shows_selection(&mut app, list_h);
+                        let mut focus_ctx = FocusCycleContext::new(
+                            &workspace_dir,
+                            &chat_id,
+                            &rt,
+                            &memory_node,
+                            &mut last_exec_poll,
+                            &mut last_conversations_poll,
+                        );
+                        apply_ui_focus_cycle(&mut app, true, &mut focus_ctx);
+                    }
+                    KeyCode::PageUp => match app.ui_focus {
+                        TerminalUiFocus::ToolHistory => app.tool_history_scroll_up(8),
+                        TerminalUiFocus::AgentTasks => {
+                            app.agent_tasks_scroll_top =
+                                app.agent_tasks_scroll_top.saturating_sub(1);
+                        }
+                        TerminalUiFocus::Executions => {
+                            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                app.executions_code_scroll_top =
+                                    app.executions_code_scroll_top.saturating_sub(3);
+                            } else if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                app.executions_list_scroll_top =
+                                    app.executions_list_scroll_top.saturating_sub(1);
+                            } else {
+                                app.executions_output_scroll_top =
+                                    app.executions_output_scroll_top.saturating_sub(3);
                             }
                         }
-                    } else if app.ui_focus == TerminalUiFocus::Executions
-                        && !app.executions_runs.is_empty()
+                        TerminalUiFocus::Conversations => {
+                            app.conversations_list_scroll_top =
+                                app.conversations_list_scroll_top.saturating_sub(1);
+                        }
+                        TerminalUiFocus::Transcript => app.scroll_up(8),
+                    },
+                    KeyCode::PageDown => match app.ui_focus {
+                        TerminalUiFocus::ToolHistory => app.tool_history_scroll_down(8),
+                        TerminalUiFocus::AgentTasks => {
+                            app.agent_tasks_scroll_top =
+                                app.agent_tasks_scroll_top.saturating_add(1);
+                        }
+                        TerminalUiFocus::Executions => {
+                            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                app.executions_code_scroll_top =
+                                    app.executions_code_scroll_top.saturating_add(3);
+                            } else if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                app.executions_list_scroll_top =
+                                    app.executions_list_scroll_top.saturating_add(1);
+                            } else {
+                                app.executions_output_scroll_top =
+                                    app.executions_output_scroll_top.saturating_add(3);
+                            }
+                        }
+                        TerminalUiFocus::Conversations => {
+                            app.conversations_list_scroll_top =
+                                app.conversations_list_scroll_top.saturating_add(1);
+                        }
+                        TerminalUiFocus::Transcript => app.scroll_down(8),
+                    },
+                    KeyCode::F(5) => {
+                        if app.ui_focus == TerminalUiFocus::Executions {
+                            rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
+                            last_exec_poll = Instant::now();
+                        }
+                        if app.ui_focus == TerminalUiFocus::Conversations {
+                            refresh_conversations_list(&rt, &memory_node, &mut app);
+                            last_conversations_poll = Instant::now();
+                        }
+                    }
+                    KeyCode::Char(c)
+                        if matches!(c, 'y' | 'Y')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                            && key.modifiers.contains(KeyModifiers::SHIFT) =>
                     {
-                        if let Some(i) = app.executions_selected_idx {
-                            if i > 0 {
-                                app.executions_selected_idx = Some(i - 1);
-                                load_selected_execution_detail(&workspace_dir, &mut app);
-                                let list_h = app
-                                    .last_executions_list_rect
-                                    .map(|r| r.height.saturating_sub(2) as usize)
-                                    .unwrap_or(8);
-                                executions_ensure_list_shows_selection(&mut app, list_h);
-                            }
-                        }
-                    } else if !matches!(
-                        app.ui_focus,
-                        TerminalUiFocus::Executions | TerminalUiFocus::Conversations
-                    ) {
-                        app.history_up();
-                    }
-                }
-                KeyCode::Down => {
-                    if app.ui_focus == TerminalUiFocus::Conversations
-                        && !app.conversations_items.is_empty()
-                    {
-                        if let Some(i) = app.conversations_selected_idx {
-                            if i + 1 < app.conversations_items.len() {
-                                app.conversations_selected_idx = Some(i + 1);
-                                let list_h = app
-                                    .last_conversations_list_rect
-                                    .map(|r| r.height.saturating_sub(2) as usize)
-                                    .unwrap_or(8);
-                                conversations_ensure_list_shows_selection(&mut app, list_h);
-                            }
-                        }
-                    } else if app.ui_focus == TerminalUiFocus::Executions
-                        && !app.executions_runs.is_empty()
-                    {
-                        if let Some(i) = app.executions_selected_idx {
-                            if i + 1 < app.executions_runs.len() {
-                                app.executions_selected_idx = Some(i + 1);
-                                load_selected_execution_detail(&workspace_dir, &mut app);
-                                let list_h = app
-                                    .last_executions_list_rect
-                                    .map(|r| r.height.saturating_sub(2) as usize)
-                                    .unwrap_or(8);
-                                executions_ensure_list_shows_selection(&mut app, list_h);
-                            }
-                        }
-                    } else if !matches!(
-                        app.ui_focus,
-                        TerminalUiFocus::Executions | TerminalUiFocus::Conversations
-                    ) {
-                        app.history_down();
-                    }
-                }
-                KeyCode::Esc => {
-                    if matches!(
-                        app.ui_focus,
-                        TerminalUiFocus::ToolHistory
-                            | TerminalUiFocus::Executions
-                            | TerminalUiFocus::Conversations
-                            | TerminalUiFocus::AgentTasks
-                    ) {
-                        app.focus_transcript();
-                    }
-                }
-                KeyCode::BackTab => {
-                    let mut focus_ctx = FocusCycleContext::new(
-                        &workspace_dir,
-                        &chat_id,
-                        &rt,
-                        &memory_node,
-                        &mut last_exec_poll,
-                        &mut last_conversations_poll,
-                    );
-                    apply_ui_focus_cycle(&mut app, false, &mut focus_ctx);
-                }
-                KeyCode::Tab => {
-                    let forward = !key.modifiers.contains(KeyModifiers::SHIFT);
-                    let mut focus_ctx = FocusCycleContext::new(
-                        &workspace_dir,
-                        &chat_id,
-                        &rt,
-                        &memory_node,
-                        &mut last_exec_poll,
-                        &mut last_conversations_poll,
-                    );
-                    apply_ui_focus_cycle(&mut app, forward, &mut focus_ctx);
-                }
-                KeyCode::Char('t') | KeyCode::Char('T')
-                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    let mut focus_ctx = FocusCycleContext::new(
-                        &workspace_dir,
-                        &chat_id,
-                        &rt,
-                        &memory_node,
-                        &mut last_exec_poll,
-                        &mut last_conversations_poll,
-                    );
-                    apply_ui_focus_cycle(&mut app, true, &mut focus_ctx);
-                }
-                KeyCode::PageUp => match app.ui_focus {
-                    TerminalUiFocus::ToolHistory => app.tool_history_scroll_up(8),
-                    TerminalUiFocus::AgentTasks => {
-                        app.agent_tasks_scroll_top = app.agent_tasks_scroll_top.saturating_sub(1);
-                    }
-                    TerminalUiFocus::Executions => {
-                        if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            app.executions_code_scroll_top =
-                                app.executions_code_scroll_top.saturating_sub(3);
-                        } else if key.modifiers.contains(KeyModifiers::SHIFT) {
-                            app.executions_list_scroll_top =
-                                app.executions_list_scroll_top.saturating_sub(1);
-                        } else {
-                            app.executions_output_scroll_top =
-                                app.executions_output_scroll_top.saturating_sub(3);
-                        }
-                    }
-                    TerminalUiFocus::Conversations => {
-                        app.conversations_list_scroll_top =
-                            app.conversations_list_scroll_top.saturating_sub(1);
-                    }
-                    TerminalUiFocus::Transcript => app.scroll_up(8),
-                },
-                KeyCode::PageDown => match app.ui_focus {
-                    TerminalUiFocus::ToolHistory => app.tool_history_scroll_down(8),
-                    TerminalUiFocus::AgentTasks => {
-                        app.agent_tasks_scroll_top = app.agent_tasks_scroll_top.saturating_add(1);
-                    }
-                    TerminalUiFocus::Executions => {
-                        if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            app.executions_code_scroll_top =
-                                app.executions_code_scroll_top.saturating_add(3);
-                        } else if key.modifiers.contains(KeyModifiers::SHIFT) {
-                            app.executions_list_scroll_top =
-                                app.executions_list_scroll_top.saturating_add(1);
-                        } else {
-                            app.executions_output_scroll_top =
-                                app.executions_output_scroll_top.saturating_add(3);
-                        }
-                    }
-                    TerminalUiFocus::Conversations => {
-                        app.conversations_list_scroll_top =
-                            app.conversations_list_scroll_top.saturating_add(1);
-                    }
-                    TerminalUiFocus::Transcript => app.scroll_down(8),
-                },
-                KeyCode::F(5) => {
-                    if app.ui_focus == TerminalUiFocus::Executions {
-                        rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
-                        last_exec_poll = Instant::now();
-                    }
-                    if app.ui_focus == TerminalUiFocus::Conversations {
-                        refresh_conversations_list(&rt, &memory_node, &mut app);
-                        last_conversations_poll = Instant::now();
-                    }
-                }
-                KeyCode::Char(c)
-                    if matches!(c, 'y' | 'Y')
-                        && key.modifiers.contains(KeyModifiers::CONTROL)
-                        && key.modifiers.contains(KeyModifiers::SHIFT) =>
-                {
-                    match copy_last_assistant_to_clipboard(&app.cells, &app.streaming_assistant) {
-                        Ok(n) => {
-                            app.set_toast(
-                                ToastKind::Ok,
-                                format!("Copied last reply ({n} chars)"),
-                                Duration::from_secs(TOAST_COPY_OK_SECS),
-                            );
-                            if app.following_tail() {
-                                app.scroll_offset = 0;
-                            }
-                        }
-                        Err(e) => {
-                            app.set_toast(
-                                ToastKind::Err,
-                                format!("Copy failed: {e}"),
-                                Duration::from_secs(TOAST_COPY_ERR_SECS),
-                            );
-                        }
-                    }
-                }
-                KeyCode::Char(mch)
-                    if matches!(mch, 'm' | 'M')
-                        && key.modifiers.contains(KeyModifiers::CONTROL)
-                        && key.modifiers.contains(KeyModifiers::SHIFT) =>
-                {
-                    if application_mouse_enabled {
-                        match execute!(terminal.backend_mut(), DisableMouseCapture) {
-                            Ok(()) => {
-                                application_mouse_enabled = false;
+                        match copy_last_assistant_to_clipboard(&app.cells, &app.streaming_assistant)
+                        {
+                            Ok(n) => {
                                 app.set_toast(
                                     ToastKind::Ok,
-                                    "Mouse wheel off — native selection works.".into(),
-                                    Duration::from_secs(TOAST_MOUSE_TOGGLE_OK_SECS),
+                                    format!("Copied last reply ({n} chars)"),
+                                    Duration::from_secs(TOAST_COPY_OK_SECS),
                                 );
+                                if app.following_tail() {
+                                    app.scroll_offset = 0;
+                                }
                             }
                             Err(e) => {
                                 app.set_toast(
                                     ToastKind::Err,
-                                    format!("Could not release mouse: {e}"),
-                                    Duration::from_secs(TOAST_MOUSE_TOGGLE_ERR_SECS),
-                                );
-                            }
-                        }
-                    } else {
-                        match execute!(terminal.backend_mut(), EnableMouseCapture) {
-                            Ok(()) => {
-                                application_mouse_enabled = true;
-                                app.set_toast(
-                                    ToastKind::Ok,
-                                    "Mouse wheel on — Ctrl+Shift+M again for native selection."
-                                        .into(),
-                                    Duration::from_secs(TOAST_MOUSE_TOGGLE_OK_SECS),
-                                );
-                            }
-                            Err(e) => {
-                                app.set_toast(
-                                    ToastKind::Err,
-                                    format!("Mouse capture failed: {e}"),
-                                    Duration::from_secs(TOAST_MOUSE_TOGGLE_ERR_SECS),
+                                    format!("Copy failed: {e}"),
+                                    Duration::from_secs(TOAST_COPY_ERR_SECS),
                                 );
                             }
                         }
                     }
+                    KeyCode::Char(mch)
+                        if matches!(mch, 'm' | 'M')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                            && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                    {
+                        if application_mouse_enabled {
+                            match execute!(terminal.backend_mut(), DisableMouseCapture) {
+                                Ok(()) => {
+                                    application_mouse_enabled = false;
+                                    app.set_toast(
+                                        ToastKind::Ok,
+                                        "Mouse wheel off — native selection works.".into(),
+                                        Duration::from_secs(TOAST_MOUSE_TOGGLE_OK_SECS),
+                                    );
+                                }
+                                Err(e) => {
+                                    app.set_toast(
+                                        ToastKind::Err,
+                                        format!("Could not release mouse: {e}"),
+                                        Duration::from_secs(TOAST_MOUSE_TOGGLE_ERR_SECS),
+                                    );
+                                }
+                            }
+                        } else {
+                            match execute!(terminal.backend_mut(), EnableMouseCapture) {
+                                Ok(()) => {
+                                    application_mouse_enabled = true;
+                                    app.set_toast(
+                                        ToastKind::Ok,
+                                        "Mouse wheel on — Ctrl+Shift+M again for native selection."
+                                            .into(),
+                                        Duration::from_secs(TOAST_MOUSE_TOGGLE_OK_SECS),
+                                    );
+                                }
+                                Err(e) => {
+                                    app.set_toast(
+                                        ToastKind::Err,
+                                        format!("Mouse capture failed: {e}"),
+                                        Duration::from_secs(TOAST_MOUSE_TOGGLE_ERR_SECS),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Char(c) => app.insert_char(c),
+                    _ => {}
                 }
-                KeyCode::Char(c) => app.insert_char(c),
-                _ => {}
-            }
             } // end Event::Key block
             Event::Mouse(me) => {
                 // ── Text selection: drag / release (fires regardless of position) ──
@@ -2487,11 +2518,8 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             if let Some(sel) = &app.transcript_selection {
                                 if !sel.is_empty() {
                                     if let Some(rect) = app.last_transcript_rect {
-                                        let inner_w =
-                                            rect.width.saturating_sub(2) as usize;
-                                        let text = extract_selection_text(
-                                            &app.cells, inner_w, sel,
-                                        );
+                                        let inner_w = rect.width.saturating_sub(2) as usize;
+                                        let text = extract_selection_text(&app.cells, inner_w, sel);
                                         let n = text.len();
                                         match arboard::Clipboard::new()
                                             .and_then(|mut c| c.set_text(&text))
@@ -2499,21 +2527,15 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                             Ok(()) => {
                                                 app.set_toast(
                                                     ToastKind::Ok,
-                                                    format!(
-                                                        "Copied selection ({n} chars)"
-                                                    ),
-                                                    Duration::from_secs(
-                                                        TOAST_COPY_OK_SECS,
-                                                    ),
+                                                    format!("Copied selection ({n} chars)"),
+                                                    Duration::from_secs(TOAST_COPY_OK_SECS),
                                                 );
                                             }
                                             Err(e) => {
                                                 app.set_toast(
                                                     ToastKind::Err,
                                                     format!("Copy failed: {e}"),
-                                                    Duration::from_secs(
-                                                        TOAST_COPY_ERR_SECS,
-                                                    ),
+                                                    Duration::from_secs(TOAST_COPY_ERR_SECS),
                                                 );
                                             }
                                         }

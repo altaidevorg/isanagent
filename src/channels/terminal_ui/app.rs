@@ -258,9 +258,19 @@ impl TranscriptSelection {
         if self.anchor_line < self.end_line
             || (self.anchor_line == self.end_line && self.anchor_col <= self.end_col)
         {
-            (self.anchor_line, self.anchor_col, self.end_line, self.end_col)
+            (
+                self.anchor_line,
+                self.anchor_col,
+                self.end_line,
+                self.end_col,
+            )
         } else {
-            (self.end_line, self.end_col, self.anchor_line, self.anchor_col)
+            (
+                self.end_line,
+                self.end_col,
+                self.anchor_line,
+                self.anchor_col,
+            )
         }
     }
 

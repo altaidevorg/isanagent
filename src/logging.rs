@@ -263,7 +263,10 @@ impl LoggingActor {
                 ..
             } => LogEvent::info(
                 "BusMessage",
-                &format!("SwitchModel provider={} model={}", provider_name, model_name),
+                &format!(
+                    "SwitchModel provider={} model={}",
+                    provider_name, model_name
+                ),
             ),
         };
 

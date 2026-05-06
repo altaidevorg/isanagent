@@ -15,9 +15,7 @@ pub fn create_provider(
     model_name: &str,
 ) -> Box<dyn Provider> {
     if provider_name == "anthropic" {
-        Box::new(
-            AnthropicProvider::new(base_url, api_key, model_name).with_temperature(0.3),
-        )
+        Box::new(AnthropicProvider::new(base_url, api_key, model_name).with_temperature(0.3))
     } else {
         let client =
             LLMClient::new_openai_compatible(base_url, api_key, model_name).with_temperature(0.3);
@@ -261,9 +259,7 @@ impl AnthropicProvider {
                     };
                     match new_content {
                         Value::Array(arr) => merged_content.extend(arr),
-                        Value::String(s) => {
-                            merged_content.push(json!({"type": "text", "text": s}))
-                        }
+                        Value::String(s) => merged_content.push(json!({"type": "text", "text": s})),
                         _ => {}
                     }
                     last["content"] = json!(merged_content);

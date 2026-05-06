@@ -221,13 +221,15 @@ impl LLMError {
 /// Produce a user-friendly error message for HTTP API errors.
 pub fn format_api_error(status: u16, body: &str, base_url: &str, model: &str) -> String {
     // Parse JSON; Gemini wraps errors in an array: [{...}] — unwrap to the first element.
-    let parsed = serde_json::from_str::<serde_json::Value>(body).ok().map(|v| {
-        if let Some(arr) = v.as_array() {
-            arr.first().cloned().unwrap_or(v)
-        } else {
-            v
-        }
-    });
+    let parsed = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .map(|v| {
+            if let Some(arr) = v.as_array() {
+                arr.first().cloned().unwrap_or(v)
+            } else {
+                v
+            }
+        });
 
     // Try to extract a message from JSON error body
     let msg = parsed.as_ref().and_then(|v| {
@@ -250,7 +252,10 @@ pub fn format_api_error(status: u16, body: &str, base_url: &str, model: &str) ->
                     None // skip numeric codes, we already have `status`
                 }
             })
-            .or_else(|| err.get("type").and_then(|t| t.as_str().map(|s| s.to_string())))
+            .or_else(|| {
+                err.get("type")
+                    .and_then(|t| t.as_str().map(|s| s.to_string()))
+            })
     });
 
     let code_tag = error_code
@@ -302,7 +307,10 @@ pub fn format_api_error(status: u16, body: &str, base_url: &str, model: &str) ->
         ),
         _ => {
             let detail = msg.unwrap_or_else(|| body.chars().take(200).collect());
-            format!("({}{}) API error for model '{}': {}", status, code_tag, model, detail)
+            format!(
+                "({}{}) API error for model '{}': {}",
+                status, code_tag, model, detail
+            )
         }
     }
 }

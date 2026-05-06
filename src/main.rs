@@ -564,8 +564,10 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         Box<dyn isanagent::traits::Provider>,
     ) = if let (Some(cfg), Some(key)) = (&provider_cfg, &api_key) {
         let base_url = cfg.resolved_base_url().map_err(std::io::Error::other)?;
-        let p1 = isanagent::provider::create_provider(&cfg.provider_name, &base_url, key, &model_name);
-        let p2 = isanagent::provider::create_provider(&cfg.provider_name, &base_url, key, &model_name);
+        let p1 =
+            isanagent::provider::create_provider(&cfg.provider_name, &base_url, key, &model_name);
+        let p2 =
+            isanagent::provider::create_provider(&cfg.provider_name, &base_url, key, &model_name);
         (p1, p2)
     } else {
         // No API key found — start with placeholder; user can switch via /model
@@ -660,7 +662,8 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             Ok(client) => Some(std::sync::Arc::new(client)),
             Err(error) => {
                 let _ = logger_bus_tx.send(BusMessage::Log(isanagent::bus::LogEvent::warn(
-                    "isanagent", &error,
+                    "isanagent",
+                    &error,
                 )));
                 None
             }
@@ -894,7 +897,10 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             }
             // Only route Inbound, Cancel, and SwitchModel messages to the agent logic.
             // This prevents the agent from being flooded with its own telemetry or other system messages.
-            if matches!(msg, BusMessage::Inbound(_) | BusMessage::Cancel(_) | BusMessage::SwitchModel { .. }) {
+            if matches!(
+                msg,
+                BusMessage::Inbound(_) | BusMessage::Cancel(_) | BusMessage::SwitchModel { .. }
+            ) {
                 let _ = agent_tx.send_packet(msg).await;
             }
         }

@@ -982,15 +982,20 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 base_url,
                 api_key,
             } => {
-                let new_provider =
-                    crate::provider::create_provider(&provider_name, &base_url, &api_key, &model_name);
+                let new_provider = crate::provider::create_provider(
+                    &provider_name,
+                    &base_url,
+                    &api_key,
+                    &model_name,
+                );
                 self.switch_provider(new_provider).await;
-                let _ = self.logger_tx.send(BusMessage::Log(
-                    LogEvent::info(
-                        &self.name,
-                        &format!("Switched to provider={} model={}", provider_name, model_name),
+                let _ = self.logger_tx.send(BusMessage::Log(LogEvent::info(
+                    &self.name,
+                    &format!(
+                        "Switched to provider={} model={}",
+                        provider_name, model_name
                     ),
-                ));
+                )));
                 return Ok(None);
             }
             BusMessage::Inbound(inbound) => {
@@ -1734,7 +1739,8 @@ impl AgentLogic {
             if !tool_invoked {
                 // If the model returned empty text after tool calls, re-prompt once so the
                 // user sees an actual response instead of an invisible empty cell.
-                if response_text.trim().is_empty() && iterations > 1 && iterations < max_iterations {
+                if response_text.trim().is_empty() && iterations > 1 && iterations < max_iterations
+                {
                     let nudge = "[SYSTEM: You used tools but did not produce a text reply for the user. Please summarize your findings or answer the user's question now.]";
                     let correction = crate::utils::ChatMessage::user(nudge);
                     mem.add_message(correction).await?;
