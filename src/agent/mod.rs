@@ -100,6 +100,58 @@ fn context_has_tool_call(context: &[crate::utils::ChatMessage], tool_name: &str)
     })
 }
 
+/// Default context token budget (conservative for most models).
+/// Uses char_count / 4 as the token estimate (same heuristic as compaction logic).
+const MAX_CONTEXT_TOKENS_DEFAULT: usize = 120_000;
+
+/// Trim context from the front (oldest messages) to stay within a token budget.
+/// Preserves the system message at index 0 and never splits tool_call/tool pairs.
+fn trim_context_to_budget(context: &mut Vec<crate::utils::ChatMessage>, max_tokens: usize) {
+    let estimate_tokens = |msgs: &[crate::utils::ChatMessage]| -> usize {
+        msgs.iter()
+            .map(|m| {
+                m.content.as_ref().map_or(0, |c| c.text_content().len()) / 4
+                    + m.tool_calls
+                        .as_ref()
+                        .map_or(0, |tcs| tcs.iter().map(|t| t.function.arguments.len() / 4).sum())
+            })
+            .sum()
+    };
+
+    if estimate_tokens(context) <= max_tokens || context.len() <= 2 {
+        return;
+    }
+
+    // Find the first safe trim point (after index 0 system message).
+    // We remove messages from the front (after system msg) until under budget,
+    // but never remove half of a tool_call/tool pair.
+    let trim_end = 1; // start after system message
+    while estimate_tokens(context) > max_tokens && trim_end < context.len().saturating_sub(2) {
+        // Skip over tool_call+tool sequences atomically
+        if context[trim_end].role == "assistant" && context[trim_end].tool_calls.is_some() {
+            // Find end of the tool response block
+            let mut block_end = trim_end + 1;
+            while block_end < context.len() && context[block_end].role == "tool" {
+                block_end += 1;
+            }
+            // Remove the entire assistant + tool block
+            context.drain(trim_end..block_end);
+        } else {
+            context.remove(trim_end);
+        }
+    }
+
+    // Insert a marker so the model knows context was trimmed
+    if trim_end > 1 || context.len() > 2 {
+        context.insert(
+            1,
+            crate::utils::ChatMessage::user(
+                "[Earlier conversation messages were trimmed to fit context window]",
+            ),
+        );
+    }
+}
+
 fn should_nudge_research_depth(
     inbound: &crate::bus::InboundMessage,
     context: &[crate::utils::ChatMessage],
@@ -1426,6 +1478,9 @@ impl AgentLogic {
                     ));
                 }
             }
+
+            // Trim context to stay within token budget before calling the provider
+            trim_context_to_budget(&mut context, MAX_CONTEXT_TOKENS_DEFAULT);
 
             let _ = logger_tx.send(BusMessage::Log(
                 LogEvent::debug(
