@@ -1,4 +1,4 @@
-use log::{debug, info};
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::{Component, Path, PathBuf};
@@ -211,7 +211,11 @@ impl LLMError {
             LLMError::RequestError(_) => true,
             LLMError::ApiError(msg) => {
                 let m = msg.to_lowercase();
-                m.contains("status 5") || m.contains("status 429") || m.contains("rate limit")
+                // format_api_error produces "(STATUS_CODE [code]) ..." so match the prefix
+                m.starts_with("(5")
+                    || m.starts_with("(429")
+                    || m.contains("rate limit")
+                    || m.contains("server error")
             }
             LLMError::ParseError(_) | LLMError::NoContent => false,
         }
@@ -385,6 +389,19 @@ impl LLMClient {
             "temperature": self.temperature
         });
 
+        // Strip `reasoning_content` from messages for providers that reject unknown fields.
+        // Only DeepSeek models use this field; others (OpenAI, Gemini, OpenRouter) return 400.
+        let model_lower = self.model.to_ascii_lowercase();
+        if !model_lower.contains("deepseek") {
+            if let Some(msgs) = body["messages"].as_array_mut() {
+                for msg in msgs.iter_mut() {
+                    if let Some(obj) = msg.as_object_mut() {
+                        obj.remove("reasoning_content");
+                    }
+                }
+            }
+        }
+
         if let Some(t) = tools {
             if let Some(obj) = body.as_object_mut() {
                 obj.insert("tools".to_string(), t);
@@ -426,16 +443,45 @@ impl LLMClient {
         let content_val = &json_resp["choices"][0]["message"]["content"];
         let content = if content_val.is_null() {
             "".to_string()
+        } else if let Some(s) = content_val.as_str() {
+            s.to_string()
+        } else if let Some(arr) = content_val.as_array() {
+            // Some providers (Gemini, OpenRouter) return content as an array of parts
+            arr.iter()
+                .filter_map(|part| part.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("")
         } else {
-            content_val.as_str().ok_or(LLMError::NoContent)?.to_string()
+            return Err(LLMError::NoContent);
         };
 
-        // Parse tool calls
+        // Parse tool calls — normalize `arguments` from object to string for providers
+        // (e.g. Gemini) that return it as a JSON object instead of a JSON-encoded string.
         let tool_calls_val = &json_resp["choices"][0]["message"]["tool_calls"];
         let tool_calls = if tool_calls_val.is_null() {
             None
         } else {
-            serde_json::from_value::<Vec<ToolCallRequest>>(tool_calls_val.clone()).ok()
+            let mut tc_json = tool_calls_val.clone();
+            if let Some(arr) = tc_json.as_array_mut() {
+                for tc in arr.iter_mut() {
+                    if let Some(args) = tc.get_mut("function").and_then(|f| f.get_mut("arguments"))
+                    {
+                        if args.is_object() || args.is_array() {
+                            *args = serde_json::Value::String(args.to_string());
+                        }
+                    }
+                }
+            }
+            match serde_json::from_value::<Vec<ToolCallRequest>>(tc_json) {
+                Ok(calls) => Some(calls),
+                Err(e) => {
+                    warn!(
+                        "Failed to parse tool_calls from provider response: {}",
+                        e
+                    );
+                    None
+                }
+            }
         };
 
         let reasoning_content = json_resp["choices"][0]["message"]["reasoning_content"]
@@ -666,12 +712,17 @@ mod tests {
 
     #[test]
     fn llm_error_transience_classification() {
-        assert!(LLMError::ApiError("Status 500: ...".into()).is_transient());
-        assert!(LLMError::ApiError("Status 503 service unavailable".into()).is_transient());
-        assert!(LLMError::ApiError("Status 429 too many requests".into()).is_transient());
+        // format_api_error produces "(STATUS [code]) ..." — test against actual format
+        assert!(LLMError::ApiError("(500 []) Server error...".into()).is_transient());
+        assert!(LLMError::ApiError("(503 []) Server error...".into()).is_transient());
+        assert!(LLMError::ApiError("(429 []) Rate limit...".into()).is_transient());
+        // Free-text fallback for non-standard error formats
         assert!(LLMError::ApiError("rate limit exceeded".into()).is_transient());
-        assert!(!LLMError::ApiError("Status 400 bad request".into()).is_transient());
-        assert!(!LLMError::ApiError("Status 401 unauthorized".into()).is_transient());
+        assert!(LLMError::ApiError("server error occurred".into()).is_transient());
+        // 4xx errors are NOT transient
+        assert!(!LLMError::ApiError("(400 []) Bad request...".into()).is_transient());
+        assert!(!LLMError::ApiError("(401 []) Unauthorized...".into()).is_transient());
+        // Parse/NoContent errors are NOT transient
         assert!(!LLMError::NoContent.is_transient());
     }
 }

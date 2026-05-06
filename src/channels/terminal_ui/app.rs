@@ -938,8 +938,28 @@ impl App {
             } = cell
             {
                 if existing_id.as_deref() == Some(id) {
+                    let merged_content =
+                        if matches!(phase, ToolNoticePhase::Result | ToolNoticePhase::Failed)
+                            && matches!(
+                                *existing_phase,
+                                ToolNoticePhase::Pending | ToolNoticePhase::Call
+                            )
+                            && !existing_content.trim().is_empty()
+                        {
+                            let result_tail = content
+                                .split_once("→")
+                                .map(|(_, tail)| tail.trim())
+                                .unwrap_or(content.trim());
+                            if result_tail.is_empty() {
+                                existing_content.clone()
+                            } else {
+                                format!("{} → {}", existing_content.trim(), result_tail)
+                            }
+                        } else {
+                            content.clone()
+                        };
                     *existing_phase = phase;
-                    *existing_content = content;
+                    *existing_content = merged_content;
                     return;
                 }
             }
@@ -1147,14 +1167,14 @@ mod tests {
         match &app.cells[1] {
             Cell::ToolNotice { phase, content, .. } => {
                 assert_eq!(*phase, ToolNoticePhase::Failed);
-                assert_eq!(content, "second failed");
+                assert_eq!(content, "second → second failed");
             }
             _ => panic!("expected ToolNotice"),
         }
         match &app.cells[0] {
             Cell::ToolNotice { phase, content, .. } => {
                 assert_eq!(*phase, ToolNoticePhase::Result);
-                assert_eq!(content, "first done");
+                assert_eq!(content, "first → first done");
             }
             _ => panic!("expected ToolNotice"),
         }

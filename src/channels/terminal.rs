@@ -23,7 +23,8 @@ use crate::channels::terminal_ui::protocol::{
     METADATA_EXECUTION_JOB_TOOL_NAME, METADATA_EXECUTION_RUN_ID, METADATA_EXECUTION_SESSION_ID,
     METADATA_SUBAGENT_AGENT_NAME, METADATA_SUBAGENT_CHILD_CHAT_ID, METADATA_SUBAGENT_DISPLAY_NAME,
     METADATA_SUBAGENT_STATUS, METADATA_SUBAGENT_TASK_ID, METADATA_TOOL_CALL_ID,
-    METADATA_TOOL_CALL_PREVIEW, METADATA_TOOL_NAME, METADATA_TOOL_RESULT_PREVIEW,
+    METADATA_TOOL_CALL_PREVIEW, METADATA_TOOL_NAME, METADATA_TOOL_RESULT_CHAR_COUNT,
+    METADATA_TOOL_RESULT_PREVIEW,
 };
 
 /// When true, `main` skips the large colored stdout banner (Ratatui alternate screen owns the TTY).
@@ -40,6 +41,18 @@ fn truncate_display(s: &str, max_chars: usize) -> String {
     }
     let shortened: String = t.chars().take(max_chars.saturating_sub(1)).collect();
     format!("{shortened}…")
+}
+
+fn truncate_leading_ellipsis(s: &str, max_chars: usize) -> String {
+    let n = s.chars().count();
+    if n <= max_chars {
+        return s.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+    let tail: String = s.chars().skip(n - (max_chars - 1)).collect();
+    format!("…{tail}")
 }
 
 fn tool_result_looks_like_failure(result: &str) -> bool {
@@ -78,10 +91,7 @@ fn summarize_tool_result_for_terminal(tool_name: &str, result: &str) -> String {
         let line = t.lines().next().unwrap_or(t);
         return truncate_display(line, 160);
     }
-    if t.chars().count() <= 120 {
-        return t.to_string();
-    }
-    format!("{} chars", t.chars().count())
+    truncate_display(t, 120)
 }
 
 fn tool_args_preview_message(args: &str) -> String {
@@ -457,6 +467,7 @@ pub fn build_tool_result_terminal_notice(
     result: &str,
     tool_call_id: Option<&str>,
 ) -> OutboundMessage {
+    let t = result.trim();
     let summary = summarize_tool_result_for_terminal(tool_name, result);
     let content = format!("{tool_name} → {summary}");
     let mut metadata = HashMap::new();
@@ -469,6 +480,12 @@ pub fn build_tool_result_terminal_notice(
     metadata.insert(ISANAGENT_TOOL_PHASE.to_string(), json!(phase));
     metadata.insert(METADATA_TOOL_NAME.to_string(), json!(tool_name));
     metadata.insert(METADATA_TOOL_RESULT_PREVIEW.to_string(), json!(summary));
+    if t.chars().count() > 120 {
+        metadata.insert(
+            METADATA_TOOL_RESULT_CHAR_COUNT.to_string(),
+            json!(t.chars().count()),
+        );
+    }
     if let Some(id) = tool_call_id.filter(|s| !s.is_empty()) {
         metadata.insert(METADATA_TOOL_CALL_ID.to_string(), json!(id));
     }
@@ -602,10 +619,10 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
         let memory_node_clone = self.memory_node.clone();
 
         let opening_banner = format!(
-            "isanagent v{} — thread {}\n\
+            "ALTAI isanagent v{} — thread {}\n\
              Commands: /exit, /new  ·  Images: @path/to/file inside the workspace.",
             env!("CARGO_PKG_VERSION"),
-            chat_id_clone
+            truncate_leading_ellipsis(&chat_id_clone, 13)
         );
 
         std::thread::Builder::new()
@@ -791,6 +808,34 @@ mod preview_tests {
                 .get(METADATA_TOOL_CALL_ID)
                 .and_then(|v| v.as_str()),
             Some("call-abc"),
+        );
+    }
+
+    #[test]
+    fn build_tool_result_terminal_notice_keeps_text_preview_for_long_outputs() {
+        let long = "x".repeat(200);
+        let notice =
+            build_tool_result_terminal_notice("chat-1", "execution_run", long.as_str(), None);
+        let preview = notice
+            .metadata
+            .get(METADATA_TOOL_RESULT_PREVIEW)
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(!preview.ends_with(" chars"), "{preview}");
+        assert!(preview.ends_with('…'), "{preview}");
+    }
+
+    #[test]
+    fn build_tool_result_terminal_notice_sets_char_count_metadata_for_long_outputs() {
+        let long = "x".repeat(200);
+        let notice =
+            build_tool_result_terminal_notice("chat-1", "execution_run", long.as_str(), None);
+        assert_eq!(
+            notice
+                .metadata
+                .get(METADATA_TOOL_RESULT_CHAR_COUNT)
+                .and_then(|v| v.as_u64()),
+            Some(200)
         );
     }
 }
