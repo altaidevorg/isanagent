@@ -475,10 +475,7 @@ impl LLMClient {
             match serde_json::from_value::<Vec<ToolCallRequest>>(tc_json) {
                 Ok(calls) => Some(calls),
                 Err(e) => {
-                    warn!(
-                        "Failed to parse tool_calls from provider response: {}",
-                        e
-                    );
+                    warn!("Failed to parse tool_calls from provider response: {}", e);
                     None
                 }
             }
