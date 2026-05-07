@@ -134,10 +134,9 @@ fn trim_context_to_budget(context: &mut Vec<crate::utils::ChatMessage>, max_toke
     // This is the same heuristic used by the existing compaction logic.
     let estimate_msg_tokens = |msg: &crate::utils::ChatMessage| -> usize {
         let text_len = msg.content.as_ref().map_or(0, |c| c.text_content().len());
-        let args_len = msg
-            .tool_calls
-            .as_ref()
-            .map_or(0, |tcs| tcs.iter().map(|t| t.function.arguments.len()).sum());
+        let args_len = msg.tool_calls.as_ref().map_or(0, |tcs| {
+            tcs.iter().map(|t| t.function.arguments.len()).sum()
+        });
         (text_len + args_len) / 4
     };
 
@@ -164,8 +163,8 @@ fn trim_context_to_budget(context: &mut Vec<crate::utils::ChatMessage>, max_toke
                 block_end += 1;
             }
             // Subtract the tokens for this entire block
-            for idx in trim_pos..block_end {
-                remaining = remaining.saturating_sub(estimate_msg_tokens(&context[idx]));
+            for msg in context[trim_pos..block_end].iter() {
+                remaining = remaining.saturating_sub(estimate_msg_tokens(msg));
             }
             context.drain(trim_pos..block_end);
             trimmed = true;
@@ -1640,7 +1639,6 @@ impl AgentLogic {
 
             // Trim context to stay within token budget before calling the provider
             trim_context_to_budget(&mut context, MAX_CONTEXT_TOKENS_DEFAULT);
-
             let _ = logger_tx.send(BusMessage::Log(
                 LogEvent::debug(
                     &name,
