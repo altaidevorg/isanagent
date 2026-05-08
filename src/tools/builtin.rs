@@ -190,7 +190,7 @@ impl Tool for ReadFileTool {
         if end < start {
             return Err("end_line must be greater than or equal to start_line".to_string());
         }
-        
+
         let lines_to_read = (end - start + 1).min(100);
 
         let lines: Vec<&str> = content.lines().collect();
@@ -404,10 +404,7 @@ impl Tool for ListDirTool {
         let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
 
         if !actual_path.is_dir() {
-            return Ok(format!(
-                "Error: Not a directory: {}",
-                actual_path.display()
-            ));
+            return Ok(format!("Error: Not a directory: {}", actual_path.display()));
         }
 
         let mut entries = match fs::read_dir(&actual_path) {
@@ -501,8 +498,13 @@ impl Tool for GlobFilesTool {
         }
 
         // Align with WalkDir output so `strip_prefix` works on all platforms (notably Windows).
-        let walk_root = fs::canonicalize(&base)
-            .map_err(|e| format!("Could not canonicalize search base {}: {}", base.display(), e))?;
+        let walk_root = fs::canonicalize(&base).map_err(|e| {
+            format!(
+                "Could not canonicalize search base {}: {}",
+                base.display(),
+                e
+            )
+        })?;
 
         let matcher = compile_glob_single(pattern)?;
         let mut matches: Vec<PathBuf> = Vec::new();
@@ -1368,15 +1370,20 @@ impl Tool for WebFetchTool {
         };
 
         let uuid = uuid::Uuid::new_v4().to_string();
-        let downloads_dir = self.workspace_dir.join(".system_generated").join("downloads");
+        let downloads_dir = self
+            .workspace_dir
+            .join(".system_generated")
+            .join("downloads");
         let _ = tokio::fs::create_dir_all(&downloads_dir).await;
         let file_path = downloads_dir.join(format!("{uuid}.txt"));
-        tokio::fs::write(&file_path, &full_content).await.map_err(|e| e.to_string())?;
+        tokio::fs::write(&file_path, &full_content)
+            .await
+            .map_err(|e| e.to_string())?;
 
         let safe_limit = self.max_output_chars.saturating_sub(1000).max(1000);
         let preview = crate::execution::truncate_utf8_str_cap(&full_content, safe_limit);
         let total_lines = full_content.lines().count();
-        
+
         Ok(format!(
             "{preview}\n\n---\nNote: The full response ({} lines, {} bytes) was saved to `{}`. \
             If this preview is truncated, use the `read_file` tool with `start_line` and `end_line` arguments \

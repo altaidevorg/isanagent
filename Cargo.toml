@@ -60,6 +60,7 @@ pulldown-cmark = "0.12"
 unicode-width = "0.2"
 arboard = { version = "3.4", default-features = false }
 russh = { version = "0.60", default-features = false, features = ["flate2", "ring", "rsa"] }
+htmd = "0.5.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -89,19 +89,37 @@ impl Tool for ArxivSearchTool {
         let entry_re = regex::Regex::new(r"(?s)<entry>.*?</entry>").map_err(|e| e.to_string())?;
         let id_re = regex::Regex::new(r"(?s)<id>(.*?)</id>").map_err(|e| e.to_string())?;
         let title_re = regex::Regex::new(r"(?s)<title>(.*?)</title>").map_err(|e| e.to_string())?;
-        let summary_re = regex::Regex::new(r"(?s)<summary>(.*?)</summary>").map_err(|e| e.to_string())?;
+        let summary_re =
+            regex::Regex::new(r"(?s)<summary>(.*?)</summary>").map_err(|e| e.to_string())?;
 
         for entry_match in entry_re.find_iter(&body) {
             let entry = entry_match.as_str();
-            let id = id_re.captures(entry).and_then(|c| c.get(1)).map_or("", |m| m.as_str()).trim();
-            let title = title_re.captures(entry).and_then(|c| c.get(1)).map_or("", |m| m.as_str()).trim().replace('\n', " ");
-            let summary = summary_re.captures(entry).and_then(|c| c.get(1)).map_or("", |m| m.as_str()).trim().replace('\n', " ");
+            let id = id_re
+                .captures(entry)
+                .and_then(|c| c.get(1))
+                .map_or("", |m| m.as_str())
+                .trim();
+            let title = title_re
+                .captures(entry)
+                .and_then(|c| c.get(1))
+                .map_or("", |m| m.as_str())
+                .trim()
+                .replace('\n', " ");
+            let summary = summary_re
+                .captures(entry)
+                .and_then(|c| c.get(1))
+                .map_or("", |m| m.as_str())
+                .trim()
+                .replace('\n', " ");
 
             let id_clean = id.split('/').next_back().unwrap_or(id);
 
-            out.push_str(&format!("ID: {}\nTitle: {}\nSummary: {}\n\n---\n", id_clean, title, summary));
+            out.push_str(&format!(
+                "ID: {}\nTitle: {}\nSummary: {}\n\n---\n",
+                id_clean, title, summary
+            ));
         }
-        
+
         if out.is_empty() {
             out = "No results found.".to_string();
         }
@@ -148,7 +166,7 @@ impl Tool for ArxivFetchTool {
             return Err("invalid arxiv_id".to_string());
         }
 
-        let url = format!("https://markxiv.org/abs/{}", id);
+        let url = format!("https://arxiv.org/html/{}", id);
 
         let client = reqwest::Client::builder()
             .user_agent(HF_USER_AGENT)
@@ -162,24 +180,36 @@ impl Tool for ArxivFetchTool {
             .map_err(|e| format!("arxiv_fetch request: {}", e))?;
 
         if !resp.status().is_success() {
-            return Err(format!("arxiv_fetch HTTP {}", resp.status()));
+            return Err(format!(
+                "arxiv_fetch HTTP {} (HTML not found for {})",
+                resp.status(),
+                id
+            ));
         }
 
-        let full_content = resp
+        let html_content = resp
             .text()
             .await
             .map_err(|e| format!("arxiv_fetch body: {}", e))?;
 
+        let full_content =
+            htmd::convert(&html_content).map_err(|e| format!("html to markdown error: {}", e))?;
+
         let uuid = uuid::Uuid::new_v4().to_string();
-        let downloads_dir = self.workspace_dir.join(".system_generated").join("downloads");
+        let downloads_dir = self
+            .workspace_dir
+            .join(".system_generated")
+            .join("downloads");
         let _ = tokio::fs::create_dir_all(&downloads_dir).await;
         let file_path = downloads_dir.join(format!("{uuid}.txt"));
-        tokio::fs::write(&file_path, &full_content).await.map_err(|e| e.to_string())?;
+        tokio::fs::write(&file_path, &full_content)
+            .await
+            .map_err(|e| e.to_string())?;
 
         let safe_limit = self.max_output_chars.saturating_sub(1000).max(1000);
         let mut body = full_content.clone();
         crate::utils::truncate_utf8_safe(&mut body, safe_limit, "\n... [TRUNCATED]");
-        
+
         let total_lines = full_content.lines().count();
 
         Ok(format!(
