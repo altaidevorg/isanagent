@@ -51,7 +51,7 @@ pub struct IsanagentWorkspace {
 
 impl IsanagentWorkspace {
     /// Initializes a new workspace at the given path.
-    /// A workspace path must be provided via `--workspace`.
+    /// A workspace path defaults to the current directory if not provided via `--workspace`.
     pub fn new(path_override: Option<&str>, config_override: Option<&str>) -> Result<Self, String> {
         let target_dir = resolve_workspace_root(path_override);
         let layout = ensure_workspace_layout(&target_dir)?;

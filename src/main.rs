@@ -79,7 +79,7 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Path to the workspace directory (required; no global default).
+    /// Path to the workspace directory (defaults to current directory; no global default).
     #[arg(short, long)]
     workspace: Option<String>,
 
@@ -96,7 +96,7 @@ enum Commands {
 
 #[derive(ClapArgs, Debug)]
 struct OnboardArgs {
-    /// Path to the workspace directory (required; no global default).
+    /// Path to the workspace directory (defaults to current directory; no global default).
     #[arg(short, long)]
     workspace: Option<String>,
     /// Textual wizard (ratatui): provider → optional base URL → API key env var name → pick model from /models

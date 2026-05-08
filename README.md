@@ -67,7 +67,7 @@ cargo run --release -- onboard --workspace my_workspace
 cargo run --release -- --workspace my_workspace
 ```
 
-The `--workspace` flag is **required** — there is no global default path. Set API credentials (for example `GEMINI_API_KEY` or the env var named in `config.toml`). Turn on **`[api] enabled = true`** and **`serve_ui = true`** in `config.toml` when you want the browser UI on `http://127.0.0.1:<port>/`. For channels, memory, harness options, and sandbox rules, see [`AGENTS.md`](./AGENTS.md).
+The `--workspace` flag defaults to the current directory (`.`) — there is no global default path like `~/.isanagent` anymore. Set API credentials (for example `GEMINI_API_KEY` or the env var named in `config.toml`). Turn on **`[api] enabled = true`** and **`serve_ui = true`** in `config.toml` when you want the browser UI on `http://127.0.0.1:<port>/`. For channels, memory, harness options, and sandbox rules, see [`AGENTS.md`](./AGENTS.md).
 
 You only need `cd ui && npm ci && npm run build` if you are changing the frontend.
 

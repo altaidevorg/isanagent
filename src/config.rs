@@ -1,3 +1,4 @@
+use log::warn;
 use serde::{Deserialize, Serialize};
 
 /// Local stdin/stdout chat. When `enabled` is omitted, defaults to `true`.
@@ -403,6 +404,15 @@ impl AppConfig {
                         api_key: cfg.api_key.clone(),
                         base_url: cfg.base_url.clone(),
                     };
+                    if result.contains_key(model) {
+                        warn!(
+                            "Duplicate model name \"{}\" in [providers.{}] -- \
+                             overwriting previous entry. Use the legacy per-model \
+                             format with unique map keys to distinguish the same \
+                             model from different providers.",
+                            model, key
+                        );
+                    }
                     result.insert(model.clone(), expanded);
                 }
             } else if !cfg.model_name.is_empty() {
@@ -411,7 +421,21 @@ impl AppConfig {
                     single.provider_name = provider_name;
                 }
                 single.models = None;
+                if result.contains_key(key) {
+                    warn!(
+                        "Duplicate provider key \"{}\" in [providers] -- \
+                         overwriting previous entry.",
+                        key
+                    );
+                }
                 result.insert(key.clone(), single);
+            } else {
+                warn!(
+                    "[providers.{}] has neither \"models\" nor \
+                     \"model_name\" -- entry is ignored. Add one to \
+                     register a provider.",
+                    key
+                );
             }
         }
         result
@@ -1963,6 +1987,83 @@ base_url = "https://proxy.example/v1/chat/completions"
     fn empty_providers_returns_empty_map() {
         let cfg = AppConfig::default();
         assert!(cfg.expanded_providers().is_empty());
+    }
+
+    #[test]
+    fn duplicate_model_name_across_families_is_detected() {
+        let toml_str = r#"
+[providers.openai]
+models = ["gpt-5.5"]
+api_key = "sk-openai"
+
+[providers.openrouter]
+models = ["gpt-5.5", "claude-opus-4-7"]
+api_key = "sk-or"
+"#;
+        let cfg: AppConfig = toml::from_str(toml_str).expect("parse");
+        let expanded = cfg.expanded_providers();
+        // Both families list "gpt-5.5"; last write wins in HashMap iteration order.
+        // Only 2 unique keys survive: the overwritten "gpt-5.5" + "claude-opus-4-7".
+        assert_eq!(expanded.len(), 2);
+        assert!(expanded.contains_key("gpt-5.5"));
+        assert!(expanded.contains_key("claude-opus-4-7"));
+        // Both values are valid API keys from one of the providers.
+        let gpt_key = expanded.get("gpt-5.5").unwrap().api_key.as_deref().unwrap();
+        assert!(gpt_key == "sk-openai" || gpt_key == "sk-or");
+    }
+
+    #[test]
+    fn family_and_legacy_with_same_model_name_is_detected() {
+        // Family and legacy entry expanding to the same model name.
+        // One overwrites the other depending on HashMap iteration order.
+        let toml_str = r#"
+[providers.openai]
+models = ["gpt-5.5"]
+api_key = "sk-family"
+
+[providers.legacy-gpt]
+provider_name = "openai"
+model_name = "gpt-5.5"
+api_key = "sk-legacy"
+"#;
+        let cfg: AppConfig = toml::from_str(toml_str).expect("parse");
+        let expanded = cfg.expanded_providers();
+        // "gpt-5.5" (overwritten) + "legacy-gpt" (pass-through)
+        assert_eq!(expanded.len(), 2);
+        assert!(expanded.contains_key("gpt-5.5"));
+        assert!(expanded.contains_key("legacy-gpt"));
+        // The "legacy-gpt" key always uses sk-legacy
+        assert_eq!(
+            expanded.get("legacy-gpt").unwrap().api_key.as_deref(),
+            Some("sk-legacy")
+        );
+        // "gpt-5.5" gets one of the two keys (non-deterministic)
+        let gpt_key = expanded.get("gpt-5.5").unwrap().api_key.as_deref().unwrap();
+        assert!(gpt_key == "sk-family" || gpt_key == "sk-legacy");
+    }
+
+    #[test]
+    fn empty_models_and_model_name_warns_and_skips() {
+        let toml_str = r#"
+[providers.broken]
+# neither models nor model_name set
+"#;
+        let cfg: AppConfig = toml::from_str(toml_str).expect("parse");
+        let expanded = cfg.expanded_providers();
+        // entry is silently skipped (no model_name and no models)
+        assert!(expanded.is_empty());
+    }
+
+    #[test]
+    fn empty_models_list_skips_entry() {
+        let toml_str = r#"
+[providers.gemini]
+models = []
+"#;
+        let cfg: AppConfig = toml::from_str(toml_str).expect("parse");
+        let expanded = cfg.expanded_providers();
+        // models is Some but empty vec: no expansions produced
+        assert!(expanded.is_empty());
     }
 }
 
