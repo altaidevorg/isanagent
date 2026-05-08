@@ -85,7 +85,27 @@ impl Tool for ArxivSearchTool {
             .await
             .map_err(|e| format!("arxiv_search body: {}", e))?;
 
-        let mut out = body;
+        let mut out = String::new();
+        let entry_re = regex::Regex::new(r"(?s)<entry>.*?</entry>").map_err(|e| e.to_string())?;
+        let id_re = regex::Regex::new(r"(?s)<id>(.*?)</id>").map_err(|e| e.to_string())?;
+        let title_re = regex::Regex::new(r"(?s)<title>(.*?)</title>").map_err(|e| e.to_string())?;
+        let summary_re = regex::Regex::new(r"(?s)<summary>(.*?)</summary>").map_err(|e| e.to_string())?;
+
+        for entry_match in entry_re.find_iter(&body) {
+            let entry = entry_match.as_str();
+            let id = id_re.captures(entry).and_then(|c| c.get(1)).map_or("", |m| m.as_str()).trim();
+            let title = title_re.captures(entry).and_then(|c| c.get(1)).map_or("", |m| m.as_str()).trim().replace('\n', " ");
+            let summary = summary_re.captures(entry).and_then(|c| c.get(1)).map_or("", |m| m.as_str()).trim().replace('\n', " ");
+
+            let id_clean = id.split('/').next_back().unwrap_or(id);
+
+            out.push_str(&format!("ID: {}\nTitle: {}\nSummary: {}\n\n---\n", id_clean, title, summary));
+        }
+        
+        if out.is_empty() {
+            out = "No results found.".to_string();
+        }
+
         crate::utils::truncate_utf8_safe(&mut out, self.max_output_chars, "\n... [TRUNCATED]");
         Ok(out)
     }
@@ -156,13 +176,17 @@ impl Tool for ArxivFetchTool {
         let file_path = downloads_dir.join(format!("{uuid}.txt"));
         tokio::fs::write(&file_path, &full_content).await.map_err(|e| e.to_string())?;
 
+        let safe_limit = self.max_output_chars.saturating_sub(1000).max(1000);
         let mut body = full_content.clone();
-        crate::utils::truncate_utf8_safe(&mut body, self.max_output_chars, "\n... [TRUNCATED]");
+        crate::utils::truncate_utf8_safe(&mut body, safe_limit, "\n... [TRUNCATED]");
         
+        let total_lines = full_content.lines().count();
+
         Ok(format!(
-            "{body}\n\n---\nNote: The full response ({} bytes) was saved to `{}`. \
-            If this preview is truncated, use the `read_file` tool with `offset` and `length` arguments \
+            "{body}\n\n---\nNote: The full response ({} lines, {} bytes) was saved to `{}`. \
+            If this preview is truncated, use the `read_file` tool with `start_line` and `end_line` arguments \
             on that path to incrementally read the rest of the content without exceeding your context limit.",
+            total_lines,
             full_content.len(),
             file_path.display()
         ))

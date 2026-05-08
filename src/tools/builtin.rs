@@ -1373,12 +1373,15 @@ impl Tool for WebFetchTool {
         let file_path = downloads_dir.join(format!("{uuid}.txt"));
         tokio::fs::write(&file_path, &full_content).await.map_err(|e| e.to_string())?;
 
-        let preview = crate::execution::truncate_utf8_str_cap(&full_content, self.max_output_chars);
+        let safe_limit = self.max_output_chars.saturating_sub(1000).max(1000);
+        let preview = crate::execution::truncate_utf8_str_cap(&full_content, safe_limit);
+        let total_lines = full_content.lines().count();
         
         Ok(format!(
-            "{preview}\n\n---\nNote: The full response ({} bytes) was saved to `{}`. \
-            If this preview is truncated, use the `read_file` tool with `offset` and `length` arguments \
+            "{preview}\n\n---\nNote: The full response ({} lines, {} bytes) was saved to `{}`. \
+            If this preview is truncated, use the `read_file` tool with `start_line` and `end_line` arguments \
             on that path to incrementally read the rest of the content without exceeding your context limit.",
+            total_lines,
             full_content.len(),
             file_path.display()
         ))
