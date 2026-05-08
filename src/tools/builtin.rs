@@ -75,8 +75,9 @@ pub fn resolve_path(path: &str, workspace_dir: &Path, restrict: bool) -> Result<
 
         if !canonical.starts_with(&canonical_workspace) {
             return Err(format!(
-                "PermissionError: Path {:?} is outside allowed workspace directory {:?}",
-                canonical, canonical_workspace
+                "PermissionError: Path {} is outside allowed workspace directory {}",
+                resolved.display(),
+                workspace_dir.display()
             ));
         }
     }
@@ -389,7 +390,7 @@ impl Tool for ListDirTool {
 
         if !actual_path.is_dir() {
             return Ok(format!(
-                "Error: Not a directory: {:?}",
+                "Error: Not a directory: {}",
                 actual_path.display()
             ));
         }
@@ -413,7 +414,7 @@ impl Tool for ListDirTool {
         items.sort();
 
         if items.is_empty() {
-            return Ok(format!("Directory {:?} is empty", actual_path.display()));
+            return Ok(format!("Directory {} is empty", actual_path.display()));
         }
 
         Ok(items.join("\n"))
@@ -475,18 +476,18 @@ impl Tool for GlobFilesTool {
 
         let base = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
         if !base.exists() {
-            return Ok(format!("Error: path not found: {:?}", base.display()));
+            return Ok(format!("Error: path not found: {}", base.display()));
         }
         if !base.is_dir() {
             return Ok(format!(
-                "Error: base path is not a directory: {:?}",
+                "Error: base path is not a directory: {}",
                 base.display()
             ));
         }
 
         // Align with WalkDir output so `strip_prefix` works on all platforms (notably Windows).
         let walk_root = fs::canonicalize(&base)
-            .map_err(|e| format!("Could not canonicalize search base {:?}: {}", base, e))?;
+            .map_err(|e| format!("Could not canonicalize search base {}: {}", base.display(), e))?;
 
         let matcher = compile_glob_single(pattern)?;
         let mut matches: Vec<PathBuf> = Vec::new();
@@ -804,7 +805,7 @@ impl Tool for SearchTextTool {
         let resolved = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
 
         if !resolved.exists() {
-            return Ok(format!("Error: path not found: {:?}", resolved.display()));
+            return Ok(format!("Error: path not found: {}", resolved.display()));
         }
 
         let search_target = fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
@@ -1956,7 +1957,7 @@ impl GitWorktreeTool {
             self.allow_path_outside_sandbox,
         )?;
         if !wt.exists() {
-            return Err(format!("worktree path does not exist: {:?}", wt.display()));
+            return Err(format!("worktree path does not exist: {}", wt.display()));
         }
         let wt_canon = fs::canonicalize(&wt).map_err(|e| e.to_string())?;
         let common = git_common_dir_abs(&wt_canon).await?;
