@@ -138,7 +138,7 @@ impl Tool for ReadFileTool {
     }
 
     fn description(&self) -> &str {
-        "Read the contents of a local file. Provide the absolute or relative path to the file."
+        "Read the contents of a local file. Provide the absolute or relative path to the file. You can optionally read specific lines by specifying start_line and end_line (1-indexed, inclusive) capped at a maximum of 100 lines per call."
     }
 
     fn parameters(&self) -> Value {
@@ -149,13 +149,13 @@ impl Tool for ReadFileTool {
                     "type": "string",
                     "description": "Path to the file to read"
                 },
-                "offset": {
+                "start_line": {
                     "type": "integer",
-                    "description": "Optional byte offset to start reading from"
+                    "description": "Optional starting line number (1-indexed, inclusive)"
                 },
-                "length": {
+                "end_line": {
                     "type": "integer",
-                    "description": "Optional maximum bytes to read"
+                    "description": "Optional ending line number (1-indexed, inclusive)"
                 }
             },
             "required": ["path"]
@@ -170,27 +170,42 @@ impl Tool for ReadFileTool {
 
         let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
 
-        let offset = args.get("offset").and_then(|v| v.as_u64());
-        let length = args.get("length").and_then(|v| v.as_u64());
+        let start_line = args.get("start_line").and_then(|v| v.as_u64());
+        let end_line = args.get("end_line").and_then(|v| v.as_u64());
 
-        if offset.is_none() && length.is_none() {
-            return fs::read_to_string(&actual_path).map_err(|e| e.to_string());
+        let content = fs::read_to_string(&actual_path).map_err(|e| e.to_string())?;
+
+        if start_line.is_none() && end_line.is_none() {
+            // No lines specified, check total lines
+            let total_lines = content.lines().count();
+            if total_lines > 100 {
+                return Err(format!("File is too large ({} lines). Please specify start_line and end_line to read a maximum of 100 lines at a time.", total_lines));
+            }
+            return Ok(content);
         }
 
-        use std::io::{Read, Seek};
-        let mut file = fs::File::open(&actual_path).map_err(|e| e.to_string())?;
+        let start = start_line.unwrap_or(1).max(1) as usize;
+        let end = end_line.unwrap_or(start as u64 + 99) as usize;
+
+        if end < start {
+            return Err("end_line must be greater than or equal to start_line".to_string());
+        }
         
-        let mut out = String::new();
-        if let Some(off) = offset {
-            file.seek(std::io::SeekFrom::Start(off)).map_err(|e| e.to_string())?;
-        }
-        if let Some(len) = length {
-            let mut handle = file.take(len);
-            handle.read_to_string(&mut out).map_err(|e| e.to_string())?;
-        } else {
-            file.read_to_string(&mut out).map_err(|e| e.to_string())?;
-        }
-        Ok(out)
+        let lines_to_read = (end - start + 1).min(100);
+
+        let lines: Vec<&str> = content.lines().collect();
+        let total_lines = lines.len();
+
+        let actual_start = start.min(total_lines.max(1));
+        let actual_end = (actual_start + lines_to_read - 1).min(total_lines);
+
+        let snippet: Vec<String> = lines[actual_start - 1..actual_end]
+            .iter()
+            .enumerate()
+            .map(|(i, l)| format!("{:4}: {}", actual_start + i, l))
+            .collect();
+
+        Ok(snippet.join("\n"))
     }
 }
 
@@ -2229,7 +2244,7 @@ impl Tool for PythonRunTool {
     }
 
     fn description(&self) -> &str {
-        "Run raw python code. The code will be piped to `python -` via stdin, bypassing shell quoting issues. Use this for quick scripts. Outputs stdout/stderr."
+        "Run raw python code. The code will be piped to `uv run python -` via stdin, bypassing shell quoting issues while running inside the uv managed environment. Use this for quick scripts. Outputs stdout/stderr."
     }
 
     fn parameters(&self) -> Value {
@@ -2251,7 +2266,9 @@ impl Tool for PythonRunTool {
             .and_then(|v| v.as_str())
             .ok_or("Missing 'code' argument")?;
 
-        let mut cmd = tokio::process::Command::new("python");
+        let mut cmd = tokio::process::Command::new("uv");
+        cmd.arg("run");
+        cmd.arg("python");
         cmd.arg("-");
         cmd.current_dir(&self.workspace_dir);
         cmd.stdin(std::process::Stdio::piped());

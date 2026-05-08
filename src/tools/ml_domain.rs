@@ -104,7 +104,7 @@ impl Tool for ArxivFetchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch an arXiv abstract page by id (e.g. `2401.0001` or `cs.CL/0001001`). Returns HTML text (truncated). Use after `arxiv_search` for detailed reading and cross-verification; do not rely on search snippets alone."
+        "Fetch an arXiv paper by id (e.g. `2401.0001` or `cs.CL/0001001`). Returns Markdown text (truncated). Use after `arxiv_search` for detailed reading and cross-verification; do not rely on search snippets alone."
     }
 
     fn parameters(&self) -> Value {
@@ -128,7 +128,7 @@ impl Tool for ArxivFetchTool {
             return Err("invalid arxiv_id".to_string());
         }
 
-        let url = format!("https://arxiv.org/abs/{}", id);
+        let url = format!("https://markxiv.org/abs/{}", id);
 
         let client = reqwest::Client::builder()
             .user_agent(HF_USER_AGENT)
