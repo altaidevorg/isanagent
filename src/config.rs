@@ -341,9 +341,9 @@ pub struct JinaWebBackend {
 }
 
 /// Heuristics to avoid sending obvious template values as `Authorization: Bearer`.
-/// Language-agnostic: rejects non-ASCII (Jina keys are ASCII), angle-bracket templates, and
-/// common README placeholder tokens (ASCII substrings only).
-fn jina_api_key_looks_like_placeholder(s: &str) -> bool {
+/// Language-agnostic: rejects non-ASCII, angle-bracket templates (e.g. `<changethis>`), and
+/// common placeholder tokens (ASCII substrings only).
+fn api_key_looks_like_placeholder(s: &str) -> bool {
     let t = s.trim();
     if t.is_empty() || t.starts_with('<') {
         return true;
@@ -464,7 +464,7 @@ impl AppConfig {
             .api_key
             .as_ref()
             .map(|s| s.trim().to_string())
-            .filter(|s| !jina_api_key_looks_like_placeholder(s));
+            .filter(|s| !api_key_looks_like_placeholder(s));
         Some(JinaWebBackend { api_key })
     }
 
@@ -1375,7 +1375,7 @@ impl ProviderConfig {
         }
         if let Some(key) = &self.api_key {
             let trimmed = key.trim();
-            if !trimmed.is_empty() {
+            if !trimmed.is_empty() && !api_key_looks_like_placeholder(trimmed) {
                 return Ok(trimmed.to_string());
             }
         }
@@ -1963,5 +1963,47 @@ base_url = "https://proxy.example/v1/chat/completions"
     fn empty_providers_returns_empty_map() {
         let cfg = AppConfig::default();
         assert!(cfg.expanded_providers().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod placeholder_key_tests {
+    use super::*;
+
+    fn provider_with_key(key: &str) -> ProviderConfig {
+        ProviderConfig {
+            provider_name: "deepseek".to_string(),
+            model_name: "deepseek-v4-pro".to_string(),
+            models: None,
+            api_key_env: "".to_string(),
+            api_key: Some(key.to_string()),
+            base_url: None,
+        }
+    }
+
+    #[test]
+    fn rejects_angle_bracket_placeholder() {
+        assert!(provider_with_key("<changethis>").resolve_api_key().is_err());
+    }
+
+    #[test]
+    fn rejects_changethis_without_brackets() {
+        assert!(provider_with_key("changethis").resolve_api_key().is_err());
+    }
+
+    #[test]
+    fn rejects_replace_me() {
+        assert!(provider_with_key("replace_me").resolve_api_key().is_err());
+    }
+
+    #[test]
+    fn rejects_placeholder_keyword() {
+        assert!(provider_with_key("my_placeholder_key").resolve_api_key().is_err());
+    }
+
+    #[test]
+    fn accepts_real_api_key() {
+        let result = provider_with_key("sk-abc123def456").resolve_api_key();
+        assert_eq!(result.unwrap(), "sk-abc123def456");
     }
 }

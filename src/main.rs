@@ -519,8 +519,20 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             isanagent::provider::create_provider(&cfg.provider_name, &base_url, key, &model_name);
         (p1, p2)
     } else {
-        // No API key found — start with placeholder; user can switch via /model
-        eprintln!("No API key found. Starting without a model. Use /model to configure one.");
+        // No API key found — list the env vars the user could set.
+        let env_vars: Vec<String> = expanded_providers
+            .values()
+            .map(|c| c.resolved_api_key_env())
+            .filter(|e| !e.is_empty())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        eprintln!("No API key configured for any provider.");
+        if !env_vars.is_empty() {
+            eprintln!("Set one of: {}", env_vars.join(", "));
+        }
+        eprintln!("Or replace \"<changethis>\" with your key in config.toml.");
+        eprintln!("Use /model at runtime to configure one.");
         (
             Box::new(isanagent::provider::NoKeyProvider),
             Box::new(isanagent::provider::NoKeyProvider),
