@@ -34,8 +34,9 @@ use isanagent::scheduler::{
 use isanagent::session::SessionManager;
 use isanagent::skills::SkillRegistry;
 use isanagent::tools::builtin::{
-    CronTool, EditFileTool, GitWorktreeTool, GlobFilesTool, ListDirTool, MessageTool, ReadFileTool,
-    SearchTextTool, ShellExecTool, WebFetchTool, WebSearchTool, WriteFileTool,
+    CronTool, EditFileTool, GetEnvTool, GitWorktreeTool, GlobFilesTool, ListDirTool, MessageTool,
+    PythonRunTool, ReadFileTool, SearchTextTool, ShellExecTool, WebFetchTool, WebSearchTool,
+    WriteFileTool,
 };
 use isanagent::tools::execution::{
     compile_colab_mcp_tool_allowlist, ColabMcpToolCallTool, ExecutionArtifactListTool,
@@ -347,6 +348,10 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     tools.register(Box::new(ShellExecTool {
         workspace_dir: workspace.sandbox_dir.clone(),
         restrict_to_workspace: restrict,
+    }));
+    tools.register(Box::new(GetEnvTool));
+    tools.register(Box::new(PythonRunTool {
+        workspace_dir: workspace.sandbox_dir.clone(),
     }));
     if workspace.config.git_worktree_tool_enabled() {
         tools.register(Box::new(GitWorktreeTool {

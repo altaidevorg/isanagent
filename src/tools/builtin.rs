@@ -881,6 +881,14 @@ impl Tool for ShellExecTool {
                 "working_dir": {
                     "type": "string",
                     "description": "Optional relative working directory for the command"
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "description": "Optional timeout in seconds (defaults to 60, max 3600)"
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Short description of what this command is trying to achieve (used for UI and audits)"
                 }
             },
             "required": ["command"]
@@ -905,6 +913,17 @@ impl Tool for ShellExecTool {
             .and_then(|v| v.as_str())
             .unwrap_or(".");
 
+        let timeout_secs = args
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(60)
+            .clamp(1, 3600);
+
+        let _desc_str = args
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Shell execution");
+
         let actual_dir = resolve_path(cwd_str, &self.workspace_dir, self.restrict_to_workspace)?;
 
         let mut cmd = if cfg!(target_os = "windows") {
@@ -921,7 +940,7 @@ impl Tool for ShellExecTool {
 
         let child = cmd.output();
 
-        match tokio::time::timeout(std::time::Duration::from_secs(60), child).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), child).await {
             Ok(Ok(output)) => {
                 let mut result = String::new();
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -963,7 +982,7 @@ impl Tool for ShellExecTool {
                 }
             }
             Ok(Err(e)) => Err(format!("Failed to execute command: {}", e)),
-            Err(_) => Err("Command timed out after 60 seconds".to_string()),
+            Err(_) => Err(format!("Command timed out after {} seconds", timeout_secs)),
         }
     }
 }
@@ -2111,6 +2130,135 @@ impl Tool for FetchMemoryByDateTool {
     }
 }
 
+pub struct GetEnvTool;
+
+#[async_trait]
+impl Tool for GetEnvTool {
+    fn name(&self) -> &str {
+        "get_env"
+    }
+
+    fn description(&self) -> &str {
+        "Get all environment variables currently exposed to the agent. Sensitive values (tokens, secrets) are masked automatically."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {}
+        })
+    }
+
+    async fn execute(&self, _args: Value) -> Result<String, String> {
+        let mut env_vars: Vec<(String, String)> = std::env::vars().collect();
+        env_vars.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut result = String::from("Environment Variables:\n\n");
+        for (k, v) in env_vars {
+            let k_lower = k.to_lowercase();
+            let masked = if k_lower.contains("token")
+                || k_lower.contains("secret")
+                || k_lower.contains("key")
+                || k_lower.contains("password")
+                || k_lower.contains("auth")
+            {
+                "********".to_string()
+            } else {
+                v
+            };
+            result.push_str(&format!("{}={}\n", k, masked));
+        }
+        Ok(result)
+    }
+}
+
+pub struct PythonRunTool {
+    pub workspace_dir: PathBuf,
+}
+
+#[async_trait]
+impl Tool for PythonRunTool {
+    fn name(&self) -> &str {
+        "python_run"
+    }
+
+    fn description(&self) -> &str {
+        "Run raw python code. The code will be piped to `python -` via stdin, bypassing shell quoting issues. Use this for quick scripts. Outputs stdout/stderr."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "Python code to execute"
+                }
+            },
+            "required": ["code"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, String> {
+        let code = args
+            .get("code")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'code' argument")?;
+
+        let mut cmd = tokio::process::Command::new("python");
+        cmd.arg("-");
+        cmd.current_dir(&self.workspace_dir);
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to spawn python: {}", e))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin
+                .write_all(code.as_bytes())
+                .await
+                .map_err(|e| format!("Failed to write to python stdin: {}", e))?;
+        }
+
+        let output =
+            tokio::time::timeout(std::time::Duration::from_secs(60), child.wait_with_output())
+                .await
+                .map_err(|_| "Python execution timed out after 60 seconds")?
+                .map_err(|e| format!("Failed to wait for python: {}", e))?;
+
+        let mut result = String::new();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !stdout.trim().is_empty() {
+            result.push_str(&stdout);
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.trim().is_empty() {
+            if !result.is_empty() {
+                result.push_str("\nSTDERR:\n");
+            }
+            result.push_str(&stderr);
+        }
+
+        if !output.status.success() {
+            result.push_str(&format!(
+                "\nExit code: {}",
+                output.status.code().unwrap_or(-1)
+            ));
+        }
+
+        if result.is_empty() {
+            Ok("(no output)".to_string())
+        } else {
+            Ok(result)
+        }
+    }
+}
+
 #[cfg(test)]
 mod resolve_path_tests {
     use super::resolve_path;
@@ -2293,5 +2441,56 @@ mod git_worktree_path_tests {
             .await
             .expect("remove");
         let _ = fs::remove_dir_all(&sandbox);
+    }
+}
+
+#[cfg(test)]
+mod get_env_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn test_get_env_masks_secrets() {
+        std::env::set_var("TEST_SAFE_VAR", "hello");
+        std::env::set_var("TEST_SECRET_TOKEN", "super_secret");
+
+        let tool = GetEnvTool;
+        let out = tool.execute(json!({})).await.unwrap();
+
+        assert!(out.contains("TEST_SAFE_VAR=hello"));
+        assert!(out.contains("TEST_SECRET_TOKEN=********"));
+        assert!(!out.contains("super_secret"));
+    }
+}
+
+#[cfg(test)]
+mod python_run_tests {
+    use super::*;
+    use serde_json::json;
+    use std::fs;
+
+    #[tokio::test]
+    async fn test_python_run_basic() {
+        if which::which("python").is_err() && which::which("python3").is_err() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("isanagent_py_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+
+        let tool = PythonRunTool {
+            workspace_dir: root.clone(),
+        };
+        let out = tool
+            .execute(json!({ "code": "print('hello from python')" }))
+            .await
+            .unwrap();
+
+        println!("PYTHON RUN OUTPUT: {}", out);
+        if out.contains("Microsoft Store") && out.contains("9009") {
+            println!("Skipping test due to Windows python app execution alias.");
+            return;
+        }
+        assert!(out.contains("hello from python"));
+        let _ = fs::remove_dir_all(&root);
     }
 }
