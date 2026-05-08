@@ -24,6 +24,7 @@ use super::ids::SessionId;
 use super::provider::ExecutionProvider;
 use super::repl_framing::{self, string_from_utf8_lossy_trim_cap, PYTHON_REPL_BOOTSTRAP};
 use super::run::{CwdPolicy, RunResult, RunSpec, SessionCreateRequest, SessionHandle};
+use super::run_history_dir;
 use crate::tool_runtime::emit_tool_progress_message;
 use crate::tools::builtin::resolve_path;
 
@@ -66,10 +67,12 @@ pub struct LocalExecutionConfig {
     pub uv_requirements: Vec<String>,
     /// Root for UV-managed runtime cache (e.g. workspace `.system_generated/uv/envs`).
     pub uv_env_root: PathBuf,
+    /// Workspace root for log files.
+    pub workspace_dir: PathBuf,
 }
 
 impl LocalExecutionConfig {
-    pub fn new(sandbox_dir: PathBuf, restrict_to_workspace: bool) -> Self {
+    pub fn new(sandbox_dir: PathBuf, workspace_dir: PathBuf, restrict_to_workspace: bool) -> Self {
         let uv_env_root = sandbox_dir
             .join(".system_generated")
             .join("uv")
@@ -87,6 +90,7 @@ impl LocalExecutionConfig {
             uv_python: "3.11".to_string(),
             uv_requirements: Vec::new(),
             uv_env_root,
+            workspace_dir,
         }
     }
 }
@@ -691,10 +695,21 @@ impl ExecutionProvider for LocalExecutionProvider {
                     let repl = g
                         .as_mut()
                         .ok_or_else(|| ExecutionError::Provider("local repl unavailable".into()))?;
+                    let mut stdout_path = None;
+                    let mut stderr_path = None;
+                    let hd;
+                    if let Some(rid) = &spec.run_id {
+                        hd = run_history_dir(&self.config.workspace_dir, "local", session_id, rid);
+                        let _ = tokio::fs::create_dir_all(&hd).await;
+                        stdout_path = Some(hd.join("stdout.txt"));
+                        stderr_path = Some(hd.join("stderr.txt"));
+                    }
                     let (stdout, stderr, st) = repl_framing::repl_round_trip(
                         &mut repl.stdin,
                         &mut repl.stdout,
                         &code,
+                        stdout_path.as_deref(),
+                        stderr_path.as_deref(),
                         max_each,
                     )
                     .await?;
@@ -1028,6 +1043,7 @@ mod tests {
     async fn rejects_non_dir_sandbox() {
         let cfg = LocalExecutionConfig::new(
             PathBuf::from("/nonexistent/path/that/should/not/exist"),
+            PathBuf::from("/nonexistent/path/that/should/not/exist"),
             true,
         );
         assert!(LocalExecutionProvider::new(cfg).is_err());
@@ -1062,7 +1078,7 @@ mod tests {
     async fn local_echo_stdout() {
         let (lang, code) = echo_hello_case();
         let dir = temp_sandbox();
-        let cfg = LocalExecutionConfig::new(dir.clone(), true);
+        let cfg = LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
         let prov = LocalExecutionProvider::new(cfg).unwrap();
         let h = prov
             .create_session(SessionCreateRequest {
@@ -1093,7 +1109,7 @@ mod tests {
         let sub = dir.join("pkg");
         fs::create_dir_all(&sub).unwrap();
         fs::write(sub.join("marker.txt"), "x").unwrap();
-        let cfg = LocalExecutionConfig::new(dir.clone(), true);
+        let cfg = LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
         let prov = LocalExecutionProvider::new(cfg).unwrap();
         let h = prov
             .create_session(SessionCreateRequest {
@@ -1119,7 +1135,7 @@ mod tests {
     async fn timeout_returns_timeout_error() {
         let (lang, code) = timeout_probe_case();
         let dir = temp_sandbox();
-        let cfg = LocalExecutionConfig::new(dir.clone(), true);
+        let cfg = LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
         let prov = LocalExecutionProvider::new(cfg).unwrap();
         let h = prov
             .create_session(SessionCreateRequest {
@@ -1141,7 +1157,7 @@ mod tests {
     async fn cancel_mid_run() {
         let (lang, code) = long_running_case();
         let dir = temp_sandbox();
-        let cfg = LocalExecutionConfig::new(dir.clone(), true);
+        let cfg = LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
         let prov = Arc::new(LocalExecutionProvider::new(cfg).unwrap());
         let h = prov
             .create_session(SessionCreateRequest {
@@ -1228,7 +1244,7 @@ mod tests {
     #[test]
     fn uv_env_key_changes_with_python_or_requirements() {
         let dir = temp_sandbox();
-        let mut cfg1 = LocalExecutionConfig::new(dir.clone(), true);
+        let mut cfg1 = LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
         cfg1.python_runtime = LocalPythonRuntime::UvManaged;
         cfg1.uv_python = "3.11".into();
         cfg1.uv_requirements = vec!["numpy".into()];

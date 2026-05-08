@@ -1386,7 +1386,7 @@ mod tests {
         std::path::PathBuf,
     ) {
         let (ws, dir) = temp_workspace();
-        let cfg = LocalExecutionConfig::new(dir.clone(), true);
+        let cfg = LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
         let prov: Arc<dyn crate::execution::ExecutionProvider> =
             Arc::new(LocalExecutionProvider::new(cfg).expect("local provider"));
         let harness = Arc::new(ExecutionHarness::new(
@@ -1415,7 +1415,7 @@ mod tests {
         mpsc::Receiver<BusMessage>,
     ) {
         let (ws, dir) = temp_workspace();
-        let cfg = LocalExecutionConfig::new(dir.clone(), true);
+        let cfg = LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
         let prov: Arc<dyn crate::execution::ExecutionProvider> =
             Arc::new(LocalExecutionProvider::new(cfg).expect("local provider"));
         let harness = Arc::new(ExecutionHarness::new(

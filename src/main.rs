@@ -400,6 +400,12 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             jobs: execution_jobs.clone(),
             max_tool_output_chars,
         }));
+        tools.register(Box::new(
+            isanagent::tools::execution::ExecutionReadLogTool {
+                jobs: execution_jobs.clone(),
+                harness: harness.clone(),
+            },
+        ));
         tools.register(Box::new(ExecutionJobListTool {
             jobs: execution_jobs.clone(),
         }));
@@ -1224,6 +1230,7 @@ async fn maybe_prompt_uv_requirements_install(
 ) {
     let local_cfg = isanagent::execution::LocalExecutionConfig {
         sandbox_dir: workspace.sandbox_dir.clone(),
+        workspace_dir: workspace.dir.clone(),
         restrict_to_workspace: true,
         max_run_timeout_secs: workspace.config.execution_max_wall_secs(),
         max_output_bytes: workspace.config.execution_max_output_bytes(),

@@ -616,6 +616,142 @@ impl Tool for ExecutionJobResultTool {
     }
 }
 
+pub struct ExecutionReadLogTool {
+    pub jobs: Arc<ExecutionJobManager>,
+    pub harness: Arc<ExecutionHarness>,
+}
+
+#[async_trait]
+impl Tool for ExecutionReadLogTool {
+    fn name(&self) -> &str {
+        "execution_read_log"
+    }
+
+    fn description(&self) -> &str {
+        "Read raw stdout or stderr logs for a given background execution job or run_id without fetching the entire output. Useful for inspecting massive logs from tools or background processes that are otherwise truncated in the result. Reads up to `length` bytes from `offset` (defaults to 0 and 16384 respectively)."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "job_id": { "type": "string", "description": "The job ID to read logs from. Provide either this or run_id." },
+                "run_id": { "type": "string", "description": "The run ID to read logs from. Provide either this or job_id." },
+                "stream": { "type": "string", "enum": ["stdout", "stderr"], "description": "Which stream to read." },
+                "offset": { "type": "integer", "description": "Byte offset to read from (default 0)" },
+                "length": { "type": "integer", "description": "Max bytes to read (default 16384, capped at 65536)" }
+            },
+            "required": ["stream"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, String> {
+        let stream = args
+            .get("stream")
+            .and_then(|v| v.as_str())
+            .unwrap_or("stdout");
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+        let length = args
+            .get("length")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(16384)
+            .clamp(1, 65536);
+
+        let run_id;
+        let mut sid = None;
+        let mut prov = None;
+
+        if let Some(jid) = args.get("job_id").and_then(|v| v.as_str()) {
+            if let Some(job) = self.jobs.get(jid) {
+                run_id = job.run_id.clone();
+                sid = Some(job.session_id.to_string());
+                prov = Some(
+                    self.harness
+                        .provider_for_session(job.session_id.as_str())
+                        .provider_id()
+                        .to_string(),
+                );
+            } else {
+                return Err(format!("Job not found: {jid}"));
+            }
+        } else if let Some(run) = args.get("run_id").and_then(|v| v.as_str()) {
+            run_id = run.to_string();
+        } else {
+            return Err("Must provide either job_id or run_id".to_string());
+        }
+
+        let target_file = format!("{stream}.txt");
+
+        let mut log_path = None;
+        if let (Some(s), Some(p)) = (sid, prov) {
+            use crate::execution::run_history_dir;
+            let sid_obj = crate::execution::SessionId::new(s);
+            log_path = Some(
+                run_history_dir(self.harness.workspace_dir(), &p, &sid_obj, &run_id)
+                    .join(&target_file),
+            );
+        } else {
+            let hist_dir = self
+                .harness
+                .workspace_dir()
+                .join(".system_generated")
+                .join("execution_history");
+            if let Ok(mut entries1) = tokio::fs::read_dir(&hist_dir).await {
+                while let Ok(Some(e1)) = entries1.next_entry().await {
+                    if let Ok(mut entries2) = tokio::fs::read_dir(e1.path()).await {
+                        while let Ok(Some(e2)) = entries2.next_entry().await {
+                            let candidate = e2.path().join(&run_id).join(&target_file);
+                            if tokio::fs::metadata(&candidate).await.is_ok() {
+                                log_path = Some(candidate);
+                                break;
+                            }
+                        }
+                    }
+                    if log_path.is_some() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let Some(path) = log_path else {
+            return Err(format!("Log file not found for run_id {run_id}."));
+        };
+
+        if tokio::fs::metadata(&path).await.is_err() {
+            return Err(format!("Log file {} does not exist.", path.display()));
+        }
+
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let mut file = tokio::fs::File::open(&path)
+            .await
+            .map_err(|e| format!("Failed to open log file: {e}"))?;
+        let total_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+
+        if offset >= total_size {
+            return Ok(format!("End of log. Total size: {total_size} bytes."));
+        }
+
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|e| format!("Seek error: {e}"))?;
+        let mut buf = vec![0u8; length as usize];
+        let n = file
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("Read error: {e}"))?;
+        buf.truncate(n);
+
+        let content = String::from_utf8_lossy(&buf);
+        let remain = total_size.saturating_sub(offset + n as u64);
+
+        let mut res =
+            format!("--- Log preview: {stream} ({n} bytes read, {remain} bytes remaining) ---\n");
+        res.push_str(&content);
+        Ok(res)
+    }
+}
+
 pub struct ExecutionJobListTool {
     pub jobs: Arc<ExecutionJobManager>,
 }
@@ -1363,7 +1499,7 @@ mod tests {
         // With a single-provider harness, an explicit `provider: "local"` should resolve cleanly
         // and the response should echo the provider id back so the model can audit its choice.
         let (ws, dir) = temp_dirs();
-        let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), true);
+        let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
         let prov: Arc<dyn crate::execution::ExecutionProvider> =
             Arc::new(crate::execution::LocalExecutionProvider::new(cfg).expect("local provider"));
         let harness = Arc::new(ExecutionHarness::new(
@@ -1398,7 +1534,7 @@ mod tests {
     #[tokio::test]
     async fn execution_session_create_rejects_unknown_provider() {
         let (ws, dir) = temp_dirs();
-        let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), true);
+        let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
         let prov: Arc<dyn crate::execution::ExecutionProvider> =
             Arc::new(crate::execution::LocalExecutionProvider::new(cfg).expect("local provider"));
         let harness = Arc::new(ExecutionHarness::new(
@@ -1423,7 +1559,7 @@ mod tests {
     #[tokio::test]
     async fn create_run_close_roundtrip() {
         let (ws, dir) = temp_dirs();
-        let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), true);
+        let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
         let prov: Arc<dyn crate::execution::ExecutionProvider> =
             Arc::new(crate::execution::LocalExecutionProvider::new(cfg).expect("local provider"));
         let harness = Arc::new(ExecutionHarness::new(
@@ -1476,7 +1612,7 @@ mod tests {
     #[tokio::test]
     async fn background_job_poll_and_result() {
         let (ws, dir) = temp_dirs();
-        let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), true);
+        let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
         let prov: Arc<dyn crate::execution::ExecutionProvider> =
             Arc::new(crate::execution::LocalExecutionProvider::new(cfg).expect("local provider"));
         let harness = Arc::new(ExecutionHarness::new(
@@ -1554,7 +1690,7 @@ mod tests {
     #[tokio::test]
     async fn execution_run_auto_promotes_when_bound_smaller_than_runtime() {
         let (ws, dir) = temp_dirs();
-        let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), true);
+        let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
         let prov: Arc<dyn crate::execution::ExecutionProvider> =
             Arc::new(crate::execution::LocalExecutionProvider::new(cfg).expect("local provider"));
         let harness = Arc::new(ExecutionHarness::new(
@@ -1638,7 +1774,7 @@ mod tests {
     #[tokio::test]
     async fn execution_env_info_includes_timeout_caps() {
         let (ws, dir) = temp_dirs();
-        let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), true);
+        let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
         let prov: Arc<dyn crate::execution::ExecutionProvider> =
             Arc::new(crate::execution::LocalExecutionProvider::new(cfg).expect("local provider"));
         let harness = Arc::new(ExecutionHarness::new(
@@ -1665,7 +1801,7 @@ mod tests {
     #[tokio::test]
     async fn background_job_carries_description_in_status_and_list() {
         let (ws, dir) = temp_dirs();
-        let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), true);
+        let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
         let prov: Arc<dyn crate::execution::ExecutionProvider> =
             Arc::new(crate::execution::LocalExecutionProvider::new(cfg).expect("local provider"));
         let harness = Arc::new(ExecutionHarness::new(
@@ -1730,7 +1866,7 @@ mod tests {
     #[tokio::test]
     async fn background_job_cancel_requests_interrupt() {
         let (ws, dir) = temp_dirs();
-        let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), true);
+        let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
         let prov: Arc<dyn crate::execution::ExecutionProvider> =
             Arc::new(crate::execution::LocalExecutionProvider::new(cfg).expect("local provider"));
         let harness = Arc::new(ExecutionHarness::new(

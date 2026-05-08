@@ -296,6 +296,7 @@ fn try_build_provider(
             };
             let lc = LocalExecutionConfig {
                 sandbox_dir: sandbox_dir.to_path_buf(),
+                workspace_dir: workspace_dir.to_path_buf(),
                 restrict_to_workspace,
                 max_run_timeout_secs: config.execution_max_wall_secs(),
                 max_output_bytes: config.execution_max_output_bytes(),
