@@ -341,9 +341,9 @@ pub struct JinaWebBackend {
 }
 
 /// Heuristics to avoid sending obvious template values as `Authorization: Bearer`.
-/// Language-agnostic: rejects non-ASCII (Jina keys are ASCII), angle-bracket templates, and
-/// common README placeholder tokens (ASCII substrings only).
-fn jina_api_key_looks_like_placeholder(s: &str) -> bool {
+/// Language-agnostic: rejects non-ASCII, angle-bracket templates (e.g. `<changethis>`), and
+/// common placeholder tokens (ASCII substrings only).
+fn api_key_looks_like_placeholder(s: &str) -> bool {
     let t = s.trim();
     if t.is_empty() || t.starts_with('<') {
         return true;
@@ -373,6 +373,50 @@ fn parse_shell_policy_mode(raw: Option<&str>, default_mode: ShellPolicyMode) -> 
 }
 
 impl AppConfig {
+    /// Expand family-format `[providers.*]` entries into flat per-model configs.
+    ///
+    /// Family entries (with `models = [...]`) are expanded into one `ProviderConfig` per model,
+    /// inheriting `api_key`, `api_key_env`, and `base_url` from the family. The map key is used
+    /// as `provider_name` when the field is omitted.
+    ///
+    /// Legacy single-model entries (with `model_name`) pass through unchanged.
+    pub fn expanded_providers(&self) -> std::collections::HashMap<String, ProviderConfig> {
+        let mut result = std::collections::HashMap::new();
+        let providers = match &self.providers {
+            Some(p) => p,
+            None => return result,
+        };
+        for (key, cfg) in providers {
+            let provider_name = if cfg.provider_name.is_empty() {
+                key.clone()
+            } else {
+                cfg.provider_name.clone()
+            };
+
+            if let Some(models) = &cfg.models {
+                for model in models {
+                    let expanded = ProviderConfig {
+                        provider_name: provider_name.clone(),
+                        model_name: model.clone(),
+                        models: None,
+                        api_key_env: cfg.api_key_env.clone(),
+                        api_key: cfg.api_key.clone(),
+                        base_url: cfg.base_url.clone(),
+                    };
+                    result.insert(model.clone(), expanded);
+                }
+            } else if !cfg.model_name.is_empty() {
+                let mut single = cfg.clone();
+                if single.provider_name.is_empty() {
+                    single.provider_name = provider_name;
+                }
+                single.models = None;
+                result.insert(key.clone(), single);
+            }
+        }
+        result
+    }
+
     /// Whether the stdin/stdout terminal channel is active (`[terminal].enabled`, default `true`).
     pub fn terminal_enabled(&self) -> bool {
         self.terminal
@@ -420,7 +464,7 @@ impl AppConfig {
             .api_key
             .as_ref()
             .map(|s| s.trim().to_string())
-            .filter(|s| !jina_api_key_looks_like_placeholder(s));
+            .filter(|s| !api_key_looks_like_placeholder(s));
         Some(JinaWebBackend { api_key })
     }
 
@@ -1284,8 +1328,16 @@ pub struct ProviderConfig {
     /// One of `KNOWN_PROVIDERS` (e.g. `"gemini"`, `"openai"`, `"deepseek"`, `"openrouter"`,
     /// `"anthropic"`) or the `OPENAI_COMPATIBLE` sentinel for any third-party endpoint speaking
     /// the OpenAI Chat Completions protocol.
+    /// In the family format, this is inferred from the map key when omitted.
+    #[serde(default)]
     pub provider_name: String,
+    /// Single model name (legacy per-model format).
+    #[serde(default)]
     pub model_name: String,
+    /// Multiple model names (family format). When present, the entry is expanded into one
+    /// `ProviderConfig` per model by [`AppConfig::expanded_providers`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<Vec<String>>,
     /// Name of the environment variable holding the API key. Checked first during resolution.
     #[serde(default)]
     pub api_key_env: String,
@@ -1323,7 +1375,7 @@ impl ProviderConfig {
         }
         if let Some(key) = &self.api_key {
             let trimmed = key.trim();
-            if !trimmed.is_empty() {
+            if !trimmed.is_empty() && !api_key_looks_like_placeholder(trimmed) {
                 return Ok(trimmed.to_string());
             }
         }
@@ -1374,6 +1426,7 @@ mod provider_config_tests {
         ProviderConfig {
             provider_name: name.to_string(),
             model_name: "m".to_string(),
+            models: None,
             api_key_env: "X".to_string(),
             api_key: None,
             base_url: base.map(str::to_string),
@@ -1824,5 +1877,133 @@ interactive_requires_approval_for = ["terraform destroy"]
             .approval_patterns
             .iter()
             .any(|s| s.contains("terraform destroy")));
+    }
+}
+
+#[cfg(test)]
+mod expanded_providers_tests {
+    use super::*;
+
+    #[test]
+    fn family_format_expands_to_per_model_entries() {
+        let toml_str = r#"
+[providers.deepseek]
+models = ["deepseek-v4-pro", "deepseek-v4-flash"]
+api_key = "sk-test"
+"#;
+        let cfg: AppConfig = toml::from_str(toml_str).expect("parse");
+        let expanded = cfg.expanded_providers();
+        assert_eq!(expanded.len(), 2);
+
+        let pro = expanded.get("deepseek-v4-pro").expect("pro entry");
+        assert_eq!(pro.provider_name, "deepseek");
+        assert_eq!(pro.model_name, "deepseek-v4-pro");
+        assert_eq!(pro.api_key.as_deref(), Some("sk-test"));
+        assert!(pro.models.is_none());
+
+        let flash = expanded.get("deepseek-v4-flash").expect("flash entry");
+        assert_eq!(flash.provider_name, "deepseek");
+        assert_eq!(flash.model_name, "deepseek-v4-flash");
+        assert_eq!(flash.api_key.as_deref(), Some("sk-test"));
+    }
+
+    #[test]
+    fn legacy_single_model_format_passes_through() {
+        let toml_str = r#"
+[providers.my-custom]
+provider_name = "openai_compatible"
+model_name = "custom-model"
+base_url = "https://example.com/v1/chat/completions"
+"#;
+        let cfg: AppConfig = toml::from_str(toml_str).expect("parse");
+        let expanded = cfg.expanded_providers();
+        assert_eq!(expanded.len(), 1);
+
+        let entry = expanded.get("my-custom").expect("legacy entry");
+        assert_eq!(entry.provider_name, "openai_compatible");
+        assert_eq!(entry.model_name, "custom-model");
+        assert_eq!(
+            entry.base_url.as_deref(),
+            Some("https://example.com/v1/chat/completions")
+        );
+    }
+
+    #[test]
+    fn infers_provider_name_from_map_key() {
+        let toml_str = r#"
+[providers.gemini]
+models = ["gemini-2.5-flash"]
+"#;
+        let cfg: AppConfig = toml::from_str(toml_str).expect("parse");
+        let expanded = cfg.expanded_providers();
+        let entry = expanded.get("gemini-2.5-flash").expect("entry");
+        assert_eq!(entry.provider_name, "gemini");
+    }
+
+    #[test]
+    fn mixed_family_and_legacy_coexist() {
+        let toml_str = r#"
+[providers.anthropic]
+models = ["claude-opus-4-7", "claude-sonnet-4-6"]
+
+[providers.my-proxy]
+provider_name = "openai_compatible"
+model_name = "proxy-model"
+base_url = "https://proxy.example/v1/chat/completions"
+"#;
+        let cfg: AppConfig = toml::from_str(toml_str).expect("parse");
+        let expanded = cfg.expanded_providers();
+        assert_eq!(expanded.len(), 3);
+        assert!(expanded.contains_key("claude-opus-4-7"));
+        assert!(expanded.contains_key("claude-sonnet-4-6"));
+        assert!(expanded.contains_key("my-proxy"));
+    }
+
+    #[test]
+    fn empty_providers_returns_empty_map() {
+        let cfg = AppConfig::default();
+        assert!(cfg.expanded_providers().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod placeholder_key_tests {
+    use super::*;
+
+    fn provider_with_key(key: &str) -> ProviderConfig {
+        ProviderConfig {
+            provider_name: "deepseek".to_string(),
+            model_name: "deepseek-v4-pro".to_string(),
+            models: None,
+            api_key_env: "".to_string(),
+            api_key: Some(key.to_string()),
+            base_url: None,
+        }
+    }
+
+    #[test]
+    fn rejects_angle_bracket_placeholder() {
+        assert!(provider_with_key("<changethis>").resolve_api_key().is_err());
+    }
+
+    #[test]
+    fn rejects_changethis_without_brackets() {
+        assert!(provider_with_key("changethis").resolve_api_key().is_err());
+    }
+
+    #[test]
+    fn rejects_replace_me() {
+        assert!(provider_with_key("replace_me").resolve_api_key().is_err());
+    }
+
+    #[test]
+    fn rejects_placeholder_keyword() {
+        assert!(provider_with_key("my_placeholder_key").resolve_api_key().is_err());
+    }
+
+    #[test]
+    fn accepts_real_api_key() {
+        let result = provider_with_key("sk-abc123def456").resolve_api_key();
+        assert_eq!(result.unwrap(), "sk-abc123def456");
     }
 }
