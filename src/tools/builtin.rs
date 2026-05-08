@@ -147,6 +147,14 @@ impl Tool for ReadFileTool {
                 "path": {
                     "type": "string",
                     "description": "Path to the file to read"
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Optional byte offset to start reading from"
+                },
+                "length": {
+                    "type": "integer",
+                    "description": "Optional maximum bytes to read"
                 }
             },
             "required": ["path"]
@@ -161,7 +169,27 @@ impl Tool for ReadFileTool {
 
         let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
 
-        fs::read_to_string(&actual_path).map_err(|e| e.to_string())
+        let offset = args.get("offset").and_then(|v| v.as_u64());
+        let length = args.get("length").and_then(|v| v.as_u64());
+
+        if offset.is_none() && length.is_none() {
+            return fs::read_to_string(&actual_path).map_err(|e| e.to_string());
+        }
+
+        use std::io::{Read, Seek};
+        let mut file = fs::File::open(&actual_path).map_err(|e| e.to_string())?;
+        
+        let mut out = String::new();
+        if let Some(off) = offset {
+            file.seek(std::io::SeekFrom::Start(off)).map_err(|e| e.to_string())?;
+        }
+        if let Some(len) = length {
+            let mut handle = file.take(len);
+            handle.read_to_string(&mut out).map_err(|e| e.to_string())?;
+        } else {
+            file.read_to_string(&mut out).map_err(|e| e.to_string())?;
+        }
+        Ok(out)
     }
 }
 
@@ -1285,6 +1313,7 @@ pub struct WebFetchTool {
     pub jina: Option<JinaWebBackend>,
     /// From `max_web_tool_output_chars` in config (see `AppConfig::effective_max_web_tool_output_chars`).
     pub max_output_chars: usize,
+    pub workspace_dir: std::path::PathBuf,
 }
 
 #[async_trait]
@@ -1316,11 +1345,27 @@ impl Tool for WebFetchTool {
             .and_then(|v| v.as_str())
             .ok_or("Missing 'url' argument")?;
 
-        if let Some(ref jina) = self.jina {
-            web_fetch_jina(url, jina, self.max_output_chars).await
+        let full_content = if let Some(ref jina) = self.jina {
+            web_fetch_jina(url, jina, usize::MAX).await?
         } else {
-            web_fetch_direct(url, self.max_output_chars).await
-        }
+            web_fetch_direct(url, usize::MAX).await?
+        };
+
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let downloads_dir = self.workspace_dir.join(".system_generated").join("downloads");
+        let _ = tokio::fs::create_dir_all(&downloads_dir).await;
+        let file_path = downloads_dir.join(format!("{uuid}.txt"));
+        tokio::fs::write(&file_path, &full_content).await.map_err(|e| e.to_string())?;
+
+        let preview = crate::execution::truncate_utf8_str_cap(&full_content, self.max_output_chars);
+        
+        Ok(format!(
+            "{preview}\n\n---\nNote: The full response ({} bytes) was saved to `{}`. \
+            If this preview is truncated, use the `read_file` tool with `offset` and `length` arguments \
+            on that path to incrementally read the rest of the content without exceeding your context limit.",
+            full_content.len(),
+            file_path.display()
+        ))
     }
 }
 

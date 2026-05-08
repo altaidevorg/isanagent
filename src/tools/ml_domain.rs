@@ -94,6 +94,7 @@ impl Tool for ArxivSearchTool {
 /// Fetch one arXiv abstract page (abs HTML) by id.
 pub struct ArxivFetchTool {
     pub max_output_chars: usize,
+    pub workspace_dir: std::path::PathBuf,
 }
 
 #[async_trait]
@@ -144,12 +145,27 @@ impl Tool for ArxivFetchTool {
             return Err(format!("arxiv_fetch HTTP {}", resp.status()));
         }
 
-        let mut body = resp
+        let full_content = resp
             .text()
             .await
             .map_err(|e| format!("arxiv_fetch body: {}", e))?;
+
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let downloads_dir = self.workspace_dir.join(".system_generated").join("downloads");
+        let _ = tokio::fs::create_dir_all(&downloads_dir).await;
+        let file_path = downloads_dir.join(format!("{uuid}.txt"));
+        tokio::fs::write(&file_path, &full_content).await.map_err(|e| e.to_string())?;
+
+        let mut body = full_content.clone();
         crate::utils::truncate_utf8_safe(&mut body, self.max_output_chars, "\n... [TRUNCATED]");
-        Ok(body)
+        
+        Ok(format!(
+            "{body}\n\n---\nNote: The full response ({} bytes) was saved to `{}`. \
+            If this preview is truncated, use the `read_file` tool with `offset` and `length` arguments \
+            on that path to incrementally read the rest of the content without exceeding your context limit.",
+            full_content.len(),
+            file_path.display()
+        ))
     }
 }
 

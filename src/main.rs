@@ -467,12 +467,14 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     tools.register(Box::new(WebFetchTool {
         jina,
         max_output_chars: max_web_output_chars,
+        workspace_dir: workspace.dir.clone(),
     }));
     tools.register(Box::new(ArxivSearchTool {
         max_output_chars: max_web_output_chars,
     }));
     tools.register(Box::new(ArxivFetchTool {
         max_output_chars: max_web_output_chars,
+        workspace_dir: workspace.dir.clone(),
     }));
     tools.register(Box::new(HfHubFileFetchTool {
         max_output_chars: max_web_output_chars,
