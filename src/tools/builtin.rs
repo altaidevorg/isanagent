@@ -138,7 +138,7 @@ impl Tool for ReadFileTool {
     }
 
     fn description(&self) -> &str {
-        "Read the contents of a local file. Provide the absolute or relative path to the file. You can optionally read specific lines by specifying start_line and end_line (1-indexed, inclusive) capped at a maximum of 100 lines per call."
+        "Read the contents of a local file. Provide the absolute or relative path to the file. You can read specific lines by specifying start_line and end_line (1-indexed, inclusive) capped at a maximum of 100 lines per call, so you can call this tool multiple times to read a file with more than 100 lines when needed."
     }
 
     fn parameters(&self) -> Value {
@@ -151,14 +151,14 @@ impl Tool for ReadFileTool {
                 },
                 "start_line": {
                     "type": "integer",
-                    "description": "Optional starting line number (1-indexed, inclusive)"
+                    "description": "Starting line number (1-indexed, inclusive)"
                 },
                 "end_line": {
                     "type": "integer",
-                    "description": "Optional ending line number (1-indexed, inclusive)"
+                    "description": "Ending line number (1-indexed, inclusive)"
                 }
             },
-            "required": ["path"]
+            "required": ["path", "start_line", "end_line"]
         })
     }
 
@@ -170,22 +170,19 @@ impl Tool for ReadFileTool {
 
         let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
 
-        let start_line = args.get("start_line").and_then(|v| v.as_u64());
-        let end_line = args.get("end_line").and_then(|v| v.as_u64());
+        let start_line = args
+            .get("start_line")
+            .and_then(|v| v.as_u64())
+            .ok_or("Missing 'start_line' argument")?;
+        let end_line = args
+            .get("end_line")
+            .and_then(|v| v.as_u64())
+            .ok_or("Missing 'end_line' argument")?;
 
         let content = fs::read_to_string(&actual_path).map_err(|e| e.to_string())?;
 
-        if start_line.is_none() && end_line.is_none() {
-            // No lines specified, check total lines
-            let total_lines = content.lines().count();
-            if total_lines > 100 {
-                return Err(format!("File is too large ({} lines). Please specify start_line and end_line to read a maximum of 100 lines at a time.", total_lines));
-            }
-            return Ok(content);
-        }
-
-        let start = start_line.unwrap_or(1).max(1) as usize;
-        let end = end_line.unwrap_or(start as u64 + 99) as usize;
+        let start = start_line.max(1) as usize;
+        let end = end_line as usize;
 
         if end < start {
             return Err("end_line must be greater than or equal to start_line".to_string());
@@ -201,8 +198,7 @@ impl Tool for ReadFileTool {
 
         let snippet: Vec<String> = lines[actual_start - 1..actual_end]
             .iter()
-            .enumerate()
-            .map(|(i, l)| format!("{:4}: {}", actual_start + i, l))
+            .map(|l| l.to_string())
             .collect();
 
         Ok(snippet.join("\n"))

@@ -638,10 +638,10 @@ impl Tool for ExecutionReadLogTool {
                 "job_id": { "type": "string", "description": "The job ID to read logs from. Provide either this or run_id." },
                 "run_id": { "type": "string", "description": "The run ID to read logs from. Provide either this or job_id." },
                 "stream": { "type": "string", "enum": ["stdout", "stderr"], "description": "Which stream to read." },
-                "start_line": { "type": "integer", "description": "Optional starting line number (1-indexed, inclusive)" },
-                "end_line": { "type": "integer", "description": "Optional ending line number (1-indexed, inclusive)" }
+                "start_line": { "type": "integer", "description": "Starting line number (1-indexed, inclusive)" },
+                "end_line": { "type": "integer", "description": "Ending line number (1-indexed, inclusive)" }
             },
-            "required": ["stream"]
+            "required": ["stream", "start_line", "end_line"]
         })
     }
 
@@ -650,8 +650,14 @@ impl Tool for ExecutionReadLogTool {
             .get("stream")
             .and_then(|v| v.as_str())
             .unwrap_or("stdout");
-        let start_line = args.get("start_line").and_then(|v| v.as_u64());
-        let end_line = args.get("end_line").and_then(|v| v.as_u64());
+        let start_line = args
+            .get("start_line")
+            .and_then(|v| v.as_u64())
+            .ok_or("Missing 'start_line' argument")?;
+        let end_line = args
+            .get("end_line")
+            .and_then(|v| v.as_u64())
+            .ok_or("Missing 'end_line' argument")?;
 
         let run_id;
         let mut sid = None;
@@ -725,8 +731,8 @@ impl Tool for ExecutionReadLogTool {
 
         let mut reader = BufReader::new(file);
 
-        let start = start_line.unwrap_or(1).max(1) as usize;
-        let end = end_line.unwrap_or(start as u64 + 99) as usize;
+        let start = start_line.max(1) as usize;
+        let end = end_line as usize;
 
         if end < start {
             return Err("end_line must be greater than or equal to start_line".to_string());
@@ -744,11 +750,7 @@ impl Tool for ExecutionReadLogTool {
                 Ok(0) => break,
                 Ok(_) => {
                     if current_line >= start && current_line <= actual_end {
-                        lines.push(format!(
-                            "{:4}: {}",
-                            current_line,
-                            buf.trim_end_matches(&['\r', '\n'][..])
-                        ));
+                        lines.push(buf.trim_end_matches(&['\r', '\n'][..]).to_string());
                     }
                     current_line += 1;
                     if current_line > actual_end {

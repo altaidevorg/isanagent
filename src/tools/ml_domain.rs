@@ -131,7 +131,6 @@ impl Tool for ArxivSearchTool {
 
 /// Fetch one arXiv abstract page (abs HTML) by id.
 pub struct ArxivFetchTool {
-    pub max_output_chars: usize,
     pub workspace_dir: std::path::PathBuf,
 }
 
@@ -166,20 +165,27 @@ impl Tool for ArxivFetchTool {
             return Err("invalid arxiv_id".to_string());
         }
 
-        let url = format!("https://arxiv.org/html/{}", id);
+        let arxiv2md_url = format!("https://arxiv2md.org/api/markdown?url={}", id);
 
         let client = reqwest::Client::builder()
             .user_agent(HF_USER_AGENT)
             .build()
             .map_err(|e| e.to_string())?;
 
-        let resp = client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("arxiv_fetch request: {}", e))?;
+        let arxiv2md_resp = client.get(&arxiv2md_url).send().await;
 
-        let full_content = if !resp.status().is_success() {
+        let mut html_markdown_content = String::new();
+        if let Ok(resp) = arxiv2md_resp {
+            if resp.status().is_success() {
+                if let Ok(text) = resp.text().await {
+                    if text.lines().count() >= 30 {
+                        html_markdown_content = text;
+                    }
+                }
+            }
+        }
+
+        let full_content = if html_markdown_content.is_empty() {
             let pdf_url = format!("https://arxiv.org/pdf/{}.pdf", id);
             let pdf_resp = client
                 .get(&pdf_url)
@@ -189,7 +195,7 @@ impl Tool for ArxivFetchTool {
 
             if !pdf_resp.status().is_success() {
                 return Err(format!(
-                    "arxiv_fetch HTTP {} (HTML not found, and PDF not found for {})",
+                    "arxiv_fetch HTTP {} (PDF not found for {})",
                     pdf_resp.status(),
                     id
                 ));
@@ -203,12 +209,7 @@ impl Tool for ArxivFetchTool {
 
             crate::utils::extract_markdown_from_pdf_bytes(&pdf_bytes)?
         } else {
-            let html_content = resp
-                .text()
-                .await
-                .map_err(|e| format!("arxiv_fetch body: {}", e))?;
-
-            htmd::convert(&html_content).map_err(|e| format!("html to markdown error: {}", e))?
+            html_markdown_content
         };
 
         let downloads_dir = self
@@ -222,20 +223,28 @@ impl Tool for ArxivFetchTool {
             .await
             .map_err(|e| e.to_string())?;
 
-        let safe_limit = self.max_output_chars.saturating_sub(1000).max(1000);
-        let mut body = full_content.clone();
-        crate::utils::truncate_utf8_safe(&mut body, safe_limit, "\n... [TRUNCATED]");
-
         let total_lines = full_content.lines().count();
+        let max_preview_lines = 50;
 
-        Ok(format!(
-            "{body}\n\n---\nSystem: The full response ({} lines, {} bytes) was saved to `{}`. \
-            If this preview is truncated, use the `read_file` tool with `start_line` and `end_line` arguments \
-            on that path to incrementally read the rest of the content and/or use the `search_text` tool to find specific information.",
-            total_lines,
-            full_content.len(),
-            file_path.display()
-        ))
+        if total_lines <= max_preview_lines {
+            Ok(format!(
+                "{full_content}\n\n---\nFull paper ({total_lines} lines) saved to `{}`.",
+                file_path.display()
+            ))
+        } else {
+            let preview: String = full_content
+                .lines()
+                .take(max_preview_lines)
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            Ok(format!(
+                "{preview}\n\n---\n[TRUNCATED] Showing first {max_preview_lines} of {total_lines} lines. \
+                Full content saved to `{}`. Use `read_file` with `start_line` and `end_line` to read \
+                the rest, or `search_text` to find specific information.",
+                file_path.display()
+            ))
+        }
     }
 }
 
