@@ -34,8 +34,9 @@ use isanagent::scheduler::{
 use isanagent::session::SessionManager;
 use isanagent::skills::SkillRegistry;
 use isanagent::tools::builtin::{
-    CronTool, EditFileTool, GitWorktreeTool, GlobFilesTool, ListDirTool, MessageTool, ReadFileTool,
-    SearchTextTool, ShellExecTool, WebFetchTool, WebSearchTool, WriteFileTool,
+    CronTool, EditFileTool, GetEnvTool, GitWorktreeTool, GlobFilesTool, ListDirTool, MessageTool,
+    PythonRunTool, ReadFileTool, SearchTextTool, ShellExecTool, WebFetchTool, WebSearchTool,
+    WriteFileTool,
 };
 use isanagent::tools::execution::{
     compile_colab_mcp_tool_allowlist, ColabMcpToolCallTool, ExecutionArtifactListTool,
@@ -297,6 +298,10 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         workspace_dir: workspace.sandbox_dir.clone(),
         restrict_to_workspace: restrict,
     }));
+    tools.register(Box::new(GetEnvTool));
+    tools.register(Box::new(PythonRunTool {
+        workspace_dir: workspace.sandbox_dir.clone(),
+    }));
     if workspace.config.git_worktree_tool_enabled() {
         tools.register(Box::new(GitWorktreeTool {
             workspace_dir: workspace.sandbox_dir.clone(),
@@ -344,6 +349,12 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             jobs: execution_jobs.clone(),
             max_tool_output_chars,
         }));
+        tools.register(Box::new(
+            isanagent::tools::execution::ExecutionReadLogTool {
+                jobs: execution_jobs.clone(),
+                harness: harness.clone(),
+            },
+        ));
         tools.register(Box::new(ExecutionJobListTool {
             jobs: execution_jobs.clone(),
         }));
@@ -405,12 +416,13 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     tools.register(Box::new(WebFetchTool {
         jina,
         max_output_chars: max_web_output_chars,
+        workspace_dir: workspace.dir.clone(),
     }));
     tools.register(Box::new(ArxivSearchTool {
         max_output_chars: max_web_output_chars,
     }));
     tools.register(Box::new(ArxivFetchTool {
-        max_output_chars: max_web_output_chars,
+        workspace_dir: workspace.dir.clone(),
     }));
     tools.register(Box::new(HfHubFileFetchTool {
         max_output_chars: max_web_output_chars,
@@ -1180,6 +1192,7 @@ async fn maybe_prompt_uv_requirements_install(
 ) {
     let local_cfg = isanagent::execution::LocalExecutionConfig {
         sandbox_dir: workspace.sandbox_dir.clone(),
+        workspace_dir: workspace.dir.clone(),
         restrict_to_workspace: true,
         max_run_timeout_secs: workspace.config.execution_max_wall_secs(),
         max_output_bytes: workspace.config.execution_max_output_bytes(),

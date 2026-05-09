@@ -674,6 +674,28 @@ pub fn extract_json_from_llm_response(text: &str) -> Option<serde_json::Value> {
     None
 }
 
+/// Extracts text from a PDF file byte payload into Markdown format.
+pub fn extract_markdown_from_pdf_bytes(pdf_bytes: &[u8]) -> Result<String, String> {
+    let doc = pdf_oxide::PdfDocument::from_bytes(pdf_bytes.to_vec())
+        .map_err(|e| format!("pdf_oxide error: {:?}", e))?;
+
+    let mut extracted = String::new();
+    let options = pdf_oxide::converters::ConversionOptions::default();
+    for i in 0..doc.page_count().unwrap_or(0) {
+        if let Ok(text) = doc.to_markdown(i, &options) {
+            extracted.push_str(&text);
+            extracted.push('\n');
+            extracted.push('\n');
+        }
+    }
+
+    if extracted.is_empty() {
+        return Err("PDF found but no text could be extracted.".to_string());
+    }
+
+    Ok(extracted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
