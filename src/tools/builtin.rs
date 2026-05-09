@@ -1372,8 +1372,9 @@ impl Tool for WebFetchTool {
         let uuid = uuid::Uuid::new_v4().to_string();
         let downloads_dir = self
             .workspace_dir
-            .join(".system_generated")
-            .join("downloads");
+            .join("workspace")
+            .join("downloads")
+            .join("web");
         let _ = tokio::fs::create_dir_all(&downloads_dir).await;
         let file_path = downloads_dir.join(format!("{uuid}.txt"));
         tokio::fs::write(&file_path, &full_content)
@@ -1387,7 +1388,7 @@ impl Tool for WebFetchTool {
         Ok(format!(
             "{preview}\n\n---\nNote: The full response ({} lines, {} bytes) was saved to `{}`. \
             If this preview is truncated, use the `read_file` tool with `start_line` and `end_line` arguments \
-            on that path to incrementally read the rest of the content without exceeding your context limit.",
+            on that path to incrementally read the rest of the content and/or use the `search_text` tool to find specific information.",
             total_lines,
             full_content.len(),
             file_path.display()

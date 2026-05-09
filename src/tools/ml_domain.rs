@@ -142,7 +142,7 @@ impl Tool for ArxivFetchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch an arXiv paper by id (e.g. `2401.0001` or `cs.CL/0001001`). Returns Markdown text (truncated). Use after `arxiv_search` for detailed reading and cross-verification; do not rely on search snippets alone."
+        "Fetch an arXiv paper by id (e.g. `2401.0001` or `cs.CL/0001001`). Returns Markdown text (truncated). Use after `arxiv_search` for downloading full text and cross-verification; do not rely on search snippets alone."
     }
 
     fn parameters(&self) -> Value {
@@ -195,13 +195,13 @@ impl Tool for ArxivFetchTool {
         let full_content =
             htmd::convert(&html_content).map_err(|e| format!("html to markdown error: {}", e))?;
 
-        let uuid = uuid::Uuid::new_v4().to_string();
         let downloads_dir = self
             .workspace_dir
-            .join(".system_generated")
-            .join("downloads");
+            .join("workspace")
+            .join("downloads")
+            .join("arxiv");
         let _ = tokio::fs::create_dir_all(&downloads_dir).await;
-        let file_path = downloads_dir.join(format!("{uuid}.txt"));
+        let file_path = downloads_dir.join(format!("{id}.md"));
         tokio::fs::write(&file_path, &full_content)
             .await
             .map_err(|e| e.to_string())?;
@@ -213,9 +213,9 @@ impl Tool for ArxivFetchTool {
         let total_lines = full_content.lines().count();
 
         Ok(format!(
-            "{body}\n\n---\nNote: The full response ({} lines, {} bytes) was saved to `{}`. \
+            "{body}\n\n---\nSystem: The full response ({} lines, {} bytes) was saved to `{}`. \
             If this preview is truncated, use the `read_file` tool with `start_line` and `end_line` arguments \
-            on that path to incrementally read the rest of the content without exceeding your context limit.",
+            on that path to incrementally read the rest of the content and/or use the `search_text` tool to find specific information.",
             total_lines,
             full_content.len(),
             file_path.display()
