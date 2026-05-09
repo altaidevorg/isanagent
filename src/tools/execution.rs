@@ -628,7 +628,7 @@ impl Tool for ExecutionReadLogTool {
     }
 
     fn description(&self) -> &str {
-        "Read raw stdout or stderr logs for a given background execution job or run_id without fetching the entire output. Useful for inspecting massive logs from tools or background processes that are otherwise truncated in the result. Reads up to `length` bytes from `offset` (defaults to 0 and 16384 respectively)."
+        "Read raw stdout or stderr logs for a given background execution job or run_id without fetching the entire output. Useful for inspecting massive logs from tools or background processes that are otherwise truncated in the result. You can read specific lines by specifying start_line and end_line (1-indexed, inclusive) capped at a maximum of 100 lines per call."
     }
 
     fn parameters(&self) -> Value {
@@ -638,8 +638,8 @@ impl Tool for ExecutionReadLogTool {
                 "job_id": { "type": "string", "description": "The job ID to read logs from. Provide either this or run_id." },
                 "run_id": { "type": "string", "description": "The run ID to read logs from. Provide either this or job_id." },
                 "stream": { "type": "string", "enum": ["stdout", "stderr"], "description": "Which stream to read." },
-                "offset": { "type": "integer", "description": "Byte offset to read from (default 0)" },
-                "length": { "type": "integer", "description": "Max bytes to read (default 16384, capped at 65536)" }
+                "start_line": { "type": "integer", "description": "Optional starting line number (1-indexed, inclusive)" },
+                "end_line": { "type": "integer", "description": "Optional ending line number (1-indexed, inclusive)" }
             },
             "required": ["stream"]
         })
@@ -650,12 +650,8 @@ impl Tool for ExecutionReadLogTool {
             .get("stream")
             .and_then(|v| v.as_str())
             .unwrap_or("stdout");
-        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
-        let length = args
-            .get("length")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(16384)
-            .clamp(1, 65536);
+        let start_line = args.get("start_line").and_then(|v| v.as_u64());
+        let end_line = args.get("end_line").and_then(|v| v.as_u64());
 
         let run_id;
         let mut sid = None;
@@ -722,32 +718,57 @@ impl Tool for ExecutionReadLogTool {
             return Err(format!("Log file {} does not exist.", path.display()));
         }
 
-        use tokio::io::{AsyncReadExt, AsyncSeekExt};
-        let mut file = tokio::fs::File::open(&path)
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let file = tokio::fs::File::open(&path)
             .await
             .map_err(|e| format!("Failed to open log file: {e}"))?;
-        let total_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
 
-        if offset >= total_size {
-            return Ok(format!("End of log. Total size: {total_size} bytes."));
+        let mut reader = BufReader::new(file);
+
+        let start = start_line.unwrap_or(1).max(1) as usize;
+        let end = end_line.unwrap_or(start as u64 + 99) as usize;
+
+        if end < start {
+            return Err("end_line must be greater than or equal to start_line".to_string());
         }
 
-        file.seek(std::io::SeekFrom::Start(offset))
-            .await
-            .map_err(|e| format!("Seek error: {e}"))?;
-        let mut buf = vec![0u8; length as usize];
-        let n = file
-            .read(&mut buf)
-            .await
-            .map_err(|e| format!("Read error: {e}"))?;
-        buf.truncate(n);
+        let actual_end = start + 99.min(end - start);
 
-        let content = String::from_utf8_lossy(&buf);
-        let remain = total_size.saturating_sub(offset + n as u64);
+        let mut lines = Vec::new();
+        let mut current_line = 1;
+        let mut buf = String::new();
 
-        let mut res =
-            format!("--- Log preview: {stream} ({n} bytes read, {remain} bytes remaining) ---\n");
-        res.push_str(&content);
+        loop {
+            buf.clear();
+            match reader.read_line(&mut buf).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    if current_line >= start && current_line <= actual_end {
+                        lines.push(format!(
+                            "{:4}: {}",
+                            current_line,
+                            buf.trim_end_matches(&['\r', '\n'][..])
+                        ));
+                    }
+                    current_line += 1;
+                    if current_line > actual_end {
+                        break;
+                    }
+                }
+                Err(e) => return Err(format!("Read error: {e}")),
+            }
+        }
+
+        if lines.is_empty() {
+            return Ok(format!("No lines found in the specified range. The file might have fewer than {start} lines."));
+        }
+
+        let content = lines.join("\n");
+        let res = format!(
+            "--- Log preview: {stream} (Lines {start} to {}) ---\n{}",
+            current_line - 1,
+            content
+        );
         Ok(res)
     }
 }
