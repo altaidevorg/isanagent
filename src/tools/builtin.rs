@@ -2255,7 +2255,7 @@ impl Tool for PythonRunTool {
     }
 
     fn description(&self) -> &str {
-        "Run raw python code. The code will be piped to `uv run python -` via stdin, bypassing shell quoting issues while running inside the uv managed environment. Use this for quick scripts. Outputs stdout/stderr."
+        "Run raw python code. The code will be piped to `uv run python -` via stdin, bypassing shell quoting issues while running inside the uv managed environment. Use this for quick calculations, and prefer writing Python scripts to execute with uv for more complex tasks. Outputs stdout/stderr."
     }
 
     fn parameters(&self) -> Value {

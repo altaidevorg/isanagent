@@ -179,21 +179,37 @@ impl Tool for ArxivFetchTool {
             .await
             .map_err(|e| format!("arxiv_fetch request: {}", e))?;
 
-        if !resp.status().is_success() {
-            return Err(format!(
-                "arxiv_fetch HTTP {} (HTML not found for {})",
-                resp.status(),
-                id
-            ));
-        }
+        let full_content = if !resp.status().is_success() {
+            let pdf_url = format!("https://arxiv.org/pdf/{}.pdf", id);
+            let pdf_resp = client
+                .get(&pdf_url)
+                .send()
+                .await
+                .map_err(|e| format!("arxiv_fetch pdf request: {}", e))?;
 
-        let html_content = resp
-            .text()
-            .await
-            .map_err(|e| format!("arxiv_fetch body: {}", e))?;
+            if !pdf_resp.status().is_success() {
+                return Err(format!(
+                    "arxiv_fetch HTTP {} (HTML not found, and PDF not found for {})",
+                    pdf_resp.status(),
+                    id
+                ));
+            }
 
-        let full_content =
-            htmd::convert(&html_content).map_err(|e| format!("html to markdown error: {}", e))?;
+            let pdf_bytes = pdf_resp
+                .bytes()
+                .await
+                .map_err(|e| format!("arxiv_fetch pdf body: {}", e))?
+                .to_vec();
+
+            crate::utils::extract_markdown_from_pdf_bytes(&pdf_bytes)?
+        } else {
+            let html_content = resp
+                .text()
+                .await
+                .map_err(|e| format!("arxiv_fetch body: {}", e))?;
+
+            htmd::convert(&html_content).map_err(|e| format!("html to markdown error: {}", e))?
+        };
 
         let downloads_dir = self
             .workspace_dir
