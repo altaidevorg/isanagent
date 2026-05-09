@@ -85,7 +85,45 @@ impl Tool for ArxivSearchTool {
             .await
             .map_err(|e| format!("arxiv_search body: {}", e))?;
 
-        let mut out = body;
+        let mut out = String::new();
+        let entry_re = regex::Regex::new(r"(?s)<entry>.*?</entry>").map_err(|e| e.to_string())?;
+        let id_re = regex::Regex::new(r"(?s)<id>(.*?)</id>").map_err(|e| e.to_string())?;
+        let title_re = regex::Regex::new(r"(?s)<title>(.*?)</title>").map_err(|e| e.to_string())?;
+        let summary_re =
+            regex::Regex::new(r"(?s)<summary>(.*?)</summary>").map_err(|e| e.to_string())?;
+
+        for entry_match in entry_re.find_iter(&body) {
+            let entry = entry_match.as_str();
+            let id = id_re
+                .captures(entry)
+                .and_then(|c| c.get(1))
+                .map_or("", |m| m.as_str())
+                .trim();
+            let title = title_re
+                .captures(entry)
+                .and_then(|c| c.get(1))
+                .map_or("", |m| m.as_str())
+                .trim()
+                .replace('\n', " ");
+            let summary = summary_re
+                .captures(entry)
+                .and_then(|c| c.get(1))
+                .map_or("", |m| m.as_str())
+                .trim()
+                .replace('\n', " ");
+
+            let id_clean = id.split('/').next_back().unwrap_or(id);
+
+            out.push_str(&format!(
+                "ID: {}\nTitle: {}\nSummary: {}\n\n---\n",
+                id_clean, title, summary
+            ));
+        }
+
+        if out.is_empty() {
+            out = "No results found.".to_string();
+        }
+
         crate::utils::truncate_utf8_safe(&mut out, self.max_output_chars, "\n... [TRUNCATED]");
         Ok(out)
     }
@@ -93,7 +131,7 @@ impl Tool for ArxivSearchTool {
 
 /// Fetch one arXiv abstract page (abs HTML) by id.
 pub struct ArxivFetchTool {
-    pub max_output_chars: usize,
+    pub workspace_dir: std::path::PathBuf,
 }
 
 #[async_trait]
@@ -103,7 +141,7 @@ impl Tool for ArxivFetchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch an arXiv abstract page by id (e.g. `2401.0001` or `cs.CL/0001001`). Returns HTML text (truncated). Use after `arxiv_search` for detailed reading and cross-verification; do not rely on search snippets alone."
+        "Fetch an arXiv paper by id (e.g. `2401.0001` or `cs.CL/0001001`). Returns Markdown text (truncated). Use after `arxiv_search` for downloading full text and cross-verification; do not rely on search snippets alone."
     }
 
     fn parameters(&self) -> Value {
@@ -127,29 +165,86 @@ impl Tool for ArxivFetchTool {
             return Err("invalid arxiv_id".to_string());
         }
 
-        let url = format!("https://arxiv.org/abs/{}", id);
+        let arxiv2md_url = format!("https://arxiv2md.org/api/markdown?url={}", id);
 
         let client = reqwest::Client::builder()
             .user_agent(HF_USER_AGENT)
             .build()
             .map_err(|e| e.to_string())?;
 
-        let resp = client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("arxiv_fetch request: {}", e))?;
+        let arxiv2md_resp = client.get(&arxiv2md_url).send().await;
 
-        if !resp.status().is_success() {
-            return Err(format!("arxiv_fetch HTTP {}", resp.status()));
+        let mut html_markdown_content = String::new();
+        if let Ok(resp) = arxiv2md_resp {
+            if resp.status().is_success() {
+                if let Ok(text) = resp.text().await {
+                    if text.lines().count() >= 30 {
+                        html_markdown_content = text;
+                    }
+                }
+            }
         }
 
-        let mut body = resp
-            .text()
+        let full_content = if html_markdown_content.is_empty() {
+            let pdf_url = format!("https://arxiv.org/pdf/{}.pdf", id);
+            let pdf_resp = client
+                .get(&pdf_url)
+                .send()
+                .await
+                .map_err(|e| format!("arxiv_fetch pdf request: {}", e))?;
+
+            if !pdf_resp.status().is_success() {
+                return Err(format!(
+                    "arxiv_fetch HTTP {} (PDF not found for {})",
+                    pdf_resp.status(),
+                    id
+                ));
+            }
+
+            let pdf_bytes = pdf_resp
+                .bytes()
+                .await
+                .map_err(|e| format!("arxiv_fetch pdf body: {}", e))?
+                .to_vec();
+
+            crate::utils::extract_markdown_from_pdf_bytes(&pdf_bytes)?
+        } else {
+            html_markdown_content
+        };
+
+        let downloads_dir = self
+            .workspace_dir
+            .join("workspace")
+            .join("downloads")
+            .join("arxiv");
+        let _ = tokio::fs::create_dir_all(&downloads_dir).await;
+        let file_path = downloads_dir.join(format!("{id}.md"));
+        tokio::fs::write(&file_path, &full_content)
             .await
-            .map_err(|e| format!("arxiv_fetch body: {}", e))?;
-        crate::utils::truncate_utf8_safe(&mut body, self.max_output_chars, "\n... [TRUNCATED]");
-        Ok(body)
+            .map_err(|e| e.to_string())?;
+
+        let total_lines = full_content.lines().count();
+        let max_preview_lines = 50;
+
+        if total_lines <= max_preview_lines {
+            Ok(format!(
+                "{full_content}\n\n---\nFull paper ({total_lines} lines) saved to `{}`.",
+                file_path.display()
+            ))
+        } else {
+            let preview: String = full_content
+                .lines()
+                .take(max_preview_lines)
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            Ok(format!(
+                "{preview}\n\n---\n[TRUNCATED] Showing first {max_preview_lines} of {total_lines} lines. \
+                Full content saved to `{}`. Use `read_file` with `start_line` and `end_line` to read \
+                the rest, or `search_text` to find specific information.",
+                file_path.display()
+            ))
+        }
     }
 }
 

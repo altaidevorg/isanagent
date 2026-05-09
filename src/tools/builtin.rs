@@ -75,8 +75,9 @@ pub fn resolve_path(path: &str, workspace_dir: &Path, restrict: bool) -> Result<
 
         if !canonical.starts_with(&canonical_workspace) {
             return Err(format!(
-                "PermissionError: Path {:?} is outside allowed workspace directory {:?}",
-                canonical, canonical_workspace
+                "PermissionError: Path {} is outside allowed workspace directory {}",
+                resolved.display(),
+                workspace_dir.display()
             ));
         }
     }
@@ -137,7 +138,7 @@ impl Tool for ReadFileTool {
     }
 
     fn description(&self) -> &str {
-        "Read the contents of a local file. Provide the absolute or relative path to the file."
+        "Read the contents of a local file. Provide the absolute or relative path to the file. You can read specific lines by specifying start_line and end_line (1-indexed, inclusive) capped at a maximum of 100 lines per call, so you can call this tool multiple times to read a file with more than 100 lines when needed."
     }
 
     fn parameters(&self) -> Value {
@@ -147,9 +148,17 @@ impl Tool for ReadFileTool {
                 "path": {
                     "type": "string",
                     "description": "Path to the file to read"
+                },
+                "start_line": {
+                    "type": "integer",
+                    "description": "Starting line number (1-indexed, inclusive)"
+                },
+                "end_line": {
+                    "type": "integer",
+                    "description": "Ending line number (1-indexed, inclusive)"
                 }
             },
-            "required": ["path"]
+            "required": ["path", "start_line", "end_line"]
         })
     }
 
@@ -161,7 +170,38 @@ impl Tool for ReadFileTool {
 
         let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
 
-        fs::read_to_string(&actual_path).map_err(|e| e.to_string())
+        let start_line = args
+            .get("start_line")
+            .and_then(|v| v.as_u64())
+            .ok_or("Missing 'start_line' argument")?;
+        let end_line = args
+            .get("end_line")
+            .and_then(|v| v.as_u64())
+            .ok_or("Missing 'end_line' argument")?;
+
+        let content = fs::read_to_string(&actual_path).map_err(|e| e.to_string())?;
+
+        let start = start_line.max(1) as usize;
+        let end = end_line as usize;
+
+        if end < start {
+            return Err("end_line must be greater than or equal to start_line".to_string());
+        }
+
+        let lines_to_read = (end - start + 1).min(100);
+
+        let lines: Vec<&str> = content.lines().collect();
+        let total_lines = lines.len();
+
+        let actual_start = start.min(total_lines.max(1));
+        let actual_end = (actual_start + lines_to_read - 1).min(total_lines);
+
+        let snippet: Vec<String> = lines[actual_start - 1..actual_end]
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+
+        Ok(snippet.join("\n"))
     }
 }
 
@@ -360,10 +400,7 @@ impl Tool for ListDirTool {
         let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
 
         if !actual_path.is_dir() {
-            return Ok(format!(
-                "Error: Not a directory: {:?}",
-                actual_path.display()
-            ));
+            return Ok(format!("Error: Not a directory: {}", actual_path.display()));
         }
 
         let mut entries = match fs::read_dir(&actual_path) {
@@ -385,7 +422,7 @@ impl Tool for ListDirTool {
         items.sort();
 
         if items.is_empty() {
-            return Ok(format!("Directory {:?} is empty", actual_path.display()));
+            return Ok(format!("Directory {} is empty", actual_path.display()));
         }
 
         Ok(items.join("\n"))
@@ -447,18 +484,23 @@ impl Tool for GlobFilesTool {
 
         let base = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
         if !base.exists() {
-            return Ok(format!("Error: path not found: {:?}", base.display()));
+            return Ok(format!("Error: path not found: {}", base.display()));
         }
         if !base.is_dir() {
             return Ok(format!(
-                "Error: base path is not a directory: {:?}",
+                "Error: base path is not a directory: {}",
                 base.display()
             ));
         }
 
         // Align with WalkDir output so `strip_prefix` works on all platforms (notably Windows).
-        let walk_root = fs::canonicalize(&base)
-            .map_err(|e| format!("Could not canonicalize search base {:?}: {}", base, e))?;
+        let walk_root = fs::canonicalize(&base).map_err(|e| {
+            format!(
+                "Could not canonicalize search base {}: {}",
+                base.display(),
+                e
+            )
+        })?;
 
         let matcher = compile_glob_single(pattern)?;
         let mut matches: Vec<PathBuf> = Vec::new();
@@ -776,7 +818,7 @@ impl Tool for SearchTextTool {
         let resolved = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
 
         if !resolved.exists() {
-            return Ok(format!("Error: path not found: {:?}", resolved.display()));
+            return Ok(format!("Error: path not found: {}", resolved.display()));
         }
 
         let search_target = fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
@@ -881,6 +923,14 @@ impl Tool for ShellExecTool {
                 "working_dir": {
                     "type": "string",
                     "description": "Optional relative working directory for the command"
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "description": "Optional timeout in seconds (defaults to 60, max 3600)"
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Short description of what this command is trying to achieve (used for UI and audits)"
                 }
             },
             "required": ["command"]
@@ -905,6 +955,17 @@ impl Tool for ShellExecTool {
             .and_then(|v| v.as_str())
             .unwrap_or(".");
 
+        let timeout_secs = args
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(60)
+            .clamp(1, 3600);
+
+        let _desc_str = args
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Shell execution");
+
         let actual_dir = resolve_path(cwd_str, &self.workspace_dir, self.restrict_to_workspace)?;
 
         let mut cmd = if cfg!(target_os = "windows") {
@@ -921,7 +982,7 @@ impl Tool for ShellExecTool {
 
         let child = cmd.output();
 
-        match tokio::time::timeout(std::time::Duration::from_secs(60), child).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), child).await {
             Ok(Ok(output)) => {
                 let mut result = String::new();
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -963,7 +1024,7 @@ impl Tool for ShellExecTool {
                 }
             }
             Ok(Err(e)) => Err(format!("Failed to execute command: {}", e)),
-            Err(_) => Err("Command timed out after 60 seconds".to_string()),
+            Err(_) => Err(format!("Command timed out after {} seconds", timeout_secs)),
         }
     }
 }
@@ -1266,6 +1327,7 @@ pub struct WebFetchTool {
     pub jina: Option<JinaWebBackend>,
     /// From `max_web_tool_output_chars` in config (see `AppConfig::effective_max_web_tool_output_chars`).
     pub max_output_chars: usize,
+    pub workspace_dir: std::path::PathBuf,
 }
 
 #[async_trait]
@@ -1297,11 +1359,36 @@ impl Tool for WebFetchTool {
             .and_then(|v| v.as_str())
             .ok_or("Missing 'url' argument")?;
 
-        if let Some(ref jina) = self.jina {
-            web_fetch_jina(url, jina, self.max_output_chars).await
+        let full_content = if let Some(ref jina) = self.jina {
+            web_fetch_jina(url, jina, usize::MAX).await?
         } else {
-            web_fetch_direct(url, self.max_output_chars).await
-        }
+            web_fetch_direct(url, usize::MAX).await?
+        };
+
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let downloads_dir = self
+            .workspace_dir
+            .join("workspace")
+            .join("downloads")
+            .join("web");
+        let _ = tokio::fs::create_dir_all(&downloads_dir).await;
+        let file_path = downloads_dir.join(format!("{uuid}.txt"));
+        tokio::fs::write(&file_path, &full_content)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let safe_limit = self.max_output_chars.saturating_sub(1000).max(1000);
+        let preview = crate::execution::truncate_utf8_str_cap(&full_content, safe_limit);
+        let total_lines = full_content.lines().count();
+
+        Ok(format!(
+            "{preview}\n\n---\nNote: The full response ({} lines, {} bytes) was saved to `{}`. \
+            If this preview is truncated, use the `read_file` tool with `start_line` and `end_line` arguments \
+            on that path to incrementally read the rest of the content and/or use the `search_text` tool to find specific information.",
+            total_lines,
+            full_content.len(),
+            file_path.display()
+        ))
     }
 }
 
@@ -1892,7 +1979,7 @@ impl GitWorktreeTool {
             self.allow_path_outside_sandbox,
         )?;
         if !wt.exists() {
-            return Err(format!("worktree path does not exist: {:?}", wt.display()));
+            return Err(format!("worktree path does not exist: {}", wt.display()));
         }
         let wt_canon = fs::canonicalize(&wt).map_err(|e| e.to_string())?;
         let common = git_common_dir_abs(&wt_canon).await?;
@@ -2111,6 +2198,137 @@ impl Tool for FetchMemoryByDateTool {
     }
 }
 
+pub struct GetEnvTool;
+
+#[async_trait]
+impl Tool for GetEnvTool {
+    fn name(&self) -> &str {
+        "get_env"
+    }
+
+    fn description(&self) -> &str {
+        "Get all environment variables currently exposed to the agent. Sensitive values (tokens, secrets) are masked automatically."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {}
+        })
+    }
+
+    async fn execute(&self, _args: Value) -> Result<String, String> {
+        let mut env_vars: Vec<(String, String)> = std::env::vars().collect();
+        env_vars.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut result = String::from("Environment Variables:\n\n");
+        for (k, v) in env_vars {
+            let k_lower = k.to_lowercase();
+            let masked = if k_lower.contains("token")
+                || k_lower.contains("secret")
+                || k_lower.contains("key")
+                || k_lower.contains("password")
+                || k_lower.contains("auth")
+            {
+                "********".to_string()
+            } else {
+                v
+            };
+            result.push_str(&format!("{}={}\n", k, masked));
+        }
+        Ok(result)
+    }
+}
+
+pub struct PythonRunTool {
+    pub workspace_dir: PathBuf,
+}
+
+#[async_trait]
+impl Tool for PythonRunTool {
+    fn name(&self) -> &str {
+        "python_run"
+    }
+
+    fn description(&self) -> &str {
+        "Run raw python code. The code will be piped to `uv run python -` via stdin, bypassing shell quoting issues while running inside the uv managed environment. Use this for quick calculations, and prefer writing Python scripts to execute with uv for more complex tasks. Outputs stdout/stderr."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "Python code to execute"
+                }
+            },
+            "required": ["code"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, String> {
+        let code = args
+            .get("code")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'code' argument")?;
+
+        let mut cmd = tokio::process::Command::new("uv");
+        cmd.arg("run");
+        cmd.arg("python");
+        cmd.arg("-");
+        cmd.current_dir(&self.workspace_dir);
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to spawn python: {}", e))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin
+                .write_all(code.as_bytes())
+                .await
+                .map_err(|e| format!("Failed to write to python stdin: {}", e))?;
+        }
+
+        let output =
+            tokio::time::timeout(std::time::Duration::from_secs(60), child.wait_with_output())
+                .await
+                .map_err(|_| "Python execution timed out after 60 seconds")?
+                .map_err(|e| format!("Failed to wait for python: {}", e))?;
+
+        let mut result = String::new();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !stdout.trim().is_empty() {
+            result.push_str(&stdout);
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.trim().is_empty() {
+            if !result.is_empty() {
+                result.push_str("\nSTDERR:\n");
+            }
+            result.push_str(&stderr);
+        }
+
+        if !output.status.success() {
+            result.push_str(&format!(
+                "\nExit code: {}",
+                output.status.code().unwrap_or(-1)
+            ));
+        }
+
+        if result.is_empty() {
+            Ok("(no output)".to_string())
+        } else {
+            Ok(result)
+        }
+    }
+}
+
 #[cfg(test)]
 mod resolve_path_tests {
     use super::resolve_path;
@@ -2293,5 +2511,56 @@ mod git_worktree_path_tests {
             .await
             .expect("remove");
         let _ = fs::remove_dir_all(&sandbox);
+    }
+}
+
+#[cfg(test)]
+mod get_env_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn test_get_env_masks_secrets() {
+        std::env::set_var("TEST_SAFE_VAR", "hello");
+        std::env::set_var("TEST_SECRET_TOKEN", "super_secret");
+
+        let tool = GetEnvTool;
+        let out = tool.execute(json!({})).await.unwrap();
+
+        assert!(out.contains("TEST_SAFE_VAR=hello"));
+        assert!(out.contains("TEST_SECRET_TOKEN=********"));
+        assert!(!out.contains("super_secret"));
+    }
+}
+
+#[cfg(test)]
+mod python_run_tests {
+    use super::*;
+    use serde_json::json;
+    use std::fs;
+
+    #[tokio::test]
+    async fn test_python_run_basic() {
+        if which::which("python").is_err() && which::which("python3").is_err() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("isanagent_py_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+
+        let tool = PythonRunTool {
+            workspace_dir: root.clone(),
+        };
+        let out = tool
+            .execute(json!({ "code": "print('hello from python')" }))
+            .await
+            .unwrap();
+
+        println!("PYTHON RUN OUTPUT: {}", out);
+        if out.contains("Microsoft Store") && out.contains("9009") {
+            println!("Skipping test due to Windows python app execution alias.");
+            return;
+        }
+        assert!(out.contains("hello from python"));
+        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -439,7 +439,7 @@ async fn open_ssh_python_repl_once(
         .map_err(|e| ExecutionError::Provider(format!("ssh: exec: {e}")))?;
     let stream = ch.into_stream();
     let (mut read, mut write) = split(stream);
-    match repl_framing::repl_round_trip(&mut write, &mut read, "pass", SSH_REPL_PROBE_MAX_EACH).await
+    match repl_framing::repl_round_trip(&mut write, &mut read, "pass", None, None, SSH_REPL_PROBE_MAX_EACH).await
     {
         Ok((_stdout, _stderr, 0)) => Ok(SshPythonRepl {
             cwd: cwd.to_string(),
@@ -659,6 +659,8 @@ impl ExecutionProvider for SshExecutionProvider {
                         &mut repl.write,
                         &mut repl.read,
                         &code,
+                        None,
+                        None,
                         max_each,
                     )
                     .await?;
