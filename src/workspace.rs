@@ -13,7 +13,7 @@ pub struct WorkspaceLayout {
 }
 
 pub fn resolve_workspace_root(path_override: Option<&str>) -> PathBuf {
-    let path_str = path_override.unwrap_or(".");
+    let path_str = path_override.unwrap_or("~/.isanagent");
     PathBuf::from(shellexpand::tilde(path_str).to_string())
 }
 
@@ -51,7 +51,7 @@ pub struct IsanagentWorkspace {
 
 impl IsanagentWorkspace {
     /// Initializes a new workspace at the given path.
-    /// A workspace path defaults to the current directory if not provided via `--workspace`.
+    /// If no path is provided, it defaults to `~/.isanagent`.
     pub fn new(path_override: Option<&str>, config_override: Option<&str>) -> Result<Self, String> {
         let target_dir = resolve_workspace_root(path_override);
         let layout = ensure_workspace_layout(&target_dir)?;

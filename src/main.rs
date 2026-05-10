@@ -79,7 +79,7 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Path to the workspace directory (defaults to current directory; no global default).
+    /// Optional explicit path to the workspace directory. Defaults to ~/.isanagent
     #[arg(short, long)]
     workspace: Option<String>,
 
@@ -96,7 +96,7 @@ enum Commands {
 
 #[derive(ClapArgs, Debug)]
 struct OnboardArgs {
-    /// Path to the workspace directory (defaults to current directory; no global default).
+    /// Optional explicit path to the workspace directory. Defaults to ~/.isanagent
     #[arg(short, long)]
     workspace: Option<String>,
     /// Textual wizard (ratatui): provider → optional base URL → API key env var name → pick model from /models
@@ -113,10 +113,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Some(Commands::Onboard(args)) => run_onboard(cli.workspace, args).await,
-        None => run_isanagent(cli.workspace, cli.config).await,
+        None => {
+            // First-run UX: when the user invokes `isanagent` with no `--workspace` and the
+            // default `~/.isanagent` directory does not yet exist, auto-launch the interactive
+            // onboard wizard before starting the agent. Subsequent runs see the directory and
+            // skip straight to `run_isanagent`.
+            if cli.workspace.is_none() {
+                let default_root = resolve_workspace_root(None);
+                if !default_root.exists() {
+                    auto_onboard_then_run(cli.config).await?;
+                    return Ok(());
+                }
+            }
+            run_isanagent(cli.workspace, cli.config).await
+        }
     }
 }
 
+/// Runs the interactive onboard against the default workspace path then transitions into
+/// `run_isanagent` in the same invocation. Cancelling the wizard (Ctrl+C / Esc) returns
+/// `Ok(())` without launching the agent so the user can retry on the next run.
+async fn auto_onboard_then_run(
+    config_arg: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Welcome to isanagent. No workspace detected at the default location.");
+    println!("Launching the interactive onboard wizard...");
+    println!();
+
+    let onboard_result = run_onboard_inner(
+        None,
+        OnboardArgs {
+            workspace: None,
+            interactive: true,
+            options: OnboardOptions::default(),
+        },
+        /* chained = */ true,
+    )
+    .await;
+
+    match onboard_result {
+        Ok(()) => {
+            println!();
+            println!("Workspace ready. Launching isanagent...");
+            println!();
+            run_isanagent(None, config_arg).await
+        }
+        Err(e) => {
+            // The interactive wizard signalled abort (Ctrl+C / Esc) or a concrete failure.
+            // Surface the message and exit cleanly so the shell prompt returns; the user can
+            // re-run when ready.
+            eprintln!("Onboard did not complete: {e}");
+            eprintln!("Run `isanagent onboard --interactive` to try again.");
+            Ok(())
+        }
+    }
+}
 
 async fn run_isanagent(
     workspace_arg: Option<String>,
@@ -531,7 +582,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         if !env_vars.is_empty() {
             eprintln!("Set one of: {}", env_vars.join(", "));
         }
-        eprintln!("Or replace \"<changethis>\" with your key in config.toml.");
+        eprintln!("Or run `isanagent onboard` to create a config.toml, then replace \"<changethis>\" with your key.");
         eprintln!("Use /model at runtime to configure one.");
         (
             Box::new(isanagent::provider::NoKeyProvider),
@@ -1431,10 +1482,28 @@ fn print_onboarding_report(
     }
 }
 
-/// Build the `Run:` line for the onboarding banner. Always includes `--workspace` since there is
-/// no global default path.
+/// Build the `Run:` line for the onboarding banner. When `report_root` resolves to the same path
+/// as the default (`~/.isanagent`), the `--workspace` flag is redundant and is omitted so the
+/// user sees the cleanest invocation that will work.
 fn format_next_steps_run_line(report_root: &std::path::Path) -> String {
-    format!("isanagent --workspace {}", report_root.display())
+    let default_root = isanagent::workspace::resolve_workspace_root(None);
+    let same = paths_equivalent(report_root, &default_root);
+    if same {
+        "isanagent".to_string()
+    } else {
+        format!("isanagent --workspace {}", report_root.display())
+    }
+}
+
+/// Compare two paths after best-effort canonicalization. Falls back to direct equality when
+/// canonicalize fails (e.g. one of the paths is on a not-yet-existing filesystem branch).
+fn paths_equivalent(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let canon_a = std::fs::canonicalize(a).ok();
+    let canon_b = std::fs::canonicalize(b).ok();
+    match (canon_a, canon_b) {
+        (Some(a), Some(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 #[cfg(test)]
@@ -1442,7 +1511,14 @@ mod next_steps_tests {
     use super::*;
 
     #[test]
-    fn always_includes_workspace_flag() {
+    fn omits_workspace_flag_when_root_is_default() {
+        let default_root = isanagent::workspace::resolve_workspace_root(None);
+        let line = format_next_steps_run_line(&default_root);
+        assert_eq!(line, "isanagent", "got {line}");
+    }
+
+    #[test]
+    fn includes_workspace_flag_for_custom_root() {
         let custom = std::env::temp_dir().join("isanagent-next-steps-test-custom");
         let line = format_next_steps_run_line(&custom);
         assert!(

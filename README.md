@@ -52,24 +52,34 @@ If that’s the kind of “finish the thing and show your work” energy you wan
 
 ## Get started
 
-### Build from source
+**Fast path:** download a prebuilt binary from **[Releases](https://github.com/altaidevorg/isanagent/releases)** (Linux, **macOS** Apple silicon, and Windows), run it, and complete the first-run wizard. The embedded browser UI is baked into the binary.
 
-From a clone of this repo, **`ui/dist` is already present**, so a normal Rust build is enough unless you edited `ui/`:
+### Prebuilt binary (recommended)
 
-```bash
-cargo build --release
-```
-
-Scaffold a workspace and run:
+**One-liner (latest [`main-latest`](https://github.com/altaidevorg/isanagent/releases/tag/main-latest))** — same assets as on the release page; downloads the binary next to you, then runs it (same first-run / onboard behavior as below):
 
 ```bash
-cargo run --release -- onboard --workspace my_workspace
-cargo run --release -- --workspace my_workspace
+# Linux (x86_64)
+curl -fsSL https://github.com/altaidevorg/isanagent/releases/download/main-latest/isanagent-linux-x86_64 -o isanagent && chmod +x isanagent && ./isanagent
 ```
 
-The `--workspace` flag defaults to the current directory (`.`) — there is no global default path like `~/.isanagent` anymore. Set API credentials (for example `GEMINI_API_KEY` or the env var named in `config.toml`). Turn on **`[api] enabled = true`** and **`serve_ui = true`** in `config.toml` when you want the browser UI on `http://127.0.0.1:<port>/`. For channels, memory, harness options, and sandbox rules, see [`AGENTS.md`](./AGENTS.md).
+```bash
+# macOS (Apple silicon)
+curl -fsSL https://github.com/altaidevorg/isanagent/releases/download/main-latest/isanagent-macos-aarch64 -o isanagent && chmod +x isanagent && ./isanagent
+```
 
-You only need `cd ui && npm ci && npm run build` if you are changing the frontend.
+```powershell
+# Windows (x86_64, PowerShell)
+Invoke-WebRequest https://github.com/altaidevorg/isanagent/releases/download/main-latest/isanagent-windows-x86_64.exe -OutFile isanagent.exe; .\isanagent.exe
+```
+
+1. Or open **[Releases](https://github.com/altaidevorg/isanagent/releases)** and download the asset for your platform from **Latest main build** (tag [`main-latest`](https://github.com/altaidevorg/isanagent/releases/tag/main-latest)): `isanagent-linux-x86_64`, `isanagent-macos-aarch64`, or `isanagent-windows-x86_64.exe`.
+2. On Linux or macOS, mark it executable (example): `chmod +x isanagent-linux-x86_64` or `chmod +x isanagent-macos-aarch64`.
+3. Run the binary from a terminal (examples): `./isanagent-linux-x86_64` (Linux) or `./isanagent-macos-aarch64` (macOS); on Windows, run `isanagent-windows-x86_64.exe` from Explorer or `.\isanagent-windows-x86_64.exe` in PowerShell.
+
+If you use the **default workspace** (`~/.isanagent` on Unix, or the equivalent on Windows) and that folder does not exist yet, **the first run starts the interactive onboard wizard** (provider, API key env var, model, and workspace layout), then continues into the agent in the same session. For a custom workspace path, run `isanagent onboard` (add `--interactive` for the full wizard) or `isanagent --workspace /path/to/workspace` once the directory and `config.toml` exist.
+
+Set API credentials the wizard recommends (for example `GEMINI_API_KEY` or your provider's variable). Turn on **`[api] enabled = true`** and **`serve_ui = true`** in `config.toml` when you want the browser UI on `http://127.0.0.1:<port>/`. For channels, memory, harness options, and sandbox rules, see [`AGENTS.md`](./AGENTS.md).
 
 ### Multi-provider setup
 
@@ -92,6 +102,25 @@ model_name = "claude-sonnet-4-6"
 ```
 
 Use `/model` in the TUI to open the interactive model selector, or `/model gemini-2-5-flash` to switch directly. Your choice is remembered across restarts.
+
+### Build from source (optional)
+
+From a clone of this repo, **`ui/dist` is already present**, so a normal Rust build is enough unless you edited `ui/`:
+
+```bash
+cargo build --release
+./target/release/isanagent
+```
+
+To scaffold a workspace at a specific path without the default first-run flow:
+
+```bash
+cargo run --release -- onboard --workspace my_agent
+# then:
+cargo run --release -- --workspace my_agent
+```
+
+You only need `cd ui && npm ci && npm run build` if you are changing the frontend.
 
 ---
 

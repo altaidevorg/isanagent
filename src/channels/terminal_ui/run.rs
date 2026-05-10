@@ -900,10 +900,7 @@ fn char_wrap_compose(
     let w = width.max(1);
     let mut out: Vec<Line<'static>> = Vec::new();
 
-    let logical_lines: Vec<&str> = input.split('\n').collect();
-    let has_lines = !logical_lines.is_empty();
-
-    for (li, logical) in logical_lines.iter().enumerate() {
+    for (li, logical) in input.split('\n').enumerate() {
         let prefix: &str = if li == 0 { "> " } else { "  " };
         let prefix_w: usize = 2; // both "> " and "  " are 2 display-columns
         let text_budget = w.saturating_sub(prefix_w);
@@ -947,13 +944,6 @@ fn char_wrap_compose(
             }
             out.push(Line::from(Span::styled(chunk, text_style)));
         }
-    }
-
-    if !has_lines {
-        out.push(Line::from(vec![
-            Span::styled("> ".to_string(), prompt_style),
-            Span::styled(String::new(), text_style),
-        ]));
     }
 
     out
