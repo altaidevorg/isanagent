@@ -167,7 +167,7 @@ impl Tool for ExecutionSessionCreateTool {
                 "label": { "type": "string", "description": "Optional label for logs" },
                 "language": {
                     "type": "string",
-                    "description": "Optional language hint. Local: python, py, shell, sh, bash. Jupyter: python, py, r, R (ir kernel). SSH: python, py, shell, sh, bash (remote exec with code on stdin). Colab MCP MVP currently expects python."
+                    "description": "Optional language hint. Local: shell, sh, bash, cmd, powershell (all map to the host shell — use python_run or exec+uv for Python). Jupyter: python, py, r, R (ir kernel). SSH: python, py, shell, sh, bash (remote exec with code on stdin). Colab MCP MVP currently expects python."
                 },
                 "resume_jupyter_kernel_id": {
                     "type": "string",
