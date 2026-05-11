@@ -979,6 +979,8 @@ impl Tool for ShellExecTool {
         };
 
         cmd.current_dir(actual_dir);
+        // Explicitly forward host environment so secrets/API keys are visible to the child.
+        cmd.envs(std::env::vars());
 
         let child = cmd.output();
 
@@ -2278,6 +2280,8 @@ impl Tool for PythonRunTool {
         cmd.arg("python");
         cmd.arg("-");
         cmd.current_dir(&self.workspace_dir);
+        // Explicitly forward host environment so secrets/API keys are visible to the child.
+        cmd.envs(std::env::vars());
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());

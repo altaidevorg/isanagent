@@ -1,7 +1,7 @@
 //! Local subprocess execution (Phase 1): sandbox cwd, timeouts, output caps, best-effort cancel.
 //!
-//! **Python** can run in **REPL mode** (default): one long-lived `python` per session with a shared
-//! namespace across `run` calls, or **subprocess mode**: a fresh interpreter per `run` (legacy).
+//! Sessions run **shell** commands only (`cmd /C` on Windows, `sh -c` on Unix).
+//! For Python, use `python_run` or write scripts and run them via `exec` / `uv run`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
@@ -22,23 +22,17 @@ use super::capabilities::{
 use super::error::ExecutionError;
 use super::ids::SessionId;
 use super::provider::ExecutionProvider;
-use super::repl_framing::{self, string_from_utf8_lossy_trim_cap, PYTHON_REPL_BOOTSTRAP};
+use super::repl_framing::string_from_utf8_lossy_trim_cap;
 use super::run::{CwdPolicy, RunResult, RunSpec, SessionCreateRequest, SessionHandle};
-use super::run_history_dir;
+
 use crate::tool_runtime::emit_tool_progress_message;
 use crate::tools::builtin::resolve_path;
 
 /// How user code is executed for a session.
 #[derive(Debug, Clone)]
 pub enum LocalExecMode {
-    /// Python: either a persistent REPL child or one fresh subprocess per `run`.
-    Python {
-        executable: String,
-        /// When true, one interpreter per session (variables persist). When false, each `run` is isolated.
-        repl: bool,
-    },
-    /// POSIX `sh -c` or Windows `cmd /C` (shell — use only with trusted prompts).
-    Shell,
+    /// POSIX `sh -c`, Windows `cmd /C`, or `powershell -Command`.
+    Shell { language: Option<String> },
 }
 
 /// Configuration for [`LocalExecutionProvider`].
@@ -120,16 +114,6 @@ struct LocalSession {
     active_pid: Mutex<Option<u32>>,
     /// Present while a `run` is in flight (also used to reject overlapping runs).
     run_cancel: Mutex<Option<CancellationToken>>,
-    /// Persistent Python worker (REPL mode only). Dropped on close, cancel, timeout, or cwd change.
-    python_repl: Mutex<Option<ReplPythonChild>>,
-}
-
-/// One long-lived `python -u -c <bootstrap>` with framed stdin/stdout.
-struct ReplPythonChild {
-    cwd: PathBuf,
-    stdin: tokio::process::ChildStdin,
-    stdout: tokio::process::ChildStdout,
-    child: Child,
 }
 
 /// Host `python` invocation for REPL and subprocess runs. On Windows, bare `python` / `python3`
@@ -145,6 +129,22 @@ pub fn build_python_host_command(executable: &str) -> StdCommand {
         }
     }
     StdCommand::new(ex)
+}
+
+/// Returns the name of the underlying terminal/shell for the current platform.
+/// Used to surface an accurate language hint in execution session capabilities.
+pub fn platform_shell_name() -> &'static str {
+    if cfg!(windows) {
+        "cmd"
+    } else if std::env::var("SHELL")
+        .ok()
+        .map(|s| s.contains("bash"))
+        .unwrap_or(false)
+    {
+        "bash"
+    } else {
+        "sh"
+    }
 }
 
 /// True when the UV binary is discoverable on PATH.
@@ -336,7 +336,7 @@ impl LocalExecutionProvider {
         }
 
         let mut caps = ProviderCapabilities::minimal("local");
-        caps.languages = vec!["python".into(), "shell".into()];
+        caps.languages = vec![platform_shell_name().to_string()];
         caps.supports_persistent_sessions = true;
         caps.supports_interrupt = true;
         caps.supports_package_install = false;
@@ -443,13 +443,20 @@ impl LocalExecutionProvider {
             .map(str::trim)
             .filter(|s| !s.is_empty());
         match lang {
-            None | Some("python") | Some("py") => Ok(LocalExecMode::Python {
-                executable: self.resolve_python_executable().await?,
-                repl: self.config.python_repl,
-            }),
-            Some("shell") | Some("sh") | Some("bash") => Ok(LocalExecMode::Shell),
+            Some("python") | Some("py") => Err(ExecutionError::InvalidArgument(
+                "Local execution sessions no longer support Python. \
+                 Use `python_run` for quick inline code, or write a .py file \
+                 and run it with `exec` via `uv run script.py` for complex tasks."
+                    .to_string(),
+            )),
+            None | Some("shell") | Some("sh") | Some("bash") | Some("cmd") | Some("powershell") => {
+                Ok(LocalExecMode::Shell {
+                    language: lang.map(String::from),
+                })
+            }
             Some(other) => Err(ExecutionError::InvalidArgument(format!(
-                "unsupported language for local provider: {other} (supported: python, shell)"
+                "unsupported language for local provider: {other} (supported: shell, {})",
+                platform_shell_name()
             ))),
         }
     }
@@ -461,21 +468,13 @@ impl LocalExecutionProvider {
         cwd_display: &str,
     ) -> SessionCapabilities {
         let active_language = match mode {
-            LocalExecMode::Python { .. } => Some("python".into()),
-            LocalExecMode::Shell => Some("shell".into()),
+            LocalExecMode::Shell { language } => Some(
+                language
+                    .clone()
+                    .unwrap_or_else(|| platform_shell_name().to_string()),
+            ),
         };
-        let mut ext = std::collections::BTreeMap::new();
-        if let LocalExecMode::Python { repl, .. } = mode {
-            ext.insert("local_python_repl".into(), serde_json::Value::Bool(*repl));
-            let runtime = match self.config.python_runtime {
-                LocalPythonRuntime::System => "system",
-                LocalPythonRuntime::UvManaged => "uv_managed",
-            };
-            ext.insert(
-                "local_python_runtime".into(),
-                serde_json::Value::String(runtime.to_string()),
-            );
-        }
+        let ext = std::collections::BTreeMap::new();
         SessionCapabilities {
             session_id: id.clone(),
             schema_version: 1,
@@ -509,75 +508,6 @@ impl LocalExecutionProvider {
             .map_err(ExecutionError::InvalidArgument),
         }
     }
-
-    /// Spawns or reuses the REPL child when `cwd` matches; otherwise kills the old child and spawns in `cwd`.
-    async fn ensure_python_repl(
-        &self,
-        session: &LocalSession,
-        executable: &str,
-        cwd: &Path,
-    ) -> Result<(), ExecutionError> {
-        let mut slot = session.python_repl.lock().await;
-        let cwd = cwd.to_path_buf();
-        let respawn = match slot.as_ref() {
-            None => true,
-            Some(ch) => ch.cwd != cwd,
-        };
-        if respawn {
-            if let Some(mut old) = slot.take() {
-                let _ = old.child.kill().await;
-            }
-            let mut cmd = Command::from(build_python_host_command(executable));
-            cmd.arg("-u").arg("-c").arg(PYTHON_REPL_BOOTSTRAP);
-            cmd.current_dir(&cwd);
-            cmd.stdin(Stdio::piped());
-            cmd.stdout(Stdio::piped());
-            cmd.stderr(Stdio::null());
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-                unsafe {
-                    cmd.as_std_mut().pre_exec(|| {
-                        if libc::setpgid(0, 0) != 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                        Ok(())
-                    });
-                }
-            }
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-                cmd.as_std_mut().creation_flags(CREATE_NO_WINDOW);
-            }
-            let mut child = cmd
-                .spawn()
-                .map_err(|e| ExecutionError::Provider(format!("local repl spawn: {e}")))?;
-            let stdin = child
-                .stdin
-                .take()
-                .ok_or_else(|| ExecutionError::Provider("local repl missing stdin".into()))?;
-            let stdout = child
-                .stdout
-                .take()
-                .ok_or_else(|| ExecutionError::Provider("local repl missing stdout".into()))?;
-            *slot = Some(ReplPythonChild {
-                cwd,
-                stdin,
-                stdout,
-                child,
-            });
-        }
-        Ok(())
-    }
-}
-
-async fn shutdown_repl_locked(m: &Mutex<Option<ReplPythonChild>>) {
-    let mut slot = m.lock().await;
-    if let Some(mut ch) = slot.take() {
-        let _ = ch.child.kill().await;
-    }
 }
 
 #[async_trait]
@@ -602,6 +532,10 @@ impl ExecutionProvider for LocalExecutionProvider {
         }
 
         let mode = self.pick_mode(&req).await?;
+        
+        if matches!(self.config.python_runtime, LocalPythonRuntime::UvManaged) {
+            let _ = self.resolve_python_executable().await?;
+        }
         let root = resolve_path(
             ".",
             &self.config.sandbox_dir,
@@ -617,7 +551,6 @@ impl ExecutionProvider for LocalExecutionProvider {
             mode,
             active_pid: Mutex::new(None),
             run_cancel: Mutex::new(None),
-            python_repl: Mutex::new(None),
         });
         self.sessions.insert(id.clone(), session);
 
@@ -632,7 +565,6 @@ impl ExecutionProvider for LocalExecutionProvider {
             if let Some(t) = sess.run_cancel.lock().await.take() {
                 t.cancel();
             }
-            shutdown_repl_locked(&sess.python_repl).await;
             if let Some(pid) = sess.active_pid.lock().await.take() {
                 kill_process_best_effort(pid);
             }
@@ -672,149 +604,100 @@ impl ExecutionProvider for LocalExecutionProvider {
         let timeout = Duration::from_secs(timeout_secs);
         let max_each = (self.config.max_output_bytes / 2).max(1024);
 
-        let result: Result<RunResult, ExecutionError> = match &session.mode {
-            LocalExecMode::Python {
-                executable,
-                repl: true,
-            } => {
-                let exec_owned = executable.clone();
-                let code = spec.code.clone();
-                let work = async {
-                    self.ensure_python_repl(&session, exec_owned.as_str(), &cwd)
-                        .await?;
-                    if let Some(pid) = session
-                        .python_repl
-                        .lock()
-                        .await
-                        .as_ref()
-                        .and_then(|ch| ch.child.id())
-                    {
-                        *session.active_pid.lock().await = Some(pid);
-                    }
-                    let mut g = session.python_repl.lock().await;
-                    let repl = g
-                        .as_mut()
-                        .ok_or_else(|| ExecutionError::Provider("local repl unavailable".into()))?;
-                    let mut stdout_path = None;
-                    let mut stderr_path = None;
-                    let hd;
-                    if let Some(rid) = &spec.run_id {
-                        hd = run_history_dir(&self.config.workspace_dir, "local", session_id, rid);
-                        let _ = tokio::fs::create_dir_all(&hd).await;
-                        stdout_path = Some(hd.join("stdout.txt"));
-                        stderr_path = Some(hd.join("stderr.txt"));
-                    }
-                    let (stdout, stderr, st) = repl_framing::repl_round_trip(
-                        &mut repl.stdin,
-                        &mut repl.stdout,
-                        &code,
-                        stdout_path.as_deref(),
-                        stderr_path.as_deref(),
-                        max_each,
-                    )
-                    .await?;
-                    Ok(RunResult::new(stdout, stderr, Some(st)))
-                };
-
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => {
-                        if let Some(p) = session.active_pid.lock().await.take() {
-                            kill_process_best_effort(p);
-                        }
-                        shutdown_repl_locked(&session.python_repl).await;
-                        Err(ExecutionError::Cancelled)
-                    }
-                    out = tokio::time::timeout(timeout, work) => match out {
-                        Err(_) => {
-                            if let Some(p) = session.active_pid.lock().await.take() {
-                                kill_process_best_effort(p);
-                            }
-                            shutdown_repl_locked(&session.python_repl).await;
-                            Err(ExecutionError::Timeout { timeout_secs })
-                        }
-                        Ok(Err(e)) => {
-                            if let Some(p) = session.active_pid.lock().await.take() {
-                                kill_process_best_effort(p);
-                            }
-                            shutdown_repl_locked(&session.python_repl).await;
-                            Err(e)
-                        }
-                        Ok(Ok(r)) => Ok(r),
-                    },
+        let result: Result<RunResult, ExecutionError> = {
+            let (mut cmd, stdin_body) = build_command(&session.mode, &spec.code)?;
+            
+            let mut has_local_venv = false;
+            for ancestor in cwd.ancestors() {
+                if ancestor.join(".venv").is_dir() {
+                    has_local_venv = true;
+                    break;
+                }
+                if ancestor == self.config.sandbox_dir.as_path() {
+                    break;
                 }
             }
-            _ => {
-                let (mut cmd, stdin_body) = build_command(&session.mode, &spec.code)?;
-                cmd.current_dir(&cwd);
-                cmd.stdin(if stdin_body.is_some() {
-                    Stdio::piped()
-                } else {
-                    Stdio::null()
-                });
-                cmd.stdout(Stdio::piped());
-                cmd.stderr(Stdio::piped());
-                #[cfg(unix)]
-                {
-                    use std::os::unix::process::CommandExt;
-                    unsafe {
-                        cmd.as_std_mut().pre_exec(|| {
-                            if libc::setpgid(0, 0) != 0 {
-                                return Err(std::io::Error::last_os_error());
-                            }
-                            Ok(())
-                        });
-                    }
-                }
-                #[cfg(windows)]
-                {
-                    use std::os::windows::process::CommandExt;
-                    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-                    cmd.as_std_mut().creation_flags(CREATE_NO_WINDOW);
-                }
 
-                let child = cmd
-                    .spawn()
-                    .map_err(|e| ExecutionError::Provider(e.to_string()))?;
-                let pid = child.id();
-                if let Some(pid) = pid {
-                    *session.active_pid.lock().await = Some(pid);
-                }
-
-                let work = async move {
-                    match tokio::time::timeout(
-                        timeout,
-                        drain_child_pipes(child, max_each, stdin_body),
-                    )
-                    .await
-                    {
-                        Err(_) => {
-                            if let Some(p) = pid {
-                                kill_process_best_effort(p);
-                            }
-                            Err(ExecutionError::Timeout { timeout_secs })
+            if !has_local_venv {
+                if let Some(state) = &self.uv_state {
+                    if let Some(path) = state.env_python_path.lock().await.as_ref() {
+                        // path is <env_dir>/bin/python or <env_dir>/Scripts/python.exe
+                        // UV_PROJECT_ENVIRONMENT should point to <env_dir>
+                        if let Some(env_dir) = path.parent().and_then(|p| p.parent()) {
+                            cmd.env("UV_PROJECT_ENVIRONMENT", env_dir);
                         }
-                        Ok(Err(e)) => Err(e),
-                        Ok(Ok(r)) => Ok(r),
                     }
-                };
+                }
+            }
+            
+            cmd.current_dir(&cwd);
+            cmd.stdin(if stdin_body.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            });
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                unsafe {
+                    cmd.as_std_mut().pre_exec(|| {
+                        if libc::setpgid(0, 0) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                cmd.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+            }
 
-                let mut jh = tokio::spawn(work);
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => {
+            let child = cmd
+                .spawn()
+                .map_err(|e| ExecutionError::Provider(e.to_string()))?;
+            let pid = child.id();
+            if let Some(pid) = pid {
+                *session.active_pid.lock().await = Some(pid);
+            }
+
+            let work = async move {
+                match tokio::time::timeout(
+                    timeout,
+                    drain_child_pipes(child, max_each, stdin_body),
+                )
+                .await
+                {
+                    Err(_) => {
                         if let Some(p) = pid {
                             kill_process_best_effort(p);
                         }
-                        jh.abort();
-                        Err(ExecutionError::Cancelled)
+                        Err(ExecutionError::Timeout { timeout_secs })
                     }
-                    joined = &mut jh => match joined {
-                        Ok(inner) => inner,
-                        Err(e) if e.is_cancelled() => Err(ExecutionError::Cancelled),
-                        Err(e) => Err(ExecutionError::Provider(format!("run task join: {e}"))),
-                    },
+                    Ok(Err(e)) => Err(e),
+                    Ok(Ok(r)) => Ok(r),
                 }
+            };
+
+            let mut jh = tokio::spawn(work);
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    if let Some(p) = pid {
+                        kill_process_best_effort(p);
+                    }
+                    jh.abort();
+                    Err(ExecutionError::Cancelled)
+                }
+                joined = &mut jh => match joined {
+                    Ok(inner) => inner,
+                    Err(e) if e.is_cancelled() => Err(ExecutionError::Cancelled),
+                    Err(e) => Err(ExecutionError::Provider(format!("run task join: {e}"))),
+                },
             }
         };
 
@@ -836,7 +719,6 @@ impl ExecutionProvider for LocalExecutionProvider {
         if let Some(pid) = session.active_pid.lock().await.take() {
             kill_process_best_effort(pid);
         }
-        shutdown_repl_locked(&session.python_repl).await;
         Ok(())
     }
 }
@@ -946,6 +828,8 @@ async fn run_uv_command(
         if let Some(cwd) = cwd.as_ref() {
             cmd.current_dir(cwd);
         }
+        // Explicitly forward host environment so secrets/API keys are visible to the child.
+        cmd.envs(std::env::vars());
         cmd.stdin(Stdio::null());
         let out = cmd
             .output()
@@ -978,18 +862,19 @@ fn build_command(
     mode: &LocalExecMode,
     code: &str,
 ) -> Result<(Command, Option<Vec<u8>>), ExecutionError> {
-    let (c, stdin) = match mode {
-        LocalExecMode::Python { executable, .. } => {
-            let mut c = Command::from(build_python_host_command(executable));
-            // Unbuffered; code is sent on stdin to avoid command-line length limits.
-            c.arg("-u").arg("-");
-            (c, Some(code.as_bytes().to_vec()))
-        }
-        LocalExecMode::Shell => {
+    let (mut c, stdin) = match mode {
+        LocalExecMode::Shell { language } => {
+            let lang = language.as_deref().unwrap_or(platform_shell_name());
             if cfg!(target_os = "windows") {
-                let mut c = Command::new("cmd");
-                c.arg("/C").arg(code);
-                (c, None)
+                if lang == "powershell" || lang == "pwsh" {
+                    let mut c = Command::new("powershell");
+                    c.arg("-Command").arg(code);
+                    (c, None)
+                } else {
+                    let mut c = Command::new("cmd");
+                    c.arg("/C").arg(code);
+                    (c, None)
+                }
             } else {
                 let mut c = Command::new("sh");
                 c.arg("-c").arg(code);
@@ -997,6 +882,8 @@ fn build_command(
             }
         }
     };
+    // Explicitly forward host environment so secrets/API keys are visible to the child.
+    c.envs(std::env::vars());
     Ok((c, stdin))
 }
 
@@ -1050,19 +937,14 @@ mod tests {
     }
 
     fn echo_hello_case() -> (&'static str, String) {
-        if cfg!(windows) {
-            // `cmd /C echo` is reliable for stdio; Windows Store `python` shims can yield empty stdout in CI.
-            ("shell", "echo hello-exec".into())
-        } else {
-            ("python", r#"print("hello-exec")"#.into())
-        }
+        ("shell", "echo hello-exec".into())
     }
 
     fn long_running_case() -> (&'static str, String) {
         if cfg!(windows) {
             ("shell", "ping -n 120 127.0.0.1 >nul".into())
         } else {
-            ("python", "import time; time.sleep(60)".into())
+            ("shell", "sleep 60".into())
         }
     }
 
@@ -1070,7 +952,7 @@ mod tests {
         if cfg!(windows) {
             ("shell", "ping -n 60 127.0.0.1 >nul".into())
         } else {
-            ("python", "import time; time.sleep(30)".into())
+            ("shell", "sleep 30".into())
         }
     }
 
@@ -1113,7 +995,7 @@ mod tests {
         let prov = LocalExecutionProvider::new(cfg).unwrap();
         let h = prov
             .create_session(SessionCreateRequest {
-                language: Some((if cfg!(windows) { "shell" } else { "python" }).to_string()),
+                language: Some("shell".to_string()),
                 ..Default::default()
             })
             .await
@@ -1121,7 +1003,7 @@ mod tests {
         let code = if cfg!(windows) {
             "type marker.txt".to_string()
         } else {
-            r#"import pathlib; print(pathlib.Path("marker.txt").read_text())"#.to_string()
+            "cat marker.txt".to_string()
         };
         let mut spec = RunSpec::new(code, 30);
         spec.cwd = CwdPolicy::SandboxRelative("pkg".into());
@@ -1181,65 +1063,6 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// REPL mode needs a real `python` on PATH; Windows Store shims are flaky for CI, so Unix-only.
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn local_python_repl_persists_variables() {
-        let dir = temp_sandbox();
-        let cfg = LocalExecutionConfig::new(dir.clone(), true);
-        assert!(cfg.python_repl);
-        let prov = LocalExecutionProvider::new(cfg).unwrap();
-        let h = prov
-            .create_session(SessionCreateRequest {
-                language: Some("python".into()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let r1 = prov
-            .run(&h.id, RunSpec::new("x = 42", 30))
-            .await
-            .unwrap_or_else(|e| panic!("first run: {e:?}"));
-        assert_eq!(r1.exit_code, Some(0), "{r1:?}");
-        let r2 = prov
-            .run(&h.id, RunSpec::new("print(x)", 30))
-            .await
-            .unwrap_or_else(|e| panic!("second run: {e:?}"));
-        assert_eq!(r2.exit_code, Some(0), "{r2:?}");
-        assert!(
-            r2.stdout.contains("42"),
-            "expected repl namespace; stdout={:?}",
-            r2.stdout
-        );
-        prov.close_session(&h.id).await.unwrap();
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn local_python_subprocess_mode_no_shared_namespace() {
-        let dir = temp_sandbox();
-        let mut cfg = LocalExecutionConfig::new(dir.clone(), true);
-        cfg.python_repl = false;
-        let prov = LocalExecutionProvider::new(cfg).unwrap();
-        let h = prov
-            .create_session(SessionCreateRequest {
-                language: Some("python".into()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let r1 = prov.run(&h.id, RunSpec::new("x = 42", 30)).await.unwrap();
-        assert_eq!(r1.exit_code, Some(0));
-        let r2 = prov.run(&h.id, RunSpec::new("print(x)", 30)).await.unwrap();
-        assert_ne!(r2.exit_code, Some(0), "{r2:?}");
-        assert!(
-            r2.stderr.contains("NameError") || r2.stdout.contains("NameError"),
-            "{r2:?}"
-        );
-        prov.close_session(&h.id).await.unwrap();
-        let _ = fs::remove_dir_all(&dir);
-    }
 
     #[test]
     fn uv_env_key_changes_with_python_or_requirements() {
@@ -1332,6 +1155,53 @@ mod tests {
         let nonexistent = dir.join("does_not_exist").join("python");
         let res = uv_requirements_status("uv", &nonexistent, &["numpy".into()]).unwrap();
         assert!(res.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn local_powershell_support() {
+        let dir = temp_sandbox();
+        let cfg = LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
+        let prov = LocalExecutionProvider::new(cfg).unwrap();
+        let h = prov
+            .create_session(SessionCreateRequest {
+                language: Some("powershell".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // $PSVersionTable exists in PowerShell but not in CMD
+        let r = prov
+            .run(&h.id, RunSpec::new("if ($PSVersionTable) { echo 'ps-ok' }", 30))
+            .await
+            .unwrap();
+        assert!(r.stdout.contains("ps-ok"), "{r:?}");
+        prov.close_session(&h.id).await.unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn uv_managed_honors_local_venv_priority() {
+        let dir = temp_sandbox();
+        let venv_dir = dir.join(".venv");
+        fs::create_dir_all(&venv_dir).unwrap();
+        // Create a dummy file to simulate a real venv
+        fs::write(venv_dir.join("pyvenv.cfg"), "home = .").unwrap();
+        
+        let mut cfg = LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
+        cfg.python_runtime = LocalPythonRuntime::UvManaged;
+        let prov = LocalExecutionProvider::new(cfg).unwrap();
+        
+        let h = prov.create_session(SessionCreateRequest::default()).await.unwrap();
+        
+        // Use a command that prints the environment variable we inject
+        let code = if cfg!(windows) { "echo %UV_PROJECT_ENVIRONMENT%" } else { "echo $UV_PROJECT_ENVIRONMENT" };
+        let r = prov.run(&h.id, RunSpec::new(code, 30)).await.unwrap();
+        
+        // It should NOT contain the managed environment path because .venv exists
+        assert!(!r.stdout.contains(".system_generated"), "UV_PROJECT_ENVIRONMENT was injected despite local .venv: {}", r.stdout);
+        
+        prov.close_session(&h.id).await.unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 }
