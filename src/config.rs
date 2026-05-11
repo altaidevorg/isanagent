@@ -387,7 +387,10 @@ impl AppConfig {
             Some(p) => p,
             None => return result,
         };
-        for (key, cfg) in providers {
+        let mut sorted_keys: Vec<_> = providers.keys().collect();
+        sorted_keys.sort();
+        for key in sorted_keys {
+            let cfg = &providers[key];
             let provider_name = if cfg.provider_name.is_empty() {
                 key.clone()
             } else {
