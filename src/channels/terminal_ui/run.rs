@@ -880,6 +880,75 @@ fn append_execution_stream_panel(app: &mut App, msg: &OutboundMessage) {
     }
 }
 
+/// Character-level wrapping for the compose input box.
+///
+/// Splits each logical line (delimited by `'\n'` in `input`) into visual rows
+/// that are at most `width` display-columns wide.  The first logical line gets
+/// the `"> "` prompt; continuations get `"  "`.  Each row is a complete
+/// [`Line`] so the caller can render the result **without** `Wrap`.
+///
+/// This keeps cursor-position arithmetic (`total_cols / width`) perfectly
+/// aligned with what is actually drawn on screen.
+fn char_wrap_compose(
+    input: &str,
+    width: usize,
+    prompt_style: Style,
+    text_style: Style,
+) -> Vec<Line<'static>> {
+    use unicode_width::UnicodeWidthChar;
+
+    let w = width.max(1);
+    let mut out: Vec<Line<'static>> = Vec::new();
+
+    for (li, logical) in input.split('\n').enumerate() {
+        let prefix: &str = if li == 0 { "> " } else { "  " };
+        let prefix_w: usize = 2; // both "> " and "  " are 2 display-columns
+        let text_budget = w.saturating_sub(prefix_w);
+
+        // First visual row: prefix + as much text as fits.
+        let mut chars = logical.chars().peekable();
+        let mut first_chunk = String::new();
+        let mut col: usize = 0;
+        while let Some(&ch) = chars.peek() {
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
+            if col + cw > text_budget {
+                break;
+            }
+            first_chunk.push(ch);
+            col += cw;
+            chars.next();
+        }
+        out.push(Line::from(vec![
+            Span::styled(prefix.to_string(), prompt_style),
+            Span::styled(first_chunk, text_style),
+        ]));
+
+        // Subsequent visual rows: up to `w` columns of text each (no prefix).
+        while chars.peek().is_some() {
+            let mut chunk = String::new();
+            let mut col: usize = 0;
+            while let Some(&ch) = chars.peek() {
+                let cw = UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
+                if col + cw > w {
+                    break;
+                }
+                chunk.push(ch);
+                col += cw;
+                chars.next();
+            }
+            if chunk.is_empty() {
+                // Single character wider than the whole line — force it through.
+                if let Some(ch) = chars.next() {
+                    chunk.push(ch);
+                }
+            }
+            out.push(Line::from(Span::styled(chunk, text_style)));
+        }
+    }
+
+    out
+}
+
 fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
     let x1 = r.x.saturating_add(r.width);
     let y1 = r.y.saturating_add(r.height);
@@ -1620,23 +1689,19 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 .title(Span::styled(" compose ", Theme::dim()))
                 .border_style(Theme::dim());
 
-            let mut text_lines = Vec::new();
-            for (i, line) in app.input.split('\n').enumerate() {
-                let prefix = if i == 0 { "> " } else { "  " };
-                text_lines.push(Line::from(vec![
-                    Span::styled(prefix, Theme::input_prompt()),
-                    Span::styled(line, Theme::text()),
-                ]));
-            }
-            if text_lines.is_empty() {
-                text_lines.push(Line::from(vec![
-                    Span::styled("> ", Theme::input_prompt()),
-                    Span::styled("", Theme::text()),
-                ]));
-            }
-
             let inner_area = ch[5].inner(Margin::new(1, 1));
             let inner_w = inner_area.width.max(1); // guard against zero-width after margin
+
+            // Build visual lines with character-level wrapping so that the cursor
+            // calculation (`total_cols / inner_w`) matches the rendered layout
+            // exactly.  Previously the code relied on ratatui's Wrap which uses
+            // word-level breaking, causing a mismatch.
+            let text_lines = char_wrap_compose(
+                &app.input,
+                inner_w as usize,
+                Theme::input_prompt(),
+                Theme::text(),
+            );
 
             // Calculate visual line of cursor for wrapping.
             // Uses display_width (Unicode column width) instead of char count so that
@@ -1647,7 +1712,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             let lines_before_cursor: Vec<&str> = text_before_cursor.split('\n').collect();
             let total_lines = lines_before_cursor.len();
             for (i, line) in lines_before_cursor.into_iter().enumerate() {
-                let prefix_len: u16 = if i == 0 { 2 } else { 0 }; // "> "
+                let prefix_len: u16 = 2; // "> " on first line, "  " on continuations
                 let col_width = super::display_width(line) as u16;
                 let total_cols = prefix_len + col_width;
 
@@ -1672,7 +1737,6 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 
             let input_para = Paragraph::new(Text::from(text_lines))
                 .block(input_block)
-                .wrap(ratatui::widgets::Wrap { trim: false })
                 .scroll((input_v_scroll, 0));
             f.render_widget(input_para, ch[5]);
 

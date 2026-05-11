@@ -515,10 +515,14 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             .unwrap_or_else(|| isanagent::config::ProviderConfig {
                 provider_name: DEFAULT_PROVIDER_NAME.to_string(),
                 model_name: DEFAULT_PROVIDER_MODEL_NAME.to_string(),
+                models: None,
                 api_key_env: DEFAULT_PROVIDER_API_KEY_ENV.to_string(),
                 api_key: None,
                 base_url: None,
             });
+
+    // Expand family-format providers into flat per-model map (once, reused everywhere).
+    let expanded_providers = workspace.config.expanded_providers();
 
     // Try to find any provider with a valid API key. No key = start with NoKeyProvider.
     // Priority: last_model file (remembers /model choice) → [provider] → first [providers.*] with key.
@@ -532,11 +536,9 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         // 0. Try remembered last model choice
         let mut found_remembered = None;
         if let Some(ref key_name) = remembered_key {
-            if let Some(providers_map) = &workspace.config.providers {
-                if let Some(cfg) = providers_map.get(key_name) {
-                    if let Ok(key) = cfg.resolve_api_key() {
-                        found_remembered = Some((cfg.clone(), key));
-                    }
+            if let Some(cfg) = expanded_providers.get(key_name) {
+                if let Ok(key) = cfg.resolve_api_key() {
+                    found_remembered = Some((cfg.clone(), key));
                 }
             }
         }
@@ -547,14 +549,12 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         else if let Ok(key) = default_provider_cfg.resolve_api_key() {
             (Some(default_provider_cfg.clone()), Some(key))
         } else {
-            // 2. Try any [providers.*] entry
+            // 2. Try any expanded [providers.*] entry
             let mut found: Option<(isanagent::config::ProviderConfig, String)> = None;
-            if let Some(providers_map) = &workspace.config.providers {
-                for cfg in providers_map.values() {
-                    if let Ok(key) = cfg.resolve_api_key() {
-                        found = Some((cfg.clone(), key));
-                        break;
-                    }
+            for cfg in expanded_providers.values() {
+                if let Ok(key) = cfg.resolve_api_key() {
+                    found = Some((cfg.clone(), key));
+                    break;
                 }
             }
             if let Some((cfg, key)) = found {
@@ -582,8 +582,20 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             isanagent::provider::create_provider(&cfg.provider_name, &base_url, key, &model_name);
         (p1, p2)
     } else {
-        // No API key found — start with placeholder; user can switch via /model
-        eprintln!("No API key found. Starting without a model. Use /model to configure one.");
+        // No API key found — list the env vars the user could set.
+        let env_vars: Vec<String> = expanded_providers
+            .values()
+            .map(|c| c.resolved_api_key_env())
+            .filter(|e| !e.is_empty())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        eprintln!("No API key configured for any provider.");
+        if !env_vars.is_empty() {
+            eprintln!("Set one of: {}", env_vars.join(", "));
+        }
+        eprintln!("Or run `isanagent onboard` to create a config.toml, then replace \"<changethis>\" with your key.");
+        eprintln!("Use /model at runtime to configure one.");
         (
             Box::new(isanagent::provider::NoKeyProvider),
             Box::new(isanagent::provider::NoKeyProvider),
@@ -771,8 +783,8 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             status_model: model_name.clone(),
             memory_node: memory_node.clone(),
             providers: {
-                // Merge default [provider] + all [providers.*] into one map for /model selector
-                let mut all_providers = workspace.config.providers.clone().unwrap_or_default();
+                // Merge default [provider] + expanded [providers.*] into one map for /model selector
+                let mut all_providers = expanded_providers.clone();
                 if let Some(def) = &workspace.config.provider {
                     let key = format!("{}/{}", def.provider_name, def.model_name);
                     all_providers.entry(key).or_insert_with(|| def.clone());
@@ -1520,7 +1532,6 @@ mod next_steps_tests {
 
     #[test]
     fn includes_workspace_flag_for_custom_root() {
-        // Use a path that cannot match the user's home directory: a sibling of the workspace dir.
         let custom = std::env::temp_dir().join("isanagent-next-steps-test-custom");
         let line = format_next_steps_run_line(&custom);
         assert!(

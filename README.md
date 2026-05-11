@@ -79,7 +79,7 @@ Invoke-WebRequest https://github.com/altaidevorg/isanagent/releases/download/mai
 
 If you use the **default workspace** (`~/.isanagent` on Unix, or the equivalent on Windows) and that folder does not exist yet, **the first run starts the interactive onboard wizard** (provider, API key env var, model, and workspace layout), then continues into the agent in the same session. For a custom workspace path, run `isanagent onboard` (add `--interactive` for the full wizard) or `isanagent --workspace /path/to/workspace` once the directory and `config.toml` exist.
 
-Set API credentials the wizard recommends (for example `GEMINI_API_KEY` or your provider’s variable). Turn on **`[api] enabled = true`** and **`serve_ui = true`** in `config.toml` when you want the browser UI on `http://127.0.0.1:<port>/`. For channels, memory, harness options, and sandbox rules, see [`AGENTS.md`](./AGENTS.md).
+Set API credentials the wizard recommends (for example `GEMINI_API_KEY` or your provider's variable). Turn on **`[api] enabled = true`** and **`serve_ui = true`** in `config.toml` when you want the browser UI on `http://127.0.0.1:<port>/`. For channels, memory, harness options, and sandbox rules, see [`AGENTS.md`](./AGENTS.md).
 
 ### Multi-provider setup
 
