@@ -2102,7 +2102,9 @@ mod placeholder_key_tests {
 
     #[test]
     fn rejects_placeholder_keyword() {
-        assert!(provider_with_key("my_placeholder_key").resolve_api_key().is_err());
+        assert!(provider_with_key("my_placeholder_key")
+            .resolve_api_key()
+            .is_err());
     }
 
     #[test]
