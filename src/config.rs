@@ -1387,7 +1387,7 @@ pub struct ApiConfig {
     pub bind_address: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct ProviderConfig {
     /// One of `KNOWN_PROVIDERS` (e.g. `"gemini"`, `"openai"`, `"deepseek"`, `"openrouter"`,
     /// `"anthropic"`) or the `OPENAI_COMPATIBLE` sentinel for any third-party endpoint speaking
@@ -2113,8 +2113,8 @@ mod placeholder_key_tests {
 
     fn provider_with_key(key: &str) -> ProviderConfig {
         ProviderConfig {
-            provider_name: "deepseek".to_string(),
-            model_name: "deepseek-v4-pro".to_string(),
+            provider_name: "nonexistent-provider".to_string(),
+            model_name: "some-model".to_string(),
             models: None,
             api_key_env: "".to_string(),
             api_key: Some(key.to_string()),

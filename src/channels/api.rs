@@ -2425,8 +2425,12 @@ async fn handle_clarification_ticket_reply(
         }
     };
     let Some(ticket) = ticket else {
-        return ApiError::new(StatusCode::NOT_FOUND, "not_found", "Unknown clarification ticket")
-            .into_response();
+        return ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Unknown clarification ticket",
+        )
+        .into_response();
     };
 
     let (rtx, rrx) = oneshot::channel();
@@ -2445,7 +2449,10 @@ async fn handle_clarification_ticket_reply(
         crate::bus::METADATA_SYNTHETIC_BACKGROUND_RESUME.to_string(),
         Value::Bool(true),
     );
-    metadata.insert("clarification_ticket_id".to_string(), Value::String(ticket_id));
+    metadata.insert(
+        "clarification_ticket_id".to_string(),
+        Value::String(ticket_id),
+    );
     if let Err(e) = state
         .bus_tx
         .send(BusMessage::Inbound(InboundMessage {

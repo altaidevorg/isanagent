@@ -176,7 +176,12 @@ fn apply_onboard_options(cfg: &mut AppConfig, opts: &OnboardOptions) {
         cfg.terminal.get_or_insert_with(Default::default).enabled = Some(v);
     }
 
-    if let Some(p) = cfg.provider.as_mut() {
+    if opts.provider_name.is_some()
+        || opts.provider_model.is_some()
+        || opts.provider_api_key_env.is_some()
+        || opts.provider_base_url.is_some()
+    {
+        let p = cfg.provider.get_or_insert_with(Default::default);
         if let Some(ref n) = opts.provider_name {
             p.provider_name = n.clone();
         }
@@ -302,6 +307,15 @@ pub fn build_interactive_config_toml(options: &OnboardOptions) -> Result<String,
 
     if let Some(v) = options.terminal_enable {
         doc["terminal"]["enabled"] = value(v);
+    }
+
+    if (options.provider_name.is_some()
+        || options.provider_model.is_some()
+        || options.provider_api_key_env.is_some()
+        || options.provider_base_url.is_some())
+        && doc.get("provider").is_none()
+    {
+        doc["provider"] = toml_edit::Item::Table(toml_edit::Table::new());
     }
 
     if let Some(ref n) = options.provider_name {

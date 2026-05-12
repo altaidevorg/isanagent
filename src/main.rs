@@ -7,7 +7,9 @@ use tokio::sync::{mpsc, watch, RwLock};
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use colored::Colorize;
 use isanagent::agent::{AgentLogic, AgentLogicParams};
-use isanagent::bus::{BusMessage, InboundMessage, LoggerControlMessage, OutboundMessage, TelemetryEvent};
+use isanagent::bus::{
+    BusMessage, InboundMessage, LoggerControlMessage, OutboundMessage, TelemetryEvent,
+};
 use isanagent::channels::terminal::{
     build_agent_thought_terminal_notice, build_tool_call_terminal_notice,
     build_tool_progress_terminal_notice, build_tool_result_terminal_notice,
@@ -1116,7 +1118,8 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         }
     });
 
-    if workspace.config.background_jobs_enabled() && workspace.config.background_jobs_auto_resume() {
+    if workspace.config.background_jobs_enabled() && workspace.config.background_jobs_auto_resume()
+    {
         recover_background_jobs_on_startup(&memory_node, &bus_tx, &global_outbound_tx).await;
     }
 

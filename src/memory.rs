@@ -1545,10 +1545,15 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 })();
                 let _ = reply.send(res);
             }
-            MemoryMessage::ListBackgroundJobs { chat_id, limit, reply } => {
+            MemoryMessage::ListBackgroundJobs {
+                chat_id,
+                limit,
+                reply,
+            } => {
                 let res = (|| -> Result<Vec<BackgroundJobRecord>, String> {
                     let lim = limit.clamp(1, 500) as i64;
-                    let sql_all = "SELECT job_id, kind, chat_id, channel, thread_id, state, payload_json,
+                    let sql_all =
+                        "SELECT job_id, kind, chat_id, channel, thread_id, state, payload_json,
                             resume_after_restart, detached, last_error, created_at_ms, updated_at_ms
                          FROM background_jobs ORDER BY updated_at_ms DESC LIMIT ?1";
                     let sql_chat = "SELECT job_id, kind, chat_id, channel, thread_id, state, payload_json,
@@ -1557,48 +1562,61 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     let mut out = Vec::new();
                     if let Some(chat_id) = chat_id {
                         let mut stmt = self.conn.prepare(sql_chat).map_err(|e| e.to_string())?;
-                        let rows = stmt.query_map(params![chat_id, lim], |row| {
-                            Ok(BackgroundJobRecord {
-                                job_id: row.get(0)?,
-                                kind: row.get(1)?,
-                                chat_id: row.get(2)?,
-                                channel: row.get(3)?,
-                                thread_id: row.get(4)?,
-                                state: row.get(5)?,
-                                payload_json: row.get(6)?,
-                                resume_after_restart: row.get::<_, i64>(7)? != 0,
-                                detached: row.get::<_, i64>(8)? != 0,
-                                last_error: row.get(9)?,
-                                created_at_ms: row.get(10)?,
-                                updated_at_ms: row.get(11)?,
+                        let rows = stmt
+                            .query_map(params![chat_id, lim], |row| {
+                                Ok(BackgroundJobRecord {
+                                    job_id: row.get(0)?,
+                                    kind: row.get(1)?,
+                                    chat_id: row.get(2)?,
+                                    channel: row.get(3)?,
+                                    thread_id: row.get(4)?,
+                                    state: row.get(5)?,
+                                    payload_json: row.get(6)?,
+                                    resume_after_restart: row.get::<_, i64>(7)? != 0,
+                                    detached: row.get::<_, i64>(8)? != 0,
+                                    last_error: row.get(9)?,
+                                    created_at_ms: row.get(10)?,
+                                    updated_at_ms: row.get(11)?,
+                                })
                             })
-                        }).map_err(|e| e.to_string())?;
-                        for r in rows { out.push(r.map_err(|e| e.to_string())?); }
+                            .map_err(|e| e.to_string())?;
+                        for r in rows {
+                            out.push(r.map_err(|e| e.to_string())?);
+                        }
                     } else {
                         let mut stmt = self.conn.prepare(sql_all).map_err(|e| e.to_string())?;
-                        let rows = stmt.query_map(params![lim], |row| {
-                            Ok(BackgroundJobRecord {
-                                job_id: row.get(0)?,
-                                kind: row.get(1)?,
-                                chat_id: row.get(2)?,
-                                channel: row.get(3)?,
-                                thread_id: row.get(4)?,
-                                state: row.get(5)?,
-                                payload_json: row.get(6)?,
-                                resume_after_restart: row.get::<_, i64>(7)? != 0,
-                                detached: row.get::<_, i64>(8)? != 0,
-                                last_error: row.get(9)?,
-                                created_at_ms: row.get(10)?,
-                                updated_at_ms: row.get(11)?,
+                        let rows = stmt
+                            .query_map(params![lim], |row| {
+                                Ok(BackgroundJobRecord {
+                                    job_id: row.get(0)?,
+                                    kind: row.get(1)?,
+                                    chat_id: row.get(2)?,
+                                    channel: row.get(3)?,
+                                    thread_id: row.get(4)?,
+                                    state: row.get(5)?,
+                                    payload_json: row.get(6)?,
+                                    resume_after_restart: row.get::<_, i64>(7)? != 0,
+                                    detached: row.get::<_, i64>(8)? != 0,
+                                    last_error: row.get(9)?,
+                                    created_at_ms: row.get(10)?,
+                                    updated_at_ms: row.get(11)?,
+                                })
                             })
-                        }).map_err(|e| e.to_string())?;
-                        for r in rows { out.push(r.map_err(|e| e.to_string())?); }
+                            .map_err(|e| e.to_string())?;
+                        for r in rows {
+                            out.push(r.map_err(|e| e.to_string())?);
+                        }
                     }
                     Ok(out)
                 })();
                 let _ = reply.send(res);
             }
-            MemoryMessage::UpdateBackgroundJobState { job_id, state, last_error, reply } => {
+            MemoryMessage::UpdateBackgroundJobState {
+                job_id,
+                state,
+                last_error,
+                reply,
+            } => {
                 let res = (|| -> Result<(), String> {
                     let now = Utc::now().timestamp_millis();
                     self.conn.execute(
@@ -1623,7 +1641,12 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 ).map_err(|e| format!("insert notifications: {}", e)).map(|_| ());
                 let _ = reply.send(res);
             }
-            MemoryMessage::ListNotifications { chat_id, limit, unseen_only, reply } => {
+            MemoryMessage::ListNotifications {
+                chat_id,
+                limit,
+                unseen_only,
+                reply,
+            } => {
                 let res = (|| -> Result<Vec<NotificationRecord>, String> {
                     let lim = limit.clamp(1, 500) as i64;
                     let mut out = Vec::new();
@@ -1633,36 +1656,48 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                         (false, true) => "SELECT notification_id, chat_id, channel, thread_id, kind, title, body, action_kind, action_payload, seen_at_ms, resolved_at_ms, created_at_ms FROM notifications WHERE seen_at_ms IS NULL ORDER BY created_at_ms DESC LIMIT ?1",
                         (false, false) => "SELECT notification_id, chat_id, channel, thread_id, kind, title, body, action_kind, action_payload, seen_at_ms, resolved_at_ms, created_at_ms FROM notifications ORDER BY created_at_ms DESC LIMIT ?1",
                     };
-                    let mapper = |row: &rusqlite::Row| -> Result<NotificationRecord, rusqlite::Error> {
-                        Ok(NotificationRecord {
-                            notification_id: row.get(0)?,
-                            chat_id: row.get(1)?,
-                            channel: row.get(2)?,
-                            thread_id: row.get(3)?,
-                            kind: row.get(4)?,
-                            title: row.get(5)?,
-                            body: row.get(6)?,
-                            action_kind: row.get(7)?,
-                            action_payload: row.get(8)?,
-                            seen_at_ms: row.get(9)?,
-                            resolved_at_ms: row.get(10)?,
-                            created_at_ms: row.get(11)?,
-                        })
-                    };
+                    let mapper =
+                        |row: &rusqlite::Row| -> Result<NotificationRecord, rusqlite::Error> {
+                            Ok(NotificationRecord {
+                                notification_id: row.get(0)?,
+                                chat_id: row.get(1)?,
+                                channel: row.get(2)?,
+                                thread_id: row.get(3)?,
+                                kind: row.get(4)?,
+                                title: row.get(5)?,
+                                body: row.get(6)?,
+                                action_kind: row.get(7)?,
+                                action_payload: row.get(8)?,
+                                seen_at_ms: row.get(9)?,
+                                resolved_at_ms: row.get(10)?,
+                                created_at_ms: row.get(11)?,
+                            })
+                        };
                     if let Some(chat_id) = chat_id {
                         let mut stmt = self.conn.prepare(sql).map_err(|e| e.to_string())?;
-                        let rows = stmt.query_map(params![chat_id, lim], mapper).map_err(|e| e.to_string())?;
-                        for r in rows { out.push(r.map_err(|e| e.to_string())?); }
+                        let rows = stmt
+                            .query_map(params![chat_id, lim], mapper)
+                            .map_err(|e| e.to_string())?;
+                        for r in rows {
+                            out.push(r.map_err(|e| e.to_string())?);
+                        }
                     } else {
                         let mut stmt = self.conn.prepare(sql).map_err(|e| e.to_string())?;
-                        let rows = stmt.query_map(params![lim], mapper).map_err(|e| e.to_string())?;
-                        for r in rows { out.push(r.map_err(|e| e.to_string())?); }
+                        let rows = stmt
+                            .query_map(params![lim], mapper)
+                            .map_err(|e| e.to_string())?;
+                        for r in rows {
+                            out.push(r.map_err(|e| e.to_string())?);
+                        }
                     }
                     Ok(out)
                 })();
                 let _ = reply.send(res);
             }
-            MemoryMessage::MarkNotificationSeen { notification_id, reply } => {
+            MemoryMessage::MarkNotificationSeen {
+                notification_id,
+                reply,
+            } => {
                 let now = Utc::now().timestamp_millis();
                 let res = self.conn.execute(
                     "UPDATE notifications SET seen_at_ms = COALESCE(seen_at_ms, ?1) WHERE notification_id = ?2",
@@ -1670,7 +1705,10 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 ).map_err(|e| format!("mark notification seen: {}", e)).map(|_| ());
                 let _ = reply.send(res);
             }
-            MemoryMessage::ResolveNotification { notification_id, reply } => {
+            MemoryMessage::ResolveNotification {
+                notification_id,
+                reply,
+            } => {
                 let now = Utc::now().timestamp_millis();
                 let res = self.conn.execute(
                     "UPDATE notifications SET resolved_at_ms = COALESCE(resolved_at_ms, ?1) WHERE notification_id = ?2",
@@ -1693,7 +1731,11 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 ).map_err(|e| format!("upsert clarification_tickets: {}", e)).map(|_| ());
                 let _ = reply.send(res);
             }
-            MemoryMessage::ResolveClarificationTicket { ticket_id, response, reply } => {
+            MemoryMessage::ResolveClarificationTicket {
+                ticket_id,
+                response,
+                reply,
+            } => {
                 let now = Utc::now().timestamp_millis();
                 let res = self.conn.execute(
                     "UPDATE clarification_tickets SET response = ?1, status = 'answered', updated_at_ms = ?2 WHERE ticket_id = ?3",
