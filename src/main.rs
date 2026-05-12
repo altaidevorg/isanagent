@@ -1309,14 +1309,21 @@ async fn recover_background_jobs_on_startup(
             }))
             .await
         {
-            log::error!("Failed to enqueue recovery message for job {}: {}", row.job_id, e);
+            log::error!(
+                "Failed to enqueue recovery message for job {}: {}",
+                row.job_id,
+                e
+            );
         } else {
             log::info!("Recovered background job on startup: {}", row.job_id);
             count += 1;
         }
     }
     if count > 0 {
-        log::info!("Successfully resumed {} background job(s) on startup.", count);
+        log::info!(
+            "Successfully resumed {} background job(s) on startup.",
+            count
+        );
     }
 }
 
