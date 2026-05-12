@@ -7,7 +7,7 @@ use tokio::sync::{mpsc, watch, RwLock};
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use colored::Colorize;
 use isanagent::agent::{AgentLogic, AgentLogicParams};
-use isanagent::bus::{BusMessage, LoggerControlMessage, TelemetryEvent};
+use isanagent::bus::{BusMessage, InboundMessage, LoggerControlMessage, OutboundMessage, TelemetryEvent};
 use isanagent::channels::terminal::{
     build_agent_thought_terminal_notice, build_tool_call_terminal_notice,
     build_tool_progress_terminal_notice, build_tool_result_terminal_notice,
@@ -490,6 +490,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     tools.register(Box::new(AskUserTool {
         clarification_hub: clarification_hub.clone(),
         outbound_tx: global_outbound_tx.clone(),
+        memory_node: Some(memory_node.clone()),
     }));
     tools.register(Box::new(isanagent::tools::builtin::SearchMemoryTool {
         memory_node: memory_node.clone(),
@@ -963,6 +964,18 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             match &msg {
                 BusMessage::Outbound(out) => {
                     if let Some(chan) = delivery_channels.get(&out.channel) {
+                        if out.channel == "terminal" {
+                            let active_chat = active_terminal_for_outbound.read().await.clone();
+                            if out.chat_id != active_chat
+                                && out
+                                    .metadata
+                                    .get("isanagent_notification")
+                                    .and_then(|v| v.as_bool())
+                                    != Some(true)
+                            {
+                                continue;
+                            }
+                        }
                         if let Err(e) = chan.send(out.clone()).await {
                             log::error!(
                                 "Failed to deliver message via channel [{}]: {}",
@@ -1103,6 +1116,10 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         }
     });
 
+    if workspace.config.background_jobs_enabled() && workspace.config.background_jobs_auto_resume() {
+        recover_background_jobs_on_startup(&memory_node, &bus_tx, &global_outbound_tx).await;
+    }
+
     tokio::select! {
         _ = shutdown_rx.recv() => {
             log::info!("Shutdown requested (terminal /exit or internal signal).");
@@ -1232,6 +1249,66 @@ Install uv manually or run /install-python from terminal mode.",
     }
 
     maybe_prompt_uv_requirements_install(workspace, &uv_bin, &requirements).await;
+}
+
+async fn recover_background_jobs_on_startup(
+    memory_node: &NodeHandle<isanagent::memory::MemoryMessage>,
+    bus_tx: &mpsc::Sender<BusMessage>,
+    outbound_tx: &mpsc::Sender<BusMessage>,
+) {
+    use isanagent::memory::{MemoryMessage, SharedReply};
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if memory_node
+        .send_packet(MemoryMessage::ListBackgroundJobs {
+            chat_id: None,
+            limit: 500,
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let Ok(Ok(rows)) = rx.await else {
+        return;
+    };
+    for row in rows {
+        if !row.resume_after_restart || row.state != "running" {
+            continue;
+        }
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            isanagent::bus::METADATA_SYNTHETIC_BACKGROUND_RESUME.to_string(),
+            serde_json::Value::Bool(true),
+        );
+        metadata.insert(
+            "background_job_id".to_string(),
+            serde_json::Value::String(row.job_id.clone()),
+        );
+        let _ = bus_tx
+            .send(BusMessage::Inbound(InboundMessage {
+                channel: row.channel.clone(),
+                sender_id: "background_recovery".to_string(),
+                chat_id: row.chat_id.clone(),
+                thread_id: row.thread_id.clone(),
+                content: format!("Resume background job {}", row.job_id),
+                attachments: Vec::new(),
+                metadata,
+            }))
+            .await;
+        let _ = outbound_tx
+            .send(BusMessage::Outbound(OutboundMessage {
+                channel: row.channel,
+                chat_id: row.chat_id,
+                thread_id: row.thread_id,
+                content: format!("Recovered background job on startup: {}", row.job_id),
+                metadata: std::collections::HashMap::from([(
+                    "isanagent_notification".to_string(),
+                    serde_json::Value::Bool(true),
+                )]),
+            }))
+            .await;
+    }
 }
 
 /// Inspect the uv-managed venv and prompt to install any missing `uv_requirements` entries.

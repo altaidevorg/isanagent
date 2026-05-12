@@ -670,11 +670,27 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
     let harness_runtime_summary = args.harness_runtime_summary.clone();
     let forbid_final_without_tools = args.forbid_final_without_tools;
     let shell_policy = args.shell_policy.clone();
+    let is_background_turn = inbound
+        .metadata
+        .get(crate::bus::METADATA_SYNTHETIC_CRON_TRIGGER)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || inbound
+            .metadata
+            .get(crate::bus::METADATA_SYNTHETIC_JOB_FOLLOWUP)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        || inbound
+            .metadata
+            .get(crate::bus::METADATA_SYNTHETIC_SUBAGENT_COMPLETION)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
     let tool_exec_ctx = ToolExecCtx::new(
         inbound.channel.clone(),
         inbound.chat_id.clone(),
         inbound.thread_id.clone(),
     )
+    .with_background(is_background_turn)
     .with_reasoning_cancel(cancel_token.as_ref().clone());
     let inbound_channel = inbound.channel.clone();
     let inbound_thread_id = inbound.thread_id.clone();

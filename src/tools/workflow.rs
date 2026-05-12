@@ -1,6 +1,7 @@
 //! Session-scoped workflow tools (todos, tool discovery, user clarification).
 
 use async_trait::async_trait;
+use chrono::Utc;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -267,11 +268,11 @@ impl Drop for ClarificationSlotGuard {
 pub struct AskUserTool {
     pub clarification_hub: Arc<ClarificationHub>,
     pub outbound_tx: mpsc::Sender<BusMessage>,
+    pub memory_node: Option<NodeHandle<MemoryMessage>>,
 }
 
 const ASK_USER_TIMEOUT_SECS_MIN: u64 = 10;
 const ASK_USER_TIMEOUT_SECS_MAX: u64 = 86_400;
-const ASK_USER_TIMEOUT_SECS_DEFAULT: u64 = 1_800;
 const ASK_USER_MAX_CHOICES: usize = 8;
 
 /// Exact option text wins; otherwise `1`..=`choices.len()` selects by 1-based index.
@@ -315,7 +316,7 @@ impl Tool for AskUserTool {
                 },
                 "timeout_secs": {
                     "type": "integer",
-                    "description": "Max seconds to wait (10–86400, default 1800)."
+                    "description": "Optional max seconds to wait (10–86400). If omitted, waits without timeout."
                 },
                 "allow_empty": {
                     "type": "boolean",
@@ -349,8 +350,7 @@ impl Tool for AskUserTool {
         let timeout_secs = args
             .get("timeout_secs")
             .and_then(|v| v.as_u64())
-            .unwrap_or(ASK_USER_TIMEOUT_SECS_DEFAULT)
-            .clamp(ASK_USER_TIMEOUT_SECS_MIN, ASK_USER_TIMEOUT_SECS_MAX);
+            .map(|v| v.clamp(ASK_USER_TIMEOUT_SECS_MIN, ASK_USER_TIMEOUT_SECS_MAX));
 
         let mut choices: Vec<String> = Vec::new();
         if let Some(arr) = args.get("choices").and_then(|v| v.as_array()) {
@@ -371,6 +371,108 @@ impl Tool for AskUserTool {
                 }
                 choices.push(s.to_string());
             }
+        }
+
+        if ctx.is_background {
+            let ticket_id = uuid::Uuid::new_v4().to_string();
+            let now = Utc::now().timestamp_millis();
+            if let Some(memory_node) = &self.memory_node {
+                let choices_json = if choices.is_empty() {
+                    None
+                } else {
+                    Some(
+                        serde_json::to_string(&choices)
+                            .map_err(|e| format!("serialize choices: {}", e))?,
+                    )
+                };
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                memory_node
+                    .send_packet(MemoryMessage::UpsertClarificationTicket {
+                        record: crate::memory::ClarificationTicketRecord {
+                            ticket_id: ticket_id.clone(),
+                            job_id: ctx.chat_id.clone(),
+                            chat_id: ctx.chat_id.clone(),
+                            channel: ctx.channel.clone(),
+                            thread_id: ctx.thread_id.clone(),
+                            prompt: prompt.to_string(),
+                            choices_json,
+                            response: None,
+                            status: "pending".to_string(),
+                            created_at_ms: now,
+                            updated_at_ms: now,
+                        },
+                        reply: SharedReply::new(tx),
+                    })
+                    .await
+                    .map_err(|e| format!("clarification ticket enqueue: {}", e))?;
+                rx.await
+                    .map_err(|_| "clarification ticket actor channel closed".to_string())?
+                    .map_err(|e| format!("clarification ticket: {}", e))?;
+
+                let notification_id = uuid::Uuid::new_v4().to_string();
+                let (ntx, nrx) = tokio::sync::oneshot::channel();
+                memory_node
+                    .send_packet(MemoryMessage::InsertNotification {
+                        record: crate::memory::NotificationRecord {
+                            notification_id,
+                            chat_id: ctx.chat_id.clone(),
+                            channel: ctx.channel.clone(),
+                            thread_id: ctx.thread_id.clone(),
+                            kind: "clarification_ticket".to_string(),
+                            title: "Background input required".to_string(),
+                            body: prompt.to_string(),
+                            action_kind: Some("reply_ticket".to_string()),
+                            action_payload: Some(ticket_id.clone()),
+                            seen_at_ms: None,
+                            resolved_at_ms: None,
+                            created_at_ms: now,
+                        },
+                        reply: SharedReply::new(ntx),
+                    })
+                    .await
+                    .map_err(|e| format!("notification enqueue: {}", e))?;
+                nrx.await
+                    .map_err(|_| "notification actor channel closed".to_string())?
+                    .map_err(|e| format!("notification: {}", e))?;
+            }
+            let mut metadata = HashMap::new();
+            metadata.insert("isanagent_notification".to_string(), serde_json::Value::Bool(true));
+            metadata.insert(
+                "isanagent_notification_kind".to_string(),
+                serde_json::Value::String("clarification_ticket".to_string()),
+            );
+            metadata.insert(
+                "clarification_ticket_id".to_string(),
+                serde_json::Value::String(ticket_id.clone()),
+            );
+            let outbound = OutboundMessage {
+                channel: ctx.channel.clone(),
+                chat_id: ctx.chat_id.clone(),
+                thread_id: ctx.thread_id.clone(),
+                content: format!(
+                    "Background task needs input and has been paused.\n\nQuestion: {}\nTicket: {}",
+                    prompt, ticket_id
+                ),
+                metadata,
+            };
+            self.outbound_tx
+                .send(BusMessage::Outbound(outbound))
+                .await
+                .map_err(|e| format!("failed to send clarification ticket notification: {}", e))?;
+            let _ = self
+                .outbound_tx
+                .send(BusMessage::Telemetry(crate::bus::TelemetryEvent::NotificationCreated {
+                    notification_id: ticket_id.clone(),
+                    chat_id: ctx.chat_id.clone(),
+                    channel: ctx.channel.clone(),
+                    kind: "clarification_ticket".to_string(),
+                    title: "Background input required".to_string(),
+                }))
+                .await;
+            return Err(format!(
+                "Background ask_user converted to clarification ticket `{}`. Waiting for notification reply.",
+                ticket_id
+            ));
         }
 
         let rx = self
@@ -411,21 +513,28 @@ impl Tool for AskUserTool {
             .await
             .map_err(|e| format!("failed to send clarification prompt: {}", e))?;
 
-        let wait = tokio::time::Duration::from_secs(timeout_secs);
-        let reply = match tokio::time::timeout(wait, rx).await {
-            Err(_) => {
-                return Err(format!(
-                    "Timed out after {}s waiting for a user reply to ask_user.",
-                    timeout_secs
-                ));
+        let reply = match timeout_secs {
+            Some(timeout_secs) => {
+                let wait = tokio::time::Duration::from_secs(timeout_secs);
+                match tokio::time::timeout(wait, rx).await {
+                    Err(_) => {
+                        return Err(format!(
+                            "Timed out after {}s waiting for a user reply to ask_user.",
+                            timeout_secs
+                        ));
+                    }
+                    Ok(Err(_)) => {
+                        return Err(
+                            "Clarification wait ended without a reply (session cancelled or reset)."
+                                .to_string(),
+                        );
+                    }
+                    Ok(Ok(text)) => text,
+                }
             }
-            Ok(Err(_)) => {
-                return Err(
-                    "Clarification wait ended without a reply (session cancelled or reset)."
-                        .to_string(),
-                );
-            }
-            Ok(Ok(text)) => text,
+            None => rx.await.map_err(|_| {
+                "Clarification wait ended without a reply (session cancelled or reset).".to_string()
+            })?,
         };
 
         guard.disarm();
@@ -493,6 +602,7 @@ mod tests {
         let tool = AskUserTool {
             clarification_hub: hub.clone(),
             outbound_tx: ob_tx,
+            memory_node: None,
         };
         let hub_signal = hub.clone();
         let join = tokio::spawn(async move {
@@ -536,6 +646,7 @@ mod tests {
         let tool = AskUserTool {
             clarification_hub: hub.clone(),
             outbound_tx: ob_tx,
+            memory_node: None,
         };
         let hub_signal = hub.clone();
         let join = tokio::spawn(async move {

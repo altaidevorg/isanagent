@@ -527,6 +527,52 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             &format!("ResearchDepthNudge channel={} reason={}", channel, reason),
         )
         .with_chat_id(chat_id),
+        TelemetryEvent::BackgroundJobUpdated {
+            job_id,
+            chat_id,
+            channel,
+            state,
+            kind,
+            detail,
+        } => LogEvent::info(
+            "Telemetry",
+            &format!(
+                "BackgroundJobUpdated channel={} job={} kind={} state={} detail={}",
+                channel,
+                job_id,
+                kind,
+                state,
+                detail.as_deref().unwrap_or("-")
+            ),
+        )
+        .with_chat_id(chat_id),
+        TelemetryEvent::NotificationCreated {
+            notification_id,
+            chat_id,
+            channel,
+            kind,
+            title,
+        } => LogEvent::info(
+            "Telemetry",
+            &format!(
+                "NotificationCreated channel={} id={} kind={} title={}",
+                channel, notification_id, kind, title
+            ),
+        )
+        .with_chat_id(chat_id),
+        TelemetryEvent::NotificationUpdated {
+            notification_id,
+            chat_id,
+            channel,
+            state,
+        } => LogEvent::info(
+            "Telemetry",
+            &format!(
+                "NotificationUpdated channel={} id={} state={}",
+                channel, notification_id, state
+            ),
+        )
+        .with_chat_id(chat_id),
     }
 }
 

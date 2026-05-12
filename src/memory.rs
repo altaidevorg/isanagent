@@ -206,6 +206,53 @@ pub struct SubagentTaskRecord {
     pub updated_at_ms: i64,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BackgroundJobRecord {
+    pub job_id: String,
+    pub kind: String,
+    pub chat_id: String,
+    pub channel: String,
+    pub thread_id: Option<String>,
+    pub state: String,
+    pub payload_json: String,
+    pub resume_after_restart: bool,
+    pub detached: bool,
+    pub last_error: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NotificationRecord {
+    pub notification_id: String,
+    pub chat_id: String,
+    pub channel: String,
+    pub thread_id: Option<String>,
+    pub kind: String,
+    pub title: String,
+    pub body: String,
+    pub action_kind: Option<String>,
+    pub action_payload: Option<String>,
+    pub seen_at_ms: Option<i64>,
+    pub resolved_at_ms: Option<i64>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ClarificationTicketRecord {
+    pub ticket_id: String,
+    pub job_id: String,
+    pub chat_id: String,
+    pub channel: String,
+    pub thread_id: Option<String>,
+    pub prompt: String,
+    pub choices_json: Option<String>,
+    pub response: Option<String>,
+    pub status: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
 pub fn ensure_subagent_tasks_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS subagent_tasks (
@@ -235,6 +282,75 @@ pub fn ensure_subagent_tasks_schema(conn: &Connection) -> Result<(), rusqlite::E
         [],
     );
     let _ = conn.execute("ALTER TABLE subagent_tasks ADD COLUMN agent_name TEXT", []);
+    Ok(())
+}
+
+pub fn ensure_background_runtime_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS background_jobs (
+            job_id TEXT PRIMARY KEY NOT NULL,
+            kind TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            thread_id TEXT,
+            state TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            resume_after_restart INTEGER NOT NULL DEFAULT 1,
+            detached INTEGER NOT NULL DEFAULT 1,
+            last_error TEXT,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_background_jobs_state_updated
+         ON background_jobs(state, updated_at_ms DESC)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS notifications (
+            notification_id TEXT PRIMARY KEY NOT NULL,
+            chat_id TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            thread_id TEXT,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            action_kind TEXT,
+            action_payload TEXT,
+            seen_at_ms INTEGER,
+            resolved_at_ms INTEGER,
+            created_at_ms INTEGER NOT NULL
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_notifications_chat_created
+         ON notifications(chat_id, created_at_ms DESC)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS clarification_tickets (
+            ticket_id TEXT PRIMARY KEY NOT NULL,
+            job_id TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            thread_id TEXT,
+            prompt TEXT NOT NULL,
+            choices_json TEXT,
+            response TEXT,
+            status TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_clarification_tickets_job
+         ON clarification_tickets(job_id, updated_at_ms DESC)",
+        [],
+    )?;
     Ok(())
 }
 
@@ -448,6 +564,52 @@ pub enum MemoryMessage {
     GetActiveCronsCount {
         reply: SharedReply<Result<usize, String>>,
     },
+    UpsertBackgroundJob {
+        record: BackgroundJobRecord,
+        reply: SharedReply<Result<(), String>>,
+    },
+    ListBackgroundJobs {
+        chat_id: Option<String>,
+        limit: usize,
+        reply: SharedReply<Result<Vec<BackgroundJobRecord>, String>>,
+    },
+    UpdateBackgroundJobState {
+        job_id: String,
+        state: String,
+        last_error: Option<String>,
+        reply: SharedReply<Result<(), String>>,
+    },
+    InsertNotification {
+        record: NotificationRecord,
+        reply: SharedReply<Result<(), String>>,
+    },
+    ListNotifications {
+        chat_id: Option<String>,
+        limit: usize,
+        unseen_only: bool,
+        reply: SharedReply<Result<Vec<NotificationRecord>, String>>,
+    },
+    MarkNotificationSeen {
+        notification_id: String,
+        reply: SharedReply<Result<(), String>>,
+    },
+    ResolveNotification {
+        notification_id: String,
+        reply: SharedReply<Result<(), String>>,
+    },
+    UpsertClarificationTicket {
+        record: ClarificationTicketRecord,
+        reply: SharedReply<Result<(), String>>,
+    },
+    ResolveClarificationTicket {
+        ticket_id: String,
+        response: String,
+        reply: SharedReply<Result<(), String>>,
+    },
+    GetClarificationTicket {
+        ticket_id: String,
+        reply: SharedReply<Result<Option<ClarificationTicketRecord>, String>>,
+    },
 }
 
 /// Persistent SQLite-based memory Actor for agents.
@@ -558,6 +720,7 @@ impl SqliteMemoryActor {
         ensure_harness_todos_schema(&conn)?;
         ensure_subagent_tasks_schema(&conn)?;
         ensure_cron_jobs_schema(&conn)?;
+        ensure_background_runtime_schema(&conn)?;
 
             Ok(conn)
         })()
@@ -1348,6 +1511,218 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                         .query_row([], |row| row.get(0))
                         .map_err(|e| e.to_string())?;
                     Ok(count as usize)
+                })();
+                let _ = reply.send(res);
+            }
+            MemoryMessage::UpsertBackgroundJob { record, reply } => {
+                let res = (|| -> Result<(), String> {
+                    self.conn.execute(
+                        "INSERT INTO background_jobs (
+                            job_id, kind, chat_id, channel, thread_id, state, payload_json,
+                            resume_after_restart, detached, last_error, created_at_ms, updated_at_ms
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                        ON CONFLICT(job_id) DO UPDATE SET
+                            kind=excluded.kind, chat_id=excluded.chat_id, channel=excluded.channel,
+                            thread_id=excluded.thread_id, state=excluded.state, payload_json=excluded.payload_json,
+                            resume_after_restart=excluded.resume_after_restart, detached=excluded.detached,
+                            last_error=excluded.last_error, updated_at_ms=excluded.updated_at_ms",
+                        params![
+                            record.job_id,
+                            record.kind,
+                            record.chat_id,
+                            record.channel,
+                            record.thread_id,
+                            record.state,
+                            record.payload_json,
+                            if record.resume_after_restart { 1 } else { 0 },
+                            if record.detached { 1 } else { 0 },
+                            record.last_error,
+                            record.created_at_ms,
+                            record.updated_at_ms
+                        ],
+                    ).map_err(|e| format!("upsert background_jobs: {}", e))?;
+                    Ok(())
+                })();
+                let _ = reply.send(res);
+            }
+            MemoryMessage::ListBackgroundJobs { chat_id, limit, reply } => {
+                let res = (|| -> Result<Vec<BackgroundJobRecord>, String> {
+                    let lim = limit.clamp(1, 500) as i64;
+                    let sql_all = "SELECT job_id, kind, chat_id, channel, thread_id, state, payload_json,
+                            resume_after_restart, detached, last_error, created_at_ms, updated_at_ms
+                         FROM background_jobs ORDER BY updated_at_ms DESC LIMIT ?1";
+                    let sql_chat = "SELECT job_id, kind, chat_id, channel, thread_id, state, payload_json,
+                            resume_after_restart, detached, last_error, created_at_ms, updated_at_ms
+                         FROM background_jobs WHERE chat_id = ?1 ORDER BY updated_at_ms DESC LIMIT ?2";
+                    let mut out = Vec::new();
+                    if let Some(chat_id) = chat_id {
+                        let mut stmt = self.conn.prepare(sql_chat).map_err(|e| e.to_string())?;
+                        let rows = stmt.query_map(params![chat_id, lim], |row| {
+                            Ok(BackgroundJobRecord {
+                                job_id: row.get(0)?,
+                                kind: row.get(1)?,
+                                chat_id: row.get(2)?,
+                                channel: row.get(3)?,
+                                thread_id: row.get(4)?,
+                                state: row.get(5)?,
+                                payload_json: row.get(6)?,
+                                resume_after_restart: row.get::<_, i64>(7)? != 0,
+                                detached: row.get::<_, i64>(8)? != 0,
+                                last_error: row.get(9)?,
+                                created_at_ms: row.get(10)?,
+                                updated_at_ms: row.get(11)?,
+                            })
+                        }).map_err(|e| e.to_string())?;
+                        for r in rows { out.push(r.map_err(|e| e.to_string())?); }
+                    } else {
+                        let mut stmt = self.conn.prepare(sql_all).map_err(|e| e.to_string())?;
+                        let rows = stmt.query_map(params![lim], |row| {
+                            Ok(BackgroundJobRecord {
+                                job_id: row.get(0)?,
+                                kind: row.get(1)?,
+                                chat_id: row.get(2)?,
+                                channel: row.get(3)?,
+                                thread_id: row.get(4)?,
+                                state: row.get(5)?,
+                                payload_json: row.get(6)?,
+                                resume_after_restart: row.get::<_, i64>(7)? != 0,
+                                detached: row.get::<_, i64>(8)? != 0,
+                                last_error: row.get(9)?,
+                                created_at_ms: row.get(10)?,
+                                updated_at_ms: row.get(11)?,
+                            })
+                        }).map_err(|e| e.to_string())?;
+                        for r in rows { out.push(r.map_err(|e| e.to_string())?); }
+                    }
+                    Ok(out)
+                })();
+                let _ = reply.send(res);
+            }
+            MemoryMessage::UpdateBackgroundJobState { job_id, state, last_error, reply } => {
+                let res = (|| -> Result<(), String> {
+                    let now = Utc::now().timestamp_millis();
+                    self.conn.execute(
+                        "UPDATE background_jobs SET state = ?1, last_error = COALESCE(?2, last_error), updated_at_ms = ?3 WHERE job_id = ?4",
+                        params![state, last_error, now, job_id],
+                    ).map_err(|e| format!("update background_jobs: {}", e))?;
+                    Ok(())
+                })();
+                let _ = reply.send(res);
+            }
+            MemoryMessage::InsertNotification { record, reply } => {
+                let res = self.conn.execute(
+                    "INSERT INTO notifications (
+                        notification_id, chat_id, channel, thread_id, kind, title, body, action_kind,
+                        action_payload, seen_at_ms, resolved_at_ms, created_at_ms
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params![
+                        record.notification_id, record.chat_id, record.channel, record.thread_id,
+                        record.kind, record.title, record.body, record.action_kind, record.action_payload,
+                        record.seen_at_ms, record.resolved_at_ms, record.created_at_ms
+                    ],
+                ).map_err(|e| format!("insert notifications: {}", e)).map(|_| ());
+                let _ = reply.send(res);
+            }
+            MemoryMessage::ListNotifications { chat_id, limit, unseen_only, reply } => {
+                let res = (|| -> Result<Vec<NotificationRecord>, String> {
+                    let lim = limit.clamp(1, 500) as i64;
+                    let mut out = Vec::new();
+                    let sql = match (chat_id.is_some(), unseen_only) {
+                        (true, true) => "SELECT notification_id, chat_id, channel, thread_id, kind, title, body, action_kind, action_payload, seen_at_ms, resolved_at_ms, created_at_ms FROM notifications WHERE chat_id = ?1 AND seen_at_ms IS NULL ORDER BY created_at_ms DESC LIMIT ?2",
+                        (true, false) => "SELECT notification_id, chat_id, channel, thread_id, kind, title, body, action_kind, action_payload, seen_at_ms, resolved_at_ms, created_at_ms FROM notifications WHERE chat_id = ?1 ORDER BY created_at_ms DESC LIMIT ?2",
+                        (false, true) => "SELECT notification_id, chat_id, channel, thread_id, kind, title, body, action_kind, action_payload, seen_at_ms, resolved_at_ms, created_at_ms FROM notifications WHERE seen_at_ms IS NULL ORDER BY created_at_ms DESC LIMIT ?1",
+                        (false, false) => "SELECT notification_id, chat_id, channel, thread_id, kind, title, body, action_kind, action_payload, seen_at_ms, resolved_at_ms, created_at_ms FROM notifications ORDER BY created_at_ms DESC LIMIT ?1",
+                    };
+                    let mapper = |row: &rusqlite::Row| -> Result<NotificationRecord, rusqlite::Error> {
+                        Ok(NotificationRecord {
+                            notification_id: row.get(0)?,
+                            chat_id: row.get(1)?,
+                            channel: row.get(2)?,
+                            thread_id: row.get(3)?,
+                            kind: row.get(4)?,
+                            title: row.get(5)?,
+                            body: row.get(6)?,
+                            action_kind: row.get(7)?,
+                            action_payload: row.get(8)?,
+                            seen_at_ms: row.get(9)?,
+                            resolved_at_ms: row.get(10)?,
+                            created_at_ms: row.get(11)?,
+                        })
+                    };
+                    if let Some(chat_id) = chat_id {
+                        let mut stmt = self.conn.prepare(sql).map_err(|e| e.to_string())?;
+                        let rows = stmt.query_map(params![chat_id, lim], mapper).map_err(|e| e.to_string())?;
+                        for r in rows { out.push(r.map_err(|e| e.to_string())?); }
+                    } else {
+                        let mut stmt = self.conn.prepare(sql).map_err(|e| e.to_string())?;
+                        let rows = stmt.query_map(params![lim], mapper).map_err(|e| e.to_string())?;
+                        for r in rows { out.push(r.map_err(|e| e.to_string())?); }
+                    }
+                    Ok(out)
+                })();
+                let _ = reply.send(res);
+            }
+            MemoryMessage::MarkNotificationSeen { notification_id, reply } => {
+                let now = Utc::now().timestamp_millis();
+                let res = self.conn.execute(
+                    "UPDATE notifications SET seen_at_ms = COALESCE(seen_at_ms, ?1) WHERE notification_id = ?2",
+                    params![now, notification_id],
+                ).map_err(|e| format!("mark notification seen: {}", e)).map(|_| ());
+                let _ = reply.send(res);
+            }
+            MemoryMessage::ResolveNotification { notification_id, reply } => {
+                let now = Utc::now().timestamp_millis();
+                let res = self.conn.execute(
+                    "UPDATE notifications SET resolved_at_ms = COALESCE(resolved_at_ms, ?1) WHERE notification_id = ?2",
+                    params![now, notification_id],
+                ).map_err(|e| format!("resolve notification: {}", e)).map(|_| ());
+                let _ = reply.send(res);
+            }
+            MemoryMessage::UpsertClarificationTicket { record, reply } => {
+                let res = self.conn.execute(
+                    "INSERT INTO clarification_tickets (
+                        ticket_id, job_id, chat_id, channel, thread_id, prompt, choices_json,
+                        response, status, created_at_ms, updated_at_ms
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                    ON CONFLICT(ticket_id) DO UPDATE SET
+                        response = excluded.response, status = excluded.status, updated_at_ms = excluded.updated_at_ms",
+                    params![
+                        record.ticket_id, record.job_id, record.chat_id, record.channel, record.thread_id,
+                        record.prompt, record.choices_json, record.response, record.status, record.created_at_ms, record.updated_at_ms
+                    ],
+                ).map_err(|e| format!("upsert clarification_tickets: {}", e)).map(|_| ());
+                let _ = reply.send(res);
+            }
+            MemoryMessage::ResolveClarificationTicket { ticket_id, response, reply } => {
+                let now = Utc::now().timestamp_millis();
+                let res = self.conn.execute(
+                    "UPDATE clarification_tickets SET response = ?1, status = 'answered', updated_at_ms = ?2 WHERE ticket_id = ?3",
+                    params![response, now, ticket_id],
+                ).map_err(|e| format!("resolve clarification ticket: {}", e)).map(|_| ());
+                let _ = reply.send(res);
+            }
+            MemoryMessage::GetClarificationTicket { ticket_id, reply } => {
+                let res = (|| -> Result<Option<ClarificationTicketRecord>, String> {
+                    self.conn.query_row(
+                        "SELECT ticket_id, job_id, chat_id, channel, thread_id, prompt, choices_json, response, status, created_at_ms, updated_at_ms
+                         FROM clarification_tickets WHERE ticket_id = ?1",
+                        params![ticket_id],
+                        |row| {
+                            Ok(ClarificationTicketRecord {
+                                ticket_id: row.get(0)?,
+                                job_id: row.get(1)?,
+                                chat_id: row.get(2)?,
+                                channel: row.get(3)?,
+                                thread_id: row.get(4)?,
+                                prompt: row.get(5)?,
+                                choices_json: row.get(6)?,
+                                response: row.get(7)?,
+                                status: row.get(8)?,
+                                created_at_ms: row.get(9)?,
+                                updated_at_ms: row.get(10)?,
+                            })
+                        },
+                    ).optional().map_err(|e| e.to_string())
                 })();
                 let _ = reply.send(res);
             }
