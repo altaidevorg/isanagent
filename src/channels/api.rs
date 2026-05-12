@@ -247,6 +247,35 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// Helper to send a request to the memory node and map common errors to ApiError.
+async fn memory_request<T>(
+    memory_node: &NodeHandle<MemoryMessage>,
+    msg_ctor: impl FnOnce(SharedReply<Result<T, String>>) -> MemoryMessage,
+) -> Result<T, ApiError> {
+    let (tx, rx) = oneshot::channel();
+    let msg = msg_ctor(SharedReply::new(tx));
+    memory_node.send_packet(msg).await.map_err(|e| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "memory_unavailable",
+            e.to_string(),
+        )
+    })?;
+    match rx.await {
+        Ok(Ok(val)) => Ok(val),
+        Ok(Err(e)) => Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "memory_error",
+            e,
+        )),
+        Err(_) => Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "memory_unavailable",
+            "Memory actor channel closed",
+        )),
+    }
+}
+
 pub struct ApiChannel {
     port: u16,
     bind_address: Option<String>,
@@ -1679,31 +1708,16 @@ async fn handle_get_thread_summaries(
         .into_response();
     }
     let memory_thread_id = resolve_memory_thread_id(&state, thread_id);
-    let (tx, rx) = oneshot::channel();
-    let msg = MemoryMessage::GetSummaries {
+    let res = memory_request(&state.memory_node, |reply| MemoryMessage::GetSummaries {
         thread_id: memory_thread_id.to_string(),
         limit: 50,
-        reply: SharedReply::new(tx),
-    };
-    if let Err(e) = state.memory_node.send_packet(msg).await {
-        return ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "memory_unavailable",
-            e.to_string(),
-        )
-        .into_response();
-    }
-    match rx.await {
-        Ok(Ok(summaries)) => Json(summaries).into_response(),
-        Ok(Err(e)) => {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "memory_error", e).into_response()
-        }
-        Err(_) => ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "memory_unavailable",
-            "Memory actor channel closed",
-        )
-        .into_response(),
+        reply,
+    })
+    .await;
+
+    match res {
+        Ok(summaries) => Json(summaries).into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -1712,62 +1726,32 @@ async fn handle_update_summary(
     AxumPath(id): AxumPath<i64>,
     Json(payload): Json<UpdateSummaryRequest>,
 ) -> Response {
-    let (tx, rx) = oneshot::channel();
-    let msg = MemoryMessage::UpdateSummary {
+    let res = memory_request(&state.memory_node, |reply| MemoryMessage::UpdateSummary {
         id,
         summary: payload.summary,
         key_info: payload.key_info,
         knowledge_gaps: payload.knowledge_gaps,
-        reply: SharedReply::new(tx),
-    };
-    if let Err(e) = state.memory_node.send_packet(msg).await {
-        return ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "memory_unavailable",
-            e.to_string(),
-        )
-        .into_response();
-    }
-    match rx.await {
-        Ok(Ok(())) => StatusCode::OK.into_response(),
-        Ok(Err(e)) => {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "memory_error", e).into_response()
-        }
-        Err(_) => ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "memory_unavailable",
-            "Memory actor channel closed",
-        )
-        .into_response(),
+        reply,
+    })
+    .await;
+
+    match res {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
 async fn handle_get_all_summaries(State(state): State<ApiState>) -> Response {
-    let (tx, rx) = oneshot::channel();
-    let msg = MemoryMessage::GetSummaries {
+    let res = memory_request(&state.memory_node, |reply| MemoryMessage::GetSummaries {
         thread_id: String::new(), // Empty string means get all
         limit: 100,
-        reply: SharedReply::new(tx),
-    };
-    if let Err(e) = state.memory_node.send_packet(msg).await {
-        return ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "memory_unavailable",
-            e.to_string(),
-        )
-        .into_response();
-    }
-    match rx.await {
-        Ok(Ok(summaries)) => Json(summaries).into_response(),
-        Ok(Err(e)) => {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "memory_error", e).into_response()
-        }
-        Err(_) => ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "memory_unavailable",
-            "Memory actor channel closed",
-        )
-        .into_response(),
+        reply,
+    })
+    .await;
+
+    match res {
+        Ok(summaries) => Json(summaries).into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -1775,30 +1759,15 @@ async fn handle_delete_summary(
     State(state): State<ApiState>,
     AxumPath(id): AxumPath<i64>,
 ) -> Response {
-    let (tx, rx) = oneshot::channel();
-    let msg = MemoryMessage::DeleteSummary {
+    let res = memory_request(&state.memory_node, |reply| MemoryMessage::DeleteSummary {
         id,
-        reply: SharedReply::new(tx),
-    };
-    if let Err(e) = state.memory_node.send_packet(msg).await {
-        return ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "memory_unavailable",
-            e.to_string(),
-        )
-        .into_response();
-    }
-    match rx.await {
-        Ok(Ok(())) => StatusCode::OK.into_response(),
-        Ok(Err(e)) => {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "memory_error", e).into_response()
-        }
-        Err(_) => ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "memory_unavailable",
-            "Memory actor channel closed",
-        )
-        .into_response(),
+        reply,
+    })
+    .await;
+
+    match res {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -2268,31 +2237,16 @@ async fn handle_list_background_jobs(
     State(state): State<ApiState>,
     Query(params): Query<JobsQuery>,
 ) -> Response {
-    let (tx, rx) = oneshot::channel();
-    let msg = MemoryMessage::ListBackgroundJobs {
+    let res = memory_request(&state.memory_node, |reply| MemoryMessage::ListBackgroundJobs {
         chat_id: params.chat_id,
         limit: params.limit.unwrap_or(100),
-        reply: SharedReply::new(tx),
-    };
-    if let Err(e) = state.memory_node.send_packet(msg).await {
-        return ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "memory_unavailable",
-            e.to_string(),
-        )
-        .into_response();
-    }
-    match rx.await {
-        Ok(Ok(rows)) => Json(rows).into_response(),
-        Ok(Err(e)) => {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "memory_error", e).into_response()
-        }
-        Err(_) => ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "memory_unavailable",
-            "Memory actor channel closed",
-        )
-        .into_response(),
+        reply,
+    })
+    .await;
+
+    match res {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -2300,32 +2254,17 @@ async fn handle_list_notifications(
     State(state): State<ApiState>,
     Query(params): Query<NotificationsQuery>,
 ) -> Response {
-    let (tx, rx) = oneshot::channel();
-    let msg = MemoryMessage::ListNotifications {
+    let res = memory_request(&state.memory_node, |reply| MemoryMessage::ListNotifications {
         chat_id: params.chat_id,
         limit: params.limit.unwrap_or(100),
         unseen_only: params.unseen_only.unwrap_or(false),
-        reply: SharedReply::new(tx),
-    };
-    if let Err(e) = state.memory_node.send_packet(msg).await {
-        return ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "memory_unavailable",
-            e.to_string(),
-        )
-        .into_response();
-    }
-    match rx.await {
-        Ok(Ok(rows)) => Json(rows).into_response(),
-        Ok(Err(e)) => {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "memory_error", e).into_response()
-        }
-        Err(_) => ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "memory_unavailable",
-            "Memory actor channel closed",
-        )
-        .into_response(),
+        reply,
+    })
+    .await;
+
+    match res {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -2333,30 +2272,15 @@ async fn handle_notification_seen(
     State(state): State<ApiState>,
     AxumPath(notification_id): AxumPath<String>,
 ) -> Response {
-    let (tx, rx) = oneshot::channel();
-    let msg = MemoryMessage::MarkNotificationSeen {
+    let res = memory_request(&state.memory_node, |reply| MemoryMessage::MarkNotificationSeen {
         notification_id,
-        reply: SharedReply::new(tx),
-    };
-    if let Err(e) = state.memory_node.send_packet(msg).await {
-        return ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "memory_unavailable",
-            e.to_string(),
-        )
-        .into_response();
-    }
-    match rx.await {
-        Ok(Ok(())) => StatusCode::OK.into_response(),
-        Ok(Err(e)) => {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "memory_error", e).into_response()
-        }
-        Err(_) => ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "memory_unavailable",
-            "Memory actor channel closed",
-        )
-        .into_response(),
+        reply,
+    })
+    .await;
+
+    match res {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -2364,30 +2288,15 @@ async fn handle_notification_resolve(
     State(state): State<ApiState>,
     AxumPath(notification_id): AxumPath<String>,
 ) -> Response {
-    let (tx, rx) = oneshot::channel();
-    let msg = MemoryMessage::ResolveNotification {
+    let res = memory_request(&state.memory_node, |reply| MemoryMessage::ResolveNotification {
         notification_id,
-        reply: SharedReply::new(tx),
-    };
-    if let Err(e) = state.memory_node.send_packet(msg).await {
-        return ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "memory_unavailable",
-            e.to_string(),
-        )
-        .into_response();
-    }
-    match rx.await {
-        Ok(Ok(())) => StatusCode::OK.into_response(),
-        Ok(Err(e)) => {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "memory_error", e).into_response()
-        }
-        Err(_) => ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "memory_unavailable",
-            "Memory actor channel closed",
-        )
-        .into_response(),
+        reply,
+    })
+    .await;
+
+    match res {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -2396,53 +2305,35 @@ async fn handle_clarification_ticket_reply(
     AxumPath(ticket_id): AxumPath<String>,
     Json(body): Json<ClarificationReplyBody>,
 ) -> Response {
-    let (tx, rx) = oneshot::channel();
-    let msg = MemoryMessage::GetClarificationTicket {
+    let ticket = match memory_request(&state.memory_node, |reply| MemoryMessage::GetClarificationTicket {
         ticket_id: ticket_id.clone(),
-        reply: SharedReply::new(tx),
-    };
-    if let Err(e) = state.memory_node.send_packet(msg).await {
-        return ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "memory_unavailable",
-            e.to_string(),
-        )
-        .into_response();
-    }
-    let ticket = match rx.await {
-        Ok(Ok(t)) => t,
-        Ok(Err(e)) => {
-            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "memory_error", e)
-                .into_response();
-        }
-        Err(_) => {
+        reply,
+    })
+    .await
+    {
+        Ok(Some(t)) => t,
+        Ok(None) => {
             return ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "memory_unavailable",
-                "Memory actor channel closed",
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "Unknown clarification ticket",
             )
             .into_response();
         }
-    };
-    let Some(ticket) = ticket else {
-        return ApiError::new(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "Unknown clarification ticket",
-        )
-        .into_response();
+        Err(e) => return e.into_response(),
     };
 
-    let (rtx, rrx) = oneshot::channel();
-    let _ = state
-        .memory_node
-        .send_packet(MemoryMessage::ResolveClarificationTicket {
+    if let Err(e) = memory_request(&state.memory_node, |reply| {
+        MemoryMessage::ResolveClarificationTicket {
             ticket_id: ticket_id.clone(),
             response: body.response.clone(),
-            reply: SharedReply::new(rtx),
-        })
-        .await;
-    let _ = rrx.await;
+            reply,
+        }
+    })
+    .await
+    {
+        return e.into_response();
+    }
 
     let mut metadata = HashMap::new();
     metadata.insert(

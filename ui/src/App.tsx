@@ -1062,6 +1062,7 @@ export default function App() {
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
           role="dialog"
           aria-modal="true"
+          aria-labelledby="background-runtime-title"
           onClick={(e) => {
             if (e.target === e.currentTarget) {
               setShowBackgroundPanel(false);
@@ -1070,7 +1071,7 @@ export default function App() {
         >
           <div className="flex h-full max-h-[90vh] w-full max-w-3xl flex-col rounded-xl border border-border bg-card shadow-lg overflow-hidden">
             <div className="flex items-center justify-between border-b border-border p-4">
-              <h2 className="text-lg font-semibold text-foreground">Background Runtime</h2>
+              <h2 id="background-runtime-title" className="text-lg font-semibold text-foreground">Background Runtime</h2>
               <Button variant="ghost" size="sm" onClick={() => setShowBackgroundPanel(false)}>
                 Close
               </Button>
@@ -1852,13 +1853,16 @@ function SummaryList({
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="memory-store-title"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
       <div className="flex h-full max-h-[90vh] w-full max-w-2xl flex-col rounded-xl border border-border bg-card shadow-lg overflow-hidden">
         <div className="flex items-center justify-between border-b border-border p-4">
-          <h2 className="text-lg font-semibold text-foreground">Memory Store</h2>
+          <h2 id="memory-store-title" className="text-lg font-semibold text-foreground">Memory Store</h2>
           <Button variant="ghost" size="sm" onClick={onClose}>
             Close
           </Button>

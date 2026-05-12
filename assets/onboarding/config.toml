@@ -154,6 +154,13 @@ uv_requirements = ["afterimage>=0.15.0"]
 # fetch results without waiting for the user. Set false for strict API control.
 # wake_on_job_terminal = true
 
+[harness.background_jobs]
+enabled = true
+auto_resume = true
+
+[harness.notifications]
+enabled = true
+
 [harness.execution.jupyter]
 base_url = "http://127.0.0.1:8888"
 token = "<changethis>"

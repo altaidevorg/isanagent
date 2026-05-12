@@ -1552,60 +1552,48 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
             } => {
                 let res = (|| -> Result<Vec<BackgroundJobRecord>, String> {
                     let lim = limit.clamp(1, 500) as i64;
-                    let sql_all =
-                        "SELECT job_id, kind, chat_id, channel, thread_id, state, payload_json,
+                    let mut sql = "SELECT job_id, kind, chat_id, channel, thread_id, state, payload_json,
                             resume_after_restart, detached, last_error, created_at_ms, updated_at_ms
-                         FROM background_jobs ORDER BY updated_at_ms DESC LIMIT ?1";
-                    let sql_chat = "SELECT job_id, kind, chat_id, channel, thread_id, state, payload_json,
-                            resume_after_restart, detached, last_error, created_at_ms, updated_at_ms
-                         FROM background_jobs WHERE chat_id = ?1 ORDER BY updated_at_ms DESC LIMIT ?2";
+                         FROM background_jobs ".to_string();
+                    let mut filters = Vec::new();
+                    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+                    if let Some(cid) = chat_id {
+                        filters.push("chat_id = ?");
+                        params_vec.push(Box::new(cid));
+                    }
+
+                    if !filters.is_empty() {
+                        sql.push_str(" WHERE ");
+                        sql.push_str(&filters.join(" AND "));
+                    }
+
+                    sql.push_str(" ORDER BY updated_at_ms DESC LIMIT ?");
+                    params_vec.push(Box::new(lim));
+
+                    let mut stmt = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
+                    let rows = stmt
+                        .query_map(params_from_iter(params_vec), |row| {
+                            Ok(BackgroundJobRecord {
+                                job_id: row.get(0)?,
+                                kind: row.get(1)?,
+                                chat_id: row.get(2)?,
+                                channel: row.get(3)?,
+                                thread_id: row.get(4)?,
+                                state: row.get(5)?,
+                                payload_json: row.get(6)?,
+                                resume_after_restart: row.get::<_, i64>(7)? != 0,
+                                detached: row.get::<_, i64>(8)? != 0,
+                                last_error: row.get(9)?,
+                                created_at_ms: row.get(10)?,
+                                updated_at_ms: row.get(11)?,
+                            })
+                        })
+                        .map_err(|e| e.to_string())?;
+
                     let mut out = Vec::new();
-                    if let Some(chat_id) = chat_id {
-                        let mut stmt = self.conn.prepare(sql_chat).map_err(|e| e.to_string())?;
-                        let rows = stmt
-                            .query_map(params![chat_id, lim], |row| {
-                                Ok(BackgroundJobRecord {
-                                    job_id: row.get(0)?,
-                                    kind: row.get(1)?,
-                                    chat_id: row.get(2)?,
-                                    channel: row.get(3)?,
-                                    thread_id: row.get(4)?,
-                                    state: row.get(5)?,
-                                    payload_json: row.get(6)?,
-                                    resume_after_restart: row.get::<_, i64>(7)? != 0,
-                                    detached: row.get::<_, i64>(8)? != 0,
-                                    last_error: row.get(9)?,
-                                    created_at_ms: row.get(10)?,
-                                    updated_at_ms: row.get(11)?,
-                                })
-                            })
-                            .map_err(|e| e.to_string())?;
-                        for r in rows {
-                            out.push(r.map_err(|e| e.to_string())?);
-                        }
-                    } else {
-                        let mut stmt = self.conn.prepare(sql_all).map_err(|e| e.to_string())?;
-                        let rows = stmt
-                            .query_map(params![lim], |row| {
-                                Ok(BackgroundJobRecord {
-                                    job_id: row.get(0)?,
-                                    kind: row.get(1)?,
-                                    chat_id: row.get(2)?,
-                                    channel: row.get(3)?,
-                                    thread_id: row.get(4)?,
-                                    state: row.get(5)?,
-                                    payload_json: row.get(6)?,
-                                    resume_after_restart: row.get::<_, i64>(7)? != 0,
-                                    detached: row.get::<_, i64>(8)? != 0,
-                                    last_error: row.get(9)?,
-                                    created_at_ms: row.get(10)?,
-                                    updated_at_ms: row.get(11)?,
-                                })
-                            })
-                            .map_err(|e| e.to_string())?;
-                        for r in rows {
-                            out.push(r.map_err(|e| e.to_string())?);
-                        }
+                    for r in rows {
+                        out.push(r.map_err(|e| e.to_string())?);
                     }
                     Ok(out)
                 })();
@@ -1649,15 +1637,29 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
             } => {
                 let res = (|| -> Result<Vec<NotificationRecord>, String> {
                     let lim = limit.clamp(1, 500) as i64;
-                    let mut out = Vec::new();
-                    let sql = match (chat_id.is_some(), unseen_only) {
-                        (true, true) => "SELECT notification_id, chat_id, channel, thread_id, kind, title, body, action_kind, action_payload, seen_at_ms, resolved_at_ms, created_at_ms FROM notifications WHERE chat_id = ?1 AND seen_at_ms IS NULL ORDER BY created_at_ms DESC LIMIT ?2",
-                        (true, false) => "SELECT notification_id, chat_id, channel, thread_id, kind, title, body, action_kind, action_payload, seen_at_ms, resolved_at_ms, created_at_ms FROM notifications WHERE chat_id = ?1 ORDER BY created_at_ms DESC LIMIT ?2",
-                        (false, true) => "SELECT notification_id, chat_id, channel, thread_id, kind, title, body, action_kind, action_payload, seen_at_ms, resolved_at_ms, created_at_ms FROM notifications WHERE seen_at_ms IS NULL ORDER BY created_at_ms DESC LIMIT ?1",
-                        (false, false) => "SELECT notification_id, chat_id, channel, thread_id, kind, title, body, action_kind, action_payload, seen_at_ms, resolved_at_ms, created_at_ms FROM notifications ORDER BY created_at_ms DESC LIMIT ?1",
-                    };
-                    let mapper =
-                        |row: &rusqlite::Row| -> Result<NotificationRecord, rusqlite::Error> {
+                    let mut sql = "SELECT notification_id, chat_id, channel, thread_id, kind, title, body, action_kind, action_payload, seen_at_ms, resolved_at_ms, created_at_ms FROM notifications".to_string();
+                    let mut filters = Vec::new();
+                    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+                    if let Some(cid) = chat_id {
+                        filters.push("chat_id = ?");
+                        params_vec.push(Box::new(cid));
+                    }
+                    if unseen_only {
+                        filters.push("seen_at_ms IS NULL");
+                    }
+
+                    if !filters.is_empty() {
+                        sql.push_str(" WHERE ");
+                        sql.push_str(&filters.join(" AND "));
+                    }
+
+                    sql.push_str(" ORDER BY created_at_ms DESC LIMIT ?");
+                    params_vec.push(Box::new(lim));
+
+                    let mut stmt = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
+                    let rows = stmt
+                        .query_map(params_from_iter(params_vec), |row| {
                             Ok(NotificationRecord {
                                 notification_id: row.get(0)?,
                                 chat_id: row.get(1)?,
@@ -1672,23 +1674,12 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                                 resolved_at_ms: row.get(10)?,
                                 created_at_ms: row.get(11)?,
                             })
-                        };
-                    if let Some(chat_id) = chat_id {
-                        let mut stmt = self.conn.prepare(sql).map_err(|e| e.to_string())?;
-                        let rows = stmt
-                            .query_map(params![chat_id, lim], mapper)
-                            .map_err(|e| e.to_string())?;
-                        for r in rows {
-                            out.push(r.map_err(|e| e.to_string())?);
-                        }
-                    } else {
-                        let mut stmt = self.conn.prepare(sql).map_err(|e| e.to_string())?;
-                        let rows = stmt
-                            .query_map(params![lim], mapper)
-                            .map_err(|e| e.to_string())?;
-                        for r in rows {
-                            out.push(r.map_err(|e| e.to_string())?);
-                        }
+                        })
+                        .map_err(|e| e.to_string())?;
+
+                    let mut out = Vec::new();
+                    for r in rows {
+                        out.push(r.map_err(|e| e.to_string())?);
                     }
                     Ok(out)
                 })();

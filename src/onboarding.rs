@@ -126,6 +126,10 @@ pub struct OnboardOptions {
     pub harness_ml_engineer_enabled: Option<bool>,
     #[arg(long, help_heading = "Harness")]
     pub harness_execution_enabled: Option<bool>,
+    #[arg(long, help_heading = "Harness")]
+    pub harness_background_jobs_enabled: Option<bool>,
+    #[arg(long, help_heading = "Harness")]
+    pub harness_notifications_enabled: Option<bool>,
 }
 
 impl OnboardOptions {
@@ -155,6 +159,8 @@ impl OnboardOptions {
             || self.harness_subagents_enabled.is_some()
             || self.harness_ml_engineer_enabled.is_some()
             || self.harness_execution_enabled.is_some()
+            || self.harness_background_jobs_enabled.is_some()
+            || self.harness_notifications_enabled.is_some()
     }
 }
 
@@ -251,6 +257,8 @@ fn apply_onboard_options(cfg: &mut AppConfig, opts: &OnboardOptions) {
         || opts.harness_subagents_enabled.is_some()
         || opts.harness_ml_engineer_enabled.is_some()
         || opts.harness_execution_enabled.is_some()
+        || opts.harness_background_jobs_enabled.is_some()
+        || opts.harness_notifications_enabled.is_some()
     {
         let h = cfg.harness.get_or_insert_with(Default::default);
         if let Some(v) = opts.harness_git_worktree_enabled {
@@ -264,6 +272,12 @@ fn apply_onboard_options(cfg: &mut AppConfig, opts: &OnboardOptions) {
         }
         if let Some(v) = opts.harness_execution_enabled {
             h.execution.get_or_insert_with(Default::default).enabled = Some(v);
+        }
+        if let Some(v) = opts.harness_background_jobs_enabled {
+            h.background_jobs.get_or_insert_with(Default::default).enabled = Some(v);
+        }
+        if let Some(v) = opts.harness_notifications_enabled {
+            h.notifications.get_or_insert_with(Default::default).enabled = Some(v);
         }
     }
 }
@@ -398,6 +412,12 @@ pub fn build_interactive_config_toml(options: &OnboardOptions) -> Result<String,
     }
     if let Some(v) = options.harness_execution_enabled {
         doc["harness"]["execution"]["enabled"] = value(v);
+    }
+    if let Some(v) = options.harness_background_jobs_enabled {
+        doc["harness"]["background_jobs"]["enabled"] = value(v);
+    }
+    if let Some(v) = options.harness_notifications_enabled {
+        doc["harness"]["notifications"]["enabled"] = value(v);
     }
 
     let out = doc.to_string();
@@ -773,6 +793,14 @@ mod tests {
         assert!(
             s.contains("[harness.ml_engineer]") || s.contains("harness.ml_engineer"),
             "expected ml_engineer section preserved from template"
+        );
+        assert!(
+            s.contains("[harness.background_jobs]") || s.contains("harness.background_jobs"),
+            "expected background_jobs section preserved from template"
+        );
+        assert!(
+            s.contains("[harness.notifications]") || s.contains("harness.notifications"),
+            "expected notifications section preserved from template"
         );
         assert!(
             !s.contains("allow_path_outside_sandbox = false"),

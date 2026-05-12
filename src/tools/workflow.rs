@@ -414,7 +414,7 @@ impl Tool for AskUserTool {
                 memory_node
                     .send_packet(MemoryMessage::InsertNotification {
                         record: crate::memory::NotificationRecord {
-                            notification_id,
+                            notification_id: notification_id.clone(),
                             chat_id: ctx.chat_id.clone(),
                             channel: ctx.channel.clone(),
                             thread_id: ctx.thread_id.clone(),
@@ -434,6 +434,17 @@ impl Tool for AskUserTool {
                 nrx.await
                     .map_err(|_| "notification actor channel closed".to_string())?
                     .map_err(|e| format!("notification: {}", e))?;
+                let _ = self.outbound_tx
+                    .send(BusMessage::Telemetry(
+                        crate::bus::TelemetryEvent::NotificationCreated {
+                            notification_id: notification_id.clone(),
+                            chat_id: ctx.chat_id.clone(),
+                            channel: ctx.channel.clone(),
+                            kind: "clarification_ticket".to_string(),
+                            title: "Background input required".to_string(),
+                        },
+                    ))
+                    .await;
             }
             let mut metadata = HashMap::new();
             metadata.insert(
@@ -462,18 +473,6 @@ impl Tool for AskUserTool {
                 .send(BusMessage::Outbound(outbound))
                 .await
                 .map_err(|e| format!("failed to send clarification ticket notification: {}", e))?;
-            let _ = self
-                .outbound_tx
-                .send(BusMessage::Telemetry(
-                    crate::bus::TelemetryEvent::NotificationCreated {
-                        notification_id: ticket_id.clone(),
-                        chat_id: ctx.chat_id.clone(),
-                        channel: ctx.channel.clone(),
-                        kind: "clarification_ticket".to_string(),
-                        title: "Background input required".to_string(),
-                    },
-                ))
-                .await;
             return Err(format!(
                 "Background ask_user converted to clarification ticket `{}`. Waiting for notification reply.",
                 ticket_id

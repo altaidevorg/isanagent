@@ -670,21 +670,15 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
     let harness_runtime_summary = args.harness_runtime_summary.clone();
     let forbid_final_without_tools = args.forbid_final_without_tools;
     let shell_policy = args.shell_policy.clone();
-    let is_background_turn = inbound
-        .metadata
-        .get(crate::bus::METADATA_SYNTHETIC_CRON_TRIGGER)
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-        || inbound
-            .metadata
-            .get(crate::bus::METADATA_SYNTHETIC_JOB_FOLLOWUP)
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        || inbound
-            .metadata
-            .get(crate::bus::METADATA_SYNTHETIC_SUBAGENT_COMPLETION)
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+    const BACKGROUND_METADATA_KEYS: &[&str] = &[
+        crate::bus::METADATA_SYNTHETIC_CRON_TRIGGER,
+        crate::bus::METADATA_SYNTHETIC_JOB_FOLLOWUP,
+        crate::bus::METADATA_SYNTHETIC_SUBAGENT_COMPLETION,
+        crate::bus::METADATA_SYNTHETIC_BACKGROUND_RESUME,
+    ];
+    let is_background_turn = BACKGROUND_METADATA_KEYS
+        .iter()
+        .any(|&key| metadata_truthy(&inbound.metadata, key));
     let tool_exec_ctx = ToolExecCtx::new(
         inbound.channel.clone(),
         inbound.chat_id.clone(),
