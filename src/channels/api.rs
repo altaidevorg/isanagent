@@ -2237,10 +2237,12 @@ async fn handle_list_background_jobs(
     State(state): State<ApiState>,
     Query(params): Query<JobsQuery>,
 ) -> Response {
-    let res = memory_request(&state.memory_node, |reply| MemoryMessage::ListBackgroundJobs {
-        chat_id: params.chat_id,
-        limit: params.limit.unwrap_or(100),
-        reply,
+    let res = memory_request(&state.memory_node, |reply| {
+        MemoryMessage::ListBackgroundJobs {
+            chat_id: params.chat_id,
+            limit: params.limit.unwrap_or(100),
+            reply,
+        }
     })
     .await;
 
@@ -2254,11 +2256,13 @@ async fn handle_list_notifications(
     State(state): State<ApiState>,
     Query(params): Query<NotificationsQuery>,
 ) -> Response {
-    let res = memory_request(&state.memory_node, |reply| MemoryMessage::ListNotifications {
-        chat_id: params.chat_id,
-        limit: params.limit.unwrap_or(100),
-        unseen_only: params.unseen_only.unwrap_or(false),
-        reply,
+    let res = memory_request(&state.memory_node, |reply| {
+        MemoryMessage::ListNotifications {
+            chat_id: params.chat_id,
+            limit: params.limit.unwrap_or(100),
+            unseen_only: params.unseen_only.unwrap_or(false),
+            reply,
+        }
     })
     .await;
 
@@ -2272,9 +2276,11 @@ async fn handle_notification_seen(
     State(state): State<ApiState>,
     AxumPath(notification_id): AxumPath<String>,
 ) -> Response {
-    let res = memory_request(&state.memory_node, |reply| MemoryMessage::MarkNotificationSeen {
-        notification_id,
-        reply,
+    let res = memory_request(&state.memory_node, |reply| {
+        MemoryMessage::MarkNotificationSeen {
+            notification_id,
+            reply,
+        }
     })
     .await;
 
@@ -2288,9 +2294,11 @@ async fn handle_notification_resolve(
     State(state): State<ApiState>,
     AxumPath(notification_id): AxumPath<String>,
 ) -> Response {
-    let res = memory_request(&state.memory_node, |reply| MemoryMessage::ResolveNotification {
-        notification_id,
-        reply,
+    let res = memory_request(&state.memory_node, |reply| {
+        MemoryMessage::ResolveNotification {
+            notification_id,
+            reply,
+        }
     })
     .await;
 
@@ -2305,9 +2313,11 @@ async fn handle_clarification_ticket_reply(
     AxumPath(ticket_id): AxumPath<String>,
     Json(body): Json<ClarificationReplyBody>,
 ) -> Response {
-    let ticket = match memory_request(&state.memory_node, |reply| MemoryMessage::GetClarificationTicket {
-        ticket_id: ticket_id.clone(),
-        reply,
+    let ticket = match memory_request(&state.memory_node, |reply| {
+        MemoryMessage::GetClarificationTicket {
+            ticket_id: ticket_id.clone(),
+            reply,
+        }
     })
     .await
     {

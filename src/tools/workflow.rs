@@ -434,7 +434,8 @@ impl Tool for AskUserTool {
                 nrx.await
                     .map_err(|_| "notification actor channel closed".to_string())?
                     .map_err(|e| format!("notification: {}", e))?;
-                let _ = self.outbound_tx
+                let _ = self
+                    .outbound_tx
                     .send(BusMessage::Telemetry(
                         crate::bus::TelemetryEvent::NotificationCreated {
                             notification_id: notification_id.clone(),

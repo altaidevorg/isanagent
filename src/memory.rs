@@ -1552,9 +1552,11 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
             } => {
                 let res = (|| -> Result<Vec<BackgroundJobRecord>, String> {
                     let lim = limit.clamp(1, 500) as i64;
-                    let mut sql = "SELECT job_id, kind, chat_id, channel, thread_id, state, payload_json,
+                    let mut sql =
+                        "SELECT job_id, kind, chat_id, channel, thread_id, state, payload_json,
                             resume_after_restart, detached, last_error, created_at_ms, updated_at_ms
-                         FROM background_jobs ".to_string();
+                         FROM background_jobs "
+                            .to_string();
                     let mut filters = Vec::new();
                     let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 

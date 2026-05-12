@@ -274,7 +274,9 @@ fn apply_onboard_options(cfg: &mut AppConfig, opts: &OnboardOptions) {
             h.execution.get_or_insert_with(Default::default).enabled = Some(v);
         }
         if let Some(v) = opts.harness_background_jobs_enabled {
-            h.background_jobs.get_or_insert_with(Default::default).enabled = Some(v);
+            h.background_jobs
+                .get_or_insert_with(Default::default)
+                .enabled = Some(v);
         }
         if let Some(v) = opts.harness_notifications_enabled {
             h.notifications.get_or_insert_with(Default::default).enabled = Some(v);
