@@ -5,7 +5,9 @@
 
 use crate::bus::{clarification_session_key, BusMessage, TelemetryEvent};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::future::Future;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Identity for the session executing a tool (matches `AgentLogic` memory key format).
@@ -20,6 +22,8 @@ pub struct ToolExecCtx {
     /// Cancellation token for the **current** reasoning loop (parent or sub-agent), when set.
     /// Used by harness tools to link child work to parent cancellation policy.
     pub reasoning_cancel: Option<tokio_util::sync::CancellationToken>,
+    /// Metadata from the inbound message that triggered the reasoning loop.
+    pub inbound_metadata: Arc<HashMap<String, serde_json::Value>>,
 }
 
 impl ToolExecCtx {
@@ -38,6 +42,7 @@ impl ToolExecCtx {
             thread_id,
             is_background: false,
             reasoning_cancel: None,
+            inbound_metadata: Arc::new(HashMap::new()),
         }
     }
 
@@ -48,6 +53,11 @@ impl ToolExecCtx {
 
     pub fn with_background(mut self, is_background: bool) -> Self {
         self.is_background = is_background;
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: Arc<HashMap<String, serde_json::Value>>) -> Self {
+        self.inbound_metadata = metadata;
         self
     }
 }

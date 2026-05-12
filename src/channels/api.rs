@@ -2351,7 +2351,7 @@ async fn handle_clarification_ticket_reply(
         Value::Bool(true),
     );
     metadata.insert(
-        "clarification_ticket_id".to_string(),
+        crate::bus::METADATA_CLARIFICATION_TICKET_ID.to_string(),
         Value::String(ticket_id),
     );
     if let Err(e) = state

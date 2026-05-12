@@ -374,9 +374,21 @@ impl Tool for AskUserTool {
         }
 
         if ctx.is_background {
+            let memory_node = self.memory_node.as_ref().ok_or_else(|| {
+                "Background ask_user requires a memory node for clarification tickets".to_string()
+            })?;
+
             let ticket_id = uuid::Uuid::new_v4().to_string();
             let now = Utc::now().timestamp_millis();
-            if let Some(memory_node) = &self.memory_node {
+
+            let job_id = ctx
+                .inbound_metadata
+                .get(crate::bus::METADATA_BACKGROUND_JOB_ID)
+                .and_then(|v| v.as_str())
+                .unwrap_or(&ctx.chat_id)
+                .to_string();
+
+            {
                 let choices_json = if choices.is_empty() {
                     None
                 } else {
@@ -390,7 +402,7 @@ impl Tool for AskUserTool {
                     .send_packet(MemoryMessage::UpsertClarificationTicket {
                         record: crate::memory::ClarificationTicketRecord {
                             ticket_id: ticket_id.clone(),
-                            job_id: ctx.chat_id.clone(),
+                            job_id,
                             chat_id: ctx.chat_id.clone(),
                             channel: ctx.channel.clone(),
                             thread_id: ctx.thread_id.clone(),
@@ -457,7 +469,7 @@ impl Tool for AskUserTool {
                 serde_json::Value::String("clarification_ticket".to_string()),
             );
             metadata.insert(
-                "clarification_ticket_id".to_string(),
+                crate::bus::METADATA_CLARIFICATION_TICKET_ID.to_string(),
                 serde_json::Value::String(ticket_id.clone()),
             );
             let outbound = OutboundMessage {

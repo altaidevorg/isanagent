@@ -1610,7 +1610,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 let res = (|| -> Result<(), String> {
                     let now = Utc::now().timestamp_millis();
                     self.conn.execute(
-                        "UPDATE background_jobs SET state = ?1, last_error = COALESCE(?2, last_error), updated_at_ms = ?3 WHERE job_id = ?4",
+                        "UPDATE background_jobs SET state = ?1, last_error = ?2, updated_at_ms = ?3 WHERE job_id = ?4",
                         params![state, last_error, now, job_id],
                     ).map_err(|e| format!("update background_jobs: {}", e))?;
                     Ok(())
