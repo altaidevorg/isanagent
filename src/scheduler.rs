@@ -852,6 +852,10 @@ impl ActorLogic<String> for CronActor {
                 .record_cron_background_job(&job_id, &channel, &chat_id, &message, now_ms);
             let mut metadata = HashMap::new();
             metadata.insert(
+                crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
+                serde_json::Value::String(format!("cron:{}", job_id)),
+            );
+            metadata.insert(
                 "cron_job_id".to_string(),
                 serde_json::Value::String(job_id.clone()),
             );

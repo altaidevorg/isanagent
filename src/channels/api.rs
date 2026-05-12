@@ -747,6 +747,10 @@ async fn handle_mte_cron_webhook(
 
     let mut metadata = HashMap::from([
         (
+            crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
+            Value::String(format!("cron:{}", trigger.job_id)),
+        ),
+        (
             "cron_job_id".to_string(),
             Value::String(trigger.job_id.clone()),
         ),
@@ -2346,6 +2350,10 @@ async fn handle_clarification_ticket_reply(
     }
 
     let mut metadata = HashMap::new();
+    metadata.insert(
+        crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
+        Value::String(ticket.job_id),
+    );
     metadata.insert(
         crate::bus::METADATA_SYNTHETIC_BACKGROUND_RESUME.to_string(),
         Value::Bool(true),

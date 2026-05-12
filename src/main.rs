@@ -1272,9 +1272,18 @@ async fn recover_background_jobs_on_startup(
     {
         return;
     }
-    let Ok(Ok(rows)) = rx.await else {
-        return;
+    let rows = match rx.await {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(e)) => {
+            log::error!("Failed to list background jobs for recovery: {}", e);
+            return;
+        }
+        Err(_) => {
+            log::error!("Memory actor channel closed during background job recovery");
+            return;
+        }
     };
+    let mut count = 0;
     for row in rows {
         if !row.resume_after_restart || row.state != "running" {
             continue;
@@ -1285,10 +1294,10 @@ async fn recover_background_jobs_on_startup(
             serde_json::Value::Bool(true),
         );
         metadata.insert(
-            "background_job_id".to_string(),
+            isanagent::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
             serde_json::Value::String(row.job_id.clone()),
         );
-        let _ = bus_tx
+        if let Err(e) = bus_tx
             .send(BusMessage::Inbound(InboundMessage {
                 channel: row.channel.clone(),
                 sender_id: "background_recovery".to_string(),
@@ -1298,19 +1307,16 @@ async fn recover_background_jobs_on_startup(
                 attachments: Vec::new(),
                 metadata,
             }))
-            .await;
-        let _ = outbound_tx
-            .send(BusMessage::Outbound(OutboundMessage {
-                channel: row.channel,
-                chat_id: row.chat_id,
-                thread_id: row.thread_id,
-                content: format!("Recovered background job on startup: {}", row.job_id),
-                metadata: std::collections::HashMap::from([(
-                    "isanagent_notification".to_string(),
-                    serde_json::Value::Bool(true),
-                )]),
-            }))
-            .await;
+            .await
+        {
+            log::error!("Failed to enqueue recovery message for job {}: {}", row.job_id, e);
+        } else {
+            log::info!("Recovered background job on startup: {}", row.job_id);
+            count += 1;
+        }
+    }
+    if count > 0 {
+        log::info!("Successfully resumed {} background job(s) on startup.", count);
     }
 }
 
