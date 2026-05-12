@@ -532,7 +532,7 @@ impl ExecutionProvider for LocalExecutionProvider {
         }
 
         let mode = self.pick_mode(&req).await?;
-        
+
         if matches!(self.config.python_runtime, LocalPythonRuntime::UvManaged) {
             let _ = self.resolve_python_executable().await?;
         }
@@ -606,7 +606,7 @@ impl ExecutionProvider for LocalExecutionProvider {
 
         let result: Result<RunResult, ExecutionError> = {
             let (mut cmd, stdin_body) = build_command(&session.mode, &spec.code)?;
-            
+
             let mut has_local_venv = false;
             for ancestor in cwd.ancestors() {
                 if ancestor.join(".venv").is_dir() {
@@ -629,7 +629,7 @@ impl ExecutionProvider for LocalExecutionProvider {
                     }
                 }
             }
-            
+
             cmd.current_dir(&cwd);
             cmd.stdin(if stdin_body.is_some() {
                 Stdio::piped()
@@ -666,11 +666,8 @@ impl ExecutionProvider for LocalExecutionProvider {
             }
 
             let work = async move {
-                match tokio::time::timeout(
-                    timeout,
-                    drain_child_pipes(child, max_each, stdin_body),
-                )
-                .await
+                match tokio::time::timeout(timeout, drain_child_pipes(child, max_each, stdin_body))
+                    .await
                 {
                     Err(_) => {
                         if let Some(p) = pid {
@@ -1063,7 +1060,6 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-
     #[test]
     fn uv_env_key_changes_with_python_or_requirements() {
         let dir = temp_sandbox();
@@ -1172,7 +1168,10 @@ mod tests {
             .unwrap();
         // $PSVersionTable exists in PowerShell but not in CMD
         let r = prov
-            .run(&h.id, RunSpec::new("if ($PSVersionTable) { echo 'ps-ok' }", 30))
+            .run(
+                &h.id,
+                RunSpec::new("if ($PSVersionTable) { echo 'ps-ok' }", 30),
+            )
             .await
             .unwrap();
         assert!(r.stdout.contains("ps-ok"), "{r:?}");
@@ -1187,20 +1186,31 @@ mod tests {
         fs::create_dir_all(&venv_dir).unwrap();
         // Create a dummy file to simulate a real venv
         fs::write(venv_dir.join("pyvenv.cfg"), "home = .").unwrap();
-        
+
         let mut cfg = LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
         cfg.python_runtime = LocalPythonRuntime::UvManaged;
         let prov = LocalExecutionProvider::new(cfg).unwrap();
-        
-        let h = prov.create_session(SessionCreateRequest::default()).await.unwrap();
-        
+
+        let h = prov
+            .create_session(SessionCreateRequest::default())
+            .await
+            .unwrap();
+
         // Use a command that prints the environment variable we inject
-        let code = if cfg!(windows) { "echo %UV_PROJECT_ENVIRONMENT%" } else { "echo $UV_PROJECT_ENVIRONMENT" };
+        let code = if cfg!(windows) {
+            "echo %UV_PROJECT_ENVIRONMENT%"
+        } else {
+            "echo $UV_PROJECT_ENVIRONMENT"
+        };
         let r = prov.run(&h.id, RunSpec::new(code, 30)).await.unwrap();
-        
+
         // It should NOT contain the managed environment path because .venv exists
-        assert!(!r.stdout.contains(".system_generated"), "UV_PROJECT_ENVIRONMENT was injected despite local .venv: {}", r.stdout);
-        
+        assert!(
+            !r.stdout.contains(".system_generated"),
+            "UV_PROJECT_ENVIRONMENT was injected despite local .venv: {}",
+            r.stdout
+        );
+
         prov.close_session(&h.id).await.unwrap();
         let _ = fs::remove_dir_all(&dir);
     }

@@ -23,23 +23,9 @@ AfterImage is a **Python 3.11+** library and a **Click CLI** entry point named `
 
 1. **Respondent** = model you want to imitate in training data (`respondent_prompt` / YAML `respondent.system_prompt`).
 2. **Correspondent** = model that plays the user; driven by a **correspondent system prompt** and/or an **instruction generator callback** that emits first user turns and metadata (context, persona).
-3. Each dialog samples an integer **turn count uniformly from `1` through `max_turns`**. Unless you need to generate a multi-turn conversational dataset, keep `max_turns=1` (default).
+3. Each dialog samples an integer **turn count uniformly from `1` through `max_turns`**. Unless you need to generate a multi-turn conversational dataset, keep `max_turns=1` (default). Setting `max_turns > 1` enables back-and-forth multi-turn conversations where the correspondent handles follow-ups.
 4. CLI is enabled, but for most realistic dataset generation needs it's quite simple, so prefer writing Python code, instead. However, the CLI tool is quite useful for exporting datasets to a common format that is ready to feed into other packages, e.g., unsloth uses `messages` format and you can export to `messages` format after the dataset generation is complete.
 5. You can find useful examples in this skill directory, i.e., `<your_sandbox_dir>/skills/synthetic-dataset-with-afterimage/examples`. Use them as the starter. Never modify the example files under that directory so they can remain **source of truth.** Instead, you can copy one or more files that you thin are relevant to your current task, and modify it outside the examples directory.
-
----
-
-## Workflow to create useful datasets
-
-1. Make sure that you fully understand the intended use of the dataset. What is this dataset supposed to teach a model. Is it a certain task or domain knowledge? Is it a kind of structured output? Is it tool calling etc.
-2. If the main goal is to teach a structured output with a certain schema, use `StructuredGenerator` and look for its examples to get inspired.
-3. If you intend to teach tool calling, look for the tool calling generation below, and decide on the tool schemas, e.g., tool names, arguments, return types etc.
-4. If you need to generate high-quality multi-choice questions (MCQs) in a certain domain, look for the MCQ pipeline from the Simula method implemented as OpenSimula in Afterimage.
-5. If you need to generate a high-quality conversational dataset based on a corpus, look for the corpus batch QA example from OpenSimula.
-6. If you work with a very large corpus indexed in a DB, e.g., Qdrant or another indexer, you can look for the `caselaw_rag` example.
-7. If you need to generate DPO-like preference data, look for the DPO example below.
-8. Afterimage has several built-in `DocumentProvider` implementations. You can choose one of based on the condition, or you an implement a custom one based on the protocol.
-9. Afterimage comes with several instruction generator callback implementations. You can adopt one of them based on the condition, or you can implement a custom one if it is required.
 
 ---
 
@@ -141,10 +127,25 @@ asyncio.run(main())
 
 Use `afterimage.preference.generator.PreferenceGenerator` with a configured `ConversationGenerator` and `ConversationJudge`.
 
-`ConversationJudge` is constructed with an **`LLMProvider`** and an **`EmbeddingProvider`** (or use `ConversationJudge.from_factory(...)` with `key_pool` and `default_embedding_provider_config` — same pattern the `afterimage preference` CLI uses).
+`ConversationJudge` is constructed with an **`LLMProvider`** and an **`EmbeddingProvider`**.
 
 ```python
+from afterimage import SmartKeyPool, LLMFactory, EmbeddingProviderFactory, ConversationJudge
 from afterimage.preference.types import PreferenceConfig
+
+pool = SmartKeyPool.from_single_key(api_key)
+llm = LLMFactory.create(
+    provider="gemini", model_name="gemini-2.5-flash", api_key=pool
+)
+embedding = EmbeddingProviderFactory.create(
+    {"type": "gemini", "model": "gemini-embedding-001"},
+    key_pool=pool,
+)
+
+judge = ConversationJudge(
+    llm=llm,
+    embedding_provider=embedding,
+)
 
 pref = gen.to_preference_generator(
     judge=judge,
@@ -159,14 +160,86 @@ Full judge wiring example: [reference.md](reference.md).
 
 ---
 
+## Structured Output
+
+Use `AsyncStructuredGenerator` to generate datasets where the assistant's response must conform to a specific Pydantic schema.
+
+```python
+from afterimage import AsyncStructuredGenerator
+from pydantic import BaseModel
+
+class MyOutputSchema(BaseModel):
+    reasoning: str
+    final_answer: str
+
+gen = AsyncStructuredGenerator(
+    output_schema=MyOutputSchema,
+    respondent_prompt="You are an expert.",
+    api_key=api_key,
+    model_name="gemini-2.5-flash",
+    instruction_generator_callback=instruction_cb,
+)
+await gen.generate(num_samples=10)
+```
+
+---
+
+## Tool Calling
+
+Use `ConversationGenerator` with `ToolCallingInstructionGeneratorCallback` and pass the tools to the generator.
+
+```python
+from typing import List, Union
+from pydantic import BaseModel, Field
+from afterimage import AsyncStructuredGenerator, ToolCallingInstructionGeneratorCallback
+
+class SearchFlights(BaseModel):
+    """Search for flights."""
+    # ... arguments ...
+
+class AnyToolCall(BaseModel):
+    function: Union[SearchFlights]
+
+class ToolInvocation(BaseModel):
+    reasoning: str = Field(description="Reasoning for selecting the tool.")
+    response: str = Field(description="The final response to the user.")
+    tool_calls: List[AnyToolCall] = Field(description="A list of tool calls to execute.")
+
+tools = [SearchFlights]
+
+instruction_cb = ToolCallingInstructionGeneratorCallback(
+    api_key=api_key,
+    documents=docs,
+    model_name="gemini-2.5-flash",
+    tools=tools,
+    n_instructions=3,
+)
+
+gen = AsyncStructuredGenerator(
+    output_schema=ToolInvocation,
+    respondent_prompt="You are a helpful assistant.",
+    api_key=api_key,
+    model_name="gemini-2.5-flash",
+    instruction_generator_callback=instruction_cb,
+)
+await gen.generate(num_samples=10)
+```
+
+---
+
 ## More examples
 
 The following examples (and more) can be found in `<your_sandbox_dir>/skills/synthetic-dataset-with-afterimage/examples`.
 
+- Medical Triage Dialogue (Multi-turn Conversational): `medical_triage_multiturn.py`
+- Code Review Assistant (Structured Output): `code_review_structured.py`
+- Flight Booking Agent (Tool Calling): `flight_booking_tool_calling.py`
+- Tone Alignment Preference Pairs (DPO): `tone_alignment_dpo.py`
+- Math Word Problem Solver (Chain-of-Thought with Simula): `math_reasoning_simula.py`
 - Customer support data generation with `StructuredGenerator`: `customer_support_data_with_structured_output.py`
 - MCQ generation with `StructuredGenerator`: `generate_chem_mcq_with_structured_output.py`
 - A more advanced way to generate MCQs with the Simula method: `<your_sandbox_dir>/skills/synthetic-dataset-with-afterimage/examples/simula/mcq_pipeline.py`
-- How to generate multiple question-answer pairs  from a corpus with the Simula method: `<your_sandbox_dir>/skills/synthetic-dataset-with-afterimage/examples/simula/corpus_batch_qa.py`
+- How to generate multiple samples with the Simula method: `<your_sandbox_dir>/skills/synthetic-dataset-with-afterimage/examples/simula/corpus_batch_qa.py`
 - Tool-calling dataset generation with tool schemas: `tool_calling_generator.py`
 - RAG-grounded synthetic dataset generation in the legal domain: read `<your_sandbox_dir>/skills/synthetic-dataset-with-afterimage/examples/caselaw_rag/README.md`
 - Simula, a reasoning-driven synthetic dataset generation and evaluation: read `<your_sandbox_dir>/skills/synthetic-dataset-with-afterimage/examples/simula/README.md`. This method may take some time, but it gives state-of-the-art results with hierarachical taxonomy building, probablistic complexification, ELO-based pruning and  double-critic evaluation.
@@ -175,7 +248,7 @@ The following examples (and more) can be found in `<your_sandbox_dir>/skills/syn
 
 ## Quality gate (`auto_improve`)
 
-With `ConversationGenerator(..., auto_improve=True)`, a judge is created automatically. For `model_provider_name="local"`, local embeddings may be required; the package raises a clear `ValueError` suggesting `pip install "afterimage[embeddings-local]"` when needed.
+With `ConversationGenerator(..., auto_improve=True)`, a judge is created automatically. This actively evaluates generated conversations and filters out low-quality ones based on default or custom criteria. For `model_provider_name="local"`, local embeddings may be required; the package raises a clear `ValueError` suggesting `pip install "afterimage[embeddings-local]"` when needed.
 
 ---
 

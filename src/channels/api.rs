@@ -247,6 +247,35 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// Helper to send a request to the memory node and map common errors to ApiError.
+async fn memory_request<T>(
+    memory_node: &NodeHandle<MemoryMessage>,
+    msg_ctor: impl FnOnce(SharedReply<Result<T, String>>) -> MemoryMessage,
+) -> Result<T, ApiError> {
+    let (tx, rx) = oneshot::channel();
+    let msg = msg_ctor(SharedReply::new(tx));
+    memory_node.send_packet(msg).await.map_err(|e| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "memory_unavailable",
+            e.to_string(),
+        )
+    })?;
+    match rx.await {
+        Ok(Ok(val)) => Ok(val),
+        Ok(Err(e)) => Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "memory_error",
+            e,
+        )),
+        Err(_) => Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "memory_unavailable",
+            "Memory actor channel closed",
+        )),
+    }
+}
+
 pub struct ApiChannel {
     port: u16,
     bind_address: Option<String>,
@@ -562,6 +591,20 @@ fn build_router(state: ApiState, serve_ui: bool) -> Router {
         .route("/v1/summaries/{id}", post(handle_update_summary))
         .route("/v1/summaries/{id}", delete(handle_delete_summary))
         .route("/v1/chat/cancel/{chat_id}", post(handle_cancel_chat))
+        .route("/v1/background-jobs", get(handle_list_background_jobs))
+        .route("/v1/notifications", get(handle_list_notifications))
+        .route(
+            "/v1/notifications/{notification_id}/seen",
+            post(handle_notification_seen),
+        )
+        .route(
+            "/v1/notifications/{notification_id}/resolve",
+            post(handle_notification_resolve),
+        )
+        .route(
+            "/v1/clarification-tickets/{ticket_id}/reply",
+            post(handle_clarification_ticket_reply),
+        )
         .route("/v1/workspace/list", get(handle_workspace_list))
         .route("/v1/workspace/file", get(handle_workspace_file))
         // POST on a distinct path so clients are not blocked by proxies or older builds that only registered GET on `/v1/workspace/file`.
@@ -703,6 +746,10 @@ async fn handle_mte_cron_webhook(
     let trigger = pending_trigger.payload().clone();
 
     let mut metadata = HashMap::from([
+        (
+            crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
+            Value::String(format!("cron:{}", trigger.job_id)),
+        ),
         (
             "cron_job_id".to_string(),
             Value::String(trigger.job_id.clone()),
@@ -1665,31 +1712,16 @@ async fn handle_get_thread_summaries(
         .into_response();
     }
     let memory_thread_id = resolve_memory_thread_id(&state, thread_id);
-    let (tx, rx) = oneshot::channel();
-    let msg = MemoryMessage::GetSummaries {
+    let res = memory_request(&state.memory_node, |reply| MemoryMessage::GetSummaries {
         thread_id: memory_thread_id.to_string(),
         limit: 50,
-        reply: SharedReply::new(tx),
-    };
-    if let Err(e) = state.memory_node.send_packet(msg).await {
-        return ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "memory_unavailable",
-            e.to_string(),
-        )
-        .into_response();
-    }
-    match rx.await {
-        Ok(Ok(summaries)) => Json(summaries).into_response(),
-        Ok(Err(e)) => {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "memory_error", e).into_response()
-        }
-        Err(_) => ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "memory_unavailable",
-            "Memory actor channel closed",
-        )
-        .into_response(),
+        reply,
+    })
+    .await;
+
+    match res {
+        Ok(summaries) => Json(summaries).into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -1698,62 +1730,32 @@ async fn handle_update_summary(
     AxumPath(id): AxumPath<i64>,
     Json(payload): Json<UpdateSummaryRequest>,
 ) -> Response {
-    let (tx, rx) = oneshot::channel();
-    let msg = MemoryMessage::UpdateSummary {
+    let res = memory_request(&state.memory_node, |reply| MemoryMessage::UpdateSummary {
         id,
         summary: payload.summary,
         key_info: payload.key_info,
         knowledge_gaps: payload.knowledge_gaps,
-        reply: SharedReply::new(tx),
-    };
-    if let Err(e) = state.memory_node.send_packet(msg).await {
-        return ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "memory_unavailable",
-            e.to_string(),
-        )
-        .into_response();
-    }
-    match rx.await {
-        Ok(Ok(())) => StatusCode::OK.into_response(),
-        Ok(Err(e)) => {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "memory_error", e).into_response()
-        }
-        Err(_) => ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "memory_unavailable",
-            "Memory actor channel closed",
-        )
-        .into_response(),
+        reply,
+    })
+    .await;
+
+    match res {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
 async fn handle_get_all_summaries(State(state): State<ApiState>) -> Response {
-    let (tx, rx) = oneshot::channel();
-    let msg = MemoryMessage::GetSummaries {
+    let res = memory_request(&state.memory_node, |reply| MemoryMessage::GetSummaries {
         thread_id: String::new(), // Empty string means get all
         limit: 100,
-        reply: SharedReply::new(tx),
-    };
-    if let Err(e) = state.memory_node.send_packet(msg).await {
-        return ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "memory_unavailable",
-            e.to_string(),
-        )
-        .into_response();
-    }
-    match rx.await {
-        Ok(Ok(summaries)) => Json(summaries).into_response(),
-        Ok(Err(e)) => {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "memory_error", e).into_response()
-        }
-        Err(_) => ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "memory_unavailable",
-            "Memory actor channel closed",
-        )
-        .into_response(),
+        reply,
+    })
+    .await;
+
+    match res {
+        Ok(summaries) => Json(summaries).into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -1761,30 +1763,15 @@ async fn handle_delete_summary(
     State(state): State<ApiState>,
     AxumPath(id): AxumPath<i64>,
 ) -> Response {
-    let (tx, rx) = oneshot::channel();
-    let msg = MemoryMessage::DeleteSummary {
+    let res = memory_request(&state.memory_node, |reply| MemoryMessage::DeleteSummary {
         id,
-        reply: SharedReply::new(tx),
-    };
-    if let Err(e) = state.memory_node.send_packet(msg).await {
-        return ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "memory_unavailable",
-            e.to_string(),
-        )
-        .into_response();
-    }
-    match rx.await {
-        Ok(Ok(())) => StatusCode::OK.into_response(),
-        Ok(Err(e)) => {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "memory_error", e).into_response()
-        }
-        Err(_) => ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "memory_unavailable",
-            "Memory actor channel closed",
-        )
-        .into_response(),
+        reply,
+    })
+    .await;
+
+    match res {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -1834,6 +1821,29 @@ struct WorkspaceRenameBody {
 #[derive(Serialize)]
 struct WorkspaceRenameResponse {
     path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct JobsQuery {
+    #[serde(default)]
+    chat_id: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NotificationsQuery {
+    #[serde(default)]
+    chat_id: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    unseen_only: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClarificationReplyBody {
+    response: String,
 }
 
 /// Matches a generous UI preview cap (binary files are rejected earlier).
@@ -2224,6 +2234,154 @@ async fn handle_cancel_chat(
     // 2. Clear the pending request lock so the user can send a new message immediately
     state.pending_requests.remove(&chat_id);
 
+    StatusCode::OK.into_response()
+}
+
+async fn handle_list_background_jobs(
+    State(state): State<ApiState>,
+    Query(params): Query<JobsQuery>,
+) -> Response {
+    let res = memory_request(&state.memory_node, |reply| {
+        MemoryMessage::ListBackgroundJobs {
+            chat_id: params.chat_id,
+            limit: params.limit.unwrap_or(100),
+            reply,
+        }
+    })
+    .await;
+
+    match res {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn handle_list_notifications(
+    State(state): State<ApiState>,
+    Query(params): Query<NotificationsQuery>,
+) -> Response {
+    let res = memory_request(&state.memory_node, |reply| {
+        MemoryMessage::ListNotifications {
+            chat_id: params.chat_id,
+            limit: params.limit.unwrap_or(100),
+            unseen_only: params.unseen_only.unwrap_or(false),
+            reply,
+        }
+    })
+    .await;
+
+    match res {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn handle_notification_seen(
+    State(state): State<ApiState>,
+    AxumPath(notification_id): AxumPath<String>,
+) -> Response {
+    let res = memory_request(&state.memory_node, |reply| {
+        MemoryMessage::MarkNotificationSeen {
+            notification_id,
+            reply,
+        }
+    })
+    .await;
+
+    match res {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn handle_notification_resolve(
+    State(state): State<ApiState>,
+    AxumPath(notification_id): AxumPath<String>,
+) -> Response {
+    let res = memory_request(&state.memory_node, |reply| {
+        MemoryMessage::ResolveNotification {
+            notification_id,
+            reply,
+        }
+    })
+    .await;
+
+    match res {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn handle_clarification_ticket_reply(
+    State(state): State<ApiState>,
+    AxumPath(ticket_id): AxumPath<String>,
+    Json(body): Json<ClarificationReplyBody>,
+) -> Response {
+    let ticket = match memory_request(&state.memory_node, |reply| {
+        MemoryMessage::GetClarificationTicket {
+            ticket_id: ticket_id.clone(),
+            reply,
+        }
+    })
+    .await
+    {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return ApiError::new(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "Unknown clarification ticket",
+            )
+            .into_response();
+        }
+        Err(e) => return e.into_response(),
+    };
+
+    if let Err(e) = memory_request(&state.memory_node, |reply| {
+        MemoryMessage::ResolveClarificationTicket {
+            ticket_id: ticket_id.clone(),
+            response: body.response.clone(),
+            reply,
+        }
+    })
+    .await
+    {
+        return e.into_response();
+    }
+
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
+        Value::String(ticket.job_id),
+    );
+    metadata.insert(
+        crate::bus::METADATA_SYNTHETIC_BACKGROUND_RESUME.to_string(),
+        Value::Bool(true),
+    );
+    metadata.insert(
+        crate::bus::METADATA_CLARIFICATION_TICKET_ID.to_string(),
+        Value::String(ticket_id),
+    );
+    if let Err(e) = state
+        .bus_tx
+        .send(BusMessage::Inbound(InboundMessage {
+            channel: ticket.channel,
+            sender_id: "notification_reply".to_string(),
+            chat_id: ticket.chat_id,
+            thread_id: ticket.thread_id,
+            content: body.response,
+            attachments: Vec::new(),
+            metadata,
+        }))
+        .await
+    {
+        return ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "agent_queue_unavailable",
+            format!("Failed to enqueue ticket response: {}", e),
+        )
+        .into_response();
+    }
     StatusCode::OK.into_response()
 }
 

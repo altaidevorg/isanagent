@@ -21,7 +21,7 @@ use crate::onboarding::OnboardOptions;
 use crate::provider_registry;
 
 /// Matches [`assets/onboarding/config.toml`] defaults for boolean-ish sections.
-const FEATURE_TOGGLE_COUNT: usize = 13;
+const FEATURE_TOGGLE_COUNT: usize = 15;
 const FEATURE_TOGGLE_LABELS: [&str; FEATURE_TOGGLE_COUNT] = [
     "[terminal] stdin/stdout chat",
     "[slack]",
@@ -36,6 +36,8 @@ const FEATURE_TOGGLE_LABELS: [&str; FEATURE_TOGGLE_COUNT] = [
     "[harness.subagents]",
     "[harness.ml_engineer] ML policy overlay (see workspace/ML_ENGINEER_OVERLAY.md)",
     "[harness.execution]",
+    "[harness.background_jobs] job tracking and auto-resume",
+    "[harness.notifications] in-app background notifications",
 ];
 
 fn default_feature_toggle_values() -> [bool; FEATURE_TOGGLE_COUNT] {
@@ -53,6 +55,8 @@ fn default_feature_toggle_values() -> [bool; FEATURE_TOGGLE_COUNT] {
         true,  // harness subagents
         true,  // harness ml_engineer
         true,  // harness execution
+        true,  // harness background_jobs
+        true,  // harness notifications
     ]
 }
 
@@ -91,6 +95,8 @@ fn build_onboard_options_with_toggles(
         harness_subagents_enabled: Some(values[10]),
         harness_ml_engineer_enabled: Some(values[11]),
         harness_execution_enabled: Some(values[12]),
+        harness_background_jobs_enabled: Some(values[13]),
+        harness_notifications_enabled: Some(values[14]),
         ..Default::default()
     }
 }

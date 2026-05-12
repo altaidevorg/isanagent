@@ -12,6 +12,12 @@ pub const METADATA_SYNTHETIC_SUBAGENT_COMPLETION: &str = "isanagent_synthetic_su
 /// Inbound metadata: hint to the agent to avoid finishing without using tools.
 pub const METADATA_AUTONOMOUS_FORBID_FINAL_WITHOUT_TOOLS: &str =
     "isanagent_autonomous_forbid_final_without_tools";
+/// Inbound metadata: synthetic message used to resume a background job from a notification action.
+pub const METADATA_SYNTHETIC_BACKGROUND_RESUME: &str = "isanagent_synthetic_background_resume";
+/// Inbound metadata: the ID of the background job being resumed.
+pub const METADATA_BACKGROUND_JOB_ID: &str = "isanagent_background_job_id";
+/// Inbound metadata: the ID of the clarification ticket being replied to.
+pub const METADATA_CLARIFICATION_TICKET_ID: &str = "clarification_ticket_id";
 
 /// An inbound message received from a Channel (e.g. Slack, Email).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,6 +201,31 @@ pub enum TelemetryEvent {
         #[serde(default)]
         channel: String,
         reason: String,
+    },
+    BackgroundJobUpdated {
+        job_id: String,
+        chat_id: String,
+        #[serde(default)]
+        channel: String,
+        state: String,
+        kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    NotificationCreated {
+        notification_id: String,
+        chat_id: String,
+        #[serde(default)]
+        channel: String,
+        kind: String,
+        title: String,
+    },
+    NotificationUpdated {
+        notification_id: String,
+        chat_id: String,
+        #[serde(default)]
+        channel: String,
+        state: String,
     },
 }
 

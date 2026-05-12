@@ -397,6 +397,48 @@ impl CronStore {
             .lock()
             .map_err(|_| "Failed to lock cron SQLite connection".to_string())
     }
+
+    fn record_cron_background_job(
+        &self,
+        job_id: &str,
+        channel: &str,
+        chat_id: &str,
+        message: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        let conn = self.lock_conn()?;
+        let payload = serde_json::json!({
+            "trigger": "cron",
+            "message": message,
+            "cron_job_id": job_id,
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO background_jobs (
+                job_id, kind, chat_id, channel, thread_id, state, payload_json,
+                resume_after_restart, detached, last_error, created_at_ms, updated_at_ms
+            ) VALUES (?1, 'cron', ?2, ?3, NULL, 'running', ?4, 1, 1, NULL, ?5, ?5)
+            ON CONFLICT(job_id) DO UPDATE SET
+                state = 'running', payload_json = excluded.payload_json, updated_at_ms = excluded.updated_at_ms",
+            params![format!("cron:{}", job_id), chat_id, channel, payload, now_ms],
+        ).map_err(|e| format!("insert background_jobs from cron: {}", e))?;
+        conn.execute(
+            "INSERT INTO notifications (
+                notification_id, chat_id, channel, thread_id, kind, title, body, action_kind, action_payload,
+                seen_at_ms, resolved_at_ms, created_at_ms
+            ) VALUES (?1, ?2, ?3, NULL, 'cron_triggered', ?4, ?5, 'open_job', ?6, NULL, NULL, ?7)",
+            params![
+                format!("notif:cron:{}:{}", job_id, now_ms),
+                chat_id,
+                channel,
+                format!("Cron job triggered: {}", job_id),
+                message,
+                format!("cron:{}", job_id),
+                now_ms
+            ],
+        ).map_err(|e| format!("insert notifications from cron: {}", e))?;
+        Ok(())
+    }
 }
 
 impl MultiTenantEdgeCronScheduler {
@@ -805,7 +847,14 @@ impl ActorLogic<String> for CronActor {
         }
 
         for (job_id, channel, chat_id, message) in triggered {
+            let _ = self
+                .store
+                .record_cron_background_job(&job_id, &channel, &chat_id, &message, now_ms);
             let mut metadata = HashMap::new();
+            metadata.insert(
+                crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
+                serde_json::Value::String(format!("cron:{}", job_id)),
+            );
             metadata.insert(
                 "cron_job_id".to_string(),
                 serde_json::Value::String(job_id.clone()),

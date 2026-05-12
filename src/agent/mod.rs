@@ -670,12 +670,29 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
     let harness_runtime_summary = args.harness_runtime_summary.clone();
     let forbid_final_without_tools = args.forbid_final_without_tools;
     let shell_policy = args.shell_policy.clone();
+    const BACKGROUND_METADATA_KEYS: &[&str] = &[
+        crate::bus::METADATA_SYNTHETIC_CRON_TRIGGER,
+        crate::bus::METADATA_SYNTHETIC_JOB_FOLLOWUP,
+        crate::bus::METADATA_SYNTHETIC_SUBAGENT_COMPLETION,
+        crate::bus::METADATA_SYNTHETIC_BACKGROUND_RESUME,
+    ];
+    let is_background_turn = BACKGROUND_METADATA_KEYS
+        .iter()
+        .any(|&key| metadata_truthy(&inbound.metadata, key));
+    let background_job_id = inbound
+        .metadata
+        .get(crate::bus::METADATA_BACKGROUND_JOB_ID)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let inbound_metadata = Arc::new(inbound.metadata.clone());
     let tool_exec_ctx = ToolExecCtx::new(
         inbound.channel.clone(),
         inbound.chat_id.clone(),
         inbound.thread_id.clone(),
     )
-    .with_reasoning_cancel(cancel_token.as_ref().clone());
+    .with_background(is_background_turn)
+    .with_reasoning_cancel(cancel_token.as_ref().clone())
+    .with_metadata(inbound_metadata.clone());
     let inbound_channel = inbound.channel.clone();
     let inbound_thread_id = inbound.thread_id.clone();
     let session_key = crate::bus::clarification_session_key(
@@ -683,7 +700,6 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
         &chat_id,
         inbound_thread_id.as_deref(),
     );
-    let inbound_metadata = Arc::new(inbound.metadata.clone());
     let hook_tool_ctx = args.hook_tool_ctx.clone();
 
     tokio::spawn(async move {
@@ -731,7 +747,7 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
         .await;
 
         match res {
-            Ok(Err(e)) => {
+            Ok(Err(ref e)) => {
                 let _ = logger_tx.send(BusMessage::Log(
                     LogEvent::error(
                         "AgentLogic",
@@ -800,6 +816,32 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
                 );
                 let _ = outbound_tx.send(BusMessage::Outbound(notice)).await;
             }
+        }
+
+        if let Some(job_id) = background_job_id {
+            let (state, last_error) = match &res {
+                Ok(Ok(_)) => {
+                    if task_token_arc.is_cancelled() {
+                        ("failed", Some("Cancelled".to_string()))
+                    } else {
+                        ("completed", None)
+                    }
+                }
+                Ok(Err(e)) => ("failed", Some(e.to_string())),
+                Err(_) => ("failed", Some("Panic in reasoning loop".to_string())),
+            };
+
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let memory_node = session_manager_for_chain.get_memory_node();
+            let _ = memory_node
+                .send_packet(MemoryMessage::UpdateBackgroundJobState {
+                    job_id,
+                    state: state.to_string(),
+                    last_error,
+                    reply: SharedReply::new(tx),
+                })
+                .await;
+            let _ = rx.await;
         }
 
         let _ = cancellation_tokens.remove_if(&task_chat_id, |_key, stored| {

@@ -266,6 +266,17 @@ pub struct HarnessHooksConfig {
     pub steering: Option<HarnessHooksSteeringConfig>,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct BackgroundJobsConfig {
+    pub enabled: Option<bool>,
+    pub auto_resume: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct NotificationsConfig {
+    pub enabled: Option<bool>,
+}
+
 /// Optional harness features (see `docs/harness-implementation-plan.md`).
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct HarnessConfig {
@@ -283,6 +294,8 @@ pub struct HarnessConfig {
     pub ml_engineer: Option<MlEngineerHarnessConfig>,
     /// Observation + steering hooks (disabled unless sub-tables set `enabled = true`).
     pub hooks: Option<HarnessHooksConfig>,
+    pub background_jobs: Option<BackgroundJobsConfig>,
+    pub notifications: Option<NotificationsConfig>,
 }
 
 /// Git worktree helpers (`git_worktree` tool). Disabled unless `[harness.git_worktree] enabled = true`.
@@ -374,6 +387,30 @@ fn parse_shell_policy_mode(raw: Option<&str>, default_mode: ShellPolicyMode) -> 
 }
 
 impl AppConfig {
+    pub fn background_jobs_enabled(&self) -> bool {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.background_jobs.as_ref())
+            .and_then(|b| b.enabled)
+            .unwrap_or(true)
+    }
+
+    pub fn background_jobs_auto_resume(&self) -> bool {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.background_jobs.as_ref())
+            .and_then(|b| b.auto_resume)
+            .unwrap_or(true)
+    }
+
+    pub fn notifications_enabled(&self) -> bool {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.notifications.as_ref())
+            .and_then(|n| n.enabled)
+            .unwrap_or(true)
+    }
+
     /// Expand family-format `[providers.*]` entries into flat per-model configs.
     ///
     /// Family entries (with `models = [...]`) are expanded into one `ProviderConfig` per model,
@@ -1350,7 +1387,7 @@ pub struct ApiConfig {
     pub bind_address: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct ProviderConfig {
     /// One of `KNOWN_PROVIDERS` (e.g. `"gemini"`, `"openai"`, `"deepseek"`, `"openrouter"`,
     /// `"anthropic"`) or the `OPENAI_COMPATIBLE` sentinel for any third-party endpoint speaking
@@ -2076,8 +2113,8 @@ mod placeholder_key_tests {
 
     fn provider_with_key(key: &str) -> ProviderConfig {
         ProviderConfig {
-            provider_name: "deepseek".to_string(),
-            model_name: "deepseek-v4-pro".to_string(),
+            provider_name: "nonexistent-provider".to_string(),
+            model_name: "some-model".to_string(),
             models: None,
             api_key_env: "".to_string(),
             api_key: Some(key.to_string()),

@@ -140,6 +140,24 @@ type SummaryEntry = {
   created_at: string;
 };
 
+type BackgroundJob = {
+  job_id: string;
+  kind: string;
+  chat_id: string;
+  state: string;
+  updated_at_ms: number;
+};
+
+type NotificationItem = {
+  notification_id: string;
+  kind: string;
+  title: string;
+  body: string;
+  seen_at_ms?: number | null;
+  resolved_at_ms?: number | null;
+  created_at_ms: number;
+};
+
 type WorkspaceListEntryDto = {
   name: string;
   kind: string;
@@ -568,7 +586,10 @@ export default function App() {
   const [sessionToDelete, setSessionToDelete] = useState<ThreadListEntry | null>(null);
   const [showSummaries, setShowSummaries] = useState(false);
   const [showWorkspaceModal, setShowWorkspaceModal] = useState(false);
+  const [showBackgroundPanel, setShowBackgroundPanel] = useState(false);
   const [workspacePaneNonce, setWorkspacePaneNonce] = useState(0);
+  const [jobs, setJobs] = useState<BackgroundJob[]>([]);
+  const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [summaries, setSummaries] = useState<SummaryEntry[]>([]);
   const [summariesLoading, setSummariesLoading] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -596,6 +617,23 @@ export default function App() {
       setErrorMessage(buildErrorMessage(error));
     } finally {
       setSummariesLoading(false);
+    }
+  }, []);
+
+  const loadBackgroundData = useCallback(async () => {
+    try {
+      const [jobsRes, notifRes] = await Promise.all([
+        fetch("/v1/background-jobs?limit=100"),
+        fetch("/v1/notifications?limit=100"),
+      ]);
+      if (jobsRes.ok) {
+        setJobs((await jobsRes.json()) as BackgroundJob[]);
+      }
+      if (notifRes.ok) {
+        setNotifications((await notifRes.json()) as NotificationItem[]);
+      }
+    } catch {
+      // keep UI best-effort
     }
   }, []);
 
@@ -1019,6 +1057,52 @@ export default function App() {
           </div>
         </div>
       ) : null}
+      {showBackgroundPanel ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="background-runtime-title"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) {
+              setShowBackgroundPanel(false);
+            }
+          }}
+        >
+          <div className="flex h-full max-h-[90vh] w-full max-w-3xl flex-col rounded-xl border border-border bg-card shadow-lg overflow-hidden">
+            <div className="flex items-center justify-between border-b border-border p-4">
+              <h2 id="background-runtime-title" className="text-lg font-semibold text-foreground">Background Runtime</h2>
+              <Button variant="ghost" size="sm" onClick={() => setShowBackgroundPanel(false)}>
+                Close
+              </Button>
+            </div>
+            <div className="grid flex-1 grid-cols-2 gap-4 overflow-y-auto p-4">
+              <div className="rounded-lg border border-border p-3">
+                <p className="text-xs font-semibold uppercase text-muted-foreground">Jobs</p>
+                <ul className="mt-2 space-y-2">
+                  {jobs.map((job) => (
+                    <li key={job.job_id} className="rounded border border-border p-2 text-xs">
+                      <div>{job.kind} - {job.state}</div>
+                      <div className="text-muted-foreground">{job.job_id}</div>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+              <div className="rounded-lg border border-border p-3">
+                <p className="text-xs font-semibold uppercase text-muted-foreground">Notifications</p>
+                <ul className="mt-2 space-y-2">
+                  {notifications.map((n) => (
+                    <li key={n.notification_id} className="rounded border border-border p-2 text-xs">
+                      <div>{n.title}</div>
+                      <div className="text-muted-foreground">{n.body}</div>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
       {showWorkspaceModal ? (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
@@ -1066,6 +1150,17 @@ export default function App() {
             disabled={summariesLoading}
           >
             {summariesLoading ? "Loading…" : "Summaries"}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="mt-2 w-full"
+            onClick={() => {
+              void loadBackgroundData();
+              setShowBackgroundPanel(true);
+            }}
+          >
+            Background
           </Button>
           <Button
             variant="outline"
@@ -1758,13 +1853,16 @@ function SummaryList({
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="memory-store-title"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
       <div className="flex h-full max-h-[90vh] w-full max-w-2xl flex-col rounded-xl border border-border bg-card shadow-lg overflow-hidden">
         <div className="flex items-center justify-between border-b border-border p-4">
-          <h2 className="text-lg font-semibold text-foreground">Memory Store</h2>
+          <h2 id="memory-store-title" className="text-lg font-semibold text-foreground">Memory Store</h2>
           <Button variant="ghost" size="sm" onClick={onClose}>
             Close
           </Button>
