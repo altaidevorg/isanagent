@@ -2195,11 +2195,13 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         if app.ui_focus == TerminalUiFocus::Conversations
                             || app.ui_focus == TerminalUiFocus::BackgroundJobs
                         {
-                            let selected_chat_id = if app.ui_focus == TerminalUiFocus::Conversations
-                            {
+                            let selected_id = if app.ui_focus == TerminalUiFocus::Conversations {
                                 if let Some(idx) = app.conversations_selected_idx {
                                     if idx < app.conversations_items.len() {
-                                        Some(app.conversations_items[idx].thread_id.clone())
+                                        Some((
+                                            app.conversations_items[idx].thread_id.clone(),
+                                            false,
+                                        ))
                                     } else {
                                         None
                                     }
@@ -2211,27 +2213,38 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 if let Some(idx) = app.background_jobs_selected_idx {
                                     app.background_panel_items()
                                         .get(idx)
-                                        .map(|item| item.chat_id().to_string())
+                                        .map(|item| (item.chat_id().to_string(), true))
                                 } else {
                                     None
                                 }
                             };
 
-                            if let Some(thread_id) = selected_chat_id {
-                                let new_cid = match chat_id_from_root_thread_id(
-                                    channel_name.as_str(),
-                                    &thread_id,
-                                ) {
-                                    Some(c) => c,
-                                    None => {
-                                        app.set_toast(
-                                            ToastKind::Err,
-                                            "Invalid session row.".into(),
-                                            Duration::from_secs(4),
-                                        );
-                                        continue;
-                                    }
+                            if let Some((target_id, is_chat_id)) = selected_id {
+                                let (thread_id, new_cid) = if is_chat_id {
+                                    let tid = crate::bus::clarification_session_key(
+                                        channel_name.as_str(),
+                                        &target_id,
+                                        None,
+                                    );
+                                    (tid, target_id)
+                                } else {
+                                    let cid = match chat_id_from_root_thread_id(
+                                        channel_name.as_str(),
+                                        &target_id,
+                                    ) {
+                                        Some(c) => c,
+                                        None => {
+                                            app.set_toast(
+                                                ToastKind::Err,
+                                                "Invalid session row.".into(),
+                                                Duration::from_secs(4),
+                                            );
+                                            continue;
+                                        }
+                                    };
+                                    (target_id, cid)
                                 };
+
                                 try_cancel_inflight(&mut app, &bus_tx, &chat_id);
                                 match load_thread_transcript_cells(&rt, &memory_node, &thread_id) {
                                     Ok(mut cells) => {

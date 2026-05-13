@@ -221,7 +221,11 @@ fn repair_tool_call_context(context: &mut Vec<crate::utils::ChatMessage>) {
         for id in missing {
             context.insert(
                 j,
-                crate::utils::ChatMessage::tool("[Cancelled — tool execution interrupted]", &id),
+                crate::utils::ChatMessage::tool(
+                    "[Cancelled — tool execution interrupted]",
+                    &id,
+                    None,
+                ),
             );
             j += 1;
         }
@@ -1604,9 +1608,28 @@ impl AgentLogic {
         // 2. Inject tool response into memory
         if let Some(id) = tool_call_id {
             if let Ok(mut mem) = self.session_manager.get_session(session_key).await {
-                mem.add_message(crate::utils::ChatMessage::tool(&inbound.content, id))
-                    .await
-                    .map_err(|e| format!("Failed to inject tool response into memory: {}", e))?;
+                // Determine tool name from memory
+                let mut tool_name_for_resume = None;
+                if let Ok(context) = mem.get_context().await {
+                    for msg in context.iter().rev() {
+                        if msg.role == "assistant" {
+                            if let Some(calls) = &msg.tool_calls {
+                                if let Some(tc) = calls.iter().find(|c| c.id == id) {
+                                    tool_name_for_resume = Some(tc.function.name.clone());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                mem.add_message(crate::utils::ChatMessage::tool(
+                    &inbound.content,
+                    id,
+                    tool_name_for_resume.as_deref(),
+                ))
+                .await
+                .map_err(|e| format!("Failed to inject tool response into memory: {}", e))?;
             } else {
                 return Err(format!("Failed to get session {}", session_key));
             }
@@ -2251,14 +2274,18 @@ impl AgentLogic {
                         hook_observe_telemetry(hook_tool_ctx.as_ref(), &inbound, is_subagent, tr);
                         let tfin = TelemetryEvent::ToolCallFinished {
                             chat_id: inbound.chat_id.clone(),
-                            tool_name,
+                            tool_name: tool_name.clone(),
                             result: tool_result_text.clone(),
                             background_job_id: crate::bus::get_background_job_id(&inbound.metadata),
                         };
                         let _ = outbound_tx.send(BusMessage::Telemetry(tfin.clone())).await;
                         hook_observe_telemetry(hook_tool_ctx.as_ref(), &inbound, is_subagent, tfin);
-                        mem.add_message(crate::utils::ChatMessage::tool(&tool_result_text, &tc.id))
-                            .await?;
+                        mem.add_message(crate::utils::ChatMessage::tool(
+                            &tool_result_text,
+                            &tc.id,
+                            Some(tool_name.as_str()),
+                        ))
+                        .await?;
                     }
                     tool_invoked = true;
                 } else {
@@ -2356,8 +2383,12 @@ impl AgentLogic {
                         let _ = outbound_tx.send(BusMessage::Telemetry(tfin.clone())).await;
                         hook_observe_telemetry(hook_tool_ctx.as_ref(), &inbound, is_subagent, tfin);
 
-                        mem.add_message(crate::utils::ChatMessage::tool(&tool_result_text, &tc.id))
-                            .await?;
+                        mem.add_message(crate::utils::ChatMessage::tool(
+                            &tool_result_text,
+                            &tc.id,
+                            Some(tool_name.as_str()),
+                        ))
+                        .await?;
                         tool_invoked = true;
                     }
                 }

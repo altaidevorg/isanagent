@@ -176,11 +176,11 @@ impl ChatMessage {
         }
     }
 
-    pub fn tool(content: &str, tool_call_id: &str) -> Self {
+    pub fn tool(content: &str, tool_call_id: &str, name: Option<&str>) -> Self {
         Self {
             role: "tool".to_string(),
             content: Some(MessageContent::Text(content.to_string())),
-            name: None,
+            name: name.map(|s| s.to_string()),
             tool_calls: None,
             tool_call_id: Some(tool_call_id.to_string()),
             reasoning_content: None,
