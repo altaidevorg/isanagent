@@ -715,14 +715,16 @@ export default function App() {
   };
 
   const jumpToThread = useCallback((threadId: string) => {
-    const entry = sessions.find(s => s.thread_id === threadId);
+    // API thread_id format is "api:<chat_id>" while internal items use plain chat_id
+    const targetId = threadId.startsWith("api:") ? threadId : `api:${threadId}`;
+    const entry = sessions.find(s => s.thread_id === targetId);
     if (entry) {
       openSession(entry);
     } else {
-      setInternalChatId(threadId);
+      setInternalChatId(targetId);
       setLatestResponseId(null);
-      void loadHistory(threadId);
-      void loadSummaries(threadId);
+      void loadHistory(targetId);
+      void loadSummaries(targetId);
     }
     setShowBackgroundPanel(false);
   }, [sessions, loadHistory, loadSummaries]);
