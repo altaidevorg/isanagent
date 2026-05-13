@@ -671,25 +671,21 @@ fn send_background_job_notification(
     let mut meta = HashMap::new();
     if is_start {
         meta.insert(
-            crate::channels::terminal_ui::protocol::ISANAGENT_BACKGROUND_JOB_STARTED
-                .to_string(),
+            crate::channels::terminal_ui::protocol::ISANAGENT_BACKGROUND_JOB_STARTED.to_string(),
             serde_json::json!(true),
         );
         meta.insert(
-            crate::channels::terminal_ui::protocol::METADATA_BACKGROUND_JOB_TOOL_NAME
-                .to_string(),
+            crate::channels::terminal_ui::protocol::METADATA_BACKGROUND_JOB_TOOL_NAME.to_string(),
             serde_json::json!("background_reasoning"),
         );
     } else {
         meta.insert(
-            crate::channels::terminal_ui::protocol::ISANAGENT_BACKGROUND_JOB_FINISHED
-                .to_string(),
+            crate::channels::terminal_ui::protocol::ISANAGENT_BACKGROUND_JOB_FINISHED.to_string(),
             serde_json::json!(true),
         );
         if let Some(s) = status {
             meta.insert(
-                crate::channels::terminal_ui::protocol::METADATA_BACKGROUND_JOB_STATUS
-                    .to_string(),
+                crate::channels::terminal_ui::protocol::METADATA_BACKGROUND_JOB_STATUS.to_string(),
                 serde_json::json!(s),
             );
         }
@@ -1336,7 +1332,10 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 }
 
                 // Check for background job resume via explicit clarification ticket UI interaction
-                if let Some(res) = self.try_resume_background_job_from_ticket(&inbound, &chat_id, &session_key).await {
+                if let Some(res) = self
+                    .try_resume_background_job_from_ticket(&inbound, &chat_id, &session_key)
+                    .await
+                {
                     return res;
                 }
 
@@ -1401,7 +1400,10 @@ impl ActorLogic<BusMessage> for AgentLogic {
 
                 // If not busy, check if there's a waiting background job for this chat
                 // to automatically resume it (user replied to the thread instead of via ticket UI).
-                if let Some(res) = self.try_auto_resume_waiting_job(&inbound, &chat_id, &session_key).await {
+                if let Some(res) = self
+                    .try_auto_resume_waiting_job(&inbound, &chat_id, &session_key)
+                    .await
+                {
                     return res;
                 }
 
@@ -1453,14 +1455,16 @@ impl AgentLogic {
                     .with_chat_id(chat_id),
                 ));
 
-                if let Err(e) = self.resolve_and_resume_job(
-                    inbound,
-                    &ticket.ticket_id,
-                    &ticket.job_id,
-                    ticket.tool_call_id.as_deref(),
-                    session_key,
-                )
-                .await {
+                if let Err(e) = self
+                    .resolve_and_resume_job(
+                        inbound,
+                        &ticket.ticket_id,
+                        &ticket.job_id,
+                        ticket.tool_call_id.as_deref(),
+                        session_key,
+                    )
+                    .await
+                {
                     let _ = self.logger_tx.send(BusMessage::Log(
                         LogEvent::error(
                             &self.name,
@@ -1534,14 +1538,16 @@ impl AgentLogic {
                             .with_chat_id(chat_id),
                         ));
 
-                        if let Err(e) = self.resolve_and_resume_job(
-                            inbound,
-                            &ticket.ticket_id,
-                            &job.job_id,
-                            ticket.tool_call_id.as_deref(),
-                            session_key,
-                        )
-                        .await {
+                        if let Err(e) = self
+                            .resolve_and_resume_job(
+                                inbound,
+                                &ticket.ticket_id,
+                                &job.job_id,
+                                ticket.tool_call_id.as_deref(),
+                                session_key,
+                            )
+                            .await
+                        {
                             let _ = self.logger_tx.send(BusMessage::Log(
                                 LogEvent::error(
                                     &self.name,
@@ -1553,7 +1559,10 @@ impl AgentLogic {
                                 &inbound.channel,
                                 chat_id,
                                 inbound.thread_id.as_deref(),
-                                &format!("Failed to auto-resume background job [{}]: {}", job.job_id, e),
+                                &format!(
+                                    "Failed to auto-resume background job [{}]: {}",
+                                    job.job_id, e
+                                ),
                             );
                             let _ = self.outbound_tx.try_send(BusMessage::Outbound(notice));
                             return Some(Ok(None));
@@ -1575,7 +1584,7 @@ impl AgentLogic {
         session_key: &str,
     ) -> Result<(), String> {
         let memory_node = self.session_manager.get_memory_node();
-        
+
         // 1. Resolve everything for this ticket in a single go
         let (tx, rx) = tokio::sync::oneshot::channel();
         memory_node
@@ -1587,7 +1596,7 @@ impl AgentLogic {
             })
             .await
             .map_err(|e| format!("Memory actor error: {}", e))?;
-            
+
         rx.await
             .map_err(|_| "Memory actor channel closed".to_string())?
             .map_err(|e| format!("Memory node failed to resolve ticket fully: {}", e))?;
@@ -2219,7 +2228,10 @@ impl AgentLogic {
                             ToolExecutionFinished::Completed(res) => res,
                             ToolExecutionFinished::Waiting(ticket_id) => {
                                 // Break the iteration loop; the job is now in 'waiting' state.
-                                return Ok(format!("{}{}", WAITING_FOR_USER_RESULT_PREFIX, ticket_id));
+                                return Ok(format!(
+                                    "{}{}",
+                                    WAITING_FOR_USER_RESULT_PREFIX, ticket_id
+                                ));
                             }
                             ToolExecutionFinished::Cancelled => {
                                 persist_and_cancel!();
@@ -2312,7 +2324,10 @@ impl AgentLogic {
                             ToolExecutionFinished::Completed(res) => res,
                             ToolExecutionFinished::Waiting(ticket_id) => {
                                 // Break the iteration loop; the job is now in 'waiting' state.
-                                return Ok(format!("{}{}", WAITING_FOR_USER_RESULT_PREFIX, ticket_id));
+                                return Ok(format!(
+                                    "{}{}",
+                                    WAITING_FOR_USER_RESULT_PREFIX, ticket_id
+                                ));
                             }
                             ToolExecutionFinished::Cancelled => {
                                 persist_and_cancel!();
