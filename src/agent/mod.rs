@@ -14,7 +14,7 @@ pub use subagent::SubagentHarness;
 use crate::clarification::ClarificationHub;
 use crate::tool_runtime::{with_tool_exec_and_progress_scope, ToolExecCtx, ToolProgressEmitter};
 
-use crate::bus::{BusMessage, LogEvent, OutboundMessage, TelemetryEvent};
+use crate::bus::{BusMessage, InboundMessage, LogEvent, OutboundMessage, TelemetryEvent};
 use crate::config::{ResolvedShellPolicy, ShellPolicyMode};
 use crate::hooks::{
     run_post_tool_hooks, run_pre_tool_hooks, run_user_prompt_hooks, HookObservationMeta,
@@ -1320,92 +1320,9 @@ impl ActorLogic<BusMessage> for AgentLogic {
                     return Ok(None);
                 }
 
-                // Check for background job resume via clarification ticket
-                if let Some(ticket_id) = inbound
-                    .metadata
-                    .get(crate::bus::METADATA_CLARIFICATION_TICKET_ID)
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                {
-                    let memory_node = self.session_manager.get_memory_node();
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    let _ = memory_node
-                        .send_packet(MemoryMessage::GetClarificationTicket {
-                            ticket_id: ticket_id.clone(),
-                            reply: SharedReply::new(tx),
-                        })
-                        .await;
-
-                    if let Ok(Ok(Some(ticket))) = rx.await {
-                        let _ = self.logger_tx.send(BusMessage::Log(
-                            LogEvent::info(
-                                &self.name,
-                                &format!(
-                                    "Resuming background job [{}] via clarification ticket [{}]",
-                                    ticket.job_id, ticket_id
-                                ),
-                            )
-                            .with_chat_id(&chat_id),
-                        ));
-
-                        // 1. Resolve ticket in DB
-                        let (tx2, rx2) = tokio::sync::oneshot::channel();
-                        let _ = memory_node
-                            .send_packet(MemoryMessage::ResolveClarificationTicket {
-                                ticket_id: ticket_id.clone(),
-                                response: inbound.content.clone(),
-                                reply: SharedReply::new(tx2),
-                            })
-                            .await;
-                        if let Err(e) = rx2.await {
-                            log::error!("Failed to receive resolve ticket response: {}", e);
-                        }
-
-                        // 2. Update job state to running
-                        let (tx3, rx3) = tokio::sync::oneshot::channel();
-                        let _ = memory_node
-                            .send_packet(MemoryMessage::UpdateBackgroundJobState {
-                                job_id: ticket.job_id.clone(),
-                                state: "running".to_string(),
-                                last_error: None,
-                                reply: SharedReply::new(tx3),
-                            })
-                            .await;
-                        if let Err(e) = rx3.await {
-                            log::error!("Failed to receive update job state response: {}", e);
-                        }
-
-                        // 3. Inject tool response into memory
-                        if let Some(tool_call_id) = &ticket.tool_call_id {
-                            if let Ok(mut mem) =
-                                self.session_manager.get_session(&session_key).await
-                            {
-                                let _ = mem
-                                    .add_message(crate::utils::ChatMessage::tool(
-                                        &inbound.content,
-                                        tool_call_id,
-                                    ))
-                                    .await;
-                            }
-                        }
-
-                        // 4. Spawn turn with resume metadata
-                        let mut resumed_inbound = inbound.clone();
-                        resumed_inbound.metadata.insert(
-                            crate::bus::METADATA_SYNTHETIC_BACKGROUND_RESUME.to_string(),
-                            serde_json::json!(true),
-                        );
-                        resumed_inbound.metadata.insert(
-                            crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
-                            serde_json::json!(ticket.job_id),
-                        );
-
-                        spawn_main_chat_reasoning_turn(
-                            self.reasoning_spawn_args().await,
-                            resumed_inbound,
-                        );
-                        return Ok(None);
-                    }
+                // Check for background job resume via explicit clarification ticket UI interaction
+                if let Some(res) = self.try_resume_background_job_from_ticket(&inbound, &chat_id, &session_key).await {
+                    return res;
                 }
 
                 let _ = self.logger_tx.send(BusMessage::Log(
@@ -1469,147 +1386,8 @@ impl ActorLogic<BusMessage> for AgentLogic {
 
                 // If not busy, check if there's a waiting background job for this chat
                 // to automatically resume it (user replied to the thread instead of via ticket UI).
-                if !metadata_truthy(
-                    &inbound.metadata,
-                    crate::bus::METADATA_CLARIFICATION_TICKET_ID,
-                ) {
-                    let memory_node = self.session_manager.get_memory_node();
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    let _ = memory_node
-                        .send_packet(MemoryMessage::ListBackgroundJobs {
-                            chat_id: Some(chat_id.clone()),
-                            limit: 10,
-                            reply: SharedReply::new(tx),
-                        })
-                        .await;
-
-                    if let Ok(Ok(jobs)) = rx.await {
-                        let waiting_jobs: Vec<_> =
-                            jobs.into_iter().filter(|j| j.state == "waiting").collect();
-                        for job in waiting_jobs {
-                            // Found a waiting job. Now find the latest ticket for it.
-                            let (tx2, rx2) = tokio::sync::oneshot::channel();
-                            let _ = memory_node
-                                .send_packet(MemoryMessage::ListClarificationTickets {
-                                    job_id: Some(job.job_id.clone()),
-                                    chat_id: Some(chat_id.clone()),
-                                    status: Some("waiting".to_string()),
-                                    limit: 1,
-                                    reply: SharedReply::new(tx2),
-                                })
-                                .await;
-
-                            if let Ok(Ok(tickets)) = rx2.await {
-                                if let Some(ticket) = tickets.into_iter().next() {
-                                    let ticket_id = ticket.ticket_id.clone();
-                                    let job_id = job.job_id.clone();
-
-                                    let _ = self.logger_tx.send(BusMessage::Log(
-                                        LogEvent::info(
-                                            &self.name,
-                                            &format!(
-                                                "Auto-resuming waiting background job [{}] via thread reply to ticket [{}]",
-                                                job_id, ticket_id
-                                            ),
-                                        )
-                                        .with_chat_id(&chat_id),
-                                    ));
-
-                                    // 1. Resolve ticket in DB
-                                    let (tx3, rx3) = tokio::sync::oneshot::channel();
-                                    let _ = memory_node
-                                        .send_packet(MemoryMessage::ResolveClarificationTicket {
-                                            ticket_id: ticket_id.clone(),
-                                            response: inbound.content.clone(),
-                                            reply: SharedReply::new(tx3),
-                                        })
-                                        .await;
-                                    if let Err(e) = rx3.await {
-                                        log::error!("Auto-resume: failed to receive resolve ticket response: {}", e);
-                                    }
-
-                                    // 2. Resolve notifications for this ticket
-                                    let (tx4, rx4) = tokio::sync::oneshot::channel();
-                                    let _ = memory_node
-                                        .send_packet(MemoryMessage::ListNotifications {
-                                            chat_id: Some(chat_id.clone()),
-                                            limit: 10,
-                                            unseen_only: false,
-                                            reply: SharedReply::new(tx4),
-                                        })
-                                        .await;
-                                    if let Ok(Ok(notifs)) = rx4.await {
-                                        for n in notifs {
-                                            if n.action_payload.as_deref() == Some(&ticket_id)
-                                                && n.resolved_at_ms.is_none()
-                                            {
-                                                let (tx5, rx5) = tokio::sync::oneshot::channel();
-                                                let _ = memory_node
-                                                    .send_packet(
-                                                        MemoryMessage::ResolveNotification {
-                                                            notification_id: n
-                                                                .notification_id
-                                                                .clone(),
-                                                            reply: SharedReply::new(tx5),
-                                                        },
-                                                    )
-                                                    .await;
-                                                if let Err(e) = rx5.await {
-                                                    log::error!("Auto-resume: failed to receive resolve notification response: {}", e);
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    // 3. Update job state to running
-                                    let (tx6, rx6) = tokio::sync::oneshot::channel();
-                                    let _ = memory_node
-                                        .send_packet(MemoryMessage::UpdateBackgroundJobState {
-                                            job_id: job_id.clone(),
-                                            state: "running".to_string(),
-                                            last_error: None,
-                                            reply: SharedReply::new(tx6),
-                                        })
-                                        .await;
-                                    if let Err(e) = rx6.await {
-                                        log::error!("Auto-resume: failed to receive update job state response: {}", e);
-                                    }
-
-                                    // 4. Inject tool response into memory
-                                    if let Some(tool_call_id) = &ticket.tool_call_id {
-                                        if let Ok(mut mem) =
-                                            self.session_manager.get_session(&session_key).await
-                                        {
-                                            let _ = mem
-                                                .add_message(crate::utils::ChatMessage::tool(
-                                                    &inbound.content,
-                                                    tool_call_id,
-                                                ))
-                                                .await;
-                                        }
-                                    }
-
-                                    // 5. Spawn turn with resume metadata
-                                    let mut resumed_inbound = inbound.clone();
-                                    resumed_inbound.metadata.insert(
-                                        crate::bus::METADATA_SYNTHETIC_BACKGROUND_RESUME
-                                            .to_string(),
-                                        serde_json::json!(true),
-                                    );
-                                    resumed_inbound.metadata.insert(
-                                        crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
-                                        serde_json::json!(job_id),
-                                    );
-
-                                    spawn_main_chat_reasoning_turn(
-                                        self.reasoning_spawn_args().await,
-                                        resumed_inbound,
-                                    );
-                                    return Ok(None);
-                                }
-                            }
-                        }
-                    }
+                if let Some(res) = self.try_auto_resume_waiting_job(&inbound, &chat_id, &session_key).await {
+                    return res;
                 }
 
                 spawn_main_chat_reasoning_turn(self.reasoning_spawn_args().await, inbound);
@@ -1623,6 +1401,169 @@ impl ActorLogic<BusMessage> for AgentLogic {
             | BusMessage::PromoteSyncToBackground(_)
             | BusMessage::SetTerminalSessionChat { .. } => Ok(None),
         }
+    }
+}
+
+impl AgentLogic {
+    async fn try_resume_background_job_from_ticket(
+        &mut self,
+        inbound: &InboundMessage,
+        chat_id: &str,
+        session_key: &str,
+    ) -> Option<Result<Option<(String, BusMessage)>, ActorError>> {
+        if let Some(ticket_id) = inbound
+            .metadata
+            .get(crate::bus::METADATA_CLARIFICATION_TICKET_ID)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+        {
+            let memory_node = self.session_manager.get_memory_node();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = memory_node
+                .send_packet(MemoryMessage::GetClarificationTicket {
+                    ticket_id: ticket_id.clone(),
+                    reply: SharedReply::new(tx),
+                })
+                .await;
+
+            if let Ok(Ok(Some(ticket))) = rx.await {
+                let _ = self.logger_tx.send(BusMessage::Log(
+                    LogEvent::info(
+                        &self.name,
+                        &format!(
+                            "Resuming background job [{}] via clarification ticket [{}]",
+                            ticket.job_id, ticket_id
+                        ),
+                    )
+                    .with_chat_id(chat_id),
+                ));
+
+                self.resolve_and_resume_job(
+                    inbound,
+                    &ticket.ticket_id,
+                    &ticket.job_id,
+                    ticket.tool_call_id.as_deref(),
+                    session_key,
+                )
+                .await;
+                return Some(Ok(None));
+            }
+        }
+        None
+    }
+
+    async fn try_auto_resume_waiting_job(
+        &mut self,
+        inbound: &InboundMessage,
+        chat_id: &str,
+        session_key: &str,
+    ) -> Option<Result<Option<(String, BusMessage)>, ActorError>> {
+        if metadata_truthy(
+            &inbound.metadata,
+            crate::bus::METADATA_CLARIFICATION_TICKET_ID,
+        ) {
+            return None;
+        }
+
+        let memory_node = self.session_manager.get_memory_node();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = memory_node
+            .send_packet(MemoryMessage::ListBackgroundJobs {
+                chat_id: Some(chat_id.to_string()),
+                limit: 10,
+                reply: SharedReply::new(tx),
+            })
+            .await;
+
+        if let Ok(Ok(jobs)) = rx.await {
+            let waiting_jobs: Vec<_> = jobs.into_iter().filter(|j| j.state == "waiting").collect();
+            for job in waiting_jobs {
+                // Found a waiting job. Now find the latest ticket for it.
+                let (tx2, rx2) = tokio::sync::oneshot::channel();
+                let _ = memory_node
+                    .send_packet(MemoryMessage::ListClarificationTickets {
+                        job_id: Some(job.job_id.clone()),
+                        chat_id: Some(chat_id.to_string()),
+                        status: Some("waiting".to_string()),
+                        limit: 1,
+                        reply: SharedReply::new(tx2),
+                    })
+                    .await;
+
+                if let Ok(Ok(tickets)) = rx2.await {
+                    if let Some(ticket) = tickets.into_iter().next() {
+                        let _ = self.logger_tx.send(BusMessage::Log(
+                            LogEvent::info(
+                                &self.name,
+                                &format!(
+                                    "Auto-resuming waiting background job [{}] via thread reply to ticket [{}]",
+                                    job.job_id, ticket.ticket_id
+                                ),
+                            )
+                            .with_chat_id(chat_id),
+                        ));
+
+                        self.resolve_and_resume_job(
+                            inbound,
+                            &ticket.ticket_id,
+                            &job.job_id,
+                            ticket.tool_call_id.as_deref(),
+                            session_key,
+                        )
+                        .await;
+                        return Some(Ok(None));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    async fn resolve_and_resume_job(
+        &mut self,
+        inbound: &InboundMessage,
+        ticket_id: &str,
+        job_id: &str,
+        tool_call_id: Option<&str>,
+        session_key: &str,
+    ) {
+        let memory_node = self.session_manager.get_memory_node();
+        
+        // 1. Resolve everything for this ticket in a single go
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = memory_node
+            .send_packet(MemoryMessage::ResolveClarificationTicketFull {
+                ticket_id: ticket_id.to_string(),
+                job_id: job_id.to_string(),
+                response: inbound.content.clone(),
+                reply: SharedReply::new(tx),
+            })
+            .await;
+        if let Err(e) = rx.await {
+            log::error!("Auto-resume: failed to resolve ticket/job fully: {}", e);
+        }
+
+        // 2. Inject tool response into memory
+        if let Some(id) = tool_call_id {
+            if let Ok(mut mem) = self.session_manager.get_session(session_key).await {
+                let _ = mem
+                    .add_message(crate::utils::ChatMessage::tool(&inbound.content, id))
+                    .await;
+            }
+        }
+
+        // 3. Spawn turn with resume metadata
+        let mut resumed_inbound = inbound.clone();
+        resumed_inbound.metadata.insert(
+            crate::bus::METADATA_SYNTHETIC_BACKGROUND_RESUME.to_string(),
+            serde_json::json!(true),
+        );
+        resumed_inbound.metadata.insert(
+            crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
+            serde_json::json!(job_id),
+        );
+
+        spawn_main_chat_reasoning_turn(self.reasoning_spawn_args().await, resumed_inbound);
     }
 }
 

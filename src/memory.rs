@@ -612,6 +612,12 @@ pub enum MemoryMessage {
         ticket_id: String,
         reply: SharedReply<Result<Option<ClarificationTicketRecord>, String>>,
     },
+    ResolveClarificationTicketFull {
+        ticket_id: String,
+        job_id: String,
+        response: String,
+        reply: SharedReply<Result<(), String>>,
+    },
     /// List clarification tickets with optional filters.
     ListClarificationTickets {
         job_id: Option<String>,
@@ -1776,6 +1782,39 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                             })
                         },
                     ).optional().map_err(|e| e.to_string());
+                let _ = reply.send(res);
+            }
+            MemoryMessage::ResolveClarificationTicketFull {
+                ticket_id,
+                job_id,
+                response,
+                reply,
+            } => {
+                let res = (|| -> Result<(), String> {
+                    let now = Utc::now().timestamp_millis();
+                    let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+
+                    // 1. Resolve ticket
+                    tx.execute(
+                        "UPDATE clarification_tickets SET response = ?1, status = 'answered', updated_at_ms = ?2 WHERE ticket_id = ?3",
+                        params![response, now, ticket_id],
+                    ).map_err(|e| format!("resolve clarification ticket: {}", e))?;
+
+                    // 2. Resolve related notifications
+                    tx.execute(
+                        "UPDATE notifications SET resolved_at_ms = ?1 WHERE action_payload = ?2 AND resolved_at_ms IS NULL",
+                        params![now, ticket_id],
+                    ).map_err(|e| format!("resolve related notifications: {}", e))?;
+
+                    // 3. Update job state to running
+                    tx.execute(
+                        "UPDATE background_jobs SET state = 'running', updated_at_ms = ?1 WHERE job_id = ?2",
+                        params![now, job_id],
+                    ).map_err(|e| format!("update job state to running: {}", e))?;
+
+                    tx.commit().map_err(|e| e.to_string())?;
+                    Ok(())
+                })();
                 let _ = reply.send(res);
             }
             MemoryMessage::DismissBackgroundJob {
