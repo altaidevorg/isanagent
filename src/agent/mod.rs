@@ -250,6 +250,7 @@ fn should_nudge_research_depth(
 }
 
 pub const WAIT_SIGNAL_PREFIX: &str = "ISANAGENT_WAIT_FOR_USER:";
+pub const WAITING_FOR_USER_RESULT_PREFIX: &str = "WAITING:";
 
 enum ToolExecutionFinished {
     Completed(Result<String, String>),
@@ -901,7 +902,7 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
 
         if let Some(job_id) = background_job_id {
             let (state, last_error) = match &res {
-                Ok(Ok(s)) if s.starts_with("WAITING:") => ("waiting", None),
+                Ok(Ok(s)) if s.starts_with(WAITING_FOR_USER_RESULT_PREFIX) => ("waiting", None),
                 Ok(Ok(_)) => {
                     if task_token_arc.is_cancelled() {
                         ("failed", Some("Cancelled".to_string()))
@@ -1467,7 +1468,14 @@ impl AgentLogic {
                         )
                         .with_chat_id(chat_id),
                     ));
-                    return Some(Ok(None)); // Or return an error OutboundMessage to user
+                    let notice = crate::channels::terminal::build_channel_error_notice(
+                        &inbound.channel,
+                        chat_id,
+                        inbound.thread_id.as_deref(),
+                        &format!("Failed to resume background job [{}]: {}", ticket.job_id, e),
+                    );
+                    let _ = self.outbound_tx.try_send(BusMessage::Outbound(notice));
+                    return Some(Ok(None));
                 }
                 return Some(Ok(None));
             }
@@ -1541,7 +1549,14 @@ impl AgentLogic {
                                 )
                                 .with_chat_id(chat_id),
                             ));
-                            return Some(Ok(None)); // Or return an error OutboundMessage to user
+                            let notice = crate::channels::terminal::build_channel_error_notice(
+                                &inbound.channel,
+                                chat_id,
+                                inbound.thread_id.as_deref(),
+                                &format!("Failed to auto-resume background job [{}]: {}", job.job_id, e),
+                            );
+                            let _ = self.outbound_tx.try_send(BusMessage::Outbound(notice));
+                            return Some(Ok(None));
                         }
                         return Some(Ok(None));
                     }
@@ -2204,7 +2219,7 @@ impl AgentLogic {
                             ToolExecutionFinished::Completed(res) => res,
                             ToolExecutionFinished::Waiting(ticket_id) => {
                                 // Break the iteration loop; the job is now in 'waiting' state.
-                                return Ok(format!("WAITING:{}", ticket_id));
+                                return Ok(format!("{}{}", WAITING_FOR_USER_RESULT_PREFIX, ticket_id));
                             }
                             ToolExecutionFinished::Cancelled => {
                                 persist_and_cancel!();
@@ -2297,7 +2312,7 @@ impl AgentLogic {
                             ToolExecutionFinished::Completed(res) => res,
                             ToolExecutionFinished::Waiting(ticket_id) => {
                                 // Break the iteration loop; the job is now in 'waiting' state.
-                                return Ok(format!("WAITING:{}", ticket_id));
+                                return Ok(format!("{}{}", WAITING_FOR_USER_RESULT_PREFIX, ticket_id));
                             }
                             ToolExecutionFinished::Cancelled => {
                                 persist_and_cancel!();

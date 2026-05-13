@@ -602,6 +602,8 @@ export default function App() {
     defaultValue?: string;
   } | null>(null);
 
+  const dialogInputRef = useRef<HTMLInputElement>(null);
+
   const showConfirm = (title: string, message: string, onConfirm: () => void) => {
     setDialogConfig({
       type: 'confirm',
@@ -1368,13 +1370,13 @@ export default function App() {
             
             {dialogConfig.type === 'prompt' && (
               <input
+                ref={dialogInputRef}
                 autoFocus
                 className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm mb-6 focus:outline-none focus:ring-2 focus:ring-primary"
                 defaultValue={dialogConfig.defaultValue}
-                id="dialog-input"
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') {
-                    dialogConfig.onConfirm((e.target as HTMLInputElement).value);
+                    dialogConfig.onConfirm(dialogInputRef.current?.value || '');
                   } else if (e.key === 'Escape') {
                     dialogConfig.onCancel();
                   }
@@ -1389,8 +1391,7 @@ export default function App() {
               <Button
                 onClick={() => {
                   if (dialogConfig.type === 'prompt') {
-                    const input = document.getElementById('dialog-input') as HTMLInputElement;
-                    dialogConfig.onConfirm(input.value);
+                    dialogConfig.onConfirm(dialogInputRef.current?.value || '');
                   } else {
                     dialogConfig.onConfirm();
                   }
@@ -2099,7 +2100,7 @@ function SummaryList({
 }: {
   summaries: SummaryEntry[];
   onUpdate: (id: number, updated: Partial<SummaryEntry>) => Promise<void>;
-  onDelete: (id: number) => Promise<void>;
+  onDelete: (id: number) => void;
   onClose: () => void;
 }) {
   const [editingId, setEditingId] = useState<number | null>(null);
