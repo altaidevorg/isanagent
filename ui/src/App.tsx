@@ -153,6 +153,9 @@ type NotificationItem = {
   kind: string;
   title: string;
   body: string;
+  chat_id: string;
+  action_kind?: string | null;
+  action_payload?: string | null;
   seen_at_ms?: number | null;
   resolved_at_ms?: number | null;
   created_at_ms: number;
@@ -637,6 +640,38 @@ export default function App() {
     }
   }, []);
 
+  const jumpToThread = useCallback((threadId: string) => {
+    const entry = sessions.find(s => s.thread_id === threadId);
+    if (entry) {
+      openSession(entry);
+    } else {
+      setInternalChatId(threadId);
+      setLatestResponseId(null);
+      void loadHistory(threadId);
+      void loadSummaries(threadId);
+    }
+    setShowBackgroundPanel(false);
+  }, [sessions, openSession, loadHistory, loadSummaries]);
+
+  const replyToTicket = async (ticketId: string, response: string) => {
+    try {
+      const res = await fetch(`/v1/clarification-tickets/${encodeURIComponent(ticketId)}/reply`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ response }),
+      });
+      if (res.ok) {
+        void loadBackgroundData();
+      } else {
+        const payload = (await res.json().catch(() => null)) as ApiErrorPayload;
+        alert(payload?.error?.message || "Failed to send reply");
+      }
+    } catch (err) {
+      console.error(err);
+      alert("Failed to send reply");
+    }
+  };
+
   const updateSummary = async (id: number, updated: Partial<SummaryEntry>) => {
     try {
       const response = await fetch(`/v1/summaries/${id}`, {
@@ -1059,7 +1094,7 @@ export default function App() {
       ) : null}
       {showBackgroundPanel ? (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
           role="dialog"
           aria-modal="true"
           aria-labelledby="background-runtime-title"
@@ -1069,35 +1104,116 @@ export default function App() {
             }
           }}
         >
-          <div className="flex h-full max-h-[90vh] w-full max-w-3xl flex-col rounded-xl border border-border bg-card shadow-lg overflow-hidden">
-            <div className="flex items-center justify-between border-b border-border p-4">
-              <h2 id="background-runtime-title" className="text-lg font-semibold text-foreground">Background Runtime</h2>
-              <Button variant="ghost" size="sm" onClick={() => setShowBackgroundPanel(false)}>
-                Close
+          <div className="flex h-full max-h-[85vh] w-full max-w-4xl flex-col rounded-2xl border border-border bg-card shadow-2xl overflow-hidden animate-in fade-in zoom-in duration-200">
+            <div className="flex items-center justify-between border-b border-border px-6 py-4 bg-muted/30">
+              <div className="flex items-center gap-3">
+                <div className="h-2 w-2 rounded-full bg-primary animate-pulse" />
+                <h2 id="background-runtime-title" className="text-lg font-semibold tracking-tight text-foreground">Background Runtime</h2>
+              </div>
+              <Button variant="ghost" size="sm" className="h-8 w-8 p-0 rounded-full" onClick={() => setShowBackgroundPanel(false)}>
+                ×
               </Button>
             </div>
-            <div className="grid flex-1 grid-cols-2 gap-4 overflow-y-auto p-4">
-              <div className="rounded-lg border border-border p-3">
-                <p className="text-xs font-semibold uppercase text-muted-foreground">Jobs</p>
-                <ul className="mt-2 space-y-2">
-                  {jobs.map((job) => (
-                    <li key={job.job_id} className="rounded border border-border p-2 text-xs">
-                      <div>{job.kind} - {job.state}</div>
-                      <div className="text-muted-foreground">{job.job_id}</div>
-                    </li>
-                  ))}
-                </ul>
+            <div className="flex flex-1 overflow-hidden">
+              {/* Jobs column */}
+              <div className="w-1/2 flex flex-col border-r border-border">
+                <div className="p-4 border-b border-border bg-muted/10">
+                  <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">Active Jobs</p>
+                </div>
+                <div className="flex-1 overflow-y-auto p-4 space-y-3">
+                  {jobs.length === 0 ? (
+                    <div className="flex h-full items-center justify-center text-muted-foreground text-sm italic">
+                      No active background jobs
+                    </div>
+                  ) : (
+                    jobs.map((job) => (
+                      <div 
+                        key={job.job_id} 
+                        className={cn(
+                          "group rounded-xl border border-border p-4 transition-all hover:bg-muted/50 cursor-pointer",
+                          job.state === "waiting" ? "border-yellow-500/50 bg-yellow-500/5 shadow-sm" : ""
+                        )}
+                        onClick={() => jumpToThread(job.chat_id)}
+                      >
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="font-mono text-[10px] text-muted-foreground truncate max-w-[150px]">{job.job_id}</span>
+                          <span className={cn(
+                            "px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-tighter",
+                            job.state === "running" ? "bg-primary/20 text-primary animate-pulse" : 
+                            job.state === "waiting" ? "bg-yellow-500/20 text-yellow-600 dark:text-yellow-400" :
+                            "bg-muted text-muted-foreground"
+                          )}>
+                            {job.state}
+                          </span>
+                        </div>
+                        <p className="text-sm font-medium text-foreground">{job.kind}</p>
+                        <div className="mt-3 flex items-center justify-between">
+                          <span className="text-[10px] text-muted-foreground">Updated {new Date(job.updated_at_ms).toLocaleTimeString()}</span>
+                          <span className="text-[10px] text-primary opacity-0 group-hover:opacity-100 transition-opacity">View thread →</span>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
               </div>
-              <div className="rounded-lg border border-border p-3">
-                <p className="text-xs font-semibold uppercase text-muted-foreground">Notifications</p>
-                <ul className="mt-2 space-y-2">
-                  {notifications.map((n) => (
-                    <li key={n.notification_id} className="rounded border border-border p-2 text-xs">
-                      <div>{n.title}</div>
-                      <div className="text-muted-foreground">{n.body}</div>
-                    </li>
-                  ))}
-                </ul>
+
+              {/* Notifications column */}
+              <div className="w-1/2 flex flex-col">
+                <div className="p-4 border-b border-border bg-muted/10">
+                  <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">Notifications</p>
+                </div>
+                <div className="flex-1 overflow-y-auto p-4 space-y-3">
+                  {notifications.length === 0 ? (
+                    <div className="flex h-full items-center justify-center text-muted-foreground text-sm italic">
+                      No notifications
+                    </div>
+                  ) : (
+                    notifications.map((n) => (
+                      <div 
+                        key={n.notification_id} 
+                        className={cn(
+                          "rounded-xl border border-border p-4 transition-all",
+                          !n.seen_at_ms ? "bg-primary/5 border-primary/30" : "bg-card",
+                          n.kind === "clarification_ticket" && !n.resolved_at_ms ? "border-yellow-500/50 shadow-sm" : ""
+                        )}
+                      >
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
+                            {n.kind.replace(/_/g, ' ')}
+                          </span>
+                          <span className="text-[10px] text-muted-foreground">{new Date(n.created_at_ms).toLocaleTimeString()}</span>
+                        </div>
+                        <h4 className="text-sm font-semibold text-foreground mb-1">{n.title}</h4>
+                        <p className="text-xs text-muted-foreground leading-relaxed mb-4">{n.body}</p>
+                        
+                        <div className="flex flex-wrap gap-2">
+                          {n.kind === "clarification_ticket" && !n.resolved_at_ms ? (
+                            <Button 
+                              size="sm" 
+                              className="h-7 text-[10px] font-bold uppercase tracking-widest bg-yellow-500 hover:bg-yellow-600 text-white border-0"
+                              onClick={() => {
+                                const reply = prompt("Enter your response:");
+                                if (reply?.trim()) {
+                                  void replyToTicket(n.action_payload || "", reply.trim());
+                                }
+                              }}
+                            >
+                              Reply to request
+                            </Button>
+                          ) : null}
+                          <Button 
+                            variant="outline" 
+                            size="sm" 
+                            className="h-7 text-[10px] font-bold uppercase tracking-widest"
+                            onClick={() => jumpToThread(n.chat_id)}
+                          >
+                            View context
+                          </Button>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
               </div>
             </div>
           </div>
@@ -1154,13 +1270,16 @@ export default function App() {
           <Button
             variant="outline"
             size="sm"
-            className="mt-2 w-full"
+            className="mt-2 w-full relative"
             onClick={() => {
               void loadBackgroundData();
               setShowBackgroundPanel(true);
             }}
           >
             Background
+            {notifications.some(n => !n.seen_at_ms || (n.kind === "clarification_ticket" && !n.resolved_at_ms)) && (
+              <span className="absolute -top-1 -right-1 h-3 w-3 rounded-full bg-primary border-2 border-background animate-pulse" />
+            )}
           </Button>
           <Button
             variant="outline"

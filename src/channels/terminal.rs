@@ -392,6 +392,7 @@ pub fn build_tool_progress_terminal_notice(
     tool_name: &str,
     message: &str,
     tool_call_id: Option<&str>,
+    background_job_id: Option<&str>,
 ) -> OutboundMessage {
     let detail = message.trim();
     let content = if detail.is_empty() {
@@ -404,6 +405,9 @@ pub fn build_tool_progress_terminal_notice(
     metadata.insert(METADATA_TOOL_NAME.to_string(), json!(tool_name));
     if let Some(id) = tool_call_id.filter(|s| !s.is_empty()) {
         metadata.insert(METADATA_TOOL_CALL_ID.to_string(), json!(id));
+    }
+    if let Some(id) = background_job_id.filter(|s| !s.is_empty()) {
+        metadata.insert(crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(), json!(id));
     }
     OutboundMessage {
         channel: "terminal".to_string(),
@@ -420,6 +424,7 @@ pub fn build_tool_call_terminal_notice(
     tool_name: &str,
     args: &str,
     tool_call_id: Option<&str>,
+    background_job_id: Option<&str>,
 ) -> OutboundMessage {
     let preview = tool_call_preview_for_terminal(tool_name, args);
     let content = if preview.is_empty() {
@@ -435,6 +440,9 @@ pub fn build_tool_call_terminal_notice(
     if let Some(id) = tool_call_id.filter(|s| !s.is_empty()) {
         metadata.insert(METADATA_TOOL_CALL_ID.to_string(), json!(id));
     }
+    if let Some(id) = background_job_id.filter(|s| !s.is_empty()) {
+        metadata.insert(crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(), json!(id));
+    }
     OutboundMessage {
         channel: "terminal".to_string(),
         chat_id: chat_id.to_string(),
@@ -445,12 +453,19 @@ pub fn build_tool_call_terminal_notice(
 }
 
 /// Live terminal row for model reasoning / thought telemetry (Ratatui → `Cell::Thinking`).
-pub fn build_agent_thought_terminal_notice(chat_id: &str, thought: &str) -> OutboundMessage {
+pub fn build_agent_thought_terminal_notice(
+    chat_id: &str,
+    thought: &str,
+    background_job_id: Option<&str>,
+) -> OutboundMessage {
     let mut metadata = HashMap::new();
     metadata.insert(
         crate::channels::terminal_ui::protocol::ISANAGENT_AGENT_THOUGHT.to_string(),
         json!(true),
     );
+    if let Some(id) = background_job_id.filter(|s| !s.is_empty()) {
+        metadata.insert(crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(), json!(id));
+    }
     OutboundMessage {
         channel: "terminal".to_string(),
         chat_id: chat_id.to_string(),
@@ -466,6 +481,7 @@ pub fn build_tool_result_terminal_notice(
     tool_name: &str,
     result: &str,
     tool_call_id: Option<&str>,
+    background_job_id: Option<&str>,
 ) -> OutboundMessage {
     let t = result.trim();
     let summary = summarize_tool_result_for_terminal(tool_name, result);
@@ -488,6 +504,9 @@ pub fn build_tool_result_terminal_notice(
     }
     if let Some(id) = tool_call_id.filter(|s| !s.is_empty()) {
         metadata.insert(METADATA_TOOL_CALL_ID.to_string(), json!(id));
+    }
+    if let Some(id) = background_job_id.filter(|s| !s.is_empty()) {
+        metadata.insert(crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(), json!(id));
     }
     OutboundMessage {
         channel: "terminal".to_string(),

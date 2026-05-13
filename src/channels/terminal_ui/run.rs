@@ -167,6 +167,7 @@ Keys:
   Ctrl+Shift+M      Toggle application mouse: on = wheel scrolls panes; off = native selection/copy
   Ctrl+Shift+Y      Copy last assistant reply
   Ctrl+W / Ctrl+U   Delete word / clear line
+  Ctrl+G            Open background jobs & notifications pane
   Ctrl+C            Cancel in-flight work (same as /cancel; does not exit)
   Ctrl+D            Exit if compose line is empty (like /exit); else delete forward (readline-style)
 
@@ -428,42 +429,122 @@ fn chunks_line_width(spans: &[Span<'static>]) -> usize {
 }
 
 /// Build lines for the agent-tasks pane (sub-agent lifecycle).
-fn agent_tasks_paragraph(app: &App) -> Vec<Line<'static>> {
-    if app.agent_tasks.is_empty() {
+fn background_pane_paragraph(app: &App) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+
+    // 1. Notifications (High Priority)
+    if !app.notifications.is_empty() {
+        out.push(Line::from(Span::styled("--- NOTIFICATIONS ---", Theme::tool_call())));
+        for entry in &app.notifications {
+            let style = if entry.kind == "clarification" {
+                Theme::tool_call_pending()
+            } else {
+                Theme::dim()
+            };
+            let age = entry.created_at.elapsed();
+            let label = format!("[{}] {} ({})", entry.kind, entry.message, format_age(age));
+            out.push(Line::from(Span::styled(label, style)));
+        }
+        out.push(Line::from(""));
+    }
+
+    // 2. Background Jobs
+    if !app.background_jobs.is_empty() {
+        out.push(Line::from(Span::styled("--- BACKGROUND JOBS ---", Theme::tool_call())));
+        let spinner_str = app.get_spinner_frame().to_string();
+        for entry in &app.background_jobs {
+            let (style, icon) = match entry.status.as_str() {
+                "running" => (Theme::tool_call(), spinner_str.as_str()),
+                "waiting" => (Theme::tool_call_pending(), "⏲"),
+                "completed" => (Theme::dim(), "✓"),
+                "failed" => (Theme::error(), "✗"),
+                _ => (Theme::dim(), "·"),
+            };
+            let age = entry.created_at.elapsed();
+            let label = format!("{} {} [{}] ({})", icon, entry.tool_name, entry.status, format_age(age));
+            let mut line = Line::from(Span::styled(label, style));
+            if let Some(desc) = &entry.description {
+                line.spans.push(Span::styled(format!("  ·  {}", desc), Theme::dim()));
+            }
+            out.push(line);
+        }
+        out.push(Line::from(""));
+    }
+
+    // 3. Sub-Agent Tasks (Legacy AgentTasks)
+    if !app.agent_tasks.is_empty() {
+        out.push(Line::from(Span::styled("--- SUB-AGENTS ---", Theme::tool_call())));
+        let spinner_str = app.get_spinner_frame().to_string();
+        for entry in app.agent_tasks.iter() {
+            let (style, icon) = match entry.status {
+                AgentTaskStatus::Running => (Theme::tool_call(), spinner_str.as_str()),
+                AgentTaskStatus::Completed => (Theme::dim(), "✓"),
+                AgentTaskStatus::Failed => (Theme::error(), "✗"),
+                AgentTaskStatus::Cancelled => (Theme::dim(), "⨯"),
+            };
+            let label = match (&entry.agent_name, &entry.display_name) {
+                (Some(a), Some(d)) => format!("{a}: {d}"),
+                (Some(a), None) => a.clone(),
+                (None, Some(d)) => d.clone(),
+                (None, None) => {
+                    let short = &entry.task_id[..8.min(entry.task_id.len())];
+                    format!("task-{short}")
+                }
+            };
+            let age = entry.started_at.elapsed();
+            let mut line_text = format!("{icon} {label}");
+            if !entry.last_line.is_empty() {
+                line_text.push_str("  ·  ");
+                line_text.push_str(&entry.last_line);
+            }
+            line_text.push_str("  ·  ");
+            line_text.push_str(&format_age(age));
+            out.push(Line::from(Span::styled(line_text, style)));
+        }
+    }
+
+    if out.is_empty() {
         return vec![Line::from(Span::styled(
-            "No sub-agent tasks yet. Use subagent_spawn or subagent_plan_execute.",
+            "No background jobs or sub-agent tasks found.",
             Theme::dim(),
         ))];
     }
-    let spinner_str = app.get_spinner_frame().to_string();
-    let mut out: Vec<Line<'static>> = Vec::new();
-    for entry in app.agent_tasks.iter() {
-        let (style, icon) = match entry.status {
-            AgentTaskStatus::Running => (Theme::tool_call(), spinner_str.as_str()),
-            AgentTaskStatus::Completed => (Theme::dim(), "✓"),
-            AgentTaskStatus::Failed => (Theme::input_prompt(), "✗"),
-            AgentTaskStatus::Cancelled => (Theme::dim(), "⨯"),
-        };
-        let label = match (&entry.agent_name, &entry.display_name) {
-            (Some(a), Some(d)) => format!("{a}: {d}"),
-            (Some(a), None) => a.clone(),
-            (None, Some(d)) => d.clone(),
-            (None, None) => {
-                let short = &entry.task_id[..8.min(entry.task_id.len())];
-                format!("task-{short}")
-            }
-        };
-        let age = entry.started_at.elapsed();
-        let mut line = format!("{icon} {label}");
-        if !entry.last_line.is_empty() {
-            line.push_str("  ·  ");
-            line.push_str(&entry.last_line);
-        }
-        line.push_str("  ·  ");
-        line.push_str(&format_age(age));
-        out.push(Line::from(Span::styled(line, style)));
-    }
     out
+}
+
+fn refresh_background_data(
+    rt: &tokio::runtime::Runtime,
+    memory_node: &NodeHandle<MemoryMessage>,
+    app: &mut App,
+) {
+    use tokio::sync::oneshot;
+    // 1. Jobs
+    let jobs: Result<Vec<crate::memory::BackgroundJobRecord>, String> = rt.block_on(async {
+        let (tx, rx) = oneshot::channel();
+        let msg = MemoryMessage::ListBackgroundJobs {
+            limit: 50,
+            reply: SharedReply::new(tx),
+        };
+        memory_node.send_packet(msg).await.map_err(|e| e.to_string())?;
+        rx.await.map_err(|_| "memory actor channel closed".to_string())?
+    });
+    if let Ok(j) = jobs {
+        app.background_jobs = j;
+    }
+
+    // 2. Notifications
+    let notifications: Result<Vec<crate::memory::NotificationRecord>, String> = rt.block_on(async {
+        let (tx, rx) = oneshot::channel();
+        let msg = MemoryMessage::ListNotifications {
+            limit: 50,
+            reply: SharedReply::new(tx),
+        };
+        memory_node.send_packet(msg).await.map_err(|e| e.to_string())?;
+        rx.await.map_err(|_| "memory actor channel closed".to_string())?
+    });
+    if let Ok(n) = notifications {
+        app.notifications = n;
+    }
 }
 
 /// Build one line per job in the multi-job strip, plus an optional Jupyter-stream tail
@@ -668,7 +749,7 @@ fn build_status_line(
         vec![
             Span::styled(" · ", dim),
             Span::styled(
-                "Enter send · ^Shift+Y copy last · ^Shift+M wheel · ^W word · ^U clear · ^C cancel · ^D exit",
+                "Enter send · ^G background · ^Shift+Y copy last · ^Shift+M wheel · ^W word · ^U clear · ^C cancel · ^D exit",
                 Theme::status_bar(),
             ),
         ],
@@ -742,8 +823,30 @@ fn handle_execution_job_started_notice(app: &mut App, msg: &OutboundMessage) {
         .get(METADATA_EXECUTION_DESCRIPTION)
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty());
-    app.job_strip_started(jid, sid, tool, desc);
+    app.job_strip_started(jid, sid, tool, desc, &msg.chat_id);
 }
+
+fn handle_background_job_started_notice(app: &mut App, msg: &OutboundMessage) {
+    let jid = msg
+        .metadata
+        .get(crate::bus::METADATA_BACKGROUND_JOB_ID)
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if jid.is_empty() {
+        return;
+    }
+    let tool = msg
+        .metadata
+        .get(METADATA_BACKGROUND_JOB_TOOL_NAME)
+        .and_then(|v| v.as_str())
+        .unwrap_or("job");
+    let desc = msg
+        .metadata
+        .get(METADATA_BACKGROUND_JOB_DESCRIPTION)
+        .and_then(|v| v.as_str());
+    app.job_strip_started(jid, "background", tool, desc, &msg.chat_id);
+}
+
 
 fn handle_execution_job_finished_notice(app: &mut App, msg: &OutboundMessage) {
     let jid = msg
@@ -760,8 +863,27 @@ fn handle_execution_job_finished_notice(app: &mut App, msg: &OutboundMessage) {
         .and_then(|v| v.as_str())
         .unwrap_or("completed");
     let summary = msg.content.trim();
-    app.job_strip_finished(jid, status, summary);
+    app.job_strip_finished(jid, status, summary, &msg.chat_id);
 }
+
+fn handle_background_job_finished_notice(app: &mut App, msg: &OutboundMessage) {
+    let jid = msg
+        .metadata
+        .get(crate::bus::METADATA_BACKGROUND_JOB_ID)
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if jid.is_empty() {
+        return;
+    }
+    let status = msg
+        .metadata
+        .get(METADATA_BACKGROUND_JOB_STATUS)
+        .and_then(|v| v.as_str())
+        .unwrap_or("completed");
+    let summary = msg.content.trim();
+    app.job_strip_finished(jid, status, summary, &msg.chat_id);
+}
+
 
 fn handle_subagent_task_started_notice(app: &mut App, msg: &OutboundMessage) {
     let tid = msg
@@ -1254,6 +1376,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
     let mut last_exec_poll = Instant::now() - Duration::from_secs(60);
     let mut last_conversations_poll = Instant::now() - Duration::from_secs(60);
     let mut last_todos_poll = Instant::now() - Duration::from_secs(60);
+    let mut last_background_poll = Instant::now() - Duration::from_secs(60);
 
     let start_time = Instant::now();
     let (todos_tx, todos_rx) = std::sync::mpsc::channel();
@@ -1339,6 +1462,12 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             last_conversations_poll = Instant::now();
             refresh_conversations_list(&rt, &memory_node, &mut app);
         }
+        if app.ui_focus == TerminalUiFocus::BackgroundJobs
+            && last_background_poll.elapsed() >= Duration::from_secs(2)
+        {
+            last_background_poll = Instant::now();
+            refresh_background_data(&rt, &memory_node, &mut app);
+        }
 
         if let Some(ref rx) = uv_install_rx {
             match rx.try_recv() {
@@ -1415,6 +1544,43 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 handle_execution_job_finished_notice(&mut app, &msg);
                 append_execution_job_panel(&mut app, &msg);
                 continue;
+            }
+            if msg
+                .metadata
+                .get(ISANAGENT_BACKGROUND_JOB_STARTED)
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
+                handle_background_job_started_notice(&mut app, &msg);
+                continue;
+            }
+            if msg
+                .metadata
+                .get(ISANAGENT_BACKGROUND_JOB_FINISHED)
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
+                handle_background_job_finished_notice(&mut app, &msg);
+                continue;
+            }
+            if let Some(jid) = msg
+                .metadata
+                .get(crate::bus::METADATA_BACKGROUND_JOB_ID)
+                .and_then(|v| v.as_str())
+            {
+                // General background job output: update strip, don't add to transcript.
+                if let Some(line) = msg.content.lines().filter(|l| !l.trim().is_empty()).last() {
+                    app.job_strip_set_last_line(jid, line);
+                }
+
+                let is_notify = msg
+                    .metadata
+                    .get("isanagent_notification")
+                    .and_then(|v| v.as_bool())
+                    == Some(true);
+                if !is_notify {
+                    continue;
+                }
             }
             if msg
                 .metadata
@@ -1619,13 +1785,18 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     app.last_conversations_list_rect = None;
                     app.last_agent_tasks_rect = None;
                 }
-                TerminalUiFocus::AgentTasks => {
-                    let list = agent_tasks_paragraph(&app);
+                TerminalUiFocus::AgentTasks | TerminalUiFocus::BackgroundJobs => {
+                    let list = background_pane_paragraph(&app);
+                    let title = if app.ui_focus == TerminalUiFocus::BackgroundJobs {
+                        " background "
+                    } else {
+                        " sub-agents "
+                    };
                     let w = Paragraph::new(Text::from(list))
                         .block(
                             Block::default()
                                 .borders(Borders::ALL)
-                                .title(Span::styled(" sub-agents ", Theme::tool_call()))
+                                .title(Span::styled(title, Theme::tool_call()))
                                 .border_style(Theme::dim()),
                         )
                         .scroll((app.agent_tasks_scroll_top as u16, 0));
@@ -1996,12 +2167,43 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             continue;
                         }
 
-                        if app.ui_focus == TerminalUiFocus::Conversations {
-                            if let Some(idx) = app.conversations_selected_idx {
-                                if idx >= app.conversations_items.len() {
-                                    continue;
+                        if app.ui_focus == TerminalUiFocus::Conversations
+                            || app.ui_focus == TerminalUiFocus::BackgroundJobs
+                        {
+                            let selected_chat_id = if app.ui_focus == TerminalUiFocus::Conversations
+                            {
+                                if let Some(idx) = app.conversations_selected_idx {
+                                    if idx < app.conversations_items.len() {
+                                        Some(app.conversations_items[idx].thread_id.clone())
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
                                 }
-                                let thread_id = app.conversations_items[idx].thread_id.clone();
+                            } else {
+                                // BackgroundJobs jump-to-thread
+                                if let Some(idx) = app.background_jobs_selected_idx {
+                                    // Total items: notifications + jobs + agent_tasks
+                                    let n_count = app.notifications.len();
+                                    let j_count = app.background_jobs.len();
+                                    let a_count = app.agent_tasks.len();
+
+                                    if idx < n_count {
+                                        app.notifications[idx].chat_id.clone()
+                                    } else if idx < n_count + j_count {
+                                        Some(app.background_jobs[idx - n_count].chat_id.clone())
+                                    } else if idx < n_count + j_count + a_count {
+                                        Some(app.agent_tasks[idx - n_count - j_count].chat_id.clone())
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            };
+
+                            if let Some(thread_id) = selected_chat_id {
                                 let new_cid = match chat_id_from_root_thread_id(
                                     channel_name.as_str(),
                                     &thread_id,
@@ -2023,13 +2225,13 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                         sync_terminal_session_chat(&bus_tx, &chat_id);
                                         let sid = &chat_id[..8.min(chat_id.len())];
                                         cells.insert(
-                                        0,
-                                        Cell::System {
-                                            message: format!(
-                                                "Resumed session {sid}… — loaded from workspace memory."
-                                            ),
-                                        },
-                                    );
+                                            0,
+                                            Cell::System {
+                                                message: format!(
+                                                    "Resumed session {sid}… — loaded from workspace memory."
+                                                ),
+                                            },
+                                        );
                                         app.cells = cells;
                                         app.thinking = false;
                                         app.llm_retry_available = false;
@@ -2146,7 +2348,15 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 continue;
                             }
                             if text.eq_ignore_ascii_case("/agents") {
-                                app.ui_focus = TerminalUiFocus::AgentTasks;
+                                app.focus_agent_tasks();
+                                continue;
+                            }
+                            if text.eq_ignore_ascii_case("/background")
+                                || text.eq_ignore_ascii_case("/bg")
+                            {
+                                app.focus_background_jobs();
+                                refresh_background_data(&rt, &memory_node, &mut app);
+                                last_background_poll = Instant::now();
                                 continue;
                             }
                             if text.eq_ignore_ascii_case("/chats") {
@@ -2325,9 +2535,17 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                     executions_ensure_list_shows_selection(&mut app, list_h);
                                 }
                             }
+                        } else if app.ui_focus == TerminalUiFocus::BackgroundJobs {
+                            if let Some(i) = app.background_jobs_selected_idx {
+                                if i > 0 {
+                                    app.background_jobs_selected_idx = Some(i - 1);
+                                }
+                            }
                         } else if !matches!(
                             app.ui_focus,
-                            TerminalUiFocus::Executions | TerminalUiFocus::Conversations
+                            TerminalUiFocus::Executions
+                                | TerminalUiFocus::Conversations
+                                | TerminalUiFocus::BackgroundJobs
                         ) {
                             app.history_up();
                         }
@@ -2360,9 +2578,24 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                     executions_ensure_list_shows_selection(&mut app, list_h);
                                 }
                             }
+                        } else if app.ui_focus == TerminalUiFocus::BackgroundJobs
+                            && (!app.background_jobs.is_empty()
+                                || !app.notifications.is_empty()
+                                || !app.agent_tasks.is_empty())
+                        {
+                            if let Some(i) = app.background_jobs_selected_idx {
+                                let total = app.notifications.len()
+                                    + app.background_jobs.len()
+                                    + app.agent_tasks.len();
+                                if i + 1 < total {
+                                    app.background_jobs_selected_idx = Some(i + 1);
+                                }
+                            }
                         } else if !matches!(
                             app.ui_focus,
-                            TerminalUiFocus::Executions | TerminalUiFocus::Conversations
+                            TerminalUiFocus::Executions
+                                | TerminalUiFocus::Conversations
+                                | TerminalUiFocus::BackgroundJobs
                         ) {
                             app.history_down();
                         }
@@ -2413,6 +2646,13 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             &mut last_conversations_poll,
                         );
                         apply_ui_focus_cycle(&mut app, true, &mut focus_ctx);
+                    }
+                    KeyCode::Char('g') | KeyCode::Char('G')
+                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        app.focus_background_jobs();
+                        refresh_background_data(&rt, &memory_node, &mut app);
+                        last_background_poll = Instant::now();
                     }
                     KeyCode::PageUp => match app.ui_focus {
                         TerminalUiFocus::ToolHistory => app.tool_history_scroll_up(8),

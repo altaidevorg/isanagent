@@ -245,6 +245,7 @@ pub struct ClarificationTicketRecord {
     pub chat_id: String,
     pub channel: String,
     pub thread_id: Option<String>,
+    pub tool_call_id: Option<String>,
     pub prompt: String,
     pub choices_json: Option<String>,
     pub response: Option<String>,
@@ -337,6 +338,7 @@ pub fn ensure_background_runtime_schema(conn: &Connection) -> Result<(), rusqlit
             chat_id TEXT NOT NULL,
             channel TEXT NOT NULL,
             thread_id TEXT,
+            tool_call_id TEXT,
             prompt TEXT NOT NULL,
             choices_json TEXT,
             response TEXT,
@@ -1712,14 +1714,15 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
             MemoryMessage::UpsertClarificationTicket { record, reply } => {
                 let res = self.conn.execute(
                     "INSERT INTO clarification_tickets (
-                        ticket_id, job_id, chat_id, channel, thread_id, prompt, choices_json,
-                        response, status, created_at_ms, updated_at_ms
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                        ticket_id, job_id, chat_id, channel, thread_id, tool_call_id, prompt, choices_json, response,
+                        status, created_at_ms, updated_at_ms
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                     ON CONFLICT(ticket_id) DO UPDATE SET
                         response = excluded.response, status = excluded.status, updated_at_ms = excluded.updated_at_ms",
                     params![
                         record.ticket_id, record.job_id, record.chat_id, record.channel, record.thread_id,
-                        record.prompt, record.choices_json, record.response, record.status, record.created_at_ms, record.updated_at_ms
+                        record.tool_call_id, record.prompt, record.choices_json, record.response, record.status,
+                        record.created_at_ms, record.updated_at_ms
                     ],
                 ).map_err(|e| format!("upsert clarification_tickets: {}", e)).map(|_| ());
                 let _ = reply.send(res);
@@ -1739,7 +1742,8 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
             MemoryMessage::GetClarificationTicket { ticket_id, reply } => {
                 let res = (|| -> Result<Option<ClarificationTicketRecord>, String> {
                     self.conn.query_row(
-                        "SELECT ticket_id, job_id, chat_id, channel, thread_id, prompt, choices_json, response, status, created_at_ms, updated_at_ms
+                        "SELECT ticket_id, job_id, chat_id, channel, thread_id, tool_call_id, prompt, choices_json, response,
+                                status, created_at_ms, updated_at_ms
                          FROM clarification_tickets WHERE ticket_id = ?1",
                         params![ticket_id],
                         |row| {
@@ -1749,12 +1753,13 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                                 chat_id: row.get(2)?,
                                 channel: row.get(3)?,
                                 thread_id: row.get(4)?,
-                                prompt: row.get(5)?,
-                                choices_json: row.get(6)?,
-                                response: row.get(7)?,
-                                status: row.get(8)?,
-                                created_at_ms: row.get(9)?,
-                                updated_at_ms: row.get(10)?,
+                                tool_call_id: row.get(5)?,
+                                prompt: row.get(6)?,
+                                choices_json: row.get(7)?,
+                                response: row.get(8)?,
+                                status: row.get(9)?,
+                                created_at_ms: row.get(10)?,
+                                updated_at_ms: row.get(11)?,
                             })
                         },
                     ).optional().map_err(|e| e.to_string())

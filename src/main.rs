@@ -987,9 +987,9 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                         }
                     }
                 }
-                BusMessage::Telemetry(TelemetryEvent::AgentThought { chat_id, thought }) => {
+                BusMessage::Telemetry(TelemetryEvent::AgentThought { chat_id, thought, background_job_id }) => {
                     if active_terminal_for_outbound.read().await.as_str() == chat_id.as_str() {
-                        let notice = build_agent_thought_terminal_notice(chat_id, thought);
+                        let notice = build_agent_thought_terminal_notice(chat_id, thought, background_job_id.as_deref());
                         if let Some(chan) = delivery_channels.get("terminal") {
                             if let Err(e) = chan.send(notice).await {
                                 log::error!("Failed to deliver AgentThought to terminal: {}", e);
@@ -1013,6 +1013,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                     tool_name,
                     tool_call_id,
                     message,
+                    background_job_id,
                 }) => {
                     if channel == "terminal"
                         && active_terminal_for_outbound.read().await.as_str() == chat_id.as_str()
@@ -1022,6 +1023,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                             tool_name,
                             message,
                             tool_call_id.as_deref(),
+                            background_job_id.as_deref(),
                         );
                         if let Some(chan) = delivery_channels.get("terminal") {
                             if let Err(e) = chan.send(notice).await {
@@ -1052,6 +1054,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                     tool_name,
                     args,
                     tool_call_id,
+                    background_job_id,
                 }) if channel == "terminal" => {
                     if isanagent::channels::terminal::should_suppress_tool_notice_for_terminal(
                         tool_name, args,
@@ -1062,8 +1065,9 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                         let notice = build_tool_call_terminal_notice(
                             chat_id,
                             tool_name,
-                            args,
+                            &args,
                             tool_call_id.as_deref(),
+                            background_job_id.as_deref(),
                         );
                         if let Some(chan) = delivery_channels.get("terminal") {
                             if let Err(e) = chan.send(notice).await {
@@ -1081,6 +1085,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                     tool_name,
                     result,
                     tool_call_id,
+                    background_job_id,
                 }) if channel == "terminal" => {
                     if isanagent::channels::terminal::should_suppress_tool_notice_for_terminal(
                         tool_name, result,
@@ -1091,8 +1096,9 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                         let notice = build_tool_result_terminal_notice(
                             chat_id,
                             tool_name,
-                            result,
+                            &result,
                             tool_call_id.as_deref(),
+                            background_job_id.as_deref(),
                         );
                         if let Some(chan) = delivery_channels.get("terminal") {
                             if let Err(e) = chan.send(notice).await {

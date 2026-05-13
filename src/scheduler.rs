@@ -405,8 +405,22 @@ impl CronStore {
         chat_id: &str,
         message: &str,
         now_ms: i64,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let conn = self.lock_conn()?;
+        
+        let full_job_id = format!("cron:{}", job_id);
+        let existing_state: Option<String> = conn.query_row(
+            "SELECT state FROM background_jobs WHERE job_id = ?1",
+            params![full_job_id],
+            |row| row.get(0),
+        ).optional().map_err(|e| e.to_string())?;
+
+        if let Some(state) = existing_state {
+            if state == "running" || state == "waiting" {
+                return Ok(false); // Already active, skip.
+            }
+        }
+
         let payload = serde_json::json!({
             "trigger": "cron",
             "message": message,
@@ -420,7 +434,7 @@ impl CronStore {
             ) VALUES (?1, 'cron', ?2, ?3, NULL, 'running', ?4, 1, 1, NULL, ?5, ?5)
             ON CONFLICT(job_id) DO UPDATE SET
                 state = 'running', payload_json = excluded.payload_json, updated_at_ms = excluded.updated_at_ms",
-            params![format!("cron:{}", job_id), chat_id, channel, payload, now_ms],
+            params![full_job_id, chat_id, channel, payload, now_ms],
         ).map_err(|e| format!("insert background_jobs from cron: {}", e))?;
         conn.execute(
             "INSERT INTO notifications (
@@ -431,13 +445,13 @@ impl CronStore {
                 format!("notif:cron:{}:{}", job_id, now_ms),
                 chat_id,
                 channel,
-                format!("Cron job triggered: {}", job_id),
-                message,
-                format!("cron:{}", job_id),
+                "Cron Triggered",
+                format!("Background task: {}", message),
+                serde_json::json!({"job_id": full_job_id}).to_string(),
                 now_ms
             ],
         ).map_err(|e| format!("insert notifications from cron: {}", e))?;
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -847,63 +861,63 @@ impl ActorLogic<String> for CronActor {
         }
 
         for (job_id, channel, chat_id, message) in triggered {
-            let _ = self
+            match self
                 .store
-                .record_cron_background_job(&job_id, &channel, &chat_id, &message, now_ms);
-            let mut metadata = HashMap::new();
-            metadata.insert(
-                crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
-                serde_json::Value::String(format!("cron:{}", job_id)),
-            );
-            metadata.insert(
-                "cron_job_id".to_string(),
-                serde_json::Value::String(job_id.clone()),
-            );
-            metadata.insert(
-                "trigger_source".to_string(),
-                serde_json::Value::String("local".to_string()),
-            );
-            metadata.insert(
-                crate::bus::METADATA_SYNTHETIC_CRON_TRIGGER.to_string(),
-                serde_json::Value::Bool(true),
-            );
-            metadata.insert(
-                crate::bus::METADATA_AUTONOMOUS_FORBID_FINAL_WITHOUT_TOOLS.to_string(),
-                serde_json::Value::Bool(true),
-            );
-
-            let inbound = crate::bus::InboundMessage {
-                channel,
-                sender_id: "cron".to_string(),
-                chat_id,
-                thread_id: None,
-                content: message.clone(),
-                attachments: Vec::new(),
-                metadata,
-            };
-
-            if let Err(error) = self
-                .bus_tx
-                .send(crate::bus::BusMessage::Inbound(inbound))
-                .await
+                .record_cron_background_job(&job_id, &channel, &chat_id, &message, now_ms)
             {
-                self.log_error(format!(
-                    "Failed to send cron trigger message to bus for {}: {}",
-                    job_id, error
-                ));
-            } else {
-                let _ = self.logger_tx.send(crate::bus::BusMessage::Telemetry(
-                    crate::bus::TelemetryEvent::CronTrigger {
-                        job_id: job_id.clone(),
-                        message: message.clone(),
-                    },
-                ));
-                let _ =
-                    self.logger_tx
-                        .send(crate::bus::BusMessage::Log(crate::bus::LogEvent::info(
-                            &self.name,
-                            &format!("Fired local cron job {}", job_id),
-                        )));
+                Ok(true) => {
+                    let mut metadata = HashMap::new();
+                    metadata.insert(
+                        crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
+                        serde_json::json!(format!("cron:{}", job_id)),
+                    );
+                    metadata.insert(
+                        "cron_job_id".to_string(),
+                        serde_json::json!(job_id.clone()),
+                    );
+                    metadata.insert(
+                        crate::bus::METADATA_SYNTHETIC_CRON_TRIGGER.to_string(),
+                        serde_json::json!(true),
+                    );
+                    metadata.insert(
+                        crate::bus::METADATA_AUTONOMOUS_FORBID_FINAL_WITHOUT_TOOLS.to_string(),
+                        serde_json::json!(true),
+                    );
+
+                    let inbound = crate::bus::InboundMessage {
+                        channel,
+                        sender_id: "cron_scheduler".to_string(),
+                        chat_id,
+                        thread_id: None,
+                        content: message.clone(),
+                        attachments: Vec::new(),
+                        metadata,
+                    };
+
+                    let _ = self.bus_tx.send(crate::bus::BusMessage::Inbound(inbound)).await;
+                    
+                    let _ = self.logger_tx.send(crate::bus::BusMessage::Telemetry(
+                        crate::bus::TelemetryEvent::CronTrigger {
+                            job_id: job_id.clone(),
+                            message: message.clone(),
+                        },
+                    ));
+                    let _ =
+                        self.logger_tx
+                            .send(crate::bus::BusMessage::Log(crate::bus::LogEvent::info(
+                                &self.name,
+                                &format!("Fired local cron job {}", job_id),
+                            )));
+                }
+                Ok(false) => {
+                    // Skip trigger, already active
+                }
+                Err(error) => {
+                    self.log_error(format!(
+                        "Failed to record cron background job for {}: {}",
+                        job_id, error
+                    ));
+                }
             }
         }
 

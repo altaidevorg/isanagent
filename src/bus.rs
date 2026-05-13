@@ -74,6 +74,8 @@ pub enum TelemetryEvent {
         /// backwards compat with synthetic emit sites that have no upstream id.
         #[serde(default)]
         tool_call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background_job_id: Option<String>,
     },
     ToolResult {
         chat_id: String,
@@ -83,10 +85,14 @@ pub enum TelemetryEvent {
         result: String,
         #[serde(default)]
         tool_call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background_job_id: Option<String>,
     },
     AgentThought {
         chat_id: String,
         thought: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background_job_id: Option<String>,
     },
     AgentUsage {
         chat_id: String,
@@ -114,6 +120,8 @@ pub enum TelemetryEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_call_id: Option<String>,
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background_job_id: Option<String>,
     },
     CronTrigger {
         job_id: String,

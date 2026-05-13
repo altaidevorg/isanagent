@@ -44,3 +44,10 @@ pub const METADATA_SUBAGENT_CHILD_CHAT_ID: &str = "subagent_child_chat_id";
 pub const METADATA_SUBAGENT_AGENT_NAME: &str = "subagent_agent_name";
 pub const METADATA_SUBAGENT_DISPLAY_NAME: &str = "subagent_display_name";
 pub const METADATA_SUBAGENT_STATUS: &str = "subagent_status";
+/// One-line notice when a generic background job is registered (Ratatui multi-job strip).
+pub const ISANAGENT_BACKGROUND_JOB_STARTED: &str = "isanagent_background_job_started";
+/// One-line notice when a generic background job finishes.
+pub const ISANAGENT_BACKGROUND_JOB_FINISHED: &str = "isanagent_background_job_finished";
+pub const METADATA_BACKGROUND_JOB_STATUS: &str = "background_job_status";
+pub const METADATA_BACKGROUND_JOB_DESCRIPTION: &str = "background_job_description";
+pub const METADATA_BACKGROUND_JOB_TOOL_NAME: &str = "background_job_tool_name";
