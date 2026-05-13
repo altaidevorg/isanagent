@@ -395,7 +395,37 @@ impl Default for App {
     }
 }
 
+pub enum BackgroundPanelItem<'a> {
+    Notification(&'a crate::memory::NotificationRecord),
+    Job(&'a crate::memory::BackgroundJobRecord),
+    AgentTask(&'a crate::channels::terminal_ui::app::AgentTaskEntry),
+}
+
+impl<'a> BackgroundPanelItem<'a> {
+    pub fn chat_id(&self) -> &'a str {
+        match self {
+            Self::Notification(n) => &n.chat_id,
+            Self::Job(j) => &j.chat_id,
+            Self::AgentTask(t) => &t.child_chat_id,
+        }
+    }
+}
+
 impl App {
+    pub fn background_panel_items(&self) -> Vec<BackgroundPanelItem<'_>> {
+        let mut items = Vec::new();
+        for n in &self.notifications {
+            items.push(BackgroundPanelItem::Notification(n));
+        }
+        for j in &self.background_jobs {
+            items.push(BackgroundPanelItem::Job(j));
+        }
+        for a in &self.agent_tasks {
+            items.push(BackgroundPanelItem::AgentTask(a));
+        }
+        items
+    }
+
     pub fn new() -> Self {
         Self {
             mode: TerminalUiMode::default(),

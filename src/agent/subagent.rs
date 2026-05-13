@@ -779,24 +779,17 @@ impl Tool for SubagentSpawnTool {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
         let p = current_parent_ids()?;
-        let (ch, parent_chat, thread, parent_cancel, bg_id) = (
-            p.channel,
-            p.chat_id,
-            p.thread_id,
-            p.token,
-            p.background_job_id,
-        );
         self.harness
             .spawn(SubagentSpawnSpec {
-                parent_channel: ch,
-                parent_chat_id: parent_chat,
-                parent_thread_id: thread,
-                parent_reasoning_cancel: parent_cancel,
+                parent_channel: p.channel,
+                parent_chat_id: p.chat_id,
+                parent_thread_id: p.thread_id,
+                parent_reasoning_cancel: p.token,
                 prompt,
                 wait,
                 display_name: name,
                 agent_name,
-                background_job_id: bg_id,
+                background_job_id: p.background_job_id,
             })
             .await
     }
@@ -983,26 +976,19 @@ impl Tool for SubagentPlanTool {
                 }
                 body.push_str(&prompts[&step_id]);
                 let p = current_parent_ids()?;
-                let (ch, parent_chat, thread, parent_cancel, bg_id) = (
-                    p.channel,
-                    p.chat_id,
-                    p.thread_id,
-                    p.token,
-                    p.background_job_id,
-                );
                 let label = format!("plan-{}", step_id);
                 let spawn_json = self
                     .harness
                     .spawn(SubagentSpawnSpec {
-                        parent_channel: ch,
-                        parent_chat_id: parent_chat,
-                        parent_thread_id: thread,
-                        parent_reasoning_cancel: parent_cancel,
+                        parent_channel: p.channel,
+                        parent_chat_id: p.chat_id,
+                        parent_thread_id: p.thread_id,
+                        parent_reasoning_cancel: p.token,
                         prompt: body,
                         wait: true,
                         display_name: Some(label),
                         agent_name: None,
-                        background_job_id: bg_id,
+                        background_job_id: p.background_job_id,
                     })
                     .await?;
                 let step_output = serde_json::from_str::<serde_json::Value>(&spawn_json)

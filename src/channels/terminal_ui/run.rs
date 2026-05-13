@@ -2209,24 +2209,9 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             } else {
                                 // BackgroundJobs jump-to-thread
                                 if let Some(idx) = app.background_jobs_selected_idx {
-                                    // Total items: notifications + jobs + agent_tasks
-                                    let n_count = app.notifications.len();
-                                    let j_count = app.background_jobs.len();
-                                    let a_count = app.agent_tasks.len();
-
-                                    if idx < n_count {
-                                        Some(app.notifications[idx].chat_id.clone())
-                                    } else if idx < n_count + j_count {
-                                        Some(app.background_jobs[idx - n_count].chat_id.clone())
-                                    } else if idx < n_count + j_count + a_count {
-                                        Some(
-                                            app.agent_tasks[idx - n_count - j_count]
-                                                .child_chat_id
-                                                .clone(),
-                                        )
-                                    } else {
-                                        None
-                                    }
+                                    app.background_panel_items()
+                                        .get(idx)
+                                        .map(|item| item.chat_id().to_string())
                                 } else {
                                     None
                                 }

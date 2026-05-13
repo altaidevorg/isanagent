@@ -34,6 +34,15 @@ pub struct InboundMessage {
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
+pub fn get_background_job_id(
+    metadata: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<String> {
+    metadata
+        .get(METADATA_BACKGROUND_JOB_ID)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
 /// Session key for clarification routing and tool execution context ([`crate::tool_runtime::ToolExecCtx`]).
 ///
 /// Format must stay aligned with [`crate::tool_runtime::ToolExecCtx`]: `channel:chat_id:thread`,
