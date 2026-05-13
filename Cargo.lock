@@ -2285,7 +2285,7 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
 name = "isanagent"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "arboard",
  "async-stream",
@@ -3112,9 +3112,9 @@ dependencies = [
 
 [[package]]
 name = "pdf_oxide"
-version = "0.3.46"
+version = "0.3.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ba152347f68db3aa3fbecc2b0104724d74aad532b186d3d9f4d5541681ddd91"
+checksum = "04717572366df7c9fa002f3c376e58c4d4071d47cf9339b95c0054adb8a0bbb7"
 dependencies = [
  "aes 0.9.0",
  "base64",
