@@ -28,15 +28,17 @@ use crate::channels::terminal_ui::panes::{
     transcript_paragraph,
 };
 use crate::channels::terminal_ui::protocol::{
-    ISANAGENT_AGENT_THOUGHT, ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_JOB_STARTED,
+    ISANAGENT_AGENT_THOUGHT, ISANAGENT_BACKGROUND_JOB_FINISHED, ISANAGENT_BACKGROUND_JOB_STARTED,
+    ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_JOB_STARTED,
     ISANAGENT_EXECUTION_STREAM, ISANAGENT_LLM_RETRY_AVAILABLE, ISANAGENT_SUBAGENT_TASK_FINISHED,
     ISANAGENT_SUBAGENT_TASK_STARTED, ISANAGENT_TERMINAL_ERROR, ISANAGENT_TOOL_PROGRESS,
-    METADATA_EXECUTION_DESCRIPTION, METADATA_EXECUTION_JOB_ID, METADATA_EXECUTION_JOB_STATUS,
-    METADATA_EXECUTION_JOB_TOOL_NAME, METADATA_EXECUTION_RUN_ID, METADATA_EXECUTION_SESSION_ID,
-    METADATA_SUBAGENT_AGENT_NAME, METADATA_SUBAGENT_CHILD_CHAT_ID, METADATA_SUBAGENT_DISPLAY_NAME,
-    METADATA_SUBAGENT_STATUS, METADATA_SUBAGENT_TASK_ID, METADATA_TOOL_CALL_ID,
-    METADATA_TOOL_CALL_PREVIEW, METADATA_TOOL_NAME, METADATA_TOOL_RESULT_CHAR_COUNT,
-    METADATA_TOOL_RESULT_PREVIEW,
+    METADATA_BACKGROUND_JOB_DESCRIPTION, METADATA_BACKGROUND_JOB_STATUS,
+    METADATA_BACKGROUND_JOB_TOOL_NAME, METADATA_EXECUTION_DESCRIPTION, METADATA_EXECUTION_JOB_ID,
+    METADATA_EXECUTION_JOB_STATUS, METADATA_EXECUTION_JOB_TOOL_NAME, METADATA_EXECUTION_RUN_ID,
+    METADATA_EXECUTION_SESSION_ID, METADATA_SUBAGENT_AGENT_NAME, METADATA_SUBAGENT_CHILD_CHAT_ID,
+    METADATA_SUBAGENT_DISPLAY_NAME, METADATA_SUBAGENT_STATUS, METADATA_SUBAGENT_TASK_ID,
+    METADATA_TOOL_CALL_ID, METADATA_TOOL_CALL_PREVIEW, METADATA_TOOL_NAME,
+    METADATA_TOOL_RESULT_CHAR_COUNT, METADATA_TOOL_RESULT_PREVIEW,
 };
 use crate::channels::terminal_ui::text_format::truncate_chars_display;
 use crate::channels::terminal_ui::{
@@ -437,12 +439,13 @@ fn background_pane_paragraph(app: &App) -> Vec<Line<'static>> {
         out.push(Line::from(Span::styled("--- NOTIFICATIONS ---", Theme::tool_call())));
         for entry in &app.notifications {
             let style = if entry.kind == "clarification" {
-                Theme::tool_call_pending()
+                Theme::tool_pending()
             } else {
                 Theme::dim()
             };
-            let age = entry.created_at.elapsed();
-            let label = format!("[{}] {} ({})", entry.kind, entry.message, format_age(age));
+            let created_at = std::time::UNIX_EPOCH + std::time::Duration::from_millis(entry.created_at_ms as u64);
+            let age = std::time::SystemTime::now().duration_since(created_at).unwrap_or_default();
+            let label = format!("[{}] {} ({})", entry.kind, entry.title, format_age(age));
             out.push(Line::from(Span::styled(label, style)));
         }
         out.push(Line::from(""));
@@ -453,19 +456,17 @@ fn background_pane_paragraph(app: &App) -> Vec<Line<'static>> {
         out.push(Line::from(Span::styled("--- BACKGROUND JOBS ---", Theme::tool_call())));
         let spinner_str = app.get_spinner_frame().to_string();
         for entry in &app.background_jobs {
-            let (style, icon) = match entry.status.as_str() {
+            let (style, icon) = match entry.state.as_str() {
                 "running" => (Theme::tool_call(), spinner_str.as_str()),
-                "waiting" => (Theme::tool_call_pending(), "⏲"),
+                "waiting" => (Theme::tool_pending(), "⏲"),
                 "completed" => (Theme::dim(), "✓"),
                 "failed" => (Theme::error(), "✗"),
                 _ => (Theme::dim(), "·"),
             };
-            let age = entry.created_at.elapsed();
-            let label = format!("{} {} [{}] ({})", icon, entry.tool_name, entry.status, format_age(age));
-            let mut line = Line::from(Span::styled(label, style));
-            if let Some(desc) = &entry.description {
-                line.spans.push(Span::styled(format!("  ·  {}", desc), Theme::dim()));
-            }
+            let created_at = std::time::UNIX_EPOCH + std::time::Duration::from_millis(entry.created_at_ms as u64);
+            let age = std::time::SystemTime::now().duration_since(created_at).unwrap_or_default();
+            let label = format!("{} {} [{}] ({})", icon, entry.kind, entry.state, format_age(age));
+            let line = Line::from(Span::styled(label, style));
             out.push(line);
         }
         out.push(Line::from(""));
@@ -522,6 +523,7 @@ fn refresh_background_data(
     let jobs: Result<Vec<crate::memory::BackgroundJobRecord>, String> = rt.block_on(async {
         let (tx, rx) = oneshot::channel();
         let msg = MemoryMessage::ListBackgroundJobs {
+            chat_id: None,
             limit: 50,
             reply: SharedReply::new(tx),
         };
@@ -536,7 +538,9 @@ fn refresh_background_data(
     let notifications: Result<Vec<crate::memory::NotificationRecord>, String> = rt.block_on(async {
         let (tx, rx) = oneshot::channel();
         let msg = MemoryMessage::ListNotifications {
+            chat_id: None,
             limit: 50,
+            unseen_only: false,
             reply: SharedReply::new(tx),
         };
         memory_node.send_packet(msg).await.map_err(|e| e.to_string())?;
@@ -579,6 +583,7 @@ fn jobs_strip_lines(app: &App, max_width: usize, include_stream_tail: bool) -> V
     for entry in app.jobs_strip.iter() {
         let (style, icon) = match entry.status {
             JobStripStatus::Running => (Theme::tool_call(), spinner_str.as_str()),
+            JobStripStatus::Waiting => (Theme::input_prompt(), "⏳"),
             JobStripStatus::Completed => (Theme::dim(), "✓"),
             JobStripStatus::Failed | JobStripStatus::Timeout => (Theme::input_prompt(), "✗"),
             JobStripStatus::Cancelled => (Theme::dim(), "⨯"),
@@ -2190,11 +2195,11 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                     let a_count = app.agent_tasks.len();
 
                                     if idx < n_count {
-                                        app.notifications[idx].chat_id.clone()
+                                        Some(app.notifications[idx].chat_id.clone())
                                     } else if idx < n_count + j_count {
                                         Some(app.background_jobs[idx - n_count].chat_id.clone())
                                     } else if idx < n_count + j_count + a_count {
-                                        Some(app.agent_tasks[idx - n_count - j_count].chat_id.clone())
+                                        Some(app.agent_tasks[idx - n_count - j_count].child_chat_id.clone())
                                     } else {
                                         None
                                     }
@@ -2656,7 +2661,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     }
                     KeyCode::PageUp => match app.ui_focus {
                         TerminalUiFocus::ToolHistory => app.tool_history_scroll_up(8),
-                        TerminalUiFocus::AgentTasks => {
+                        TerminalUiFocus::AgentTasks | TerminalUiFocus::BackgroundJobs => {
                             app.agent_tasks_scroll_top =
                                 app.agent_tasks_scroll_top.saturating_sub(1);
                         }
@@ -2680,7 +2685,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     },
                     KeyCode::PageDown => match app.ui_focus {
                         TerminalUiFocus::ToolHistory => app.tool_history_scroll_down(8),
-                        TerminalUiFocus::AgentTasks => {
+                        TerminalUiFocus::AgentTasks | TerminalUiFocus::BackgroundJobs => {
                             app.agent_tasks_scroll_top =
                                 app.agent_tasks_scroll_top.saturating_add(1);
                         }

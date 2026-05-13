@@ -350,6 +350,7 @@ async fn log_tool_invocation_start(
             chat_id: inbound.chat_id.clone(),
             tool_name: tool_name.to_string(),
             args: args_str.clone(),
+            background_job_id: background_job_id.clone(),
         }))
         .await;
     hook_observe_telemetry(
@@ -362,6 +363,7 @@ async fn log_tool_invocation_start(
             tool_name: tool_name.to_string(),
             args: args_str.clone(),
             tool_call_id: Some(tc.id.clone()),
+            background_job_id: background_job_id.clone(),
         },
     );
     hook_observe_telemetry(
@@ -372,6 +374,7 @@ async fn log_tool_invocation_start(
             chat_id: inbound.chat_id.clone(),
             tool_name: tool_name.to_string(),
             args: args_str.clone(),
+            background_job_id: background_job_id.clone(),
         },
     );
 }
@@ -734,13 +737,13 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
         if let Some(ref jid) = background_job_id {
             let mut meta = HashMap::new();
             meta.insert(crate::channels::terminal_ui::protocol::ISANAGENT_BACKGROUND_JOB_STARTED.to_string(), serde_json::json!(true));
-            meta.insert(crate::channels::terminal_ui::protocol::METADATA_BACKGROUND_JOB_ID.to_string(), serde_json::json!(jid));
+            meta.insert(crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(), serde_json::json!(jid));
             meta.insert(crate::channels::terminal_ui::protocol::METADATA_BACKGROUND_JOB_TOOL_NAME.to_string(), serde_json::json!("background_reasoning"));
             
             let notice = crate::bus::OutboundMessage {
-                channel: "terminal".to_string(),
+                channel: inbound_channel.clone(),
                 chat_id: task_chat_id.clone(),
-                thread_id: inbound.thread_id.clone(),
+                thread_id: inbound_thread_id.clone(),
                 content: "Background task started...".to_string(),
                 metadata: meta,
             };
@@ -871,7 +874,7 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
                 serde_json::json!(true),
             );
             meta.insert(
-                crate::channels::terminal_ui::protocol::METADATA_BACKGROUND_JOB_ID.to_string(),
+                crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
                 serde_json::json!(job_id),
             );
             meta.insert(
@@ -880,9 +883,9 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
             );
 
             let notice = crate::bus::OutboundMessage {
-                channel: "terminal".to_string(),
+                channel: inbound_channel.clone(),
                 chat_id: task_chat_id.clone(),
-                thread_id: inbound.thread_id.clone(),
+                thread_id: inbound_thread_id.clone(),
                 content: format!("Background task finished: {}", state),
                 metadata: meta,
             };
@@ -1378,6 +1381,18 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 ));
 
                 if self.cancellation_tokens.contains_key(&chat_id) {
+                    // Check if this is a synthetic cron trigger. If so, drop it if we're already busy.
+                    if metadata_truthy(&inbound.metadata, crate::bus::METADATA_SYNTHETIC_CRON_TRIGGER) {
+                         let _ = self.logger_tx.send(BusMessage::Log(
+                            LogEvent::info(
+                                &self.name,
+                                "Dropping synthetic cron trigger because chat is already active.",
+                            )
+                            .with_chat_id(&chat_id),
+                        ));
+                        return Ok(None);
+                    }
+
                     let queue = self
                         .pending_inbound
                         .entry(chat_id.clone())
@@ -1407,6 +1422,130 @@ impl ActorLogic<BusMessage> for AgentLogic {
                         .with_chat_id(&chat_id),
                     ));
                     return Ok(None);
+                }
+
+                // If not busy, check if there's a waiting background job for this chat
+                // to automatically resume it (user replied to the thread instead of via ticket UI).
+                if !metadata_truthy(&inbound.metadata, crate::bus::METADATA_CLARIFICATION_TICKET_ID) {
+                    let memory_node = self.session_manager.get_memory_node();
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let _ = memory_node
+                        .send_packet(MemoryMessage::ListBackgroundJobs {
+                            chat_id: Some(chat_id.clone()),
+                            limit: 10,
+                            reply: SharedReply::new(tx),
+                        })
+                        .await;
+
+                    if let Ok(Ok(jobs)) = rx.await {
+                        if let Some(job) = jobs.into_iter().find(|j| j.state == "waiting") {
+                            // Found a waiting job. Now find the latest ticket for it.
+                            let (tx2, rx2) = tokio::sync::oneshot::channel();
+                            let _ = memory_node
+                                .send_packet(MemoryMessage::ListClarificationTickets {
+                                    job_id: Some(job.job_id.clone()),
+                                    chat_id: Some(chat_id.clone()),
+                                    status: Some("waiting".to_string()),
+                                    limit: 1,
+                                    reply: SharedReply::new(tx2),
+                                })
+                                .await;
+
+                            if let Ok(Ok(tickets)) = rx2.await {
+                                if let Some(ticket) = tickets.into_iter().next() {
+                                    let ticket_id = ticket.ticket_id.clone();
+                                    let job_id = job.job_id.clone();
+
+                                    let _ = self.logger_tx.send(BusMessage::Log(
+                                        LogEvent::info(
+                                            &self.name,
+                                            &format!(
+                                                "Auto-resuming waiting background job [{}] via thread reply to ticket [{}]",
+                                                job_id, ticket_id
+                                            ),
+                                        )
+                                        .with_chat_id(&chat_id),
+                                    ));
+
+                                    // 1. Resolve ticket in DB
+                                    let (tx3, rx3) = tokio::sync::oneshot::channel();
+                                    let _ = memory_node
+                                        .send_packet(MemoryMessage::ResolveClarificationTicket {
+                                            ticket_id: ticket_id.clone(),
+                                            response: inbound.content.clone(),
+                                            reply: SharedReply::new(tx3),
+                                        })
+                                        .await;
+                                    let _ = rx3.await;
+
+                                    // 2. Resolve notifications for this ticket
+                                    let (tx4, rx4) = tokio::sync::oneshot::channel();
+                                    let _ = memory_node.send_packet(MemoryMessage::ListNotifications {
+                                        chat_id: Some(chat_id.clone()),
+                                        limit: 10,
+                                        unseen_only: false,
+                                        reply: SharedReply::new(tx4),
+                                    }).await;
+                                    if let Ok(Ok(notifs)) = rx4.await {
+                                        for n in notifs {
+                                            if n.action_payload.as_deref() == Some(&ticket_id) && n.resolved_at_ms.is_none() {
+                                                let (tx5, rx5) = tokio::sync::oneshot::channel();
+                                                let _ = memory_node.send_packet(MemoryMessage::ResolveNotification {
+                                                    notification_id: n.notification_id.clone(),
+                                                    reply: SharedReply::new(tx5),
+                                                }).await;
+                                                let _ = rx5.await;
+                                            }
+                                        }
+                                    }
+
+                                    // 3. Update job state to running
+                                    let (tx6, rx6) = tokio::sync::oneshot::channel();
+                                    let _ = memory_node
+                                        .send_packet(MemoryMessage::UpdateBackgroundJobState {
+                                            job_id: job_id.clone(),
+                                            state: "running".to_string(),
+                                            last_error: None,
+                                            reply: SharedReply::new(tx6),
+                                        })
+                                        .await;
+                                    let _ = rx6.await;
+
+                                    // 4. Inject tool response into memory
+                                    if let Some(tool_call_id) = &ticket.tool_call_id {
+                                        if let Ok(mut mem) =
+                                            self.session_manager.get_session(&session_key).await
+                                        {
+                                            let _ = mem
+                                                .add_message(crate::utils::ChatMessage::tool(
+                                                    &inbound.content,
+                                                    tool_call_id,
+                                                ))
+                                                .await;
+                                        }
+                                    }
+
+                                    // 5. Spawn turn with resume metadata
+                                    let mut resumed_inbound = inbound.clone();
+                                    resumed_inbound.metadata.insert(
+                                        crate::bus::METADATA_SYNTHETIC_BACKGROUND_RESUME
+                                            .to_string(),
+                                        serde_json::json!(true),
+                                    );
+                                    resumed_inbound.metadata.insert(
+                                        crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
+                                        serde_json::json!(job_id),
+                                    );
+
+                                    spawn_main_chat_reasoning_turn(
+                                        self.reasoning_spawn_args().await,
+                                        resumed_inbound,
+                                    );
+                                    return Ok(None);
+                                }
+                            }
+                        }
+                    }
                 }
 
                 spawn_main_chat_reasoning_turn(self.reasoning_spawn_args().await, inbound);
@@ -1876,6 +2015,7 @@ impl AgentLogic {
                     prompt_tokens: usage.prompt_tokens,
                     completion_tokens: usage.completion_tokens,
                     total_tokens: usage.total_tokens,
+                    background_job_id: inbound.metadata.get(crate::bus::METADATA_BACKGROUND_JOB_ID).and_then(|v| v.as_str()).map(|s| s.to_string()),
                 };
                 let _ = outbound_tx
                     .send(BusMessage::Telemetry(usage_evt.clone()))
@@ -2039,6 +2179,7 @@ impl AgentLogic {
                             chat_id: inbound.chat_id.clone(),
                             tool_name,
                             result: tool_result_text.clone(),
+                            background_job_id: inbound.metadata.get(crate::bus::METADATA_BACKGROUND_JOB_ID).and_then(|v| v.as_str()).map(|s| s.to_string()),
                         };
                         let _ = outbound_tx.send(BusMessage::Telemetry(tfin.clone())).await;
                         hook_observe_telemetry(hook_tool_ctx.as_ref(), &inbound, is_subagent, tfin);
@@ -2133,6 +2274,7 @@ impl AgentLogic {
                             chat_id: inbound.chat_id.clone(),
                             tool_name: tn,
                             result: tool_result_text.clone(),
+                            background_job_id: inbound.metadata.get(crate::bus::METADATA_BACKGROUND_JOB_ID).and_then(|v| v.as_str()).map(|s| s.to_string()),
                         };
                         let _ = outbound_tx.send(BusMessage::Telemetry(tfin.clone())).await;
                         hook_observe_telemetry(hook_tool_ctx.as_ref(), &inbound, is_subagent, tfin);

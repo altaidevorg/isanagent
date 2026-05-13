@@ -100,16 +100,20 @@ pub enum TelemetryEvent {
         prompt_tokens: u32,
         completion_tokens: u32,
         total_tokens: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background_job_id: Option<String>,
     },
     ToolCallStarted {
         chat_id: String,
         tool_name: String,
         args: String,
+        background_job_id: Option<String>,
     },
     ToolCallFinished {
         chat_id: String,
         tool_name: String,
         result: String,
+        background_job_id: Option<String>,
     },
     /// Mid–tool-call status (e.g. uv-managed Python env setup); not a tool result.
     ToolProgress {
@@ -172,6 +176,8 @@ pub enum TelemetryEvent {
         /// Named agent type (e.g. "researcher", "coder"). None for legacy generic spawns.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background_job_id: Option<String>,
     },
     /// Sub-agent task reached a terminal state (also persisted in SQLite).
     SubagentFinished {

@@ -40,6 +40,7 @@ pub struct SubagentSpawnSpec {
     pub display_name: Option<String>,
     /// Named agent to invoke (e.g. "researcher", "coder"). Uses per-agent prompt/tools/model.
     pub agent_name: Option<String>,
+    pub background_job_id: Option<String>,
 }
 
 /// Shared wiring for each spawned sub-agent run.
@@ -267,6 +268,7 @@ impl SubagentHarness {
             wait,
             display_name,
             agent_name,
+            background_job_id,
         } = spec;
 
         if self.inner.tasks.len() >= self.inner.deps.max_tasks {
@@ -344,6 +346,7 @@ impl SubagentHarness {
                 task_id: task_id.clone(),
                 display_name: display_name.clone(),
                 agent_name: agent_name.clone(),
+                background_job_id: background_job_id.clone(),
             }))
             .await;
 
@@ -708,14 +711,16 @@ impl SubagentHarness {
 }
 
 fn current_parent_ids(
-) -> Result<(String, String, Option<String>, Option<CancellationToken>), String> {
+) -> Result<(String, String, Option<String>, Option<CancellationToken>, Option<String>), String> {
     let ctx = crate::tool_runtime::current_tool_exec_ctx()
         .ok_or_else(|| "subagent tools require an active agent tool scope".to_string())?;
+    let bg_id = ctx.inbound_metadata.get(crate::bus::METADATA_BACKGROUND_JOB_ID).and_then(|v| v.as_str()).map(|s| s.to_string());
     Ok((
         ctx.channel,
         ctx.chat_id,
         ctx.thread_id,
         ctx.reasoning_cancel,
+        bg_id,
     ))
 }
 
@@ -762,7 +767,7 @@ impl Tool for SubagentSpawnTool {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
-        let (ch, parent_chat, thread, parent_cancel) = current_parent_ids()?;
+        let (ch, parent_chat, thread, parent_cancel, bg_id) = current_parent_ids()?;
         self.harness
             .spawn(SubagentSpawnSpec {
                 parent_channel: ch,
@@ -773,6 +778,7 @@ impl Tool for SubagentSpawnTool {
                 wait,
                 display_name: name,
                 agent_name,
+                background_job_id: bg_id,
             })
             .await
     }
@@ -797,7 +803,7 @@ impl Tool for TaskListTool {
     }
 
     async fn execute(&self, _: Value) -> Result<String, String> {
-        let (_, parent_chat, _, _) = current_parent_ids()?;
+        let (_, parent_chat, _, _, _) = current_parent_ids()?;
         Ok(self.harness.list_for_parent(&parent_chat))
     }
 }
@@ -831,7 +837,7 @@ impl Tool for TaskGetTool {
             .get("task_id")
             .and_then(|v| v.as_str())
             .ok_or("Missing task_id")?;
-        let (_, parent_chat, _, _) = current_parent_ids()?;
+        let (_, parent_chat, _, _, _) = current_parent_ids()?;
         self.harness.get_task(id, &parent_chat)
     }
 }
@@ -865,7 +871,7 @@ impl Tool for TaskCancelTool {
             .get("task_id")
             .and_then(|v| v.as_str())
             .ok_or("Missing task_id")?;
-        let (_, parent_chat, _, _) = current_parent_ids()?;
+        let (_, parent_chat, _, _, _) = current_parent_ids()?;
         self.harness.cancel_task(id, &parent_chat)
     }
 }
@@ -958,7 +964,7 @@ impl Tool for SubagentPlanTool {
                     }
                 }
                 body.push_str(&prompts[&step_id]);
-                let (ch, parent_chat, thread, parent_cancel) = current_parent_ids()?;
+                let (ch, parent_chat, thread, parent_cancel, bg_id) = current_parent_ids()?;
                 let label = format!("plan-{}", step_id);
                 let spawn_json = self
                     .harness
@@ -971,6 +977,7 @@ impl Tool for SubagentPlanTool {
                         wait: true,
                         display_name: Some(label),
                         agent_name: None,
+                        background_job_id: bg_id,
                     })
                     .await?;
                 let step_output = serde_json::from_str::<serde_json::Value>(&spawn_json)
@@ -1020,7 +1027,7 @@ impl Tool for TaskHistoryListTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(40)
             .clamp(1, 200) as usize;
-        let (_, parent_chat, _, _) = current_parent_ids()?;
+        let (_, parent_chat, _, _, _) = current_parent_ids()?;
         let (tx, rx) = oneshot::channel();
         self.memory_node
             .send_packet(MemoryMessage::ListSubagentTasksForParent {
@@ -1120,7 +1127,7 @@ impl Tool for TaskDashboardTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(10)
             .clamp(1, 50) as usize;
-        let (_, parent_chat, _, _) = current_parent_ids()?;
+        let (_, parent_chat, _, _, _) = current_parent_ids()?;
 
         let mut out = String::from("# Task Dashboard\n\n## Active\n\n");
         let active = self.harness.list_for_parent(&parent_chat);
@@ -1296,6 +1303,7 @@ mod tests {
                 wait: false,
                 display_name: None,
                 agent_name: Some("researcher".to_string()),
+                background_job_id: None,
             })
             .await
             .expect_err("named agent without registry should fail");

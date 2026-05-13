@@ -183,6 +183,7 @@ mod tests {
                 tool_name,
                 tool_call_id,
                 message,
+                ..
             }) => {
                 assert_eq!(chat_id, "chat-xyz");
                 assert_eq!(channel, "api");

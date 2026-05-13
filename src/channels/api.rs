@@ -511,6 +511,7 @@ impl ApiChannel {
                 chat_id,
                 tool_name,
                 args,
+                ..
             } => {
                 if let Some(pending) = self.pending_requests.get(&chat_id) {
                     if let PendingRequest::Stream(pending) = pending.value() {
@@ -544,6 +545,7 @@ impl ApiChannel {
                 chat_id,
                 tool_name,
                 result,
+                ..
             } => {
                 if let Some(pending) = self.pending_requests.get(&chat_id) {
                     if let PendingRequest::Stream(pending) = pending.value() {
@@ -556,7 +558,7 @@ impl ApiChannel {
                     }
                 }
             }
-            TelemetryEvent::AgentThought { chat_id, thought } => {
+            TelemetryEvent::AgentThought { chat_id, thought, .. } => {
                 if let Some(pending) = self.pending_requests.get(&chat_id) {
                     if let PendingRequest::Stream(pending) = pending.value() {
                         if let Err(e) = pending
@@ -592,6 +594,10 @@ fn build_router(state: ApiState, serve_ui: bool) -> Router {
         .route("/v1/summaries/{id}", delete(handle_delete_summary))
         .route("/v1/chat/cancel/{chat_id}", post(handle_cancel_chat))
         .route("/v1/background-jobs", get(handle_list_background_jobs))
+        .route(
+            "/v1/background-jobs/{job_id}/dismiss",
+            post(handle_background_job_dismiss),
+        )
         .route("/v1/notifications", get(handle_list_notifications))
         .route(
             "/v1/notifications/{notification_id}/seen",
@@ -604,6 +610,10 @@ fn build_router(state: ApiState, serve_ui: bool) -> Router {
         .route(
             "/v1/clarification-tickets/{ticket_id}/reply",
             post(handle_clarification_ticket_reply),
+        )
+        .route(
+            "/v1/clarification-tickets/{ticket_id}/dismiss",
+            post(handle_clarification_ticket_dismiss),
         )
         .route("/v1/workspace/list", get(handle_workspace_list))
         .route("/v1/workspace/file", get(handle_workspace_file))
@@ -2312,6 +2322,25 @@ async fn handle_notification_resolve(
     }
 }
 
+async fn handle_background_job_dismiss(
+    State(state): State<ApiState>,
+    AxumPath(job_id): AxumPath<String>,
+) -> Response {
+    let res = memory_request(&state.memory_node, |reply| {
+        MemoryMessage::DismissBackgroundJob {
+            job_id: Some(job_id),
+            ticket_id: None,
+            reply,
+        }
+    })
+    .await;
+
+    match res {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
 async fn handle_clarification_ticket_reply(
     State(state): State<ApiState>,
     AxumPath(ticket_id): AxumPath<String>,
@@ -2383,6 +2412,25 @@ async fn handle_clarification_ticket_reply(
         .into_response();
     }
     StatusCode::OK.into_response()
+}
+
+async fn handle_clarification_ticket_dismiss(
+    State(state): State<ApiState>,
+    AxumPath(ticket_id): AxumPath<String>,
+) -> Response {
+    let res = memory_request(&state.memory_node, |reply| {
+        MemoryMessage::DismissBackgroundJob {
+            job_id: None,
+            ticket_id: Some(ticket_id),
+            reply,
+        }
+    })
+    .await;
+
+    match res {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
 fn log_api(logger_tx: &LoggerHandle, event: LogEvent) {

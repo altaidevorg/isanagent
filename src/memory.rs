@@ -612,6 +612,20 @@ pub enum MemoryMessage {
         ticket_id: String,
         reply: SharedReply<Result<Option<ClarificationTicketRecord>, String>>,
     },
+    /// List clarification tickets with optional filters.
+    ListClarificationTickets {
+        job_id: Option<String>,
+        chat_id: Option<String>,
+        status: Option<String>,
+        limit: usize,
+        reply: SharedReply<Result<Vec<ClarificationTicketRecord>, String>>,
+    },
+    /// Explicitly mark a background job as completed, resolving associated tickets/notifications.
+    DismissBackgroundJob {
+        job_id: Option<String>,
+        ticket_id: Option<String>,
+        reply: SharedReply<Result<(), String>>,
+    },
 }
 
 /// Persistent SQLite-based memory Actor for agents.
@@ -1763,6 +1777,113 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                             })
                         },
                     ).optional().map_err(|e| e.to_string())
+                })();
+                let _ = reply.send(res);
+            }
+            MemoryMessage::DismissBackgroundJob { job_id, ticket_id, reply } => {
+                let res = (|| -> Result<(), String> {
+                    let now = Utc::now().timestamp_millis();
+                    
+                    let mut target_job_id = job_id;
+                    if target_job_id.is_none() {
+                        if let Some(tid) = ticket_id.as_ref() {
+                            let jid: Option<String> = self.conn.query_row(
+                                "SELECT job_id FROM clarification_tickets WHERE ticket_id = ?1",
+                                params![tid],
+                                |row| row.get(0)
+                            ).optional().map_err(|e| e.to_string())?.flatten();
+                            target_job_id = jid;
+                        }
+                    }
+
+                    let jid = match target_job_id {
+                        Some(j) => j,
+                        None => return Ok(()), // Nothing to dismiss
+                    };
+
+                    // 1. Mark job as completed
+                    self.conn.execute(
+                        "UPDATE background_jobs SET state = 'completed', updated_at_ms = ?1 WHERE job_id = ?2",
+                        params![now, jid],
+                    ).map_err(|e| format!("dismiss background_job: {}", e))?;
+
+                    // 2. Resolve any associated clarification tickets
+                    let mut stmt = self.conn.prepare(
+                        "SELECT ticket_id FROM clarification_tickets WHERE job_id = ?1 AND status = 'waiting'"
+                    ).map_err(|e| e.to_string())?;
+                    let ticket_ids: Vec<String> = stmt.query_map(params![jid], |row| row.get(0))
+                        .map_err(|e| e.to_string())?
+                        .filter_map(Result::ok)
+                        .collect();
+
+                    for tid in ticket_ids {
+                        self.conn.execute(
+                            "UPDATE clarification_tickets SET response = 'Dismissed', status = 'answered', updated_at_ms = ?1 WHERE ticket_id = ?2",
+                            params![now, tid],
+                        ).map_err(|e| format!("dismiss ticket: {}", e))?;
+
+                        // Resolve notifications for this ticket
+                        self.conn.execute(
+                            "UPDATE notifications SET resolved_at_ms = COALESCE(resolved_at_ms, ?1) WHERE action_payload = ?2 AND kind = 'clarification_ticket'",
+                            params![now, tid],
+                        ).map_err(|e| format!("resolve notifications for ticket: {}", e))?;
+                    }
+
+                    Ok(())
+                })();
+                let _ = reply.send(res);
+            }
+            MemoryMessage::ListClarificationTickets { job_id, chat_id, status, limit, reply } => {
+                let res = (|| -> Result<Vec<ClarificationTicketRecord>, String> {
+                    let lim = limit.clamp(1, 500) as i64;
+                    let mut sql = "SELECT ticket_id, job_id, chat_id, channel, thread_id, tool_call_id, prompt, choices_json, response, status, created_at_ms, updated_at_ms FROM clarification_tickets".to_string();
+                    let mut filters = Vec::new();
+                    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+                    if let Some(jid) = job_id {
+                        filters.push("job_id = ?");
+                        params_vec.push(Box::new(jid));
+                    }
+                    if let Some(cid) = chat_id {
+                        filters.push("chat_id = ?");
+                        params_vec.push(Box::new(cid));
+                    }
+                    if let Some(s) = status {
+                        filters.push("status = ?");
+                        params_vec.push(Box::new(s));
+                    }
+
+                    if !filters.is_empty() {
+                        sql.push_str(" WHERE ");
+                        sql.push_str(&filters.join(" AND "));
+                    }
+
+                    sql.push_str(" ORDER BY updated_at_ms DESC LIMIT ?");
+                    params_vec.push(Box::new(lim));
+
+                    let mut stmt = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
+                    let rows = stmt.query_map(params_from_iter(params_vec), |row| {
+                        Ok(ClarificationTicketRecord {
+                            ticket_id: row.get(0)?,
+                            job_id: row.get(1)?,
+                            chat_id: row.get(2)?,
+                            channel: row.get(3)?,
+                            thread_id: row.get(4)?,
+                            tool_call_id: row.get(5)?,
+                            prompt: row.get(6)?,
+                            choices_json: row.get(7)?,
+                            response: row.get(8)?,
+                            status: row.get(9)?,
+                            created_at_ms: row.get(10)?,
+                            updated_at_ms: row.get(11)?,
+                        })
+                    }).map_err(|e| e.to_string())?;
+
+                    let mut out = Vec::new();
+                    for r in rows {
+                        out.push(r.map_err(|e| e.to_string())?);
+                    }
+                    Ok(out)
                 })();
                 let _ = reply.send(res);
             }

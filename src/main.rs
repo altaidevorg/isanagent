@@ -8,7 +8,7 @@ use clap::{Args as ClapArgs, Parser, Subcommand};
 use colored::Colorize;
 use isanagent::agent::{AgentLogic, AgentLogicParams};
 use isanagent::bus::{
-    BusMessage, InboundMessage, LoggerControlMessage, OutboundMessage, TelemetryEvent,
+    BusMessage, InboundMessage, LoggerControlMessage, TelemetryEvent,
 };
 use isanagent::channels::terminal::{
     build_agent_thought_terminal_notice, build_tool_call_terminal_notice,
@@ -1002,6 +1002,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                                 .handle_telemetry(TelemetryEvent::AgentThought {
                                     chat_id: chat_id.clone(),
                                     thought: thought.clone(),
+                                    background_job_id: background_job_id.clone(),
                                 })
                                 .await;
                         }
@@ -1043,6 +1044,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                                     tool_name: tool_name.clone(),
                                     tool_call_id: tool_call_id.clone(),
                                     message: message.clone(),
+                                    background_job_id: background_job_id.clone(),
                                 })
                                 .await;
                         }
@@ -1263,7 +1265,7 @@ Install uv manually or run /install-python from terminal mode.",
 async fn recover_background_jobs_on_startup(
     memory_node: &NodeHandle<isanagent::memory::MemoryMessage>,
     bus_tx: &mpsc::Sender<BusMessage>,
-    outbound_tx: &mpsc::Sender<BusMessage>,
+    _outbound_tx: &mpsc::Sender<BusMessage>,
 ) {
     use isanagent::memory::{MemoryMessage, SharedReply};
     let (tx, rx) = tokio::sync::oneshot::channel();

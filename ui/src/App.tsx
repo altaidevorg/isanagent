@@ -623,6 +623,71 @@ export default function App() {
     }
   }, []);
 
+  const loadHistory = useCallback(async (sessionId: string) => {
+    setHistoryLoading(true);
+    setErrorMessage(null);
+    try {
+      const response = await fetch(`/v1/threads/${encodeURIComponent(sessionId)}/messages`);
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as
+          | { error?: { message?: string } }
+          | null;
+        throw new Error(payload?.error?.message || `History request failed (${response.status}).`);
+      }
+      const rows = (await response.json()) as HistoryRow[];
+      setMessages(historyRowsToMessages(rows));
+    } catch (error) {
+      setErrorMessage(buildErrorMessage(error));
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, []);
+
+  const loadSessions = useCallback(async () => {
+    setSessionsLoading(true);
+    try {
+      const q = new URLSearchParams({ user: requestUserId, limit: "100" });
+      const response = await fetch(`/v1/threads?${q.toString()}`);
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as
+          | { error?: { message?: string } }
+          | null;
+        throw new Error(payload?.error?.message || `Thread list failed (${response.status}).`);
+      }
+      const rows = (await response.json()) as ThreadListEntry[];
+      setSessions(rows);
+    } catch {
+      /* sidebar is optional if API older */
+      setSessions([]);
+    } finally {
+      setSessionsLoading(false);
+    }
+  }, [requestUserId]);
+
+  const openSession = (entry: ThreadListEntry) => {
+    startTransition(() => {
+      setErrorMessage(null);
+      persistSessionPointers(entry.thread_id, entry.latest_response_id);
+      setInternalChatId(entry.thread_id);
+      setLatestResponseId(entry.latest_response_id);
+      void loadHistory(entry.thread_id);
+      void loadSummaries(entry.thread_id);
+    });
+  };
+
+  const jumpToThread = useCallback((threadId: string) => {
+    const entry = sessions.find(s => s.thread_id === threadId);
+    if (entry) {
+      openSession(entry);
+    } else {
+      setInternalChatId(threadId);
+      setLatestResponseId(null);
+      void loadHistory(threadId);
+      void loadSummaries(threadId);
+    }
+    setShowBackgroundPanel(false);
+  }, [sessions, loadHistory, loadSummaries]);
+
   const loadBackgroundData = useCallback(async () => {
     try {
       const [jobsRes, notifRes] = await Promise.all([
@@ -640,19 +705,6 @@ export default function App() {
     }
   }, []);
 
-  const jumpToThread = useCallback((threadId: string) => {
-    const entry = sessions.find(s => s.thread_id === threadId);
-    if (entry) {
-      openSession(entry);
-    } else {
-      setInternalChatId(threadId);
-      setLatestResponseId(null);
-      void loadHistory(threadId);
-      void loadSummaries(threadId);
-    }
-    setShowBackgroundPanel(false);
-  }, [sessions, openSession, loadHistory, loadSummaries]);
-
   const replyToTicket = async (ticketId: string, response: string) => {
     try {
       const res = await fetch(`/v1/clarification-tickets/${encodeURIComponent(ticketId)}/reply`, {
@@ -664,11 +716,45 @@ export default function App() {
         void loadBackgroundData();
       } else {
         const payload = (await res.json().catch(() => null)) as ApiErrorPayload;
-        alert(payload?.error?.message || "Failed to send reply");
+        setErrorMessage(payload?.error?.message || "Failed to send reply");
       }
     } catch (err) {
       console.error(err);
-      alert("Failed to send reply");
+      setErrorMessage(buildErrorMessage(err));
+    }
+  };
+
+  const dismissTicket = async (ticketId: string) => {
+    try {
+      const res = await fetch(`/v1/clarification-tickets/${encodeURIComponent(ticketId)}/dismiss`, {
+        method: "POST",
+      });
+      if (res.ok) {
+        void loadBackgroundData();
+      } else {
+        const payload = (await res.json().catch(() => null)) as ApiErrorPayload;
+        setErrorMessage(payload?.error?.message || "Failed to dismiss request");
+      }
+    } catch (err) {
+      console.error(err);
+      setErrorMessage(buildErrorMessage(err));
+    }
+  };
+
+  const dismissBackgroundJob = async (jobId: string) => {
+    try {
+      const res = await fetch(`/v1/background-jobs/${encodeURIComponent(jobId)}/dismiss`, {
+        method: "POST",
+      });
+      if (res.ok) {
+        void loadBackgroundData();
+      } else {
+        const payload = (await res.json().catch(() => null)) as ApiErrorPayload;
+        setErrorMessage(payload?.error?.message || "Failed to dismiss job");
+      }
+    } catch (err) {
+      console.error(err);
+      setErrorMessage(buildErrorMessage(err));
     }
   };
 
@@ -705,50 +791,12 @@ export default function App() {
     }
   };
 
-  const loadSessions = useCallback(async () => {
-    setSessionsLoading(true);
-    try {
-      const q = new URLSearchParams({ user: requestUserId, limit: "100" });
-      const response = await fetch(`/v1/threads?${q.toString()}`);
-      if (!response.ok) {
-        const payload = (await response.json().catch(() => null)) as
-          | { error?: { message?: string } }
-          | null;
-        throw new Error(payload?.error?.message || `Thread list failed (${response.status}).`);
-      }
-      const rows = (await response.json()) as ThreadListEntry[];
-      setSessions(rows);
-    } catch {
-      /* sidebar is optional if API older */
-      setSessions([]);
-    } finally {
-      setSessionsLoading(false);
-    }
-  }, [requestUserId]);
 
   useEffect(() => {
     void loadSessions();
   }, [loadSessions]);
 
-  const loadHistory = useCallback(async (sessionId: string) => {
-    setHistoryLoading(true);
-    setErrorMessage(null);
-    try {
-      const response = await fetch(`/v1/threads/${encodeURIComponent(sessionId)}/messages`);
-      if (!response.ok) {
-        const payload = (await response.json().catch(() => null)) as
-          | { error?: { message?: string } }
-          | null;
-        throw new Error(payload?.error?.message || `History request failed (${response.status}).`);
-      }
-      const rows = (await response.json()) as HistoryRow[];
-      setMessages(historyRowsToMessages(rows));
-    } catch (error) {
-      setErrorMessage(buildErrorMessage(error));
-    } finally {
-      setHistoryLoading(false);
-    }
-  }, []);
+  // loadBackgroundData is now defined above
 
   useEffect(() => {
     const id = readPersistedThreadId();
@@ -773,16 +821,6 @@ export default function App() {
     });
   };
 
-  const openSession = (entry: ThreadListEntry) => {
-    startTransition(() => {
-      setErrorMessage(null);
-      persistSessionPointers(entry.thread_id, entry.latest_response_id);
-      setInternalChatId(entry.thread_id);
-      setLatestResponseId(entry.latest_response_id);
-      void loadHistory(entry.thread_id);
-      void loadSummaries(entry.thread_id);
-    });
-  };
 
   const requestDeleteSession = (entry: ThreadListEntry, event: MouseEvent<HTMLButtonElement>) => {
     event.stopPropagation();
@@ -1148,7 +1186,20 @@ export default function App() {
                         </div>
                         <p className="text-sm font-medium text-foreground">{job.kind}</p>
                         <div className="mt-3 flex items-center justify-between">
-                          <span className="text-[10px] text-muted-foreground">Updated {new Date(job.updated_at_ms).toLocaleTimeString()}</span>
+                          <div className="flex items-center gap-2">
+                            <span className="text-[10px] text-muted-foreground">Updated {new Date(job.updated_at_ms).toLocaleTimeString()}</span>
+                            <button 
+                              className="text-[10px] text-destructive hover:underline"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (confirm("Dismiss this background job and all associated requests?")) {
+                                  void dismissBackgroundJob(job.job_id);
+                                }
+                              }}
+                            >
+                              Dismiss
+                            </button>
+                          </div>
                           <span className="text-[10px] text-primary opacity-0 group-hover:opacity-100 transition-opacity">View thread →</span>
                         </div>
                       </div>
@@ -1209,6 +1260,20 @@ export default function App() {
                           >
                             View context
                           </Button>
+                          {n.kind === "clarification_ticket" && !n.resolved_at_ms && (
+                            <Button 
+                              variant="ghost" 
+                              size="sm" 
+                              className="h-7 text-[10px] font-bold uppercase tracking-widest text-destructive hover:text-destructive hover:bg-destructive/10"
+                              onClick={() => {
+                                if (confirm("Dismiss this request? This will also mark the background job as completed.")) {
+                                  void dismissTicket(n.action_payload || "");
+                                }
+                              }}
+                            >
+                              Dismiss
+                            </Button>
+                          )}
                         </div>
                       </div>
                     ))
