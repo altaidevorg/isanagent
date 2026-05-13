@@ -485,10 +485,6 @@ impl App {
         })
     }
 
-    pub fn refresh_background_data(&mut self) {
-        // Implementation for refreshing background jobs and notifications
-    }
-
     pub fn following_tail(&self) -> bool {
         self.scroll_offset == 0
     }
@@ -1073,7 +1069,13 @@ mod tests {
     #[test]
     fn job_strip_started_inserts_running_row() {
         let mut app = App::new();
-        app.job_strip_started("job-1", "sess-1", "colab_mcp_tool_call", Some("training"));
+        app.job_strip_started(
+            "job-1",
+            "sess-1",
+            "colab_mcp_tool_call",
+            Some("training"),
+            "chat-1",
+        );
         assert_eq!(app.jobs_strip.len(), 1);
         let row = app.jobs_strip.front().unwrap();
         assert_eq!(row.job_id, "job-1");
@@ -1086,9 +1088,9 @@ mod tests {
     #[test]
     fn job_strip_finished_marks_terminal_status() {
         let mut app = App::new();
-        app.job_strip_started("job-1", "sess-1", "execution_run", None);
+        app.job_strip_started("job-1", "sess-1", "execution_run", None, "chat-1");
         app.job_strip_set_last_line("job-1", "epoch 4 / 8");
-        app.job_strip_finished("job-1", "completed", "exit 0 in 1234ms");
+        app.job_strip_finished("job-1", "completed", "exit 0 in 1234ms", "chat-1");
         let row = app.jobs_strip.front().unwrap();
         assert_eq!(row.status, JobStripStatus::Completed);
         assert!(row.terminal_at.is_some());
@@ -1098,9 +1100,9 @@ mod tests {
     #[test]
     fn evict_expired_jobs_drops_only_old_terminal_rows() {
         let mut app = App::new();
-        app.job_strip_started("running", "s1", "execution_run", None);
-        app.job_strip_started("done", "s1", "execution_run", None);
-        app.job_strip_finished("done", "completed", "ok");
+        app.job_strip_started("running", "s1", "execution_run", None, "chat-1");
+        app.job_strip_started("done", "s1", "execution_run", None, "chat-1");
+        app.job_strip_finished("done", "completed", "ok", "chat-1");
         if let Some(row) = app.jobs_strip.iter_mut().find(|e| e.job_id == "done") {
             row.terminal_at = Some(Instant::now() - Duration::from_secs(60));
         }

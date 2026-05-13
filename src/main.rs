@@ -7,9 +7,7 @@ use tokio::sync::{mpsc, watch, RwLock};
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use colored::Colorize;
 use isanagent::agent::{AgentLogic, AgentLogicParams};
-use isanagent::bus::{
-    BusMessage, InboundMessage, LoggerControlMessage, TelemetryEvent,
-};
+use isanagent::bus::{BusMessage, InboundMessage, LoggerControlMessage, TelemetryEvent};
 use isanagent::channels::terminal::{
     build_agent_thought_terminal_notice, build_tool_call_terminal_notice,
     build_tool_progress_terminal_notice, build_tool_result_terminal_notice,
@@ -987,9 +985,17 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                         }
                     }
                 }
-                BusMessage::Telemetry(TelemetryEvent::AgentThought { chat_id, thought, background_job_id }) => {
+                BusMessage::Telemetry(TelemetryEvent::AgentThought {
+                    chat_id,
+                    thought,
+                    background_job_id,
+                }) => {
                     if active_terminal_for_outbound.read().await.as_str() == chat_id.as_str() {
-                        let notice = build_agent_thought_terminal_notice(chat_id, thought, background_job_id.as_deref());
+                        let notice = build_agent_thought_terminal_notice(
+                            chat_id,
+                            thought,
+                            background_job_id.as_deref(),
+                        );
                         if let Some(chan) = delivery_channels.get("terminal") {
                             if let Err(e) = chan.send(notice).await {
                                 log::error!("Failed to deliver AgentThought to terminal: {}", e);
@@ -1067,7 +1073,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                         let notice = build_tool_call_terminal_notice(
                             chat_id,
                             tool_name,
-                            &args,
+                            args,
                             tool_call_id.as_deref(),
                             background_job_id.as_deref(),
                         );
@@ -1098,7 +1104,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                         let notice = build_tool_result_terminal_notice(
                             chat_id,
                             tool_name,
-                            &result,
+                            result,
                             tool_call_id.as_deref(),
                             background_job_id.as_deref(),
                         );

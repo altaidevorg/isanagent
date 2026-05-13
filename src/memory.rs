@@ -1754,8 +1754,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 let _ = reply.send(res);
             }
             MemoryMessage::GetClarificationTicket { ticket_id, reply } => {
-                let res = (|| -> Result<Option<ClarificationTicketRecord>, String> {
-                    self.conn.query_row(
+                let res = self.conn.query_row(
                         "SELECT ticket_id, job_id, chat_id, channel, thread_id, tool_call_id, prompt, choices_json, response,
                                 status, created_at_ms, updated_at_ms
                          FROM clarification_tickets WHERE ticket_id = ?1",
@@ -1776,22 +1775,30 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                                 updated_at_ms: row.get(11)?,
                             })
                         },
-                    ).optional().map_err(|e| e.to_string())
-                })();
+                    ).optional().map_err(|e| e.to_string());
                 let _ = reply.send(res);
             }
-            MemoryMessage::DismissBackgroundJob { job_id, ticket_id, reply } => {
+            MemoryMessage::DismissBackgroundJob {
+                job_id,
+                ticket_id,
+                reply,
+            } => {
                 let res = (|| -> Result<(), String> {
                     let now = Utc::now().timestamp_millis();
-                    
+
                     let mut target_job_id = job_id;
                     if target_job_id.is_none() {
                         if let Some(tid) = ticket_id.as_ref() {
-                            let jid: Option<String> = self.conn.query_row(
-                                "SELECT job_id FROM clarification_tickets WHERE ticket_id = ?1",
-                                params![tid],
-                                |row| row.get(0)
-                            ).optional().map_err(|e| e.to_string())?.flatten();
+                            let jid: Option<String> = self
+                                .conn
+                                .query_row(
+                                    "SELECT job_id FROM clarification_tickets WHERE ticket_id = ?1",
+                                    params![tid],
+                                    |row| row.get(0),
+                                )
+                                .optional()
+                                .map_err(|e| e.to_string())?
+                                .flatten();
                             target_job_id = jid;
                         }
                     }
@@ -1811,7 +1818,8 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     let mut stmt = self.conn.prepare(
                         "SELECT ticket_id FROM clarification_tickets WHERE job_id = ?1 AND status = 'waiting'"
                     ).map_err(|e| e.to_string())?;
-                    let ticket_ids: Vec<String> = stmt.query_map(params![jid], |row| row.get(0))
+                    let ticket_ids: Vec<String> = stmt
+                        .query_map(params![jid], |row| row.get(0))
                         .map_err(|e| e.to_string())?
                         .filter_map(Result::ok)
                         .collect();
@@ -1833,7 +1841,13 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 })();
                 let _ = reply.send(res);
             }
-            MemoryMessage::ListClarificationTickets { job_id, chat_id, status, limit, reply } => {
+            MemoryMessage::ListClarificationTickets {
+                job_id,
+                chat_id,
+                status,
+                limit,
+                reply,
+            } => {
                 let res = (|| -> Result<Vec<ClarificationTicketRecord>, String> {
                     let lim = limit.clamp(1, 500) as i64;
                     let mut sql = "SELECT ticket_id, job_id, chat_id, channel, thread_id, tool_call_id, prompt, choices_json, response, status, created_at_ms, updated_at_ms FROM clarification_tickets".to_string();
@@ -1862,22 +1876,24 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     params_vec.push(Box::new(lim));
 
                     let mut stmt = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
-                    let rows = stmt.query_map(params_from_iter(params_vec), |row| {
-                        Ok(ClarificationTicketRecord {
-                            ticket_id: row.get(0)?,
-                            job_id: row.get(1)?,
-                            chat_id: row.get(2)?,
-                            channel: row.get(3)?,
-                            thread_id: row.get(4)?,
-                            tool_call_id: row.get(5)?,
-                            prompt: row.get(6)?,
-                            choices_json: row.get(7)?,
-                            response: row.get(8)?,
-                            status: row.get(9)?,
-                            created_at_ms: row.get(10)?,
-                            updated_at_ms: row.get(11)?,
+                    let rows = stmt
+                        .query_map(params_from_iter(params_vec), |row| {
+                            Ok(ClarificationTicketRecord {
+                                ticket_id: row.get(0)?,
+                                job_id: row.get(1)?,
+                                chat_id: row.get(2)?,
+                                channel: row.get(3)?,
+                                thread_id: row.get(4)?,
+                                tool_call_id: row.get(5)?,
+                                prompt: row.get(6)?,
+                                choices_json: row.get(7)?,
+                                response: row.get(8)?,
+                                status: row.get(9)?,
+                                created_at_ms: row.get(10)?,
+                                updated_at_ms: row.get(11)?,
+                            })
                         })
-                    }).map_err(|e| e.to_string())?;
+                        .map_err(|e| e.to_string())?;
 
                     let mut out = Vec::new();
                     for r in rows {

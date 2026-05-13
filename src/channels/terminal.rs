@@ -407,7 +407,10 @@ pub fn build_tool_progress_terminal_notice(
         metadata.insert(METADATA_TOOL_CALL_ID.to_string(), json!(id));
     }
     if let Some(id) = background_job_id.filter(|s| !s.is_empty()) {
-        metadata.insert(crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(), json!(id));
+        metadata.insert(
+            crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
+            json!(id),
+        );
     }
     OutboundMessage {
         channel: "terminal".to_string(),
@@ -441,7 +444,10 @@ pub fn build_tool_call_terminal_notice(
         metadata.insert(METADATA_TOOL_CALL_ID.to_string(), json!(id));
     }
     if let Some(id) = background_job_id.filter(|s| !s.is_empty()) {
-        metadata.insert(crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(), json!(id));
+        metadata.insert(
+            crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
+            json!(id),
+        );
     }
     OutboundMessage {
         channel: "terminal".to_string(),
@@ -464,7 +470,10 @@ pub fn build_agent_thought_terminal_notice(
         json!(true),
     );
     if let Some(id) = background_job_id.filter(|s| !s.is_empty()) {
-        metadata.insert(crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(), json!(id));
+        metadata.insert(
+            crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
+            json!(id),
+        );
     }
     OutboundMessage {
         channel: "terminal".to_string(),
@@ -506,7 +515,10 @@ pub fn build_tool_result_terminal_notice(
         metadata.insert(METADATA_TOOL_CALL_ID.to_string(), json!(id));
     }
     if let Some(id) = background_job_id.filter(|s| !s.is_empty()) {
-        metadata.insert(crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(), json!(id));
+        metadata.insert(
+            crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
+            json!(id),
+        );
     }
     OutboundMessage {
         channel: "terminal".to_string(),
@@ -792,6 +804,7 @@ mod preview_tests {
             "execution_run",
             r#"{"description":"warm up"}"#,
             Some("call-abc"),
+            None,
         );
         assert_eq!(
             notice
@@ -809,6 +822,7 @@ mod preview_tests {
             "execution_run",
             r#"{"description":"warm up"}"#,
             None,
+            None,
         );
         assert!(!notice.metadata.contains_key(METADATA_TOOL_CALL_ID));
     }
@@ -820,6 +834,7 @@ mod preview_tests {
             "execution_run",
             "exit 0 in 12ms",
             Some("call-abc"),
+            None,
         );
         assert_eq!(
             notice
@@ -834,7 +849,7 @@ mod preview_tests {
     fn build_tool_result_terminal_notice_keeps_text_preview_for_long_outputs() {
         let long = "x".repeat(200);
         let notice =
-            build_tool_result_terminal_notice("chat-1", "execution_run", long.as_str(), None);
+            build_tool_result_terminal_notice("chat-1", "execution_run", long.as_str(), None, None);
         let preview = notice
             .metadata
             .get(METADATA_TOOL_RESULT_PREVIEW)
@@ -848,7 +863,7 @@ mod preview_tests {
     fn build_tool_result_terminal_notice_sets_char_count_metadata_for_long_outputs() {
         let long = "x".repeat(200);
         let notice =
-            build_tool_result_terminal_notice("chat-1", "execution_run", long.as_str(), None);
+            build_tool_result_terminal_notice("chat-1", "execution_run", long.as_str(), None, None);
         assert_eq!(
             notice
                 .metadata

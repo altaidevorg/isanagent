@@ -407,13 +407,16 @@ impl CronStore {
         now_ms: i64,
     ) -> Result<bool, String> {
         let conn = self.lock_conn()?;
-        
+
         let full_job_id = format!("cron:{}", job_id);
-        let existing_state: Option<String> = conn.query_row(
-            "SELECT state FROM background_jobs WHERE job_id = ?1",
-            params![full_job_id],
-            |row| row.get(0),
-        ).optional().map_err(|e| e.to_string())?;
+        let existing_state: Option<String> = conn
+            .query_row(
+                "SELECT state FROM background_jobs WHERE job_id = ?1",
+                params![full_job_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
 
         if let Some(state) = existing_state {
             if state == "running" || state == "waiting" {
@@ -871,10 +874,7 @@ impl ActorLogic<String> for CronActor {
                         crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
                         serde_json::json!(format!("cron:{}", job_id)),
                     );
-                    metadata.insert(
-                        "cron_job_id".to_string(),
-                        serde_json::json!(job_id.clone()),
-                    );
+                    metadata.insert("cron_job_id".to_string(), serde_json::json!(job_id.clone()));
                     metadata.insert(
                         crate::bus::METADATA_SYNTHETIC_CRON_TRIGGER.to_string(),
                         serde_json::json!(true),
@@ -894,20 +894,23 @@ impl ActorLogic<String> for CronActor {
                         metadata,
                     };
 
-                    let _ = self.bus_tx.send(crate::bus::BusMessage::Inbound(inbound)).await;
-                    
+                    let _ = self
+                        .bus_tx
+                        .send(crate::bus::BusMessage::Inbound(inbound))
+                        .await;
+
                     let _ = self.logger_tx.send(crate::bus::BusMessage::Telemetry(
                         crate::bus::TelemetryEvent::CronTrigger {
                             job_id: job_id.clone(),
                             message: message.clone(),
                         },
                     ));
-                    let _ =
-                        self.logger_tx
-                            .send(crate::bus::BusMessage::Log(crate::bus::LogEvent::info(
-                                &self.name,
-                                &format!("Fired local cron job {}", job_id),
-                            )));
+                    let _ = self.logger_tx.send(crate::bus::BusMessage::Log(
+                        crate::bus::LogEvent::info(
+                            &self.name,
+                            &format!("Fired local cron job {}", job_id),
+                        ),
+                    ));
                 }
                 Ok(false) => {
                     // Skip trigger, already active

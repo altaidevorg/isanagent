@@ -558,7 +558,9 @@ impl ApiChannel {
                     }
                 }
             }
-            TelemetryEvent::AgentThought { chat_id, thought, .. } => {
+            TelemetryEvent::AgentThought {
+                chat_id, thought, ..
+            } => {
                 if let Some(pending) = self.pending_requests.get(&chat_id) {
                     if let PendingRequest::Stream(pending) = pending.value() {
                         if let Err(e) = pending

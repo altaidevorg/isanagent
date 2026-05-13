@@ -29,8 +29,8 @@ use crate::channels::terminal_ui::panes::{
 };
 use crate::channels::terminal_ui::protocol::{
     ISANAGENT_AGENT_THOUGHT, ISANAGENT_BACKGROUND_JOB_FINISHED, ISANAGENT_BACKGROUND_JOB_STARTED,
-    ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_JOB_STARTED,
-    ISANAGENT_EXECUTION_STREAM, ISANAGENT_LLM_RETRY_AVAILABLE, ISANAGENT_SUBAGENT_TASK_FINISHED,
+    ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_JOB_STARTED, ISANAGENT_EXECUTION_STREAM,
+    ISANAGENT_LLM_RETRY_AVAILABLE, ISANAGENT_SUBAGENT_TASK_FINISHED,
     ISANAGENT_SUBAGENT_TASK_STARTED, ISANAGENT_TERMINAL_ERROR, ISANAGENT_TOOL_PROGRESS,
     METADATA_BACKGROUND_JOB_DESCRIPTION, METADATA_BACKGROUND_JOB_STATUS,
     METADATA_BACKGROUND_JOB_TOOL_NAME, METADATA_EXECUTION_DESCRIPTION, METADATA_EXECUTION_JOB_ID,
@@ -436,15 +436,21 @@ fn background_pane_paragraph(app: &App) -> Vec<Line<'static>> {
 
     // 1. Notifications (High Priority)
     if !app.notifications.is_empty() {
-        out.push(Line::from(Span::styled("--- NOTIFICATIONS ---", Theme::tool_call())));
+        out.push(Line::from(Span::styled(
+            "--- NOTIFICATIONS ---",
+            Theme::tool_call(),
+        )));
         for entry in &app.notifications {
             let style = if entry.kind == "clarification" {
                 Theme::tool_pending()
             } else {
                 Theme::dim()
             };
-            let created_at = std::time::UNIX_EPOCH + std::time::Duration::from_millis(entry.created_at_ms as u64);
-            let age = std::time::SystemTime::now().duration_since(created_at).unwrap_or_default();
+            let created_at = std::time::UNIX_EPOCH
+                + std::time::Duration::from_millis(entry.created_at_ms as u64);
+            let age = std::time::SystemTime::now()
+                .duration_since(created_at)
+                .unwrap_or_default();
             let label = format!("[{}] {} ({})", entry.kind, entry.title, format_age(age));
             out.push(Line::from(Span::styled(label, style)));
         }
@@ -453,7 +459,10 @@ fn background_pane_paragraph(app: &App) -> Vec<Line<'static>> {
 
     // 2. Background Jobs
     if !app.background_jobs.is_empty() {
-        out.push(Line::from(Span::styled("--- BACKGROUND JOBS ---", Theme::tool_call())));
+        out.push(Line::from(Span::styled(
+            "--- BACKGROUND JOBS ---",
+            Theme::tool_call(),
+        )));
         let spinner_str = app.get_spinner_frame().to_string();
         for entry in &app.background_jobs {
             let (style, icon) = match entry.state.as_str() {
@@ -463,9 +472,18 @@ fn background_pane_paragraph(app: &App) -> Vec<Line<'static>> {
                 "failed" => (Theme::error(), "✗"),
                 _ => (Theme::dim(), "·"),
             };
-            let created_at = std::time::UNIX_EPOCH + std::time::Duration::from_millis(entry.created_at_ms as u64);
-            let age = std::time::SystemTime::now().duration_since(created_at).unwrap_or_default();
-            let label = format!("{} {} [{}] ({})", icon, entry.kind, entry.state, format_age(age));
+            let created_at = std::time::UNIX_EPOCH
+                + std::time::Duration::from_millis(entry.created_at_ms as u64);
+            let age = std::time::SystemTime::now()
+                .duration_since(created_at)
+                .unwrap_or_default();
+            let label = format!(
+                "{} {} [{}] ({})",
+                icon,
+                entry.kind,
+                entry.state,
+                format_age(age)
+            );
             let line = Line::from(Span::styled(label, style));
             out.push(line);
         }
@@ -474,7 +492,10 @@ fn background_pane_paragraph(app: &App) -> Vec<Line<'static>> {
 
     // 3. Sub-Agent Tasks (Legacy AgentTasks)
     if !app.agent_tasks.is_empty() {
-        out.push(Line::from(Span::styled("--- SUB-AGENTS ---", Theme::tool_call())));
+        out.push(Line::from(Span::styled(
+            "--- SUB-AGENTS ---",
+            Theme::tool_call(),
+        )));
         let spinner_str = app.get_spinner_frame().to_string();
         for entry in app.agent_tasks.iter() {
             let (style, icon) = match entry.status {
@@ -511,44 +532,6 @@ fn background_pane_paragraph(app: &App) -> Vec<Line<'static>> {
         ))];
     }
     out
-}
-
-fn refresh_background_data(
-    rt: &tokio::runtime::Runtime,
-    memory_node: &NodeHandle<MemoryMessage>,
-    app: &mut App,
-) {
-    use tokio::sync::oneshot;
-    // 1. Jobs
-    let jobs: Result<Vec<crate::memory::BackgroundJobRecord>, String> = rt.block_on(async {
-        let (tx, rx) = oneshot::channel();
-        let msg = MemoryMessage::ListBackgroundJobs {
-            chat_id: None,
-            limit: 50,
-            reply: SharedReply::new(tx),
-        };
-        memory_node.send_packet(msg).await.map_err(|e| e.to_string())?;
-        rx.await.map_err(|_| "memory actor channel closed".to_string())?
-    });
-    if let Ok(j) = jobs {
-        app.background_jobs = j;
-    }
-
-    // 2. Notifications
-    let notifications: Result<Vec<crate::memory::NotificationRecord>, String> = rt.block_on(async {
-        let (tx, rx) = oneshot::channel();
-        let msg = MemoryMessage::ListNotifications {
-            chat_id: None,
-            limit: 50,
-            unseen_only: false,
-            reply: SharedReply::new(tx),
-        };
-        memory_node.send_packet(msg).await.map_err(|e| e.to_string())?;
-        rx.await.map_err(|_| "memory actor channel closed".to_string())?
-    });
-    if let Ok(n) = notifications {
-        app.notifications = n;
-    }
 }
 
 /// Build one line per job in the multi-job strip, plus an optional Jupyter-stream tail
@@ -852,7 +835,6 @@ fn handle_background_job_started_notice(app: &mut App, msg: &OutboundMessage) {
     app.job_strip_started(jid, "background", tool, desc, &msg.chat_id);
 }
 
-
 fn handle_execution_job_finished_notice(app: &mut App, msg: &OutboundMessage) {
     let jid = msg
         .metadata
@@ -888,7 +870,6 @@ fn handle_background_job_finished_notice(app: &mut App, msg: &OutboundMessage) {
     let summary = msg.content.trim();
     app.job_strip_finished(jid, status, summary, &msg.chat_id);
 }
-
 
 fn handle_subagent_task_started_notice(app: &mut App, msg: &OutboundMessage) {
     let tid = msg
@@ -1381,13 +1362,15 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
     let mut last_exec_poll = Instant::now() - Duration::from_secs(60);
     let mut last_conversations_poll = Instant::now() - Duration::from_secs(60);
     let mut last_todos_poll = Instant::now() - Duration::from_secs(60);
-    let mut last_background_poll = Instant::now() - Duration::from_secs(60);
 
     let start_time = Instant::now();
     let (todos_tx, todos_rx) = std::sync::mpsc::channel();
     let (crons_tx, crons_rx) = std::sync::mpsc::channel::<usize>();
+    let (jobs_tx, jobs_rx) = std::sync::mpsc::channel::<Vec<crate::memory::BackgroundJobRecord>>();
+    let (notifications_tx, notifications_rx) =
+        std::sync::mpsc::channel::<Vec<crate::memory::NotificationRecord>>();
 
-    // Spawn a single long-lived background thread for periodic DB polling (todos + crons).
+    // Spawn a single long-lived background thread for periodic DB polling (todos + crons + jobs + notifications).
     // Receives tick signals via a channel; avoids spawning a new OS thread every poll interval.
     let (poll_trigger_tx, poll_trigger_rx) = std::sync::mpsc::channel::<String>();
     {
@@ -1395,15 +1378,18 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         let memory_node = memory_node.clone();
         let todos_tx = todos_tx.clone();
         let crons_tx = crons_tx.clone();
+        let jobs_tx = jobs_tx.clone();
+        let notifications_tx = notifications_tx.clone();
         let spawn_result = std::thread::Builder::new()
             .name("ui-db-poller".into())
             .spawn(move || {
                 while let Ok(cid) = poll_trigger_rx.recv() {
                     rt_handle.block_on(async {
+                        // 1. Todos
                         let (otx, orx) = tokio::sync::oneshot::channel();
                         let _ = memory_node
                             .send_packet(crate::memory::MemoryMessage::LoadHarnessTodos {
-                                chat_id: cid,
+                                chat_id: cid.clone(),
                                 reply: crate::memory::SharedReply::new(otx),
                             })
                             .await;
@@ -1418,6 +1404,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             let _ = todos_tx.send(0);
                         }
 
+                        // 2. Crons
                         let (ctx, crx) = tokio::sync::oneshot::channel();
                         let _ = memory_node
                             .send_packet(crate::memory::MemoryMessage::GetActiveCronsCount {
@@ -1429,6 +1416,33 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             let _ = crons_tx.send(count);
                         } else {
                             let _ = crons_tx.send(0);
+                        }
+
+                        // 3. Background Jobs
+                        let (jtx, jrx) = tokio::sync::oneshot::channel();
+                        let _ = memory_node
+                            .send_packet(crate::memory::MemoryMessage::ListBackgroundJobs {
+                                chat_id: None,
+                                limit: 50,
+                                reply: crate::memory::SharedReply::new(jtx),
+                            })
+                            .await;
+                        if let Ok(Ok(jobs)) = jrx.await {
+                            let _ = jobs_tx.send(jobs);
+                        }
+
+                        // 4. Notifications
+                        let (ntx, nrx) = tokio::sync::oneshot::channel();
+                        let _ = memory_node
+                            .send_packet(crate::memory::MemoryMessage::ListNotifications {
+                                chat_id: None,
+                                limit: 50,
+                                unseen_only: false,
+                                reply: crate::memory::SharedReply::new(ntx),
+                            })
+                            .await;
+                        if let Ok(Ok(notifs)) = nrx.await {
+                            let _ = notifications_tx.send(notifs);
                         }
                     });
                 }
@@ -1446,6 +1460,12 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         }
         while let Ok(active_count) = crons_rx.try_recv() {
             app.crons_count = active_count;
+        }
+        while let Ok(jobs) = jobs_rx.try_recv() {
+            app.background_jobs = jobs;
+        }
+        while let Ok(notifs) = notifications_rx.try_recv() {
+            app.notifications = notifs;
         }
 
         if last_todos_poll.elapsed() >= Duration::from_secs(2) {
@@ -1467,12 +1487,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             last_conversations_poll = Instant::now();
             refresh_conversations_list(&rt, &memory_node, &mut app);
         }
-        if app.ui_focus == TerminalUiFocus::BackgroundJobs
-            && last_background_poll.elapsed() >= Duration::from_secs(2)
-        {
-            last_background_poll = Instant::now();
-            refresh_background_data(&rt, &memory_node, &mut app);
-        }
+        // Background jobs and notifications are now polled by the background thread.
 
         if let Some(ref rx) = uv_install_rx {
             match rx.try_recv() {
@@ -1574,7 +1589,12 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 .and_then(|v| v.as_str())
             {
                 // General background job output: update strip, don't add to transcript.
-                if let Some(line) = msg.content.lines().filter(|l| !l.trim().is_empty()).last() {
+                if let Some(line) = msg
+                    .content
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .next_back()
+                {
                     app.job_strip_set_last_line(jid, line);
                 }
 
@@ -2199,7 +2219,11 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                     } else if idx < n_count + j_count {
                                         Some(app.background_jobs[idx - n_count].chat_id.clone())
                                     } else if idx < n_count + j_count + a_count {
-                                        Some(app.agent_tasks[idx - n_count - j_count].child_chat_id.clone())
+                                        Some(
+                                            app.agent_tasks[idx - n_count - j_count]
+                                                .child_chat_id
+                                                .clone(),
+                                        )
                                     } else {
                                         None
                                     }
@@ -2360,8 +2384,8 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 || text.eq_ignore_ascii_case("/bg")
                             {
                                 app.focus_background_jobs();
-                                refresh_background_data(&rt, &memory_node, &mut app);
-                                last_background_poll = Instant::now();
+                                let _ = poll_trigger_tx.send(chat_id.clone());
+
                                 continue;
                             }
                             if text.eq_ignore_ascii_case("/chats") {
@@ -2656,8 +2680,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         if key.modifiers.contains(KeyModifiers::CONTROL) =>
                     {
                         app.focus_background_jobs();
-                        refresh_background_data(&rt, &memory_node, &mut app);
-                        last_background_poll = Instant::now();
+                        let _ = poll_trigger_tx.send(chat_id.clone());
                     }
                     KeyCode::PageUp => match app.ui_focus {
                         TerminalUiFocus::ToolHistory => app.tool_history_scroll_up(8),

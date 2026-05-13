@@ -472,8 +472,14 @@ impl Tool for AskUserTool {
                 crate::bus::METADATA_CLARIFICATION_TICKET_ID.to_string(),
                 serde_json::Value::String(ticket_id.clone()),
             );
-            if let Some(jid) = ctx.inbound_metadata.get(crate::bus::METADATA_BACKGROUND_JOB_ID) {
-                metadata.insert(crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(), jid.clone());
+            if let Some(jid) = ctx
+                .inbound_metadata
+                .get(crate::bus::METADATA_BACKGROUND_JOB_ID)
+            {
+                metadata.insert(
+                    crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
+                    jid.clone(),
+                );
             }
             let outbound = OutboundMessage {
                 channel: ctx.channel.clone(),
@@ -489,7 +495,7 @@ impl Tool for AskUserTool {
                 .send(BusMessage::Outbound(outbound))
                 .await
                 .map_err(|e| format!("failed to send clarification ticket notification: {}", e))?;
-            
+
             // Update job state to waiting
             let (tx, rx) = tokio::sync::oneshot::channel();
             let _ = memory_node
@@ -502,11 +508,7 @@ impl Tool for AskUserTool {
                 .await;
             let _ = rx.await;
 
-            return Err(format!(
-                "{}{}",
-                crate::agent::WAIT_SIGNAL_PREFIX,
-                ticket_id
-            ));
+            return Err(format!("{}{}", crate::agent::WAIT_SIGNAL_PREFIX, ticket_id));
         }
 
         let rx = self

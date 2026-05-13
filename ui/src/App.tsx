@@ -591,6 +591,43 @@ export default function App() {
   const [showWorkspaceModal, setShowWorkspaceModal] = useState(false);
   const [showBackgroundPanel, setShowBackgroundPanel] = useState(false);
   const [workspacePaneNonce, setWorkspacePaneNonce] = useState(0);
+
+  // Custom dialog state to replace window.confirm/prompt
+  const [dialogConfig, setDialogConfig] = useState<{
+    type: 'confirm' | 'prompt';
+    title: string;
+    message: string;
+    onConfirm: (value?: string) => void;
+    onCancel: () => void;
+    defaultValue?: string;
+  } | null>(null);
+
+  const showConfirm = (title: string, message: string, onConfirm: () => void) => {
+    setDialogConfig({
+      type: 'confirm',
+      title,
+      message,
+      onConfirm: () => {
+        onConfirm();
+        setDialogConfig(null);
+      },
+      onCancel: () => setDialogConfig(null),
+    });
+  };
+
+  const showPrompt = (title: string, message: string, defaultValue: string, onConfirm: (val: string) => void) => {
+    setDialogConfig({
+      type: 'prompt',
+      title,
+      message,
+      defaultValue,
+      onConfirm: (val) => {
+        if (val !== undefined) onConfirm(val);
+        setDialogConfig(null);
+      },
+      onCancel: () => setDialogConfig(null),
+    });
+  };
   const [jobs, setJobs] = useState<BackgroundJob[]>([]);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [summaries, setSummaries] = useState<SummaryEntry[]>([]);
@@ -775,20 +812,21 @@ export default function App() {
     }
   };
 
-  const deleteSummary = async (id: number) => {
-    if (!confirm("Are you sure you want to delete this summary?")) return;
-    try {
-      const response = await fetch(`/v1/summaries/${id}`, {
-        method: "DELETE",
-      });
-      if (!response.ok) {
-        throw new Error(`Failed to delete summary (${response.status})`);
+  const deleteSummary = (id: number) => {
+    showConfirm("Delete summary", "Are you sure you want to delete this summary?", async () => {
+      try {
+        const response = await fetch(`/v1/summaries/${id}`, {
+          method: "DELETE",
+        });
+        if (!response.ok) {
+          throw new Error(`Failed to delete summary (${response.status})`);
+        }
+        setSummaries((prev) => prev.filter((s) => s.id !== id));
+      } catch (error) {
+        console.error(error);
+        setErrorMessage(buildErrorMessage(error));
       }
-      setSummaries((prev) => prev.filter((s) => s.id !== id));
-    } catch (error) {
-      console.error(error);
-      setErrorMessage(buildErrorMessage(error));
-    }
+    });
   };
 
 
@@ -1192,9 +1230,9 @@ export default function App() {
                               className="text-[10px] text-destructive hover:underline"
                               onClick={(e) => {
                                 e.stopPropagation();
-                                if (confirm("Dismiss this background job and all associated requests?")) {
+                                showConfirm("Dismiss Job", "Dismiss this background job and all associated requests?", () => {
                                   void dismissBackgroundJob(job.job_id);
-                                }
+                                });
                               }}
                             >
                               Dismiss
@@ -1243,10 +1281,11 @@ export default function App() {
                               size="sm" 
                               className="h-7 text-[10px] font-bold uppercase tracking-widest bg-yellow-500 hover:bg-yellow-600 text-white border-0"
                               onClick={() => {
-                                const reply = prompt("Enter your response:");
-                                if (reply?.trim()) {
-                                  void replyToTicket(n.action_payload || "", reply.trim());
-                                }
+                                showPrompt("Reply to request", "Enter your response:", "", (reply) => {
+                                  if (reply.trim()) {
+                                    void replyToTicket(n.action_payload || "", reply.trim());
+                                  }
+                                });
                               }}
                             >
                               Reply to request
@@ -1266,9 +1305,9 @@ export default function App() {
                               size="sm" 
                               className="h-7 text-[10px] font-bold uppercase tracking-widest text-destructive hover:text-destructive hover:bg-destructive/10"
                               onClick={() => {
-                                if (confirm("Dismiss this request? This will also mark the background job as completed.")) {
+                                showConfirm("Dismiss Request", "Dismiss this request? This will also mark the background job as completed.", () => {
                                   void dismissTicket(n.action_payload || "");
-                                }
+                                });
                               }}
                             >
                               Dismiss
@@ -1307,6 +1346,58 @@ export default function App() {
             </div>
             <div className="flex-1 overflow-y-auto p-6">
               <WorkspaceFilePane key={workspacePaneNonce} />
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {dialogConfig ? (
+        <div
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4"
+          role="dialog"
+          aria-modal="true"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) {
+              dialogConfig.onCancel();
+            }
+          }}
+        >
+          <div className="w-full max-w-md rounded-xl border border-border bg-card p-6 shadow-xl">
+            <h2 className="text-lg font-semibold text-foreground mb-2">{dialogConfig.title}</h2>
+            <p className="text-sm text-muted-foreground mb-6">{dialogConfig.message}</p>
+            
+            {dialogConfig.type === 'prompt' && (
+              <input
+                autoFocus
+                className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm mb-6 focus:outline-none focus:ring-2 focus:ring-primary"
+                defaultValue={dialogConfig.defaultValue}
+                id="dialog-input"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    dialogConfig.onConfirm((e.target as HTMLInputElement).value);
+                  } else if (e.key === 'Escape') {
+                    dialogConfig.onCancel();
+                  }
+                }}
+              />
+            )}
+            
+            <div className="flex justify-end gap-3">
+              <Button variant="ghost" onClick={dialogConfig.onCancel}>
+                Cancel
+              </Button>
+              <Button
+                onClick={() => {
+                  if (dialogConfig.type === 'prompt') {
+                    const input = document.getElementById('dialog-input') as HTMLInputElement;
+                    dialogConfig.onConfirm(input.value);
+                  } else {
+                    dialogConfig.onConfirm();
+                  }
+                }}
+              >
+                {dialogConfig.type === 'confirm' ? 'Confirm' : 'OK'}
+              </Button>
             </div>
           </div>
         </div>

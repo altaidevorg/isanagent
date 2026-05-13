@@ -169,6 +169,7 @@ mod tests {
             chat_id: "chat-xyz".to_string(),
             tool_name: "execution_session_create".to_string(),
             tool_call_id: Some("call-1".to_string()),
+            background_job_id: None,
         };
         with_tool_exec_and_progress_scope(ctx, emitter, async {
             emit_tool_progress_message("Creating Python environment with uv…").await;
