@@ -221,7 +221,12 @@ fn repair_tool_call_context(context: &mut Vec<crate::utils::ChatMessage>) {
         for id in missing {
             context.insert(
                 j,
-                crate::utils::ChatMessage::tool("[Cancelled — tool execution interrupted]", &id, None),            );
+                crate::utils::ChatMessage::tool(
+                    "[Cancelled — tool execution interrupted]",
+                    &id,
+                    None,
+                ),
+            );
             j += 1;
         }
 
@@ -1617,10 +1622,14 @@ impl AgentLogic {
                         }
                     }
                 }
-                
-                mem.add_message(crate::utils::ChatMessage::tool(&inbound.content, id, tool_name_for_resume.as_deref()))
-                    .await
-                    .map_err(|e| format!("Failed to inject tool response into memory: {}", e))?;
+
+                mem.add_message(crate::utils::ChatMessage::tool(
+                    &inbound.content,
+                    id,
+                    tool_name_for_resume.as_deref(),
+                ))
+                .await
+                .map_err(|e| format!("Failed to inject tool response into memory: {}", e))?;
             } else {
                 return Err(format!("Failed to get session {}", session_key));
             }
@@ -2271,8 +2280,12 @@ impl AgentLogic {
                         };
                         let _ = outbound_tx.send(BusMessage::Telemetry(tfin.clone())).await;
                         hook_observe_telemetry(hook_tool_ctx.as_ref(), &inbound, is_subagent, tfin);
-                        mem.add_message(crate::utils::ChatMessage::tool(&tool_result_text, &tc.id, Some(tool_name.as_str())))
-                            .await?;
+                        mem.add_message(crate::utils::ChatMessage::tool(
+                            &tool_result_text,
+                            &tc.id,
+                            Some(tool_name.as_str()),
+                        ))
+                        .await?;
                     }
                     tool_invoked = true;
                 } else {
@@ -2370,8 +2383,12 @@ impl AgentLogic {
                         let _ = outbound_tx.send(BusMessage::Telemetry(tfin.clone())).await;
                         hook_observe_telemetry(hook_tool_ctx.as_ref(), &inbound, is_subagent, tfin);
 
-                        mem.add_message(crate::utils::ChatMessage::tool(&tool_result_text, &tc.id, Some(tool_name.as_str())))
-                            .await?;
+                        mem.add_message(crate::utils::ChatMessage::tool(
+                            &tool_result_text,
+                            &tc.id,
+                            Some(tool_name.as_str()),
+                        ))
+                        .await?;
                         tool_invoked = true;
                     }
                 }

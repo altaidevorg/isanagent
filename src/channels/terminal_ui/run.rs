@@ -2198,7 +2198,10 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             let selected_id = if app.ui_focus == TerminalUiFocus::Conversations {
                                 if let Some(idx) = app.conversations_selected_idx {
                                     if idx < app.conversations_items.len() {
-                                        Some((app.conversations_items[idx].thread_id.clone(), false))
+                                        Some((
+                                            app.conversations_items[idx].thread_id.clone(),
+                                            false,
+                                        ))
                                     } else {
                                         None
                                     }
@@ -2218,7 +2221,11 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 
                             if let Some((target_id, is_chat_id)) = selected_id {
                                 let (thread_id, new_cid) = if is_chat_id {
-                                    let tid = crate::bus::clarification_session_key(channel_name.as_str(), &target_id, None);
+                                    let tid = crate::bus::clarification_session_key(
+                                        channel_name.as_str(),
+                                        &target_id,
+                                        None,
+                                    );
                                     (tid, target_id)
                                 } else {
                                     let cid = match chat_id_from_root_thread_id(
