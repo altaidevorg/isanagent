@@ -34,6 +34,15 @@ pub struct InboundMessage {
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
+pub fn get_background_job_id(
+    metadata: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<String> {
+    metadata
+        .get(METADATA_BACKGROUND_JOB_ID)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
 /// Session key for clarification routing and tool execution context ([`crate::tool_runtime::ToolExecCtx`]).
 ///
 /// Format must stay aligned with [`crate::tool_runtime::ToolExecCtx`]: `channel:chat_id:thread`,
@@ -74,6 +83,8 @@ pub enum TelemetryEvent {
         /// backwards compat with synthetic emit sites that have no upstream id.
         #[serde(default)]
         tool_call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background_job_id: Option<String>,
     },
     ToolResult {
         chat_id: String,
@@ -83,10 +94,14 @@ pub enum TelemetryEvent {
         result: String,
         #[serde(default)]
         tool_call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background_job_id: Option<String>,
     },
     AgentThought {
         chat_id: String,
         thought: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background_job_id: Option<String>,
     },
     AgentUsage {
         chat_id: String,
@@ -94,16 +109,20 @@ pub enum TelemetryEvent {
         prompt_tokens: u32,
         completion_tokens: u32,
         total_tokens: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background_job_id: Option<String>,
     },
     ToolCallStarted {
         chat_id: String,
         tool_name: String,
         args: String,
+        background_job_id: Option<String>,
     },
     ToolCallFinished {
         chat_id: String,
         tool_name: String,
         result: String,
+        background_job_id: Option<String>,
     },
     /// Mid–tool-call status (e.g. uv-managed Python env setup); not a tool result.
     ToolProgress {
@@ -114,6 +133,8 @@ pub enum TelemetryEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_call_id: Option<String>,
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background_job_id: Option<String>,
     },
     CronTrigger {
         job_id: String,
@@ -164,6 +185,8 @@ pub enum TelemetryEvent {
         /// Named agent type (e.g. "researcher", "coder"). None for legacy generic spawns.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background_job_id: Option<String>,
     },
     /// Sub-agent task reached a terminal state (also persisted in SQLite).
     SubagentFinished {

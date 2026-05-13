@@ -97,6 +97,8 @@ pub enum TerminalUiFocus {
     ToolHistory,
     /// Sub-agent task lifecycle pane (running / finished named agents, plan steps).
     AgentTasks,
+    /// Detailed list of background jobs and notifications.
+    BackgroundJobs,
 }
 
 const TOOL_RAIL_CAP: usize = 150;
@@ -113,6 +115,7 @@ pub struct ToolRailEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobStripStatus {
     Running,
+    Waiting,
     Completed,
     Failed,
     Cancelled,
@@ -126,6 +129,7 @@ impl JobStripStatus {
             "failed" => JobStripStatus::Failed,
             "cancelled" => JobStripStatus::Cancelled,
             "timeout" => JobStripStatus::Timeout,
+            "waiting" => JobStripStatus::Waiting,
             _ => JobStripStatus::Running,
         }
     }
@@ -133,6 +137,7 @@ impl JobStripStatus {
     pub fn icon(&self) -> &'static str {
         match self {
             JobStripStatus::Running => "·",
+            JobStripStatus::Waiting => "⏳",
             JobStripStatus::Completed => "✓",
             JobStripStatus::Failed => "✗",
             JobStripStatus::Cancelled => "⨯",
@@ -141,7 +146,7 @@ impl JobStripStatus {
     }
 
     pub fn is_terminal(&self) -> bool {
-        !matches!(self, JobStripStatus::Running)
+        !matches!(self, JobStripStatus::Running | JobStripStatus::Waiting)
     }
 }
 
@@ -196,6 +201,7 @@ pub struct AgentTaskEntry {
 pub struct JobStripEntry {
     pub job_id: String,
     pub session_id: String,
+    pub chat_id: String,
     pub tool_name: String,
     pub description: Option<String>,
     pub started_at: Instant,
@@ -340,6 +346,10 @@ pub struct App {
     /// Lines hidden below the agent-tasks viewport top (`0` = follow tail).
     pub agent_tasks_scroll_top: usize,
     pub last_agent_tasks_rect: Option<Rect>,
+    pub background_jobs: Vec<crate::memory::BackgroundJobRecord>,
+    pub notifications: Vec<crate::memory::NotificationRecord>,
+    pub background_jobs_selected_idx: Option<usize>,
+    pub last_background_jobs_rect: Option<Rect>,
     /// True when the most recent reasoning turn ended with an exhausted-retry LLM failure
     /// banner. Cleared once the next user message (or `/retry`) is sent.
     pub llm_retry_available: bool,
@@ -385,7 +395,37 @@ impl Default for App {
     }
 }
 
+pub enum BackgroundPanelItem<'a> {
+    Notification(&'a crate::memory::NotificationRecord),
+    Job(&'a crate::memory::BackgroundJobRecord),
+    AgentTask(&'a crate::channels::terminal_ui::app::AgentTaskEntry),
+}
+
+impl<'a> BackgroundPanelItem<'a> {
+    pub fn chat_id(&self) -> &'a str {
+        match self {
+            Self::Notification(n) => &n.chat_id,
+            Self::Job(j) => &j.chat_id,
+            Self::AgentTask(t) => &t.child_chat_id,
+        }
+    }
+}
+
 impl App {
+    pub fn background_panel_items(&self) -> Vec<BackgroundPanelItem<'_>> {
+        let mut items = Vec::new();
+        for n in &self.notifications {
+            items.push(BackgroundPanelItem::Notification(n));
+        }
+        for j in &self.background_jobs {
+            items.push(BackgroundPanelItem::Job(j));
+        }
+        for a in &self.agent_tasks {
+            items.push(BackgroundPanelItem::AgentTask(a));
+        }
+        items
+    }
+
     pub fn new() -> Self {
         Self {
             mode: TerminalUiMode::default(),
@@ -417,6 +457,10 @@ impl App {
             agent_tasks: VecDeque::new(),
             agent_tasks_scroll_top: 0,
             last_agent_tasks_rect: None,
+            background_jobs: Vec::new(),
+            notifications: Vec::new(),
+            background_jobs_selected_idx: None,
+            last_background_jobs_rect: None,
             llm_retry_available: false,
             last_inbound_text: None,
             executions_runs: Vec::new(),
@@ -486,14 +530,16 @@ impl App {
             TerminalUiFocus::Conversations => TerminalUiFocus::Executions,
             TerminalUiFocus::Executions => TerminalUiFocus::ToolHistory,
             TerminalUiFocus::ToolHistory => TerminalUiFocus::AgentTasks,
-            TerminalUiFocus::AgentTasks => TerminalUiFocus::Transcript,
+            TerminalUiFocus::AgentTasks => TerminalUiFocus::BackgroundJobs,
+            TerminalUiFocus::BackgroundJobs => TerminalUiFocus::Transcript,
         };
         self.tool_history_scroll = 0;
     }
 
     pub fn toggle_ui_focus_back(&mut self) {
         self.ui_focus = match self.ui_focus {
-            TerminalUiFocus::Transcript => TerminalUiFocus::AgentTasks,
+            TerminalUiFocus::Transcript => TerminalUiFocus::BackgroundJobs,
+            TerminalUiFocus::BackgroundJobs => TerminalUiFocus::AgentTasks,
             TerminalUiFocus::AgentTasks => TerminalUiFocus::ToolHistory,
             TerminalUiFocus::ToolHistory => TerminalUiFocus::Executions,
             TerminalUiFocus::Executions => TerminalUiFocus::Conversations,
@@ -510,6 +556,19 @@ impl App {
     pub fn focus_transcript(&mut self) {
         self.ui_focus = TerminalUiFocus::Transcript;
         self.tool_history_scroll = 0;
+    }
+
+    pub fn focus_agent_tasks(&mut self) {
+        self.ui_focus = TerminalUiFocus::AgentTasks;
+    }
+
+    pub fn focus_background_jobs(&mut self) {
+        self.ui_focus = TerminalUiFocus::BackgroundJobs;
+        if self.background_jobs_selected_idx.is_none()
+            && (!self.background_jobs.is_empty() || !self.notifications.is_empty())
+        {
+            self.background_jobs_selected_idx = Some(0);
+        }
     }
 
     pub fn focus_executions(&mut self) {
@@ -750,18 +809,19 @@ impl App {
         session_id: &str,
         tool_name: &str,
         description: Option<&str>,
+        chat_id: &str,
     ) {
-        if let Some(existing) = self.jobs_strip.iter_mut().find(|e| e.job_id == job_id) {
-            existing.status = JobStripStatus::Running;
-            existing.terminal_at = None;
-            existing.tool_name = tool_name.to_string();
-            existing.session_id = session_id.to_string();
-            existing.description = description.map(|s| s.to_string());
+        if let Some(entry) = self.jobs_strip.iter_mut().find(|e| e.job_id == job_id) {
+            entry.status = JobStripStatus::Running;
+            entry.started_at = Instant::now();
+            entry.terminal_at = None;
+            entry.chat_id = chat_id.to_string();
             return;
         }
         self.jobs_strip.push_back(JobStripEntry {
             job_id: job_id.to_string(),
             session_id: session_id.to_string(),
+            chat_id: chat_id.to_string(),
             tool_name: tool_name.to_string(),
             description: description.map(|s| s.to_string()),
             started_at: Instant::now(),
@@ -781,7 +841,7 @@ impl App {
         }
     }
 
-    pub fn job_strip_finished(&mut self, job_id: &str, status: &str, summary: &str) {
+    pub fn job_strip_finished(&mut self, job_id: &str, status: &str, summary: &str, chat_id: &str) {
         let new_status = JobStripStatus::from_str(status);
         if let Some(existing) = self.jobs_strip.iter_mut().find(|e| e.job_id == job_id) {
             existing.status = new_status;
@@ -795,6 +855,7 @@ impl App {
             self.jobs_strip.push_back(JobStripEntry {
                 job_id: job_id.to_string(),
                 session_id: String::new(),
+                chat_id: chat_id.to_string(),
                 tool_name: String::new(),
                 description: None,
                 started_at: Instant::now(),
@@ -1038,7 +1099,13 @@ mod tests {
     #[test]
     fn job_strip_started_inserts_running_row() {
         let mut app = App::new();
-        app.job_strip_started("job-1", "sess-1", "colab_mcp_tool_call", Some("training"));
+        app.job_strip_started(
+            "job-1",
+            "sess-1",
+            "colab_mcp_tool_call",
+            Some("training"),
+            "chat-1",
+        );
         assert_eq!(app.jobs_strip.len(), 1);
         let row = app.jobs_strip.front().unwrap();
         assert_eq!(row.job_id, "job-1");
@@ -1051,9 +1118,9 @@ mod tests {
     #[test]
     fn job_strip_finished_marks_terminal_status() {
         let mut app = App::new();
-        app.job_strip_started("job-1", "sess-1", "execution_run", None);
+        app.job_strip_started("job-1", "sess-1", "execution_run", None, "chat-1");
         app.job_strip_set_last_line("job-1", "epoch 4 / 8");
-        app.job_strip_finished("job-1", "completed", "exit 0 in 1234ms");
+        app.job_strip_finished("job-1", "completed", "exit 0 in 1234ms", "chat-1");
         let row = app.jobs_strip.front().unwrap();
         assert_eq!(row.status, JobStripStatus::Completed);
         assert!(row.terminal_at.is_some());
@@ -1063,9 +1130,9 @@ mod tests {
     #[test]
     fn evict_expired_jobs_drops_only_old_terminal_rows() {
         let mut app = App::new();
-        app.job_strip_started("running", "s1", "execution_run", None);
-        app.job_strip_started("done", "s1", "execution_run", None);
-        app.job_strip_finished("done", "completed", "ok");
+        app.job_strip_started("running", "s1", "execution_run", None, "chat-1");
+        app.job_strip_started("done", "s1", "execution_run", None, "chat-1");
+        app.job_strip_finished("done", "completed", "ok", "chat-1");
         if let Some(row) = app.jobs_strip.iter_mut().find(|e| e.job_id == "done") {
             row.terminal_at = Some(Instant::now() - Duration::from_secs(60));
         }

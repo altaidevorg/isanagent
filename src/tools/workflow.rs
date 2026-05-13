@@ -389,27 +389,27 @@ impl Tool for AskUserTool {
                 .to_string();
 
             {
-                let choices_json = if choices.is_empty() {
-                    None
-                } else {
-                    Some(
-                        serde_json::to_string(&choices)
-                            .map_err(|e| format!("serialize choices: {}", e))?,
-                    )
-                };
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 memory_node
                     .send_packet(MemoryMessage::UpsertClarificationTicket {
                         record: crate::memory::ClarificationTicketRecord {
                             ticket_id: ticket_id.clone(),
-                            job_id,
+                            job_id: job_id.clone(),
                             chat_id: ctx.chat_id.clone(),
                             channel: ctx.channel.clone(),
                             thread_id: ctx.thread_id.clone(),
+                            tool_call_id: ctx.tool_call_id.clone(),
                             prompt: prompt.to_string(),
-                            choices_json,
+                            choices_json: if choices.is_empty() {
+                                None
+                            } else {
+                                Some(
+                                    serde_json::to_string(&choices)
+                                        .map_err(|e| format!("serialize choices: {}", e))?,
+                                )
+                            },
                             response: None,
-                            status: "pending".to_string(),
+                            status: "waiting".to_string(),
                             created_at_ms: now,
                             updated_at_ms: now,
                         },
@@ -472,6 +472,15 @@ impl Tool for AskUserTool {
                 crate::bus::METADATA_CLARIFICATION_TICKET_ID.to_string(),
                 serde_json::Value::String(ticket_id.clone()),
             );
+            if let Some(jid) = ctx
+                .inbound_metadata
+                .get(crate::bus::METADATA_BACKGROUND_JOB_ID)
+            {
+                metadata.insert(
+                    crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
+                    jid.clone(),
+                );
+            }
             let outbound = OutboundMessage {
                 channel: ctx.channel.clone(),
                 chat_id: ctx.chat_id.clone(),
@@ -486,10 +495,20 @@ impl Tool for AskUserTool {
                 .send(BusMessage::Outbound(outbound))
                 .await
                 .map_err(|e| format!("failed to send clarification ticket notification: {}", e))?;
-            return Err(format!(
-                "Background ask_user converted to clarification ticket `{}`. Waiting for notification reply.",
-                ticket_id
-            ));
+
+            // Update job state to waiting
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = memory_node
+                .send_packet(crate::memory::MemoryMessage::UpdateBackgroundJobState {
+                    job_id: job_id.clone(),
+                    state: "waiting".to_string(),
+                    last_error: None,
+                    reply: crate::memory::SharedReply::new(tx),
+                })
+                .await;
+            let _ = rx.await;
+
+            return Err(format!("{}{}", crate::agent::WAIT_SIGNAL_PREFIX, ticket_id));
         }
 
         let rx = self

@@ -7,9 +7,7 @@ use tokio::sync::{mpsc, watch, RwLock};
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use colored::Colorize;
 use isanagent::agent::{AgentLogic, AgentLogicParams};
-use isanagent::bus::{
-    BusMessage, InboundMessage, LoggerControlMessage, OutboundMessage, TelemetryEvent,
-};
+use isanagent::bus::{BusMessage, InboundMessage, LoggerControlMessage, TelemetryEvent};
 use isanagent::channels::terminal::{
     build_agent_thought_terminal_notice, build_tool_call_terminal_notice,
     build_tool_progress_terminal_notice, build_tool_result_terminal_notice,
@@ -987,9 +985,17 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                         }
                     }
                 }
-                BusMessage::Telemetry(TelemetryEvent::AgentThought { chat_id, thought }) => {
+                BusMessage::Telemetry(TelemetryEvent::AgentThought {
+                    chat_id,
+                    thought,
+                    background_job_id,
+                }) => {
                     if active_terminal_for_outbound.read().await.as_str() == chat_id.as_str() {
-                        let notice = build_agent_thought_terminal_notice(chat_id, thought);
+                        let notice = build_agent_thought_terminal_notice(
+                            chat_id,
+                            thought,
+                            background_job_id.as_deref(),
+                        );
                         if let Some(chan) = delivery_channels.get("terminal") {
                             if let Err(e) = chan.send(notice).await {
                                 log::error!("Failed to deliver AgentThought to terminal: {}", e);
@@ -1002,6 +1008,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                                 .handle_telemetry(TelemetryEvent::AgentThought {
                                     chat_id: chat_id.clone(),
                                     thought: thought.clone(),
+                                    background_job_id: background_job_id.clone(),
                                 })
                                 .await;
                         }
@@ -1013,6 +1020,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                     tool_name,
                     tool_call_id,
                     message,
+                    background_job_id,
                 }) => {
                     if channel == "terminal"
                         && active_terminal_for_outbound.read().await.as_str() == chat_id.as_str()
@@ -1022,6 +1030,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                             tool_name,
                             message,
                             tool_call_id.as_deref(),
+                            background_job_id.as_deref(),
                         );
                         if let Some(chan) = delivery_channels.get("terminal") {
                             if let Err(e) = chan.send(notice).await {
@@ -1041,6 +1050,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                                     tool_name: tool_name.clone(),
                                     tool_call_id: tool_call_id.clone(),
                                     message: message.clone(),
+                                    background_job_id: background_job_id.clone(),
                                 })
                                 .await;
                         }
@@ -1052,6 +1062,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                     tool_name,
                     args,
                     tool_call_id,
+                    background_job_id,
                 }) if channel == "terminal" => {
                     if isanagent::channels::terminal::should_suppress_tool_notice_for_terminal(
                         tool_name, args,
@@ -1064,6 +1075,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                             tool_name,
                             args,
                             tool_call_id.as_deref(),
+                            background_job_id.as_deref(),
                         );
                         if let Some(chan) = delivery_channels.get("terminal") {
                             if let Err(e) = chan.send(notice).await {
@@ -1081,6 +1093,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                     tool_name,
                     result,
                     tool_call_id,
+                    background_job_id,
                 }) if channel == "terminal" => {
                     if isanagent::channels::terminal::should_suppress_tool_notice_for_terminal(
                         tool_name, result,
@@ -1093,6 +1106,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                             tool_name,
                             result,
                             tool_call_id.as_deref(),
+                            background_job_id.as_deref(),
                         );
                         if let Some(chan) = delivery_channels.get("terminal") {
                             if let Err(e) = chan.send(notice).await {
@@ -1257,7 +1271,7 @@ Install uv manually or run /install-python from terminal mode.",
 async fn recover_background_jobs_on_startup(
     memory_node: &NodeHandle<isanagent::memory::MemoryMessage>,
     bus_tx: &mpsc::Sender<BusMessage>,
-    outbound_tx: &mpsc::Sender<BusMessage>,
+    _outbound_tx: &mpsc::Sender<BusMessage>,
 ) {
     use isanagent::memory::{MemoryMessage, SharedReply};
     let (tx, rx) = tokio::sync::oneshot::channel();

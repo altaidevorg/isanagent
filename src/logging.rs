@@ -307,14 +307,16 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             tool_name,
             args,
             tool_call_id,
+            background_job_id,
         } => LogEvent::info(
             "Telemetry",
             &format!(
-                "ToolCall channel={} tool={} args_len={} id={}",
+                "ToolCall channel={} tool={} args_len={} id={} bg={}",
                 channel,
                 tool_name,
                 args.len(),
                 tool_call_id.as_deref().unwrap_or("-"),
+                background_job_id.as_deref().unwrap_or("-"),
             ),
         )
         .with_chat_id(chat_id),
@@ -324,20 +326,22 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             tool_name,
             result,
             tool_call_id,
+            background_job_id,
         } => LogEvent::info(
             "Telemetry",
             &format!(
-                "ToolResult channel={} tool={} result_len={} id={}",
+                "ToolResult channel={} tool={} result_len={} id={} bg={}",
                 channel,
                 tool_name,
                 result.len(),
                 tool_call_id.as_deref().unwrap_or("-"),
+                background_job_id.as_deref().unwrap_or("-"),
             ),
         )
         .with_chat_id(chat_id),
-        TelemetryEvent::AgentThought { chat_id, thought } => LogEvent::debug(
+        TelemetryEvent::AgentThought { chat_id, thought, background_job_id } => LogEvent::debug(
             "Telemetry",
-            &format!("AgentThought thought_len={}", thought.len()),
+            &format!("AgentThought thought_len={} bg={}", thought.len(), background_job_id.as_deref().unwrap_or("-")),
         )
         .with_chat_id(chat_id),
         TelemetryEvent::AgentUsage {
@@ -346,11 +350,12 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             prompt_tokens,
             completion_tokens,
             total_tokens,
+            background_job_id,
         } => LogEvent::info(
             "Telemetry",
             &format!(
-                "AgentUsage model={} prompt={} completion={} total={}",
-                model, prompt_tokens, completion_tokens, total_tokens
+                "AgentUsage model={} prompt={} completion={} total={} bg={}",
+                model, prompt_tokens, completion_tokens, total_tokens, background_job_id.as_deref().unwrap_or("-")
             ),
         )
         .with_chat_id(chat_id),
@@ -366,6 +371,7 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             chat_id,
             tool_name,
             args,
+            ..
         } => LogEvent::debug(
             "Telemetry",
             &format!("ToolCallStarted tool={} args_len={}", tool_name, args.len()),
@@ -375,6 +381,7 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             chat_id,
             tool_name,
             result,
+            ..
         } => LogEvent::debug(
             "Telemetry",
             &format!(
@@ -390,13 +397,15 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             tool_name,
             tool_call_id,
             message,
+            background_job_id,
         } => LogEvent::debug(
             "Telemetry",
             &format!(
-                "ToolProgress channel={} tool={} id={} msg_len={}",
+                "ToolProgress channel={} tool={} id={} bg={} msg_len={}",
                 channel,
                 tool_name,
                 tool_call_id.as_deref().unwrap_or("-"),
+                background_job_id.as_deref().unwrap_or("-"),
                 message.len()
             ),
         )
@@ -413,6 +422,7 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             artifact_count,
             git_head,
             description,
+            ..
         } => LogEvent::info(
             "Telemetry",
             &format!(
@@ -443,6 +453,7 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             stderr_len,
             artifact_count,
             description,
+            ..
         } => LogEvent::info(
             "Telemetry",
             &format!(
@@ -498,6 +509,7 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             mode,
             decision,
             command_preview,
+            ..
         } => LogEvent::info(
             "Telemetry",
             &format!(
@@ -510,6 +522,7 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             chat_id,
             channel,
             command_preview,
+            ..
         } => LogEvent::warn(
             "Telemetry",
             &format!(
@@ -522,6 +535,7 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             chat_id,
             channel,
             reason,
+            ..
         } => LogEvent::info(
             "Telemetry",
             &format!("ResearchDepthNudge channel={} reason={}", channel, reason),
@@ -534,6 +548,7 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             state,
             kind,
             detail,
+            ..
         } => LogEvent::info(
             "Telemetry",
             &format!(
@@ -552,6 +567,7 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             channel,
             kind,
             title,
+            ..
         } => LogEvent::info(
             "Telemetry",
             &format!(
@@ -565,6 +581,7 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             chat_id,
             channel,
             state,
+            ..
         } => LogEvent::info(
             "Telemetry",
             &format!(

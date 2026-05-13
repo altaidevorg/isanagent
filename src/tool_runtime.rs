@@ -17,6 +17,9 @@ pub struct ToolExecCtx {
     pub channel: String,
     pub chat_id: String,
     pub thread_id: Option<String>,
+    /// Optional tool call ID from the LLM; used by tools like ask_user to link
+    /// background tickets back to the specific function call.
+    pub tool_call_id: Option<String>,
     /// True when execution is detached/background and should avoid blocking user-interaction waits.
     pub is_background: bool,
     /// Cancellation token for the **current** reasoning loop (parent or sub-agent), when set.
@@ -40,10 +43,16 @@ impl ToolExecCtx {
             channel,
             chat_id,
             thread_id,
+            tool_call_id: None,
             is_background: false,
             reasoning_cancel: None,
             inbound_metadata: Arc::new(HashMap::new()),
         }
+    }
+
+    pub fn with_tool_call_id(mut self, tool_call_id: Option<String>) -> Self {
+        self.tool_call_id = tool_call_id;
+        self
     }
 
     pub fn with_reasoning_cancel(mut self, token: tokio_util::sync::CancellationToken) -> Self {
@@ -70,6 +79,7 @@ pub struct ToolProgressEmitter {
     pub chat_id: String,
     pub tool_name: String,
     pub tool_call_id: Option<String>,
+    pub background_job_id: Option<String>,
 }
 
 tokio::task_local! {
@@ -139,6 +149,7 @@ pub async fn emit_tool_progress_message(message: &str) {
             tool_name: emitter.tool_name.clone(),
             tool_call_id: emitter.tool_call_id.clone(),
             message: msg.to_string(),
+            background_job_id: emitter.background_job_id.clone(),
         }))
         .await;
 }
@@ -158,6 +169,7 @@ mod tests {
             chat_id: "chat-xyz".to_string(),
             tool_name: "execution_session_create".to_string(),
             tool_call_id: Some("call-1".to_string()),
+            background_job_id: None,
         };
         with_tool_exec_and_progress_scope(ctx, emitter, async {
             emit_tool_progress_message("Creating Python environment with uv…").await;
@@ -172,6 +184,7 @@ mod tests {
                 tool_name,
                 tool_call_id,
                 message,
+                ..
             }) => {
                 assert_eq!(chat_id, "chat-xyz");
                 assert_eq!(channel, "api");

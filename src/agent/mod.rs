@@ -14,7 +14,7 @@ pub use subagent::SubagentHarness;
 use crate::clarification::ClarificationHub;
 use crate::tool_runtime::{with_tool_exec_and_progress_scope, ToolExecCtx, ToolProgressEmitter};
 
-use crate::bus::{BusMessage, LogEvent, OutboundMessage, TelemetryEvent};
+use crate::bus::{BusMessage, InboundMessage, LogEvent, OutboundMessage, TelemetryEvent};
 use crate::config::{ResolvedShellPolicy, ShellPolicyMode};
 use crate::hooks::{
     run_post_tool_hooks, run_pre_tool_hooks, run_user_prompt_hooks, HookObservationMeta,
@@ -249,9 +249,13 @@ fn should_nudge_research_depth(
     !has_deep_source_reads
 }
 
+pub const WAIT_SIGNAL_PREFIX: &str = "ISANAGENT_WAIT_FOR_USER:";
+pub const WAITING_FOR_USER_RESULT_PREFIX: &str = "WAITING:";
+
 enum ToolExecutionFinished {
     Completed(Result<String, String>),
     Cancelled,
+    Waiting(String), // The ticket ID
 }
 
 fn extract_exec_command(args: &Value) -> Option<String> {
@@ -338,6 +342,7 @@ async fn log_tool_invocation_start(
             tool_name: tool_name.to_string(),
             args: args_str.clone(),
             tool_call_id: Some(tc.id.clone()),
+            background_job_id: crate::bus::get_background_job_id(&inbound.metadata),
         }))
         .await;
     let _ = outbound_tx
@@ -345,6 +350,7 @@ async fn log_tool_invocation_start(
             chat_id: inbound.chat_id.clone(),
             tool_name: tool_name.to_string(),
             args: args_str.clone(),
+            background_job_id: crate::bus::get_background_job_id(&inbound.metadata),
         }))
         .await;
     hook_observe_telemetry(
@@ -357,6 +363,7 @@ async fn log_tool_invocation_start(
             tool_name: tool_name.to_string(),
             args: args_str.clone(),
             tool_call_id: Some(tc.id.clone()),
+            background_job_id: crate::bus::get_background_job_id(&inbound.metadata),
         },
     );
     hook_observe_telemetry(
@@ -367,6 +374,7 @@ async fn log_tool_invocation_start(
             chat_id: inbound.chat_id.clone(),
             tool_name: tool_name.to_string(),
             args: args_str.clone(),
+            background_job_id: crate::bus::get_background_job_id(&inbound.metadata),
         },
     );
 }
@@ -400,7 +408,8 @@ async fn execute_tool_call_with_activity(
 ) -> ToolExecutionFinished {
     let session_key = runtime.session.session_key.clone();
     let hub = Arc::clone(&runtime.hub);
-    let tool_exec_ctx = runtime.session;
+    let mut tool_exec_ctx = runtime.session;
+    tool_exec_ctx.tool_call_id = tool_call_id.clone();
     let thread_id_for_hooks = tool_exec_ctx.thread_id.clone();
     let chat_id = chat_id.to_string();
     let tool_name = tool_name.to_string();
@@ -409,12 +418,14 @@ async fn execute_tool_call_with_activity(
     let outbound_tx = outbound_tx.clone();
     let cancel_owned = cancel_token.cloned();
     let tool_call_id_for_hooks = tool_call_id.clone();
+    let background_job_id = crate::bus::get_background_job_id(&runtime.inbound_metadata);
     let progress_emitter = ToolProgressEmitter {
         outbound_tx: outbound_tx.clone(),
         channel: channel.clone(),
         chat_id: chat_id.clone(),
         tool_name: tool_name.clone(),
         tool_call_id,
+        background_job_id,
     };
 
     with_tool_exec_and_progress_scope(tool_exec_ctx, progress_emitter, async move {
@@ -603,7 +614,14 @@ async fn execute_tool_call_with_activity(
         }
 
         match completed {
-            Some(res) => ToolExecutionFinished::Completed(res),
+            Some(res) => {
+                if let Err(ref e) = res {
+                    if let Some(ticket_id) = e.strip_prefix(WAIT_SIGNAL_PREFIX) {
+                        return ToolExecutionFinished::Waiting(ticket_id.to_string());
+                    }
+                }
+                ToolExecutionFinished::Completed(res)
+            }
             None => {
                 hub.cancel_wait(&session_key);
                 ToolExecutionFinished::Cancelled
@@ -639,6 +657,58 @@ struct ReasoningSpawnArgs {
     forbid_final_without_tools: bool,
     shell_policy: Arc<ResolvedShellPolicy>,
     hook_tool_ctx: Option<Arc<ToolCallHookContext>>,
+}
+
+fn send_background_job_notification(
+    outbound_tx: &tokio::sync::mpsc::Sender<BusMessage>,
+    channel: &str,
+    chat_id: &str,
+    thread_id: Option<&str>,
+    job_id: &str,
+    is_start: bool,
+    status: Option<&str>,
+) {
+    let mut meta = HashMap::new();
+    if is_start {
+        meta.insert(
+            crate::channels::terminal_ui::protocol::ISANAGENT_BACKGROUND_JOB_STARTED.to_string(),
+            serde_json::json!(true),
+        );
+        meta.insert(
+            crate::channels::terminal_ui::protocol::METADATA_BACKGROUND_JOB_TOOL_NAME.to_string(),
+            serde_json::json!("background_reasoning"),
+        );
+    } else {
+        meta.insert(
+            crate::channels::terminal_ui::protocol::ISANAGENT_BACKGROUND_JOB_FINISHED.to_string(),
+            serde_json::json!(true),
+        );
+        if let Some(s) = status {
+            meta.insert(
+                crate::channels::terminal_ui::protocol::METADATA_BACKGROUND_JOB_STATUS.to_string(),
+                serde_json::json!(s),
+            );
+        }
+    }
+    meta.insert(
+        crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
+        serde_json::json!(job_id),
+    );
+
+    let content = if is_start {
+        "Background task started...".to_string()
+    } else {
+        format!("Background task finished: {}", status.unwrap_or("unknown"))
+    };
+
+    let notice = crate::bus::OutboundMessage {
+        channel: channel.to_string(),
+        chat_id: chat_id.to_string(),
+        thread_id: thread_id.map(|s| s.to_string()),
+        content,
+        metadata: meta,
+    };
+    let _ = outbound_tx.try_send(BusMessage::Outbound(notice));
 }
 
 fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus::InboundMessage) {
@@ -679,11 +749,7 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
     let is_background_turn = BACKGROUND_METADATA_KEYS
         .iter()
         .any(|&key| metadata_truthy(&inbound.metadata, key));
-    let background_job_id = inbound
-        .metadata
-        .get(crate::bus::METADATA_BACKGROUND_JOB_ID)
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let background_job_id = crate::bus::get_background_job_id(&inbound.metadata);
     let inbound_metadata = Arc::new(inbound.metadata.clone());
     let tool_exec_ctx = ToolExecCtx::new(
         inbound.channel.clone(),
@@ -714,6 +780,18 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
             )
             .with_chat_id(&task_chat_id),
         ));
+
+        if let Some(ref jid) = background_job_id {
+            send_background_job_notification(
+                &outbound_tx,
+                &inbound_channel,
+                &task_chat_id,
+                inbound_thread_id.as_deref(),
+                jid,
+                true,
+                None,
+            );
+        }
 
         let res = AssertUnwindSafe(AgentLogic::run_reasoning_loop(ReasoningLoopCtx {
             name,
@@ -759,7 +837,7 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
                     &inbound_channel,
                     &task_chat_id,
                     inbound_thread_id.as_deref(),
-                    &e,
+                    e,
                 );
                 let _ = outbound_tx.send(BusMessage::Outbound(notice)).await;
             }
@@ -820,6 +898,7 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
 
         if let Some(job_id) = background_job_id {
             let (state, last_error) = match &res {
+                Ok(Ok(s)) if s.starts_with(WAITING_FOR_USER_RESULT_PREFIX) => ("waiting", None),
                 Ok(Ok(_)) => {
                     if task_token_arc.is_cancelled() {
                         ("failed", Some("Cancelled".to_string()))
@@ -831,11 +910,22 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
                 Err(_) => ("failed", Some("Panic in reasoning loop".to_string())),
             };
 
+            // Send FINISHED notice to TUI
+            send_background_job_notification(
+                &outbound_tx,
+                &inbound_channel,
+                &task_chat_id,
+                inbound_thread_id.as_deref(),
+                &job_id,
+                false,
+                Some(state),
+            );
+
             let (tx, rx) = tokio::sync::oneshot::channel();
             let memory_node = session_manager_for_chain.get_memory_node();
             let _ = memory_node
                 .send_packet(MemoryMessage::UpdateBackgroundJobState {
-                    job_id,
+                    job_id: job_id.clone(),
                     state: state.to_string(),
                     last_error,
                     reply: SharedReply::new(tx),
@@ -1159,6 +1249,10 @@ impl AgentLogic {
         .await
         {
             ToolExecutionFinished::Completed(res) => res,
+            ToolExecutionFinished::Waiting(ticket_id) => Err(format!(
+                "tool call waiting for clarification ticket: {}",
+                ticket_id
+            )),
             ToolExecutionFinished::Cancelled => {
                 Err("tool call cancelled without cancellation token".to_string())
             }
@@ -1237,6 +1331,14 @@ impl ActorLogic<BusMessage> for AgentLogic {
                     return Ok(None);
                 }
 
+                // Check for background job resume via explicit clarification ticket UI interaction
+                if let Some(res) = self
+                    .try_resume_background_job_from_ticket(&inbound, &chat_id, &session_key)
+                    .await
+                {
+                    return res;
+                }
+
                 let _ = self.logger_tx.send(BusMessage::Log(
                     LogEvent::info(
                         &self.name,
@@ -1250,6 +1352,21 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 ));
 
                 if self.cancellation_tokens.contains_key(&chat_id) {
+                    // Check if this is a synthetic cron trigger. If so, drop it if we're already busy.
+                    if metadata_truthy(
+                        &inbound.metadata,
+                        crate::bus::METADATA_SYNTHETIC_CRON_TRIGGER,
+                    ) {
+                        let _ = self.logger_tx.send(BusMessage::Log(
+                            LogEvent::info(
+                                &self.name,
+                                "Dropping synthetic cron trigger because chat is already active.",
+                            )
+                            .with_chat_id(&chat_id),
+                        ));
+                        return Ok(None);
+                    }
+
                     let queue = self
                         .pending_inbound
                         .entry(chat_id.clone())
@@ -1281,6 +1398,15 @@ impl ActorLogic<BusMessage> for AgentLogic {
                     return Ok(None);
                 }
 
+                // If not busy, check if there's a waiting background job for this chat
+                // to automatically resume it (user replied to the thread instead of via ticket UI).
+                if let Some(res) = self
+                    .try_auto_resume_waiting_job(&inbound, &chat_id, &session_key)
+                    .await
+                {
+                    return res;
+                }
+
                 spawn_main_chat_reasoning_turn(self.reasoning_spawn_args().await, inbound);
 
                 Ok(None)
@@ -1292,6 +1418,213 @@ impl ActorLogic<BusMessage> for AgentLogic {
             | BusMessage::PromoteSyncToBackground(_)
             | BusMessage::SetTerminalSessionChat { .. } => Ok(None),
         }
+    }
+}
+
+impl AgentLogic {
+    async fn try_resume_background_job_from_ticket(
+        &mut self,
+        inbound: &InboundMessage,
+        chat_id: &str,
+        session_key: &str,
+    ) -> Option<Result<Option<(String, BusMessage)>, ActorError>> {
+        if let Some(ticket_id) = inbound
+            .metadata
+            .get(crate::bus::METADATA_CLARIFICATION_TICKET_ID)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+        {
+            let memory_node = self.session_manager.get_memory_node();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = memory_node
+                .send_packet(MemoryMessage::GetClarificationTicket {
+                    ticket_id: ticket_id.clone(),
+                    reply: SharedReply::new(tx),
+                })
+                .await;
+
+            if let Ok(Ok(Some(ticket))) = rx.await {
+                let _ = self.logger_tx.send(BusMessage::Log(
+                    LogEvent::info(
+                        &self.name,
+                        &format!(
+                            "Resuming background job [{}] via clarification ticket [{}]",
+                            ticket.job_id, ticket_id
+                        ),
+                    )
+                    .with_chat_id(chat_id),
+                ));
+
+                if let Err(e) = self
+                    .resolve_and_resume_job(
+                        inbound,
+                        &ticket.ticket_id,
+                        &ticket.job_id,
+                        ticket.tool_call_id.as_deref(),
+                        session_key,
+                    )
+                    .await
+                {
+                    let _ = self.logger_tx.send(BusMessage::Log(
+                        LogEvent::error(
+                            &self.name,
+                            &format!("Failed to resume job {}: {}", ticket.job_id, e),
+                        )
+                        .with_chat_id(chat_id),
+                    ));
+                    let notice = crate::channels::terminal::build_channel_error_notice(
+                        &inbound.channel,
+                        chat_id,
+                        inbound.thread_id.as_deref(),
+                        &format!("Failed to resume background job [{}]: {}", ticket.job_id, e),
+                    );
+                    let _ = self.outbound_tx.try_send(BusMessage::Outbound(notice));
+                    return Some(Ok(None));
+                }
+                return Some(Ok(None));
+            }
+        }
+        None
+    }
+
+    async fn try_auto_resume_waiting_job(
+        &mut self,
+        inbound: &InboundMessage,
+        chat_id: &str,
+        session_key: &str,
+    ) -> Option<Result<Option<(String, BusMessage)>, ActorError>> {
+        if metadata_truthy(
+            &inbound.metadata,
+            crate::bus::METADATA_CLARIFICATION_TICKET_ID,
+        ) {
+            return None;
+        }
+
+        let memory_node = self.session_manager.get_memory_node();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = memory_node
+            .send_packet(MemoryMessage::ListBackgroundJobs {
+                chat_id: Some(chat_id.to_string()),
+                limit: 10,
+                reply: SharedReply::new(tx),
+            })
+            .await;
+
+        if let Ok(Ok(jobs)) = rx.await {
+            let waiting_jobs: Vec<_> = jobs.into_iter().filter(|j| j.state == "waiting").collect();
+            for job in waiting_jobs {
+                // Found a waiting job. Now find the latest ticket for it.
+                let (tx2, rx2) = tokio::sync::oneshot::channel();
+                let _ = memory_node
+                    .send_packet(MemoryMessage::ListClarificationTickets {
+                        job_id: Some(job.job_id.clone()),
+                        chat_id: Some(chat_id.to_string()),
+                        status: Some("waiting".to_string()),
+                        limit: 1,
+                        reply: SharedReply::new(tx2),
+                    })
+                    .await;
+
+                if let Ok(Ok(tickets)) = rx2.await {
+                    if let Some(ticket) = tickets.into_iter().next() {
+                        let _ = self.logger_tx.send(BusMessage::Log(
+                            LogEvent::info(
+                                &self.name,
+                                &format!(
+                                    "Auto-resuming waiting background job [{}] via thread reply to ticket [{}]",
+                                    job.job_id, ticket.ticket_id
+                                ),
+                            )
+                            .with_chat_id(chat_id),
+                        ));
+
+                        if let Err(e) = self
+                            .resolve_and_resume_job(
+                                inbound,
+                                &ticket.ticket_id,
+                                &job.job_id,
+                                ticket.tool_call_id.as_deref(),
+                                session_key,
+                            )
+                            .await
+                        {
+                            let _ = self.logger_tx.send(BusMessage::Log(
+                                LogEvent::error(
+                                    &self.name,
+                                    &format!("Failed to auto-resume job {}: {}", job.job_id, e),
+                                )
+                                .with_chat_id(chat_id),
+                            ));
+                            let notice = crate::channels::terminal::build_channel_error_notice(
+                                &inbound.channel,
+                                chat_id,
+                                inbound.thread_id.as_deref(),
+                                &format!(
+                                    "Failed to auto-resume background job [{}]: {}",
+                                    job.job_id, e
+                                ),
+                            );
+                            let _ = self.outbound_tx.try_send(BusMessage::Outbound(notice));
+                            return Some(Ok(None));
+                        }
+                        return Some(Ok(None));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    async fn resolve_and_resume_job(
+        &mut self,
+        inbound: &InboundMessage,
+        ticket_id: &str,
+        job_id: &str,
+        tool_call_id: Option<&str>,
+        session_key: &str,
+    ) -> Result<(), String> {
+        let memory_node = self.session_manager.get_memory_node();
+
+        // 1. Resolve everything for this ticket in a single go
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        memory_node
+            .send_packet(MemoryMessage::ResolveClarificationTicketFull {
+                ticket_id: ticket_id.to_string(),
+                job_id: job_id.to_string(),
+                response: inbound.content.clone(),
+                reply: SharedReply::new(tx),
+            })
+            .await
+            .map_err(|e| format!("Memory actor error: {}", e))?;
+
+        rx.await
+            .map_err(|_| "Memory actor channel closed".to_string())?
+            .map_err(|e| format!("Memory node failed to resolve ticket fully: {}", e))?;
+
+        // 2. Inject tool response into memory
+        if let Some(id) = tool_call_id {
+            if let Ok(mut mem) = self.session_manager.get_session(session_key).await {
+                mem.add_message(crate::utils::ChatMessage::tool(&inbound.content, id))
+                    .await
+                    .map_err(|e| format!("Failed to inject tool response into memory: {}", e))?;
+            } else {
+                return Err(format!("Failed to get session {}", session_key));
+            }
+        }
+
+        // 3. Spawn turn with resume metadata
+        let mut resumed_inbound = inbound.clone();
+        resumed_inbound.metadata.insert(
+            crate::bus::METADATA_SYNTHETIC_BACKGROUND_RESUME.to_string(),
+            serde_json::json!(true),
+        );
+        resumed_inbound.metadata.insert(
+            crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
+            serde_json::json!(job_id),
+        );
+
+        spawn_main_chat_reasoning_turn(self.reasoning_spawn_args().await, resumed_inbound);
+        Ok(())
     }
 }
 
@@ -1560,6 +1893,7 @@ impl AgentLogic {
             .send(BusMessage::Telemetry(TelemetryEvent::AgentThought {
                 chat_id: inbound.chat_id.clone(),
                 thought: "I am starting to process your request...".to_string(),
+                background_job_id: crate::bus::get_background_job_id(&inbound.metadata),
             }))
             .await;
 
@@ -1721,12 +2055,20 @@ impl AgentLogic {
                         &persisted,
                     )
                     .await;
-                    let banner = build_llm_failed_banner(
+                    let mut banner = build_llm_failed_banner(
                         &inbound.channel,
                         &inbound.chat_id,
                         inbound.thread_id.as_deref(),
                         &err,
                     );
+                    if let Some(job_id) =
+                        inbound.metadata.get(crate::bus::METADATA_BACKGROUND_JOB_ID)
+                    {
+                        banner.metadata.insert(
+                            crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
+                            job_id.clone(),
+                        );
+                    }
                     let _ = outbound_tx.send(BusMessage::Outbound(banner)).await;
                     return Err(err);
                 }
@@ -1744,6 +2086,7 @@ impl AgentLogic {
                     prompt_tokens: usage.prompt_tokens,
                     completion_tokens: usage.completion_tokens,
                     total_tokens: usage.total_tokens,
+                    background_job_id: crate::bus::get_background_job_id(&inbound.metadata),
                 };
                 let _ = outbound_tx
                     .send(BusMessage::Telemetry(usage_evt.clone()))
@@ -1757,6 +2100,7 @@ impl AgentLogic {
                     .send(BusMessage::Telemetry(TelemetryEvent::AgentThought {
                         chat_id: inbound.chat_id.clone(),
                         thought: reasoning.clone(),
+                        background_job_id: crate::bus::get_background_job_id(&inbound.metadata),
                     }))
                     .await;
             }
@@ -1882,6 +2226,13 @@ impl AgentLogic {
                         }
                         let tool_result = match fin {
                             ToolExecutionFinished::Completed(res) => res,
+                            ToolExecutionFinished::Waiting(ticket_id) => {
+                                // Break the iteration loop; the job is now in 'waiting' state.
+                                return Ok(format!(
+                                    "{}{}",
+                                    WAITING_FOR_USER_RESULT_PREFIX, ticket_id
+                                ));
+                            }
                             ToolExecutionFinished::Cancelled => {
                                 persist_and_cancel!();
                             }
@@ -1894,6 +2245,7 @@ impl AgentLogic {
                             tool_name: tool_name.clone(),
                             result: tool_result_text.clone(),
                             tool_call_id: Some(tc.id.clone()),
+                            background_job_id: crate::bus::get_background_job_id(&inbound.metadata),
                         };
                         let _ = outbound_tx.send(BusMessage::Telemetry(tr.clone())).await;
                         hook_observe_telemetry(hook_tool_ctx.as_ref(), &inbound, is_subagent, tr);
@@ -1901,6 +2253,7 @@ impl AgentLogic {
                             chat_id: inbound.chat_id.clone(),
                             tool_name,
                             result: tool_result_text.clone(),
+                            background_job_id: crate::bus::get_background_job_id(&inbound.metadata),
                         };
                         let _ = outbound_tx.send(BusMessage::Telemetry(tfin.clone())).await;
                         hook_observe_telemetry(hook_tool_ctx.as_ref(), &inbound, is_subagent, tfin);
@@ -1969,6 +2322,13 @@ impl AgentLogic {
                         .await
                         {
                             ToolExecutionFinished::Completed(res) => res,
+                            ToolExecutionFinished::Waiting(ticket_id) => {
+                                // Break the iteration loop; the job is now in 'waiting' state.
+                                return Ok(format!(
+                                    "{}{}",
+                                    WAITING_FOR_USER_RESULT_PREFIX, ticket_id
+                                ));
+                            }
                             ToolExecutionFinished::Cancelled => {
                                 persist_and_cancel!();
                             }
@@ -1982,6 +2342,7 @@ impl AgentLogic {
                             tool_name: tool_name.to_string(),
                             result: tool_result_text.clone(),
                             tool_call_id: Some(tc.id.clone()),
+                            background_job_id: crate::bus::get_background_job_id(&inbound.metadata),
                         };
                         let _ = outbound_tx.send(BusMessage::Telemetry(tr.clone())).await;
                         hook_observe_telemetry(hook_tool_ctx.as_ref(), &inbound, is_subagent, tr);
@@ -1990,6 +2351,7 @@ impl AgentLogic {
                             chat_id: inbound.chat_id.clone(),
                             tool_name: tn,
                             result: tool_result_text.clone(),
+                            background_job_id: crate::bus::get_background_job_id(&inbound.metadata),
                         };
                         let _ = outbound_tx.send(BusMessage::Telemetry(tfin.clone())).await;
                         hook_observe_telemetry(hook_tool_ctx.as_ref(), &inbound, is_subagent, tfin);
@@ -2042,12 +2404,20 @@ impl AgentLogic {
                     .to_string();
 
                 // Emit outbound response payload.
+                let mut metadata = HashMap::new();
+                if let Some(job_id) = inbound.metadata.get(crate::bus::METADATA_BACKGROUND_JOB_ID) {
+                    metadata.insert(
+                        crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
+                        job_id.clone(),
+                    );
+                }
+
                 let outbound = OutboundMessage {
                     channel: inbound.channel.clone(),
                     chat_id: inbound.chat_id.clone(),
                     thread_id: inbound.thread_id.clone(),
                     content: final_response.clone(),
-                    metadata: HashMap::new(),
+                    metadata,
                 };
 
                 let _ = logger_tx.send(BusMessage::Log(

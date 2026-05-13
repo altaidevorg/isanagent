@@ -153,6 +153,9 @@ type NotificationItem = {
   kind: string;
   title: string;
   body: string;
+  chat_id: string;
+  action_kind?: string | null;
+  action_payload?: string | null;
   seen_at_ms?: number | null;
   resolved_at_ms?: number | null;
   created_at_ms: number;
@@ -588,6 +591,45 @@ export default function App() {
   const [showWorkspaceModal, setShowWorkspaceModal] = useState(false);
   const [showBackgroundPanel, setShowBackgroundPanel] = useState(false);
   const [workspacePaneNonce, setWorkspacePaneNonce] = useState(0);
+
+  // Custom dialog state to replace window.confirm/prompt
+  const [dialogConfig, setDialogConfig] = useState<{
+    type: 'confirm' | 'prompt';
+    title: string;
+    message: string;
+    onConfirm: (value?: string) => void;
+    onCancel: () => void;
+    defaultValue?: string;
+  } | null>(null);
+
+  const dialogInputRef = useRef<HTMLInputElement>(null);
+
+  const showConfirm = (title: string, message: string, onConfirm: () => void) => {
+    setDialogConfig({
+      type: 'confirm',
+      title,
+      message,
+      onConfirm: () => {
+        onConfirm();
+        setDialogConfig(null);
+      },
+      onCancel: () => setDialogConfig(null),
+    });
+  };
+
+  const showPrompt = (title: string, message: string, defaultValue: string, onConfirm: (val: string) => void) => {
+    setDialogConfig({
+      type: 'prompt',
+      title,
+      message,
+      defaultValue,
+      onConfirm: (val) => {
+        if (val !== undefined) onConfirm(val);
+        setDialogConfig(null);
+      },
+      onCancel: () => setDialogConfig(null),
+    });
+  };
   const [jobs, setJobs] = useState<BackgroundJob[]>([]);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [summaries, setSummaries] = useState<SummaryEntry[]>([]);
@@ -620,55 +662,25 @@ export default function App() {
     }
   }, []);
 
-  const loadBackgroundData = useCallback(async () => {
+  const loadHistory = useCallback(async (sessionId: string) => {
+    setHistoryLoading(true);
+    setErrorMessage(null);
     try {
-      const [jobsRes, notifRes] = await Promise.all([
-        fetch("/v1/background-jobs?limit=100"),
-        fetch("/v1/notifications?limit=100"),
-      ]);
-      if (jobsRes.ok) {
-        setJobs((await jobsRes.json()) as BackgroundJob[]);
+      const response = await fetch(`/v1/threads/${encodeURIComponent(sessionId)}/messages`);
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as
+          | { error?: { message?: string } }
+          | null;
+        throw new Error(payload?.error?.message || `History request failed (${response.status}).`);
       }
-      if (notifRes.ok) {
-        setNotifications((await notifRes.json()) as NotificationItem[]);
-      }
-    } catch {
-      // keep UI best-effort
+      const rows = (await response.json()) as HistoryRow[];
+      setMessages(historyRowsToMessages(rows));
+    } catch (error) {
+      setErrorMessage(buildErrorMessage(error));
+    } finally {
+      setHistoryLoading(false);
     }
   }, []);
-
-  const updateSummary = async (id: number, updated: Partial<SummaryEntry>) => {
-    try {
-      const response = await fetch(`/v1/summaries/${id}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(updated),
-      });
-      if (!response.ok) {
-        throw new Error(`Failed to update summary (${response.status})`);
-      }
-      setSummaries((prev) => prev.map((s) => (s.id === id ? { ...s, ...updated } : s)));
-    } catch (error) {
-      console.error(error);
-      setErrorMessage(buildErrorMessage(error));
-    }
-  };
-
-  const deleteSummary = async (id: number) => {
-    if (!confirm("Are you sure you want to delete this summary?")) return;
-    try {
-      const response = await fetch(`/v1/summaries/${id}`, {
-        method: "DELETE",
-      });
-      if (!response.ok) {
-        throw new Error(`Failed to delete summary (${response.status})`);
-      }
-      setSummaries((prev) => prev.filter((s) => s.id !== id));
-    } catch (error) {
-      console.error(error);
-      setErrorMessage(buildErrorMessage(error));
-    }
-  };
 
   const loadSessions = useCallback(async () => {
     setSessionsLoading(true);
@@ -691,29 +703,140 @@ export default function App() {
     }
   }, [requestUserId]);
 
+  const openSession = (entry: ThreadListEntry) => {
+    startTransition(() => {
+      setErrorMessage(null);
+      persistSessionPointers(entry.thread_id, entry.latest_response_id);
+      setInternalChatId(entry.thread_id);
+      setLatestResponseId(entry.latest_response_id);
+      void loadHistory(entry.thread_id);
+      void loadSummaries(entry.thread_id);
+    });
+  };
+
+  const jumpToThread = useCallback((threadId: string) => {
+    const entry = sessions.find(s => s.thread_id === threadId);
+    if (entry) {
+      openSession(entry);
+    } else {
+      setInternalChatId(threadId);
+      setLatestResponseId(null);
+      void loadHistory(threadId);
+      void loadSummaries(threadId);
+    }
+    setShowBackgroundPanel(false);
+  }, [sessions, loadHistory, loadSummaries]);
+
+  const loadBackgroundData = useCallback(async () => {
+    try {
+      const [jobsRes, notifRes] = await Promise.all([
+        fetch("/v1/background-jobs?limit=100"),
+        fetch("/v1/notifications?limit=100"),
+      ]);
+      if (jobsRes.ok) {
+        setJobs((await jobsRes.json()) as BackgroundJob[]);
+      }
+      if (notifRes.ok) {
+        setNotifications((await notifRes.json()) as NotificationItem[]);
+      }
+    } catch {
+      // keep UI best-effort
+    }
+  }, []);
+
+  const replyToTicket = async (ticketId: string, response: string) => {
+    try {
+      const res = await fetch(`/v1/clarification-tickets/${encodeURIComponent(ticketId)}/reply`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ response }),
+      });
+      if (res.ok) {
+        void loadBackgroundData();
+      } else {
+        const payload = (await res.json().catch(() => null)) as ApiErrorPayload;
+        setErrorMessage(payload?.error?.message || "Failed to send reply");
+      }
+    } catch (err) {
+      console.error(err);
+      setErrorMessage(buildErrorMessage(err));
+    }
+  };
+
+  const dismissTicket = async (ticketId: string) => {
+    try {
+      const res = await fetch(`/v1/clarification-tickets/${encodeURIComponent(ticketId)}/dismiss`, {
+        method: "POST",
+      });
+      if (res.ok) {
+        void loadBackgroundData();
+      } else {
+        const payload = (await res.json().catch(() => null)) as ApiErrorPayload;
+        setErrorMessage(payload?.error?.message || "Failed to dismiss request");
+      }
+    } catch (err) {
+      console.error(err);
+      setErrorMessage(buildErrorMessage(err));
+    }
+  };
+
+  const dismissBackgroundJob = async (jobId: string) => {
+    try {
+      const res = await fetch(`/v1/background-jobs/${encodeURIComponent(jobId)}/dismiss`, {
+        method: "POST",
+      });
+      if (res.ok) {
+        void loadBackgroundData();
+      } else {
+        const payload = (await res.json().catch(() => null)) as ApiErrorPayload;
+        setErrorMessage(payload?.error?.message || "Failed to dismiss job");
+      }
+    } catch (err) {
+      console.error(err);
+      setErrorMessage(buildErrorMessage(err));
+    }
+  };
+
+  const updateSummary = async (id: number, updated: Partial<SummaryEntry>) => {
+    try {
+      const response = await fetch(`/v1/summaries/${id}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(updated),
+      });
+      if (!response.ok) {
+        throw new Error(`Failed to update summary (${response.status})`);
+      }
+      setSummaries((prev) => prev.map((s) => (s.id === id ? { ...s, ...updated } : s)));
+    } catch (error) {
+      console.error(error);
+      setErrorMessage(buildErrorMessage(error));
+    }
+  };
+
+  const deleteSummary = (id: number) => {
+    showConfirm("Delete summary", "Are you sure you want to delete this summary?", async () => {
+      try {
+        const response = await fetch(`/v1/summaries/${id}`, {
+          method: "DELETE",
+        });
+        if (!response.ok) {
+          throw new Error(`Failed to delete summary (${response.status})`);
+        }
+        setSummaries((prev) => prev.filter((s) => s.id !== id));
+      } catch (error) {
+        console.error(error);
+        setErrorMessage(buildErrorMessage(error));
+      }
+    });
+  };
+
+
   useEffect(() => {
     void loadSessions();
   }, [loadSessions]);
 
-  const loadHistory = useCallback(async (sessionId: string) => {
-    setHistoryLoading(true);
-    setErrorMessage(null);
-    try {
-      const response = await fetch(`/v1/threads/${encodeURIComponent(sessionId)}/messages`);
-      if (!response.ok) {
-        const payload = (await response.json().catch(() => null)) as
-          | { error?: { message?: string } }
-          | null;
-        throw new Error(payload?.error?.message || `History request failed (${response.status}).`);
-      }
-      const rows = (await response.json()) as HistoryRow[];
-      setMessages(historyRowsToMessages(rows));
-    } catch (error) {
-      setErrorMessage(buildErrorMessage(error));
-    } finally {
-      setHistoryLoading(false);
-    }
-  }, []);
+  // loadBackgroundData is now defined above
 
   useEffect(() => {
     const id = readPersistedThreadId();
@@ -738,16 +861,6 @@ export default function App() {
     });
   };
 
-  const openSession = (entry: ThreadListEntry) => {
-    startTransition(() => {
-      setErrorMessage(null);
-      persistSessionPointers(entry.thread_id, entry.latest_response_id);
-      setInternalChatId(entry.thread_id);
-      setLatestResponseId(entry.latest_response_id);
-      void loadHistory(entry.thread_id);
-      void loadSummaries(entry.thread_id);
-    });
-  };
 
   const requestDeleteSession = (entry: ThreadListEntry, event: MouseEvent<HTMLButtonElement>) => {
     event.stopPropagation();
@@ -1059,7 +1172,7 @@ export default function App() {
       ) : null}
       {showBackgroundPanel ? (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
           role="dialog"
           aria-modal="true"
           aria-labelledby="background-runtime-title"
@@ -1069,35 +1182,144 @@ export default function App() {
             }
           }}
         >
-          <div className="flex h-full max-h-[90vh] w-full max-w-3xl flex-col rounded-xl border border-border bg-card shadow-lg overflow-hidden">
-            <div className="flex items-center justify-between border-b border-border p-4">
-              <h2 id="background-runtime-title" className="text-lg font-semibold text-foreground">Background Runtime</h2>
-              <Button variant="ghost" size="sm" onClick={() => setShowBackgroundPanel(false)}>
-                Close
+          <div className="flex h-full max-h-[85vh] w-full max-w-4xl flex-col rounded-2xl border border-border bg-card shadow-2xl overflow-hidden animate-in fade-in zoom-in duration-200">
+            <div className="flex items-center justify-between border-b border-border px-6 py-4 bg-muted/30">
+              <div className="flex items-center gap-3">
+                <div className="h-2 w-2 rounded-full bg-primary animate-pulse" />
+                <h2 id="background-runtime-title" className="text-lg font-semibold tracking-tight text-foreground">Background Runtime</h2>
+              </div>
+              <Button variant="ghost" size="sm" className="h-8 w-8 p-0 rounded-full" onClick={() => setShowBackgroundPanel(false)}>
+                ×
               </Button>
             </div>
-            <div className="grid flex-1 grid-cols-2 gap-4 overflow-y-auto p-4">
-              <div className="rounded-lg border border-border p-3">
-                <p className="text-xs font-semibold uppercase text-muted-foreground">Jobs</p>
-                <ul className="mt-2 space-y-2">
-                  {jobs.map((job) => (
-                    <li key={job.job_id} className="rounded border border-border p-2 text-xs">
-                      <div>{job.kind} - {job.state}</div>
-                      <div className="text-muted-foreground">{job.job_id}</div>
-                    </li>
-                  ))}
-                </ul>
+            <div className="flex flex-1 overflow-hidden">
+              {/* Jobs column */}
+              <div className="w-1/2 flex flex-col border-r border-border">
+                <div className="p-4 border-b border-border bg-muted/10">
+                  <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">Active Jobs</p>
+                </div>
+                <div className="flex-1 overflow-y-auto p-4 space-y-3">
+                  {jobs.length === 0 ? (
+                    <div className="flex h-full items-center justify-center text-muted-foreground text-sm italic">
+                      No active background jobs
+                    </div>
+                  ) : (
+                    jobs.map((job) => (
+                      <div 
+                        key={job.job_id} 
+                        className={cn(
+                          "group rounded-xl border border-border p-4 transition-all hover:bg-muted/50 cursor-pointer",
+                          job.state === "waiting" ? "border-yellow-500/50 bg-yellow-500/5 shadow-sm" : ""
+                        )}
+                        onClick={() => jumpToThread(job.chat_id)}
+                      >
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="font-mono text-[10px] text-muted-foreground truncate max-w-[150px]">{job.job_id}</span>
+                          <span className={cn(
+                            "px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-tighter",
+                            job.state === "running" ? "bg-primary/20 text-primary animate-pulse" : 
+                            job.state === "waiting" ? "bg-yellow-500/20 text-yellow-600 dark:text-yellow-400" :
+                            "bg-muted text-muted-foreground"
+                          )}>
+                            {job.state}
+                          </span>
+                        </div>
+                        <p className="text-sm font-medium text-foreground">{job.kind}</p>
+                        <div className="mt-3 flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <span className="text-[10px] text-muted-foreground">Updated {new Date(job.updated_at_ms).toLocaleTimeString()}</span>
+                            <button 
+                              className="text-[10px] text-destructive hover:underline"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                showConfirm("Dismiss Job", "Dismiss this background job and all associated requests?", () => {
+                                  void dismissBackgroundJob(job.job_id);
+                                });
+                              }}
+                            >
+                              Dismiss
+                            </button>
+                          </div>
+                          <span className="text-[10px] text-primary opacity-0 group-hover:opacity-100 transition-opacity">View thread →</span>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
               </div>
-              <div className="rounded-lg border border-border p-3">
-                <p className="text-xs font-semibold uppercase text-muted-foreground">Notifications</p>
-                <ul className="mt-2 space-y-2">
-                  {notifications.map((n) => (
-                    <li key={n.notification_id} className="rounded border border-border p-2 text-xs">
-                      <div>{n.title}</div>
-                      <div className="text-muted-foreground">{n.body}</div>
-                    </li>
-                  ))}
-                </ul>
+
+              {/* Notifications column */}
+              <div className="w-1/2 flex flex-col">
+                <div className="p-4 border-b border-border bg-muted/10">
+                  <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">Notifications</p>
+                </div>
+                <div className="flex-1 overflow-y-auto p-4 space-y-3">
+                  {notifications.length === 0 ? (
+                    <div className="flex h-full items-center justify-center text-muted-foreground text-sm italic">
+                      No notifications
+                    </div>
+                  ) : (
+                    notifications.map((n) => (
+                      <div 
+                        key={n.notification_id} 
+                        className={cn(
+                          "rounded-xl border border-border p-4 transition-all",
+                          !n.seen_at_ms ? "bg-primary/5 border-primary/30" : "bg-card",
+                          n.kind === "clarification_ticket" && !n.resolved_at_ms ? "border-yellow-500/50 shadow-sm" : ""
+                        )}
+                      >
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
+                            {n.kind.replace(/_/g, ' ')}
+                          </span>
+                          <span className="text-[10px] text-muted-foreground">{new Date(n.created_at_ms).toLocaleTimeString()}</span>
+                        </div>
+                        <h4 className="text-sm font-semibold text-foreground mb-1">{n.title}</h4>
+                        <p className="text-xs text-muted-foreground leading-relaxed mb-4">{n.body}</p>
+                        
+                        <div className="flex flex-wrap gap-2">
+                          {n.kind === "clarification_ticket" && !n.resolved_at_ms ? (
+                            <Button 
+                              size="sm" 
+                              className="h-7 text-[10px] font-bold uppercase tracking-widest bg-yellow-500 hover:bg-yellow-600 text-white border-0"
+                              onClick={() => {
+                                showPrompt("Reply to request", "Enter your response:", "", (reply) => {
+                                  if (reply.trim()) {
+                                    void replyToTicket(n.action_payload || "", reply.trim());
+                                  }
+                                });
+                              }}
+                            >
+                              Reply to request
+                            </Button>
+                          ) : null}
+                          <Button 
+                            variant="outline" 
+                            size="sm" 
+                            className="h-7 text-[10px] font-bold uppercase tracking-widest"
+                            onClick={() => jumpToThread(n.chat_id)}
+                          >
+                            View context
+                          </Button>
+                          {n.kind === "clarification_ticket" && !n.resolved_at_ms && (
+                            <Button 
+                              variant="ghost" 
+                              size="sm" 
+                              className="h-7 text-[10px] font-bold uppercase tracking-widest text-destructive hover:text-destructive hover:bg-destructive/10"
+                              onClick={() => {
+                                showConfirm("Dismiss Request", "Dismiss this request? This will also mark the background job as completed.", () => {
+                                  void dismissTicket(n.action_payload || "");
+                                });
+                              }}
+                            >
+                              Dismiss
+                            </Button>
+                          )}
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
               </div>
             </div>
           </div>
@@ -1130,6 +1352,57 @@ export default function App() {
           </div>
         </div>
       ) : null}
+
+      {dialogConfig ? (
+        <div
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4"
+          role="dialog"
+          aria-modal="true"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) {
+              dialogConfig.onCancel();
+            }
+          }}
+        >
+          <div className="w-full max-w-md rounded-xl border border-border bg-card p-6 shadow-xl">
+            <h2 className="text-lg font-semibold text-foreground mb-2">{dialogConfig.title}</h2>
+            <p className="text-sm text-muted-foreground mb-6">{dialogConfig.message}</p>
+            
+            {dialogConfig.type === 'prompt' && (
+              <input
+                ref={dialogInputRef}
+                autoFocus
+                className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm mb-6 focus:outline-none focus:ring-2 focus:ring-primary"
+                defaultValue={dialogConfig.defaultValue}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    dialogConfig.onConfirm(dialogInputRef.current?.value || '');
+                  } else if (e.key === 'Escape') {
+                    dialogConfig.onCancel();
+                  }
+                }}
+              />
+            )}
+            
+            <div className="flex justify-end gap-3">
+              <Button variant="ghost" onClick={dialogConfig.onCancel}>
+                Cancel
+              </Button>
+              <Button
+                onClick={() => {
+                  if (dialogConfig.type === 'prompt') {
+                    dialogConfig.onConfirm(dialogInputRef.current?.value || '');
+                  } else {
+                    dialogConfig.onConfirm();
+                  }
+                }}
+              >
+                {dialogConfig.type === 'confirm' ? 'Confirm' : 'OK'}
+              </Button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       <aside className="flex w-64 shrink-0 flex-col border-r border-border bg-background/90 backdrop-blur-md">
         <div className="border-b border-border p-3">
           <div className="flex items-center justify-between gap-2">
@@ -1154,13 +1427,16 @@ export default function App() {
           <Button
             variant="outline"
             size="sm"
-            className="mt-2 w-full"
+            className="mt-2 w-full relative"
             onClick={() => {
               void loadBackgroundData();
               setShowBackgroundPanel(true);
             }}
           >
             Background
+            {notifications.some(n => !n.seen_at_ms || (n.kind === "clarification_ticket" && !n.resolved_at_ms)) && (
+              <span className="absolute -top-1 -right-1 h-3 w-3 rounded-full bg-primary border-2 border-background animate-pulse" />
+            )}
           </Button>
           <Button
             variant="outline"
@@ -1824,7 +2100,7 @@ function SummaryList({
 }: {
   summaries: SummaryEntry[];
   onUpdate: (id: number, updated: Partial<SummaryEntry>) => Promise<void>;
-  onDelete: (id: number) => Promise<void>;
+  onDelete: (id: number) => void;
   onClose: () => void;
 }) {
   const [editingId, setEditingId] = useState<number | null>(null);
