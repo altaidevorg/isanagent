@@ -493,9 +493,9 @@ Recommended scope for the follow-up PR:
 
 ### 9.5 Original audit checklist (for reference)
 
-Kept below as the original Phase 0.0b proposal. Items that landed are checked above in §9.0; deferred items are tracked in §9.1–9.3.
+Kept below as the original Phase 0.0b proposal. Subsections are numbered §9.5.x to avoid collision with the top-level §9.1–§9.4 above. Items that landed are checked in §9.0; deferred items live in §9.1–§9.3.
 
-### 9.1 Add `#[non_exhaustive]`
+### 9.5.1 Add `#[non_exhaustive]`
 
 Apply the marker to:
 
@@ -526,7 +526,7 @@ Apply `#[non_exhaustive]` to these **structs** (forces struct-update syntax on c
 
 > **Caveat for `#[non_exhaustive]` on structs.** Once applied, downstream crates can no longer construct the struct with a struct literal *unless* they use struct-update syntax with a `Default` impl. Phase 0.0b must therefore also `#[derive(Default)]` where it makes sense, or provide a `pub fn new(...)` constructor and convert downstream sites to use it. For `AgentLogicParams` specifically, the field count is large enough that an explicit builder would be cleaner than `Default`.
 
-### 9.2 Add `#[serde(default)]` to fields likely to gain peers
+### 9.5.2 Add `#[serde(default)]` to fields likely to gain peers
 
 For every `#[derive(Serialize, Deserialize)]` struct in §4, §5.3, and §6 that currently has a "required" field, mark it `#[serde(default)]` if a future overhaul PR may add a sibling field. This lets old on-disk blobs deserialize after we add new fields.
 
@@ -536,7 +536,7 @@ Priority targets:
 - [ ] Every struct field on persisted records (`SubagentTaskRecord`, `BackgroundJobRecord`, `NotificationRecord`, `ClarificationTicketRecord`) — these live in SQLite and survive process restart.
 - [ ] All config struct fields — these load from TOML and old TOML files must keep working after we add `[harness.compaction.*]` keys.
 
-### 9.3 Default-value strategy
+### 9.5.3 Default-value strategy
 
 Phase 0.0b must decide between two patterns for each struct:
 
@@ -545,7 +545,7 @@ Phase 0.0b must decide between two patterns for each struct:
 
 Recommendation: **builder for `AgentLogicParams` and `SubagentHarnessParams`; `Default` for everything else**. The builder change is invasive but pays for itself across every future overhaul PR.
 
-### 9.4 Items intentionally NOT in scope for Phase 0.0b
+### 9.5.4 Items intentionally NOT in scope for Phase 0.0b
 
 - `Tool`, `Provider`, `Memory` traits — already minimal; adding methods would be breaking regardless of markers. Defer trait evolution policy.
 - `ActorLogic<T>` — same rationale.
@@ -689,7 +689,7 @@ The v2 plan's "single highest-leverage change," scoped down to the **transient-s
 - **New MemoryMessage variants.** `CacheToolResult { tool_call_id, chat_id, session_key, tool_name, full_content, compact_summary, reply }` upserts by `tool_call_id`. `FetchToolResult { tool_call_id, reply }` returns `Ok(None)` for cache misses. Both variants safely additive under Phase 0.0b's `#[non_exhaustive]`.
 - **New `TelemetryEvent::ToolResultRefetch { chat_id, tool_call_id }`** emitted on every successful `recall_tool_result` call. Logger arm added; eval tooling can correlate recall counts against compaction wins (frequent recalls = over-aggressive swap).
 - **Compact placeholder format.** [src/agent/compaction.rs](../src/agent/compaction.rs) `build_compact_placeholder(tool_call_id, tool_name, full_content)` emits `[Tool result archived. Recall: recall_tool_result(tool_call_id="…"). Original: tool=… bytes=… head="…"]`. UTF-8-safe head excerpt (≤ 80 bytes), newlines flattened to spaces so the placeholder stays single-line.
-- **In-place swap.** [src/agent/compaction.rs](../src/agent/compaction.rs) `swap_stale_tool_results_in_place(context: &mut [ChatMessage]) -> (count, Vec<(id, full, name)>)`. Idempotent — re-running on already-swapped messages is a no-op (placeholders detected by prefix). Skips tool messages without `tool_call_id` (can't be recalled).
+- **In-place swap.** [src/agent/compaction.rs](../src/agent/compaction.rs) `swap_all_tool_results_in_place(context: &mut [ChatMessage]) -> (count, Vec<(tool_call_id, full_content, tool_name)>)`. Renamed from the original `swap_stale_tool_results_in_place` because the function applies no staleness logic itself — it swaps every eligible tool result; the *caller* controls eligibility by selecting which messages to put in `context`. (Position-based staleness lives in `identify_stale_tool_swaps`.) Eligibility is shared with both other swap paths via [`try_build_tool_swap`](../src/agent/compaction.rs). Idempotent — re-running on already-swapped messages is a no-op (placeholder prefix detected). Tool messages without `tool_call_id` are skipped (can't be recalled).
 - **`do_compaction` integration.** Before the summarizer prompt is built, `do_compaction` now clones `current_context` into a local `Vec`, runs the swap, persists each cached entry via `CacheToolResult`, and feeds the swapped vec into preprocessing + summarization. **The stored messages table is NOT mutated** — only the summarizer's input is smaller. Net effect: lower summarizer LLM cost on tool-heavy sessions. Persistent DB-mutating swap is **PR-7.1**.
 - **`RecallToolResultTool`.** [src/tools/recall.rs](../src/tools/recall.rs) — new built-in tool registered in [src/main.rs:502](../src/main.rs#L502). Parameter: `tool_call_id: string`. Fetches from cache via `FetchToolResult`, returns the full content. Emits `ToolResultRefetch` telemetry on success.
 - **Acceptance status.**

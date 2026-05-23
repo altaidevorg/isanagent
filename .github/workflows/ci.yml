@@ -27,6 +27,18 @@ jobs:
         with:
           shared-key: pr-check
 
+      # Two pre-existing tests spawn external binaries and assume they're on
+      # PATH: `tools::builtin::python_run_tests::test_python_run_basic` shells
+      # out to `python` (not `python3`), and `execution::local::tests::uv_managed_*`
+      # shells out to `uv`. Both pass locally on developer machines that have
+      # these installed; the bare ubuntu runner doesn't. Install both so the
+      # gate matches local behavior — alternative would be `#[ignore]` markers,
+      # but that would silently drop real coverage.
+      - name: Install python (python -> python3 symlink)
+        run: sudo apt-get install -y python-is-python3
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
       # Fast type-check across all targets first so trivial errors fail loudly
       # before the slower release builds below.
       - name: cargo check

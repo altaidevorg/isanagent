@@ -45,20 +45,27 @@ pub const RESERVE_TOKENS_DEFAULT: usize = 16_384;
 ///
 /// When `window` is `None`, returns `absolute` unchanged — provider doesn't
 /// know its own context size, so we can't safely use a relative threshold.
+///
+/// **Degenerate-config defense.** When the caller misconfigures (`reserve >= window`,
+/// `percentage <= 0`, or `percentage > 1`), naive computation produces a 0-or-near-0
+/// threshold; `approx_tokens >= 0` is always true, so compaction would fire every
+/// turn — an infinite-loop trap. In those cases the function falls back to
+/// `absolute`. A final `.max(1)` guarantees the return is never literally zero.
 pub fn effective_compaction_threshold(
     absolute: usize,
     window: Option<usize>,
     percentage: f32,
     reserve: usize,
 ) -> usize {
-    match window {
-        Some(w) => {
-            let pct_bound = ((w as f32) * percentage) as usize;
-            let reserve_bound = w.saturating_sub(reserve);
-            absolute.min(pct_bound).min(reserve_bound)
-        }
-        None => absolute,
+    let Some(w) = window else {
+        return absolute.max(1);
+    };
+    if reserve >= w || !(0.0 < percentage && percentage <= 1.0) {
+        return absolute.max(1);
     }
+    let pct_bound = ((w as f32) * percentage) as usize;
+    let reserve_bound = w - reserve; // safe: reserve < w by the guard above
+    absolute.min(pct_bound).min(reserve_bound).max(1)
 }
 
 /// Rough token estimate per byte. Same heuristic used by the existing
@@ -361,57 +368,85 @@ pub fn identify_stale_tool_swaps(
         if user_turns_seen < keep_recent_user_turns {
             continue;
         }
-        if msg.role != "tool" {
-            continue;
-        }
-        let Some(tool_call_id) = msg.tool_call_id.clone() else {
+        // Same swap predicate as the transient + at-compaction paths
+        // (`swap_all_tool_results_in_place` and `do_compaction`).
+        let Some(payload) = try_build_tool_swap(msg) else {
             continue;
         };
-        let tool_name = msg.name.clone().unwrap_or_else(|| "unknown".to_string());
-        let full = match &msg.content {
-            Some(c) => c.text_content(),
-            None => continue,
-        };
-        if full.starts_with("[Tool result archived.") {
-            continue;
-        }
-        let placeholder = build_compact_placeholder(&tool_call_id, &tool_name, &full);
-        results.push((*db_id, tool_call_id, tool_name, full, placeholder));
+        results.push((
+            *db_id,
+            payload.tool_call_id,
+            payload.tool_name,
+            payload.full_content,
+            payload.placeholder,
+        ));
     }
     results
 }
 
-/// PR-7: walk a transcript (the `current_context` slice fed to the summarizer)
-/// and replace tool-role messages with their compact placeholders in-place.
-/// Only messages whose `tool_call_id` is `Some(…)` are swapped — tool messages
-/// without an id can't be recalled, so swapping them would be lossy.
+/// PR-7: parsed payload for a single tool-result swap. Carries everything the
+/// caller needs to (a) write the original to `tool_result_cache` via
+/// `MemoryMessage::CacheToolResult` and (b) overwrite the message content
+/// (in memory, in the DB, or both — caller's choice).
+#[derive(Debug)]
+pub struct ToolSwapPayload {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub full_content: String,
+    pub placeholder: String,
+}
+
+/// PR-7: classify a single chat message — is it a swappable tool result?
+/// Returns `Some(payload)` when the message is a tool result with a
+/// `tool_call_id` whose content is not already a placeholder; `None` otherwise.
 ///
-/// Returns the count of messages swapped and the `(tool_call_id, full_content, tool_name)`
-/// triples for the caller to cache via `MemoryMessage::CacheToolResult`. Doing the cache
-/// write here would entangle this pure helper with the actor bus; the caller does it.
-pub fn swap_stale_tool_results_in_place(
+/// Single source of truth for the swap predicate. All three swap sites
+/// (`swap_all_tool_results_in_place` at the transient summarizer step,
+/// `identify_stale_tool_swaps` at the per-iteration staleness check, and
+/// `do_compaction`'s in-line ID-bearing swap) call this to decide eligibility.
+pub fn try_build_tool_swap(msg: &ChatMessage) -> Option<ToolSwapPayload> {
+    if msg.role != "tool" {
+        return None;
+    }
+    let tool_call_id = msg.tool_call_id.clone()?;
+    let tool_name = msg.name.clone().unwrap_or_else(|| "unknown".to_string());
+    let full_content = msg.content.as_ref()?.text_content();
+    if full_content.starts_with("[Tool result archived.") {
+        return None;
+    }
+    let placeholder = build_compact_placeholder(&tool_call_id, &tool_name, &full_content);
+    Some(ToolSwapPayload {
+        tool_call_id,
+        tool_name,
+        full_content,
+        placeholder,
+    })
+}
+
+/// PR-7: walk a transcript and replace **every** swappable tool-role message
+/// with its compact placeholder, in place. Only messages whose `tool_call_id`
+/// is `Some(…)` are swapped (orphans can't be recalled, so swapping them would
+/// be lossy). Caller controls "staleness" — by definition this swaps anything
+/// it can swap. For position-based staleness, use [`identify_stale_tool_swaps`].
+///
+/// Returns the count of messages swapped and `(tool_call_id, full_content, tool_name)`
+/// triples for the caller to forward to `MemoryMessage::CacheToolResult`.
+pub fn swap_all_tool_results_in_place(
     context: &mut [ChatMessage],
 ) -> (usize, Vec<(String, String, String)>) {
     let mut to_cache: Vec<(String, String, String)> = Vec::new();
     let mut swapped: usize = 0;
     for msg in context.iter_mut() {
-        if msg.role != "tool" {
-            continue;
-        }
-        let Some(tool_call_id) = msg.tool_call_id.clone() else {
+        let Some(payload) = try_build_tool_swap(msg) else {
             continue;
         };
-        let tool_name = msg.name.clone().unwrap_or_else(|| "unknown".to_string());
-        let full = match &msg.content {
-            Some(c) => c.text_content(),
-            None => continue,
-        };
-        // Skip if already a placeholder (idempotent on re-swap).
-        if full.starts_with("[Tool result archived.") {
-            continue;
-        }
-        let placeholder = build_compact_placeholder(&tool_call_id, &tool_name, &full);
-        to_cache.push((tool_call_id, full, tool_name));
+        let ToolSwapPayload {
+            tool_call_id,
+            tool_name,
+            full_content,
+            placeholder,
+        } = payload;
+        to_cache.push((tool_call_id, full_content, tool_name));
         msg.content = Some(crate::utils::MessageContent::Text(placeholder));
         swapped += 1;
     }
@@ -503,30 +538,26 @@ pub async fn do_compaction(args: DoCompactionArgs<'_>) -> CompactionOutcome {
     if messages_with_ids.is_empty() {
         // Fallback path — no IDs available, transient swap only.
         swapped_context = args.current_context.to_vec();
-        let (_, ce) = swap_stale_tool_results_in_place(&mut swapped_context);
+        let (_, ce) = swap_all_tool_results_in_place(&mut swapped_context);
         cache_entries = ce;
     } else {
         // Preferred path — swap on the ID-bearing tuples, harvest both the
-        // cache entries and the per-row UPDATE payloads in one pass.
+        // cache entries and the per-row UPDATE payloads in one pass. Uses
+        // the same `try_build_tool_swap` predicate as the transient and
+        // staleness paths so behavior stays consistent across call sites.
         let mut working: Vec<(i64, ChatMessage)> = messages_with_ids;
         cache_entries = Vec::new();
         for (db_id, msg) in working.iter_mut() {
-            if msg.role != "tool" {
-                continue;
-            }
-            let Some(tool_call_id) = msg.tool_call_id.clone() else {
+            let Some(payload) = try_build_tool_swap(msg) else {
                 continue;
             };
-            let tool_name = msg.name.clone().unwrap_or_else(|| "unknown".to_string());
-            let full = match &msg.content {
-                Some(c) => c.text_content(),
-                None => continue,
-            };
-            if full.starts_with("[Tool result archived.") {
-                continue;
-            }
-            let placeholder = build_compact_placeholder(&tool_call_id, &tool_name, &full);
-            cache_entries.push((tool_call_id, full, tool_name));
+            let ToolSwapPayload {
+                tool_call_id,
+                tool_name,
+                full_content,
+                placeholder,
+            } = payload;
+            cache_entries.push((tool_call_id, full_content, tool_name));
             id_updates.push((*db_id, placeholder.clone()));
             msg.content = Some(crate::utils::MessageContent::Text(placeholder));
         }
@@ -1048,7 +1079,7 @@ mod tests {
             tool_msg_with_id("c1", "huge result body".repeat(100).as_str(), "search_text"),
             ChatMessage::assistant("Found it."),
         ];
-        let (swapped, cached) = swap_stale_tool_results_in_place(&mut ctx);
+        let (swapped, cached) = swap_all_tool_results_in_place(&mut ctx);
         assert_eq!(swapped, 1);
         assert_eq!(cached.len(), 1);
         assert_eq!(cached[0].0, "c1");
@@ -1072,7 +1103,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
         }];
-        let (swapped, cached) = swap_stale_tool_results_in_place(&mut ctx);
+        let (swapped, cached) = swap_all_tool_results_in_place(&mut ctx);
         assert_eq!(swapped, 0);
         assert!(cached.is_empty());
     }
@@ -1189,20 +1220,44 @@ mod tests {
     #[test]
     fn swap_is_idempotent_on_already_swapped_messages() {
         let mut ctx = vec![tool_msg_with_id("c2", "first body", "x")];
-        let _ = swap_stale_tool_results_in_place(&mut ctx);
-        let (swapped_again, cached_again) = swap_stale_tool_results_in_place(&mut ctx);
+        let _ = swap_all_tool_results_in_place(&mut ctx);
+        let (swapped_again, cached_again) = swap_all_tool_results_in_place(&mut ctx);
         assert_eq!(swapped_again, 0, "re-swap must be a no-op");
         assert!(cached_again.is_empty());
     }
 
     #[test]
-    fn effective_threshold_handles_reserve_larger_than_window() {
-        // Defensive: reserve > window → saturating_sub(reserve) = 0. The
-        // function should still return *some* number; absolute remains the
-        // smallest non-zero floor here.
+    fn effective_threshold_falls_back_to_absolute_when_reserve_exceeds_window() {
+        // Degenerate config (reserve >= window). Without the guard, the naive
+        // computation would return 0 and trigger compaction every turn. With
+        // the guard, we fall back to `absolute` (the user's explicit ceiling).
         let t = effective_compaction_threshold(80_000, Some(50_000), 0.85, 100_000);
-        // pct = 42.5k → 42_500; reserve = 0; absolute = 80k → returns 0.
-        assert_eq!(t, 0);
+        assert_eq!(t, 80_000);
+    }
+
+    #[test]
+    fn effective_threshold_falls_back_to_absolute_for_invalid_percentage() {
+        // percentage <= 0 or > 1: drop the window-aware path entirely.
+        assert_eq!(
+            effective_compaction_threshold(80_000, Some(200_000), 0.0, 16_384),
+            80_000
+        );
+        assert_eq!(
+            effective_compaction_threshold(80_000, Some(200_000), -0.5, 16_384),
+            80_000
+        );
+        assert_eq!(
+            effective_compaction_threshold(80_000, Some(200_000), 1.5, 16_384),
+            80_000
+        );
+    }
+
+    #[test]
+    fn effective_threshold_never_returns_zero() {
+        // Final `.max(1)` floor — even if a future bound regresses to zero,
+        // callers never face `approx_tokens >= 0` always-true.
+        assert!(effective_compaction_threshold(0, None, 0.85, 16_384) >= 1);
+        assert!(effective_compaction_threshold(0, Some(200_000), 0.85, 16_384) >= 1);
     }
 
     #[test]
