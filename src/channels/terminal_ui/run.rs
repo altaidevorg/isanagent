@@ -2456,6 +2456,93 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 app.scroll_to_bottom();
                                 continue;
                             }
+                            // PR-5.1.1: `/context` — report the current chat's
+                            // context size. Read-only memory query; runs even while
+                            // a reasoning turn is active (the read goes through the
+                            // SqliteMemoryActor which serializes against writes).
+                            if text.eq_ignore_ascii_case("/context") {
+                                let session_key = crate::bus::clarification_session_key(
+                                    &channel_name,
+                                    &chat_id,
+                                    None,
+                                );
+                                let messages = rt.block_on(async {
+                                    let (tx, rx) = tokio::sync::oneshot::channel();
+                                    let _ = memory_node
+                                        .send_packet(crate::memory::MemoryMessage::GetContext {
+                                            thread_id: session_key.clone(),
+                                            reply: crate::memory::SharedReply::new(tx),
+                                        })
+                                        .await;
+                                    rx.await.ok().and_then(|r| r.ok()).unwrap_or_default()
+                                });
+                                let user_turns =
+                                    messages.iter().filter(|m| m.role == "user").count();
+                                let approx_tokens: usize = messages
+                                    .iter()
+                                    .map(|m| {
+                                        m.content
+                                            .as_ref()
+                                            .map_or(0, |c| c.text_content().len())
+                                            / 4
+                                    })
+                                    .sum();
+                                app.cells.push(Cell::System {
+                                    message: format!(
+                                        "Context: {} message(s) · {} user turn(s) · ~{} tokens (rough estimate, 4 chars per token). Use /compact to force a compaction.",
+                                        messages.len(),
+                                        user_turns,
+                                        approx_tokens
+                                    ),
+                                });
+                                continue;
+                            }
+                            // PR-5.1: `/compact [focus instructions]` — fires a
+                            // manual compaction for the current terminal chat by
+                            // posting `BusMessage::TriggerCompaction`. The agent's
+                            // per-chat FIFO guard runs the compaction between turns
+                            // (drops it with a warning if a reasoning turn is
+                            // currently active).
+                            if text.eq_ignore_ascii_case("/compact")
+                                || text.to_ascii_lowercase().starts_with("/compact ")
+                            {
+                                let focus = text
+                                    .strip_prefix("/compact")
+                                    .or_else(|| text.strip_prefix("/COMPACT"))
+                                    .unwrap_or("")
+                                    .trim()
+                                    .to_string();
+                                let session_key = crate::bus::clarification_session_key(
+                                    &channel_name,
+                                    &chat_id,
+                                    None,
+                                );
+                                let msg = BusMessage::TriggerCompaction {
+                                    session_key,
+                                    focus_instructions: if focus.is_empty() {
+                                        None
+                                    } else {
+                                        Some(focus.clone())
+                                    },
+                                    trigger: Some(crate::bus::CompactionTrigger::Manual),
+                                };
+                                if bus_tx.blocking_send(msg).is_err() {
+                                    app.cells.push(Cell::System {
+                                        message: "Bus closed; cannot trigger compaction.".into(),
+                                    });
+                                } else {
+                                    let note = if focus.is_empty() {
+                                        "Compaction requested. It will run between turns; next inbound will see a smaller context.".to_string()
+                                    } else {
+                                        format!(
+                                            "Compaction requested with focus: \"{}\". Next inbound will see a smaller context.",
+                                            focus
+                                        )
+                                    };
+                                    app.cells.push(Cell::System { message: note });
+                                }
+                                continue;
+                            }
                             if text.eq_ignore_ascii_case("/model")
                                 || text.to_ascii_lowercase().starts_with("/model ")
                             {
@@ -2493,7 +2580,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             }
                             app.cells.push(Cell::System {
                             message:
-                                "Unknown command. Try /help, /exit, /new, /chats, /copy, /install-python, /cancel, /background, /retry, /tools, /exec, /agents, /model."
+                                "Unknown command. Try /help, /exit, /new, /chats, /copy, /install-python, /cancel, /background, /retry, /tools, /exec, /agents, /model, /compact, /context."
                                     .into(),
                         });
                             continue;

@@ -1,4 +1,4 @@
-use crate::bus::{BusMessage, LogEvent};
+use crate::bus::{BusMessage, LogEvent, ReflectionKind, TelemetryEvent};
 use crate::config::MemoryConfig;
 use crate::logging::LoggerHandle;
 use crate::memory::{MemoryMessage, SharedReply};
@@ -114,6 +114,15 @@ impl ReflectionEngine {
                 continue;
             }
 
+            let reflection_started = std::time::Instant::now();
+            let _ = self
+                .logger_tx
+                .send(BusMessage::Telemetry(TelemetryEvent::ReflectionStarted {
+                    chat_id: Some(session_id.clone()),
+                    kind: ReflectionKind::ShortTerm,
+                    inputs_consumed: new_messages.len().min(u32::MAX as usize) as u32,
+                }));
+
             let _ = self.logger_tx.send(BusMessage::Log(
                 LogEvent::debug(
                     "ReflectionEngine",
@@ -139,11 +148,12 @@ impl ReflectionEngine {
                 transcript.push_str(&format!("{}: {}{}\n\n", msg.role, body, tools));
             }
 
-            let prompt = format!(
-                    "Summarize the following conversation. Extract key information, facts and any potential knowledge gaps.\n\
-                    Format your response EXACTLY as a JSON object with these keys: \"summary\", \"key_info\", \"knowledge_gaps\".\n\n\
-                    Conversation:\n{}", transcript
-                );
+            // PR-2.1: short-term reflection now produces the same 8-slot sectional
+            // JSON as the in-loop auto-compaction (PR-2). Markdown render goes into
+            // the legacy `summary` column for backward-compat readers; the JSON
+            // form is persisted via `WriteSectionsJson`.
+            let prompt =
+                crate::agent::compaction::build_sectional_prompt(None, &transcript, None);
 
             let context = vec![ChatMessage::user(&prompt)];
             match self.provider.chat(&context, None).await {
@@ -151,29 +161,35 @@ impl ReflectionEngine {
                     let text = response.content;
                     // Use robust JSON extractor
                     if let Some(val) = crate::utils::extract_json_from_llm_response(&text) {
-                        let summary = val
-                            .get("summary")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let key_info = val
-                            .get("key_info")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let knowledge_gaps = val
-                            .get("knowledge_gaps")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
+                        let sections =
+                            crate::agent::compaction::SummarySections::from_json(&val);
+                        let summary_md = sections.to_markdown();
+                        let output_bytes =
+                            summary_md.len().min(u32::MAX as usize) as u32;
+                        let sections_json = serde_json::to_string(&sections)
+                            .unwrap_or_else(|_| "{}".to_string());
 
                         let (tx, rx) = tokio::sync::oneshot::channel();
                         self.memory_node
                             .send_packet(MemoryMessage::AddSummary {
                                 thread_id: session_id.clone(),
-                                summary,
-                                key_info,
-                                knowledge_gaps,
+                                summary: summary_md,
+                                key_info: String::new(),
+                                knowledge_gaps: String::new(),
+                                reply: SharedReply::new(tx),
+                            })
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        rx.await??;
+
+                        // Fire-and-forget the structured JSON into the
+                        // `sections_json` column. Failures are non-fatal — the
+                        // row still has the rendered Markdown.
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        self.memory_node
+                            .send_packet(MemoryMessage::WriteSectionsJson {
+                                thread_id: session_id.clone(),
+                                sections_json,
                                 reply: SharedReply::new(tx),
                             })
                             .await
@@ -191,6 +207,19 @@ impl ReflectionEngine {
                             .await
                             .map_err(|e| e.to_string())?;
                         rx.await??;
+
+                        let _ = self.logger_tx.send(BusMessage::Telemetry(
+                            TelemetryEvent::ReflectionCompleted {
+                                chat_id: Some(session_id.clone()),
+                                kind: ReflectionKind::ShortTerm,
+                                output_bytes,
+                                wall_ms: reflection_started
+                                    .elapsed()
+                                    .as_millis()
+                                    .min(u64::MAX as u128)
+                                    as u64,
+                            },
+                        ));
 
                         let _ = self.logger_tx.send(BusMessage::Log(
                             LogEvent::info(
@@ -235,6 +264,21 @@ impl ReflectionEngine {
             return Ok(());
         }
 
+        let reflection_started = std::time::Instant::now();
+        // Long-term aggregation has no single chat_id (it consolidates across all threads).
+        // `inputs_consumed` uses the line count of `summaries_content` as a rough proxy for
+        // the number of summary records consumed — the underlying SQL function returns a
+        // concatenated blob rather than a count.
+        let inputs_consumed_estimate =
+            summaries_content.lines().count().min(u32::MAX as usize) as u32;
+        let _ = self
+            .logger_tx
+            .send(BusMessage::Telemetry(TelemetryEvent::ReflectionStarted {
+                chat_id: None,
+                kind: ReflectionKind::LongTerm,
+                inputs_consumed: inputs_consumed_estimate,
+            }));
+
         let current_memory = if memory_md_path.exists() {
             fs::read_to_string(&memory_md_path).unwrap_or_default()
         } else {
@@ -257,7 +301,9 @@ impl ReflectionEngine {
                     answer = answer[start + 11..start + 11 + end].to_string();
                 }
             }
-            fs::write(&memory_md_path, answer.trim())?;
+            let trimmed = answer.trim();
+            let output_bytes = trimmed.len().min(u32::MAX as usize) as u32;
+            fs::write(&memory_md_path, trimmed)?;
 
             let (tx, rx) = tokio::sync::oneshot::channel();
             self.memory_node
@@ -268,6 +314,19 @@ impl ReflectionEngine {
                 .await
                 .map_err(|e| e.to_string())?;
             rx.await??;
+
+            let _ = self
+                .logger_tx
+                .send(BusMessage::Telemetry(TelemetryEvent::ReflectionCompleted {
+                    chat_id: None,
+                    kind: ReflectionKind::LongTerm,
+                    output_bytes,
+                    wall_ms: reflection_started
+                        .elapsed()
+                        .as_millis()
+                        .min(u64::MAX as u128)
+                        as u64,
+                }));
 
             let _ = self.logger_tx.send(BusMessage::Log(LogEvent::info(
                 "ReflectionEngine",

@@ -14,6 +14,18 @@ pub trait Provider: Send + Sync + dyn_clone::DynClone {
         messages: &[crate::utils::ChatMessage],
         tools: Option<serde_json::Value>,
     ) -> Result<crate::utils::LLMResponse, crate::utils::LLMError>;
+
+    /// PR-3: the model's input context window in tokens, if known. Used by
+    /// `effective_compaction_threshold` to fire compaction at a fraction of the
+    /// window rather than at an absolute count — so Sonnet (200k) and Opus (1M)
+    /// behave appropriately with a single configured percentage.
+    ///
+    /// Default returns `None`; provider impls should override when they can
+    /// determine the window from their model name. Adding the method to the
+    /// trait via a default keeps Phase 0.0b's additive contract intact.
+    fn context_window_tokens(&self) -> Option<usize> {
+        None
+    }
 }
 
 dyn_clone::clone_trait_object!(Provider);
