@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::mpsc;
 
+pub mod compaction;
 mod doom_loop;
 pub mod registry;
 mod subagent;
@@ -996,6 +997,12 @@ pub(crate) struct ReasoningLoopCtx {
 }
 
 /// Constructor arguments for [`AgentLogic`], grouped to keep call sites readable.
+//
+// NOTE: `#[non_exhaustive]` is deliberately NOT applied here. Several fields (`provider`,
+// `outbound_tx`, `logger_tx`, `clarification_hub`, …) cannot have a sensible `Default`,
+// so the `..Default::default()` workaround that other Phase 0.0b structs use is not
+// viable. Adding `#[non_exhaustive]` requires a builder API as a prerequisite — tracked
+// as a follow-up to the Phase 0.0b sweep (see docs/public-api-surface.md §9.3).
 pub struct AgentLogicParams {
     pub name: String,
     pub provider: Box<dyn Provider>,
@@ -1028,6 +1035,11 @@ pub struct AgentLogicParams {
 }
 
 /// Build-time options for the Phase 5 sub-agent harness (see `[harness.subagents]`).
+//
+// NOTE: `#[non_exhaustive]` is deferred — `src/main.rs` (a separate Cargo crate from the lib)
+// constructs this struct directly when wiring the sub-agent harness. Adopting the marker
+// requires either a builder or a constructor helper; tracked as a Phase 0.0b follow-up
+// (see docs/public-api-surface.md §9.3).
 #[derive(Clone, Debug)]
 pub struct SubagentHarnessParams {
     pub cancel_children_on_parent_cancel: bool,
@@ -1415,6 +1427,32 @@ impl ActorLogic<BusMessage> for AgentLogic {
 
                 Ok(None)
             }
+            BusMessage::TriggerCompaction {
+                session_key,
+                focus_instructions,
+                trigger,
+            } => {
+                // PR-5 + PR-10: delegate to the internal `trigger_compaction_with_reason`
+                // so the carried `trigger` (Manual vs AgentSelf) propagates into the
+                // `CompactionTriggered` telemetry event. The per-chat FIFO guard
+                // already lives inside that helper; failures are logged and dropped.
+                let reason = trigger.unwrap_or(crate::bus::CompactionTrigger::Manual);
+                if let Err(e) = self
+                    .trigger_compaction_with_reason(session_key.clone(), focus_instructions, reason)
+                    .await
+                {
+                    let _ = self.logger_tx.send(BusMessage::Log(
+                        LogEvent::warn(
+                            &self.name,
+                            &format!(
+                                "TriggerCompaction dropped for session_key={}: {}",
+                                session_key, e
+                            ),
+                        ),
+                    ));
+                }
+                Ok(None)
+            }
             BusMessage::Outbound(_)
             | BusMessage::Telemetry(_)
             | BusMessage::LoggerControl(_)
@@ -1426,6 +1464,120 @@ impl ActorLogic<BusMessage> for AgentLogic {
 }
 
 impl AgentLogic {
+    /// PR-5: manually trigger a compaction for `session_key` outside the normal
+    /// threshold path. The compaction runs synchronously in the calling task and
+    /// emits the full matched `CompactionTriggered { reason: Manual }` + (`Completed`
+    /// or `Failed`) telemetry pair.
+    ///
+    /// Construct `session_key` via [`crate::bus::clarification_session_key`].
+    /// `focus_instructions`, when present, is appended to the summarizer prompt
+    /// as a `FOCUS:` block so the model can prioritize certain content.
+    ///
+    /// **Per-chat FIFO.** Returns `Err` if a reasoning turn is currently in flight
+    /// for the same `chat_id` — the AGENTS.md invariant requires compaction to
+    /// happen *between* turns, not during. Callers that arrive via the bus
+    /// (`BusMessage::TriggerCompaction`) should expect drops in that case.
+    pub async fn trigger_compaction(
+        &self,
+        session_key: String,
+        focus_instructions: Option<String>,
+    ) -> Result<crate::agent::compaction::CompactionOutcome, String> {
+        self.trigger_compaction_with_reason(
+            session_key,
+            focus_instructions,
+            crate::bus::CompactionTrigger::Manual,
+        )
+        .await
+    }
+
+    /// Internal entry point shared by the pub [`Self::trigger_compaction`] API
+    /// and the PR-10 `compact_context` tool path (via `BusMessage::TriggerCompaction`
+    /// with `trigger: Some(AgentSelf)`). Splits the public surface from the
+    /// `CompactionTrigger` taxonomy so the eval pipeline can distinguish
+    /// caller-driven (`Manual`) from agent-driven (`AgentSelf`) compactions.
+    async fn trigger_compaction_with_reason(
+        &self,
+        session_key: String,
+        focus_instructions: Option<String>,
+        trigger_reason: crate::bus::CompactionTrigger,
+    ) -> Result<crate::agent::compaction::CompactionOutcome, String> {
+        // session_key format: `<channel>:<chat_id>:<thread_part>`. The chat_id
+        // segment drives the in-flight guard and telemetry labelling.
+        let chat_id = session_key
+            .split(':')
+            .nth(1)
+            .ok_or_else(|| {
+                format!(
+                    "Malformed session_key (expected `channel:chat_id:thread`): {}",
+                    session_key
+                )
+            })?
+            .to_string();
+
+        if self.cancellation_tokens.contains_key(&chat_id) {
+            return Err(format!(
+                "Refusing manual compaction: reasoning turn in flight for chat_id={}",
+                chat_id
+            ));
+        }
+
+        let mem = self
+            .session_manager
+            .get_session(&session_key)
+            .await
+            .map_err(|e| format!("get_session({}): {}", session_key, e))?;
+        let current_context = mem
+            .get_context_since_reflection()
+            .await
+            .map_err(|e| format!("get_context_since_reflection({}): {}", session_key, e))?;
+        let user_turns = current_context
+            .iter()
+            .filter(|m| m.role == "user")
+            .count();
+        let approx_tokens: usize = current_context
+            .iter()
+            .map(|m| m.content.as_ref().map_or(0, |c| c.text_content().len()) / 4)
+            .sum();
+
+        // Most recent summary keyed by the same channel:chat_id prefix
+        // — same scheme used at the threshold-trigger site.
+        let prefix = {
+            let mut parts = session_key.splitn(3, ':');
+            let channel = parts.next().unwrap_or("");
+            format!("{}:{}", channel, chat_id)
+        };
+        let recent = self
+            .session_manager
+            .get_recent_summaries(&prefix, self.max_recent_summaries.max(1))
+            .await
+            .unwrap_or_default();
+
+        let memory_node = self.session_manager.get_memory_node();
+        let provider_guard = self.provider.read().await;
+        // Manual triggers have no per-call cancellation; a token that never
+        // fires keeps `do_compaction`'s `select!` valid without altering behavior.
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+
+        let outcome = crate::agent::compaction::do_compaction(
+            crate::agent::compaction::DoCompactionArgs {
+                chat_id: &chat_id,
+                session_key: &session_key,
+                trigger_reason,
+                tokens_before: approx_tokens.min(u32::MAX as usize) as u32,
+                turns_before: user_turns.min(u32::MAX as usize) as u32,
+                current_context: &current_context,
+                existing_summary: recent.first().map(|s| s.as_str()),
+                focus_instructions: focus_instructions.as_deref(),
+                provider: provider_guard.as_ref(),
+                memory_node: &memory_node,
+                outbound_tx: &self.outbound_tx,
+                cancel_token: &cancel_token,
+            },
+        )
+        .await;
+        Ok(outcome)
+    }
+
     async fn try_resume_background_job_from_ticket(
         &mut self,
         inbound: &InboundMessage,
@@ -1659,6 +1811,14 @@ enum ChatRetryOutcome {
     /// Retries exhausted; final user-facing error string. The caller is expected to surface
     /// an LLM-failed banner.
     Failed(String),
+    /// PR-4: provider rejected the request because the input exceeded its context
+    /// window. Not retried — bouncing the same payload guarantees the same failure.
+    /// The reasoning loop is expected to (eventually, PR-4.1) emergency-compact
+    /// and retry once.
+    ContextOverflow {
+        tokens_attempted: u32,
+        max: Option<u32>,
+    },
 }
 
 /// Wrap `provider.chat` with a small retry loop for transient errors (network/5xx/429).
@@ -1689,6 +1849,17 @@ async fn chat_with_retry(
         };
         match res {
             Ok(resp) => return ChatRetryOutcome::Ok(resp),
+            Err(crate::utils::LLMError::ContextOverflow {
+                tokens_attempted,
+                max,
+            }) => {
+                // PR-4: short-circuit — retrying the identical payload guarantees
+                // the same overflow. Caller decides whether to compact and retry.
+                return ChatRetryOutcome::ContextOverflow {
+                    tokens_attempted,
+                    max,
+                };
+            }
             Err(e) => {
                 let transient = e.is_transient();
                 let is_last = attempt + 1 >= MAX_ATTEMPTS;
@@ -1927,6 +2098,10 @@ impl AgentLogic {
 
         // 2. Loop until no more tool calls or max iterations reached
         let mut iterations = 0;
+        // PR-4.1: hard cap — at most one emergency context-overflow recovery
+        // per inbound. A second overflow within the same turn surfaces the
+        // failure to the user instead of looping on compact-and-retry.
+        let mut overflow_recovery_used = false;
 
         while iterations < max_iterations {
             if cancel_token.is_cancelled() {
@@ -1945,6 +2120,70 @@ impl AgentLogic {
                 )
                 .with_chat_id(&inbound.chat_id),
             ));
+
+            // PR-7.2: stale tool-result swap pass. Runs at the top of every
+            // iteration (independent of the compaction threshold). For tool
+            // results older than `KEEP_RECENT_USER_TURNS_DEFAULT` user turns
+            // from the latest, cache the original and replace the stored
+            // content with a compact placeholder. The next `get_context_*`
+            // fetch (immediately below) sees the smaller form, so the chat
+            // call sends a smaller payload to the provider. Idempotent — the
+            // helper skips messages already in placeholder form.
+            //
+            // Cost per iteration: 1 SELECT + N UPDATE pairs (where N = number
+            // of newly-stale tool messages, typically 0 except right after a
+            // tool-heavy iteration). The helper does no I/O itself; all writes
+            // go through the memory actor and serialize.
+            {
+                let memory_node = session_manager.get_memory_node();
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = memory_node
+                    .send_packet(crate::memory::MemoryMessage::GetMessagesSinceReflection {
+                        thread_id: session_key.clone(),
+                        reply: crate::memory::SharedReply::new(tx),
+                    })
+                    .await;
+                let messages_with_ids: Vec<(i64, crate::utils::ChatMessage)> = rx
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .map(|(rows, _)| rows)
+                    .unwrap_or_default();
+                let stale = crate::agent::compaction::identify_stale_tool_swaps(
+                    &messages_with_ids,
+                    crate::agent::compaction::KEEP_RECENT_USER_TURNS_DEFAULT,
+                );
+                for (db_id, tool_call_id, tool_name, full_content, placeholder) in stale {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let compact = crate::agent::compaction::build_compact_placeholder(
+                        &tool_call_id,
+                        &tool_name,
+                        &full_content,
+                    );
+                    let _ = memory_node
+                        .send_packet(crate::memory::MemoryMessage::CacheToolResult {
+                            tool_call_id: tool_call_id.clone(),
+                            chat_id: inbound.chat_id.clone(),
+                            session_key: session_key.clone(),
+                            tool_name,
+                            full_content,
+                            compact_summary: compact,
+                            reply: crate::memory::SharedReply::new(tx),
+                        })
+                        .await;
+                    let _ = rx.await;
+
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let _ = memory_node
+                        .send_packet(crate::memory::MemoryMessage::UpdateMessageContent {
+                            message_id: db_id,
+                            new_content: placeholder,
+                            reply: crate::memory::SharedReply::new(tx),
+                        })
+                        .await;
+                    let _ = rx.await;
+                }
+            }
 
             // Fetch context
             let mut context = mem.get_context_since_reflection().await?;
@@ -2066,6 +2305,134 @@ impl AgentLogic {
                 ChatRetryOutcome::Cancelled => {
                     persist_and_cancel!();
                 }
+                ChatRetryOutcome::ContextOverflow {
+                    tokens_attempted,
+                    max,
+                } => {
+                    // PR-4.1: emergency compact-and-retry. The first overflow per
+                    // turn fires `do_compaction` (same code path as the threshold
+                    // trigger) and continues to the next iteration — which
+                    // refetches a smaller post-compaction context and will retry
+                    // the chat call naturally. A second overflow in the same turn
+                    // surfaces the failure to the user.
+                    let tokens_before_u32 = context
+                        .iter()
+                        .map(|m| m.content.as_ref().map_or(0, |c| c.text_content().len()) / 4)
+                        .sum::<usize>()
+                        .min(u32::MAX as usize) as u32;
+                    let turns_before_u32 = context
+                        .iter()
+                        .filter(|m| m.role == "user")
+                        .count()
+                        .min(u32::MAX as usize) as u32;
+
+                    if !overflow_recovery_used {
+                        overflow_recovery_used = true;
+                        let memory_node = session_manager.get_memory_node();
+                        let outcome = crate::agent::compaction::do_compaction(
+                            crate::agent::compaction::DoCompactionArgs {
+                                chat_id: &inbound.chat_id,
+                                session_key: &session_key,
+                                trigger_reason: crate::bus::CompactionTrigger::Overflow400,
+                                tokens_before: tokens_before_u32,
+                                turns_before: turns_before_u32,
+                                current_context: &context,
+                                existing_summary: summaries.first().map(|s| s.as_str()),
+                                focus_instructions: None,
+                                provider: provider.as_ref(),
+                                memory_node: &memory_node,
+                                outbound_tx: &outbound_tx,
+                                cancel_token: &cancel_token,
+                            },
+                        )
+                        .await;
+                        match outcome {
+                            crate::agent::compaction::CompactionOutcome::Succeeded => {
+                                let _ = logger_tx.send(BusMessage::Log(
+                                    LogEvent::info(
+                                        &name,
+                                        &format!(
+                                            "Emergency compaction succeeded after context overflow (attempted={} max={}); retrying iteration.",
+                                            tokens_attempted,
+                                            max.map(|m| m.to_string())
+                                                .unwrap_or_else(|| "?".to_string()),
+                                        ),
+                                    )
+                                    .with_chat_id(&inbound.chat_id),
+                                ));
+                                // Next iteration refetches context (now smaller due
+                                // to AddSummary + UpdateThreadMetadata) and re-runs
+                                // the chat call. No iteration counter refund — the
+                                // existing max_iterations budget absorbs the retry.
+                                continue;
+                            }
+                            crate::agent::compaction::CompactionOutcome::Cancelled => {
+                                persist_and_cancel!();
+                            }
+                            crate::agent::compaction::CompactionOutcome::Failed => {
+                                // `do_compaction` already emitted the matched
+                                // `CompactionFailed`. Fall through to the
+                                // user-facing banner below.
+                            }
+                        }
+                    } else {
+                        // Second overflow in the same turn — emit a matched pair
+                        // so the eval pipeline still sees the event, then surface
+                        // the failure. We do NOT call `do_compaction` again.
+                        let _ = outbound_tx
+                            .send(BusMessage::Telemetry(TelemetryEvent::CompactionTriggered {
+                                chat_id: inbound.chat_id.clone(),
+                                reason: crate::bus::CompactionTrigger::Overflow400,
+                                tokens_before: tokens_before_u32,
+                                turns_before: turns_before_u32,
+                                tokens_after_preprocess: 0,
+                            }))
+                            .await;
+                        let _ = outbound_tx
+                            .send(BusMessage::Telemetry(TelemetryEvent::CompactionFailed {
+                                chat_id: inbound.chat_id.clone(),
+                                reason:
+                                    "second context overflow in the same turn; recovery cap (1) exhausted"
+                                        .to_string(),
+                                tokens_at_failure: tokens_before_u32,
+                            }))
+                            .await;
+                    }
+
+                    let err = format!(
+                        "Context overflow: input exceeds the model's window \
+                         (attempted={} max={}). Reduce the conversation length and retry.",
+                        tokens_attempted,
+                        max.map(|m| m.to_string()).unwrap_or_else(|| "?".to_string()),
+                    );
+                    let persisted = format!(
+                        "LLM call failed: {err}\nPress /retry to try again or /cancel to abandon."
+                    );
+                    persist_terminal_assistant_message(
+                        &mut mem,
+                        &logger_tx,
+                        &name,
+                        &inbound.chat_id,
+                        &persisted,
+                    )
+                    .await;
+                    let mut banner = build_llm_failed_banner(
+                        &inbound.channel,
+                        &inbound.chat_id,
+                        inbound.thread_id.as_deref(),
+                        &err,
+                    );
+                    if let Some(job_id) =
+                        inbound.metadata.get(crate::bus::METADATA_BACKGROUND_JOB_ID)
+                    {
+                        banner.metadata.insert(
+                            crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
+                            job_id.clone(),
+                        );
+                    }
+                    let _ = outbound_tx.send(BusMessage::Outbound(banner)).await;
+                    return Err(err);
+                }
                 ChatRetryOutcome::Failed(err) => {
                     let persisted = format!(
                         "LLM call failed after 3 attempts: {err}\nPress /retry to try again or /cancel to abandon."
@@ -2109,6 +2476,8 @@ impl AgentLogic {
                     prompt_tokens: usage.prompt_tokens,
                     completion_tokens: usage.completion_tokens,
                     total_tokens: usage.total_tokens,
+                    cache_read_tokens: usage.cache_read_tokens,
+                    cache_creation_tokens: usage.cache_creation_tokens,
                     background_job_id: crate::bus::get_background_job_id(&inbound.metadata),
                 };
                 let _ = outbound_tx
@@ -2463,100 +2832,65 @@ impl AgentLogic {
                     .map(|msg| msg.content.as_ref().map_or(0, |c| c.text_content().len()) / 4)
                     .sum();
 
+                // PR-3: pull the model's context window from the provider; if known,
+                // tighten the absolute token threshold to whichever is smaller of:
+                // 85% of the window, or (window - 16k reserve). With Window=None
+                // (provider can't determine), `effective_compaction_threshold`
+                // returns the legacy absolute threshold unchanged.
+                let effective_token_threshold = {
+                    let window = provider.context_window_tokens();
+                    crate::agent::compaction::effective_compaction_threshold(
+                        short_term_threshold_tokens,
+                        window,
+                        crate::agent::compaction::TRIGGER_AT_PERCENTAGE_DEFAULT,
+                        crate::agent::compaction::RESERVE_TOKENS_DEFAULT,
+                    )
+                };
+
                 if user_turns >= short_term_threshold_turns
-                    || approx_tokens >= short_term_threshold_tokens
+                    || approx_tokens >= effective_token_threshold
                 {
-                    // ... (Summary generation logic - same as before but using local variables)
-                    let mut transcript = String::new();
-                    for msg in &current_context {
-                        if msg.role != "system" {
-                            if let Some(content) = &msg.content {
-                                transcript.push_str(&format!("{}: {}\n\n", msg.role, content));
-                            } else if let Some(_tc) = &msg.tool_calls {
-                                transcript.push_str(&format!("{}: [Invoked Tools]\n\n", msg.role));
-                            }
-                        }
-                    }
-
-                    let existing_summary = if !summaries.is_empty() {
-                        format!("\nEXISTING SUMMARY TO UPDATE:\n{}", summaries[0])
-                    } else {
-                        String::new()
+                    let tokens_before_u32 = approx_tokens.min(u32::MAX as usize) as u32;
+                    let turns_before_u32 = user_turns.min(u32::MAX as usize) as u32;
+                    // PR-3: trigger_reason matches the *effective* token threshold,
+                    // not the legacy absolute one — otherwise a window-aware
+                    // trigger that fires below the absolute would fall through
+                    // to the `unreachable!()` arm.
+                    let trigger_reason = match (
+                        user_turns >= short_term_threshold_turns,
+                        approx_tokens >= effective_token_threshold,
+                    ) {
+                        (true, true) => crate::bus::CompactionTrigger::BothLimits,
+                        (true, false) => crate::bus::CompactionTrigger::TurnLimit,
+                        (false, true) => crate::bus::CompactionTrigger::TokenLimit,
+                        (false, false) => unreachable!("guarded by the outer if"),
                     };
 
-                    let prompt = format!(
-                        "Update the following conversation summary with new information from the transcript. \
-                        If no existing summary is provided, create a new one. \
-                        Extract key information, facts and any potential knowledge gaps.\n\
-                        Format your response EXACTLY as a JSON object with these keys: \"summary\", \"key_info\", \"knowledge_gaps\".\n\n\
-                        {}\n\n\
-                        NEW TRANSCRIPT:\n{}", existing_summary, transcript
-                    );
-
-                    let summary_context = vec![
-                        crate::utils::ChatMessage::system("You are a helpful assistant that summarizes conversations into structured JSON."),
-                        crate::utils::ChatMessage::user(&prompt)
-                    ];
-
-                    let response = tokio::select! {
-                        res = provider.chat(&summary_context, None) => res,
-                        _ = cancel_token.cancelled() => {
-                            persist_and_cancel!();
-                        }
-                    };
-
-                    if let Ok(response) = response {
-                        let text = response.content;
-                        if let Some(val) = crate::utils::extract_json_from_llm_response(&text) {
-                            let summary = val
-                                .get("summary")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let key_info = val
-                                .get("key_info")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let knowledge_gaps = val
-                                .get("knowledge_gaps")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-
-                            let memory_node = session_manager.get_memory_node();
-                            let (tx, rx) = tokio::sync::oneshot::channel();
-                            let _ = memory_node
-                                .send_packet(crate::memory::MemoryMessage::AddSummary {
-                                    thread_id: session_key.clone(),
-                                    summary,
-                                    key_info,
-                                    knowledge_gaps,
-                                    reply: crate::memory::SharedReply::new(tx),
-                                })
-                                .await;
-                            let _ = rx.await;
-
-                            // Update metadata
-                            let (tx, rx) = tokio::sync::oneshot::channel();
-                            let msg = crate::memory::MemoryMessage::GetMessagesSinceReflection {
-                                thread_id: session_key.clone(),
-                                reply: crate::memory::SharedReply::new(tx),
-                            };
-                            if memory_node.send_packet(msg).await.is_ok() {
-                                if let Ok(Ok((rows, _))) = rx.await {
-                                    if let Some((last_id, _)) = rows.last() {
-                                        let (tx, rx) = tokio::sync::oneshot::channel();
-                                        let _ = memory_node.send_packet(crate::memory::MemoryMessage::UpdateThreadMetadata {
-                                            thread_id: session_key.clone(),
-                                            last_reflection_msg_id: Some(*last_id),
-                                            reply: crate::memory::SharedReply::new(tx),
-                                        }).await;
-                                        let _ = rx.await;
-                                    }
-                                }
-                            }
-                        }
+                    // PR-4.1: compaction now goes through the shared `do_compaction`
+                    // helper. Used by both this threshold-trigger path and the
+                    // overflow-recovery path at the chat call site. The helper emits
+                    // the full matched telemetry pair (Triggered + Completed/Failed)
+                    // internally; we only need to handle the Cancelled outcome.
+                    let memory_node = session_manager.get_memory_node();
+                    let outcome = crate::agent::compaction::do_compaction(
+                        crate::agent::compaction::DoCompactionArgs {
+                            chat_id: &inbound.chat_id,
+                            session_key: &session_key,
+                            trigger_reason,
+                            tokens_before: tokens_before_u32,
+                            turns_before: turns_before_u32,
+                            current_context: &current_context,
+                            existing_summary: summaries.first().map(|s| s.as_str()),
+                            focus_instructions: None,
+                            provider: provider.as_ref(),
+                            memory_node: &memory_node,
+                            outbound_tx: &outbound_tx,
+                            cancel_token: &cancel_token,
+                        },
+                    )
+                    .await;
+                    if matches!(outcome, crate::agent::compaction::CompactionOutcome::Cancelled) {
+                        persist_and_cancel!();
                     }
                 }
 

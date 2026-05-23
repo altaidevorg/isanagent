@@ -38,6 +38,7 @@ pub mod workspace;
 
 /// Message Protocol for inter-actor communication.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Message<T: Debug + Send + Sync + Clone> {
     /// Data payload passed between nodes.
     Packet(T),
@@ -55,6 +56,7 @@ pub enum Message<T: Debug + Send + Sync + Clone> {
 // --- Errors ---
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum ActorError {
     #[error("Logic error in actor '{actor}': {source}")]
     LogicError {

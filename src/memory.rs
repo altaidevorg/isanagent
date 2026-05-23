@@ -89,6 +89,7 @@ pub const AGENT_SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
 
 /// One persisted root session row for a channel (e.g. `terminal` → `thread_id` = `terminal:<chat_uuid>:`).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RootThreadListItem {
     /// Full `messages.thread_id` (see [`crate::bus::clarification_session_key`] for root keys).
     pub thread_id: String,
@@ -190,6 +191,7 @@ pub fn ensure_harness_todos_schema(conn: &Connection) -> Result<(), rusqlite::Er
 
 /// Persisted sub-agent runs for audit (`subagent_tasks` in the agent DB).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct SubagentTaskRecord {
     pub task_id: String,
     pub parent_chat_id: String,
@@ -207,6 +209,7 @@ pub struct SubagentTaskRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct BackgroundJobRecord {
     pub job_id: String,
     pub kind: String,
@@ -223,6 +226,7 @@ pub struct BackgroundJobRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct NotificationRecord {
     pub notification_id: String,
     pub chat_id: String,
@@ -239,6 +243,7 @@ pub struct NotificationRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct ClarificationTicketRecord {
     pub ticket_id: String,
     pub job_id: String,
@@ -377,6 +382,7 @@ pub fn ensure_cron_jobs_schema(conn: &Connection) -> Result<(), rusqlite::Error>
 
 /// One row in a session todo list (`harness_todos`, via [`SqliteMemoryActor`]).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct TodoRow {
     pub content: String,
     pub status: String,
@@ -420,6 +426,7 @@ fn todo_load_sqlite_conn(conn: &Connection, chat_id: &str) -> Result<Option<Vec<
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SummaryEntry {
     pub id: i64,
     pub thread_id: String,
@@ -427,10 +434,17 @@ pub struct SummaryEntry {
     pub key_info: String,
     pub knowledge_gaps: String,
     pub created_at: String,
+    /// PR-2.2: structured sectional JSON written alongside the legacy summary
+    /// row by `WriteSectionsJson` (PR-2). `None` for older rows that predate
+    /// the migration or were written by paths that bypass the sectional flow.
+    /// `#[serde(default)]` so older serialized blobs deserialize cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sections_json: Option<String>,
 }
 
 /// Messages sent to the SqliteMemoryActor
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum MemoryMessage {
     AddMessage {
         thread_id: String,
@@ -462,6 +476,45 @@ pub enum MemoryMessage {
         summary: String,
         key_info: String,
         knowledge_gaps: String,
+        reply: SharedReply<Result<(), String>>,
+    },
+    /// PR-2: write the structured sectional JSON for a session into the
+    /// `sections_json` column (added by an idempotent ALTER in
+    /// [`SqliteMemoryActor::new`]). Independent of [`AddSummary`] so the legacy
+    /// reflection path can keep writing without sections; the compaction site
+    /// in `AgentLogic::run_reasoning_loop` sends both back-to-back.
+    WriteSectionsJson {
+        thread_id: String,
+        sections_json: String,
+        reply: SharedReply<Result<(), String>>,
+    },
+    /// PR-7: insert (or replace) a tool result in the cache. Populated by the
+    /// agent's tool-execution branch after every tool result is added to memory,
+    /// so the `recall_tool_result` tool can later restore the full content.
+    /// Upsert semantics — re-running the same tool_call_id replaces the row.
+    CacheToolResult {
+        tool_call_id: String,
+        chat_id: String,
+        session_key: String,
+        tool_name: String,
+        full_content: String,
+        compact_summary: String,
+        reply: SharedReply<Result<(), String>>,
+    },
+    /// PR-7: fetch the full content of a previously cached tool result by id.
+    /// Returns `Ok(None)` when there's no row (id never cached, or cache cleared).
+    FetchToolResult {
+        tool_call_id: String,
+        reply: SharedReply<Result<Option<String>, String>>,
+    },
+    /// PR-7.1: overwrite the `content` column of a stored message by its DB id.
+    /// Used by `do_compaction` to persist the tool-result swap so that future
+    /// iterations (and any consumer of `get_context()`) see the compact
+    /// placeholder. The original content is preserved in `tool_result_cache`
+    /// and recoverable via `recall_tool_result`.
+    UpdateMessageContent {
+        message_id: i64,
+        new_content: String,
         reply: SharedReply<Result<(), String>>,
     },
     UpdateSummary {
@@ -677,6 +730,36 @@ impl SqliteMemoryActor {
                 knowledge_gaps TEXT NOT NULL,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )",
+            [],
+        )?;
+        // PR-2: structured sectional summary as JSON. Idempotent ALTER —
+        // failures on existing databases that already have the column are expected.
+        let _ = conn.execute(
+            "ALTER TABLE session_summaries ADD COLUMN sections_json TEXT",
+            [],
+        );
+        // PR-7: cache for tool results. Populated on every tool-result add
+        // (see agent/mod.rs) and read by the `recall_tool_result` tool when
+        // the LLM wants to recover content that was compacted out of the
+        // active conversation. `tool_call_id` is the LLM-supplied id used
+        // both as the cache key and as the lookup parameter passed by the
+        // recall tool. `compact_summary` is the placeholder text inlined
+        // into the swapped tool message.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS tool_result_cache (
+                tool_call_id TEXT PRIMARY KEY NOT NULL,
+                chat_id TEXT NOT NULL,
+                session_key TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                full_content TEXT NOT NULL,
+                compact_summary TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tool_result_cache_session
+             ON tool_result_cache(session_key, created_at_ms DESC)",
             [],
         )?;
 
@@ -929,16 +1012,106 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 reply,
             } => {
                 let res = self.conn.execute(
-                    "INSERT INTO session_summaries (thread_id, summary, key_info, knowledge_gaps) 
+                    "INSERT INTO session_summaries (thread_id, summary, key_info, knowledge_gaps)
                      VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(thread_id) DO UPDATE SET 
-                        summary=excluded.summary, 
-                        key_info=excluded.key_info, 
+                     ON CONFLICT(thread_id) DO UPDATE SET
+                        summary=excluded.summary,
+                        key_info=excluded.key_info,
                         knowledge_gaps=excluded.knowledge_gaps,
                         created_at=CURRENT_TIMESTAMP",
                     params![thread_id, summary, key_info, knowledge_gaps],
                 ).map_err(|e| e.to_string()).map(|_| ());
 
+                let _ = reply.send(res);
+            }
+            MemoryMessage::WriteSectionsJson {
+                thread_id,
+                sections_json,
+                reply,
+            } => {
+                // Updates ZERO rows if the matching `AddSummary` hasn't landed
+                // yet — that's intentional. The caller (compaction site) sends
+                // `AddSummary` first, then this; if the row vanished between the
+                // two sends (e.g. the thread was cleared), the no-op is correct.
+                let res = self
+                    .conn
+                    .execute(
+                        "UPDATE session_summaries SET sections_json = ?1 WHERE thread_id = ?2",
+                        params![sections_json, thread_id],
+                    )
+                    .map_err(|e| e.to_string())
+                    .map(|_| ());
+
+                let _ = reply.send(res);
+            }
+            MemoryMessage::CacheToolResult {
+                tool_call_id,
+                chat_id,
+                session_key,
+                tool_name,
+                full_content,
+                compact_summary,
+                reply,
+            } => {
+                let now_ms = Utc::now().timestamp_millis();
+                let res = self
+                    .conn
+                    .execute(
+                        "INSERT INTO tool_result_cache
+                             (tool_call_id, chat_id, session_key, tool_name, full_content, compact_summary, created_at_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                         ON CONFLICT(tool_call_id) DO UPDATE SET
+                            chat_id = excluded.chat_id,
+                            session_key = excluded.session_key,
+                            tool_name = excluded.tool_name,
+                            full_content = excluded.full_content,
+                            compact_summary = excluded.compact_summary,
+                            created_at_ms = excluded.created_at_ms",
+                        params![
+                            tool_call_id,
+                            chat_id,
+                            session_key,
+                            tool_name,
+                            full_content,
+                            compact_summary,
+                            now_ms
+                        ],
+                    )
+                    .map_err(|e| e.to_string())
+                    .map(|_| ());
+                let _ = reply.send(res);
+            }
+            MemoryMessage::FetchToolResult {
+                tool_call_id,
+                reply,
+            } => {
+                let res = self
+                    .conn
+                    .query_row(
+                        "SELECT full_content FROM tool_result_cache WHERE tool_call_id = ?1",
+                        params![tool_call_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string());
+                let _ = reply.send(res);
+            }
+            MemoryMessage::UpdateMessageContent {
+                message_id,
+                new_content,
+                reply,
+            } => {
+                // Updates ZERO rows if `message_id` no longer exists (thread
+                // cleared between read and write). The no-op is correct — the
+                // swap would have been wasted anyway.
+                let res = self
+                    .conn
+                    .execute(
+                        "UPDATE messages SET content = ?1 WHERE id = ?2",
+                        params![new_content, message_id],
+                    )
+                    .map_err(|e| e.to_string())
+                    .map(|_| ());
                 let _ = reply.send(res);
             }
             MemoryMessage::UpdateSummary {
@@ -997,18 +1170,21 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 let res = (|| -> Result<Vec<SummaryEntry>, String> {
                     let mut stmt = if thread_id.is_empty() {
                         self.conn.prepare(
-                            "SELECT id, thread_id, summary, key_info, knowledge_gaps, created_at FROM session_summaries 
+                            "SELECT id, thread_id, summary, key_info, knowledge_gaps, created_at, sections_json FROM session_summaries
                              ORDER BY created_at DESC LIMIT ?1"
                         ).map_err(|e| e.to_string())?
                     } else {
                         self.conn.prepare(
-                            "SELECT id, thread_id, summary, key_info, knowledge_gaps, created_at FROM session_summaries 
+                            "SELECT id, thread_id, summary, key_info, knowledge_gaps, created_at, sections_json FROM session_summaries
                              WHERE thread_id LIKE ?1 ORDER BY created_at DESC LIMIT ?2"
                         ).map_err(|e| e.to_string())?
                     };
 
                     let limit_i64 = limit as i64;
                     let summary_mapper = |row: &rusqlite::Row| {
+                        // PR-2.2: project the new `sections_json` column. NULL
+                        // for older rows; rusqlite maps SQLite NULL to None
+                        // through the Option<String> column type.
                         Ok(SummaryEntry {
                             id: row.get(0)?,
                             thread_id: row.get(1)?,
@@ -1016,6 +1192,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                             key_info: row.get(3)?,
                             knowledge_gaps: row.get(4)?,
                             created_at: row.get(5)?,
+                            sections_json: row.get::<_, Option<String>>(6)?,
                         })
                     };
 

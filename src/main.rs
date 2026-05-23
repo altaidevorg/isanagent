@@ -492,6 +492,18 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         outbound_tx: global_outbound_tx.clone(),
         memory_node: Some(memory_node.clone()),
     }));
+    // PR-10: agent-triggered compaction. Tool posts a TriggerCompaction bus
+    // message with `AgentSelf` reason; the agent processes it between turns
+    // to respect the per-chat FIFO invariant (AGENTS.md).
+    tools.register(Box::new(isanagent::tools::compact::CompactContextTool {
+        outbound_tx: global_outbound_tx.clone(),
+    }));
+    // PR-7: re-materialize tool results that were compacted out of the active
+    // conversation. Reads the cache populated by `do_compaction`'s swap step.
+    tools.register(Box::new(isanagent::tools::recall::RecallToolResultTool {
+        memory_node: memory_node.clone(),
+        outbound_tx: global_outbound_tx.clone(),
+    }));
     tools.register(Box::new(isanagent::tools::builtin::SearchMemoryTool {
         memory_node: memory_node.clone(),
     }));
