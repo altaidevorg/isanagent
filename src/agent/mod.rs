@@ -2629,6 +2629,7 @@ impl AgentLogic {
                                 persist_and_cancel!();
                             }
                         };
+                        let is_error = tool_result.is_err();
                         let tool_result_text = finalize_tool_output(tool_result);
                         let tool_name = tc.function.name.clone();
                         let tr = TelemetryEvent::ToolResult {
@@ -2636,6 +2637,7 @@ impl AgentLogic {
                             channel: inbound.channel.clone(),
                             tool_name: tool_name.clone(),
                             result: tool_result_text.clone(),
+                            is_error,
                             tool_call_id: Some(tc.id.clone()),
                             background_job_id: crate::bus::get_background_job_id(&inbound.metadata),
                         };
@@ -2730,6 +2732,7 @@ impl AgentLogic {
                             }
                         };
 
+                        let is_error = tool_result.is_err();
                         let tool_result_text = finalize_tool_output(tool_result);
 
                         let tr = TelemetryEvent::ToolResult {
@@ -2737,6 +2740,7 @@ impl AgentLogic {
                             channel: inbound.channel.clone(),
                             tool_name: tool_name.to_string(),
                             result: tool_result_text.clone(),
+                            is_error,
                             tool_call_id: Some(tc.id.clone()),
                             background_job_id: crate::bus::get_background_job_id(&inbound.metadata),
                         };

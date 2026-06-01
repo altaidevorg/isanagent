@@ -139,6 +139,9 @@ pub enum TelemetryEvent {
         channel: String,
         tool_name: String,
         result: String,
+        /// True when the tool returned `Err` (failed) rather than `Ok`.
+        #[serde(default)]
+        is_error: bool,
         #[serde(default)]
         tool_call_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

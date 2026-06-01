@@ -345,6 +345,7 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             channel,
             tool_name,
             result,
+            is_error: _,
             tool_call_id,
             background_job_id,
         } => LogEvent::info(

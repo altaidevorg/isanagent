@@ -1104,6 +1104,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                     chat_id,
                     tool_name,
                     result,
+                    is_error: _,
                     tool_call_id,
                     background_job_id,
                 }) if channel == "terminal" => {
