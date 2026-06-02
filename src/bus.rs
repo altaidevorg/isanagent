@@ -20,6 +20,11 @@ pub const METADATA_BACKGROUND_JOB_ID: &str = "isanagent_background_job_id";
 pub const METADATA_CLARIFICATION_TICKET_ID: &str = "clarification_ticket_id";
 
 /// An inbound message received from a Channel (e.g. Slack, Email).
+//
+// NOTE: `#[non_exhaustive]` is deferred — `src/main.rs` (a separate Cargo crate from the lib)
+// constructs this struct directly during background-job recovery. Adopting the marker requires
+// either a builder or a constructor helper; tracked as a Phase 0.0b follow-up
+// (see docs/public-api-surface.md §9.3).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboundMessage {
     pub channel: String,
@@ -31,6 +36,7 @@ pub struct InboundMessage {
     /// Optional multimodal attachments (e.g. images) accompanying the text content.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<ContentPart>,
+    #[serde(default)]
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
@@ -59,17 +65,58 @@ impl InboundMessage {
 }
 
 /// An outbound message from the Agent to a Channel.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct OutboundMessage {
     pub channel: String,
     pub chat_id: String,
     pub thread_id: Option<String>,
     pub content: String,
+    #[serde(default)]
     pub metadata: HashMap<String, serde_json::Value>,
+}
+
+/// Why a compaction event fired. Drives the eval harness's "trigger reason" bucket.
+///
+/// Currently only `TurnLimit`, `TokenLimit`, and `BothLimits` are emitted by the
+/// in-loop auto-compaction path (see [`src/agent/mod.rs`](../src/agent/mod.rs) auto-compaction
+/// check). Future PRs will add additional triggers: `Manual` (PR-5 trigger API),
+/// `AgentSelf` (PR-10 self-compaction tool), `Overflow400` (PR-4 context-overflow recovery).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CompactionTrigger {
+    /// `user_turns >= short_term_threshold_turns` and tokens still under limit.
+    TurnLimit,
+    /// `approx_tokens >= short_term_threshold_tokens` and turns still under limit.
+    TokenLimit,
+    /// Both thresholds met in the same check.
+    BothLimits,
+    /// PR-4: the provider returned a context-overflow error (e.g. HTTP 400 with
+    /// "input is too long"). Threshold-based compaction failed to fire in time —
+    /// usually because the per-call window is tighter than the configured
+    /// thresholds, or a tool call returned an unexpectedly large output.
+    Overflow400,
+    /// PR-5: caller-driven trigger — `AgentLogic::trigger_compaction`, the
+    /// `BusMessage::TriggerCompaction` variant, or a CLI `/compact` command.
+    Manual,
+    /// PR-10: the agent itself called the `compact_context` tool to free up
+    /// context. Distinguished from `Manual` so eval tooling can measure how
+    /// often (and how usefully) the model decides to compact unprompted.
+    AgentSelf,
+}
+
+/// Which reflection loop produced the event. Short-term operates per-thread on
+/// recent messages; long-term aggregates summaries across threads into `MEMORY.md`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReflectionKind {
+    ShortTerm,
+    LongTerm,
 }
 
 /// Specific telemetry events for deep Agent observability.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum TelemetryEvent {
     ToolCall {
         chat_id: String,
@@ -92,6 +139,9 @@ pub enum TelemetryEvent {
         channel: String,
         tool_name: String,
         result: String,
+        /// True when the tool returned `Err` (failed) rather than `Ok`.
+        #[serde(default)]
+        is_error: bool,
         #[serde(default)]
         tool_call_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -109,6 +159,13 @@ pub enum TelemetryEvent {
         prompt_tokens: u32,
         completion_tokens: u32,
         total_tokens: u32,
+        /// PR-6.1: tokens served from the provider's prompt cache. `0` when the
+        /// provider doesn't expose this. `#[serde(default)]` for backward compat.
+        #[serde(default)]
+        cache_read_tokens: u32,
+        /// PR-6.1: tokens written to the provider's prompt cache on this call.
+        #[serde(default)]
+        cache_creation_tokens: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         background_job_id: Option<String>,
     },
@@ -250,6 +307,69 @@ pub enum TelemetryEvent {
         channel: String,
         state: String,
     },
+    // --- Phase 0 (compaction overhaul) telemetry ---
+    /// Auto-compaction fired for a chat. `tokens_before` / `turns_before` are the
+    /// values measured at the trigger check; `reason` indicates which threshold tripped.
+    /// `tokens_after_preprocess` is the approximate token count of the transcript
+    /// after preprocessing (image stripping, tool-result truncation) — added in PR-1.
+    /// `#[serde(default)]` lets older `conversation.jsonl` blobs without this field
+    /// continue to deserialize, so historical data can still be replayed.
+    CompactionTriggered {
+        chat_id: String,
+        reason: CompactionTrigger,
+        tokens_before: u32,
+        turns_before: u32,
+        #[serde(default)]
+        tokens_after_preprocess: u32,
+    },
+    /// Compaction produced a summary and persisted the new reflection cursor.
+    /// `wall_ms` is the duration from `CompactionTriggered` to this event.
+    /// `section_completeness` is the fraction of required slots populated in the
+    /// summary — `0.0` until PR-2 (sectional template) lands.
+    CompactionCompleted {
+        chat_id: String,
+        tokens_before: u32,
+        tokens_after: u32,
+        wall_ms: u64,
+        summary_bytes: u32,
+        section_completeness: f32,
+    },
+    /// Compaction did not produce a usable summary (provider error, cancellation,
+    /// or unparseable response). `tokens_at_failure` is the context size measured
+    /// at the matching `CompactionTriggered`.
+    CompactionFailed {
+        chat_id: String,
+        reason: String,
+        tokens_at_failure: u32,
+    },
+    /// An idle reflection cycle began. `chat_id` is the thread id for short-term
+    /// reflection and `None` for global long-term aggregation.
+    /// `inputs_consumed` is the count of messages (short-term) or summaries (long-term)
+    /// fed into the cycle.
+    ReflectionStarted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat_id: Option<String>,
+        kind: ReflectionKind,
+        inputs_consumed: u32,
+    },
+    /// Reflection cycle finished successfully. `output_bytes` is the size of the
+    /// produced artifact (a summary's text or the rewritten `MEMORY.md`).
+    ReflectionCompleted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat_id: Option<String>,
+        kind: ReflectionKind,
+        output_bytes: u32,
+        wall_ms: u64,
+    },
+    /// PR-7: the `recall_tool_result` tool was called to re-materialize a
+    /// tool result that had been compacted out of the active context.
+    /// Frequent recalls suggest the compaction was over-aggressive (the
+    /// agent needed content we threw away); low/zero recalls mean the swap
+    /// is paying for itself without rework.
+    ToolResultRefetch {
+        chat_id: String,
+        tool_call_id: String,
+    },
 }
 
 /// Log severity levels for verbose diagnostics.
@@ -284,6 +404,7 @@ pub enum LoggerControlMessage {
 /// Structured log event for verbose diagnostics and 100% traceability.
 /// All actors send these to the LoggingActor via BusMessage::Log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct LogEvent {
     /// ISO 8601 timestamp
     pub timestamp: String,
@@ -458,6 +579,7 @@ mod tests {
 
 /// A wrapper used to distinguish routing intents inside the Agent network.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum BusMessage {
     Inbound(InboundMessage),
     Outbound(OutboundMessage),
@@ -483,5 +605,25 @@ pub enum BusMessage {
         model_name: String,
         base_url: String,
         api_key: String,
+    },
+    /// PR-5: caller-driven compaction request for a specific chat session.
+    /// `session_key` is `format!("{channel}:{chat_id}:{thread}")` — construct
+    /// via [`clarification_session_key`]. `focus_instructions`, when present,
+    /// is appended to the sectional summary prompt as a `FOCUS:` block so the
+    /// summarizer can prioritize certain content (e.g. "drop the file-listing
+    /// exploration, keep the API design decisions").
+    ///
+    /// Manual triggers are no-ops while a reasoning turn is already in flight
+    /// for the same `chat_id` — see [`crate::agent::AgentLogic::trigger_compaction`].
+    /// `trigger` distinguishes a `Manual` caller-API trigger from `AgentSelf` (the
+    /// `compact_context` tool); other `CompactionTrigger` variants are reserved
+    /// for the in-loop paths and should not appear here. `None` defaults to `Manual`
+    /// so older serialized payloads still deserialize cleanly.
+    TriggerCompaction {
+        session_key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        focus_instructions: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trigger: Option<CompactionTrigger>,
     },
 }

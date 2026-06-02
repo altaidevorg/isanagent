@@ -19,6 +19,7 @@ pub const REDACTED_THINKING_STRIP_PATTERN: &str =
 /// Follows the OpenAI content part schema.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ContentPart {
     /// Plain text content.
     Text { text: String },
@@ -40,6 +41,7 @@ pub struct ImageUrl {
 /// list of multimodal content parts (following the OpenAI spec).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum MessageContent {
     /// A plain-text string – used for system, assistant, and tool messages.
     Text(String),
@@ -112,6 +114,18 @@ pub struct TokenUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// PR-6.1: tokens served from the provider's prompt cache (Anthropic
+    /// `cache_read_input_tokens`, OpenAI `prompt_tokens_details.cached_tokens`).
+    /// Charged at a reduced rate by the provider. `0` when the provider doesn't
+    /// expose this or no cache hit occurred. `#[serde(default)]` so older
+    /// `conversation.jsonl` rows without the field still deserialize.
+    #[serde(default)]
+    pub cache_read_tokens: u32,
+    /// PR-6.1: tokens written to the provider's prompt cache on this call
+    /// (Anthropic `cache_creation_input_tokens`). OpenAI doesn't bill cache
+    /// writes separately, so it's always `0` there.
+    #[serde(default)]
+    pub cache_creation_tokens: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,6 +205,7 @@ impl ChatMessage {
 // --- Error Handling ---
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum LLMError {
     #[error("HTTP Request Failed: {0}")]
     RequestError(#[from] reqwest::Error),
@@ -200,12 +215,23 @@ pub enum LLMError {
     ParseError(#[from] serde_json::Error),
     #[error("No content in response")]
     NoContent,
+    /// PR-4: provider returned a context-length overflow (typically HTTP 400 with
+    /// a body whose error code or message indicates the input exceeded the model's
+    /// window). `max` may be `None` when the provider doesn't echo the model's
+    /// context window in the error response.
+    #[error("Context overflow: attempted {tokens_attempted} tokens, max {}", max.map(|m| m.to_string()).unwrap_or_else(|| "unknown".to_string()))]
+    ContextOverflow {
+        tokens_attempted: u32,
+        max: Option<u32>,
+    },
 }
 
 impl LLMError {
     /// Heuristic: should the caller retry this error after a backoff?
     /// True for network/IO errors and HTTP 429 / 5xx. False for parse errors and 4xx
     /// (those need user/config attention; retrying just hammers the upstream).
+    /// `ContextOverflow` is also non-transient — retrying without first reducing
+    /// the input is guaranteed to fail again. The caller should compact instead.
     pub fn is_transient(&self) -> bool {
         match self {
             LLMError::RequestError(_) => true,
@@ -217,8 +243,34 @@ impl LLMError {
                     || m.contains("rate limit")
                     || m.contains("server error")
             }
-            LLMError::ParseError(_) | LLMError::NoContent => false,
+            LLMError::ParseError(_) | LLMError::NoContent | LLMError::ContextOverflow { .. } => {
+                false
+            }
         }
+    }
+
+    /// Sniff a provider's 4xx body text for context-overflow signals. Used by
+    /// provider adapters before falling back to the generic `ApiError`.
+    ///
+    /// Recognized patterns (case-insensitive substring):
+    /// - OpenAI: `"context_length_exceeded"`, `"maximum context length"`
+    /// - Anthropic: `"input is too long"`, `"prompt is too long"`, `"max_tokens_to_sample"` overflow
+    /// - Generic: `"context window"` + `"exceed"`, `"context length"` + `"exceed"`
+    pub fn looks_like_context_overflow(body: &str) -> bool {
+        let m = body.to_lowercase();
+        if m.contains("context_length_exceeded") || m.contains("maximum context length") {
+            return true;
+        }
+        if m.contains("input is too long") || m.contains("prompt is too long") {
+            return true;
+        }
+        if m.contains("max_tokens_to_sample") && m.contains("exceed") {
+            return true;
+        }
+        if (m.contains("context window") || m.contains("context length")) && m.contains("exceed") {
+            return true;
+        }
+        false
     }
 }
 
@@ -429,6 +481,16 @@ impl LLMClient {
         let status = res.status();
         if !status.is_success() {
             let text = res.text().await.unwrap_or_default();
+            // PR-4: classify context-length overflow as a typed error so the
+            // reasoning loop can compact-and-retry instead of bouncing the turn.
+            if status == reqwest::StatusCode::BAD_REQUEST
+                && LLMError::looks_like_context_overflow(&text)
+            {
+                return Err(LLMError::ContextOverflow {
+                    tokens_attempted: 0,
+                    max: None,
+                });
+            }
             let friendly = format_api_error(status.as_u16(), &text, &self.base_url, &self.model);
             return Err(LLMError::ApiError(friendly));
         }
@@ -485,10 +547,24 @@ impl LLMClient {
             .as_str()
             .map(|s| s.to_string());
 
-        let usage = json_resp.get("usage").map(|usage_obj| TokenUsage {
-            prompt_tokens: usage_obj["prompt_tokens"].as_u64().unwrap_or(0) as u32,
-            completion_tokens: usage_obj["completion_tokens"].as_u64().unwrap_or(0) as u32,
-            total_tokens: usage_obj["total_tokens"].as_u64().unwrap_or(0) as u32,
+        let usage = json_resp.get("usage").map(|usage_obj| {
+            // PR-6.1: OpenAI exposes cache hits at
+            // `usage.prompt_tokens_details.cached_tokens` (gpt-4o+). Older models
+            // and other OpenAI-compatible providers omit it; default to 0. OpenAI
+            // doesn't bill cache writes separately, so `cache_creation_tokens`
+            // stays at 0 for this path.
+            let cache_read = usage_obj
+                .get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            TokenUsage {
+                prompt_tokens: usage_obj["prompt_tokens"].as_u64().unwrap_or(0) as u32,
+                completion_tokens: usage_obj["completion_tokens"].as_u64().unwrap_or(0) as u32,
+                total_tokens: usage_obj["total_tokens"].as_u64().unwrap_or(0) as u32,
+                cache_read_tokens: cache_read,
+                cache_creation_tokens: 0,
+            }
         });
 
         let finish_reason = json_resp["choices"][0]["finish_reason"]
@@ -699,6 +775,45 @@ pub fn extract_markdown_from_pdf_bytes(pdf_bytes: &[u8]) -> Result<String, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn looks_like_context_overflow_recognizes_known_signals() {
+        // OpenAI shape
+        assert!(LLMError::looks_like_context_overflow(
+            r#"{"error":{"code":"context_length_exceeded","message":"This model's maximum context length is 128000 tokens"}}"#
+        ));
+        assert!(LLMError::looks_like_context_overflow(
+            r#"{"error":{"message":"This model's maximum context length is 200000 tokens, however you provided 300000"}}"#
+        ));
+        // Anthropic shape
+        assert!(LLMError::looks_like_context_overflow(
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"input is too long"}}"#
+        ));
+        assert!(LLMError::looks_like_context_overflow(
+            r#"{"error":{"message":"prompt is too long: 250000 tokens > 200000"}}"#
+        ));
+        // Generic phrasing
+        assert!(LLMError::looks_like_context_overflow(
+            "the context window would be exceeded"
+        ));
+        // Unrelated 4xx bodies must NOT trigger
+        assert!(!LLMError::looks_like_context_overflow(
+            r#"{"error":{"code":"invalid_api_key","message":"bad key"}}"#
+        ));
+        assert!(!LLMError::looks_like_context_overflow(
+            r#"{"error":{"message":"rate limit exceeded"}}"#
+        ));
+        assert!(!LLMError::looks_like_context_overflow(""));
+    }
+
+    #[test]
+    fn context_overflow_is_not_transient() {
+        let e = LLMError::ContextOverflow {
+            tokens_attempted: 500_000,
+            max: Some(200_000),
+        };
+        assert!(!e.is_transient(), "ContextOverflow must not be retried");
+    }
 
     #[test]
     fn assistant_message_serializes_reasoning_content_when_set() {

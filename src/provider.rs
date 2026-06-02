@@ -285,6 +285,21 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl Provider for AnthropicProvider {
+    fn context_window_tokens(&self) -> Option<usize> {
+        // PR-3: Anthropic publishes per-model input windows. Match on the
+        // family in the model id; default 200k for current Claude (3.x/4.x)
+        // Opus/Sonnet/Haiku and 100k for Claude 2.x. Unknown models return
+        // `None` so the trigger check falls back to the absolute threshold.
+        let m = self.model.to_lowercase();
+        if m.contains("opus") || m.contains("sonnet") || m.contains("haiku") {
+            Some(200_000)
+        } else if m.contains("claude-2") {
+            Some(100_000)
+        } else {
+            None
+        }
+    }
+
     async fn chat(
         &self,
         messages: &[ChatMessage],
@@ -306,7 +321,20 @@ impl Provider for AnthropicProvider {
         });
 
         if let Some(system_text) = system {
-            body["system"] = json!(system_text);
+            // PR-6: mark the system block as cacheable so repeated summarizations
+            // (and any other repeat call within a ~5 min window) hit the prompt
+            // cache. Cache writes cost ~25% more on the first call; cache reads
+            // cost ~10% of normal input tokens, so break-even is one reuse — system
+            // prompts in a multi-turn agent reuse far more than that. Switching
+            // from `string` to a single-block array form is required because
+            // `cache_control` is a block-level marker.
+            body["system"] = json!([
+                {
+                    "type": "text",
+                    "text": system_text,
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ]);
         }
 
         if let Some(ref t) = tools {
@@ -332,6 +360,15 @@ impl Provider for AnthropicProvider {
         let status = res.status();
         if !status.is_success() {
             let text = res.text().await.unwrap_or_default();
+            // PR-4: classify context-length overflow as a typed error.
+            if status == reqwest::StatusCode::BAD_REQUEST
+                && LLMError::looks_like_context_overflow(&text)
+            {
+                return Err(LLMError::ContextOverflow {
+                    tokens_attempted: 0,
+                    max: None,
+                });
+            }
             let friendly =
                 crate::utils::format_api_error(status.as_u16(), &text, &self.base_url, &self.model);
             return Err(LLMError::ApiError(friendly));
@@ -387,11 +424,20 @@ impl Provider for AnthropicProvider {
             );
         }
 
-        let usage = json_resp.get("usage").map(|u| TokenUsage {
-            prompt_tokens: u["input_tokens"].as_u64().unwrap_or(0) as u32,
-            completion_tokens: u["output_tokens"].as_u64().unwrap_or(0) as u32,
-            total_tokens: (u["input_tokens"].as_u64().unwrap_or(0)
-                + u["output_tokens"].as_u64().unwrap_or(0)) as u32,
+        let usage = json_resp.get("usage").map(|u| {
+            // PR-6.1: surface Anthropic's cache stats so eval tooling can verify
+            // the PR-6 system-prompt cache_control is actually hitting. `total_tokens`
+            // here is just input+output; cache reads/creations are reported separately.
+            let cache_read = u["cache_read_input_tokens"].as_u64().unwrap_or(0) as u32;
+            let cache_creation = u["cache_creation_input_tokens"].as_u64().unwrap_or(0) as u32;
+            TokenUsage {
+                prompt_tokens: u["input_tokens"].as_u64().unwrap_or(0) as u32,
+                completion_tokens: u["output_tokens"].as_u64().unwrap_or(0) as u32,
+                total_tokens: (u["input_tokens"].as_u64().unwrap_or(0)
+                    + u["output_tokens"].as_u64().unwrap_or(0)) as u32,
+                cache_read_tokens: cache_read,
+                cache_creation_tokens: cache_creation,
+            }
         });
 
         Ok(LLMResponse {

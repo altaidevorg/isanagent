@@ -1,0 +1,60 @@
+name: PR check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust-check:
+    name: cargo check + clippy + test (release)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: pr-check
+
+      # Two pre-existing tests spawn external binaries and assume they're on
+      # PATH: `tools::builtin::python_run_tests::test_python_run_basic` shells
+      # out to `python` (not `python3`), and `execution::local::tests::uv_managed_*`
+      # shells out to `uv`. Both pass locally on developer machines that have
+      # these installed; the bare ubuntu runner doesn't. Install both so the
+      # gate matches local behavior — alternative would be `#[ignore]` markers,
+      # but that would silently drop real coverage.
+      - name: Install python (python -> python3 symlink)
+        run: sudo apt-get install -y python-is-python3
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      # Fast type-check across all targets first so trivial errors fail loudly
+      # before the slower release builds below.
+      - name: cargo check
+        run: cargo check --all-targets --locked
+
+      # Per AGENTS.md, the canonical clippy gate is the release profile with all
+      # targets. `-D warnings` is NOT enabled yet: there are 8 pre-existing
+      # clippy warnings in src/channels/terminal_ui/run.rs, src/execution/jupyter.rs,
+      # src/execution/ssh.rs, and src/tools/builtin.rs. Tracked as a follow-up
+      # cleanup — tighten this gate (add `-- -D warnings`) once they are cleared.
+      - name: cargo clippy
+        run: cargo clippy --release -p isanagent --all-targets --locked
+
+      # Release-profile test run, matching AGENTS.md. 7 tests are marked
+      # `#[ignore]` (6 in tools::execution::tests that need porting away from
+      # `language: "python"` on the local provider, plus 1 pre-existing).
+      # See `#[ignore]` annotations in src/tools/execution.rs.
+      - name: cargo test
+        run: cargo test --release -p isanagent --lib --locked

@@ -196,6 +196,10 @@ impl LoggingActor {
             BusMessage::PromoteSyncToBackground(_) => return Ok(()),
             BusMessage::SetTerminalSessionChat { .. } => return Ok(()),
             BusMessage::SwitchModel { .. } => return Ok(()),
+            // PR-5: a manual trigger is internal control flow; the resulting
+            // `CompactionTriggered` / `CompactionCompleted` telemetry pair already
+            // shows up in the conversation log via the `Telemetry(_)` arm above.
+            BusMessage::TriggerCompaction { .. } => return Ok(()),
         }
         .map_err(|e| ActorError::from(format!("Failed to serialize conversation event: {}", e)))?;
 
@@ -268,6 +272,22 @@ impl LoggingActor {
                     provider_name, model_name
                 ),
             ),
+            BusMessage::TriggerCompaction {
+                session_key,
+                focus_instructions,
+                trigger,
+            } => LogEvent::info(
+                "BusMessage",
+                &format!(
+                    "TriggerCompaction session_key={} trigger={:?} focus={}",
+                    session_key,
+                    trigger,
+                    focus_instructions
+                        .as_deref()
+                        .map(|s| if s.is_empty() { "-" } else { s })
+                        .unwrap_or("-"),
+                ),
+            ),
         };
 
         self.write_runtime_event(&event)
@@ -325,6 +345,7 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             channel,
             tool_name,
             result,
+            is_error: _,
             tool_call_id,
             background_job_id,
         } => LogEvent::info(
@@ -350,12 +371,20 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             prompt_tokens,
             completion_tokens,
             total_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
             background_job_id,
         } => LogEvent::info(
             "Telemetry",
             &format!(
-                "AgentUsage model={} prompt={} completion={} total={} bg={}",
-                model, prompt_tokens, completion_tokens, total_tokens, background_job_id.as_deref().unwrap_or("-")
+                "AgentUsage model={} prompt={} completion={} total={} cache_read={} cache_create={} bg={}",
+                model,
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+                background_job_id.as_deref().unwrap_or("-")
             ),
         )
         .with_chat_id(chat_id),
@@ -588,6 +617,91 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
                 "NotificationUpdated channel={} id={} state={}",
                 channel, notification_id, state
             ),
+        )
+        .with_chat_id(chat_id),
+        // --- Phase 0 (compaction overhaul) telemetry ---
+        TelemetryEvent::CompactionTriggered {
+            chat_id,
+            reason,
+            tokens_before,
+            turns_before,
+            tokens_after_preprocess,
+        } => LogEvent::info(
+            "Telemetry",
+            &format!(
+                "CompactionTriggered reason={:?} tokens_before={} turns_before={} tokens_after_preprocess={}",
+                reason, tokens_before, turns_before, tokens_after_preprocess
+            ),
+        )
+        .with_chat_id(chat_id),
+        TelemetryEvent::CompactionCompleted {
+            chat_id,
+            tokens_before,
+            tokens_after,
+            wall_ms,
+            summary_bytes,
+            section_completeness,
+        } => LogEvent::info(
+            "Telemetry",
+            &format!(
+                "CompactionCompleted tokens={}→{} wall_ms={} summary_bytes={} completeness={:.2}",
+                tokens_before, tokens_after, wall_ms, summary_bytes, section_completeness
+            ),
+        )
+        .with_chat_id(chat_id),
+        TelemetryEvent::CompactionFailed {
+            chat_id,
+            reason,
+            tokens_at_failure,
+        } => LogEvent::warn(
+            "Telemetry",
+            &format!(
+                "CompactionFailed reason={} tokens_at_failure={}",
+                reason, tokens_at_failure
+            ),
+        )
+        .with_chat_id(chat_id),
+        TelemetryEvent::ReflectionStarted {
+            chat_id,
+            kind,
+            inputs_consumed,
+        } => {
+            let ev = LogEvent::info(
+                "Telemetry",
+                &format!(
+                    "ReflectionStarted kind={:?} inputs_consumed={}",
+                    kind, inputs_consumed
+                ),
+            );
+            match chat_id {
+                Some(id) => ev.with_chat_id(id),
+                None => ev,
+            }
+        }
+        TelemetryEvent::ReflectionCompleted {
+            chat_id,
+            kind,
+            output_bytes,
+            wall_ms,
+        } => {
+            let ev = LogEvent::info(
+                "Telemetry",
+                &format!(
+                    "ReflectionCompleted kind={:?} output_bytes={} wall_ms={}",
+                    kind, output_bytes, wall_ms
+                ),
+            );
+            match chat_id {
+                Some(id) => ev.with_chat_id(id),
+                None => ev,
+            }
+        }
+        TelemetryEvent::ToolResultRefetch {
+            chat_id,
+            tool_call_id,
+        } => LogEvent::info(
+            "Telemetry",
+            &format!("ToolResultRefetch tool_call_id={}", tool_call_id),
         )
         .with_chat_id(chat_id),
     }
