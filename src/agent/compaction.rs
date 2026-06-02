@@ -531,6 +531,12 @@ pub async fn do_compaction(args: DoCompactionArgs<'_>) -> CompactionOutcome {
             .unwrap_or_default()
     };
 
+    // Capture the last message id now, before `messages_with_ids` is moved
+    // into the swap below. No new messages are appended to the thread during
+    // compaction, so this is the same id a fresh query would return at the
+    // end — reused there to advance the reflection cursor without re-querying.
+    let last_msg_id = messages_with_ids.last().map(|(id, _)| *id);
+
     let mut swapped_context: Vec<ChatMessage>;
     let mut cache_entries: Vec<(String, String, String)>;
     let mut id_updates: Vec<(i64, String)> = Vec::new();
@@ -708,28 +714,19 @@ pub async fn do_compaction(args: DoCompactionArgs<'_>) -> CompactionOutcome {
         .await;
     let _ = rx.await;
 
-    // Advance reflection cursor.
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let _ = args
-        .memory_node
-        .send_packet(MemoryMessage::GetMessagesSinceReflection {
-            thread_id: args.session_key.to_string(),
-            reply: SharedReply::new(tx),
-        })
-        .await;
-    if let Ok(Ok((rows, _))) = rx.await {
-        if let Some((last_id, _)) = rows.last() {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let _ = args
-                .memory_node
-                .send_packet(MemoryMessage::UpdateThreadMetadata {
-                    thread_id: args.session_key.to_string(),
-                    last_reflection_msg_id: Some(*last_id),
-                    reply: SharedReply::new(tx),
-                })
-                .await;
-            let _ = rx.await;
-        }
+    // Advance reflection cursor — reuse the id captured before the swap
+    // instead of issuing another GetMessagesSinceReflection round-trip.
+    if let Some(last_id) = last_msg_id {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = args
+            .memory_node
+            .send_packet(MemoryMessage::UpdateThreadMetadata {
+                thread_id: args.session_key.to_string(),
+                last_reflection_msg_id: Some(last_id),
+                reply: SharedReply::new(tx),
+            })
+            .await;
+        let _ = rx.await;
     }
 
     let _ = args

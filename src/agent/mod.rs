@@ -2125,16 +2125,16 @@ impl AgentLogic {
             // iteration (independent of the compaction threshold). For tool
             // results older than `KEEP_RECENT_USER_TURNS_DEFAULT` user turns
             // from the latest, cache the original and replace the stored
-            // content with a compact placeholder. The next `get_context_*`
-            // fetch (immediately below) sees the smaller form, so the chat
-            // call sends a smaller payload to the provider. Idempotent — the
+            // content with a compact placeholder. The swap is mirrored into
+            // the in-memory `messages_with_ids` so the reasoning context is
+            // built directly from it below — no second fetch. Idempotent — the
             // helper skips messages already in placeholder form.
             //
             // Cost per iteration: 1 SELECT + N UPDATE pairs (where N = number
             // of newly-stale tool messages, typically 0 except right after a
             // tool-heavy iteration). The helper does no I/O itself; all writes
             // go through the memory actor and serialize.
-            {
+            let mut messages_with_ids: Vec<(i64, crate::utils::ChatMessage)> = {
                 let memory_node = session_manager.get_memory_node();
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 let _ = memory_node
@@ -2143,12 +2143,14 @@ impl AgentLogic {
                         reply: crate::memory::SharedReply::new(tx),
                     })
                     .await;
-                let messages_with_ids: Vec<(i64, crate::utils::ChatMessage)> = rx
-                    .await
+                rx.await
                     .ok()
                     .and_then(|r| r.ok())
                     .map(|(rows, _)| rows)
-                    .unwrap_or_default();
+                    .unwrap_or_default()
+            };
+            {
+                let memory_node = session_manager.get_memory_node();
                 let stale = crate::agent::compaction::identify_stale_tool_swaps(
                     &messages_with_ids,
                     crate::agent::compaction::KEEP_RECENT_USER_TURNS_DEFAULT,
@@ -2177,16 +2179,28 @@ impl AgentLogic {
                     let _ = memory_node
                         .send_packet(crate::memory::MemoryMessage::UpdateMessageContent {
                             message_id: db_id,
-                            new_content: placeholder,
+                            new_content: placeholder.clone(),
                             reply: crate::memory::SharedReply::new(tx),
                         })
                         .await;
                     let _ = rx.await;
+
+                    // Mirror the swap in the already-fetched in-memory copy so
+                    // the context built below matches the persisted form.
+                    if let Some((_, msg)) =
+                        messages_with_ids.iter_mut().find(|(id, _)| *id == db_id)
+                    {
+                        msg.content =
+                            Some(crate::utils::MessageContent::Text(placeholder));
+                    }
                 }
             }
 
-            // Fetch context
-            let mut context = mem.get_context_since_reflection().await?;
+            // Fetch context — reuse the messages already fetched for the stale
+            // swap pass (get_context_since_reflection issues the identical
+            // GetMessagesSinceReflection query) instead of a second round-trip.
+            let mut context: Vec<crate::utils::ChatMessage> =
+                messages_with_ids.into_iter().map(|(_, m)| m).collect();
 
             // Strip any legacy static system prompts that SQLite may have persisted
             context.retain(|msg| msg.role != "system");
