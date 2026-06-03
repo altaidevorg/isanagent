@@ -63,8 +63,8 @@ pub struct LocalExecutionConfig {
     pub uv_env_root: PathBuf,
     /// Workspace root for log files.
     pub workspace_dir: PathBuf,
-    /// Hard per-run resource caps applied to the child via `setrlimit` (Unix only). All fields
-    /// default to `None` (no limit).
+    /// Per-run resource caps applied to the child via `setrlimit` (Unix only; best-effort —
+    /// a failed `setrlimit` is not fatal). All fields default to `None` (no limit).
     pub resource_limits: ResourceLimits,
 }
 
@@ -89,7 +89,8 @@ pub struct ResourceLimits {
 }
 
 impl ResourceLimits {
-    /// True when no limit is set (lets callers skip the `pre_exec` hook entirely).
+    /// True when no limit is set, so the `pre_exec` applier can skip the `setrlimit` calls.
+    /// (The hook itself is still installed for `setpgid`.)
     pub fn is_unset(&self) -> bool {
         self.address_space_bytes.is_none()
             && self.cpu_secs.is_none()
@@ -719,7 +720,9 @@ impl ExecutionProvider for LocalExecutionProvider {
                         if libc::setpgid(0, 0) != 0 {
                             return Err(std::io::Error::last_os_error());
                         }
-                        resource_limits.apply_in_child();
+                        if !resource_limits.is_unset() {
+                            resource_limits.apply_in_child();
+                        }
                         Ok(())
                     });
                 }

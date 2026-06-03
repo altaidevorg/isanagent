@@ -53,7 +53,7 @@ pub use jupyter::{JupyterExecutionProvider, JupyterExecutionProviderConfig};
 pub use local::{
     build_python_host_command, install_uv_best_effort, parse_uv_pip_list_and_diff,
     uv_binary_available, uv_managed_env_python, uv_requirements_status, LocalExecMode,
-    LocalExecutionConfig, LocalExecutionProvider, LocalPythonRuntime,
+    LocalExecutionConfig, LocalExecutionProvider, LocalPythonRuntime, ResourceLimits,
 };
 pub use mcp_call_history::{
     append_mcp_call_manifest, mcp_call_history_dir, write_mcp_call_journal, McpCallJournalParams,

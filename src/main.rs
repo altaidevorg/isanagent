@@ -1379,6 +1379,13 @@ async fn maybe_prompt_uv_requirements_install(
             .join(".system_generated")
             .join("uv")
             .join("envs"),
+        resource_limits: isanagent::execution::ResourceLimits {
+            address_space_bytes: workspace.config.execution_rlimit_address_space_bytes(),
+            cpu_secs: workspace.config.execution_rlimit_cpu_secs(),
+            max_processes: workspace.config.execution_rlimit_max_processes(),
+            max_open_files: workspace.config.execution_rlimit_max_open_files(),
+            max_file_size_bytes: workspace.config.execution_rlimit_max_file_size_bytes(),
+        },
     };
     let Some(env_python) = isanagent::execution::uv_managed_env_python(&local_cfg) else {
         return;
