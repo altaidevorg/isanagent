@@ -91,12 +91,15 @@ pub struct ChatMessage {
     /// providers that ignore the field see no change.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
-    /// For `role == "tool"` messages: whether the tool call failed. INTERNAL-ONLY — never
-    /// serialized via this struct's serde (`skip_serializing`), so the OpenAI-compatible wire
-    /// format is byte-identical and strict endpoints can't reject an unknown field. It is read
-    /// directly by the Anthropic message builder, which sets the native `is_error: true` on the
-    /// `tool_result` content block so the model gets a structured failure signal (not just an
-    /// `"Error:"` text prefix). `default` so older persisted messages still deserialize.
+    /// For `role == "tool"` messages: whether the tool call **failed at execution/transport
+    /// level** (the dispatch `Result` was `Err`). Note: a few tools report *recoverable* errors
+    /// in-band as `Ok("Error: ...")`; those are not reflected here (they still reach the model
+    /// via the `"Error:"` text in `content`) — widening this to the textual failure heuristic is
+    /// a possible follow-up. INTERNAL-ONLY — never serialized via this struct's serde
+    /// (`skip_serializing`), so the OpenAI-compatible wire format is byte-identical and strict
+    /// endpoints can't reject an unknown field. It is read directly by the Anthropic message
+    /// builder, which sets the native `is_error: true` on the `tool_result` content block so the
+    /// model gets a structured failure signal. `default` so older persisted messages deserialize.
     #[serde(default, skip_serializing)]
     pub is_error: Option<bool>,
 }

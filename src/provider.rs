@@ -489,7 +489,11 @@ mod is_error_tests {
         ];
         let (_system, anthropic) = AnthropicProvider::convert_messages(&msgs);
         let blocks = tool_result_blocks(&anthropic);
-        assert_eq!(blocks.len(), 3, "expected 3 tool_result blocks, got {anthropic:?}");
+        assert_eq!(
+            blocks.len(),
+            3,
+            "expected 3 tool_result blocks, got {anthropic:?}"
+        );
 
         let by_id = |id: &str| {
             blocks
@@ -498,7 +502,10 @@ mod is_error_tests {
                 .unwrap_or_else(|| panic!("missing tool_result for {id}"))
         };
         // Failure -> native is_error: true.
-        assert_eq!(by_id("call_1").get("is_error"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            by_id("call_1").get("is_error"),
+            Some(&serde_json::json!(true))
+        );
         // Success and legacy(None) -> NO is_error key (Anthropic treats absence as success).
         assert!(by_id("call_2").get("is_error").is_none());
         assert!(by_id("call_3").get("is_error").is_none());
@@ -513,6 +520,13 @@ mod is_error_tests {
         assert!(
             v.get("is_error").is_none(),
             "is_error leaked onto the OpenAI-compatible wire: {v}"
+        );
+        // Also assert against the real request-body shape (LLMClient::chat serializes
+        // `{"messages": [...]}` directly), not just the bare struct.
+        let body = serde_json::json!({ "messages": [msg] });
+        assert!(
+            body["messages"][0].get("is_error").is_none(),
+            "is_error leaked inside the messages array: {body}"
         );
     }
 }
