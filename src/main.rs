@@ -348,10 +348,14 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     tools.register(Box::new(ShellExecTool {
         workspace_dir: workspace.sandbox_dir.clone(),
         restrict_to_workspace: restrict,
+        env_scrub_secrets: workspace.config.execution_env_scrub_secrets(),
+        env_extra_secret_vars: workspace.config.execution_env_extra_secret_vars(),
     }));
     tools.register(Box::new(GetEnvTool));
     tools.register(Box::new(PythonRunTool {
         workspace_dir: workspace.sandbox_dir.clone(),
+        env_scrub_secrets: workspace.config.execution_env_scrub_secrets(),
+        env_extra_secret_vars: workspace.config.execution_env_extra_secret_vars(),
     }));
     if workspace.config.git_worktree_tool_enabled() {
         tools.register(Box::new(GitWorktreeTool {

@@ -870,6 +870,12 @@ impl Tool for SearchTextTool {
 pub struct ShellExecTool {
     pub workspace_dir: PathBuf,
     pub restrict_to_workspace: bool,
+    /// When true, strip secret-bearing env vars from the child (see
+    /// [`crate::execution::is_secret_env_var`]). Default false. Wired from
+    /// `[harness.execution].env_scrub_secrets` so one policy covers exec + shell_exec + python_run.
+    pub env_scrub_secrets: bool,
+    /// Extra exact (case-insensitive) env var names to strip when `env_scrub_secrets` is on.
+    pub env_extra_secret_vars: Vec<String>,
 }
 
 impl ShellExecTool {
@@ -979,8 +985,13 @@ impl Tool for ShellExecTool {
         };
 
         cmd.current_dir(actual_dir);
-        // Explicitly forward host environment so secrets/API keys are visible to the child.
-        cmd.envs(std::env::vars());
+        // Forward host environment, optionally stripping secret-bearing vars (default: forward
+        // all). Same policy as the execution provider so enabling env_scrub_secrets actually
+        // covers this model-reachable shell path, not just `execution_run`.
+        cmd.envs(crate::execution::host_env_for_child(
+            self.env_scrub_secrets,
+            &self.env_extra_secret_vars,
+        ));
 
         let child = cmd.output();
 
@@ -2244,6 +2255,12 @@ impl Tool for GetEnvTool {
 
 pub struct PythonRunTool {
     pub workspace_dir: PathBuf,
+    /// When true, strip secret-bearing env vars from the child (see
+    /// [`crate::execution::is_secret_env_var`]). Default false. Wired from
+    /// `[harness.execution].env_scrub_secrets`.
+    pub env_scrub_secrets: bool,
+    /// Extra exact (case-insensitive) env var names to strip when `env_scrub_secrets` is on.
+    pub env_extra_secret_vars: Vec<String>,
 }
 
 #[async_trait]
@@ -2280,8 +2297,12 @@ impl Tool for PythonRunTool {
         cmd.arg("python");
         cmd.arg("-");
         cmd.current_dir(&self.workspace_dir);
-        // Explicitly forward host environment so secrets/API keys are visible to the child.
-        cmd.envs(std::env::vars());
+        // Forward host environment, optionally stripping secret-bearing vars (default: forward
+        // all). Same policy as the execution provider / shell_exec.
+        cmd.envs(crate::execution::host_env_for_child(
+            self.env_scrub_secrets,
+            &self.env_extra_secret_vars,
+        ));
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
@@ -2553,6 +2574,8 @@ mod python_run_tests {
 
         let tool = PythonRunTool {
             workspace_dir: root.clone(),
+            env_scrub_secrets: false,
+            env_extra_secret_vars: Vec::new(),
         };
         let out = tool
             .execute(json!({ "code": "print('hello from python')" }))

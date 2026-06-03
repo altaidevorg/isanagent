@@ -51,9 +51,9 @@ pub use ids::SessionId;
 pub use inflight::{InflightGuard, InflightSyncRegistry};
 pub use jupyter::{JupyterExecutionProvider, JupyterExecutionProviderConfig};
 pub use local::{
-    build_python_host_command, install_uv_best_effort, parse_uv_pip_list_and_diff,
-    uv_binary_available, uv_managed_env_python, uv_requirements_status, LocalExecMode,
-    LocalExecutionConfig, LocalExecutionProvider, LocalPythonRuntime,
+    build_python_host_command, host_env_for_child, install_uv_best_effort, is_secret_env_var,
+    parse_uv_pip_list_and_diff, uv_binary_available, uv_managed_env_python, uv_requirements_status,
+    LocalExecMode, LocalExecutionConfig, LocalExecutionProvider, LocalPythonRuntime,
 };
 pub use mcp_call_history::{
     append_mcp_call_manifest, mcp_call_history_dir, write_mcp_call_journal, McpCallJournalParams,

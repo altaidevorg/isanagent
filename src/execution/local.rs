@@ -108,6 +108,7 @@ pub fn is_secret_env_var(name: &str, extra: &[String]) -> bool {
         "_SECRET",
         "_SECRET_KEY",
         "_ACCESS_KEY",
+        "_KEY_ID", // e.g. AWS_ACCESS_KEY_ID (the secret half AWS_SECRET_ACCESS_KEY hits _ACCESS_KEY)
         "_PASSWORD",
         "_PASSWD",
     ];
@@ -131,8 +132,10 @@ fn filter_secret_env<I: IntoIterator<Item = (String, String)>>(
         .collect()
 }
 
-/// Host environment to forward to a child, with optional secret scrubbing applied.
-fn host_env_for_child(scrub_secrets: bool, extra: &[String]) -> Vec<(String, String)> {
+/// Host environment to forward to a child, with optional secret scrubbing applied. Shared by the
+/// local provider and the builtin `shell_exec` / `python_run` tools so a single `env_scrub_secrets`
+/// policy covers every place the agent spawns a child.
+pub fn host_env_for_child(scrub_secrets: bool, extra: &[String]) -> Vec<(String, String)> {
     filter_secret_env(std::env::vars(), scrub_secrets, extra)
 }
 
@@ -1011,6 +1014,7 @@ mod tests {
             "HF_TOKEN",
             "JUPYTER_TOKEN",
             "AWS_SECRET_ACCESS_KEY",
+            "AWS_ACCESS_KEY_ID", // via _KEY_ID
             "AWS_SESSION_TOKEN",
             "SSH_PASSWORD",
             "github_token", // case-insensitive
