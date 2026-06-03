@@ -311,6 +311,8 @@ fn try_build_provider(
                     .join(".system_generated")
                     .join("uv")
                     .join("envs"),
+                env_scrub_secrets: config.execution_env_scrub_secrets(),
+                env_extra_secret_vars: config.execution_env_extra_secret_vars(),
             };
             let p = LocalExecutionProvider::new(lc).map_err(|e: ExecutionError| e.to_string())?;
             Ok((Arc::new(p), None))

@@ -1379,6 +1379,8 @@ async fn maybe_prompt_uv_requirements_install(
             .join(".system_generated")
             .join("uv")
             .join("envs"),
+        env_scrub_secrets: workspace.config.execution_env_scrub_secrets(),
+        env_extra_secret_vars: workspace.config.execution_env_extra_secret_vars(),
     };
     let Some(env_python) = isanagent::execution::uv_managed_env_python(&local_cfg) else {
         return;

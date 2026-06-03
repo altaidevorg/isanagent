@@ -63,6 +63,11 @@ pub struct LocalExecutionConfig {
     pub uv_env_root: PathBuf,
     /// Workspace root for log files.
     pub workspace_dir: PathBuf,
+    /// When true, strip secret-bearing env vars from the child (see [`is_secret_env_var`]).
+    /// Default false (full host env forwarded).
+    pub env_scrub_secrets: bool,
+    /// Extra exact (case-insensitive) env var names to strip when `env_scrub_secrets` is on.
+    pub env_extra_secret_vars: Vec<String>,
 }
 
 impl LocalExecutionConfig {
@@ -85,8 +90,50 @@ impl LocalExecutionConfig {
             uv_requirements: Vec::new(),
             uv_env_root,
             workspace_dir,
+            env_scrub_secrets: false,
+            env_extra_secret_vars: Vec::new(),
         }
     }
+}
+
+/// True if `name` denotes a secret-bearing environment variable that should not be forwarded to
+/// executed child processes when scrubbing is enabled. Matches common credential suffixes
+/// (covers `OPENAI_API_KEY`, `HF_TOKEN`, `JUPYTER_TOKEN`, `AWS_SECRET_ACCESS_KEY`, `SSH_PASSWORD`,
+/// …) plus any operator-supplied `extra` names (exact, case-insensitive).
+pub fn is_secret_env_var(name: &str, extra: &[String]) -> bool {
+    const SECRET_SUFFIXES: &[&str] = &[
+        "_API_KEY",
+        "_APIKEY",
+        "_TOKEN",
+        "_SECRET",
+        "_SECRET_KEY",
+        "_ACCESS_KEY",
+        "_PASSWORD",
+        "_PASSWD",
+    ];
+    let upper = name.to_ascii_uppercase();
+    if SECRET_SUFFIXES.iter().any(|s| upper.ends_with(s)) {
+        return true;
+    }
+    extra.iter().any(|e| e.eq_ignore_ascii_case(name))
+}
+
+/// Filter a set of `(name, value)` env pairs for forwarding to a child. With `scrub_secrets`
+/// off this is identity; with it on, secret-bearing vars (see [`is_secret_env_var`]) are dropped.
+/// Pure (operates on the provided iterator) so it is deterministically testable.
+fn filter_secret_env<I: IntoIterator<Item = (String, String)>>(
+    vars: I,
+    scrub_secrets: bool,
+    extra: &[String],
+) -> Vec<(String, String)> {
+    vars.into_iter()
+        .filter(|(k, _)| !scrub_secrets || !is_secret_env_var(k, extra))
+        .collect()
+}
+
+/// Host environment to forward to a child, with optional secret scrubbing applied.
+fn host_env_for_child(scrub_secrets: bool, extra: &[String]) -> Vec<(String, String)> {
+    filter_secret_env(std::env::vars(), scrub_secrets, extra)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -415,6 +462,8 @@ impl LocalExecutionProvider {
                             env_dir.to_string_lossy().to_string(),
                         ],
                         None,
+                        self.config.env_scrub_secrets,
+                        &self.config.env_extra_secret_vars,
                     )
                     .await?;
                     if !self.config.uv_requirements.is_empty() {
@@ -426,7 +475,14 @@ impl LocalExecutionProvider {
                             py.to_string_lossy().to_string(),
                         ];
                         args.extend(self.config.uv_requirements.clone());
-                        run_uv_command(&self.config.uv_binary, &args, None).await?;
+                        run_uv_command(
+                            &self.config.uv_binary,
+                            &args,
+                            None,
+                            self.config.env_scrub_secrets,
+                            &self.config.env_extra_secret_vars,
+                        )
+                        .await?;
                     }
                     emit_tool_progress_message("Python environment ready.").await;
                 }
@@ -605,7 +661,12 @@ impl ExecutionProvider for LocalExecutionProvider {
         let max_each = (self.config.max_output_bytes / 2).max(1024);
 
         let result: Result<RunResult, ExecutionError> = {
-            let (mut cmd, stdin_body) = build_command(&session.mode, &spec.code)?;
+            let (mut cmd, stdin_body) = build_command(
+                &session.mode,
+                &spec.code,
+                self.config.env_scrub_secrets,
+                &self.config.env_extra_secret_vars,
+            )?;
 
             let mut has_local_venv = false;
             for ancestor in cwd.ancestors() {
@@ -815,18 +876,21 @@ async fn run_uv_command(
     uv_binary: &str,
     args: &[String],
     cwd: Option<&Path>,
+    scrub_secrets: bool,
+    extra_secret_vars: &[String],
 ) -> Result<(), ExecutionError> {
     let uv_binary = uv_binary.to_string();
     let args = args.to_vec();
     let cwd = cwd.map(Path::to_path_buf);
+    let child_env = host_env_for_child(scrub_secrets, extra_secret_vars);
     tokio::task::spawn_blocking(move || {
         let mut cmd = StdCommand::new(uv_binary);
         cmd.args(&args);
         if let Some(cwd) = cwd.as_ref() {
             cmd.current_dir(cwd);
         }
-        // Explicitly forward host environment so secrets/API keys are visible to the child.
-        cmd.envs(std::env::vars());
+        // Forward host environment (uv needs PATH/HOME/UV_*); strip secrets when scrubbing is on.
+        cmd.envs(child_env);
         cmd.stdin(Stdio::null());
         let out = cmd
             .output()
@@ -858,6 +922,8 @@ async fn run_uv_command(
 fn build_command(
     mode: &LocalExecMode,
     code: &str,
+    scrub_secrets: bool,
+    extra_secret_vars: &[String],
 ) -> Result<(Command, Option<Vec<u8>>), ExecutionError> {
     let (mut c, stdin) = match mode {
         LocalExecMode::Shell { language } => {
@@ -879,8 +945,10 @@ fn build_command(
             }
         }
     };
-    // Explicitly forward host environment so secrets/API keys are visible to the child.
-    c.envs(std::env::vars());
+    // Forward the host environment to the child, optionally stripping secret-bearing vars
+    // (default: forward everything). Keeps PATH/HOME/locale and ML vars (CUDA_*, HF_HOME, …);
+    // when scrubbing is on, drops credentials so prompt-injected code can't echo them.
+    c.envs(host_env_for_child(scrub_secrets, extra_secret_vars));
     Ok((c, stdin))
 }
 
@@ -931,6 +999,68 @@ mod tests {
             true,
         );
         assert!(LocalExecutionProvider::new(cfg).is_err());
+    }
+
+    // P1.2: env-scrub. Secrets are recognized by name; ML/runtime vars must survive.
+    #[test]
+    fn secret_env_var_detection() {
+        let extra = vec!["MY_CUSTOM_CRED".to_string()];
+        for s in [
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "HF_TOKEN",
+            "JUPYTER_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "SSH_PASSWORD",
+            "github_token", // case-insensitive
+        ] {
+            assert!(is_secret_env_var(s, &extra), "{s} should be secret");
+        }
+        // extra list (exact, case-insensitive)
+        assert!(is_secret_env_var("my_custom_cred", &extra));
+        // non-secrets: ML/runtime vars must NOT be stripped
+        for ok in [
+            "PATH",
+            "HOME",
+            "LANG",
+            "CUDA_VISIBLE_DEVICES",
+            "LD_LIBRARY_PATH",
+            "HF_HOME",
+            "VIRTUAL_ENV",
+            "UV_PROJECT_ENVIRONMENT",
+        ] {
+            assert!(!is_secret_env_var(ok, &extra), "{ok} should NOT be secret");
+        }
+    }
+
+    #[test]
+    fn filter_secret_env_off_is_identity_on_strips() {
+        let vars = vec![
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("OPENAI_API_KEY".to_string(), "sk-xxx".to_string()),
+            ("CUDA_VISIBLE_DEVICES".to_string(), "0".to_string()),
+            ("HF_TOKEN".to_string(), "hf_xxx".to_string()),
+        ];
+        // scrub off -> identity (default behavior, nothing stripped)
+        assert_eq!(filter_secret_env(vars.clone(), false, &[]).len(), 4);
+        // scrub on -> secrets dropped, ML/runtime vars kept
+        let on = filter_secret_env(vars, true, &[]);
+        let names: Vec<&str> = on.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(names.contains(&"PATH") && names.contains(&"CUDA_VISIBLE_DEVICES"));
+        assert!(!names.contains(&"OPENAI_API_KEY") && !names.contains(&"HF_TOKEN"));
+    }
+
+    #[test]
+    fn env_scrub_unset_by_default() {
+        let dir = temp_sandbox();
+        let cfg = LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
+        assert!(
+            !cfg.env_scrub_secrets,
+            "scrub must be off by default (ML workloads rely on forwarded env)"
+        );
+        assert!(cfg.env_extra_secret_vars.is_empty());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn echo_hello_case() -> (&'static str, String) {

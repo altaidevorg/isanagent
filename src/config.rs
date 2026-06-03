@@ -91,6 +91,15 @@ pub struct ExecutionHarnessConfig {
     pub auto_promote_after_secs: Option<u64>,
     /// Max concurrent sessions (default 32, clamped 1–256).
     pub max_sessions: Option<usize>,
+    /// Local provider only: when true, strip secret-bearing environment variables (anything whose
+    /// name ends with `_API_KEY` / `_TOKEN` / `_SECRET` / `_ACCESS_KEY` / `_PASSWORD`, plus
+    /// `env_extra_secret_vars`) from the child's environment, so prompt-injected code can't
+    /// `printenv` the agent's own credentials. Default **false** (full env is forwarded) so ML
+    /// workloads that rely on those vars (e.g. `HF_TOKEN`) keep working; enable for
+    /// untrusted-input deployments.
+    pub env_scrub_secrets: Option<bool>,
+    /// Additional env var names (exact, case-insensitive) to strip when `env_scrub_secrets` is on.
+    pub env_extra_secret_vars: Option<Vec<String>>,
     /// If set and non-empty, only these provider ids may be constructed (e.g. `["local"]`).
     pub allowed_providers: Option<Vec<String>>,
     /// Interpreter for `language: python` (default `python`) — local provider and `execution_env_info`.
@@ -957,6 +966,30 @@ impl AppConfig {
             .clamp(MIN, MAX)
     }
 
+    /// Local provider: strip secret-bearing env vars from the child? Default `false`.
+    pub fn execution_env_scrub_secrets(&self) -> bool {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.env_scrub_secrets)
+            .unwrap_or(false)
+    }
+
+    /// Extra env var names to strip when `env_scrub_secrets` is on (trimmed, non-empty).
+    pub fn execution_env_extra_secret_vars(&self) -> Vec<String> {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.env_extra_secret_vars.as_ref())
+            .map(|v| {
+                v.iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn execution_python_executable(&self) -> String {
         self.execution_python_executable_configured()
             .unwrap_or_else(|| "python".to_string())
@@ -1773,6 +1806,24 @@ accept_unknown_host_keys = false
         );
         assert_eq!(c.execution_ssh_remote_python(), "python3");
         assert!(!c.execution_ssh_accept_unknown_host_keys());
+    }
+
+    #[test]
+    fn execution_env_scrub_config_parses() {
+        // Default: off, no extras.
+        let empty: AppConfig = toml::from_str("[harness.execution]\nenabled = true\n").expect("parse");
+        assert!(!empty.execution_env_scrub_secrets());
+        assert!(empty.execution_env_extra_secret_vars().is_empty());
+
+        let s = r#"
+[harness.execution]
+env_scrub_secrets = true
+env_extra_secret_vars = ["MY_CRED", "  "]
+"#;
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        assert!(c.execution_env_scrub_secrets());
+        // blank entries are filtered out
+        assert_eq!(c.execution_env_extra_secret_vars(), vec!["MY_CRED".to_string()]);
     }
 
     #[test]
