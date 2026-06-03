@@ -91,6 +91,19 @@ pub struct ExecutionHarnessConfig {
     pub auto_promote_after_secs: Option<u64>,
     /// Max concurrent sessions (default 32, clamped 1–256).
     pub max_sessions: Option<usize>,
+    /// Local provider only: hard per-run resource limits applied to the child via `setrlimit`
+    /// (Unix). All default to unset (no limit), so ML workloads (large memory / long CPU) are
+    /// not broken out of the box — set these for untrusted-input deployments. `0` = unset.
+    /// `RLIMIT_AS` — max virtual address space, bytes (Linux-enforced; macOS best-effort).
+    pub rlimit_address_space_bytes: Option<u64>,
+    /// `RLIMIT_CPU` — max CPU seconds per run.
+    pub rlimit_cpu_secs: Option<u64>,
+    /// `RLIMIT_NPROC` — max processes for the real user (fork-bomb guard; per-user count).
+    pub rlimit_max_processes: Option<u64>,
+    /// `RLIMIT_NOFILE` — max open file descriptors.
+    pub rlimit_max_open_files: Option<u64>,
+    /// `RLIMIT_FSIZE` — max bytes of any file the child writes.
+    pub rlimit_max_file_size_bytes: Option<u64>,
     /// If set and non-empty, only these provider ids may be constructed (e.g. `["local"]`).
     pub allowed_providers: Option<Vec<String>>,
     /// Interpreter for `language: python` (default `python`) — local provider and `execution_env_info`.
@@ -957,6 +970,38 @@ impl AppConfig {
             .clamp(MIN, MAX)
     }
 
+    /// Read one optional `setrlimit` value from `[harness.execution]`, treating `0` as unset.
+    fn execution_rlimit(
+        &self,
+        pick: impl Fn(&ExecutionHarnessConfig) -> Option<u64>,
+    ) -> Option<u64> {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(pick)
+            .filter(|&v| v > 0)
+    }
+
+    pub fn execution_rlimit_address_space_bytes(&self) -> Option<u64> {
+        self.execution_rlimit(|e| e.rlimit_address_space_bytes)
+    }
+
+    pub fn execution_rlimit_cpu_secs(&self) -> Option<u64> {
+        self.execution_rlimit(|e| e.rlimit_cpu_secs)
+    }
+
+    pub fn execution_rlimit_max_processes(&self) -> Option<u64> {
+        self.execution_rlimit(|e| e.rlimit_max_processes)
+    }
+
+    pub fn execution_rlimit_max_open_files(&self) -> Option<u64> {
+        self.execution_rlimit(|e| e.rlimit_max_open_files)
+    }
+
+    pub fn execution_rlimit_max_file_size_bytes(&self) -> Option<u64> {
+        self.execution_rlimit(|e| e.rlimit_max_file_size_bytes)
+    }
+
     pub fn execution_python_executable(&self) -> String {
         self.execution_python_executable_configured()
             .unwrap_or_else(|| "python".to_string())
@@ -1773,6 +1818,23 @@ accept_unknown_host_keys = false
         );
         assert_eq!(c.execution_ssh_remote_python(), "python3");
         assert!(!c.execution_ssh_accept_unknown_host_keys());
+    }
+
+    #[test]
+    fn execution_rlimits_parse_and_zero_is_unset() {
+        let s = r#"
+[harness.execution]
+rlimit_max_open_files = 128
+rlimit_cpu_secs = 0
+"#;
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        assert_eq!(c.execution_rlimit_max_open_files(), Some(128));
+        assert_eq!(c.execution_rlimit_cpu_secs(), None, "0 must be treated as unset");
+        assert_eq!(
+            c.execution_rlimit_address_space_bytes(),
+            None,
+            "absent must be unset"
+        );
     }
 
     #[test]

@@ -13,7 +13,7 @@ use super::artifacts::ArtifactLimits;
 use super::colab_mcp::{ColabMcpExecutionProvider, ColabMcpExecutionProviderConfig};
 use super::error::ExecutionError;
 use super::jupyter::{JupyterExecutionProvider, JupyterExecutionProviderConfig};
-use super::local::{LocalExecutionConfig, LocalExecutionProvider, LocalPythonRuntime};
+use super::local::{LocalExecutionConfig, LocalExecutionProvider, LocalPythonRuntime, ResourceLimits};
 use super::provider::ExecutionProvider;
 use super::ssh::{SshExecutionProvider, SshExecutionProviderConfig};
 
@@ -311,6 +311,13 @@ fn try_build_provider(
                     .join(".system_generated")
                     .join("uv")
                     .join("envs"),
+                resource_limits: ResourceLimits {
+                    address_space_bytes: config.execution_rlimit_address_space_bytes(),
+                    cpu_secs: config.execution_rlimit_cpu_secs(),
+                    max_processes: config.execution_rlimit_max_processes(),
+                    max_open_files: config.execution_rlimit_max_open_files(),
+                    max_file_size_bytes: config.execution_rlimit_max_file_size_bytes(),
+                },
             };
             let p = LocalExecutionProvider::new(lc).map_err(|e: ExecutionError| e.to_string())?;
             Ok((Arc::new(p), None))

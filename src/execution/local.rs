@@ -63,6 +63,75 @@ pub struct LocalExecutionConfig {
     pub uv_env_root: PathBuf,
     /// Workspace root for log files.
     pub workspace_dir: PathBuf,
+    /// Hard per-run resource caps applied to the child via `setrlimit` (Unix only). All fields
+    /// default to `None` (no limit).
+    pub resource_limits: ResourceLimits,
+}
+
+/// Per-run OS resource limits applied to the local provider's child process via `setrlimit`
+/// in the post-fork `pre_exec` hook (Unix only; a no-op on Windows). Each field is optional and
+/// defaults to `None` (= no limit), so default behavior is unchanged. Operators running
+/// untrusted or prompt-injected code should set these to bound a fork bomb / OOM / disk-fill /
+/// runaway-CPU child. (`0` from config is treated as "unset".)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResourceLimits {
+    /// `RLIMIT_AS` — max virtual address space, bytes. Linux-enforced; macOS best-effort.
+    pub address_space_bytes: Option<u64>,
+    /// `RLIMIT_CPU` — max CPU seconds (child gets `SIGXCPU` when exceeded).
+    pub cpu_secs: Option<u64>,
+    /// `RLIMIT_NPROC` — max processes for the real user (fork-bomb guard). Note: per-user, so it
+    /// counts the user's existing processes; choose a value above the current baseline.
+    pub max_processes: Option<u64>,
+    /// `RLIMIT_NOFILE` — max open file descriptors for the child.
+    pub max_open_files: Option<u64>,
+    /// `RLIMIT_FSIZE` — max size in bytes of any file the child writes (`SIGXFSZ` when exceeded).
+    pub max_file_size_bytes: Option<u64>,
+}
+
+impl ResourceLimits {
+    /// True when no limit is set (lets callers skip the `pre_exec` hook entirely).
+    pub fn is_unset(&self) -> bool {
+        self.address_space_bytes.is_none()
+            && self.cpu_secs.is_none()
+            && self.max_processes.is_none()
+            && self.max_open_files.is_none()
+            && self.max_file_size_bytes.is_none()
+    }
+
+    /// Apply the configured limits in the just-forked child, before `exec`. Best-effort and
+    /// async-signal-safe: only stack-allocated `rlimit` structs + `setrlimit` syscalls — no
+    /// allocation, no logging. A failed `setrlimit` is ignored (the limit simply isn't applied);
+    /// we never abort the spawn over a soft-limit failure.
+    #[cfg(unix)]
+    fn apply_in_child(&self) {
+        // SAFETY: called post-fork/pre-exec. `setrlimit` is async-signal-safe; the `rlimit`
+        // struct is stack-allocated. Passing the `libc::RLIMIT_*` constant directly keeps the
+        // resource-arg type correct on both Linux (`__rlimit_resource_t`) and macOS (`c_int`).
+        unsafe {
+            let set = |resource, value: u64| {
+                let rl = libc::rlimit {
+                    rlim_cur: value as libc::rlim_t,
+                    rlim_max: value as libc::rlim_t,
+                };
+                let _ = libc::setrlimit(resource, &rl);
+            };
+            if let Some(v) = self.address_space_bytes {
+                set(libc::RLIMIT_AS, v);
+            }
+            if let Some(v) = self.cpu_secs {
+                set(libc::RLIMIT_CPU, v);
+            }
+            if let Some(v) = self.max_processes {
+                set(libc::RLIMIT_NPROC, v);
+            }
+            if let Some(v) = self.max_open_files {
+                set(libc::RLIMIT_NOFILE, v);
+            }
+            if let Some(v) = self.max_file_size_bytes {
+                set(libc::RLIMIT_FSIZE, v);
+            }
+        }
+    }
 }
 
 impl LocalExecutionConfig {
@@ -85,6 +154,7 @@ impl LocalExecutionConfig {
             uv_requirements: Vec::new(),
             uv_env_root,
             workspace_dir,
+            resource_limits: ResourceLimits::default(),
         }
     }
 }
@@ -641,11 +711,15 @@ impl ExecutionProvider for LocalExecutionProvider {
             #[cfg(unix)]
             {
                 use std::os::unix::process::CommandExt;
+                // `ResourceLimits` is `Copy`, so move a copy into the post-fork closure (no
+                // allocation / shared state in the child).
+                let resource_limits = self.config.resource_limits;
                 unsafe {
-                    cmd.as_std_mut().pre_exec(|| {
+                    cmd.as_std_mut().pre_exec(move || {
                         if libc::setpgid(0, 0) != 0 {
                             return Err(std::io::Error::last_os_error());
                         }
+                        resource_limits.apply_in_child();
                         Ok(())
                     });
                 }
@@ -931,6 +1005,48 @@ mod tests {
             true,
         );
         assert!(LocalExecutionProvider::new(cfg).is_err());
+    }
+
+    // P1.1: a configured RLIMIT_NOFILE must actually be applied to the child. `ulimit -n` in the
+    // child shell prints its soft RLIMIT_NOFILE, so this proves the pre_exec setrlimit ran.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rlimit_nofile_applied_to_child() {
+        let dir = temp_sandbox();
+        let mut cfg = LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
+        cfg.resource_limits.max_open_files = Some(64);
+        let prov = LocalExecutionProvider::new(cfg).unwrap();
+        let h = prov
+            .create_session(SessionCreateRequest {
+                language: Some("shell".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let r = prov
+            .run(&h.id, RunSpec::new("ulimit -n".to_string(), 30))
+            .await
+            .unwrap_or_else(|e| panic!("run failed: {e:?}"));
+        assert_eq!(
+            r.stdout.trim(),
+            "64",
+            "child RLIMIT_NOFILE soft limit should be 64 (stdout={:?} stderr={:?})",
+            r.stdout,
+            r.stderr
+        );
+        prov.close_session(&h.id).await.unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resource_limits_unset_by_default() {
+        let dir = temp_sandbox();
+        let cfg = LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
+        assert!(
+            cfg.resource_limits.is_unset(),
+            "no rlimits should be set by default (must not break ML workloads)"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn echo_hello_case() -> (&'static str, String) {
