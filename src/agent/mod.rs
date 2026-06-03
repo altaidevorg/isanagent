@@ -295,6 +295,94 @@ fn command_preview(command: &str) -> String {
     }
 }
 
+/// Tools that execute model-authored code/commands on the host or a session. All of these run
+/// arbitrary code, so they share the shell-policy approval gate — not just `exec`. Keying the
+/// gate on this category (rather than the literal name `"exec"`) is what stops `execution_run`
+/// / `execution_run_background` / `python_run` from bypassing approval entirely.
+fn is_code_exec_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "exec" | "python_run" | "execution_run" | "execution_run_background"
+    )
+}
+
+/// Code-exec tools that run *arbitrary* code (Python source / session cells) where the
+/// destructive-shell-pattern heuristic does not meaningfully apply, so any such call is
+/// treated as approval-worthy in ask/deny mode.
+fn is_arbitrary_code_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "python_run" | "execution_run" | "execution_run_background"
+    )
+}
+
+/// Extract the command/code a code-exec tool will run. `exec` carries it in `command`; the
+/// execution / python tools carry it in `code`.
+fn extract_code_exec_command(tool_name: &str, args: &Value) -> Option<String> {
+    let key = if tool_name == "exec" { "command" } else { "code" };
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Whether a code-exec call needs approval in ask/deny mode. Arbitrary-code tools always do;
+/// shell `exec` only when the command matches a destructive pattern (preserves existing UX).
+fn code_exec_requires_approval(tool_name: &str, command: &str, patterns: &[String]) -> bool {
+    is_arbitrary_code_tool(tool_name) || should_require_shell_approval(command, patterns)
+}
+
+#[cfg(test)]
+mod code_exec_gate_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn category_covers_all_code_exec_tools() {
+        assert!(is_code_exec_tool("exec"));
+        assert!(is_code_exec_tool("python_run"));
+        assert!(is_code_exec_tool("execution_run"));
+        assert!(is_code_exec_tool("execution_run_background"));
+        assert!(!is_code_exec_tool("read_file"));
+        assert!(!is_code_exec_tool("web_search"));
+    }
+
+    #[test]
+    fn extracts_command_for_exec_and_code_for_execution_tools() {
+        assert_eq!(
+            extract_code_exec_command("exec", &json!({"command": " ls -la "})).as_deref(),
+            Some("ls -la")
+        );
+        assert_eq!(
+            extract_code_exec_command("execution_run", &json!({"code": "print(1)"})).as_deref(),
+            Some("print(1)")
+        );
+        assert_eq!(
+            extract_code_exec_command("python_run", &json!({"code": "import os"})).as_deref(),
+            Some("import os")
+        );
+        // wrong key / empty -> None
+        assert!(extract_code_exec_command("execution_run", &json!({"command": "x"})).is_none());
+        assert!(extract_code_exec_command("exec", &json!({"command": "  "})).is_none());
+    }
+
+    #[test]
+    fn arbitrary_code_always_requires_approval_benign_exec_does_not() {
+        let patterns = vec!["rm -rf".to_string()];
+        // Arbitrary-code tools: even benign code requires approval (closes the bypass).
+        assert!(code_exec_requires_approval(
+            "execution_run",
+            "print('hi')",
+            &patterns
+        ));
+        assert!(code_exec_requires_approval("python_run", "1+1", &patterns));
+        // Shell `exec`: benign command does NOT require approval (preserves existing UX)...
+        assert!(!code_exec_requires_approval("exec", "ls -la", &patterns));
+        // ...but a destructive one does.
+        assert!(code_exec_requires_approval("exec", "rm -rf /tmp/x", &patterns));
+    }
+}
+
 fn hook_observe_telemetry(
     hook_tool_ctx: Option<&Arc<ToolCallHookContext>>,
     inbound: &crate::bus::InboundMessage,
@@ -441,13 +529,16 @@ async fn execute_tool_call_with_activity(
 
         let is_subagent = runtime.is_subagent;
         let allow = runtime.subagent_allowlist.clone();
-        if tool_name == "exec" {
-            if let Some(command) = extract_exec_command(&args) {
+        if is_code_exec_tool(&tool_name) {
+            if let Some(command) = extract_code_exec_command(&tool_name, &args) {
                 let preview = command_preview(&command);
                 let mode =
                     shell_policy_mode_for_session(&runtime.shell_policy, runtime.unattended_session);
-                let requires_approval =
-                    should_require_shell_approval(&command, &runtime.shell_policy.approval_patterns);
+                let requires_approval = code_exec_requires_approval(
+                    &tool_name,
+                    &command,
+                    &runtime.shell_policy.approval_patterns,
+                );
                 match mode {
                     ShellPolicyMode::Allow => {}
                     ShellPolicyMode::Deny => {
@@ -480,8 +571,8 @@ async fn execute_tool_call_with_activity(
                                 .await;
                             let ask_payload = serde_json::json!({
                                 "prompt": format!(
-                                    "Approve potentially destructive shell command?\n\n`{}`\n\nReply with approve or deny.",
-                                    command
+                                    "Approve running `{}`?\n\n```\n{}\n```\n\nReply with approve or deny.",
+                                    tool_name, command
                                 ),
                                 "choices": ["approve", "deny"],
                                 "timeout_secs": 1800,

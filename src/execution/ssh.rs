@@ -4,6 +4,7 @@
 //! `cwd_relative` refer to **remote** paths only (never the agent workspace sandbox).
 
 use std::io::Cursor;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,7 +42,11 @@ pub struct SshExecutionProviderConfig {
     pub remote_workdir: String,
     pub remote_python: String,
     pub identity_path: Option<String>,
+    /// INSECURE escape hatch: when true, ANY server key is accepted (no verification). Default
+    /// false — the provider verifies host keys via a trust-on-first-use `known_hosts` store.
     pub accept_unknown_host_keys: bool,
+    /// File where verified host-key fingerprints are recorded (`host:port SHA256:...` per line).
+    pub known_hosts_path: PathBuf,
     pub max_run_timeout_secs: u64,
     pub max_output_bytes: usize,
     pub max_sessions: usize,
@@ -49,6 +54,69 @@ pub struct SshExecutionProviderConfig {
 
 struct SshClientHandler {
     accept_unknown_host_keys: bool,
+    host_label: String,
+    known_hosts_path: PathBuf,
+}
+
+/// Outcome of comparing a presented server key against the `known_hosts` store.
+#[derive(Debug, PartialEq, Eq)]
+enum HostKeyVerdict {
+    /// Fingerprint matches the recorded one.
+    Match,
+    /// First time we have seen this host; fingerprint recorded.
+    TrustedOnFirstUse,
+    /// A different fingerprint is already recorded — possible MITM; connection must be refused.
+    Mismatch { recorded: String },
+}
+
+/// Read the recorded fingerprint for `host_label` from the known_hosts file, if any.
+fn read_recorded_host_key(path: &Path, host_label: &str) -> std::io::Result<Option<String>> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((host, fingerprint)) = line.split_once(' ') {
+            if host == host_label {
+                return Ok(Some(fingerprint.trim().to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn append_known_host(path: &Path, host_label: &str, fingerprint: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(file, "{host_label} {fingerprint}")
+}
+
+/// Trust-on-first-use host-key verification: record an unknown host, confirm a matching one,
+/// and flag a changed key (possible MITM) so the caller can refuse the connection.
+fn verify_or_record_known_host(
+    path: &Path,
+    host_label: &str,
+    fingerprint: &str,
+) -> std::io::Result<HostKeyVerdict> {
+    match read_recorded_host_key(path, host_label)? {
+        Some(recorded) if recorded == fingerprint => Ok(HostKeyVerdict::Match),
+        Some(recorded) => Ok(HostKeyVerdict::Mismatch { recorded }),
+        None => {
+            append_known_host(path, host_label, fingerprint)?;
+            Ok(HostKeyVerdict::TrustedOnFirstUse)
+        }
+    }
 }
 
 impl russh::client::Handler for SshClientHandler {
@@ -56,9 +124,47 @@ impl russh::client::Handler for SshClientHandler {
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &keys::PublicKey,
+        server_public_key: &keys::PublicKey,
     ) -> Result<bool, Self::Error> {
-        Ok(self.accept_unknown_host_keys)
+        // Explicit insecure override: accept any key without verification. Off by default.
+        if self.accept_unknown_host_keys {
+            log::warn!(
+                "ssh: accept_unknown_host_keys=true — skipping host-key verification for {} (INSECURE; vulnerable to MITM)",
+                self.host_label
+            );
+            return Ok(true);
+        }
+        let fingerprint = server_public_key
+            .fingerprint(keys::HashAlg::Sha256)
+            .to_string();
+        match verify_or_record_known_host(&self.known_hosts_path, &self.host_label, &fingerprint) {
+            Ok(HostKeyVerdict::Match) => Ok(true),
+            Ok(HostKeyVerdict::TrustedOnFirstUse) => {
+                log::info!(
+                    "ssh: trusting new host key for {} on first use ({})",
+                    self.host_label,
+                    fingerprint
+                );
+                Ok(true)
+            }
+            Ok(HostKeyVerdict::Mismatch { recorded }) => {
+                log::error!(
+                    "ssh: HOST KEY MISMATCH for {} — refusing connection (possible MITM). \
+                     recorded={recorded} presented={fingerprint}. If the change is legitimate, \
+                     remove the stale line from {}.",
+                    self.host_label,
+                    self.known_hosts_path.display()
+                );
+                Ok(false)
+            }
+            Err(e) => {
+                log::error!(
+                    "ssh: known_hosts verification failed for {} ({e}) — refusing connection (fail closed)",
+                    self.host_label
+                );
+                Ok(false)
+            }
+        }
     }
 }
 
@@ -411,6 +517,8 @@ async fn open_ssh_handle(
     let client_cfg = Arc::new(client::Config::default());
     let handler = SshClientHandler {
         accept_unknown_host_keys: config.accept_unknown_host_keys,
+        host_label: format!("{}:{}", config.host, config.port),
+        known_hosts_path: config.known_hosts_path.clone(),
     };
     let addrs = (config.host.as_str(), config.port);
     let mut handle = client::connect(client_cfg, addrs, handler)
@@ -729,6 +837,59 @@ mod tests {
             validate_remote_workdir("/tmp/isanagent-exec").unwrap(),
             "/tmp/isanagent-exec"
         );
+    }
+
+    // 0.4: trust-on-first-use host-key verification.
+    fn tofu_temp_path() -> PathBuf {
+        std::env::temp_dir()
+            .join(format!("isanagent-knownhosts-{}", uuid::Uuid::new_v4()))
+            .join("known_hosts")
+    }
+
+    #[test]
+    fn host_key_tofu_records_then_matches() {
+        let path = tofu_temp_path();
+        // First sight of the host -> trusted on first use and recorded.
+        assert_eq!(
+            verify_or_record_known_host(&path, "10.0.0.5:22", "SHA256:abc").unwrap(),
+            HostKeyVerdict::TrustedOnFirstUse
+        );
+        // Same fingerprint next time -> match.
+        assert_eq!(
+            verify_or_record_known_host(&path, "10.0.0.5:22", "SHA256:abc").unwrap(),
+            HostKeyVerdict::Match
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn host_key_mismatch_is_detected() {
+        let path = tofu_temp_path();
+        verify_or_record_known_host(&path, "host:22", "SHA256:original").unwrap();
+        // A different key for the same host -> mismatch (possible MITM); caller must refuse.
+        assert_eq!(
+            verify_or_record_known_host(&path, "host:22", "SHA256:changed").unwrap(),
+            HostKeyVerdict::Mismatch {
+                recorded: "SHA256:original".to_string()
+            }
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn host_key_store_is_per_host() {
+        let path = tofu_temp_path();
+        verify_or_record_known_host(&path, "a:22", "SHA256:aaa").unwrap();
+        // A different host is independent -> first use, not a mismatch.
+        assert_eq!(
+            verify_or_record_known_host(&path, "b:22", "SHA256:bbb").unwrap(),
+            HostKeyVerdict::TrustedOnFirstUse
+        );
+        assert_eq!(
+            verify_or_record_known_host(&path, "a:22", "SHA256:aaa").unwrap(),
+            HostKeyVerdict::Match
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

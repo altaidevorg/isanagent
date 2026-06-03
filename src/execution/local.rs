@@ -339,10 +339,19 @@ impl LocalExecutionProvider {
         caps.languages = vec![platform_shell_name().to_string()];
         caps.supports_persistent_sessions = true;
         caps.supports_interrupt = true;
-        caps.supports_package_install = false;
+        // Truthful capability: the uv_managed runtime performs network-backed
+        // `uv venv` / `uv pip install` during env provisioning, so it genuinely offers package
+        // installation. The system runtime does not provision packages itself, so it reports false.
+        caps.supports_package_install =
+            matches!(config.python_runtime, LocalPythonRuntime::UvManaged);
         caps.supports_remote_shell = false;
         caps.jupyter_kernel = false;
-        caps.network_policy = NetworkPolicy::Off;
+        // Truthful capability: the local provider runs code as an ordinary host child with NO
+        // egress enforcement (no netns/seccomp/firewall), so network access is in fact Full.
+        // Do NOT advertise `Off` here — nothing enforces it, and a model told "Off" may wrongly
+        // assume exfiltration is impossible and plan unsafely. Flip this to a real restricted
+        // policy only once an enforced netns/Seatbelt deny path exists (see PLAN.md P1.5).
+        caps.network_policy = NetworkPolicy::Full;
         caps.max_output_bytes_default = Some(config.max_output_bytes as u64);
         let runtime_name = match config.python_runtime {
             LocalPythonRuntime::System => "system",
@@ -921,6 +930,39 @@ mod tests {
             std::env::temp_dir().join(format!("isanagent-exec-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // 0.1 capability truthfulness: the local provider must not advertise protections it lacks.
+    // Network is unenforced -> must report Full (never Off). Package-install reflects the runtime.
+    #[test]
+    fn local_caps_are_truthful_system_runtime() {
+        let dir = temp_sandbox();
+        let cfg = LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
+        let caps = LocalExecutionProvider::new(cfg).unwrap().capabilities();
+        assert_eq!(
+            caps.network_policy,
+            NetworkPolicy::Full,
+            "local has no egress enforcement; advertising Off manufactures false assurance"
+        );
+        assert!(
+            !caps.supports_package_install,
+            "system runtime does not provision packages itself"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_caps_are_truthful_uv_managed_runtime() {
+        let dir = temp_sandbox();
+        let mut cfg = LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
+        cfg.python_runtime = LocalPythonRuntime::UvManaged;
+        let caps = LocalExecutionProvider::new(cfg).unwrap().capabilities();
+        assert_eq!(caps.network_policy, NetworkPolicy::Full);
+        assert!(
+            caps.supports_package_install,
+            "uv_managed runs network-backed `uv pip install`, so it does install packages"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

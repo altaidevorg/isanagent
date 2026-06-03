@@ -1231,12 +1231,14 @@ impl AppConfig {
     }
 
     pub fn execution_ssh_accept_unknown_host_keys(&self) -> bool {
+        // Secure by default: verify host keys via the trust-on-first-use known_hosts store.
+        // Opt in to the insecure "accept any key" behavior only by explicitly setting true.
         self.harness
             .as_ref()
             .and_then(|h| h.execution.as_ref())
             .and_then(|e| e.ssh.as_ref())
             .and_then(|s| s.accept_unknown_host_keys)
-            .unwrap_or(true)
+            .unwrap_or(false)
     }
 
     pub fn execution_colab_mcp_command(&self) -> String {
@@ -1385,6 +1387,11 @@ pub struct ApiConfig {
     pub port: u16,
     pub serve_ui: Option<bool>,
     pub bind_address: Option<String>,
+    /// Bearer token required on the `/v1` control surface when set. Also loadable via the
+    /// `ISANAGENT_API_TOKEN` env var (config value wins). REQUIRED to bind a non-loopback
+    /// address — the API exposes chat control and workspace file read/write with no other guard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -1773,6 +1780,22 @@ accept_unknown_host_keys = false
         );
         assert_eq!(c.execution_ssh_remote_python(), "python3");
         assert!(!c.execution_ssh_accept_unknown_host_keys());
+    }
+
+    #[test]
+    fn ssh_accept_unknown_host_keys_defaults_false() {
+        // 0.4: host-key verification must be ON by default. Omitting the key => secure default.
+        let s = r#"
+[harness.execution.ssh]
+host = "10.0.0.9"
+user = "dev"
+remote_workdir = "/tmp/x"
+"#;
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        assert!(
+            !c.execution_ssh_accept_unknown_host_keys(),
+            "default must verify host keys (accept_unknown_host_keys=false)"
+        );
     }
 
     #[test]
