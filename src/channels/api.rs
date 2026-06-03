@@ -370,11 +370,24 @@ impl ApiChannel {
 }
 
 /// Loopback / local-only binds that are safe to serve without authentication.
+///
+/// Parses the host as an IP and uses `is_loopback()` (covers all of `127.0.0.0/8` and `::1`,
+/// including the bracketed `[::1]` form), so a non-loopback bind (`0.0.0.0`, `::`, a public IP) —
+/// or anything unparseable, including a hostname like `127.example.com` — is treated as NOT
+/// loopback and therefore requires a token. Fails safe (unknown ⇒ not loopback).
 fn is_loopback_bind(addr: &str) -> bool {
-    match addr.trim() {
-        "127.0.0.1" | "::1" | "localhost" => true,
-        host => host.starts_with("127."),
+    let host = addr.trim();
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
     }
+    // Accept the bracketed IPv6 literal `[::1]` as well as bare `::1`.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 /// Refuse to expose the control plane to a non-loopback address without a token. The `/v1`
@@ -2689,10 +2702,15 @@ bind_address = "127.0.0.1"
     fn loopback_binds_recognized() {
         assert!(is_loopback_bind("127.0.0.1"));
         assert!(is_loopback_bind("::1"));
+        assert!(is_loopback_bind("[::1]")); // bracketed IPv6 literal
         assert!(is_loopback_bind("localhost"));
-        assert!(is_loopback_bind("127.0.0.5"));
+        assert!(is_loopback_bind("127.0.0.5")); // all of 127.0.0.0/8
         assert!(!is_loopback_bind("0.0.0.0"));
+        assert!(!is_loopback_bind("::")); // unspecified IPv6 is NOT loopback
         assert!(!is_loopback_bind("192.168.1.10"));
+        // A hostname that merely starts with "127." must NOT be treated as loopback
+        // (previously fail-open via a `starts_with("127.")` shortcut).
+        assert!(!is_loopback_bind("127.example.com"));
     }
 
     #[test]
