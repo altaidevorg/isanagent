@@ -120,6 +120,29 @@ your arguments significantly, or explain what you are stuck on and ask for guida
     None
 }
 
+/// True if the agent is *currently* looping at the tail of the conversation. This is distinct
+/// from [`check_for_doom_loop_prompt`], which also fires for a stale identical run that merely
+/// lingers in the 30-message lookback window after the model has already changed course
+/// (`detect_identical_consecutive` matches a run *anywhere* in the window, not just at the end).
+///
+/// Escalation to a hard stop must count only genuinely-ongoing loops — otherwise a model that
+/// corrects itself after one nudge would still be terminated as the stale run ages out. So the
+/// escalation path gates on this tail-anchored check rather than on detection alone.
+pub fn doom_loop_active_at_tail(messages: &[ChatMessage]) -> bool {
+    let signatures = extract_recent_tool_signatures(messages, 30);
+    let n = signatures.len();
+    if n < 2 {
+        return false;
+    }
+    // Identical loop still ongoing: the model just repeated its previous tool call byte-for-byte.
+    if signatures[n - 1] == signatures[n - 2] {
+        return true;
+    }
+    // Cyclic loop (A→B→A→B…): `detect_repeating_sequence` is tail-anchored (it inspects only the
+    // most recent `2*seq_len` signatures), so a match means the cycle is still active at the tail.
+    detect_repeating_sequence(&signatures).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +196,52 @@ mod tests {
         ];
         let p = check_for_doom_loop_prompt(&msgs).expect("prompt");
         assert!(p.contains("a → b"));
+    }
+
+    #[test]
+    fn active_at_tail_true_while_repeating() {
+        let t = tc("read_file", r#"{"path":"x"}"#);
+        let msgs = vec![
+            assistant_with_tools(vec![t.clone()]),
+            assistant_with_tools(vec![t.clone()]),
+            assistant_with_tools(vec![t]),
+        ];
+        assert!(doom_loop_active_at_tail(&msgs));
+    }
+
+    #[test]
+    fn active_at_tail_false_after_model_corrects() {
+        // The model looped (X,X,X) then changed course (Y). `check_for_doom_loop_prompt` still
+        // fires on the stale X,X,X in the window, but the loop is NOT active at the tail — so
+        // escalation must not count it (this is the regression the HIGH review finding caught).
+        let x = tc("read_file", r#"{"path":"x"}"#);
+        let y = tc("write_file", r#"{"path":"y"}"#);
+        let msgs = vec![
+            assistant_with_tools(vec![x.clone()]),
+            assistant_with_tools(vec![x.clone()]),
+            assistant_with_tools(vec![x]),
+            assistant_with_tools(vec![y]),
+        ];
+        assert!(
+            check_for_doom_loop_prompt(&msgs).is_some(),
+            "stale run still detected in window"
+        );
+        assert!(
+            !doom_loop_active_at_tail(&msgs),
+            "must not be active at tail once the model has moved on"
+        );
+    }
+
+    #[test]
+    fn active_at_tail_true_for_tail_anchored_cycle() {
+        let a = tc("a", "{}");
+        let b = tc("b", "{}");
+        let msgs = vec![
+            assistant_with_tools(vec![a.clone()]),
+            assistant_with_tools(vec![b.clone()]),
+            assistant_with_tools(vec![a]),
+            assistant_with_tools(vec![b]),
+        ];
+        assert!(doom_loop_active_at_tail(&msgs));
     }
 }

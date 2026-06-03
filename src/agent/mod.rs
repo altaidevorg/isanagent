@@ -139,7 +139,9 @@ const DOOM_LOOP_HARD_STOP_AFTER: usize = 3;
 fn estimate_message_tokens(msg: &crate::utils::ChatMessage) -> usize {
     let text_len = msg.content.as_ref().map_or(0, |c| c.text_content().len());
     let args_len = msg.tool_calls.as_ref().map_or(0, |tcs| {
-        tcs.iter().map(|t| t.function.arguments.len()).sum::<usize>()
+        tcs.iter()
+            .map(|t| t.function.arguments.len())
+            .sum::<usize>()
     });
     (text_len + args_len) / 4
 }
@@ -2293,22 +2295,31 @@ impl AgentLogic {
 
             if doom_loop_enabled {
                 if let Some(prompt) = doom_loop::check_for_doom_loop_prompt(&context) {
-                    consecutive_doom_detections += 1;
-                    if consecutive_doom_detections >= DOOM_LOOP_HARD_STOP_AFTER {
-                        // Nudges didn't break the loop — escalate to a hard stop so the run
-                        // doesn't spin to max_iterations re-receiving the same advice.
-                        doom_loop_stuck = true;
-                        let _ = logger_tx.send(BusMessage::Log(
-                            LogEvent::warn(
-                                &name,
-                                &format!(
-                                    "Doom loop persisted after {} consecutive detections — stopping the run.",
-                                    consecutive_doom_detections
-                                ),
-                            )
-                            .with_chat_id(&inbound.chat_id),
-                        ));
-                        break;
+                    // Escalate ONLY while the loop is still active at the tail — a stale run can
+                    // linger in the lookback window after the model corrects itself, and counting
+                    // those would hard-stop a model that already recovered (see
+                    // `doom_loop_active_at_tail`). The advisory nudge still fires on any detection.
+                    if doom_loop::doom_loop_active_at_tail(&context) {
+                        consecutive_doom_detections += 1;
+                        if consecutive_doom_detections >= DOOM_LOOP_HARD_STOP_AFTER {
+                            // Nudges didn't break the loop — hard stop so the run doesn't spin to
+                            // max_iterations re-receiving the same advice.
+                            doom_loop_stuck = true;
+                            let _ = logger_tx.send(BusMessage::Log(
+                                LogEvent::warn(
+                                    &name,
+                                    &format!(
+                                        "Doom loop still active after {} consecutive detections — stopping the run.",
+                                        consecutive_doom_detections
+                                    ),
+                                )
+                                .with_chat_id(&inbound.chat_id),
+                            ));
+                            break;
+                        }
+                    } else {
+                        // Detected in the window but the model has moved on — don't escalate.
+                        consecutive_doom_detections = 0;
                     }
                     let correction = crate::utils::ChatMessage::user(&prompt);
                     mem.add_message(correction.clone()).await?;
@@ -2321,7 +2332,7 @@ impl AgentLogic {
                         .with_chat_id(&inbound.chat_id),
                     ));
                 } else {
-                    // No loop this iteration — reset so only *consecutive* detections escalate.
+                    // No loop in the window — reset so only *consecutive active* loops escalate.
                     consecutive_doom_detections = 0;
                 }
             }
@@ -3347,6 +3358,45 @@ mod tests {
         }
     }
 
+    /// Loops identically for the first 3 calls (triggers detection + a nudge), then emits
+    /// distinct tool calls — simulating a model that corrects itself after the nudge.
+    #[derive(Clone)]
+    struct CorrectingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for CorrectingProvider {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<serde_json::Value>,
+        ) -> Result<LLMResponse, LLMError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            // First 3: identical args (X,X,X → detection). After: distinct args (loop no longer
+            // active at the tail), so escalation must reset rather than hard-stop.
+            let arguments = if n < 3 {
+                "{\"x\":0}".to_string()
+            } else {
+                format!("{{\"x\":{n}}}")
+            };
+            Ok(LLMResponse {
+                content: String::new(),
+                tool_calls: Some(vec![crate::utils::ToolCallRequest {
+                    id: format!("call_{n}"),
+                    tool_type: "function".to_string(),
+                    extra_content: None,
+                    function: crate::utils::ToolCallFunction {
+                        name: "looping_tool".to_string(),
+                        arguments,
+                    },
+                }]),
+                reasoning_content: None,
+                usage: None,
+            })
+        }
+    }
+
     async fn run_loop_once_for_test(
         provider: Box<dyn Provider>,
         max_iterations: usize,
@@ -3874,6 +3924,22 @@ mod tests {
         assert_eq!(
             result.expect("terminal message"),
             "Agent reached max reasoning iterations."
+        );
+    }
+
+    // P1.4 (review regression): a model that loops then CORRECTS after the nudge must NOT be
+    // hard-stopped — escalation counts only loops still active at the tail, so the stale run
+    // lingering in the lookback window can't force a stop. Reaches the cap instead.
+    #[tokio::test]
+    async fn doom_loop_does_not_stop_after_model_corrects() {
+        let provider = Box::new(CorrectingProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let (result, _context) = run_loop_once_for_test(provider, 8, false, true).await;
+        assert_eq!(
+            result.expect("terminal message"),
+            "Agent reached max reasoning iterations.",
+            "a model that corrected after a nudge must not be hard-stopped"
         );
     }
 
