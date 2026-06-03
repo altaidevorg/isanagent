@@ -886,6 +886,9 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                                 tool_calls,
                                 tool_call_id: row.get(4)?,
                                 reasoning_content: row.get(5)?,
+                                // Not persisted (skip_serializing internal field); a reloaded
+                                // message keeps only the "Error:" text already in `content`.
+                                is_error: None,
                             })
                         })
                         .map_err(|e| e.to_string())?;
@@ -1388,6 +1391,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                                     tool_calls,
                                     tool_call_id,
                                     reasoning_content,
+                                    is_error: None,
                                 },
                             ))
                         })

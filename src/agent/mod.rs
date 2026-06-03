@@ -2527,6 +2527,7 @@ impl AgentLogic {
                     tool_calls: Some(tool_calls.clone()),
                     tool_call_id: None,
                     reasoning_content: response.reasoning_content.clone(),
+                    is_error: None,
                 };
                 mem.add_message(assistant_msg).await?;
 
@@ -2665,10 +2666,11 @@ impl AgentLogic {
                         };
                         let _ = outbound_tx.send(BusMessage::Telemetry(tfin.clone())).await;
                         hook_observe_telemetry(hook_tool_ctx.as_ref(), &inbound, is_subagent, tfin);
-                        mem.add_message(crate::utils::ChatMessage::tool(
+                        mem.add_message(crate::utils::ChatMessage::tool_with_error(
                             &tool_result_text,
                             &tc.id,
                             Some(tool_name.as_str()),
+                            is_error,
                         ))
                         .await?;
                     }
@@ -2770,10 +2772,11 @@ impl AgentLogic {
                         let _ = outbound_tx.send(BusMessage::Telemetry(tfin.clone())).await;
                         hook_observe_telemetry(hook_tool_ctx.as_ref(), &inbound, is_subagent, tfin);
 
-                        mem.add_message(crate::utils::ChatMessage::tool(
+                        mem.add_message(crate::utils::ChatMessage::tool_with_error(
                             &tool_result_text,
                             &tc.id,
                             Some(tool_name.as_str()),
+                            is_error,
                         ))
                         .await?;
                         tool_invoked = true;

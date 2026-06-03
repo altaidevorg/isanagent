@@ -91,6 +91,14 @@ pub struct ChatMessage {
     /// providers that ignore the field see no change.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// For `role == "tool"` messages: whether the tool call failed. INTERNAL-ONLY — never
+    /// serialized via this struct's serde (`skip_serializing`), so the OpenAI-compatible wire
+    /// format is byte-identical and strict endpoints can't reject an unknown field. It is read
+    /// directly by the Anthropic message builder, which sets the native `is_error: true` on the
+    /// `tool_result` content block so the model gets a structured failure signal (not just an
+    /// `"Error:"` text prefix). `default` so older persisted messages still deserialize.
+    #[serde(default, skip_serializing)]
+    pub is_error: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +153,7 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            is_error: None,
         }
     }
 
@@ -165,6 +174,7 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            is_error: None,
         }
     }
 
@@ -176,6 +186,7 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            is_error: None,
         }
     }
 
@@ -187,6 +198,7 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            is_error: None,
         }
     }
 
@@ -198,6 +210,22 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: Some(tool_call_id.to_string()),
             reasoning_content: None,
+            is_error: None,
+        }
+    }
+
+    /// Like [`ChatMessage::tool`] but records whether the tool call failed, so the Anthropic
+    /// message builder can set the native `is_error` on the `tool_result` block. `content`
+    /// still carries the human/OpenAI-readable text (typically `"Error: ..."` on failure).
+    pub fn tool_with_error(
+        content: &str,
+        tool_call_id: &str,
+        name: Option<&str>,
+        is_error: bool,
+    ) -> Self {
+        Self {
+            is_error: Some(is_error),
+            ..Self::tool(content, tool_call_id, name)
         }
     }
 }
