@@ -2716,7 +2716,8 @@ bind_address = "127.0.0.1"
     #[test]
     fn refuses_public_bind_without_token() {
         assert!(validate_bind_security("127.0.0.1", false).is_ok());
-        let err = validate_bind_security("0.0.0.0", false).expect_err("must refuse public+no-token");
+        let err =
+            validate_bind_security("0.0.0.0", false).expect_err("must refuse public+no-token");
         assert!(
             err.contains("auth_token") || err.contains("127.0.0.1"),
             "err={err}"

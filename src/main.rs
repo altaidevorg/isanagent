@@ -93,6 +93,28 @@ struct Cli {
 enum Commands {
     /// Create workspace layout and starter files; optional flags override generated config.toml
     Onboard(OnboardArgs),
+    /// Manage skills (add, list, etc.)
+    Skills(SkillsArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+struct SkillsArgs {
+    #[command(subcommand)]
+    command: SkillCommands,
+}
+
+#[derive(Subcommand, Debug)]
+enum SkillCommands {
+    /// Add skills from a remote GitHub repository
+    Add {
+        /// Repository URL (e.g., https://github.com/vercel-labs/skills) or shorthand (owner/repo)
+        repo_url: String,
+        /// Optional specific skill name to install
+        #[arg(short, long)]
+        skill: Option<String>,
+    },
+    /// List all installed skills
+    List,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -114,6 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Some(Commands::Onboard(args)) => run_onboard(cli.workspace, args).await,
+        Some(Commands::Skills(args)) => run_skills(cli.workspace, args).await,
         None => {
             // First-run UX: when the user invokes `isanagent` with no `--workspace` and the
             // default `~/.isanagent` directory does not yet exist, auto-launch the interactive
@@ -1493,6 +1516,47 @@ venv is touched."
     if let Err(e) = prompt_result {
         log::warn!("uv_requirements install prompt task failed: {e}");
     }
+}
+
+async fn run_skills(
+    workspace_arg: Option<String>,
+    args: SkillsArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let workspace = IsanagentWorkspace::new(workspace_arg.as_deref(), None)?;
+    let mut skills = SkillRegistry::new(workspace.skills_path());
+
+    match args.command {
+        SkillCommands::Add { repo_url, skill } => {
+            if let Some(ref name) = skill {
+                println!("Adding skill '{}' from {}...", name, repo_url);
+            } else {
+                println!("Adding all skills from {}...", repo_url);
+            }
+            match skills
+                .install_skills_from_repo(&repo_url, skill.as_deref())
+                .await
+            {
+                Ok(installed) => {
+                    if installed.is_empty() {
+                        println!("No skills found in the repository.");
+                    } else {
+                        println!("Successfully installed {} skills:", installed.len());
+                        for name in installed {
+                            println!("  - {}", name);
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(format!("Error installing skills: {}", e).into());
+                }
+            }
+        }
+        SkillCommands::List => {
+            println!("{}", skills.format_skill_directory());
+        }
+    }
+
+    Ok(())
 }
 
 async fn run_onboard(

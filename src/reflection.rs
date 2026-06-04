@@ -152,8 +152,7 @@ impl ReflectionEngine {
             // JSON as the in-loop auto-compaction (PR-2). Markdown render goes into
             // the legacy `summary` column for backward-compat readers; the JSON
             // form is persisted via `WriteSectionsJson`.
-            let prompt =
-                crate::agent::compaction::build_sectional_prompt(None, &transcript, None);
+            let prompt = crate::agent::compaction::build_sectional_prompt(None, &transcript, None);
 
             let context = vec![ChatMessage::user(&prompt)];
             match self.provider.chat(&context, None).await {
@@ -161,13 +160,11 @@ impl ReflectionEngine {
                     let text = response.content;
                     // Use robust JSON extractor
                     if let Some(val) = crate::utils::extract_json_from_llm_response(&text) {
-                        let sections =
-                            crate::agent::compaction::SummarySections::from_json(&val);
+                        let sections = crate::agent::compaction::SummarySections::from_json(&val);
                         let summary_md = sections.to_markdown();
-                        let output_bytes =
-                            summary_md.len().min(u32::MAX as usize) as u32;
-                        let sections_json = serde_json::to_string(&sections)
-                            .unwrap_or_else(|_| "{}".to_string());
+                        let output_bytes = summary_md.len().min(u32::MAX as usize) as u32;
+                        let sections_json =
+                            serde_json::to_string(&sections).unwrap_or_else(|_| "{}".to_string());
 
                         let (tx, rx) = tokio::sync::oneshot::channel();
                         self.memory_node
@@ -315,18 +312,17 @@ impl ReflectionEngine {
                 .map_err(|e| e.to_string())?;
             rx.await??;
 
-            let _ = self
-                .logger_tx
-                .send(BusMessage::Telemetry(TelemetryEvent::ReflectionCompleted {
-                    chat_id: None,
-                    kind: ReflectionKind::LongTerm,
-                    output_bytes,
-                    wall_ms: reflection_started
-                        .elapsed()
-                        .as_millis()
-                        .min(u64::MAX as u128)
-                        as u64,
-                }));
+            let _ =
+                self.logger_tx
+                    .send(BusMessage::Telemetry(TelemetryEvent::ReflectionCompleted {
+                        chat_id: None,
+                        kind: ReflectionKind::LongTerm,
+                        output_bytes,
+                        wall_ms: reflection_started
+                            .elapsed()
+                            .as_millis()
+                            .min(u64::MAX as u128) as u64,
+                    }));
 
             let _ = self.logger_tx.send(BusMessage::Log(LogEvent::info(
                 "ReflectionEngine",

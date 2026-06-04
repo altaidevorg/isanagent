@@ -24,7 +24,7 @@ use crate::hooks::{
 use crate::logging::LoggerHandle;
 use crate::memory::{MemoryMessage, SharedReply, TodoRow};
 use crate::session::SessionManager;
-use crate::skills::SkillRegistry;
+use crate::skills::{SharedSkillRegistry, SkillRegistry};
 use crate::tool_activity::SharedToolExecutionActivity;
 use crate::tools::ToolRegistry;
 use crate::traits::{Memory, Provider, Tool};
@@ -336,7 +336,11 @@ fn is_arbitrary_code_tool(tool_name: &str) -> bool {
 /// Extract the command/code a code-exec tool will run. `exec` carries it in `command`; the
 /// execution / python tools carry it in `code`.
 fn extract_code_exec_command(tool_name: &str, args: &Value) -> Option<String> {
-    let key = if tool_name == "exec" { "command" } else { "code" };
+    let key = if tool_name == "exec" {
+        "command"
+    } else {
+        "code"
+    };
     args.get(key)
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
@@ -396,7 +400,11 @@ mod code_exec_gate_tests {
         // Shell `exec`: benign command does NOT require approval (preserves existing UX)...
         assert!(!code_exec_requires_approval("exec", "ls -la", &patterns));
         // ...but a destructive one does.
-        assert!(code_exec_requires_approval("exec", "rm -rf /tmp/x", &patterns));
+        assert!(code_exec_requires_approval(
+            "exec",
+            "rm -rf /tmp/x",
+            &patterns
+        ));
     }
 }
 
@@ -752,7 +760,7 @@ struct ReasoningSpawnArgs {
     provider: Box<dyn Provider>,
     session_manager: Arc<SessionManager>,
     tools: Arc<ToolRegistry>,
-    skills: Arc<SkillRegistry>,
+    skills: SharedSkillRegistry,
     system_prompt: String,
     max_iterations: usize,
     max_tool_output_chars: usize,
@@ -1079,7 +1087,7 @@ pub(crate) struct ReasoningLoopCtx {
     pub(crate) provider: Box<dyn Provider>,
     pub(crate) session_manager: Arc<SessionManager>,
     pub(crate) tools: Arc<ToolRegistry>,
-    pub(crate) skills: Arc<SkillRegistry>,
+    pub(crate) skills: SharedSkillRegistry,
     pub(crate) system_prompt: String,
     pub(crate) max_iterations: usize,
     pub(crate) max_tool_output_chars: usize,
@@ -1167,7 +1175,7 @@ pub struct AgentLogic {
     provider: Arc<tokio::sync::RwLock<Box<dyn Provider>>>,
     session_manager: Arc<SessionManager>,
     tools: Arc<ToolRegistry>,
-    skills: Arc<SkillRegistry>,
+    skills: SharedSkillRegistry,
     system_prompt: String,
     max_iterations: usize,
     max_tool_output_chars: usize,
@@ -1217,7 +1225,7 @@ impl AgentLogic {
 
         let harness_for_subagent = harness_runtime_summary.clone();
         let session_manager = Arc::new(session_manager);
-        let skills = Arc::new(skills);
+        let skills = Arc::new(tokio::sync::RwLock::new(skills));
         let tools = Arc::new(tools);
         let memory_node = session_manager.get_memory_node();
         let shell_policy = Arc::new(shell_policy);
@@ -1438,6 +1446,38 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 )));
                 return Ok(None);
             }
+            BusMessage::InstallSkill {
+                repo_url,
+                skill_name,
+            } => {
+                let skills_arc = self.skills.clone();
+                let logger_tx = self.logger_tx.clone();
+                let name = self.name.clone();
+
+                tokio::spawn(async move {
+                    let mut skills_guard = skills_arc.write().await;
+                    match skills_guard
+                        .install_skills_from_repo(&repo_url, skill_name.as_deref())
+                        .await
+                    {
+                        Ok(installed) => {
+                            let msg = if installed.is_empty() {
+                                "No skills found in the repository.".to_string()
+                            } else {
+                                format!("Successfully installed skills: {}", installed.join(", "))
+                            };
+                            let _ = logger_tx.send(BusMessage::Log(LogEvent::info(&name, &msg)));
+                        }
+                        Err(e) => {
+                            let _ = logger_tx.send(BusMessage::Log(LogEvent::error(
+                                &name,
+                                &format!("Failed to install skills from {}: {}", repo_url, e),
+                            )));
+                        }
+                    }
+                });
+                return Ok(None);
+            }
             BusMessage::Inbound(inbound) => {
                 let chat_id = inbound.chat_id.clone();
                 let session_key = inbound.clarification_session_key();
@@ -1549,15 +1589,13 @@ impl ActorLogic<BusMessage> for AgentLogic {
                     .trigger_compaction_with_reason(session_key.clone(), focus_instructions, reason)
                     .await
                 {
-                    let _ = self.logger_tx.send(BusMessage::Log(
-                        LogEvent::warn(
-                            &self.name,
-                            &format!(
-                                "TriggerCompaction dropped for session_key={}: {}",
-                                session_key, e
-                            ),
+                    let _ = self.logger_tx.send(BusMessage::Log(LogEvent::warn(
+                        &self.name,
+                        &format!(
+                            "TriggerCompaction dropped for session_key={}: {}",
+                            session_key, e
                         ),
-                    ));
+                    )));
                 }
                 Ok(None)
             }
@@ -1638,10 +1676,7 @@ impl AgentLogic {
             .get_context_since_reflection()
             .await
             .map_err(|e| format!("get_context_since_reflection({}): {}", session_key, e))?;
-        let user_turns = current_context
-            .iter()
-            .filter(|m| m.role == "user")
-            .count();
+        let user_turns = current_context.iter().filter(|m| m.role == "user").count();
         let approx_tokens: usize = estimate_context_tokens(&current_context);
 
         // Most recent summary keyed by the same channel:chat_id prefix
@@ -1663,8 +1698,8 @@ impl AgentLogic {
         // fires keeps `do_compaction`'s `select!` valid without altering behavior.
         let cancel_token = tokio_util::sync::CancellationToken::new();
 
-        let outcome = crate::agent::compaction::do_compaction(
-            crate::agent::compaction::DoCompactionArgs {
+        let outcome =
+            crate::agent::compaction::do_compaction(crate::agent::compaction::DoCompactionArgs {
                 chat_id: &chat_id,
                 session_key: &session_key,
                 trigger_reason,
@@ -1677,9 +1712,8 @@ impl AgentLogic {
                 memory_node: &memory_node,
                 outbound_tx: &self.outbound_tx,
                 cancel_token: &cancel_token,
-            },
-        )
-        .await;
+            })
+            .await;
         Ok(outcome)
     }
 
@@ -2300,8 +2334,7 @@ impl AgentLogic {
                     if let Some((_, msg)) =
                         messages_with_ids.iter_mut().find(|(id, _)| *id == db_id)
                     {
-                        msg.content =
-                            Some(crate::utils::MessageContent::Text(placeholder));
+                        msg.content = Some(crate::utils::MessageContent::Text(placeholder));
                     }
                 }
             }
@@ -2373,7 +2406,7 @@ impl AgentLogic {
                 "{}\n\n{}\n{}{}{}{}",
                 system_prompt,
                 summaries_text,
-                skills.get_capabilities_summary(),
+                skills.read().await.get_capabilities_summary(),
                 harness_block,
                 todo_block,
                 iteration_line
@@ -2553,7 +2586,8 @@ impl AgentLogic {
                         "Context overflow: input exceeds the model's window \
                          (attempted={} max={}). Reduce the conversation length and retry.",
                         tokens_attempted,
-                        max.map(|m| m.to_string()).unwrap_or_else(|| "?".to_string()),
+                        max.map(|m| m.to_string())
+                            .unwrap_or_else(|| "?".to_string()),
                     );
                     let persisted = format!(
                         "LLM call failed: {err}\nPress /retry to try again or /cancel to abandon."
@@ -3043,7 +3077,10 @@ impl AgentLogic {
                         },
                     )
                     .await;
-                    if matches!(outcome, crate::agent::compaction::CompactionOutcome::Cancelled) {
+                    if matches!(
+                        outcome,
+                        crate::agent::compaction::CompactionOutcome::Cancelled
+                    ) {
                         persist_and_cancel!();
                     }
                 }
@@ -3086,7 +3123,7 @@ impl AgentLogic {
 /// A built-in tool that allows the agent to load the markdown instructions
 /// for a skill dynamically from the SkillRegistry.
 pub struct LoadSkillTool {
-    registry: Arc<SkillRegistry>,
+    registry: SharedSkillRegistry,
 }
 
 #[async_trait]
@@ -3127,8 +3164,10 @@ impl Tool for LoadSkillTool {
             .and_then(|v| v.as_str())
             .unwrap_or("load");
 
+        let registry = self.registry.read().await;
+
         if action == "list" {
-            return Ok(self.registry.format_skill_directory());
+            return Ok(registry.format_skill_directory());
         }
 
         let skill_name = args
@@ -3142,10 +3181,10 @@ impl Tool for LoadSkillTool {
             .unwrap_or("full");
 
         if detail == "metadata" {
-            return self.registry.get_skill_metadata(skill_name);
+            return registry.get_skill_metadata(skill_name);
         }
 
-        self.registry.get_skill_instructions(skill_name)
+        registry.get_skill_instructions(skill_name)
     }
 }
 
@@ -3174,7 +3213,7 @@ mod tests {
     use crate::memory::SqliteMemoryActor;
     use crate::multi_tenant_edge::{ActivityHeartbeatClient, HeartbeatTransport};
     use crate::session::SessionManager;
-    use crate::skills::SkillRegistry;
+    use crate::skills::{SharedSkillRegistry, SkillRegistry};
     use crate::tool_activity::SharedToolExecutionActivity;
     use crate::tool_runtime::ToolExecCtx;
     use crate::tools::ToolRegistry;
@@ -3502,7 +3541,9 @@ mod tests {
         let session_manager = Arc::new(SessionManager::new(memory_node));
         let tools = Arc::new(ToolRegistry::new());
         let skills_temp = LocalTempDir::new();
-        let skills = Arc::new(SkillRegistry::new(skills_temp.path().clone()));
+        let skills = Arc::new(tokio::sync::RwLock::new(SkillRegistry::new(
+            skills_temp.path().clone(),
+        )));
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<BusMessage>(8);
         // Drain outbound telemetry so the loop's `send().await` never blocks on a full buffer
         // (tool-call-returning providers emit several messages per iteration).
@@ -4053,7 +4094,10 @@ mod tests {
             },
         }]);
         assert_eq!(super::estimate_message_tokens(&msg), 100);
-        assert_eq!(super::estimate_context_tokens(std::slice::from_ref(&msg)), 100);
+        assert_eq!(
+            super::estimate_context_tokens(std::slice::from_ref(&msg)),
+            100
+        );
     }
 
     #[tokio::test]
@@ -4113,7 +4157,7 @@ mod tests {
             "---\nname: lint_skill\ndescription: Lint helper\n---\n\ndo things\n",
         )
         .unwrap();
-        let reg = Arc::new(SkillRegistry::new(skills_root));
+        let reg = Arc::new(tokio::sync::RwLock::new(SkillRegistry::new(skills_root)));
         let tool = super::LoadSkillTool {
             registry: reg.clone(),
         };
