@@ -2523,6 +2523,12 @@ impl AgentLogic {
                                     )
                                     .with_chat_id(&inbound.chat_id),
                                 ));
+                                // The context just shrank, so the pre-compaction `prompt_tokens` is
+                                // now stale. Clear it; otherwise, if the retried call returns no
+                                // usage stats (mock/local provider, transient gap), the end-of-turn
+                                // check would read the old huge value via `effective_context_tokens`
+                                // and immediately fire a redundant compaction right after this one.
+                                last_prompt_tokens = None;
                                 // Next iteration refetches context (now smaller due
                                 // to AddSummary + UpdateThreadMetadata) and re-runs
                                 // the chat call. No iteration counter refund — the
