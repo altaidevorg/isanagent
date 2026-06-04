@@ -2443,11 +2443,10 @@ impl AgentLogic {
                         }
                     } else {
                         // Detected in the window but not active at the tail — the model varied
-                        // this turn. Decay rather than hard-reset so an intermittently-varying
-                        // loop (mostly repeating, occasional one-off) still escalates over time
-                        // instead of being fully forgiven by a single non-active turn.
-                        consecutive_doom_detections =
-                            consecutive_doom_detections.saturating_sub(1);
+                        // this turn, so don't escalate. (A counter *decay* here, to also catch
+                        // intermittently-varying loops, is plausible but its benefit is narrow and
+                        // hard to test deterministically — left as a deferred follow-up.)
+                        consecutive_doom_detections = 0;
                     }
                     let correction = crate::utils::ChatMessage::user(&prompt);
                     mem.add_message(correction.clone()).await?;

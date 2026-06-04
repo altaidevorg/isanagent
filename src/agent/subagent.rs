@@ -1209,7 +1209,7 @@ mod tests {
     use crate::logging::create_logger_channel;
     use crate::memory::SqliteMemoryActor;
     use crate::session::SessionManager;
-    use crate::skills::{SharedSkillRegistry, SkillRegistry};
+    use crate::skills::SkillRegistry;
     use crate::traits::Provider;
     use crate::utils::{ChatMessage, LLMError, LLMResponse};
     use crate::NodeHandle;

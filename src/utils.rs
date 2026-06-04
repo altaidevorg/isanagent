@@ -908,7 +908,9 @@ mod tests {
         assert!(tool_output_looks_like_failure("  \n error: path not found"));
         // Normal output is not a failure — even when it mentions "error" mid-line.
         assert!(!tool_output_looks_like_failure("ok: wrote 3 files"));
-        assert!(!tool_output_looks_like_failure("grep found 'Error:' in 2 logs"));
+        assert!(!tool_output_looks_like_failure(
+            "grep found 'Error:' in 2 logs"
+        ));
         assert!(!tool_output_looks_like_failure(""));
     }
 }
