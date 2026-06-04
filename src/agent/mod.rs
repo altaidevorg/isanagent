@@ -3177,10 +3177,8 @@ impl Tool for LoadSkillTool {
             .and_then(|v| v.as_str())
             .unwrap_or("load");
 
-        let registry = self.registry.read().await;
-
         if action == "list" {
-            return Ok(registry.format_skill_directory());
+            return Ok(self.registry.read().await.format_skill_directory());
         }
 
         let skill_name = args
@@ -3193,11 +3191,33 @@ impl Tool for LoadSkillTool {
             .and_then(|v| v.as_str())
             .unwrap_or("full");
 
-        if detail == "metadata" {
-            return registry.get_skill_metadata(skill_name);
+        // First attempt against the registry as it was last scanned. The read guard is scoped to
+        // this block and dropped before the rescan path below takes the write lock, so we never
+        // hold a read guard across a write acquisition on the same RwLock (which would deadlock).
+        let first = {
+            let registry = self.registry.read().await;
+            if detail == "metadata" {
+                registry.get_skill_metadata(skill_name)
+            } else {
+                registry.get_skill_instructions(skill_name)
+            }
+        };
+        if first.is_ok() {
+            return first;
         }
 
-        registry.get_skill_instructions(skill_name)
+        // Miss: a SKILL.md may have been dropped into the skills directory since the registry was
+        // last scanned (it is scanned once at startup). Rescan once and retry before reporting the
+        // skill missing, so a freshly added skill is loadable without restarting the agent. The
+        // rescan is paid only on an actual miss, so the common path (skill already present) is
+        // unchanged.
+        self.registry.write().await.scan_for_skills();
+        let registry = self.registry.read().await;
+        if detail == "metadata" {
+            registry.get_skill_metadata(skill_name)
+        } else {
+            registry.get_skill_instructions(skill_name)
+        }
     }
 }
 
@@ -4195,5 +4215,68 @@ mod tests {
             .await
             .unwrap();
         assert!(full.contains("do things"));
+    }
+
+    #[tokio::test]
+    async fn load_skill_rescans_on_miss_to_pick_up_a_new_skill() {
+        let root = LocalTempDir::new();
+        let skills_root = root.path().join("skills");
+
+        // One skill present when the registry is first scanned (at startup).
+        let first = skills_root.join("first_skill");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::write(
+            first.join("SKILL.md"),
+            "---\nname: first_skill\ndescription: present at startup\n---\n\nalpha body\n",
+        )
+        .unwrap();
+
+        let reg = Arc::new(tokio::sync::RwLock::new(SkillRegistry::new(
+            skills_root.clone(),
+        )));
+        let tool = super::LoadSkillTool {
+            registry: reg.clone(),
+        };
+
+        // A skill dropped into the directory AFTER the startup scan: the in-memory registry has
+        // never seen it.
+        let late = skills_root.join("late_skill");
+        std::fs::create_dir_all(&late).unwrap();
+        std::fs::write(
+            late.join("SKILL.md"),
+            "---\nname: late_skill\ndescription: added after scan\n---\n\nomega instructions\n",
+        )
+        .unwrap();
+
+        // Without rescan-on-miss this would error "skill not found"; the on-miss rescan must pick
+        // the new skill up and return its instructions without an agent restart.
+        let loaded = tool
+            .execute(serde_json::json!({ "skill_name": "late_skill", "detail": "full" }))
+            .await
+            .expect("late skill should be loadable after the on-miss rescan");
+        assert!(loaded.contains("omega instructions"), "{loaded}");
+
+        // metadata path also benefits from the rescan (covers the detail == "metadata" branch).
+        let late_meta = tool
+            .execute(serde_json::json!({ "skill_name": "late_skill", "detail": "metadata" }))
+            .await
+            .expect("late skill metadata after rescan");
+        assert!(late_meta.contains("Available: true"), "{late_meta}");
+
+        // The originally-present skill still loads.
+        let alpha = tool
+            .execute(serde_json::json!({ "skill_name": "first_skill", "detail": "full" }))
+            .await
+            .expect("first skill still loads");
+        assert!(alpha.contains("alpha body"), "{alpha}");
+
+        // A genuinely non-existent skill still errors after a rescan turns up nothing new.
+        let missing = tool
+            .execute(serde_json::json!({ "skill_name": "no_such_skill" }))
+            .await;
+        assert!(
+            missing.is_err(),
+            "unknown skill should still error after rescan: {missing:?}"
+        );
     }
 }
