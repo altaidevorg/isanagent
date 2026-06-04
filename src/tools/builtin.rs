@@ -1017,10 +1017,18 @@ impl Tool for ShellExecTool {
                     }
                     // Truncate if massive (the exit marker is appended afterwards, so it is never cut).
                     if result.len() > 10000 {
+                        // Step back to a char boundary at/below the 10 KB cap so we never slice
+                        // through a multi-byte UTF-8 sequence (e.g. Turkish text or emoji straddling
+                        // the limit), which would panic. Matches the is_char_boundary idiom used by
+                        // the other truncation sites in this file.
+                        let mut cut = 10000;
+                        while cut > 0 && !result.is_char_boundary(cut) {
+                            cut -= 1;
+                        }
                         result = format!(
                             "{}\n... (truncated, {} more chars)",
-                            &result[..10000],
-                            result.len() - 10000
+                            &result[..cut],
+                            result.len() - cut
                         );
                     }
                     if let Some(marker) = exit_marker {
@@ -2635,5 +2643,18 @@ mod exec_failure_tests {
             .expect("exec returns Ok");
         assert!(!out.contains("Exit code:"), "no marker on success: {out}");
         assert!(!crate::utils::tool_output_signals_failure("exec", &out));
+    }
+
+    /// Output whose 10 KB truncation point lands inside a multi-byte UTF-8 sequence must not panic.
+    /// `yes ₺ | head -n 5000 | tr -d '\n'` emits 5000 × '₺' (3 bytes each) = 15000 bytes, so byte
+    /// 10000 falls mid-character. Before the char-boundary step-back this panicked on `&result[..10000]`.
+    #[tokio::test]
+    async fn large_multibyte_output_truncates_on_a_char_boundary() {
+        let out = exec_tool()
+            .execute(json!({ "command": "yes ₺ | head -n 5000 | tr -d '\\n'" }))
+            .await
+            .expect("exec returns Ok without panicking on a mid-char truncation");
+        // Reaching here at all proves no char-boundary panic (the String is valid UTF-8 by type).
+        assert!(out.contains("(truncated,"), "expected truncation notice");
     }
 }
