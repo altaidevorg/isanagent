@@ -59,10 +59,11 @@ pub fn start_observation_hooks(params: ObservationHooksParams) -> Option<Observa
     let webhook_url = params.webhook_url.clone();
     let hmac_secret = params.webhook_hmac_secret.clone();
     let metadata_keys = Arc::new(params.metadata_keys);
-    // Built once from the process env. Applied in the background consumer (off the agent hot path)
-    // so a secret that lands in tool output never reaches the JSONL journal or the third-party
-    // webhook. Redacting here does NOT affect what the executed child or the model sees.
-    let redactor = crate::redact::SecretRedactor::from_env();
+    // Reuse the process-wide static redactor instead of re-scanning the env and recompiling every
+    // pattern here. Applied in the background consumer (off the agent hot path) so a secret that
+    // lands in tool output never reaches the JSONL journal or the third-party webhook. Redacting
+    // here does NOT affect what the executed child or the model sees.
+    let redactor = crate::redact::shared();
 
     tokio::spawn(async move {
         let client = reqwest::Client::builder()

@@ -48,6 +48,16 @@ const MIN_SECRET_VALUE_LEN: usize = 8;
 /// own default parse depth of 128). Deeper subtrees are left unredacted rather than overflowing.
 const MAX_JSON_DEPTH: usize = 256;
 
+/// Matches env-var / JSON-key *names* that look like they hold a secret (`*_KEY`, `*TOKEN*`,
+/// `*SECRET*`, `*PASSWORD*`, `*_DSN`, …). Compiled once and reused for both the env-value scan and
+/// the JSON-key redaction pass.
+static NAME_IS_SECRET: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(secret|token|passwd|password|credential|api[_-]?key|access[_-]?key|private[_-]?key|auth[_-]?token|signing|connection[_-]?string|_pat$|_psk$|_dsn$|_key$|^key$)",
+    )
+    .expect("static secret-name regex compiles")
+});
+
 /// Redacts secret values/credentials from strings and JSON trees. Built once (env scan + regex
 /// compile) and reused for every emitted telemetry envelope.
 pub struct SecretRedactor {
@@ -66,15 +76,10 @@ impl SecretRedactor {
 
     /// Build from an explicit set of `(name, value)` pairs (used by tests).
     pub fn from_pairs<I: IntoIterator<Item = (String, String)>>(vars: I) -> Self {
-        let name_is_secret = Regex::new(
-            r"(?i)(secret|token|passwd|password|credential|api[_-]?key|access[_-]?key|private[_-]?key|auth[_-]?token|signing|connection[_-]?string|_pat$|_psk$|_dsn$|_key$|^key$)",
-        )
-        .expect("static secret-name regex compiles");
-
         let mut secret_values: Vec<(String, String)> = vars
             .into_iter()
             .filter(|(name, value)| {
-                value.len() >= MIN_SECRET_VALUE_LEN && name_is_secret.is_match(name)
+                value.len() >= MIN_SECRET_VALUE_LEN && NAME_IS_SECRET.is_match(name)
             })
             .map(|(name, value)| (format!("[REDACTED:{name}]"), value))
             .collect();
@@ -95,7 +100,8 @@ impl SecretRedactor {
                 r"(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}",
                 "[REDACTED_STRIPE_KEY]",
             ),
-            (r"AKIA[0-9A-Z]{16}", "[REDACTED_AWS_KEY]"),
+            // AKIA = permanent access keys, ASIA = temporary/session keys; both are 20 chars.
+            (r"(?:AKIA|ASIA)[0-9A-Z]{16}", "[REDACTED_AWS_KEY]"),
             (r"hf_[A-Za-z0-9]{20,}", "[REDACTED_HF_TOKEN]"),
             (r"gh[pousr]_[A-Za-z0-9]{20,}", "[REDACTED_GITHUB_TOKEN]"),
             (r"glpat-[A-Za-z0-9_-]{16,}", "[REDACTED_GITLAB_TOKEN]"),
@@ -111,10 +117,12 @@ impl SecretRedactor {
                 r"(?is)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
                 "[REDACTED_PRIVATE_KEY]",
             ),
-            // Generic `name = value` assignments; keep the key name, drop the value.
+            // Generic `name = value` assignments; keep the key name, drop the value. Capture the
+            // delimiter+opening-quote (group 2) and the closing quote (group 3) so `api_key: "x"`
+            // stays well-formed as `api_key: "[REDACTED]"` rather than the mangled `api_key=[REDACTED]"`.
             (
-                r#"(?i)(api[_-]?key|secret|token|passwd|password|access[_-]?key)["']?\s*[:=]\s*["']?[A-Za-z0-9._\-/+]{8,}"#,
-                "${1}=[REDACTED]",
+                r#"(?i)(api[_-]?key|secret|token|passwd|password|access[_-]?key)(["']?\s*[:=]\s*["']?)[A-Za-z0-9._\-/+]{8,}(["']?)"#,
+                "${1}${2}[REDACTED]${3}",
             ),
         ];
         raw.iter()
@@ -137,8 +145,10 @@ impl SecretRedactor {
             }
         }
         for (re, repl) in &self.patterns {
-            if re.is_match(&out) {
-                out = Cow::Owned(re.replace_all(&out, *repl).into_owned());
+            // `replace_all` already returns `Cow::Owned` only when it actually replaced something,
+            // so match on that instead of a separate `is_match` pass (which would search twice).
+            if let Cow::Owned(replaced) = re.replace_all(&out, *repl) {
+                out = Cow::Owned(replaced);
             }
         }
         out
@@ -162,9 +172,21 @@ impl SecretRedactor {
             Value::Array(arr) => arr
                 .iter_mut()
                 .for_each(|v| self.redact_json_at(v, depth + 1)),
-            Value::Object(map) => map
-                .values_mut()
-                .for_each(|v| self.redact_json_at(v, depth + 1)),
+            Value::Object(map) => {
+                for (k, v) in map.iter_mut() {
+                    // A string value under a secret-named key (e.g. {"api_key": "..."}) is redacted
+                    // by key even when the value matches no credential format and isn't in this
+                    // process's env — structured telemetry is the common place such bare secrets
+                    // appear. Over-redaction in a monitoring sink is harmless (see module docs).
+                    if let Value::String(s) = v {
+                        if NAME_IS_SECRET.is_match(k) {
+                            *s = format!("[REDACTED:{}]", k.to_uppercase());
+                            continue;
+                        }
+                    }
+                    self.redact_json_at(v, depth + 1);
+                }
+            }
             _ => {}
         }
     }
@@ -243,6 +265,11 @@ mod tests {
             r.redact("token AKIAIOSFODNN7EXAMPLE done"),
             "token [REDACTED_AWS_KEY] done"
         );
+        // Temporary/session keys (ASIA prefix) are redacted too, not just permanent AKIA keys.
+        assert_eq!(
+            r.redact("token ASIAIOSFODNN7EXAMPLE done"),
+            "token [REDACTED_AWS_KEY] done"
+        );
         assert!(r
             .redact("Authorization: Bearer ya29.A0ARrdaM-longtoken")
             .contains("Bearer [REDACTED]"));
@@ -265,6 +292,14 @@ mod tests {
         let out = r.redact("password = hunter2longenough");
         assert!(out.contains("[REDACTED]"), "got: {out}");
         assert!(!out.contains("hunter2longenough"), "value must be gone: {out}");
+        // Quoted assignment keeps its delimiter and BOTH quotes intact (no mangling to
+        // `api_key=[REDACTED]"`).
+        let quoted = r.redact(r#"{"api_key": "abcdef123456"}"#);
+        assert!(
+            quoted.contains(r#""api_key": "[REDACTED]""#),
+            "quotes/delimiter must be preserved: {quoted}"
+        );
+        assert!(!quoted.contains("abcdef123456"), "value must be gone: {quoted}");
         // Full PEM block (body + footer) is masked, not just the header.
         let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAK...\nabcd1234\n-----END RSA PRIVATE KEY-----";
         let red = r.redact(pem);
@@ -294,5 +329,25 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("[REDACTED:DB_PASSWORD]"));
+    }
+
+    #[test]
+    fn redacts_json_string_values_under_secret_keys() {
+        // A bare secret under a secret-named key — no recognizable credential format, not in the
+        // env — is still redacted by key. Non-secret keys and non-string values are untouched.
+        let r = SecretRedactor::from_pairs(std::iter::empty());
+        let mut v = json!({
+            "api_key": "plainvalue_no_format",
+            "password": "short",
+            "user": "alice",
+            "count": 7,
+            "nested": { "access_key": "anotherplainsecret" }
+        });
+        r.redact_json(&mut v);
+        assert_eq!(v["api_key"], "[REDACTED:API_KEY]");
+        assert_eq!(v["password"], "[REDACTED:PASSWORD]"); // redacted by key even though short
+        assert_eq!(v["user"], "alice");
+        assert_eq!(v["count"], 7);
+        assert_eq!(v["nested"]["access_key"], "[REDACTED:ACCESS_KEY]");
     }
 }
