@@ -2176,19 +2176,27 @@ pub fn build_fallback_specs(
         .collect()
 }
 
-/// Process-wide fallback providers, set once at startup (like the primary, these are config).
-/// Empty until set, so failover is simply inert when unconfigured or in tests.
-static FALLBACK_PROVIDERS: std::sync::OnceLock<Vec<FallbackProviderSpec>> = std::sync::OnceLock::new();
+/// Process-wide fallback providers (config, like the primary). Empty until set, so failover is
+/// simply inert when unconfigured. Stored behind an `RwLock` rather than a `OnceLock` so an embedder
+/// that rebuilds its runtime — e.g. a desktop app that re-bootstraps on a provider/model switch —
+/// can refresh the list, keeping the fallbacks consistent with the current primary instead of
+/// frozen at the first call.
+static FALLBACK_PROVIDERS: std::sync::RwLock<Vec<FallbackProviderSpec>> =
+    std::sync::RwLock::new(Vec::new());
 
-/// Install the fallback provider list. Call once at startup, after the primary is built; a second
-/// call is ignored (OnceLock). **Do not call from tests** — the `OnceLock` can't be reset, so it
-/// would pollute every other test in the binary. Tests drive [`try_fallbacks`] directly instead.
+/// Install (or replace) the fallback provider list. Safe to call repeatedly — each call replaces the
+/// previous list; pass an empty vec to disable failover. A test that sets this should reset it (set
+/// `vec![]`) afterwards so it doesn't leak into other tests in the binary.
 pub fn set_fallback_providers(specs: Vec<FallbackProviderSpec>) {
-    let _ = FALLBACK_PROVIDERS.set(specs);
+    if let Ok(mut guard) = FALLBACK_PROVIDERS.write() {
+        *guard = specs;
+    }
 }
 
-fn fallback_providers() -> &'static [FallbackProviderSpec] {
-    FALLBACK_PROVIDERS.get().map(Vec::as_slice).unwrap_or(&[])
+/// Snapshot of the current fallback list. Returns an owned clone so the lock isn't held across the
+/// (async) failover chat calls.
+fn fallback_providers() -> Vec<FallbackProviderSpec> {
+    FALLBACK_PROVIDERS.read().map(|g| g.clone()).unwrap_or_default()
 }
 
 /// Result of attempting the configured fallback providers.
@@ -2355,8 +2363,9 @@ async fn chat_with_retry(
     // Primary exhausted. Before surfacing a failure, try each configured fallback provider once, so
     // a transient outage / key rotation / model deprecation on the primary doesn't drop a long
     // unattended turn. The primary stays the active provider — failover is per-call.
+    let fallbacks = fallback_providers();
     match try_fallbacks(
-        fallback_providers(),
+        &fallbacks,
         |s| {
             crate::provider::create_provider(&s.provider_name, &s.base_url, &s.api_key, &s.model_name)
         },
@@ -4013,6 +4022,26 @@ mod tests {
         )
         .await;
         assert!(matches!(out, super::FallbackOutcome::Cancelled));
+    }
+
+    #[test]
+    fn set_fallback_providers_is_resettable() {
+        // The list is process-global; this is the only test that mutates it.
+        // A second `set` must replace the first (an `OnceLock` could not), so an
+        // embedder that re-bootstraps on a provider switch gets fresh fallbacks.
+        super::set_fallback_providers(vec![fb_spec("a")]);
+        let first = super::fallback_providers();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].provider_name, "a");
+
+        super::set_fallback_providers(vec![fb_spec("b"), fb_spec("c")]);
+        let second = super::fallback_providers();
+        assert_eq!(second.len(), 2);
+        assert_eq!(second[0].provider_name, "b");
+
+        // Reset so the global doesn't leak into other tests in this binary.
+        super::set_fallback_providers(vec![]);
+        assert!(super::fallback_providers().is_empty());
     }
 
     #[derive(Clone)]
