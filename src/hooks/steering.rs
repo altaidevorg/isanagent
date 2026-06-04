@@ -154,9 +154,18 @@ async fn run_hook_command(
         .take()
         .ok_or_else(|| "hook stdin missing".to_string())?;
     let body = serde_json::to_vec(stdin_json).map_err(|e| format!("hook stdin encode: {}", e))?;
-    tokio::io::AsyncWriteExt::write_all(&mut stdin, &body)
-        .await
-        .map_err(|e| format!("hook stdin write: {}", e))?;
+    // A hook that ignores its stdin and exits (a bare `cargo build` / `pytest`, or any verify hook
+    // that reads the event from argv/env instead) closes its stdin read end before — or while — we
+    // write. On Linux that surfaces here as `BrokenPipe`; on macOS the small event JSON usually fits
+    // the pipe buffer and the write completes before the child exits. Treating BrokenPipe as fatal
+    // therefore dropped the hook's captured output non-deterministically (the failure reached the
+    // model on macOS but vanished on Linux). The hook simply didn't consume the event, which is
+    // fine — swallow BrokenPipe and proceed to capture its output and exit status.
+    if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut stdin, &body).await {
+        if e.kind() != std::io::ErrorKind::BrokenPipe {
+            return Err(format!("hook stdin write: {}", e));
+        }
+    }
     drop(stdin);
 
     let stdout = child
