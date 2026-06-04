@@ -295,6 +295,24 @@ fn extract_exec_command(args: &Value) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Append post_tool verification-hook output (build/test/lint results) to a tool result, preserving
+/// Ok/Err polarity so the model sees it alongside the tool's own output and can self-correct.
+fn append_post_tool_output(res: Result<String, String>, hook_out: &str) -> Result<String, String> {
+    let note = format!("\n\n[post-tool hook]\n{hook_out}");
+    // `res` is owned, so append the note onto the existing buffer in place rather than allocating a
+    // fresh string and copying the (potentially large) tool output into it.
+    match res {
+        Ok(mut s) => {
+            s.push_str(&note);
+            Ok(s)
+        }
+        Err(mut s) => {
+            s.push_str(&note);
+            Err(s)
+        }
+    }
+}
+
 /// Lowercase and collapse every run of whitespace (spaces, tabs, newlines) to a single space so a
 /// destructive command can't slip past a single-spaced approval pattern via `rm  -rf`, a tab, or a
 /// mid-command line break.
@@ -548,6 +566,22 @@ mod code_exec_gate_tests {
         assert!(shell_approval_reply_is_grant("yes do it"));
         assert!(shell_approval_reply_is_grant("yes, please do"));
         assert!(!shell_approval_reply_is_grant("do it"));
+    }
+
+    #[test]
+    fn append_post_tool_output_preserves_polarity() {
+        // Appends to an Ok result, staying Ok (verification output is informational).
+        let ok = append_post_tool_output(Ok("applied".into()), "tests passed");
+        assert_eq!(
+            ok.as_deref(),
+            Ok("applied\n\n[post-tool hook]\ntests passed")
+        );
+        // Appends to an Err result, staying Err (the tool itself failed).
+        let err = append_post_tool_output(Err("boom".into()), "lint output");
+        assert_eq!(
+            err.as_ref().err().map(String::as_str),
+            Some("boom\n\n[post-tool hook]\nlint output")
+        );
     }
 }
 
@@ -849,6 +883,7 @@ async fn execute_tool_call_with_activity(
             }
         };
 
+        let mut post_tool_output: Option<String> = None;
         if let Some(ref hc) = runtime.hook_tool_ctx {
             if let Some(st) = &hc.steering {
                 let res_for_hook = match &completed {
@@ -862,7 +897,7 @@ async fn execute_tool_call_with_activity(
                     metadata: runtime.inbound_metadata.as_ref(),
                     is_subagent: runtime.is_subagent,
                 };
-                run_post_tool_hooks(
+                post_tool_output = run_post_tool_hooks(
                     st.as_ref(),
                     &tool_name,
                     tool_call_id_for_hooks.as_deref(),
@@ -885,6 +920,12 @@ async fn execute_tool_call_with_activity(
                         return ToolExecutionFinished::Waiting(ticket_id.to_string());
                     }
                 }
+                // Append any post_tool verification-hook output so the model sees test/lint/build
+                // results (including failures) and can self-correct. Ok/Err polarity is preserved.
+                let res = match post_tool_output {
+                    Some(hook_out) => append_post_tool_output(res, &hook_out),
+                    None => res,
+                };
                 ToolExecutionFinished::Completed(res)
             }
             None => {
