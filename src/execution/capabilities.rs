@@ -79,7 +79,10 @@ pub struct SessionCapabilities {
     pub provider_id: String,
     #[serde(default)]
     pub active_language: Option<String>,
-    #[serde(default)]
+    /// `Some(true/false)` only when the provider actually probed GPU visibility. Omitted from
+    /// serialized snapshots when unknown, so a permanently-null field is not surfaced to the
+    /// model as if it were a real (negative) capability signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_visible: Option<bool>,
     #[serde(default)]
     pub working_directory_display: Option<String>,

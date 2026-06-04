@@ -355,6 +355,10 @@ fn try_build_provider(
                 remote_python: config.execution_ssh_remote_python(),
                 identity_path: config.execution_ssh_identity_file(),
                 accept_unknown_host_keys: config.execution_ssh_accept_unknown_host_keys(),
+                known_hosts_path: workspace_dir
+                    .join(".system_generated")
+                    .join("ssh")
+                    .join("known_hosts"),
                 max_run_timeout_secs: config.execution_max_wall_secs(),
                 max_output_bytes: config.execution_max_output_bytes(),
                 max_sessions: config.execution_max_sessions(),

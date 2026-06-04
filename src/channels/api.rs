@@ -7,8 +7,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use axum::{
     body::{Body, Bytes},
-    extract::{OriginalUri, Path as AxumPath, Query, State},
+    extract::{OriginalUri, Path as AxumPath, Query, Request, State},
     http::{header, HeaderName, HeaderValue, StatusCode},
+    middleware::{self, Next},
     response::{sse::Event, sse::Sse, IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
@@ -59,6 +60,8 @@ struct ApiState {
     memory_node: NodeHandle<MemoryMessage>,
     /// Agent sandbox (`<workspace>/workspace`); same root as filesystem tools.
     workspace_sandbox: std::path::PathBuf,
+    /// When `Some`, a `Authorization: Bearer <token>` is required on all `/v1` routes.
+    auth_token: Option<std::sync::Arc<String>>,
 }
 
 enum PendingRequest {
@@ -280,6 +283,7 @@ pub struct ApiChannel {
     port: u16,
     bind_address: Option<String>,
     serve_ui: bool,
+    auth_token: Option<std::sync::Arc<String>>,
     workspace_sandbox: std::path::PathBuf,
     pending_requests: std::sync::Arc<DashMap<String, PendingRequest>>,
     responses_cache: Cache<String, StoredResponse>,
@@ -304,6 +308,19 @@ impl ApiChannel {
             .bind_address
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        // Config value wins; fall back to the ISANAGENT_API_TOKEN env var so the secret need
+        // not live in the workspace TOML.
+        let auth_token = config
+            .auth_token
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                std::env::var("ISANAGENT_API_TOKEN")
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            })
+            .map(std::sync::Arc::new);
         let workspace_sandbox = std::fs::canonicalize(workspace_sandbox.as_ref()).map_err(|e| {
             format!(
                 "Failed to canonicalize workspace sandbox {:?}: {}",
@@ -315,6 +332,7 @@ impl ApiChannel {
             port: config.port,
             bind_address,
             serve_ui: config.serve_ui.unwrap_or(false),
+            auth_token,
             workspace_sandbox,
             pending_requests: std::sync::Arc::new(DashMap::new()),
             responses_cache: Cache::builder()
@@ -341,11 +359,96 @@ impl ApiChannel {
     fn resolved_bind_address(&self) -> String {
         if let Some(bind_address) = &self.bind_address {
             bind_address.clone()
-        } else if self.serve_ui {
-            "127.0.0.1".to_string()
         } else {
-            "0.0.0.0".to_string()
+            // Safe by default: loopback. Exposing the control plane to the network now requires
+            // an explicit `bind_address` AND an auth token (enforced in `start`). Previously the
+            // headless default was `0.0.0.0`, which silently network-exposed chat control and
+            // workspace file read/write.
+            "127.0.0.1".to_string()
         }
+    }
+}
+
+/// Loopback / local-only binds that are safe to serve without authentication.
+///
+/// Parses the host as an IP and uses `is_loopback()` (covers all of `127.0.0.0/8` and `::1`,
+/// including the bracketed `[::1]` form), so a non-loopback bind (`0.0.0.0`, `::`, a public IP) —
+/// or anything unparseable, including a hostname like `127.example.com` — is treated as NOT
+/// loopback and therefore requires a token. Fails safe (unknown ⇒ not loopback).
+fn is_loopback_bind(addr: &str) -> bool {
+    let host = addr.trim();
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // Accept the bracketed IPv6 literal `[::1]` as well as bare `::1`.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// Refuse to expose the control plane to a non-loopback address without a token. The `/v1`
+/// surface includes chat control and workspace file read/write, so an unauthenticated public
+/// bind is an unauthenticated remote-code-execution surface.
+fn validate_bind_security(addr: &str, has_token: bool) -> Result<(), String> {
+    if is_loopback_bind(addr) || has_token {
+        Ok(())
+    } else {
+        Err(format!(
+            "Refusing to bind the API control plane to non-loopback address {addr:?} without authentication. \
+             Set [api].auth_token (or the ISANAGENT_API_TOKEN env var), or bind to 127.0.0.1."
+        ))
+    }
+}
+
+/// Constant-time bearer-token check for `Authorization: Bearer <token>`.
+fn bearer_token_matches(auth_header: Option<&str>, expected: &str) -> bool {
+    if expected.is_empty() {
+        return false;
+    }
+    let Some(header) = auth_header else {
+        return false;
+    };
+    let Some(token) = header
+        .strip_prefix("Bearer ")
+        .or_else(|| header.strip_prefix("bearer "))
+    else {
+        return false;
+    };
+    let token = token.trim();
+    if token.len() != expected.len() {
+        return false;
+    }
+    // Constant-time compare so a near-miss token cannot be discovered byte-by-byte via timing.
+    let mut diff = 0u8;
+    for (a, b) in token.bytes().zip(expected.bytes()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+/// Middleware gating the `/v1` routes when an auth token is configured.
+async fn require_bearer_auth(
+    State(expected): State<std::sync::Arc<String>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let provided = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    if bearer_token_matches(provided, expected.as_str()) {
+        next.run(req).await
+    } else {
+        ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Missing or invalid `Authorization: Bearer` token.",
+        )
+        .into_response()
     }
 }
 
@@ -368,7 +471,11 @@ impl Channel for ApiChannel {
             logger_tx: self.logger_tx.clone(),
             memory_node: self.memory_node.clone(),
             workspace_sandbox: self.workspace_sandbox.clone(),
+            auth_token: self.auth_token.clone(),
         };
+
+        let resolved_bind = self.resolved_bind_address();
+        validate_bind_security(&resolved_bind, self.auth_token.is_some())?;
 
         let logger_tx = self.logger_tx.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -376,7 +483,7 @@ impl Channel for ApiChannel {
             "ApiChannel",
             "Starting API channel...",
         )));
-        let addr = format!("{}:{}", self.resolved_bind_address(), port);
+        let addr = format!("{}:{}", resolved_bind, port);
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .map_err(|e| format!("Failed to bind API port on {}: {}", addr, e))?;
@@ -578,7 +685,8 @@ impl ApiChannel {
 }
 
 fn build_router(state: ApiState, serve_ui: bool) -> Router {
-    let mut app = Router::new()
+    let auth_token = state.auth_token.clone();
+    let mut v1 = Router::new()
         .route("/v1/chat/completions", post(handle_chat))
         .route("/v1/responses", post(handle_responses))
         .route("/v1/threads", get(handle_list_threads))
@@ -622,6 +730,15 @@ fn build_router(state: ApiState, serve_ui: bool) -> Router {
         // POST on a distinct path so clients are not blocked by proxies or older builds that only registered GET on `/v1/workspace/file`.
         .route("/v1/workspace/file/save", post(handle_workspace_file_put))
         .route("/v1/workspace/rename", post(handle_workspace_rename));
+
+    // Gate the `/v1` control surface with bearer auth when a token is configured. The cron
+    // webhook (its own per-job URL token) and the embedded UI assets are intentionally left
+    // open: external cron callers and browser asset GETs cannot carry the bearer header.
+    if let Some(token) = auth_token {
+        v1 = v1.route_layer(middleware::from_fn_with_state(token, require_bearer_auth));
+    }
+
+    let mut app = Router::new().merge(v1);
 
     if state.mte_cron_scheduler.is_some() {
         app = app.route("/_mte/cron/{job_id}/{token}", get(handle_mte_cron_webhook));
@@ -2441,7 +2558,10 @@ fn log_api(logger_tx: &LoggerHandle, event: LogEvent) {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_router, ApiState, PendingRequest, EMBEDDED_UI_ASSETS};
+    use super::{
+        bearer_token_matches, build_router, is_loopback_bind, validate_bind_security, ApiState,
+        PendingRequest, EMBEDDED_UI_ASSETS,
+    };
     use crate::bus::{BusMessage, OutboundMessage};
     use crate::channels::api_store::ResponseStore;
     use crate::config::ApiConfig;
@@ -2554,6 +2674,7 @@ mod tests {
             logger_tx,
             memory_node,
             workspace_sandbox,
+            auth_token: None,
         }
     }
 
@@ -2573,6 +2694,97 @@ bind_address = "127.0.0.1"
         assert_eq!(config.port, 8080);
         assert_eq!(config.serve_ui, Some(true));
         assert_eq!(config.bind_address.as_deref(), Some("127.0.0.1"));
+    }
+
+    // ---- 0.2: HTTP control-plane auth + safe bind ----
+
+    #[test]
+    fn loopback_binds_recognized() {
+        assert!(is_loopback_bind("127.0.0.1"));
+        assert!(is_loopback_bind("::1"));
+        assert!(is_loopback_bind("[::1]")); // bracketed IPv6 literal
+        assert!(is_loopback_bind("localhost"));
+        assert!(is_loopback_bind("127.0.0.5")); // all of 127.0.0.0/8
+        assert!(!is_loopback_bind("0.0.0.0"));
+        assert!(!is_loopback_bind("::")); // unspecified IPv6 is NOT loopback
+        assert!(!is_loopback_bind("192.168.1.10"));
+        // A hostname that merely starts with "127." must NOT be treated as loopback
+        // (previously fail-open via a `starts_with("127.")` shortcut).
+        assert!(!is_loopback_bind("127.example.com"));
+    }
+
+    #[test]
+    fn refuses_public_bind_without_token() {
+        assert!(validate_bind_security("127.0.0.1", false).is_ok());
+        let err = validate_bind_security("0.0.0.0", false).expect_err("must refuse public+no-token");
+        assert!(
+            err.contains("auth_token") || err.contains("127.0.0.1"),
+            "err={err}"
+        );
+        assert!(validate_bind_security("0.0.0.0", true).is_ok());
+    }
+
+    #[test]
+    fn bearer_match_rules() {
+        assert!(bearer_token_matches(Some("Bearer s3cret"), "s3cret"));
+        assert!(bearer_token_matches(Some("bearer s3cret"), "s3cret"));
+        assert!(!bearer_token_matches(Some("Bearer wrong0"), "s3cret"));
+        assert!(!bearer_token_matches(Some("s3cret"), "s3cret")); // missing scheme
+        assert!(!bearer_token_matches(None, "s3cret"));
+        assert!(!bearer_token_matches(Some("Bearer s3cret"), "")); // empty expected never matches
+    }
+
+    #[tokio::test]
+    async fn v1_requires_bearer_when_token_configured() {
+        let temp = LocalTempDir::new();
+        let (bus_tx, _bus_rx) = mpsc::channel(4);
+        let mut state = build_state(&temp.db_path(), bus_tx, None);
+        state.auth_token = Some(std::sync::Arc::new("topsecret".to_string()));
+        let app = build_router(state, false);
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/threads")
+                    .method("GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request succeeds");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/threads")
+                    .method("GET")
+                    .header("authorization", "Bearer topsecret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request succeeds");
+        assert_ne!(authorized.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn v1_open_when_no_token_configured() {
+        let temp = LocalTempDir::new();
+        let (bus_tx, _bus_rx) = mpsc::channel(4);
+        let app = build_router(build_state(&temp.db_path(), bus_tx, None), false);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/threads")
+                    .method("GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request succeeds");
+        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -2798,6 +3010,7 @@ bind_address = "127.0.0.1"
             logger_tx,
             memory_node,
             workspace_sandbox,
+            auth_token: None,
         };
         let app = build_router(state, true);
 
