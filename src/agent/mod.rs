@@ -291,19 +291,34 @@ fn extract_exec_command(args: &Value) -> Option<String> {
 /// destructive command can't slip past a single-spaced approval pattern via `rm  -rf`, a tab, or a
 /// mid-command line break.
 fn normalize_command_for_matching(s: &str) -> String {
-    s.to_ascii_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    let lowercase = s.to_ascii_lowercase();
+    let mut result = String::with_capacity(lowercase.len());
+    let mut words = lowercase.split_whitespace();
+    if let Some(first) = words.next() {
+        result.push_str(first);
+        for word in words {
+            result.push(' ');
+            result.push_str(word);
+        }
+    }
+    result
 }
 
 fn should_require_shell_approval(command: &str, patterns: &[String]) -> bool {
-    let normalized = normalize_command_for_matching(command);
+    // Pad with spaces so matching is on whole-word boundaries: a bare `.contains()` on the
+    // normalized command would let a pattern like `rm` match any command containing `terminal`,
+    // `platform`, `firmware`, `alarm`, `warm`, `harm`, etc. ("terminal".contains("rm") is true),
+    // forcing spurious approval prompts. Padding both sides keeps the whitespace-robustness (a
+    // run of spaces/tabs/newlines was already collapsed to one) while only matching real tokens.
+    let normalized = format!(" {} ", normalize_command_for_matching(command));
     patterns.iter().any(|p| {
         let np = normalize_command_for_matching(p);
         // Ignore empty/whitespace-only patterns: `contains("")` is always true and would otherwise
         // force approval on *every* command — a silent config footgun.
-        !np.is_empty() && normalized.contains(&np)
+        if np.is_empty() {
+            return false;
+        }
+        normalized.contains(&format!(" {} ", np))
     })
 }
 
@@ -323,7 +338,7 @@ fn shell_approval_reply_is_grant(reply: &str) -> bool {
         "approve", "approved", "approves", "yes", "yep", "yeah", "y", "ok", "okay", "k", "allow",
         "allowed", "confirm", "confirmed", "accept", "accepted", "proceed", "go", "sure",
     ];
-    const FILLER: &[&str] = &["please", "it", "this", "that", "ahead", "now", "run"];
+    const FILLER: &[&str] = &["please", "it", "this", "that", "ahead", "now", "run", "do"];
 
     let r = reply.trim().to_ascii_lowercase();
     if r.is_empty() {
@@ -461,6 +476,19 @@ mod code_exec_gate_tests {
     }
 
     #[test]
+    fn approval_match_is_word_boundary_not_substring() {
+        // A bare `rm` pattern must match the real command but NOT words that merely contain "rm"
+        // (the substring false positive: "terminal".contains("rm") is true).
+        let patterns = vec!["rm".to_string()];
+        assert!(should_require_shell_approval("rm -rf /tmp/x", &patterns));
+        assert!(should_require_shell_approval("echo hi && rm file", &patterns));
+        assert!(!should_require_shell_approval("terminal --help", &patterns));
+        assert!(!should_require_shell_approval("warm up the cache", &patterns));
+        assert!(!should_require_shell_approval("npm run platform", &patterns));
+        assert!(!should_require_shell_approval("check firmware", &patterns));
+    }
+
+    #[test]
     fn empty_pattern_does_not_force_approval_on_everything() {
         // `contains("")` is always true; an empty/whitespace pattern must be ignored.
         let patterns = vec!["".to_string(), "   ".to_string()];
@@ -498,6 +526,12 @@ mod code_exec_gate_tests {
         assert!(shell_approval_reply_is_grant("approve please"));
         assert!(shell_approval_reply_is_grant("approve this"));
         assert!(shell_approval_reply_is_grant("go ahead"));
+        // "do" is neutral filler: it rescues genuine affirmatives ("yes do it") without weakening
+        // deny-default — a negation always carries another non-filler token (see "do not approve"
+        // above), and "do" on its own is not affirmative.
+        assert!(shell_approval_reply_is_grant("yes do it"));
+        assert!(shell_approval_reply_is_grant("yes, please do"));
+        assert!(!shell_approval_reply_is_grant("do it"));
     }
 }
 
