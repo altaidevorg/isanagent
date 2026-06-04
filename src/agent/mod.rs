@@ -3137,13 +3137,15 @@ impl AgentLogic {
                                 persist_and_cancel!();
                             }
                         };
-                        let was_err = tool_result.is_err();
+                        // Compute is_error from the RAW result (a dispatch Err, or an in-band Ok
+                        // failure — a non-zero runner `Exit code:` or a scoped `Error:` payload)
+                        // BEFORE finalize_tool_output truncates the tail-anchored exit marker away.
+                        // tool_output_looks_like_failure (text-only, all tools) missed non-zero
+                        // exits whose output did not start with "Error:" and false-flagged content
+                        // tools like read_file; tool_call_is_error is tool-scoped and exit-aware.
+                        let is_error =
+                            crate::utils::tool_call_is_error(&tc.function.name, &tool_result);
                         let tool_result_text = finalize_tool_output(tool_result);
-                        // Treat both a dispatch Err AND an in-band Ok("Error: ...") (recoverable
-                        // tool-reported failure) as an error, so the model's is_error signal
-                        // matches what the result text already conveys.
-                        let is_error = was_err
-                            || crate::utils::tool_output_looks_like_failure(&tool_result_text);
                         let tool_name = tc.function.name.clone();
                         let tr = TelemetryEvent::ToolResult {
                             chat_id: inbound.chat_id.clone(),
@@ -3246,13 +3248,15 @@ impl AgentLogic {
                             }
                         };
 
-                        let was_err = tool_result.is_err();
+                        // Compute is_error from the RAW result (a dispatch Err, or an in-band Ok
+                        // failure — a non-zero runner `Exit code:` or a scoped `Error:` payload)
+                        // BEFORE finalize_tool_output truncates the tail-anchored exit marker away.
+                        // tool_output_looks_like_failure (text-only, all tools) missed non-zero
+                        // exits whose output did not start with "Error:" and false-flagged content
+                        // tools like read_file; tool_call_is_error is tool-scoped and exit-aware.
+                        let is_error =
+                            crate::utils::tool_call_is_error(&tc.function.name, &tool_result);
                         let tool_result_text = finalize_tool_output(tool_result);
-                        // Treat both a dispatch Err AND an in-band Ok("Error: ...") (recoverable
-                        // tool-reported failure) as an error, so the model's is_error signal
-                        // matches what the result text already conveys.
-                        let is_error = was_err
-                            || crate::utils::tool_output_looks_like_failure(&tool_result_text);
 
                         let tr = TelemetryEvent::ToolResult {
                             chat_id: inbound.chat_id.clone(),
