@@ -772,6 +772,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            is_error: None,
         }
     }
 
@@ -783,6 +784,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: Some("call_0".to_string()),
             reasoning_content: None,
+            is_error: None,
         }
     }
 
@@ -1045,6 +1047,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: Some(id.to_string()),
             reasoning_content: None,
+            is_error: None,
         }
     }
 
@@ -1099,6 +1102,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            is_error: None,
         }];
         let (swapped, cached) = swap_all_tool_results_in_place(&mut ctx);
         assert_eq!(swapped, 0);
@@ -1171,6 +1175,7 @@ mod tests {
                     tool_calls: None,
                     tool_call_id: None,
                     reasoning_content: None,
+                    is_error: None,
                 },
             ),
             (3, user_msg("u2")),
@@ -1204,6 +1209,7 @@ mod tests {
                     tool_calls: None,
                     tool_call_id: Some("c1".to_string()),
                     reasoning_content: None,
+                    is_error: None,
                 },
             ),
             (3, user_msg("u2")),

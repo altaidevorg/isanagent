@@ -168,6 +168,7 @@ mod tests {
             tool_calls: Some(calls),
             tool_call_id: None,
             reasoning_content: None,
+            is_error: None,
         }
     }
 

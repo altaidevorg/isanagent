@@ -110,6 +110,7 @@ mod tests {
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning_content: None,
+                is_error: None,
             },
         ];
         let cells = chat_messages_to_terminal_cells(&messages);

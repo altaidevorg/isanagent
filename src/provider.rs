@@ -229,13 +229,20 @@ impl AnthropicProvider {
                         .unwrap_or_default();
                     let tool_call_id = msg.tool_call_id.as_deref().unwrap_or("");
 
+                    let mut tool_result = json!({
+                        "type": "tool_result",
+                        "tool_use_id": tool_call_id,
+                        "content": result_text
+                    });
+                    // Surface Anthropic's native failure flag so the model gets a structured
+                    // error signal, not just an "Error:" text prefix. Only emit on failure
+                    // (Anthropic treats an absent flag as success).
+                    if msg.is_error == Some(true) {
+                        tool_result["is_error"] = json!(true);
+                    }
                     anthropic_messages.push(json!({
                         "role": "user",
-                        "content": [{
-                            "type": "tool_result",
-                            "tool_use_id": tool_call_id,
-                            "content": result_text
-                        }]
+                        "content": [tool_result]
                     }));
                 }
                 _ => {}
@@ -450,5 +457,76 @@ impl Provider for AnthropicProvider {
             reasoning_content: None,
             usage,
         })
+    }
+}
+
+#[cfg(test)]
+mod is_error_tests {
+    use super::AnthropicProvider;
+    use crate::utils::ChatMessage;
+
+    /// Collect every `tool_result` content block across the converted Anthropic messages.
+    fn tool_result_blocks(msgs: &[serde_json::Value]) -> Vec<serde_json::Value> {
+        let mut blocks = Vec::new();
+        for m in msgs {
+            if let Some(content) = m.get("content").and_then(|c| c.as_array()) {
+                for b in content {
+                    if b.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+                        blocks.push(b.clone());
+                    }
+                }
+            }
+        }
+        blocks
+    }
+
+    #[test]
+    fn anthropic_tool_result_sets_is_error_only_on_failure() {
+        let msgs = vec![
+            ChatMessage::tool_with_error("Error: boom", "call_1", Some("exec"), true),
+            ChatMessage::tool_with_error("ok output", "call_2", Some("exec"), false),
+            ChatMessage::tool("legacy output", "call_3", Some("exec")), // is_error == None
+        ];
+        let (_system, anthropic) = AnthropicProvider::convert_messages(&msgs);
+        let blocks = tool_result_blocks(&anthropic);
+        assert_eq!(
+            blocks.len(),
+            3,
+            "expected 3 tool_result blocks, got {anthropic:?}"
+        );
+
+        let by_id = |id: &str| {
+            blocks
+                .iter()
+                .find(|b| b["tool_use_id"] == id)
+                .unwrap_or_else(|| panic!("missing tool_result for {id}"))
+        };
+        // Failure -> native is_error: true.
+        assert_eq!(
+            by_id("call_1").get("is_error"),
+            Some(&serde_json::json!(true))
+        );
+        // Success and legacy(None) -> NO is_error key (Anthropic treats absence as success).
+        assert!(by_id("call_2").get("is_error").is_none());
+        assert!(by_id("call_3").get("is_error").is_none());
+    }
+
+    #[test]
+    fn is_error_is_never_serialized_to_openai_wire() {
+        // The OpenAI-compatible request serializes ChatMessage directly; `is_error` must NOT
+        // appear (strict endpoints reject unknown message fields).
+        let msg = ChatMessage::tool_with_error("Error: boom", "call_1", Some("exec"), true);
+        let v = serde_json::to_value(&msg).expect("serialize");
+        assert!(
+            v.get("is_error").is_none(),
+            "is_error leaked onto the OpenAI-compatible wire: {v}"
+        );
+        // Also assert against the real request-body shape (LLMClient::chat serializes
+        // `{"messages": [...]}` directly), not just the bare struct.
+        let body = serde_json::json!({ "messages": [msg] });
+        assert!(
+            body["messages"][0].get("is_error").is_none(),
+            "is_error leaked inside the messages array: {body}"
+        );
     }
 }
