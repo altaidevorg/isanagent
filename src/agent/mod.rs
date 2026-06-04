@@ -3207,12 +3207,14 @@ impl Tool for LoadSkillTool {
         }
 
         // Miss: a SKILL.md may have been dropped into the skills directory since the registry was
-        // last scanned (it is scanned once at startup). Rescan once and retry before reporting the
-        // skill missing, so a freshly added skill is loadable without restarting the agent. The
+        // last scanned (it is scanned once at startup). Rescan once and re-resolve before reporting
+        // the skill missing, so a freshly added skill is loadable without restarting the agent. The
         // rescan is paid only on an actual miss, so the common path (skill already present) is
-        // unchanged.
-        self.registry.write().await.scan_for_skills();
-        let registry = self.registry.read().await;
+        // unchanged. Hold a single write guard for both the rescan and the follow-up lookup (the
+        // guard derefs to the registry for the immutable getters), avoiding a redundant drop-then-
+        // reacquire and closing the gap between scan and read.
+        let mut registry = self.registry.write().await;
+        registry.scan_for_skills();
         if detail == "metadata" {
             registry.get_skill_metadata(skill_name)
         } else {
