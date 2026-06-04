@@ -276,11 +276,9 @@ fn try_build_provider(
                 max_sessions: config.execution_max_sessions(),
                 artifact_sandbox_dir: sandbox_dir.to_path_buf(),
                 artifact_limits,
-                notebook_sync_path_template: config
-                    .execution_jupyter_notebook_sync_path_template(),
+                notebook_sync_path_template: config.execution_jupyter_notebook_sync_path_template(),
             };
-            let p =
-                JupyterExecutionProvider::new(jc).map_err(|e: ExecutionError| e.to_string())?;
+            let p = JupyterExecutionProvider::new(jc).map_err(|e: ExecutionError| e.to_string())?;
             Ok(Arc::new(p))
         }
         "ssh" => {
@@ -327,9 +325,12 @@ pub fn build_execution_harness(
     restrict_to_workspace: bool,
     config: &AppConfig,
 ) -> Result<Arc<ExecutionHarness>, String> {
-    let candidates = config
-        .execution_allowed_providers()
-        .unwrap_or_else(|| IMPLEMENTED_PROVIDERS.iter().map(|s| s.to_string()).collect());
+    let candidates = config.execution_allowed_providers().unwrap_or_else(|| {
+        IMPLEMENTED_PROVIDERS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    });
 
     let configured_default = config.execution_default_provider();
     let default_explicit = config.execution_default_provider_explicit();

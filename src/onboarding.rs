@@ -32,7 +32,8 @@ const LITERATURE_TO_RECIPE_SKILL_TEMPLATE: &str =
     include_str!("../assets/onboarding/skills/literature-to-recipe/SKILL.md");
 const OOM_RECOVERY_PLAYBOOK_SKILL_TEMPLATE: &str =
     include_str!("../assets/onboarding/skills/oom-recovery-playbook/SKILL.md");
-const COLAB_CLI_SKILL_TEMPLATE: &str = include_str!("../assets/onboarding/skills/colab-cli/SKILL.md");
+const COLAB_CLI_SKILL_TEMPLATE: &str =
+    include_str!("../assets/onboarding/skills/colab-cli/SKILL.md");
 
 struct TemplateFile {
     relative_path: &'static str,
