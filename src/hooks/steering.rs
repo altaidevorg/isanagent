@@ -87,8 +87,12 @@ fn shell_invocation() -> (&'static str, &'static str) {
     }
 }
 
-async fn read_bounded(
-    mut reader: tokio::process::ChildStdout,
+/// Read up to `max` bytes from a child pipe, truncating (rather than erroring) on overflow so a
+/// verbose hook still yields a usable prefix, and lossily decoding so non-UTF-8 output (common from
+/// compilers/test runners) doesn't drop the whole capture. Generic over the pipe type so the same
+/// reader serves both stdout and stderr.
+async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: R,
     max: usize,
 ) -> Result<String, String> {
     let mut buf = Vec::new();
@@ -97,24 +101,37 @@ async fn read_bounded(
         let n = reader
             .read(&mut chunk)
             .await
-            .map_err(|e| format!("read stdout: {}", e))?;
+            .map_err(|e| format!("read hook output: {}", e))?;
         if n == 0 {
             break;
         }
-        if buf.len() + n > max {
-            return Err(format!("hook stdout exceeded {} bytes", max));
+        let remaining = max.saturating_sub(buf.len());
+        if n >= remaining {
+            buf.extend_from_slice(&chunk[..remaining]);
+            break;
         }
         buf.extend_from_slice(&chunk[..n]);
     }
-    String::from_utf8(buf).map_err(|e| format!("hook stdout utf8: {}", e))
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// Run a hook subprocess, piping the JSON event to its stdin and capturing stdout.
+///
+/// When `capture_failure` is true (post_tool *verification* hooks), stderr is also captured and the
+/// output is returned **even on a non-zero exit** (prefixed with the exit status) — a failing
+/// `cargo build` / `pytest` is exactly what must reach the model. When false (pre_tool /
+/// user_prompt directive hooks), the legacy contract holds: stderr is dropped and a non-zero exit
+/// yields `Ok(None)` (proceed without the hook's directive).
+///
+/// Both pipes are drained concurrently with `wait()` under one timeout, so a hook that fills a pipe
+/// buffer can't deadlock.
 async fn run_hook_command(
     command: &str,
     cwd: &Path,
     stdin_json: &Value,
     timeout_ms: u64,
     max_stdout: usize,
+    capture_failure: bool,
 ) -> Result<Option<String>, String> {
     let (shell, arg) = shell_invocation();
     let mut child = Command::new(shell)
@@ -123,7 +140,11 @@ async fn run_hook_command(
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(if capture_failure {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("spawn hook: {}", e))?;
@@ -142,31 +163,62 @@ async fn run_hook_command(
         .stdout
         .take()
         .ok_or_else(|| "hook stdout missing".to_string())?;
-    let read_out = read_bounded(stdout, max_stdout);
+    let stderr = child.stderr.take();
 
-    let status = tokio::time::timeout(
+    let io = async {
+        let out_fut = read_bounded(stdout, max_stdout);
+        let err_fut = async {
+            match stderr {
+                Some(se) => read_bounded(se, max_stdout).await.unwrap_or_default(),
+                None => String::new(),
+            }
+        };
+        let (status, out, err) = tokio::join!(child.wait(), out_fut, err_fut);
+        (status, out, err)
+    };
+    let (status, out, err) = tokio::time::timeout(
         std::time::Duration::from_millis(hook_command_timeout_ms(timeout_ms)),
-        child.wait(),
+        io,
     )
     .await
-    .map_err(|_| "hook timed out".to_string())?
-    .map_err(|e| format!("hook wait: {}", e))?;
+    .map_err(|_| "hook timed out".to_string())?;
 
-    let out = read_out.await?;
+    let status = status.map_err(|e| format!("hook wait: {}", e))?;
+    let out = out?;
+
+    // Join stdout + stderr (stderr is empty unless `capture_failure` piped it).
+    let mut combined = out;
+    if !err.is_empty() {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str(&err);
+    }
+    let combined = combined.trim();
 
     if !status.success() {
-        log::warn!(
-            "hook command exited with {} (proceeding)",
-            status.code().unwrap_or(-1)
-        );
-        return Ok(None);
+        if !capture_failure {
+            log::warn!(
+                "hook command exited with {} (proceeding)",
+                status.code().unwrap_or(-1)
+            );
+            return Ok(None);
+        }
+        let code = status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signal".to_string());
+        return Ok(Some(if combined.is_empty() {
+            format!("[hook exited {code} with no output]")
+        } else {
+            format!("[hook exited {code}]\n{combined}")
+        }));
     }
 
-    let trimmed = out.trim();
-    if trimmed.is_empty() {
+    if combined.is_empty() {
         return Ok(None);
     }
-    Ok(Some(trimmed.to_string()))
+    Ok(Some(combined.to_string()))
 }
 
 fn parse_pre_tool_stdout(text: &str) -> Result<PreToolOutcome, String> {
@@ -271,8 +323,15 @@ pub async fn run_pre_tool_hooks(
             "sandbox_dir": engine.sandbox_dir.to_string_lossy(),
         });
         let timeout = hook_command_timeout_ms(h.timeout_ms);
-        let out = match run_hook_command(&h.command, &cwd, &stdin, timeout, engine.max_stdout_bytes)
-            .await
+        let out = match run_hook_command(
+            &h.command,
+            &cwd,
+            &stdin,
+            timeout,
+            engine.max_stdout_bytes,
+            false,
+        )
+        .await
         {
             Ok(o) => o,
             Err(e) => {
@@ -294,6 +353,10 @@ pub async fn run_pre_tool_hooks(
     PreToolOutcome::Proceed(args)
 }
 
+/// Run the configured post_tool hooks. Returns their combined stdout/stderr (verification output)
+/// so the caller can append it to the tool result the model sees — this is what closes the
+/// verify-into-fix loop: a `cargo build` / `pytest` / lint hook's output (including failures) now
+/// reaches the model for self-correction instead of being discarded.
 pub async fn run_post_tool_hooks(
     engine: &SteeringHooksEngine,
     tool_name: &str,
@@ -301,7 +364,8 @@ pub async fn run_post_tool_hooks(
     args: &Value,
     result: &Result<String, String>,
     session: HookSessionInfo<'_>,
-) {
+) -> Option<String> {
+    let mut outputs: Vec<String> = Vec::new();
     for h in engine.post_tool.iter() {
         if !matches_tool(&h.matcher, tool_name) {
             continue;
@@ -331,11 +395,25 @@ pub async fn run_post_tool_hooks(
             "sandbox_dir": engine.sandbox_dir.to_string_lossy(),
         });
         let timeout = hook_command_timeout_ms(h.timeout_ms);
-        if let Err(e) =
-            run_hook_command(&h.command, &cwd, &stdin, timeout, engine.max_stdout_bytes).await
+        match run_hook_command(
+            &h.command,
+            &cwd,
+            &stdin,
+            timeout,
+            engine.max_stdout_bytes,
+            true,
+        )
+        .await
         {
-            log::warn!("post_tool hook failed: {}", e);
+            Ok(Some(out)) => outputs.push(out),
+            Ok(None) => {}
+            Err(e) => log::warn!("post_tool hook failed: {}", e),
         }
+    }
+    if outputs.is_empty() {
+        None
+    } else {
+        Some(outputs.join("\n\n"))
     }
 }
 
@@ -366,8 +444,15 @@ pub async fn run_user_prompt_hooks(
             "sandbox_dir": engine.sandbox_dir.to_string_lossy(),
         });
         let timeout = hook_command_timeout_ms(h.timeout_ms);
-        let out = match run_hook_command(&h.command, &cwd, &stdin, timeout, engine.max_stdout_bytes)
-            .await
+        let out = match run_hook_command(
+            &h.command,
+            &cwd,
+            &stdin,
+            timeout,
+            engine.max_stdout_bytes,
+            false,
+        )
+        .await
         {
             Ok(o) => o,
             Err(e) => {
@@ -466,4 +551,130 @@ pub fn build_steering_engine(
         workspace_dir,
         sandbox_dir,
     }))
+}
+
+#[cfg(all(test, unix))]
+mod post_tool_capture_tests {
+    use super::*;
+
+    fn engine(post_cmd: &str) -> SteeringHooksEngine {
+        let dir = std::env::temp_dir().join(format!("isanagent_hook_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        SteeringHooksEngine {
+            pre_tool: Arc::new(vec![]),
+            post_tool: Arc::new(vec![HookHandlerResolved {
+                matcher: None,
+                command: post_cmd.to_string(),
+                timeout_ms: 5_000,
+                cwd_relative: None,
+            }]),
+            user_prompt: Arc::new(vec![]),
+            max_stdout_bytes: 64 * 1024,
+            default_timeout_ms: 5_000,
+            workspace_dir: dir.clone(),
+            sandbox_dir: dir,
+        }
+    }
+
+    fn session(meta: &HashMap<String, Value>) -> HookSessionInfo<'_> {
+        HookSessionInfo {
+            channel: "terminal",
+            chat_id: "c1",
+            thread_id: None,
+            metadata: meta,
+            is_subagent: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn post_tool_captures_failure_stdout_and_stderr() {
+        // A verify hook that fails: its stdout AND stderr must reach the model, with the exit code.
+        let eng = engine("echo build-out; echo build-err 1>&2; exit 1");
+        let meta = HashMap::new();
+        let out = run_post_tool_hooks(
+            &eng,
+            "edit_file",
+            Some("id"),
+            &json!({}),
+            &Ok("applied".to_string()),
+            session(&meta),
+        )
+        .await
+        .expect("failure output captured");
+        assert!(out.contains("[hook exited 1]"), "{out}");
+        assert!(out.contains("build-out"), "{out}");
+        assert!(out.contains("build-err"), "{out}");
+        let _ = std::fs::remove_dir_all(&eng.sandbox_dir);
+    }
+
+    #[tokio::test]
+    async fn post_tool_captures_success_stdout() {
+        let eng = engine("echo all-green");
+        let meta = HashMap::new();
+        let out = run_post_tool_hooks(
+            &eng,
+            "edit_file",
+            None,
+            &json!({}),
+            &Ok("applied".to_string()),
+            session(&meta),
+        )
+        .await
+        .expect("success output captured");
+        assert!(out.contains("all-green"), "{out}");
+        assert!(!out.contains("hook exited"), "{out}");
+        let _ = std::fs::remove_dir_all(&eng.sandbox_dir);
+    }
+
+    #[tokio::test]
+    async fn capture_failure_false_preserves_legacy_directive_contract() {
+        // pre_tool / user_prompt hooks pass capture_failure=false: stderr is dropped and a non-zero
+        // exit yields Ok(None) (proceed without the directive) — unchanged from before this PR.
+        let dir = std::env::temp_dir().join(format!("isanagent_hook_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let nonzero = run_hook_command(
+            "echo out; echo err 1>&2; exit 3",
+            &dir,
+            &json!({}),
+            5_000,
+            64 * 1024,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            nonzero.is_none(),
+            "non-zero exit must be Ok(None): {nonzero:?}"
+        );
+
+        let ok = run_hook_command(
+            "echo only-stdout; echo hidden 1>&2",
+            &dir,
+            &json!({}),
+            5_000,
+            64 * 1024,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok.as_deref(), Some("only-stdout")); // stderr ("hidden") dropped
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn post_tool_no_output_returns_none() {
+        let eng = engine("true"); // succeeds, no output
+        let meta = HashMap::new();
+        let out = run_post_tool_hooks(
+            &eng,
+            "edit_file",
+            None,
+            &json!({}),
+            &Ok("x".to_string()),
+            session(&meta),
+        )
+        .await;
+        assert!(out.is_none());
+        let _ = std::fs::remove_dir_all(&eng.sandbox_dir);
+    }
 }
