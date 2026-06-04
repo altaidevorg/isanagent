@@ -2442,7 +2442,10 @@ impl AgentLogic {
                             break;
                         }
                     } else {
-                        // Detected in the window but the model has moved on — don't escalate.
+                        // Detected in the window but not active at the tail — the model varied
+                        // this turn, so don't escalate. (A counter *decay* here, to also catch
+                        // intermittently-varying loops, is plausible but its benefit is narrow and
+                        // hard to test deterministically — left as a deferred follow-up.)
                         consecutive_doom_detections = 0;
                     }
                     let correction = crate::utils::ChatMessage::user(&prompt);
@@ -2814,8 +2817,13 @@ impl AgentLogic {
                                 persist_and_cancel!();
                             }
                         };
-                        let is_error = tool_result.is_err();
+                        let was_err = tool_result.is_err();
                         let tool_result_text = finalize_tool_output(tool_result);
+                        // Treat both a dispatch Err AND an in-band Ok("Error: ...") (recoverable
+                        // tool-reported failure) as an error, so the model's is_error signal
+                        // matches what the result text already conveys.
+                        let is_error = was_err
+                            || crate::utils::tool_output_looks_like_failure(&tool_result_text);
                         let tool_name = tc.function.name.clone();
                         let tr = TelemetryEvent::ToolResult {
                             chat_id: inbound.chat_id.clone(),
@@ -2918,8 +2926,13 @@ impl AgentLogic {
                             }
                         };
 
-                        let is_error = tool_result.is_err();
+                        let was_err = tool_result.is_err();
                         let tool_result_text = finalize_tool_output(tool_result);
+                        // Treat both a dispatch Err AND an in-band Ok("Error: ...") (recoverable
+                        // tool-reported failure) as an error, so the model's is_error signal
+                        // matches what the result text already conveys.
+                        let is_error = was_err
+                            || crate::utils::tool_output_looks_like_failure(&tool_result_text);
 
                         let tr = TelemetryEvent::ToolResult {
                             chat_id: inbound.chat_id.clone(),
