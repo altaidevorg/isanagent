@@ -9,6 +9,7 @@ use tokio::time::{sleep, Duration};
 pub mod agent;
 pub mod bus;
 pub mod channels;
+pub mod checkpoint;
 pub mod clarification;
 pub mod config;
 pub mod execution;
