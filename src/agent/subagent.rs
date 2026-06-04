@@ -21,7 +21,7 @@ use crate::config::ResolvedShellPolicy;
 use crate::logging::LoggerHandle;
 use crate::memory::{MemoryMessage, SharedReply};
 use crate::session::SessionManager;
-use crate::skills::SkillRegistry;
+use crate::skills::SharedSkillRegistry;
 use crate::tool_activity::SharedToolExecutionActivity;
 use crate::tool_runtime::ToolExecCtx;
 use crate::tools::ToolRegistry;
@@ -49,7 +49,7 @@ pub struct SubagentSpawnDeps {
     /// Shared provider reference — reads the current provider (updates with `/model` switch).
     pub provider: Arc<tokio::sync::RwLock<Box<dyn Provider>>>,
     pub session_manager: Arc<SessionManager>,
-    pub skills: Arc<SkillRegistry>,
+    pub skills: SharedSkillRegistry,
     pub system_prompt: String,
     pub max_iterations: usize,
     pub max_tool_output_chars: usize,
@@ -1267,7 +1267,9 @@ mod tests {
         let memory_node = NodeHandle::new(memory_actor, 16, 1, Duration::from_millis(1));
         let session_manager = Arc::new(SessionManager::new(memory_node.clone()));
         let skills_dir = TempDir::new();
-        let skills = Arc::new(SkillRegistry::new(skills_dir.path().to_path_buf()));
+        let skills = Arc::new(tokio::sync::RwLock::new(SkillRegistry::new(
+            skills_dir.path().to_path_buf(),
+        )));
         let (outbound_tx, _outbound_rx) = mpsc::channel::<BusMessage>(8);
         let (logger_tx, _logger_rx) = create_logger_channel(16);
         let harness = Arc::new(SubagentHarness::new(SubagentSpawnDeps {

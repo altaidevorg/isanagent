@@ -24,7 +24,7 @@ use crate::hooks::{
 use crate::logging::LoggerHandle;
 use crate::memory::{MemoryMessage, SharedReply, TodoRow};
 use crate::session::SessionManager;
-use crate::skills::SkillRegistry;
+use crate::skills::{SharedSkillRegistry, SkillRegistry};
 use crate::tool_activity::SharedToolExecutionActivity;
 use crate::tools::ToolRegistry;
 use crate::traits::{Memory, Provider, Tool};
@@ -149,6 +149,14 @@ fn estimate_message_tokens(msg: &crate::utils::ChatMessage) -> usize {
 /// Approximate token count for a whole context (sum of [`estimate_message_tokens`]).
 fn estimate_context_tokens(context: &[crate::utils::ChatMessage]) -> usize {
     context.iter().map(estimate_message_tokens).sum()
+}
+
+/// Best available context-size estimate for the compaction trigger: the larger of the bytes/4
+/// heuristic and the last LLM call's exact `usage.prompt_tokens`. The heuristic under-counts the
+/// code/JSON/non-English payloads this agent produces, while `prompt_tokens` is the provider's
+/// ground-truth input count — so the max guards against silently overflowing the context window.
+fn effective_context_tokens(estimate: usize, last_prompt_tokens: Option<u32>) -> usize {
+    estimate.max(last_prompt_tokens.unwrap_or(0) as usize)
 }
 
 /// Trim context from the front (oldest messages) to stay within a token budget.
@@ -305,9 +313,73 @@ fn append_post_tool_output(res: Result<String, String>, hook_out: &str) -> Resul
     }
 }
 
+/// Lowercase and collapse every run of whitespace (spaces, tabs, newlines) to a single space so a
+/// destructive command can't slip past a single-spaced approval pattern via `rm  -rf`, a tab, or a
+/// mid-command line break.
+fn normalize_command_for_matching(s: &str) -> String {
+    let lowercase = s.to_ascii_lowercase();
+    let mut result = String::with_capacity(lowercase.len());
+    let mut words = lowercase.split_whitespace();
+    if let Some(first) = words.next() {
+        result.push_str(first);
+        for word in words {
+            result.push(' ');
+            result.push_str(word);
+        }
+    }
+    result
+}
+
 fn should_require_shell_approval(command: &str, patterns: &[String]) -> bool {
-    let lower = command.to_ascii_lowercase();
-    patterns.iter().any(|p| lower.contains(p))
+    // Pad with spaces so matching is on whole-word boundaries: a bare `.contains()` on the
+    // normalized command would let a pattern like `rm` match any command containing `terminal`,
+    // `platform`, `firmware`, `alarm`, `warm`, `harm`, etc. ("terminal".contains("rm") is true),
+    // forcing spurious approval prompts. Padding both sides keeps the whitespace-robustness (a
+    // run of spaces/tabs/newlines was already collapsed to one) while only matching real tokens.
+    let normalized = format!(" {} ", normalize_command_for_matching(command));
+    patterns.iter().any(|p| {
+        let np = normalize_command_for_matching(p);
+        // Ignore empty/whitespace-only patterns: `contains("")` is always true and would otherwise
+        // force approval on *every* command — a silent config footgun.
+        if np.is_empty() {
+            return false;
+        }
+        normalized.contains(&format!(" {} ", np))
+    })
+}
+
+/// Parse a user's reply to a shell-approval prompt. **Deny by default**: the command runs only when
+/// the reply is composed *entirely* of affirmative or neutral-filler words AND carries at least one
+/// explicit affirmative. Any unrecognized token — a negation ("never", "nope", "can't"), a caveat,
+/// or stray prose — forces a deny.
+///
+/// This allowlist posture (rather than a denylist) is deliberate: it fixes the original
+/// `contains("approve") && !contains("deny")` parse that read "do not approve" as APPROVED, and it
+/// also closes the broader class a denylist misses, where an affirmative word is buried in a
+/// negative sentence ("never approve", "i can't approve", "approve? actually nope"). The prompt
+/// constrains the choices to approve/deny with `allow_empty = false`, so the strictness is
+/// UX-compatible; an unrecognized reply simply skips execution and the user can re-confirm.
+fn shell_approval_reply_is_grant(reply: &str) -> bool {
+    const AFFIRM: &[&str] = &[
+        "approve", "approved", "approves", "yes", "yep", "yeah", "y", "ok", "okay", "k", "allow",
+        "allowed", "confirm", "confirmed", "accept", "accepted", "proceed", "go", "sure",
+    ];
+    const FILLER: &[&str] = &["please", "it", "this", "that", "ahead", "now", "run", "do"];
+
+    let r = reply.trim().to_ascii_lowercase();
+    if r.is_empty() {
+        return false;
+    }
+    let mut saw_affirmative = false;
+    for tok in r.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()) {
+        if AFFIRM.contains(&tok) {
+            saw_affirmative = true;
+        } else if !FILLER.contains(&tok) {
+            // Negation, caveat, or unmodeled prose -> deny.
+            return false;
+        }
+    }
+    saw_affirmative
 }
 
 fn shell_policy_mode_for_session(
@@ -354,7 +426,11 @@ fn is_arbitrary_code_tool(tool_name: &str) -> bool {
 /// Extract the command/code a code-exec tool will run. `exec` carries it in `command`; the
 /// execution / python tools carry it in `code`.
 fn extract_code_exec_command(tool_name: &str, args: &Value) -> Option<String> {
-    let key = if tool_name == "exec" { "command" } else { "code" };
+    let key = if tool_name == "exec" {
+        "command"
+    } else {
+        "code"
+    };
     args.get(key)
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
@@ -414,7 +490,82 @@ mod code_exec_gate_tests {
         // Shell `exec`: benign command does NOT require approval (preserves existing UX)...
         assert!(!code_exec_requires_approval("exec", "ls -la", &patterns));
         // ...but a destructive one does.
-        assert!(code_exec_requires_approval("exec", "rm -rf /tmp/x", &patterns));
+        assert!(code_exec_requires_approval(
+            "exec",
+            "rm -rf /tmp/x",
+            &patterns
+        ));
+    }
+
+    #[test]
+    fn approval_match_is_whitespace_insensitive() {
+        let patterns = vec!["rm -rf".to_string()];
+        // Extra spaces, tabs, and a mid-command newline must not bypass the gate.
+        assert!(should_require_shell_approval("rm  -rf /tmp/x", &patterns));
+        assert!(should_require_shell_approval("rm\t-rf /tmp/x", &patterns));
+        assert!(should_require_shell_approval("rm\n-rf /tmp/x", &patterns));
+        assert!(should_require_shell_approval("RM -RF /tmp/x", &patterns));
+        // A benign command still does not match.
+        assert!(!should_require_shell_approval("ls -la", &patterns));
+    }
+
+    #[test]
+    fn approval_match_is_word_boundary_not_substring() {
+        // A bare `rm` pattern must match the real command but NOT words that merely contain "rm"
+        // (the substring false positive: "terminal".contains("rm") is true).
+        let patterns = vec!["rm".to_string()];
+        assert!(should_require_shell_approval("rm -rf /tmp/x", &patterns));
+        assert!(should_require_shell_approval("echo hi && rm file", &patterns));
+        assert!(!should_require_shell_approval("terminal --help", &patterns));
+        assert!(!should_require_shell_approval("warm up the cache", &patterns));
+        assert!(!should_require_shell_approval("npm run platform", &patterns));
+        assert!(!should_require_shell_approval("check firmware", &patterns));
+    }
+
+    #[test]
+    fn empty_pattern_does_not_force_approval_on_everything() {
+        // `contains("")` is always true; an empty/whitespace pattern must be ignored.
+        let patterns = vec!["".to_string(), "   ".to_string()];
+        assert!(!should_require_shell_approval("ls -la", &patterns));
+        // An empty pattern alongside a real one must not suppress the real match.
+        let mixed = vec!["".to_string(), "rm -rf".to_string()];
+        assert!(should_require_shell_approval("rm -rf /tmp/x", &mixed));
+        assert!(!should_require_shell_approval("ls", &mixed));
+    }
+
+    #[test]
+    fn approval_reply_is_deny_default() {
+        // The regression: "do not approve" must NOT grant.
+        assert!(!shell_approval_reply_is_grant("do not approve"));
+        assert!(!shell_approval_reply_is_grant("don't approve"));
+        assert!(!shell_approval_reply_is_grant("deny"));
+        assert!(!shell_approval_reply_is_grant("no"));
+        assert!(!shell_approval_reply_is_grant("reject this"));
+        assert!(!shell_approval_reply_is_grant(""));
+        assert!(!shell_approval_reply_is_grant("   "));
+        // Ambiguous / unrelated text is denied (safe default).
+        assert!(!shell_approval_reply_is_grant("hmm let me think"));
+        // Affirmative word buried in a negative reply must NOT grant (the denylist gap).
+        assert!(!shell_approval_reply_is_grant("never approve"));
+        assert!(!shell_approval_reply_is_grant("i can't approve"));
+        assert!(!shell_approval_reply_is_grant("approve? actually nope"));
+        assert!(!shell_approval_reply_is_grant("disapprove"));
+        assert!(!shell_approval_reply_is_grant("i approve... no wait, deny"));
+        // Explicit grants (incl. affirmative + neutral filler).
+        assert!(shell_approval_reply_is_grant("approve"));
+        assert!(shell_approval_reply_is_grant("Approved"));
+        assert!(shell_approval_reply_is_grant("yes"));
+        assert!(shell_approval_reply_is_grant("ok"));
+        assert!(shell_approval_reply_is_grant("allow"));
+        assert!(shell_approval_reply_is_grant("approve please"));
+        assert!(shell_approval_reply_is_grant("approve this"));
+        assert!(shell_approval_reply_is_grant("go ahead"));
+        // "do" is neutral filler: it rescues genuine affirmatives ("yes do it") without weakening
+        // deny-default — a negation always carries another non-filler token (see "do not approve"
+        // above), and "do" on its own is not affirmative.
+        assert!(shell_approval_reply_is_grant("yes do it"));
+        assert!(shell_approval_reply_is_grant("yes, please do"));
+        assert!(!shell_approval_reply_is_grant("do it"));
     }
 
     #[test]
@@ -639,8 +790,9 @@ async fn execute_tool_call_with_activity(
                                 .await;
                             match ask_result {
                                 Ok(reply) => {
-                                    let approved = reply.to_ascii_lowercase().contains("approve")
-                                        && !reply.to_ascii_lowercase().contains("deny");
+                                    // Deny-default parse: an explicit grant runs; anything else
+                                    // (incl. "do not approve") skips execution.
+                                    let approved = shell_approval_reply_is_grant(&reply);
                                     if !approved {
                                         let _ = outbound_tx
                                             .send(BusMessage::Telemetry(
@@ -793,7 +945,7 @@ struct ReasoningSpawnArgs {
     provider: Box<dyn Provider>,
     session_manager: Arc<SessionManager>,
     tools: Arc<ToolRegistry>,
-    skills: Arc<SkillRegistry>,
+    skills: SharedSkillRegistry,
     system_prompt: String,
     max_iterations: usize,
     max_tool_output_chars: usize,
@@ -1120,7 +1272,7 @@ pub(crate) struct ReasoningLoopCtx {
     pub(crate) provider: Box<dyn Provider>,
     pub(crate) session_manager: Arc<SessionManager>,
     pub(crate) tools: Arc<ToolRegistry>,
-    pub(crate) skills: Arc<SkillRegistry>,
+    pub(crate) skills: SharedSkillRegistry,
     pub(crate) system_prompt: String,
     pub(crate) max_iterations: usize,
     pub(crate) max_tool_output_chars: usize,
@@ -1208,7 +1360,7 @@ pub struct AgentLogic {
     provider: Arc<tokio::sync::RwLock<Box<dyn Provider>>>,
     session_manager: Arc<SessionManager>,
     tools: Arc<ToolRegistry>,
-    skills: Arc<SkillRegistry>,
+    skills: SharedSkillRegistry,
     system_prompt: String,
     max_iterations: usize,
     max_tool_output_chars: usize,
@@ -1258,7 +1410,7 @@ impl AgentLogic {
 
         let harness_for_subagent = harness_runtime_summary.clone();
         let session_manager = Arc::new(session_manager);
-        let skills = Arc::new(skills);
+        let skills = Arc::new(tokio::sync::RwLock::new(skills));
         let tools = Arc::new(tools);
         let memory_node = session_manager.get_memory_node();
         let shell_policy = Arc::new(shell_policy);
@@ -1479,6 +1631,38 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 )));
                 return Ok(None);
             }
+            BusMessage::InstallSkill {
+                repo_url,
+                skill_name,
+            } => {
+                let skills_arc = self.skills.clone();
+                let logger_tx = self.logger_tx.clone();
+                let name = self.name.clone();
+
+                tokio::spawn(async move {
+                    let mut skills_guard = skills_arc.write().await;
+                    match skills_guard
+                        .install_skills_from_repo(&repo_url, skill_name.as_deref())
+                        .await
+                    {
+                        Ok(installed) => {
+                            let msg = if installed.is_empty() {
+                                "No skills found in the repository.".to_string()
+                            } else {
+                                format!("Successfully installed skills: {}", installed.join(", "))
+                            };
+                            let _ = logger_tx.send(BusMessage::Log(LogEvent::info(&name, &msg)));
+                        }
+                        Err(e) => {
+                            let _ = logger_tx.send(BusMessage::Log(LogEvent::error(
+                                &name,
+                                &format!("Failed to install skills from {}: {}", repo_url, e),
+                            )));
+                        }
+                    }
+                });
+                return Ok(None);
+            }
             BusMessage::Inbound(inbound) => {
                 let chat_id = inbound.chat_id.clone();
                 let session_key = inbound.clarification_session_key();
@@ -1590,15 +1774,13 @@ impl ActorLogic<BusMessage> for AgentLogic {
                     .trigger_compaction_with_reason(session_key.clone(), focus_instructions, reason)
                     .await
                 {
-                    let _ = self.logger_tx.send(BusMessage::Log(
-                        LogEvent::warn(
-                            &self.name,
-                            &format!(
-                                "TriggerCompaction dropped for session_key={}: {}",
-                                session_key, e
-                            ),
+                    let _ = self.logger_tx.send(BusMessage::Log(LogEvent::warn(
+                        &self.name,
+                        &format!(
+                            "TriggerCompaction dropped for session_key={}: {}",
+                            session_key, e
                         ),
-                    ));
+                    )));
                 }
                 Ok(None)
             }
@@ -1679,10 +1861,7 @@ impl AgentLogic {
             .get_context_since_reflection()
             .await
             .map_err(|e| format!("get_context_since_reflection({}): {}", session_key, e))?;
-        let user_turns = current_context
-            .iter()
-            .filter(|m| m.role == "user")
-            .count();
+        let user_turns = current_context.iter().filter(|m| m.role == "user").count();
         let approx_tokens: usize = estimate_context_tokens(&current_context);
 
         // Most recent summary keyed by the same channel:chat_id prefix
@@ -1704,8 +1883,8 @@ impl AgentLogic {
         // fires keeps `do_compaction`'s `select!` valid without altering behavior.
         let cancel_token = tokio_util::sync::CancellationToken::new();
 
-        let outcome = crate::agent::compaction::do_compaction(
-            crate::agent::compaction::DoCompactionArgs {
+        let outcome =
+            crate::agent::compaction::do_compaction(crate::agent::compaction::DoCompactionArgs {
                 chat_id: &chat_id,
                 session_key: &session_key,
                 trigger_reason,
@@ -1718,9 +1897,8 @@ impl AgentLogic {
                 memory_node: &memory_node,
                 outbound_tx: &self.outbound_tx,
                 cancel_token: &cancel_token,
-            },
-        )
-        .await;
+            })
+            .await;
         Ok(outcome)
     }
 
@@ -1949,6 +2127,143 @@ impl AgentLogic {
     }
 }
 
+/// A configured alternate LLM provider to fail over to when the primary's retries are exhausted.
+/// Holds everything [`crate::provider::create_provider`] needs; resolved once at startup from the
+/// `[providers.*]` config.
+#[derive(Clone)]
+pub struct FallbackProviderSpec {
+    pub provider_name: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub model_name: String,
+}
+
+// Manual `Debug` so a stray `{:?}` can never dump the API key into a log.
+impl std::fmt::Debug for FallbackProviderSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FallbackProviderSpec")
+            .field("provider_name", &self.provider_name)
+            .field("base_url", &self.base_url)
+            .field("api_key", &"[redacted]")
+            .field("model_name", &self.model_name)
+            .finish()
+    }
+}
+
+/// Filter `candidates` to genuine fallbacks: drop any whose (provider, base_url, model) matches the
+/// active primary, so the primary is never retried as its own fallback. Matching the full identity
+/// (not just provider+model) correctly excludes the primary even when it came from the `[provider]`
+/// default block rather than the `[providers.*]` map a candidate was built from.
+pub fn build_fallback_specs(
+    primary_provider: &str,
+    primary_base_url: &str,
+    primary_model: &str,
+    candidates: Vec<FallbackProviderSpec>,
+) -> Vec<FallbackProviderSpec> {
+    candidates
+        .into_iter()
+        .filter(|c| {
+            // Normalize before comparing so the primary isn't accidentally retried as its own
+            // fallback: trailing slashes on base URLs are insignificant, and provider/model names
+            // are matched case-insensitively (e.g. `https://api.openai.com/v1/` vs `.../v1`, or
+            // `OpenAI` vs `openai`).
+            let norm_c_url = c.base_url.trim_end_matches('/');
+            let norm_p_url = primary_base_url.trim_end_matches('/');
+            !(c.provider_name.eq_ignore_ascii_case(primary_provider)
+                && norm_c_url == norm_p_url
+                && c.model_name.eq_ignore_ascii_case(primary_model))
+        })
+        .collect()
+}
+
+/// Process-wide fallback providers, set once at startup (like the primary, these are config).
+/// Empty until set, so failover is simply inert when unconfigured or in tests.
+static FALLBACK_PROVIDERS: std::sync::OnceLock<Vec<FallbackProviderSpec>> = std::sync::OnceLock::new();
+
+/// Install the fallback provider list. Call once at startup, after the primary is built; a second
+/// call is ignored (OnceLock). **Do not call from tests** — the `OnceLock` can't be reset, so it
+/// would pollute every other test in the binary. Tests drive [`try_fallbacks`] directly instead.
+pub fn set_fallback_providers(specs: Vec<FallbackProviderSpec>) {
+    let _ = FALLBACK_PROVIDERS.set(specs);
+}
+
+fn fallback_providers() -> &'static [FallbackProviderSpec] {
+    FALLBACK_PROVIDERS.get().map(Vec::as_slice).unwrap_or(&[])
+}
+
+/// Result of attempting the configured fallback providers.
+enum FallbackOutcome {
+    Ok(crate::utils::LLMResponse),
+    Cancelled,
+    Exhausted,
+}
+
+/// Borrowed logging identity for the failover loop (bundled to keep the arg count in check).
+struct FailoverLogCtx<'a> {
+    logger_tx: &'a LoggerHandle,
+    name: &'a str,
+    chat_id: &'a str,
+}
+
+/// Try each fallback provider **once**, returning the first successful response. `build` constructs
+/// a provider from a spec — real code passes [`crate::provider::create_provider`]; tests inject a
+/// mock builder, keeping this loop fully testable without network. Cancellation preempts a
+/// fallback chat.
+async fn try_fallbacks<F>(
+    fallbacks: &[FallbackProviderSpec],
+    build: F,
+    context: &[crate::utils::ChatMessage],
+    tools_payload: &Option<serde_json::Value>,
+    cancel_token: &tokio_util::sync::CancellationToken,
+    log: FailoverLogCtx<'_>,
+) -> FallbackOutcome
+where
+    F: Fn(&FallbackProviderSpec) -> Box<dyn crate::traits::Provider>,
+{
+    for spec in fallbacks {
+        let _ = log.logger_tx.send(BusMessage::Log(
+            LogEvent::warn(
+                log.name,
+                &format!(
+                    "Primary LLM exhausted; failing over to provider={} model={}",
+                    spec.provider_name, spec.model_name
+                ),
+            )
+            .with_chat_id(log.chat_id),
+        ));
+        let provider = build(spec);
+        let res = tokio::select! {
+            r = provider.chat(context, tools_payload.clone()) => r,
+            _ = cancel_token.cancelled() => return FallbackOutcome::Cancelled,
+        };
+        match res {
+            Ok(resp) => {
+                let _ = log.logger_tx.send(BusMessage::Log(
+                    LogEvent::info(
+                        log.name,
+                        &format!(
+                            "Fallback succeeded: provider={} model={}",
+                            spec.provider_name, spec.model_name
+                        ),
+                    )
+                    .with_chat_id(log.chat_id),
+                ));
+                return FallbackOutcome::Ok(resp);
+            }
+            Err(e) => {
+                let _ = log.logger_tx.send(BusMessage::Log(
+                    LogEvent::warn(
+                        log.name,
+                        &format!("Fallback provider={} failed: {}", spec.provider_name, e),
+                    )
+                    .with_chat_id(log.chat_id),
+                ));
+            }
+        }
+    }
+    FallbackOutcome::Exhausted
+}
+
 /// Outcome of a `provider.chat` invocation that may be retried for transient errors.
 enum ChatRetryOutcome {
     Ok(crate::utils::LLMResponse),
@@ -2037,6 +2352,30 @@ async fn chat_with_retry(
             }
         }
     }
+    // Primary exhausted. Before surfacing a failure, try each configured fallback provider once, so
+    // a transient outage / key rotation / model deprecation on the primary doesn't drop a long
+    // unattended turn. The primary stays the active provider — failover is per-call.
+    match try_fallbacks(
+        fallback_providers(),
+        |s| {
+            crate::provider::create_provider(&s.provider_name, &s.base_url, &s.api_key, &s.model_name)
+        },
+        context,
+        &tools_payload,
+        cancel_token,
+        FailoverLogCtx {
+            logger_tx,
+            name,
+            chat_id,
+        },
+    )
+    .await
+    {
+        FallbackOutcome::Ok(resp) => return ChatRetryOutcome::Ok(resp),
+        FallbackOutcome::Cancelled => return ChatRetryOutcome::Cancelled,
+        FallbackOutcome::Exhausted => {}
+    }
+
     ChatRetryOutcome::Failed(
         last_err
             .map(|e| e.to_string())
@@ -2253,6 +2592,11 @@ impl AgentLogic {
         let mut consecutive_doom_detections: usize = 0;
         // Set when the doom loop persists past the nudge budget; branches the terminal message.
         let mut doom_loop_stuck = false;
+        // Ground-truth input size from the most recent LLM call's `usage.prompt_tokens` (exact,
+        // server-counted). The bytes/4 heuristic under-counts code/JSON/non-English — exactly what
+        // this agent generates — so the compaction trigger uses `max(estimate, last_prompt_tokens)`
+        // to avoid silently overflowing the context window. Updated after each provider response.
+        let mut last_prompt_tokens: Option<u32> = None;
 
         while iterations < max_iterations {
             if cancel_token.is_cancelled() {
@@ -2341,8 +2685,7 @@ impl AgentLogic {
                     if let Some((_, msg)) =
                         messages_with_ids.iter_mut().find(|(id, _)| *id == db_id)
                     {
-                        msg.content =
-                            Some(crate::utils::MessageContent::Text(placeholder));
+                        msg.content = Some(crate::utils::MessageContent::Text(placeholder));
                     }
                 }
             }
@@ -2414,7 +2757,7 @@ impl AgentLogic {
                 "{}\n\n{}\n{}{}{}{}",
                 system_prompt,
                 summaries_text,
-                skills.get_capabilities_summary(),
+                skills.read().await.get_capabilities_summary(),
                 harness_block,
                 todo_block,
                 iteration_line
@@ -2450,7 +2793,10 @@ impl AgentLogic {
                             break;
                         }
                     } else {
-                        // Detected in the window but the model has moved on — don't escalate.
+                        // Detected in the window but not active at the tail — the model varied
+                        // this turn, so don't escalate. (A counter *decay* here, to also catch
+                        // intermittently-varying loops, is plausible but its benefit is narrow and
+                        // hard to test deterministically — left as a deferred follow-up.)
                         consecutive_doom_detections = 0;
                     }
                     let correction = crate::utils::ChatMessage::user(&prompt);
@@ -2551,6 +2897,12 @@ impl AgentLogic {
                                     )
                                     .with_chat_id(&inbound.chat_id),
                                 ));
+                                // The context just shrank, so the pre-compaction `prompt_tokens` is
+                                // now stale. Clear it; otherwise, if the retried call returns no
+                                // usage stats (mock/local provider, transient gap), the end-of-turn
+                                // check would read the old huge value via `effective_context_tokens`
+                                // and immediately fire a redundant compaction right after this one.
+                                last_prompt_tokens = None;
                                 // Next iteration refetches context (now smaller due
                                 // to AddSummary + UpdateThreadMetadata) and re-runs
                                 // the chat call. No iteration counter refund — the
@@ -2594,7 +2946,8 @@ impl AgentLogic {
                         "Context overflow: input exceeds the model's window \
                          (attempted={} max={}). Reduce the conversation length and retry.",
                         tokens_attempted,
-                        max.map(|m| m.to_string()).unwrap_or_else(|| "?".to_string()),
+                        max.map(|m| m.to_string())
+                            .unwrap_or_else(|| "?".to_string()),
                     );
                     let persisted = format!(
                         "LLM call failed: {err}\nPress /retry to try again or /cancel to abandon."
@@ -2661,6 +3014,10 @@ impl AgentLogic {
 
             // Log USAGE telemetry
             if let Some(usage) = &response.usage {
+                // Remember the exact server-counted input size for the compaction trigger.
+                if usage.prompt_tokens > 0 {
+                    last_prompt_tokens = Some(usage.prompt_tokens);
+                }
                 let usage_evt = TelemetryEvent::AgentUsage {
                     chat_id: inbound.chat_id.clone(),
                     model: "llm_provider".to_string(),
@@ -2821,7 +3178,14 @@ impl AgentLogic {
                                 persist_and_cancel!();
                             }
                         };
-                        let is_error = tool_result.is_err();
+                        // Compute is_error from the RAW result (a dispatch Err, or an in-band Ok
+                        // failure — a non-zero runner `Exit code:` or a scoped `Error:` payload)
+                        // BEFORE finalize_tool_output truncates the tail-anchored exit marker away.
+                        // tool_output_looks_like_failure (text-only, all tools) missed non-zero
+                        // exits whose output did not start with "Error:" and false-flagged content
+                        // tools like read_file; tool_call_is_error is tool-scoped and exit-aware.
+                        let is_error =
+                            crate::utils::tool_call_is_error(&tc.function.name, &tool_result);
                         let tool_result_text = finalize_tool_output(tool_result);
                         let tool_name = tc.function.name.clone();
                         let tr = TelemetryEvent::ToolResult {
@@ -2925,7 +3289,14 @@ impl AgentLogic {
                             }
                         };
 
-                        let is_error = tool_result.is_err();
+                        // Compute is_error from the RAW result (a dispatch Err, or an in-band Ok
+                        // failure — a non-zero runner `Exit code:` or a scoped `Error:` payload)
+                        // BEFORE finalize_tool_output truncates the tail-anchored exit marker away.
+                        // tool_output_looks_like_failure (text-only, all tools) missed non-zero
+                        // exits whose output did not start with "Error:" and false-flagged content
+                        // tools like read_file; tool_call_is_error is tool-scoped and exit-aware.
+                        let is_error =
+                            crate::utils::tool_call_is_error(&tc.function.name, &tool_result);
                         let tool_result_text = finalize_tool_output(tool_result);
 
                         let tr = TelemetryEvent::ToolResult {
@@ -3025,7 +3396,15 @@ impl AgentLogic {
                 // Auto-compaction check
                 let current_context = mem.get_context_since_reflection().await?;
                 let user_turns = current_context.iter().filter(|m| m.role == "user").count();
-                let approx_tokens: usize = estimate_context_tokens(&current_context);
+                // Prefer the ground truth: `last_prompt_tokens` is the exact input size the provider
+                // counted for the most recent request, which (at this end-of-turn point) covers
+                // nearly the entire current context — only the just-produced final assistant message
+                // is newer. Taking the max with the bytes/4 estimate corrects the heuristic's
+                // under-count on code/JSON-heavy contexts so a real overflow triggers compaction.
+                let approx_tokens: usize = effective_context_tokens(
+                    estimate_context_tokens(&current_context),
+                    last_prompt_tokens,
+                );
 
                 // PR-3: pull the model's context window from the provider; if known,
                 // tighten the absolute token threshold to whichever is smaller of:
@@ -3084,7 +3463,10 @@ impl AgentLogic {
                         },
                     )
                     .await;
-                    if matches!(outcome, crate::agent::compaction::CompactionOutcome::Cancelled) {
+                    if matches!(
+                        outcome,
+                        crate::agent::compaction::CompactionOutcome::Cancelled
+                    ) {
                         persist_and_cancel!();
                     }
                 }
@@ -3127,7 +3509,7 @@ impl AgentLogic {
 /// A built-in tool that allows the agent to load the markdown instructions
 /// for a skill dynamically from the SkillRegistry.
 pub struct LoadSkillTool {
-    registry: Arc<SkillRegistry>,
+    registry: SharedSkillRegistry,
 }
 
 #[async_trait]
@@ -3169,7 +3551,7 @@ impl Tool for LoadSkillTool {
             .unwrap_or("load");
 
         if action == "list" {
-            return Ok(self.registry.format_skill_directory());
+            return Ok(self.registry.read().await.format_skill_directory());
         }
 
         let skill_name = args
@@ -3182,11 +3564,35 @@ impl Tool for LoadSkillTool {
             .and_then(|v| v.as_str())
             .unwrap_or("full");
 
-        if detail == "metadata" {
-            return self.registry.get_skill_metadata(skill_name);
+        // First attempt against the registry as it was last scanned. The read guard is scoped to
+        // this block and dropped before the rescan path below takes the write lock, so we never
+        // hold a read guard across a write acquisition on the same RwLock (which would deadlock).
+        let first = {
+            let registry = self.registry.read().await;
+            if detail == "metadata" {
+                registry.get_skill_metadata(skill_name)
+            } else {
+                registry.get_skill_instructions(skill_name)
+            }
+        };
+        if first.is_ok() {
+            return first;
         }
 
-        self.registry.get_skill_instructions(skill_name)
+        // Miss: a SKILL.md may have been dropped into the skills directory since the registry was
+        // last scanned (it is scanned once at startup). Rescan once and re-resolve before reporting
+        // the skill missing, so a freshly added skill is loadable without restarting the agent. The
+        // rescan is paid only on an actual miss, so the common path (skill already present) is
+        // unchanged. Hold a single write guard for both the rescan and the follow-up lookup (the
+        // guard derefs to the registry for the immutable getters), avoiding a redundant drop-then-
+        // reacquire and closing the gap between scan and read.
+        let mut registry = self.registry.write().await;
+        registry.scan_for_skills();
+        if detail == "metadata" {
+            registry.get_skill_metadata(skill_name)
+        } else {
+            registry.get_skill_instructions(skill_name)
+        }
     }
 }
 
@@ -3215,7 +3621,7 @@ mod tests {
     use crate::memory::SqliteMemoryActor;
     use crate::multi_tenant_edge::{ActivityHeartbeatClient, HeartbeatTransport};
     use crate::session::SessionManager;
-    use crate::skills::SkillRegistry;
+    use crate::skills::{SharedSkillRegistry, SkillRegistry};
     use crate::tool_activity::SharedToolExecutionActivity;
     use crate::tool_runtime::ToolExecCtx;
     use crate::tools::ToolRegistry;
@@ -3451,6 +3857,164 @@ mod tests {
         }
     }
 
+    /// Returns `Ok` with `content` set to `tag` — a stand-in for a working fallback provider.
+    #[derive(Clone)]
+    struct RespondingProvider {
+        tag: String,
+    }
+
+    #[async_trait]
+    impl Provider for RespondingProvider {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<serde_json::Value>,
+        ) -> Result<LLMResponse, LLMError> {
+            Ok(LLMResponse {
+                content: self.tag.clone(),
+                tool_calls: None,
+                reasoning_content: None,
+                usage: None,
+            })
+        }
+    }
+
+    fn fb_spec(name: &str) -> super::FallbackProviderSpec {
+        super::FallbackProviderSpec {
+            provider_name: name.to_string(),
+            base_url: String::new(),
+            api_key: String::new(),
+            model_name: format!("{name}-model"),
+        }
+    }
+
+    fn fb_full(provider: &str, base: &str, model: &str) -> super::FallbackProviderSpec {
+        super::FallbackProviderSpec {
+            provider_name: provider.to_string(),
+            base_url: base.to_string(),
+            api_key: "k".to_string(),
+            model_name: model.to_string(),
+        }
+    }
+
+    #[test]
+    fn build_fallback_specs_excludes_primary_by_full_identity() {
+        let candidates = vec![
+            // Same identity as the primary but with different casing and a trailing slash on the
+            // base URL — must still be excluded after normalization.
+            fb_full("Anthropic", "https://api.anthropic.com/", "Claude"),
+            fb_full("openai", "https://api.openai.com", "gpt-4o"),
+        ];
+        let out = super::build_fallback_specs(
+            "anthropic",
+            "https://api.anthropic.com",
+            "claude",
+            candidates,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].provider_name, "openai");
+    }
+
+    #[test]
+    fn build_fallback_specs_keeps_same_provider_different_model_or_url() {
+        // Same provider but a different model — a legitimate fallback, must be kept.
+        let candidates = vec![
+            fb_full("openai", "u", "gpt-4o-mini"),
+            fb_full("openai", "u2", "gpt-4o"), // same provider+model, different base_url -> kept
+        ];
+        let out = super::build_fallback_specs("openai", "u", "gpt-4o", candidates);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn fallback_spec_debug_redacts_api_key() {
+        let dbg = format!("{:?}", fb_full("openai", "u", "m"));
+        assert!(dbg.contains("[redacted]"), "{dbg}");
+        assert!(!dbg.contains("\"k\""), "api key must not appear: {dbg}");
+    }
+
+    #[tokio::test]
+    async fn try_fallbacks_returns_first_success() {
+        let (logger, _rx) = crate::logging::create_logger_channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let specs = vec![fb_spec("a"), fb_spec("b")];
+        // 'a' fails, 'b' succeeds -> first success wins, 'b' chosen.
+        let out = super::try_fallbacks(
+            &specs,
+            |s| -> Box<dyn Provider> {
+                if s.provider_name == "b" {
+                    Box::new(RespondingProvider { tag: "b-ok".into() })
+                } else {
+                    Box::new(NonTransientErrorProvider)
+                }
+            },
+            &[],
+            &None,
+            &cancel,
+            super::FailoverLogCtx { logger_tx: &logger, name: "agent", chat_id: "c1" },
+        )
+        .await;
+        match out {
+            super::FallbackOutcome::Ok(r) => assert_eq!(r.content, "b-ok"),
+            _ => panic!("expected Ok from fallback b"),
+        }
+    }
+
+    #[tokio::test]
+    async fn try_fallbacks_all_fail_is_exhausted() {
+        let (logger, _rx) = crate::logging::create_logger_channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let specs = vec![fb_spec("a"), fb_spec("b")];
+        let out = super::try_fallbacks(
+            &specs,
+            |_| -> Box<dyn Provider> { Box::new(NonTransientErrorProvider) },
+            &[],
+            &None,
+            &cancel,
+            super::FailoverLogCtx { logger_tx: &logger, name: "agent", chat_id: "c1" },
+        )
+        .await;
+        assert!(matches!(out, super::FallbackOutcome::Exhausted));
+    }
+
+    #[tokio::test]
+    async fn try_fallbacks_empty_is_exhausted() {
+        let (logger, _rx) = crate::logging::create_logger_channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let out = super::try_fallbacks(
+            &[],
+            |_| -> Box<dyn Provider> { Box::new(RespondingProvider { tag: "x".into() }) },
+            &[],
+            &None,
+            &cancel,
+            super::FailoverLogCtx { logger_tx: &logger, name: "agent", chat_id: "c1" },
+        )
+        .await;
+        assert!(matches!(out, super::FallbackOutcome::Exhausted));
+    }
+
+    #[tokio::test]
+    async fn try_fallbacks_cancellation_short_circuits() {
+        let (logger, _rx) = crate::logging::create_logger_channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel(); // pre-cancelled; the slow provider's chat never wins the select
+        let specs = vec![fb_spec("a")];
+        let out = super::try_fallbacks(
+            &specs,
+            |_| -> Box<dyn Provider> {
+                Box::new(LongSleepProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                })
+            },
+            &[],
+            &None,
+            &cancel,
+            super::FailoverLogCtx { logger_tx: &logger, name: "agent", chat_id: "c1" },
+        )
+        .await;
+        assert!(matches!(out, super::FallbackOutcome::Cancelled));
+    }
+
     #[derive(Clone)]
     struct PanicProvider;
 
@@ -3543,7 +4107,9 @@ mod tests {
         let session_manager = Arc::new(SessionManager::new(memory_node));
         let tools = Arc::new(ToolRegistry::new());
         let skills_temp = LocalTempDir::new();
-        let skills = Arc::new(SkillRegistry::new(skills_temp.path().clone()));
+        let skills = Arc::new(tokio::sync::RwLock::new(SkillRegistry::new(
+            skills_temp.path().clone(),
+        )));
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<BusMessage>(8);
         // Drain outbound telemetry so the loop's `send().await` never blocks on a full buffer
         // (tool-call-returning providers emit several messages per iteration).
@@ -4094,7 +4660,23 @@ mod tests {
             },
         }]);
         assert_eq!(super::estimate_message_tokens(&msg), 100);
-        assert_eq!(super::estimate_context_tokens(std::slice::from_ref(&msg)), 100);
+        assert_eq!(
+            super::estimate_context_tokens(std::slice::from_ref(&msg)),
+            100
+        );
+    }
+
+    #[test]
+    fn effective_context_tokens_prefers_ground_truth() {
+        // No usage yet -> fall back to the estimate.
+        assert_eq!(super::effective_context_tokens(1000, None), 1000);
+        // Provider's exact count exceeds the bytes/4 under-estimate -> use the ground truth so a
+        // real overflow still triggers compaction.
+        assert_eq!(super::effective_context_tokens(1000, Some(9000)), 9000);
+        // Estimate larger (e.g. messages added since the last call) -> keep the estimate.
+        assert_eq!(super::effective_context_tokens(9000, Some(1000)), 9000);
+        // A zero ground-truth never lowers the estimate.
+        assert_eq!(super::effective_context_tokens(1000, Some(0)), 1000);
     }
 
     #[tokio::test]
@@ -4154,7 +4736,7 @@ mod tests {
             "---\nname: lint_skill\ndescription: Lint helper\n---\n\ndo things\n",
         )
         .unwrap();
-        let reg = Arc::new(SkillRegistry::new(skills_root));
+        let reg = Arc::new(tokio::sync::RwLock::new(SkillRegistry::new(skills_root)));
         let tool = super::LoadSkillTool {
             registry: reg.clone(),
         };
@@ -4179,5 +4761,68 @@ mod tests {
             .await
             .unwrap();
         assert!(full.contains("do things"));
+    }
+
+    #[tokio::test]
+    async fn load_skill_rescans_on_miss_to_pick_up_a_new_skill() {
+        let root = LocalTempDir::new();
+        let skills_root = root.path().join("skills");
+
+        // One skill present when the registry is first scanned (at startup).
+        let first = skills_root.join("first_skill");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::write(
+            first.join("SKILL.md"),
+            "---\nname: first_skill\ndescription: present at startup\n---\n\nalpha body\n",
+        )
+        .unwrap();
+
+        let reg = Arc::new(tokio::sync::RwLock::new(SkillRegistry::new(
+            skills_root.clone(),
+        )));
+        let tool = super::LoadSkillTool {
+            registry: reg.clone(),
+        };
+
+        // A skill dropped into the directory AFTER the startup scan: the in-memory registry has
+        // never seen it.
+        let late = skills_root.join("late_skill");
+        std::fs::create_dir_all(&late).unwrap();
+        std::fs::write(
+            late.join("SKILL.md"),
+            "---\nname: late_skill\ndescription: added after scan\n---\n\nomega instructions\n",
+        )
+        .unwrap();
+
+        // Without rescan-on-miss this would error "skill not found"; the on-miss rescan must pick
+        // the new skill up and return its instructions without an agent restart.
+        let loaded = tool
+            .execute(serde_json::json!({ "skill_name": "late_skill", "detail": "full" }))
+            .await
+            .expect("late skill should be loadable after the on-miss rescan");
+        assert!(loaded.contains("omega instructions"), "{loaded}");
+
+        // metadata path also benefits from the rescan (covers the detail == "metadata" branch).
+        let late_meta = tool
+            .execute(serde_json::json!({ "skill_name": "late_skill", "detail": "metadata" }))
+            .await
+            .expect("late skill metadata after rescan");
+        assert!(late_meta.contains("Available: true"), "{late_meta}");
+
+        // The originally-present skill still loads.
+        let alpha = tool
+            .execute(serde_json::json!({ "skill_name": "first_skill", "detail": "full" }))
+            .await
+            .expect("first skill still loads");
+        assert!(alpha.contains("alpha body"), "{alpha}");
+
+        // A genuinely non-existent skill still errors after a rescan turns up nothing new.
+        let missing = tool
+            .execute(serde_json::json!({ "skill_name": "no_such_skill" }))
+            .await;
+        assert!(
+            missing.is_err(),
+            "unknown skill should still error after rescan: {missing:?}"
+        );
     }
 }

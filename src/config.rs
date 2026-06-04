@@ -324,6 +324,9 @@ pub struct AppConfig {
     pub max_iterations: Option<usize>,
     /// When true (default), detect repeated identical tool calls and inject a corrective user message.
     pub doom_loop_enabled: Option<bool>,
+    /// When true, back up each file before `edit_file`/`write_file` mutates it and register the
+    /// `checkpoint` tool for one-step undo. Default false. Only touched files are backed up.
+    pub checkpoint_enabled: Option<bool>,
     pub max_tool_output_chars: Option<usize>,
     /// Max characters returned by `web_search` / `web_fetch` (default 50_000). Separate from
     /// `max_tool_output_chars`, which caps tool output when passed to the model.
@@ -551,6 +554,11 @@ impl AppConfig {
     /// ml-intern-style doom loop detection before each LLM call (default: enabled).
     pub fn doom_loop_enabled(&self) -> bool {
         self.doom_loop_enabled.unwrap_or(true)
+    }
+
+    /// Pre-edit file checkpointing for one-step undo (default: disabled).
+    pub fn checkpoint_enabled(&self) -> bool {
+        self.checkpoint_enabled.unwrap_or(false)
     }
 
     /// When true, `git_worktree` is registered (see `[harness.git_worktree]` in config).

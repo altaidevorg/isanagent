@@ -103,6 +103,27 @@ model_name = "claude-sonnet-4-6"
 
 Use `/model` in the TUI to open the interactive model selector, or `/model gemini-2-5-flash` to switch directly. Your choice is remembered across restarts.
 
+### Skill management
+
+isanagent supports installing specialized **skills** (structured procedures and instructions) from remote GitHub repositories. You can install an entire repository of skills or a specific one using shorthand `owner/repo` or full URLs.
+
+**From the CLI:**
+```bash
+# Install all skills from a repository
+isanagent skills add google-deepmind/science-skills
+
+# Install a specific skill from a repository
+isanagent skills add huggingface/sentence-transformers --skill train-sentence-transformers
+```
+
+**From the TUI (Slash Command):**
+```text
+/skills add google-deepmind/science-skills
+/skills add huggingface/sentence-transformers train-sentence-transformers
+```
+
+Skills are installed directly to your workspace's `skills/` directory and are immediately available for the agent to load using the `load_skill_instructions` tool. Use `/skills list` (TUI) or `isanagent skills list` (CLI) to see what's installed.
+
 ### Build from source (optional)
 
 From a clone of this repo, **`ui/dist` is already present**, so a normal Rust build is enough unless you edited `ui/`:

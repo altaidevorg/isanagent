@@ -93,6 +93,28 @@ struct Cli {
 enum Commands {
     /// Create workspace layout and starter files; optional flags override generated config.toml
     Onboard(OnboardArgs),
+    /// Manage skills (add, list, etc.)
+    Skills(SkillsArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+struct SkillsArgs {
+    #[command(subcommand)]
+    command: SkillCommands,
+}
+
+#[derive(Subcommand, Debug)]
+enum SkillCommands {
+    /// Add skills from a remote GitHub repository
+    Add {
+        /// Repository URL (e.g., https://github.com/vercel-labs/skills) or shorthand (owner/repo)
+        repo_url: String,
+        /// Optional specific skill name to install
+        #[arg(short, long)]
+        skill: Option<String>,
+    },
+    /// List all installed skills
+    List,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -114,6 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Some(Commands::Onboard(args)) => run_onboard(cli.workspace, args).await,
+        Some(Commands::Skills(args)) => run_skills(cli.workspace, args).await,
         None => {
             // First-run UX: when the user invokes `isanagent` with no `--workspace` and the
             // default `~/.isanagent` directory does not yet exist, auto-launch the interactive
@@ -360,6 +383,15 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             allow_path_outside_sandbox: workspace.config.git_worktree_allow_path_outside_sandbox(),
         }));
     }
+    if workspace.config.checkpoint_enabled() {
+        // Backups live in the outer rim (never inside the agent's editable sandbox); restores are
+        // confined to the sandbox when the file tools are workspace-restricted.
+        isanagent::checkpoint::init(
+            workspace.dir.join(".system_generated").join("checkpoints"),
+            restrict.then(|| workspace.sandbox_dir.clone()),
+        );
+        tools.register(Box::new(isanagent::checkpoint::CheckpointTool));
+    }
     let mut inflight_sync_outer: Option<Arc<InflightSyncRegistry>> = None;
     let mut execution_harness_for_shutdown: Option<Arc<isanagent::execution::ExecutionHarness>> =
         None;
@@ -593,6 +625,38 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             isanagent::provider::create_provider(&cfg.provider_name, &base_url, key, &model_name);
         let p2 =
             isanagent::provider::create_provider(&cfg.provider_name, &base_url, key, &model_name);
+
+        // Cross-provider failover: register every *other* configured provider with a resolvable
+        // key as a fallback, so an exhausted-retry failure on the primary (a 5xx/529 outage, a
+        // rotated key, a deprecated model) fails over instead of dropping the turn. The primary is
+        // excluded by full (provider, base_url, model) identity via `build_fallback_specs`.
+        let candidates: Vec<isanagent::agent::FallbackProviderSpec> = expanded_providers
+            .values()
+            .filter_map(|fb_cfg| {
+                let fb_key = fb_cfg.resolve_api_key().ok()?;
+                let fb_base = fb_cfg.resolved_base_url().ok()?;
+                Some(isanagent::agent::FallbackProviderSpec {
+                    provider_name: fb_cfg.provider_name.clone(),
+                    base_url: fb_base,
+                    api_key: fb_key,
+                    model_name: fb_cfg.model_name.clone(),
+                })
+            })
+            .collect();
+        let fallbacks = isanagent::agent::build_fallback_specs(
+            &cfg.provider_name,
+            &base_url,
+            &model_name,
+            candidates,
+        );
+        if !fallbacks.is_empty() {
+            log::info!(
+                "Cross-provider failover enabled with {} fallback provider(s).",
+                fallbacks.len()
+            );
+        }
+        isanagent::agent::set_fallback_providers(fallbacks);
+
         (p1, p2)
     } else {
         // No API key found — list the env vars the user could set.
@@ -1493,6 +1557,47 @@ venv is touched."
     if let Err(e) = prompt_result {
         log::warn!("uv_requirements install prompt task failed: {e}");
     }
+}
+
+async fn run_skills(
+    workspace_arg: Option<String>,
+    args: SkillsArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let workspace = IsanagentWorkspace::new(workspace_arg.as_deref(), None)?;
+    let mut skills = SkillRegistry::new(workspace.skills_path());
+
+    match args.command {
+        SkillCommands::Add { repo_url, skill } => {
+            if let Some(ref name) = skill {
+                println!("Adding skill '{}' from {}...", name, repo_url);
+            } else {
+                println!("Adding all skills from {}...", repo_url);
+            }
+            match skills
+                .install_skills_from_repo(&repo_url, skill.as_deref())
+                .await
+            {
+                Ok(installed) => {
+                    if installed.is_empty() {
+                        println!("No skills found in the repository.");
+                    } else {
+                        println!("Successfully installed {} skills:", installed.len());
+                        for name in installed {
+                            println!("  - {}", name);
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(format!("Error installing skills: {}", e).into());
+                }
+            }
+        }
+        SkillCommands::List => {
+            println!("{}", skills.format_skill_directory());
+        }
+    }
+
+    Ok(())
 }
 
 async fn run_onboard(

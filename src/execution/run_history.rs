@@ -90,12 +90,18 @@ pub async fn write_run_journal(p: RunJournalParams<'_>) -> Result<PathBuf, Strin
         .await
         .map_err(|e| format!("run journal mkdir {}: {e}", dir.display()))?;
 
-    tokio::fs::write(dir.join("source.txt"), p.code.as_bytes())
+    // Redact secrets before they hit disk: executed code and captured stdout/stderr routinely carry
+    // keys (an `env` dump, an echoed `$OPENAI_API_KEY`, a token printed by a script).
+    let redactor = crate::redact::shared();
+    let code = redactor.redact(p.code);
+    tokio::fs::write(dir.join("source.txt"), code.as_bytes())
         .await
         .map_err(|e| format!("run journal source write: {e}"))?;
 
-    let (stdout, stdout_truncated) = truncate_field(p.result.stdout.clone(), MAX_INLINE_TEXT);
-    let (stderr, stderr_truncated) = truncate_field(p.result.stderr.clone(), MAX_INLINE_TEXT);
+    let (stdout, stdout_truncated) =
+        truncate_field(redactor.redact(&p.result.stdout).into_owned(), MAX_INLINE_TEXT);
+    let (stderr, stderr_truncated) =
+        truncate_field(redactor.redact(&p.result.stderr).into_owned(), MAX_INLINE_TEXT);
 
     let journal = RunJournal {
         schema_version: 1,
@@ -129,4 +135,53 @@ pub async fn write_run_journal(p: RunJournalParams<'_>) -> Result<PathBuf, Strin
         .map_err(|e| format!("run journal run.json: {e}"))?;
 
     Ok(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn run_journal_redacts_secrets_in_code_stdout_stderr() {
+        // Use format-identifiable secrets so the test does not depend on the process environment.
+        let ws = std::env::temp_dir().join(format!("isanagent_runjournal_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let sid = SessionId::new("sess1");
+        let result = RunResult::new(
+            "leaked AKIAIOSFODNN7EXAMPLE in stdout",
+            "trace ghp_0123456789abcdefghijABCDEFGHIJ here",
+            Some(0),
+        );
+
+        write_run_journal(RunJournalParams {
+            workspace_dir: &ws,
+            provider_id: "local",
+            session_id: &sid,
+            run_id: "run1",
+            code: "print('sk_live_0123456789abcdefghij')",
+            result: &result,
+            jupyter_kernel_id: None,
+            jupyter_notebook_path: None,
+            started_rfc3339: "t0",
+            finished_rfc3339: "t1",
+            duration_ms: 1,
+        })
+        .await
+        .unwrap();
+
+        let dir = run_history_dir(&ws, "local", &sid, "run1");
+        let source = std::fs::read_to_string(dir.join("source.txt")).unwrap();
+        let run_json = std::fs::read_to_string(dir.join("run.json")).unwrap();
+
+        // Executed code (source.txt)
+        assert!(source.contains("[REDACTED_STRIPE_KEY]"), "source: {source}");
+        assert!(!source.contains("sk_live_0123456789"), "source: {source}");
+        // stdout/stderr (run.json)
+        assert!(run_json.contains("[REDACTED_AWS_KEY]"), "run.json: {run_json}");
+        assert!(!run_json.contains("AKIAIOSFODNN7EXAMPLE"), "run.json: {run_json}");
+        assert!(run_json.contains("[REDACTED_GITHUB_TOKEN]"), "run.json: {run_json}");
+        assert!(!run_json.contains("ghp_0123456789"), "run.json: {run_json}");
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
 }

@@ -157,6 +157,7 @@ const TERMINAL_HELP: &str = r#"Commands (leading slash):
   /agents        Open the sub-agent task pane (running / finished named agents, plan steps)
   /chats         Open past sessions (saved terminal threads from workspace memory)
   /help, /?      Show this help
+  /skills add <url_or_shorthand> [skill_name] Add remote skills
 
 Keys:
   Enter             Send the compose line; in past-sessions pane: load selected and continue
@@ -210,6 +211,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/agents", "Open sub-agent tasks"),
     ("/chats", "Open past sessions"),
     ("/help", "Show full help"),
+    ("/skills", "Add remote skills"),
     ("/install-python", "Install uv runtime"),
 ];
 
@@ -2481,10 +2483,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 let approx_tokens: usize = messages
                                     .iter()
                                     .map(|m| {
-                                        m.content
-                                            .as_ref()
-                                            .map_or(0, |c| c.text_content().len())
-                                            / 4
+                                        m.content.as_ref().map_or(0, |c| c.text_content().len()) / 4
                                     })
                                     .sum();
                                 app.cells.push(Cell::System {
@@ -2578,9 +2577,44 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 }
                                 continue;
                             }
+                            if text.to_ascii_lowercase().starts_with("/skills ") {
+                                let arg = text.strip_prefix("/skills ").unwrap_or("").trim();
+                                if arg.starts_with("add ") {
+                                    let repo_part = arg.strip_prefix("add ").unwrap_or("").trim();
+                                    if repo_part.is_empty() {
+                                        app.cells.push(Cell::System {
+                                            message: "Usage: /skills add <repo_url_or_shorthand> [skill_name]".into(),
+                                        });
+                                    } else {
+                                        let mut parts = repo_part.split_whitespace();
+                                        let repo_url = parts.next().unwrap_or("").to_string();
+                                        let skill_name = parts.next().map(|s| s.to_string());
+
+                                        let msg = BusMessage::InstallSkill {
+                                            repo_url: repo_url.clone(),
+                                            skill_name,
+                                        };
+                                        if bus_tx.blocking_send(msg).is_err() {
+                                            app.cells.push(Cell::System {
+                                                message: "Bus closed; cannot install skills."
+                                                    .into(),
+                                            });
+                                        } else {
+                                            app.cells.push(Cell::System {
+                                                message: format!("Skill installation requested for repository: {}. Check logs for progress.", repo_url).into(),
+                                            });
+                                        }
+                                    }
+                                } else {
+                                    app.cells.push(Cell::System {
+                                        message: "Usage: /skills add <repo_url_or_shorthand> [skill_name]".into(),
+                                    });
+                                }
+                                continue;
+                            }
                             app.cells.push(Cell::System {
                             message:
-                                "Unknown command. Try /help, /exit, /new, /chats, /copy, /install-python, /cancel, /background, /retry, /tools, /exec, /agents, /model, /compact, /context."
+                                "Unknown command. Try /help, /exit, /new, /chats, /copy, /install-python, /cancel, /background, /retry, /tools, /exec, /agents, /model, /compact, /context, /skills."
                                     .into(),
                         });
                             continue;
