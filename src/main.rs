@@ -1532,7 +1532,10 @@ async fn run_skills(
             } else {
                 println!("Adding all skills from {}...", repo_url);
             }
-            match skills.install_skills_from_repo(&repo_url, skill.as_deref()).await {
+            match skills
+                .install_skills_from_repo(&repo_url, skill.as_deref())
+                .await
+            {
                 Ok(installed) => {
                     if installed.is_empty() {
                         println!("No skills found in the repository.");
@@ -1544,7 +1547,7 @@ async fn run_skills(
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error installing skills: {}", e);
+                    return Err(format!("Error installing skills: {}", e).into());
                 }
             }
         }

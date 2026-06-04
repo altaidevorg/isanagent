@@ -441,7 +441,8 @@ impl Provider for AnthropicProvider {
                 prompt_tokens: u["input_tokens"].as_u64().unwrap_or(0) as u32,
                 completion_tokens: u["output_tokens"].as_u64().unwrap_or(0) as u32,
                 total_tokens: (u["input_tokens"].as_u64().unwrap_or(0)
-                    + u["output_tokens"].as_u64().unwrap_or(0)) as u32,
+                    + u["output_tokens"].as_u64().unwrap_or(0))
+                    as u32,
                 cache_read_tokens: cache_read,
                 cache_creation_tokens: cache_creation,
             }

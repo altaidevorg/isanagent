@@ -2483,10 +2483,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 let approx_tokens: usize = messages
                                     .iter()
                                     .map(|m| {
-                                        m.content
-                                            .as_ref()
-                                            .map_or(0, |c| c.text_content().len())
-                                            / 4
+                                        m.content.as_ref().map_or(0, |c| c.text_content().len()) / 4
                                     })
                                     .sum();
                                 app.cells.push(Cell::System {
@@ -2599,7 +2596,8 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                         };
                                         if bus_tx.blocking_send(msg).is_err() {
                                             app.cells.push(Cell::System {
-                                                message: "Bus closed; cannot install skills.".into(),
+                                                message: "Bus closed; cannot install skills."
+                                                    .into(),
                                             });
                                         } else {
                                             app.cells.push(Cell::System {

@@ -611,8 +611,7 @@ pub async fn do_compaction(args: DoCompactionArgs<'_>) -> CompactionOutcome {
         PREPROCESS_STRIP_IMAGES_DEFAULT,
         PREPROCESS_TOOL_RESULT_MAX_TOKENS_DEFAULT,
     );
-    let tokens_after_preprocess_u32 =
-        tokens_after_preprocess.min(u32::MAX as usize) as u32;
+    let tokens_after_preprocess_u32 = tokens_after_preprocess.min(u32::MAX as usize) as u32;
 
     // 2. Emit CompactionTriggered (matched by Completed/Failed below).
     let _ = args
@@ -826,7 +825,10 @@ mod tests {
         let ctx = vec![user_with_parts(parts)];
         let (out, _) = preprocess_transcript_for_compaction(&ctx, false, 10_000);
         assert!(out.contains("describe"));
-        assert!(out.contains("[image]"), "should keep placeholder when not stripping");
+        assert!(
+            out.contains("[image]"),
+            "should keep placeholder when not stripping"
+        );
     }
 
     #[test]
@@ -834,8 +836,8 @@ mod tests {
         let huge = "x".repeat(200_000); // 200k bytes ≈ 50k tokens
         let ctx = vec![tool_message(&huge)];
         let (out, _) = preprocess_transcript_for_compaction(&ctx, true, 100); // cap = 100 tokens = 400 bytes
-        // The transcript line is "tool: " + truncated + "…[truncated]" + "\n\n".
-        // Truncated body must be at most 400 bytes; full line is bounded around it.
+                                                                              // The transcript line is "tool: " + truncated + "…[truncated]" + "\n\n".
+                                                                              // Truncated body must be at most 400 bytes; full line is bounded around it.
         assert!(out.contains("…[truncated]"), "must mark truncation");
         let body_len = out.len();
         assert!(
@@ -879,7 +881,10 @@ mod tests {
             "external_refs": ["https://github.com/seanmonstar/reqwest/issues/2024"],
         });
         let s = SummarySections::from_json(&raw);
-        assert_eq!(s.task_overview.as_deref(), Some("Investigate failing CI build."));
+        assert_eq!(
+            s.task_overview.as_deref(),
+            Some("Investigate failing CI build.")
+        );
         assert_eq!(s.files_touched, vec!["src/foo.rs", "src/bar.rs"]); // trimmed
         assert_eq!(s.next_steps.len(), 2);
         assert!(s.external_refs[0].starts_with("https://"));
@@ -908,7 +913,10 @@ mod tests {
             "files_touched": ["a", "", 42, null, "  b  "],
         });
         let s = SummarySections::from_json(&raw);
-        assert!(s.task_overview.is_none(), "whitespace-only string drops to None");
+        assert!(
+            s.task_overview.is_none(),
+            "whitespace-only string drops to None"
+        );
         assert!(s.current_state.is_none());
         assert_eq!(s.files_touched, vec!["a", "b"]);
     }
@@ -1217,7 +1225,10 @@ mod tests {
             (5, user_msg("u4")),
         ];
         let stale = identify_stale_tool_swaps(&messages, 2);
-        assert!(stale.is_empty(), "already-swapped messages must not be re-swapped");
+        assert!(
+            stale.is_empty(),
+            "already-swapped messages must not be re-swapped"
+        );
     }
 
     #[test]
@@ -1288,8 +1299,7 @@ mod tests {
         // the un-preprocessed token count.
         let (baseline, baseline_tokens) =
             preprocess_transcript_for_compaction(&ctx, false, usize::MAX);
-        let (stripped, stripped_tokens) =
-            preprocess_transcript_for_compaction(&ctx, true, 10_000);
+        let (stripped, stripped_tokens) = preprocess_transcript_for_compaction(&ctx, true, 10_000);
         assert!(baseline.len() > stripped.len());
         let reduction = 1.0 - (stripped_tokens as f64 / baseline_tokens as f64);
         assert!(

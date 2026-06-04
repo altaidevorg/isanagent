@@ -107,11 +107,9 @@ mod tests {
         let (tool, mut rx) = make_tool();
         let ctx = ToolExecCtx::new("terminal", "u1", None);
         let session_key = ctx.session_key.clone();
-        let result = with_tool_exec_scope(ctx, async {
-            tool.execute(serde_json::json!({})).await
-        })
-        .await
-        .expect("tool execute");
+        let result = with_tool_exec_scope(ctx, async { tool.execute(serde_json::json!({})).await })
+            .await
+            .expect("tool execute");
         assert!(result.contains("Compaction scheduled"));
 
         let msg = rx.recv().await.expect("bus message");
@@ -147,7 +145,10 @@ mod tests {
             BusMessage::TriggerCompaction {
                 focus_instructions, ..
             } => {
-                assert_eq!(focus_instructions.as_deref(), Some("keep the API design talk"));
+                assert_eq!(
+                    focus_instructions.as_deref(),
+                    Some("keep the API design talk")
+                );
             }
             other => panic!("expected TriggerCompaction, got {:?}", other),
         }

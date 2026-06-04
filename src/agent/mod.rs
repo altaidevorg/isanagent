@@ -336,7 +336,11 @@ fn is_arbitrary_code_tool(tool_name: &str) -> bool {
 /// Extract the command/code a code-exec tool will run. `exec` carries it in `command`; the
 /// execution / python tools carry it in `code`.
 fn extract_code_exec_command(tool_name: &str, args: &Value) -> Option<String> {
-    let key = if tool_name == "exec" { "command" } else { "code" };
+    let key = if tool_name == "exec" {
+        "command"
+    } else {
+        "code"
+    };
     args.get(key)
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
@@ -396,7 +400,11 @@ mod code_exec_gate_tests {
         // Shell `exec`: benign command does NOT require approval (preserves existing UX)...
         assert!(!code_exec_requires_approval("exec", "ls -la", &patterns));
         // ...but a destructive one does.
-        assert!(code_exec_requires_approval("exec", "rm -rf /tmp/x", &patterns));
+        assert!(code_exec_requires_approval(
+            "exec",
+            "rm -rf /tmp/x",
+            &patterns
+        ));
     }
 }
 
@@ -1438,14 +1446,20 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 )));
                 return Ok(None);
             }
-            BusMessage::InstallSkill { repo_url, skill_name } => {
+            BusMessage::InstallSkill {
+                repo_url,
+                skill_name,
+            } => {
                 let skills_arc = self.skills.clone();
                 let logger_tx = self.logger_tx.clone();
                 let name = self.name.clone();
-                
+
                 tokio::spawn(async move {
                     let mut skills_guard = skills_arc.write().await;
-                    match skills_guard.install_skills_from_repo(&repo_url, skill_name.as_deref()).await {
+                    match skills_guard
+                        .install_skills_from_repo(&repo_url, skill_name.as_deref())
+                        .await
+                    {
                         Ok(installed) => {
                             let msg = if installed.is_empty() {
                                 "No skills found in the repository.".to_string()
@@ -1455,7 +1469,10 @@ impl ActorLogic<BusMessage> for AgentLogic {
                             let _ = logger_tx.send(BusMessage::Log(LogEvent::info(&name, &msg)));
                         }
                         Err(e) => {
-                            let _ = logger_tx.send(BusMessage::Log(LogEvent::error(&name, &format!("Failed to install skills from {}: {}", repo_url, e))));
+                            let _ = logger_tx.send(BusMessage::Log(LogEvent::error(
+                                &name,
+                                &format!("Failed to install skills from {}: {}", repo_url, e),
+                            )));
                         }
                     }
                 });
@@ -1572,15 +1589,13 @@ impl ActorLogic<BusMessage> for AgentLogic {
                     .trigger_compaction_with_reason(session_key.clone(), focus_instructions, reason)
                     .await
                 {
-                    let _ = self.logger_tx.send(BusMessage::Log(
-                        LogEvent::warn(
-                            &self.name,
-                            &format!(
-                                "TriggerCompaction dropped for session_key={}: {}",
-                                session_key, e
-                            ),
+                    let _ = self.logger_tx.send(BusMessage::Log(LogEvent::warn(
+                        &self.name,
+                        &format!(
+                            "TriggerCompaction dropped for session_key={}: {}",
+                            session_key, e
                         ),
-                    ));
+                    )));
                 }
                 Ok(None)
             }
@@ -1661,10 +1676,7 @@ impl AgentLogic {
             .get_context_since_reflection()
             .await
             .map_err(|e| format!("get_context_since_reflection({}): {}", session_key, e))?;
-        let user_turns = current_context
-            .iter()
-            .filter(|m| m.role == "user")
-            .count();
+        let user_turns = current_context.iter().filter(|m| m.role == "user").count();
         let approx_tokens: usize = estimate_context_tokens(&current_context);
 
         // Most recent summary keyed by the same channel:chat_id prefix
@@ -1686,8 +1698,8 @@ impl AgentLogic {
         // fires keeps `do_compaction`'s `select!` valid without altering behavior.
         let cancel_token = tokio_util::sync::CancellationToken::new();
 
-        let outcome = crate::agent::compaction::do_compaction(
-            crate::agent::compaction::DoCompactionArgs {
+        let outcome =
+            crate::agent::compaction::do_compaction(crate::agent::compaction::DoCompactionArgs {
                 chat_id: &chat_id,
                 session_key: &session_key,
                 trigger_reason,
@@ -1700,9 +1712,8 @@ impl AgentLogic {
                 memory_node: &memory_node,
                 outbound_tx: &self.outbound_tx,
                 cancel_token: &cancel_token,
-            },
-        )
-        .await;
+            })
+            .await;
         Ok(outcome)
     }
 
@@ -2323,8 +2334,7 @@ impl AgentLogic {
                     if let Some((_, msg)) =
                         messages_with_ids.iter_mut().find(|(id, _)| *id == db_id)
                     {
-                        msg.content =
-                            Some(crate::utils::MessageContent::Text(placeholder));
+                        msg.content = Some(crate::utils::MessageContent::Text(placeholder));
                     }
                 }
             }
@@ -2576,7 +2586,8 @@ impl AgentLogic {
                         "Context overflow: input exceeds the model's window \
                          (attempted={} max={}). Reduce the conversation length and retry.",
                         tokens_attempted,
-                        max.map(|m| m.to_string()).unwrap_or_else(|| "?".to_string()),
+                        max.map(|m| m.to_string())
+                            .unwrap_or_else(|| "?".to_string()),
                     );
                     let persisted = format!(
                         "LLM call failed: {err}\nPress /retry to try again or /cancel to abandon."
@@ -3066,7 +3077,10 @@ impl AgentLogic {
                         },
                     )
                     .await;
-                    if matches!(outcome, crate::agent::compaction::CompactionOutcome::Cancelled) {
+                    if matches!(
+                        outcome,
+                        crate::agent::compaction::CompactionOutcome::Cancelled
+                    ) {
                         persist_and_cancel!();
                     }
                 }
@@ -3527,7 +3541,9 @@ mod tests {
         let session_manager = Arc::new(SessionManager::new(memory_node));
         let tools = Arc::new(ToolRegistry::new());
         let skills_temp = LocalTempDir::new();
-        let skills = Arc::new(tokio::sync::RwLock::new(SkillRegistry::new(skills_temp.path().clone())));
+        let skills = Arc::new(tokio::sync::RwLock::new(SkillRegistry::new(
+            skills_temp.path().clone(),
+        )));
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<BusMessage>(8);
         // Drain outbound telemetry so the loop's `send().await` never blocks on a full buffer
         // (tool-call-returning providers emit several messages per iteration).
@@ -4078,7 +4094,10 @@ mod tests {
             },
         }]);
         assert_eq!(super::estimate_message_tokens(&msg), 100);
-        assert_eq!(super::estimate_context_tokens(std::slice::from_ref(&msg)), 100);
+        assert_eq!(
+            super::estimate_context_tokens(std::slice::from_ref(&msg)),
+            100
+        );
     }
 
     #[tokio::test]

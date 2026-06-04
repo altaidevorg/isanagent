@@ -266,7 +266,8 @@ impl SkillRegistry {
         // 1. Create a temporary directory with a cleanup guard
         let temp_dir_path =
             std::env::temp_dir().join(format!("isanagent-skills-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&temp_dir_path).map_err(|e| format!("Failed to create temp dir: {}", e))?;
+        fs::create_dir_all(&temp_dir_path)
+            .map_err(|e| format!("Failed to create temp dir: {}", e))?;
         let _guard = TempDirGuard::new(temp_dir_path.clone());
 
         // 2. Clone the repository (using git command)
@@ -285,7 +286,10 @@ impl SkillRegistry {
             })?;
 
         if !status.success() {
-            return Err(format!("git clone failed with exit code: {:?}", status.code()));
+            return Err(format!(
+                "git clone failed with exit code: {:?}",
+                status.code()
+            ));
         }
 
         // 3. Scan the cloned repo for SKILL.md files
@@ -351,33 +355,35 @@ impl SkillRegistry {
 
         Ok(installed_skills)
     }
-    }
+}
 
-    /// Ensures a temporary directory is deleted when this guard is dropped.
-    struct TempDirGuard {
+/// Ensures a temporary directory is deleted when this guard is dropped.
+struct TempDirGuard {
     path: PathBuf,
-    }
+}
 
-    impl TempDirGuard {
+impl TempDirGuard {
     fn new(path: PathBuf) -> Self {
         Self { path }
     }
-    }
+}
 
-    impl Drop for TempDirGuard {
+impl Drop for TempDirGuard {
     fn drop(&mut self) {
         if self.path.exists() {
             let _ = fs::remove_dir_all(&self.path);
         }
     }
-    }
+}
 
-    fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     if !dst.exists() {
-        fs::create_dir_all(dst).map_err(|e| format!("Failed to create directory {:?}: {}", dst, e))?;
+        fs::create_dir_all(dst)
+            .map_err(|e| format!("Failed to create directory {:?}: {}", dst, e))?;
     }
 
-    for entry in fs::read_dir(src).map_err(|e| format!("Failed to read directory {:?}: {}", src, e))?
+    for entry in
+        fs::read_dir(src).map_err(|e| format!("Failed to read directory {:?}: {}", src, e))?
     {
         let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
         let file_type = entry
@@ -398,7 +404,7 @@ impl SkillRegistry {
         }
     }
     Ok(())
-    }
+}
 #[cfg(test)]
 mod skill_metadata_tests {
     use super::*;
