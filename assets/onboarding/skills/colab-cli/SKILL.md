@@ -1,5 +1,7 @@
+---
 name: colab-cli
-description: "Manage Google Colab sessions and execute code on remote Colab VMs via the colab-cli."
+description: Manage Google Colab sessions and execute code on remote Colab VMs via the colab-cli.
+---
 
 # Colab Session Operator
 
