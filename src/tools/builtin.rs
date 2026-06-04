@@ -255,6 +255,7 @@ impl Tool for WriteFileTool {
                 .map_err(|e| format!("Failed to create parent directories: {}", e))?;
         }
 
+        crate::checkpoint::snapshot_before(&actual_path, "write_file");
         fs::write(&actual_path, content)
             .map(|_| format!("Successfully wrote to {}", actual_path.display()))
             .map_err(|e| e.to_string())
@@ -350,6 +351,7 @@ impl Tool for EditFileTool {
             content.replacen(old_text, new_text, 1)
         };
 
+        crate::checkpoint::snapshot_before(&actual_path, "edit_file");
         fs::write(&actual_path, &new_content).map_err(|e| format!("Error saving edits: {}", e))?;
 
         let diff = unified_diff_snippet(&old_content, &new_content);

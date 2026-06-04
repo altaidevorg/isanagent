@@ -360,6 +360,15 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             allow_path_outside_sandbox: workspace.config.git_worktree_allow_path_outside_sandbox(),
         }));
     }
+    if workspace.config.checkpoint_enabled() {
+        // Backups live in the outer rim (never inside the agent's editable sandbox); restores are
+        // confined to the sandbox when the file tools are workspace-restricted.
+        isanagent::checkpoint::init(
+            workspace.dir.join(".system_generated").join("checkpoints"),
+            restrict.then(|| workspace.sandbox_dir.clone()),
+        );
+        tools.register(Box::new(isanagent::checkpoint::CheckpointTool));
+    }
     let mut inflight_sync_outer: Option<Arc<InflightSyncRegistry>> = None;
     let mut execution_harness_for_shutdown: Option<Arc<isanagent::execution::ExecutionHarness>> =
         None;
