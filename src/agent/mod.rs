@@ -291,9 +291,17 @@ fn extract_exec_command(args: &Value) -> Option<String> {
 /// Ok/Err polarity so the model sees it alongside the tool's own output and can self-correct.
 fn append_post_tool_output(res: Result<String, String>, hook_out: &str) -> Result<String, String> {
     let note = format!("\n\n[post-tool hook]\n{hook_out}");
+    // `res` is owned, so append the note onto the existing buffer in place rather than allocating a
+    // fresh string and copying the (potentially large) tool output into it.
     match res {
-        Ok(s) => Ok(format!("{s}{note}")),
-        Err(s) => Err(format!("{s}{note}")),
+        Ok(mut s) => {
+            s.push_str(&note);
+            Ok(s)
+        }
+        Err(mut s) => {
+            s.push_str(&note);
+            Err(s)
+        }
     }
 }
 
