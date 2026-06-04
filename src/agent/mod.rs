@@ -24,7 +24,7 @@ use crate::hooks::{
 use crate::logging::LoggerHandle;
 use crate::memory::{MemoryMessage, SharedReply, TodoRow};
 use crate::session::SessionManager;
-use crate::skills::SkillRegistry;
+use crate::skills::{SharedSkillRegistry, SkillRegistry};
 use crate::tool_activity::SharedToolExecutionActivity;
 use crate::tools::ToolRegistry;
 use crate::traits::{Memory, Provider, Tool};
@@ -752,7 +752,7 @@ struct ReasoningSpawnArgs {
     provider: Box<dyn Provider>,
     session_manager: Arc<SessionManager>,
     tools: Arc<ToolRegistry>,
-    skills: Arc<tokio::sync::RwLock<SkillRegistry>>,
+    skills: SharedSkillRegistry,
     system_prompt: String,
     max_iterations: usize,
     max_tool_output_chars: usize,
@@ -1079,7 +1079,7 @@ pub(crate) struct ReasoningLoopCtx {
     pub(crate) provider: Box<dyn Provider>,
     pub(crate) session_manager: Arc<SessionManager>,
     pub(crate) tools: Arc<ToolRegistry>,
-    pub(crate) skills: Arc<tokio::sync::RwLock<SkillRegistry>>,
+    pub(crate) skills: SharedSkillRegistry,
     pub(crate) system_prompt: String,
     pub(crate) max_iterations: usize,
     pub(crate) max_tool_output_chars: usize,
@@ -1167,7 +1167,7 @@ pub struct AgentLogic {
     provider: Arc<tokio::sync::RwLock<Box<dyn Provider>>>,
     session_manager: Arc<SessionManager>,
     tools: Arc<ToolRegistry>,
-    skills: Arc<tokio::sync::RwLock<SkillRegistry>>,
+    skills: SharedSkillRegistry,
     system_prompt: String,
     max_iterations: usize,
     max_tool_output_chars: usize,
@@ -3109,7 +3109,7 @@ impl AgentLogic {
 /// A built-in tool that allows the agent to load the markdown instructions
 /// for a skill dynamically from the SkillRegistry.
 pub struct LoadSkillTool {
-    registry: Arc<tokio::sync::RwLock<SkillRegistry>>,
+    registry: SharedSkillRegistry,
 }
 
 #[async_trait]
@@ -3199,7 +3199,7 @@ mod tests {
     use crate::memory::SqliteMemoryActor;
     use crate::multi_tenant_edge::{ActivityHeartbeatClient, HeartbeatTransport};
     use crate::session::SessionManager;
-    use crate::skills::SkillRegistry;
+    use crate::skills::{SharedSkillRegistry, SkillRegistry};
     use crate::tool_activity::SharedToolExecutionActivity;
     use crate::tool_runtime::ToolExecCtx;
     use crate::tools::ToolRegistry;

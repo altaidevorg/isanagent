@@ -2,7 +2,12 @@ use log::{info, warn};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+/// Thread-safe skill registry shared across agents and the TUI.
+pub type SharedSkillRegistry = Arc<RwLock<SkillRegistry>>;
 
 /// Represents a parsed Anthropic Agent Skill
 #[derive(Debug, Clone)]
@@ -236,7 +241,16 @@ impl SkillRegistry {
     /// Installs skills from a remote GitHub repository.
     /// If `specific_skill` is Some, only that skill will be installed.
     /// Returns a list of installed skill names.
-    pub async fn install_skills_from_repo(&mut self, repo_url: &str, specific_skill: Option<&str>) -> Result<Vec<String>, String> {
+    pub async fn install_skills_from_repo(
+        &mut self,
+        repo_url: &str,
+        specific_skill: Option<&str>,
+    ) -> Result<Vec<String>, String> {
+        // 0. Pre-flight check: is git installed?
+        if which::which("git").is_err() {
+            return Err("The 'git' command was not found. Please install git to use remote skill installation.".to_string());
+        }
+
         // Support shorthand owner/repo format
         let full_repo_url = if !repo_url.contains("://") && repo_url.contains('/') {
             format!("https://github.com/{}", repo_url)
@@ -244,11 +258,16 @@ impl SkillRegistry {
             repo_url.to_string()
         };
 
-        info!("Installing skills from repository: {} (specific: {:?})", full_repo_url, specific_skill);
+        info!(
+            "Installing skills from repository: {} (specific: {:?})",
+            full_repo_url, specific_skill
+        );
 
-        // 1. Create a temporary directory
-        let temp_dir = std::env::temp_dir().join(format!("isanagent-skills-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&temp_dir).map_err(|e| format!("Failed to create temp dir: {}", e))?;
+        // 1. Create a temporary directory with a cleanup guard
+        let temp_dir_path =
+            std::env::temp_dir().join(format!("isanagent-skills-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir_path).map_err(|e| format!("Failed to create temp dir: {}", e))?;
+        let _guard = TempDirGuard::new(temp_dir_path.clone());
 
         // 2. Clone the repository (using git command)
         let status = std::process::Command::new("git")
@@ -256,9 +275,14 @@ impl SkillRegistry {
             .arg("--depth")
             .arg("1")
             .arg(&full_repo_url)
-            .arg(&temp_dir)
+            .arg(&temp_dir_path)
             .status()
-            .map_err(|e| format!("Failed to execute git clone: {}. Make sure 'git' is installed and in your PATH.", e))?;
+            .map_err(|e| {
+                format!(
+                    "Failed to execute git clone: {}. Make sure 'git' is installed and in your PATH.",
+                    e
+                )
+            })?;
 
         if !status.success() {
             return Err(format!("git clone failed with exit code: {:?}", status.code()));
@@ -266,13 +290,13 @@ impl SkillRegistry {
 
         // 3. Scan the cloned repo for SKILL.md files
         let mut installed_skills = Vec::new();
-        let walker = walkdir::WalkDir::new(&temp_dir).into_iter();
-        
+        let walker = walkdir::WalkDir::new(&temp_dir_path).into_iter();
+
         for entry in walker.filter_map(|e| e.ok()) {
             if entry.file_name() == "SKILL.md" {
                 let skill_md_path = entry.path();
                 let skill_dir = skill_md_path.parent().ok_or("Invalid skill path")?;
-                
+
                 // Parse to get the skill name
                 if let Some(def) = Self::parse_skill_md(&skill_md_path.to_path_buf()) {
                     // Filter if specific skill requested
@@ -283,17 +307,27 @@ impl SkillRegistry {
                     }
 
                     let dest_dir = self.skills_dir.join(&def.name);
-                    
-                    if dest_dir.exists() {
-                        info!("Skill {} already exists, overwriting.", def.name);
-                        fs::remove_dir_all(&dest_dir).map_err(|e| format!("Failed to remove existing skill dir: {}", e))?;
+
+                    // Atomic installation: copy to a .tmp sibling first
+                    let tmp_dest_dir = self.skills_dir.join(format!("{}.tmp", def.name));
+                    if tmp_dest_dir.exists() {
+                        let _ = fs::remove_dir_all(&tmp_dest_dir);
                     }
-                    
-                    fs::create_dir_all(&dest_dir).map_err(|e| format!("Failed to create skill dir: {}", e))?;
-                    
-                    // Copy everything from skill_dir to dest_dir
-                    copy_dir_recursive(skill_dir, &dest_dir)?;
-                    
+
+                    fs::create_dir_all(&tmp_dest_dir)
+                        .map_err(|e| format!("Failed to create skill dir: {}", e))?;
+
+                    // Copy everything from skill_dir to tmp_dest_dir
+                    copy_dir_recursive(skill_dir, &tmp_dest_dir)?;
+
+                    // Swap: remove old and rename tmp to dest
+                    if dest_dir.exists() {
+                        fs::remove_dir_all(&dest_dir)
+                            .map_err(|e| format!("Failed to remove existing skill dir: {}", e))?;
+                    }
+                    fs::rename(&tmp_dest_dir, &dest_dir)
+                        .map_err(|e| format!("Failed to finalize skill installation: {}", e))?;
+
                     installed_skills.push(def.name);
 
                     // If we found the specific skill, we can stop
@@ -304,11 +338,12 @@ impl SkillRegistry {
             }
         }
 
-        // 4. Cleanup
-        let _ = fs::remove_dir_all(&temp_dir);
-
         if specific_skill.is_some() && installed_skills.is_empty() {
-            return Err(format!("Skill '{}' not found in repository {}", specific_skill.unwrap(), full_repo_url));
+            return Err(format!(
+                "Skill '{}' not found in repository {}",
+                specific_skill.unwrap(),
+                full_repo_url
+            ));
         }
 
         // 5. Re-scan for skills
@@ -316,28 +351,54 @@ impl SkillRegistry {
 
         Ok(installed_skills)
     }
-}
+    }
 
-fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    /// Ensures a temporary directory is deleted when this guard is dropped.
+    struct TempDirGuard {
+    path: PathBuf,
+    }
+
+    impl TempDirGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+    }
+
+    impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        if self.path.exists() {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+    }
+
+    fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     if !dst.exists() {
         fs::create_dir_all(dst).map_err(|e| format!("Failed to create directory {:?}: {}", dst, e))?;
     }
 
-    for entry in fs::read_dir(src).map_err(|e| format!("Failed to read directory {:?}: {}", src, e))? {
+    for entry in fs::read_dir(src).map_err(|e| format!("Failed to read directory {:?}: {}", src, e))?
+    {
         let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
-        let file_type = entry.file_type().map_err(|e| format!("Failed to get file type: {}", e))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("Failed to get file type: {}", e))?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
 
         if file_type.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
         } else {
-            fs::copy(&src_path, &dst_path).map_err(|e| format!("Failed to copy file {:?} to {:?}: {}", src_path, dst_path, e))?;
+            fs::copy(&src_path, &dst_path).map_err(|e| {
+                format!(
+                    "Failed to copy file {:?} to {:?}: {}",
+                    src_path, dst_path, e
+                )
+            })?;
         }
     }
     Ok(())
-}
-
+    }
 #[cfg(test)]
 mod skill_metadata_tests {
     use super::*;

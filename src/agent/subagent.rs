@@ -21,7 +21,7 @@ use crate::config::ResolvedShellPolicy;
 use crate::logging::LoggerHandle;
 use crate::memory::{MemoryMessage, SharedReply};
 use crate::session::SessionManager;
-use crate::skills::SkillRegistry;
+use crate::skills::SharedSkillRegistry;
 use crate::tool_activity::SharedToolExecutionActivity;
 use crate::tool_runtime::ToolExecCtx;
 use crate::tools::ToolRegistry;
@@ -49,7 +49,7 @@ pub struct SubagentSpawnDeps {
     /// Shared provider reference — reads the current provider (updates with `/model` switch).
     pub provider: Arc<tokio::sync::RwLock<Box<dyn Provider>>>,
     pub session_manager: Arc<SessionManager>,
-    pub skills: Arc<tokio::sync::RwLock<SkillRegistry>>,
+    pub skills: SharedSkillRegistry,
     pub system_prompt: String,
     pub max_iterations: usize,
     pub max_tool_output_chars: usize,
@@ -1209,7 +1209,7 @@ mod tests {
     use crate::logging::create_logger_channel;
     use crate::memory::SqliteMemoryActor;
     use crate::session::SessionManager;
-    use crate::skills::SkillRegistry;
+    use crate::skills::SharedSkillRegistry;
     use crate::traits::Provider;
     use crate::utils::{ChatMessage, LLMError, LLMResponse};
     use crate::NodeHandle;
