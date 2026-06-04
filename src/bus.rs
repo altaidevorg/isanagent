@@ -626,4 +626,8 @@ pub enum BusMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         trigger: Option<CompactionTrigger>,
     },
+    /// TUI `/skills add <repo_url>` command: triggers remote skill installation.
+    InstallSkill {
+        repo_url: String,
+    },
 }

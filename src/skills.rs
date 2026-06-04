@@ -232,6 +232,86 @@ impl SkillRegistry {
             skill.path.display()
         ))
     }
+
+    /// Installs skills from a remote GitHub repository.
+    /// Returns a list of installed skill names.
+    pub async fn install_skills_from_repo(&mut self, repo_url: &str) -> Result<Vec<String>, String> {
+        info!("Installing skills from repository: {}", repo_url);
+
+        // 1. Create a temporary directory
+        let temp_dir = std::env::temp_dir().join(format!("isanagent-skills-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir).map_err(|e| format!("Failed to create temp dir: {}", e))?;
+
+        // 2. Clone the repository (using git command)
+        let status = std::process::Command::new("git")
+            .arg("clone")
+            .arg("--depth")
+            .arg("1")
+            .arg(repo_url)
+            .arg(&temp_dir)
+            .status()
+            .map_err(|e| format!("Failed to execute git clone: {}. Make sure 'git' is installed and in your PATH.", e))?;
+
+        if !status.success() {
+            return Err(format!("git clone failed with exit code: {:?}", status.code()));
+        }
+
+        // 3. Scan the cloned repo for SKILL.md files
+        let mut installed_skills = Vec::new();
+        let walker = walkdir::WalkDir::new(&temp_dir).into_iter();
+        
+        for entry in walker.filter_map(|e| e.ok()) {
+            if entry.file_name() == "SKILL.md" {
+                let skill_md_path = entry.path();
+                let skill_dir = skill_md_path.parent().ok_or("Invalid skill path")?;
+                
+                // Parse to get the skill name
+                if let Some(def) = Self::parse_skill_md(&skill_md_path.to_path_buf()) {
+                    let dest_dir = self.skills_dir.join(&def.name);
+                    
+                    if dest_dir.exists() {
+                        info!("Skill {} already exists, overwriting.", def.name);
+                        fs::remove_dir_all(&dest_dir).map_err(|e| format!("Failed to remove existing skill dir: {}", e))?;
+                    }
+                    
+                    fs::create_dir_all(&dest_dir).map_err(|e| format!("Failed to create skill dir: {}", e))?;
+                    
+                    // Copy everything from skill_dir to dest_dir
+                    copy_dir_recursive(skill_dir, &dest_dir)?;
+                    
+                    installed_skills.push(def.name);
+                }
+            }
+        }
+
+        // 4. Cleanup
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        // 5. Re-scan for skills
+        self.scan_for_skills();
+
+        Ok(installed_skills)
+    }
+}
+
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    if !dst.exists() {
+        fs::create_dir_all(dst).map_err(|e| format!("Failed to create directory {:?}: {}", dst, e))?;
+    }
+
+    for entry in fs::read_dir(src).map_err(|e| format!("Failed to read directory {:?}: {}", src, e))? {
+        let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
+        let file_type = entry.file_type().map_err(|e| format!("Failed to get file type: {}", e))?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+
+        if file_type.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            fs::copy(&src_path, &dst_path).map_err(|e| format!("Failed to copy file {:?} to {:?}: {}", src_path, dst_path, e))?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

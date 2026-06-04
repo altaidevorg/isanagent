@@ -200,6 +200,7 @@ impl LoggingActor {
             // `CompactionTriggered` / `CompactionCompleted` telemetry pair already
             // shows up in the conversation log via the `Telemetry(_)` arm above.
             BusMessage::TriggerCompaction { .. } => return Ok(()),
+            BusMessage::InstallSkill { .. } => return Ok(()),
         }
         .map_err(|e| ActorError::from(format!("Failed to serialize conversation event: {}", e)))?;
 
@@ -287,6 +288,10 @@ impl LoggingActor {
                         .map(|s| if s.is_empty() { "-" } else { s })
                         .unwrap_or("-"),
                 ),
+            ),
+            BusMessage::InstallSkill { repo_url } => LogEvent::info(
+                "BusMessage",
+                &format!("InstallSkill requested for repo={}", repo_url),
             ),
         };
 
