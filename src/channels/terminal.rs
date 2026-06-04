@@ -56,8 +56,8 @@ fn truncate_leading_ellipsis(s: &str, max_chars: usize) -> String {
 }
 
 fn tool_result_looks_like_failure(result: &str) -> bool {
-    let t = result.trim_start();
-    t.starts_with("Error:") || t.starts_with("error:")
+    // Single source of truth shared with the agent loop's is_error computation.
+    crate::utils::tool_output_looks_like_failure(result)
 }
 
 fn summarize_message_tool_result(t: &str) -> Option<String> {

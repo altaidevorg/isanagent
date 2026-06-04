@@ -72,6 +72,16 @@ impl std::fmt::Display for MessageContent {
     }
 }
 
+/// Heuristic: does a tool result's text look like a failure? Tools report failure two ways — a
+/// dispatch `Err` (transport/execution), and an in-band `Ok("Error: ...")` for *recoverable*
+/// problems (e.g. "old_text not found", "path not found"). This catches the in-band case so
+/// callers can treat both uniformly: the terminal UI failure phase and the model-facing
+/// `is_error` flag (so Anthropic gets a structured failure signal for these too, not just text).
+pub fn tool_output_looks_like_failure(text: &str) -> bool {
+    let t = text.trim_start();
+    t.starts_with("Error:") || t.starts_with("error:")
+}
+
 // --- Data Structures ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -889,5 +899,16 @@ mod tests {
         assert!(!LLMError::ApiError("(401 []) Unauthorized...".into()).is_transient());
         // Parse/NoContent errors are NOT transient
         assert!(!LLMError::NoContent.is_transient());
+    }
+
+    #[test]
+    fn tool_output_failure_heuristic() {
+        // In-band tool errors (Ok("Error: ...")) and leading whitespace are detected.
+        assert!(tool_output_looks_like_failure("Error: old_text not found"));
+        assert!(tool_output_looks_like_failure("  \n error: path not found"));
+        // Normal output is not a failure — even when it mentions "error" mid-line.
+        assert!(!tool_output_looks_like_failure("ok: wrote 3 files"));
+        assert!(!tool_output_looks_like_failure("grep found 'Error:' in 2 logs"));
+        assert!(!tool_output_looks_like_failure(""));
     }
 }
