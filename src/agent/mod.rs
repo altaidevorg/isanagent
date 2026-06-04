@@ -287,9 +287,73 @@ fn extract_exec_command(args: &Value) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Lowercase and collapse every run of whitespace (spaces, tabs, newlines) to a single space so a
+/// destructive command can't slip past a single-spaced approval pattern via `rm  -rf`, a tab, or a
+/// mid-command line break.
+fn normalize_command_for_matching(s: &str) -> String {
+    let lowercase = s.to_ascii_lowercase();
+    let mut result = String::with_capacity(lowercase.len());
+    let mut words = lowercase.split_whitespace();
+    if let Some(first) = words.next() {
+        result.push_str(first);
+        for word in words {
+            result.push(' ');
+            result.push_str(word);
+        }
+    }
+    result
+}
+
 fn should_require_shell_approval(command: &str, patterns: &[String]) -> bool {
-    let lower = command.to_ascii_lowercase();
-    patterns.iter().any(|p| lower.contains(p))
+    // Pad with spaces so matching is on whole-word boundaries: a bare `.contains()` on the
+    // normalized command would let a pattern like `rm` match any command containing `terminal`,
+    // `platform`, `firmware`, `alarm`, `warm`, `harm`, etc. ("terminal".contains("rm") is true),
+    // forcing spurious approval prompts. Padding both sides keeps the whitespace-robustness (a
+    // run of spaces/tabs/newlines was already collapsed to one) while only matching real tokens.
+    let normalized = format!(" {} ", normalize_command_for_matching(command));
+    patterns.iter().any(|p| {
+        let np = normalize_command_for_matching(p);
+        // Ignore empty/whitespace-only patterns: `contains("")` is always true and would otherwise
+        // force approval on *every* command — a silent config footgun.
+        if np.is_empty() {
+            return false;
+        }
+        normalized.contains(&format!(" {} ", np))
+    })
+}
+
+/// Parse a user's reply to a shell-approval prompt. **Deny by default**: the command runs only when
+/// the reply is composed *entirely* of affirmative or neutral-filler words AND carries at least one
+/// explicit affirmative. Any unrecognized token — a negation ("never", "nope", "can't"), a caveat,
+/// or stray prose — forces a deny.
+///
+/// This allowlist posture (rather than a denylist) is deliberate: it fixes the original
+/// `contains("approve") && !contains("deny")` parse that read "do not approve" as APPROVED, and it
+/// also closes the broader class a denylist misses, where an affirmative word is buried in a
+/// negative sentence ("never approve", "i can't approve", "approve? actually nope"). The prompt
+/// constrains the choices to approve/deny with `allow_empty = false`, so the strictness is
+/// UX-compatible; an unrecognized reply simply skips execution and the user can re-confirm.
+fn shell_approval_reply_is_grant(reply: &str) -> bool {
+    const AFFIRM: &[&str] = &[
+        "approve", "approved", "approves", "yes", "yep", "yeah", "y", "ok", "okay", "k", "allow",
+        "allowed", "confirm", "confirmed", "accept", "accepted", "proceed", "go", "sure",
+    ];
+    const FILLER: &[&str] = &["please", "it", "this", "that", "ahead", "now", "run", "do"];
+
+    let r = reply.trim().to_ascii_lowercase();
+    if r.is_empty() {
+        return false;
+    }
+    let mut saw_affirmative = false;
+    for tok in r.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()) {
+        if AFFIRM.contains(&tok) {
+            saw_affirmative = true;
+        } else if !FILLER.contains(&tok) {
+            // Negation, caveat, or unmodeled prose -> deny.
+            return false;
+        }
+    }
+    saw_affirmative
 }
 
 fn shell_policy_mode_for_session(
@@ -405,6 +469,77 @@ mod code_exec_gate_tests {
             "rm -rf /tmp/x",
             &patterns
         ));
+    }
+
+    #[test]
+    fn approval_match_is_whitespace_insensitive() {
+        let patterns = vec!["rm -rf".to_string()];
+        // Extra spaces, tabs, and a mid-command newline must not bypass the gate.
+        assert!(should_require_shell_approval("rm  -rf /tmp/x", &patterns));
+        assert!(should_require_shell_approval("rm\t-rf /tmp/x", &patterns));
+        assert!(should_require_shell_approval("rm\n-rf /tmp/x", &patterns));
+        assert!(should_require_shell_approval("RM -RF /tmp/x", &patterns));
+        // A benign command still does not match.
+        assert!(!should_require_shell_approval("ls -la", &patterns));
+    }
+
+    #[test]
+    fn approval_match_is_word_boundary_not_substring() {
+        // A bare `rm` pattern must match the real command but NOT words that merely contain "rm"
+        // (the substring false positive: "terminal".contains("rm") is true).
+        let patterns = vec!["rm".to_string()];
+        assert!(should_require_shell_approval("rm -rf /tmp/x", &patterns));
+        assert!(should_require_shell_approval("echo hi && rm file", &patterns));
+        assert!(!should_require_shell_approval("terminal --help", &patterns));
+        assert!(!should_require_shell_approval("warm up the cache", &patterns));
+        assert!(!should_require_shell_approval("npm run platform", &patterns));
+        assert!(!should_require_shell_approval("check firmware", &patterns));
+    }
+
+    #[test]
+    fn empty_pattern_does_not_force_approval_on_everything() {
+        // `contains("")` is always true; an empty/whitespace pattern must be ignored.
+        let patterns = vec!["".to_string(), "   ".to_string()];
+        assert!(!should_require_shell_approval("ls -la", &patterns));
+        // An empty pattern alongside a real one must not suppress the real match.
+        let mixed = vec!["".to_string(), "rm -rf".to_string()];
+        assert!(should_require_shell_approval("rm -rf /tmp/x", &mixed));
+        assert!(!should_require_shell_approval("ls", &mixed));
+    }
+
+    #[test]
+    fn approval_reply_is_deny_default() {
+        // The regression: "do not approve" must NOT grant.
+        assert!(!shell_approval_reply_is_grant("do not approve"));
+        assert!(!shell_approval_reply_is_grant("don't approve"));
+        assert!(!shell_approval_reply_is_grant("deny"));
+        assert!(!shell_approval_reply_is_grant("no"));
+        assert!(!shell_approval_reply_is_grant("reject this"));
+        assert!(!shell_approval_reply_is_grant(""));
+        assert!(!shell_approval_reply_is_grant("   "));
+        // Ambiguous / unrelated text is denied (safe default).
+        assert!(!shell_approval_reply_is_grant("hmm let me think"));
+        // Affirmative word buried in a negative reply must NOT grant (the denylist gap).
+        assert!(!shell_approval_reply_is_grant("never approve"));
+        assert!(!shell_approval_reply_is_grant("i can't approve"));
+        assert!(!shell_approval_reply_is_grant("approve? actually nope"));
+        assert!(!shell_approval_reply_is_grant("disapprove"));
+        assert!(!shell_approval_reply_is_grant("i approve... no wait, deny"));
+        // Explicit grants (incl. affirmative + neutral filler).
+        assert!(shell_approval_reply_is_grant("approve"));
+        assert!(shell_approval_reply_is_grant("Approved"));
+        assert!(shell_approval_reply_is_grant("yes"));
+        assert!(shell_approval_reply_is_grant("ok"));
+        assert!(shell_approval_reply_is_grant("allow"));
+        assert!(shell_approval_reply_is_grant("approve please"));
+        assert!(shell_approval_reply_is_grant("approve this"));
+        assert!(shell_approval_reply_is_grant("go ahead"));
+        // "do" is neutral filler: it rescues genuine affirmatives ("yes do it") without weakening
+        // deny-default — a negation always carries another non-filler token (see "do not approve"
+        // above), and "do" on its own is not affirmative.
+        assert!(shell_approval_reply_is_grant("yes do it"));
+        assert!(shell_approval_reply_is_grant("yes, please do"));
+        assert!(!shell_approval_reply_is_grant("do it"));
     }
 }
 
@@ -613,8 +748,9 @@ async fn execute_tool_call_with_activity(
                                 .await;
                             match ask_result {
                                 Ok(reply) => {
-                                    let approved = reply.to_ascii_lowercase().contains("approve")
-                                        && !reply.to_ascii_lowercase().contains("deny");
+                                    // Deny-default parse: an explicit grant runs; anything else
+                                    // (incl. "do not approve") skips execution.
+                                    let approved = shell_approval_reply_is_grant(&reply);
                                     if !approved {
                                         let _ = outbound_tx
                                             .send(BusMessage::Telemetry(
