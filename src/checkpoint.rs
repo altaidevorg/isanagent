@@ -98,9 +98,36 @@ impl CheckpointStore {
     /// Bound disk growth: keep only the most recent [`MAX_CHECKPOINTS`], pruning the oldest.
     /// Best-effort — a prune failure never fails the snapshot.
     fn prune(&self) {
-        let entries = self.list(); // newest first
-        for e in entries.iter().skip(MAX_CHECKPOINTS) {
-            let _ = std::fs::remove_dir_all(self.root.join(&e.id));
+        let Ok(rd) = std::fs::read_dir(&self.root) else {
+            return;
+        };
+        // Sort checkpoint dirs by mtime (≈ creation time — a checkpoint is written once and never
+        // modified afterwards) rather than reading and JSON-parsing every meta.json. prune runs on
+        // every snapshot, so this keeps it O(n) syscalls instead of O(n) file reads + parses.
+        let mut dirs: Vec<(PathBuf, std::time::SystemTime)> = rd
+            .flatten()
+            .filter_map(|e| {
+                // Use the dirent `file_type()` (populated from `d_type` without a stat syscall on
+                // Linux/macOS) instead of `path().is_dir()`. It also does NOT follow symlinks, so a
+                // stray symlink dropped into the store is skipped rather than traversed. filter_map
+                // resolves `e.path()` once instead of in both a filter and a map.
+                if !e.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                    return None;
+                }
+                let modified = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                Some((e.path(), modified))
+            })
+            .collect();
+        if dirs.len() <= MAX_CHECKPOINTS {
+            return;
+        }
+        dirs.sort_by_key(|(_, modified)| *modified); // oldest first
+        let to_remove = dirs.len() - MAX_CHECKPOINTS;
+        for (path, _) in dirs.into_iter().take(to_remove) {
+            let _ = std::fs::remove_dir_all(path);
         }
     }
 
@@ -155,15 +182,13 @@ impl CheckpointStore {
             Ok(format!("Restored {} from checkpoint {}.", m.path, id))
         } else {
             // The snapshotted edit created the file; undo = remove it. `remove_file` unlinks a
-            // symlink itself (not its target), so a lexical containment check is sufficient here.
-            if let Some(base) = &self.base {
-                if !target.starts_with(base) {
-                    return Err(
-                        "checkpoint target is outside the workspace; refusing to restore".to_string(),
-                    );
-                }
-            }
-            match std::fs::remove_file(&target) {
+            // symlink itself (not its target) at the FINAL component, but it still traverses
+            // symlinks in PARENT directories — so a lexical `starts_with(base)` check is not enough:
+            // an agent could swap a parent dir for a symlink after the snapshot and redirect the
+            // unlink outside the sandbox (TOCTOU). Resolve the parent through the canonicalizing
+            // boundary and rejoin the final component before deleting.
+            let safe_target = self.safe_delete_target(&target)?;
+            match std::fs::remove_file(&safe_target) {
                 Ok(()) => Ok(format!(
                     "Removed {} (it was created after checkpoint {}).",
                     m.path, id
@@ -192,6 +217,43 @@ impl CheckpointStore {
         }
         crate::tools::builtin::resolve_path(raw, base, true)
             .map_err(|e| format!("checkpoint target rejected: {e}"))
+    }
+
+    /// Resolve a safe target for a restore *delete* (undo of a created file), closing the
+    /// parent-symlink/TOCTOU escape. In unrestricted mode (`base == None`) the recorded path is used
+    /// as-is. In restricted mode the parent directory is re-resolved through `resolve_path` (which
+    /// canonicalizes, rejecting a parent that escapes the boundary) and the original final component
+    /// is rejoined — so a parent symlink can't redirect the unlink, while a symlink *at* the final
+    /// component is still unlinked itself (not its target), which is the correct undo.
+    fn safe_delete_target(&self, target: &Path) -> Result<PathBuf, String> {
+        let Some(base) = &self.base else {
+            return Ok(target.to_path_buf());
+        };
+        let parent = target
+            .parent()
+            .ok_or_else(|| "checkpoint target has no parent directory".to_string())?;
+        let safe_parent = crate::tools::builtin::resolve_path(&parent.to_string_lossy(), base, true)
+            .map_err(|e| format!("checkpoint target parent rejected: {e}"))?;
+        // Defense in depth: `resolve_path` canonicalizes *existing* components but appends a
+        // non-existent trailing component lexically, so it can return a path whose final parent
+        // segment was not actually resolved through the symlink boundary. Re-check the resolved
+        // parent here and refuse if it is itself a symlink — mirroring the final-component guard on
+        // the write path (`safe_write_target`). A missing parent is fine: the created file is then
+        // already gone, and the caller's NotFound arm reports it as "already absent". This narrows
+        // the residual window to a sub-`remove_file` race; a fully race-free unlink would require
+        // `openat2(RESOLVE_NO_SYMLINKS)` + `unlinkat` (tracked as a follow-up).
+        match std::fs::symlink_metadata(&safe_parent) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err("checkpoint target parent is now a symlink; refusing to delete".to_string())
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("checkpoint target parent stat: {e}")),
+        }
+        let file_name = target
+            .file_name()
+            .ok_or_else(|| "checkpoint target has no file name".to_string())?;
+        Ok(safe_parent.join(file_name))
     }
 }
 
@@ -355,6 +417,42 @@ mod tests {
         let res = store.restore(&id);
         assert!(res.is_err(), "must refuse a symlinked target: {res:?}");
         assert!(!outside.exists(), "must not write through the symlink");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_delete_refuses_parent_symlink_escape() {
+        // Undo of a *created* file deletes it. A lexical containment check would miss a TOCTOU where
+        // a PARENT directory is swapped for a symlink pointing outside the sandbox: `remove_file`
+        // follows parent symlinks, so it would unlink a victim file outside the workspace.
+        let (base, store) = temp();
+        let sub = base.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let created = sub.join("created.txt");
+        store.snapshot(&created, "write_file").unwrap(); // file doesn't exist yet -> records creation
+        std::fs::write(&created, "created").unwrap();
+        let id = store.list()[0].id.clone();
+        assert!(!store.list()[0].existed);
+
+        // A victim outside the sandbox, reachable only by redirecting the parent dir.
+        let outside_dir =
+            std::env::temp_dir().join(format!("isan_victim_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let victim = outside_dir.join("created.txt");
+        std::fs::write(&victim, "do not delete me").unwrap();
+
+        // Swap base/sub for a symlink -> outside_dir (TOCTOU on a parent component).
+        std::fs::remove_dir_all(&sub).unwrap();
+        std::os::unix::fs::symlink(&outside_dir, &sub).unwrap();
+
+        let res = store.restore(&id);
+        assert!(res.is_err(), "must refuse a parent-symlink escape: {res:?}");
+        assert!(
+            victim.exists(),
+            "must not delete the file outside the sandbox"
+        );
+        let _ = std::fs::remove_dir_all(&outside_dir);
         let _ = std::fs::remove_dir_all(&base);
     }
 
