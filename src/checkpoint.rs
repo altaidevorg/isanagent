@@ -106,13 +106,19 @@ impl CheckpointStore {
         // every snapshot, so this keeps it O(n) syscalls instead of O(n) file reads + parses.
         let mut dirs: Vec<(PathBuf, std::time::SystemTime)> = rd
             .flatten()
-            .filter(|e| e.path().is_dir())
-            .map(|e| {
+            .filter_map(|e| {
+                // Use the dirent `file_type()` (populated from `d_type` without a stat syscall on
+                // Linux/macOS) instead of `path().is_dir()`. It also does NOT follow symlinks, so a
+                // stray symlink dropped into the store is skipped rather than traversed. filter_map
+                // resolves `e.path()` once instead of in both a filter and a map.
+                if !e.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                    return None;
+                }
                 let modified = e
                     .metadata()
                     .and_then(|m| m.modified())
                     .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                (e.path(), modified)
+                Some((e.path(), modified))
             })
             .collect();
         if dirs.len() <= MAX_CHECKPOINTS {
@@ -228,6 +234,22 @@ impl CheckpointStore {
             .ok_or_else(|| "checkpoint target has no parent directory".to_string())?;
         let safe_parent = crate::tools::builtin::resolve_path(&parent.to_string_lossy(), base, true)
             .map_err(|e| format!("checkpoint target parent rejected: {e}"))?;
+        // Defense in depth: `resolve_path` canonicalizes *existing* components but appends a
+        // non-existent trailing component lexically, so it can return a path whose final parent
+        // segment was not actually resolved through the symlink boundary. Re-check the resolved
+        // parent here and refuse if it is itself a symlink — mirroring the final-component guard on
+        // the write path (`safe_write_target`). A missing parent is fine: the created file is then
+        // already gone, and the caller's NotFound arm reports it as "already absent". This narrows
+        // the residual window to a sub-`remove_file` race; a fully race-free unlink would require
+        // `openat2(RESOLVE_NO_SYMLINKS)` + `unlinkat` (tracked as a follow-up).
+        match std::fs::symlink_metadata(&safe_parent) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err("checkpoint target parent is now a symlink; refusing to delete".to_string())
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("checkpoint target parent stat: {e}")),
+        }
         let file_name = target
             .file_name()
             .ok_or_else(|| "checkpoint target has no file name".to_string())?;
