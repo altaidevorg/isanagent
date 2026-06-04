@@ -1908,6 +1908,125 @@ impl AgentLogic {
     }
 }
 
+/// A configured alternate LLM provider to fail over to when the primary's retries are exhausted.
+/// Holds everything [`crate::provider::create_provider`] needs; resolved once at startup from the
+/// `[providers.*]` config.
+#[derive(Clone)]
+pub struct FallbackProviderSpec {
+    pub provider_name: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub model_name: String,
+}
+
+// Manual `Debug` so a stray `{:?}` can never dump the API key into a log.
+impl std::fmt::Debug for FallbackProviderSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FallbackProviderSpec")
+            .field("provider_name", &self.provider_name)
+            .field("base_url", &self.base_url)
+            .field("api_key", &"[redacted]")
+            .field("model_name", &self.model_name)
+            .finish()
+    }
+}
+
+/// Filter `candidates` to genuine fallbacks: drop any whose (provider, base_url, model) matches the
+/// active primary, so the primary is never retried as its own fallback. Matching the full identity
+/// (not just provider+model) correctly excludes the primary even when it came from the `[provider]`
+/// default block rather than the `[providers.*]` map a candidate was built from.
+pub fn build_fallback_specs(
+    primary_provider: &str,
+    primary_base_url: &str,
+    primary_model: &str,
+    candidates: Vec<FallbackProviderSpec>,
+) -> Vec<FallbackProviderSpec> {
+    candidates
+        .into_iter()
+        .filter(|c| {
+            !(c.provider_name == primary_provider
+                && c.base_url == primary_base_url
+                && c.model_name == primary_model)
+        })
+        .collect()
+}
+
+/// Process-wide fallback providers, set once at startup (like the primary, these are config).
+/// Empty until set, so failover is simply inert when unconfigured or in tests.
+static FALLBACK_PROVIDERS: std::sync::OnceLock<Vec<FallbackProviderSpec>> = std::sync::OnceLock::new();
+
+/// Install the fallback provider list. Call once at startup, after the primary is built; a second
+/// call is ignored (OnceLock). **Do not call from tests** — the `OnceLock` can't be reset, so it
+/// would pollute every other test in the binary. Tests drive [`try_fallbacks`] directly instead.
+pub fn set_fallback_providers(specs: Vec<FallbackProviderSpec>) {
+    let _ = FALLBACK_PROVIDERS.set(specs);
+}
+
+fn fallback_providers() -> &'static [FallbackProviderSpec] {
+    FALLBACK_PROVIDERS.get().map(Vec::as_slice).unwrap_or(&[])
+}
+
+/// Result of attempting the configured fallback providers.
+enum FallbackOutcome {
+    Ok(crate::utils::LLMResponse),
+    Cancelled,
+    Exhausted,
+}
+
+/// Borrowed logging identity for the failover loop (bundled to keep the arg count in check).
+struct FailoverLogCtx<'a> {
+    logger_tx: &'a LoggerHandle,
+    name: &'a str,
+    chat_id: &'a str,
+}
+
+/// Try each fallback provider **once**, returning the first successful response. `build` constructs
+/// a provider from a spec — real code passes [`crate::provider::create_provider`]; tests inject a
+/// mock builder, keeping this loop fully testable without network. Cancellation preempts a
+/// fallback chat.
+async fn try_fallbacks<F>(
+    fallbacks: &[FallbackProviderSpec],
+    build: F,
+    context: &[crate::utils::ChatMessage],
+    tools_payload: &Option<serde_json::Value>,
+    cancel_token: &tokio_util::sync::CancellationToken,
+    log: FailoverLogCtx<'_>,
+) -> FallbackOutcome
+where
+    F: Fn(&FallbackProviderSpec) -> Box<dyn crate::traits::Provider>,
+{
+    for spec in fallbacks {
+        let _ = log.logger_tx.send(BusMessage::Log(
+            LogEvent::warn(
+                log.name,
+                &format!(
+                    "Primary LLM exhausted; failing over to provider={} model={}",
+                    spec.provider_name, spec.model_name
+                ),
+            )
+            .with_chat_id(log.chat_id),
+        ));
+        let provider = build(spec);
+        let res = tokio::select! {
+            r = provider.chat(context, tools_payload.clone()) => r,
+            _ = cancel_token.cancelled() => return FallbackOutcome::Cancelled,
+        };
+        match res {
+            Ok(resp) => return FallbackOutcome::Ok(resp),
+            Err(e) => {
+                let _ = log.logger_tx.send(BusMessage::Log(
+                    LogEvent::warn(
+                        log.name,
+                        &format!("Fallback provider={} failed: {}", spec.provider_name, e),
+                    )
+                    .with_chat_id(log.chat_id),
+                ));
+            }
+        }
+    }
+    FallbackOutcome::Exhausted
+}
+
 /// Outcome of a `provider.chat` invocation that may be retried for transient errors.
 enum ChatRetryOutcome {
     Ok(crate::utils::LLMResponse),
@@ -1996,6 +2115,30 @@ async fn chat_with_retry(
             }
         }
     }
+    // Primary exhausted. Before surfacing a failure, try each configured fallback provider once, so
+    // a transient outage / key rotation / model deprecation on the primary doesn't drop a long
+    // unattended turn. The primary stays the active provider — failover is per-call.
+    match try_fallbacks(
+        fallback_providers(),
+        |s| {
+            crate::provider::create_provider(&s.provider_name, &s.base_url, &s.api_key, &s.model_name)
+        },
+        context,
+        &tools_payload,
+        cancel_token,
+        FailoverLogCtx {
+            logger_tx,
+            name,
+            chat_id,
+        },
+    )
+    .await
+    {
+        FallbackOutcome::Ok(resp) => return ChatRetryOutcome::Ok(resp),
+        FallbackOutcome::Cancelled => return ChatRetryOutcome::Cancelled,
+        FallbackOutcome::Exhausted => {}
+    }
+
     ChatRetryOutcome::Failed(
         last_err
             .map(|e| e.to_string())
@@ -3408,6 +3551,162 @@ mod tests {
         ) -> Result<LLMResponse, LLMError> {
             Err(LLMError::ApiError("Status 400 bad request".into()))
         }
+    }
+
+    /// Returns `Ok` with `content` set to `tag` — a stand-in for a working fallback provider.
+    #[derive(Clone)]
+    struct RespondingProvider {
+        tag: String,
+    }
+
+    #[async_trait]
+    impl Provider for RespondingProvider {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<serde_json::Value>,
+        ) -> Result<LLMResponse, LLMError> {
+            Ok(LLMResponse {
+                content: self.tag.clone(),
+                tool_calls: None,
+                reasoning_content: None,
+                usage: None,
+            })
+        }
+    }
+
+    fn fb_spec(name: &str) -> super::FallbackProviderSpec {
+        super::FallbackProviderSpec {
+            provider_name: name.to_string(),
+            base_url: String::new(),
+            api_key: String::new(),
+            model_name: format!("{name}-model"),
+        }
+    }
+
+    fn fb_full(provider: &str, base: &str, model: &str) -> super::FallbackProviderSpec {
+        super::FallbackProviderSpec {
+            provider_name: provider.to_string(),
+            base_url: base.to_string(),
+            api_key: "k".to_string(),
+            model_name: model.to_string(),
+        }
+    }
+
+    #[test]
+    fn build_fallback_specs_excludes_primary_by_full_identity() {
+        let candidates = vec![
+            fb_full("anthropic", "https://api.anthropic.com", "claude"), // == primary
+            fb_full("openai", "https://api.openai.com", "gpt-4o"),
+        ];
+        let out = super::build_fallback_specs(
+            "anthropic",
+            "https://api.anthropic.com",
+            "claude",
+            candidates,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].provider_name, "openai");
+    }
+
+    #[test]
+    fn build_fallback_specs_keeps_same_provider_different_model_or_url() {
+        // Same provider but a different model — a legitimate fallback, must be kept.
+        let candidates = vec![
+            fb_full("openai", "u", "gpt-4o-mini"),
+            fb_full("openai", "u2", "gpt-4o"), // same provider+model, different base_url -> kept
+        ];
+        let out = super::build_fallback_specs("openai", "u", "gpt-4o", candidates);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn fallback_spec_debug_redacts_api_key() {
+        let dbg = format!("{:?}", fb_full("openai", "u", "m"));
+        assert!(dbg.contains("[redacted]"), "{dbg}");
+        assert!(!dbg.contains("\"k\""), "api key must not appear: {dbg}");
+    }
+
+    #[tokio::test]
+    async fn try_fallbacks_returns_first_success() {
+        let (logger, _rx) = crate::logging::create_logger_channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let specs = vec![fb_spec("a"), fb_spec("b")];
+        // 'a' fails, 'b' succeeds -> first success wins, 'b' chosen.
+        let out = super::try_fallbacks(
+            &specs,
+            |s| -> Box<dyn Provider> {
+                if s.provider_name == "b" {
+                    Box::new(RespondingProvider { tag: "b-ok".into() })
+                } else {
+                    Box::new(NonTransientErrorProvider)
+                }
+            },
+            &[],
+            &None,
+            &cancel,
+            super::FailoverLogCtx { logger_tx: &logger, name: "agent", chat_id: "c1" },
+        )
+        .await;
+        match out {
+            super::FallbackOutcome::Ok(r) => assert_eq!(r.content, "b-ok"),
+            _ => panic!("expected Ok from fallback b"),
+        }
+    }
+
+    #[tokio::test]
+    async fn try_fallbacks_all_fail_is_exhausted() {
+        let (logger, _rx) = crate::logging::create_logger_channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let specs = vec![fb_spec("a"), fb_spec("b")];
+        let out = super::try_fallbacks(
+            &specs,
+            |_| -> Box<dyn Provider> { Box::new(NonTransientErrorProvider) },
+            &[],
+            &None,
+            &cancel,
+            super::FailoverLogCtx { logger_tx: &logger, name: "agent", chat_id: "c1" },
+        )
+        .await;
+        assert!(matches!(out, super::FallbackOutcome::Exhausted));
+    }
+
+    #[tokio::test]
+    async fn try_fallbacks_empty_is_exhausted() {
+        let (logger, _rx) = crate::logging::create_logger_channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let out = super::try_fallbacks(
+            &[],
+            |_| -> Box<dyn Provider> { Box::new(RespondingProvider { tag: "x".into() }) },
+            &[],
+            &None,
+            &cancel,
+            super::FailoverLogCtx { logger_tx: &logger, name: "agent", chat_id: "c1" },
+        )
+        .await;
+        assert!(matches!(out, super::FallbackOutcome::Exhausted));
+    }
+
+    #[tokio::test]
+    async fn try_fallbacks_cancellation_short_circuits() {
+        let (logger, _rx) = crate::logging::create_logger_channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel(); // pre-cancelled; the slow provider's chat never wins the select
+        let specs = vec![fb_spec("a")];
+        let out = super::try_fallbacks(
+            &specs,
+            |_| -> Box<dyn Provider> {
+                Box::new(LongSleepProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                })
+            },
+            &[],
+            &None,
+            &cancel,
+            super::FailoverLogCtx { logger_tx: &logger, name: "agent", chat_id: "c1" },
+        )
+        .await;
+        assert!(matches!(out, super::FallbackOutcome::Cancelled));
     }
 
     #[derive(Clone)]
