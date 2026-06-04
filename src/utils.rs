@@ -763,6 +763,68 @@ pub fn truncate_utf8_safe(s: &mut String, max_bytes: usize, suffix: &str) {
     s.push_str(suffix);
 }
 
+/// Whether a tool's *in-band* `Ok(...)` payload should be treated as a failure (`is_error`),
+/// scoped to the specific tools that report recoverable failures inside `Ok(...)` rather than
+/// via `Err`.
+///
+/// This is the precise counterpart to [`tool_output_looks_like_failure`] (which the UI layer in
+/// `channels/terminal.rs` still uses for result tinting). That helper does a text-only prefix
+/// check on *every* tool's *finalized* output, which has two failure modes this function closes:
+///
+/// 1. **Non-zero exit codes are missed.** `exec`/`python_run` report failure by appending a
+///    trailing `Exit code: <N>` line — not by starting with `"Error:"`. A failed `cargo build`
+///    (exit 1 with output that does not begin `"Error:"`) would be recorded as a *success*. Here
+///    we tail-anchor on the runner's `Exit code:` marker instead.
+/// 2. **File content is false-flagged.** A text-only check applied to *all* tools misclassifies
+///    `read_file` returning a log/file that legitimately begins with `"Error:"`. Here the
+///    `"Error:"` prefix rule is restricted to exactly the tools whose entire `Ok` payload is a
+///    control message: `edit_file` / `list_dir` / `glob_files` / `search_text` (plus `list_dir`'s
+///    `"Error reading dir:"` variant). That is the complete set of tools using the `"Error:"`
+///    *prefix* convention in `tools/builtin.rs`; `read_file` and every other content-returning tool
+///    are excluded. (A few tools report failures in other phrasings — e.g. `cron` returns
+///    `"Job <id> was not found"` — which neither this nor the prior text-only check flags; those
+///    are low-risk, non-state-corrupting, and the message text still informs the model.)
+///
+/// `raw_output` must be the **pre-truncation** `Ok` payload: the `Exit code:` marker sits at the
+/// tail and the agent's `finalize_tool_output` would truncate it away. `exec` additionally appends
+/// the marker *after* its grep advisory and its internal 10 KB cap, so it is always the final line
+/// of its own payload and tail-anchoring is sound.
+///
+/// Known, accepted residual: a successful command whose own output's final line is literally
+/// `Exit code: <non-zero>` is a false positive. Low-frequency; the only consequence is a spurious
+/// `is_error` (a possible wasted retry, never a masked real failure), so it is tolerated rather
+/// than papered over with brittle text gymnastics.
+pub fn tool_output_signals_failure(tool_name: &str, raw_output: &str) -> bool {
+    if matches!(tool_name, "exec" | "python_run") {
+        if let Some(last) = raw_output.lines().rev().find(|l| !l.trim().is_empty()) {
+            if let Some(code) = last.trim().strip_prefix("Exit code:") {
+                if code.trim().parse::<i64>().is_ok_and(|c| c != 0) {
+                    return true;
+                }
+            }
+        }
+    }
+    if matches!(tool_name, "edit_file" | "list_dir" | "glob_files" | "search_text") {
+        let head = raw_output.trim_start();
+        if head.starts_with("Error:") || head.starts_with("Error reading dir:") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a completed tool call should be recorded as a failure (`is_error`): the dispatch
+/// `Result` was `Err`, or an `Ok` payload signals an in-band failure (see
+/// [`tool_output_signals_failure`]). Single source of truth for both tool-result sites in the
+/// reasoning loop. Pass the **raw** `Result` (before `finalize_tool_output`) so the runner exit
+/// marker is still present at the tail.
+pub fn tool_call_is_error(tool_name: &str, result: &Result<String, String>) -> bool {
+    match result {
+        Err(_) => true,
+        Ok(raw) => tool_output_signals_failure(tool_name, raw),
+    }
+}
+
 /// Robustly extracts a JSON object from a raw LLM text response.
 /// Intended to handle markdown formatting (` ```json ... ``` `)
 /// or conversational wrappers around the core `{ ... }` payload.
@@ -912,5 +974,125 @@ mod tests {
             "grep found 'Error:' in 2 logs"
         ));
         assert!(!tool_output_looks_like_failure(""));
+    }
+
+    #[test]
+    fn inband_failure_detects_nonzero_exit_for_runners() {
+        // exec / python_run append a trailing "Exit code: <N>" only on non-zero exit.
+        assert!(tool_output_signals_failure(
+            "exec",
+            "some stdout\nSTDERR:\nboom\nExit code: 1"
+        ));
+        assert!(tool_output_signals_failure(
+            "python_run",
+            "Traceback ...\nExit code: 2"
+        ));
+        // Negative exit (signal / unknown) still counts as failure.
+        assert!(tool_output_signals_failure("exec", "killed\nExit code: -1"));
+    }
+
+    #[test]
+    fn inband_failure_ignores_successful_runner_output() {
+        // No trailing exit marker -> success.
+        assert!(!tool_output_signals_failure("exec", "build succeeded\nall good"));
+        assert!(!tool_output_signals_failure("python_run", "42\n"));
+        // "(no output)" sentinel must not be treated as failure.
+        assert!(!tool_output_signals_failure("exec", "(no output)"));
+    }
+
+    #[test]
+    fn inband_failure_is_anchored_to_the_last_line() {
+        // An "Exit code: 1" line in the MIDDLE of output (e.g. a cat'd log) where the command
+        // itself succeeded must NOT be flagged — only the trailing runner marker counts.
+        let log = "old run log:\nExit code: 1\n--- new run ---\ndone";
+        assert!(!tool_output_signals_failure("exec", log));
+    }
+
+    #[test]
+    fn inband_failure_detects_error_prefix_for_scoped_tools() {
+        assert!(tool_output_signals_failure(
+            "edit_file",
+            "Error: old_text not found in file."
+        ));
+        assert!(tool_output_signals_failure(
+            "list_dir",
+            "Error reading dir: permission denied"
+        ));
+        assert!(tool_output_signals_failure(
+            "glob_files",
+            "Error: path not found: /nope"
+        ));
+        // Normal listings/results are not failures.
+        assert!(!tool_output_signals_failure(
+            "search_text",
+            "src/main.rs:10: fn main() {"
+        ));
+        assert!(!tool_output_signals_failure("list_dir", "foo/\nbar.rs\nbaz.rs"));
+    }
+
+    #[test]
+    fn inband_failure_does_not_misclassify_file_content() {
+        // read_file returns raw file content and is intentionally NOT scoped for the "Error:"
+        // prefix rule: a file that legitimately begins with "Error:" must not look like a failure.
+        // This is the key false positive the broader text-only check (tool_output_looks_like_failure)
+        // would hit; the tool-scoped check fixes it.
+        assert!(!tool_output_signals_failure(
+            "read_file",
+            "Error: this is line one of a saved log file"
+        ));
+        // Likewise the exit rule is scoped to the runners only.
+        assert!(!tool_output_signals_failure("read_file", "build.log\nExit code: 7"));
+        // An unrelated tool with an "Error:"-looking payload is left alone.
+        assert!(!tool_output_signals_failure(
+            "web_search",
+            "Error: how to fix a 500 — top results ..."
+        ));
+    }
+
+    #[test]
+    fn inband_failure_exit_code_edge_cases() {
+        // Explicit zero (the runners never emit this, but the parser must treat it as success).
+        assert!(!tool_output_signals_failure("exec", "done\nExit code: 0"));
+        // Non-numeric / garbage after the prefix -> not a failure signal.
+        assert!(!tool_output_signals_failure("exec", "huh\nExit code: abc"));
+        // Empty / whitespace-only output -> no signal.
+        assert!(!tool_output_signals_failure("exec", "   \n  "));
+        assert!(!tool_output_signals_failure("python_run", ""));
+    }
+
+    #[test]
+    fn inband_failure_known_residual_spoofed_exit_marker() {
+        // Documented, accepted false positive: a *successful* command whose own final line forges
+        // the marker. Locked in as intentional so a future change is a conscious decision, not a
+        // silent regression. Consequence is at most a spurious retry, never a masked real failure.
+        assert!(tool_output_signals_failure("exec", "echo test\nExit code: 1"));
+    }
+
+    #[test]
+    fn tool_call_is_error_combines_dispatch_and_in_band() {
+        // Dispatch-level failure.
+        assert!(tool_call_is_error(
+            "exec",
+            &Err("Failed to execute command".to_string())
+        ));
+        assert!(tool_call_is_error("read_file", &Err("not found".to_string())));
+        // In-band failures surfaced through `Ok`.
+        assert!(tool_call_is_error(
+            "edit_file",
+            &Ok("Error: old_text not found in file.".to_string())
+        ));
+        assert!(tool_call_is_error(
+            "python_run",
+            &Ok("Traceback ...\nExit code: 1".to_string())
+        ));
+        // Genuine successes.
+        assert!(!tool_call_is_error(
+            "exec",
+            &Ok("build succeeded".to_string())
+        ));
+        assert!(!tool_call_is_error(
+            "read_file",
+            &Ok("Error: line one of a log file".to_string())
+        ));
     }
 }

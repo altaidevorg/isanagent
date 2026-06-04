@@ -1000,29 +1000,33 @@ impl Tool for ShellExecTool {
                     result.push_str(&stderr);
                 }
 
-                if !output.status.success() {
-                    result.push_str(&format!(
-                        "\nExit code: {}",
-                        output.status.code().unwrap_or(-1)
-                    ));
-                }
+                // Compute the non-zero exit marker but append it LAST — after the grep advisory
+                // and after the size-truncation — so it always survives as the final line. The
+                // agent derives `is_error` by tail-anchoring on this marker
+                // (`utils::tool_output_signals_failure`); if the advisory or the truncation notice
+                // trailed it, a genuine non-zero exit on grep-like or large (>10 KB) output would
+                // be silently recorded as a success and the model would build on broken state.
+                let exit_marker = (!output.status.success())
+                    .then(|| format!("\nExit code: {}", output.status.code().unwrap_or(-1)));
 
-                if result.is_empty() {
+                if result.is_empty() && exit_marker.is_none() {
                     Ok("(no output)".to_string())
                 } else {
                     if grep_like {
                         result.push_str("\n\n[advisory] Prefer `search_text` for code/log discovery and `read_file` for file reads; shell grep/cat pipelines are less portable across hosts.");
                     }
-                    // Truncate if massive
+                    // Truncate if massive (the exit marker is appended afterwards, so it is never cut).
                     if result.len() > 10000 {
-                        Ok(format!(
+                        result = format!(
                             "{}\n... (truncated, {} more chars)",
                             &result[..10000],
                             result.len() - 10000
-                        ))
-                    } else {
-                        Ok(result)
+                        );
                     }
+                    if let Some(marker) = exit_marker {
+                        result.push_str(&marker);
+                    }
+                    Ok(result)
                 }
             }
             Ok(Err(e)) => Err(format!("Failed to execute command: {}", e)),
@@ -2318,6 +2322,11 @@ impl Tool for PythonRunTool {
             result.push_str(&stderr);
         }
 
+        // Keep this the LAST append to `result`: the agent tail-anchors on the final `Exit code:`
+        // line to derive is_error (utils::tool_output_signals_failure). python_run currently has no
+        // grep advisory and no size truncation, so the marker is already the final line; if either
+        // is ever added here, append it BEFORE this marker (see the exec path in ShellExecTool,
+        // which appends the marker last for exactly this invariant).
         if !output.status.success() {
             result.push_str(&format!(
                 "\nExit code: {}",
@@ -2566,5 +2575,65 @@ mod python_run_tests {
         }
         assert!(out.contains("hello from python"));
         let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod exec_failure_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn exec_tool() -> ShellExecTool {
+        let root = std::env::temp_dir().join(format!("isanagent_exec_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        ShellExecTool {
+            workspace_dir: root,
+            restrict_to_workspace: false,
+        }
+    }
+
+    fn last_nonempty_line(s: &str) -> &str {
+        s.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("")
+    }
+
+    /// Large (>10 KB) failing output: the internal truncation must NOT cut the `Exit code:` marker,
+    /// and the agent's `is_error` heuristic must flag it. Regression guard for the truncation gap.
+    #[tokio::test]
+    async fn large_failing_output_keeps_exit_marker_last() {
+        let out = exec_tool()
+            .execute(json!({
+                "command": "i=0; while [ $i -lt 1500 ]; do echo xxxxxxxxxx; i=$((i+1)); done; exit 7"
+            }))
+            .await
+            .expect("exec returns Ok with the captured output");
+        assert!(out.len() > 10_000, "expected truncation to engage: {}", out.len());
+        assert!(out.contains("(truncated,"), "expected truncation notice");
+        assert_eq!(last_nonempty_line(&out), "Exit code: 7");
+        assert!(crate::utils::tool_output_signals_failure("exec", &out));
+    }
+
+    /// grep-like failing command: the advisory must not trail (and thus hide) the exit marker.
+    #[tokio::test]
+    async fn grep_like_failure_keeps_exit_marker_last() {
+        let out = exec_tool()
+            .execute(json!({
+                "command": "grep zzz /isanagent/definitely/missing/path/xyz; exit 2"
+            }))
+            .await
+            .expect("exec returns Ok");
+        assert!(out.contains("[advisory]"), "grep-like advisory expected: {out}");
+        assert_eq!(last_nonempty_line(&out), "Exit code: 2");
+        assert!(crate::utils::tool_output_signals_failure("exec", &out));
+    }
+
+    /// A successful command is never flagged and carries no exit marker.
+    #[tokio::test]
+    async fn successful_command_has_no_exit_marker() {
+        let out = exec_tool()
+            .execute(json!({ "command": "echo ok" }))
+            .await
+            .expect("exec returns Ok");
+        assert!(!out.contains("Exit code:"), "no marker on success: {out}");
+        assert!(!crate::utils::tool_output_signals_failure("exec", &out));
     }
 }
