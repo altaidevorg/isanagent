@@ -21,6 +21,7 @@ pub mod onboarding;
 pub mod onboarding_interactive;
 pub mod provider;
 pub mod provider_registry;
+pub mod redact;
 pub mod reflection;
 pub mod scheduler;
 pub mod session;

@@ -186,10 +186,14 @@ impl LoggingActor {
     }
 
     fn write_conversation(&mut self, packet: &BusMessage) -> Result<(), ActorError> {
-        let json_line = match packet {
-            BusMessage::Inbound(inv) => serde_json::to_string(inv),
-            BusMessage::Outbound(out) => serde_json::to_string(out),
-            BusMessage::Telemetry(tel) => serde_json::to_string(tel),
+        // Serialize to a `Value` first so secrets can be redacted before this analytical journal
+        // hits disk — tool results / inbound text routinely carry keys (an `env` dump, an echoed
+        // `$OPENAI_API_KEY`). `conversation.jsonl` is write-only telemetry (agent memory lives in
+        // SQLite), so redaction here never affects what the agent can recall or use.
+        let mut value = match packet {
+            BusMessage::Inbound(inv) => serde_json::to_value(inv),
+            BusMessage::Outbound(out) => serde_json::to_value(out),
+            BusMessage::Telemetry(tel) => serde_json::to_value(tel),
             BusMessage::Log(_) => return Ok(()),
             BusMessage::LoggerControl(_) => return Ok(()),
             BusMessage::Cancel(_) => return Ok(()),
@@ -202,6 +206,11 @@ impl LoggingActor {
             BusMessage::TriggerCompaction { .. } => return Ok(()),
         }
         .map_err(|e| ActorError::from(format!("Failed to serialize conversation event: {}", e)))?;
+
+        crate::redact::shared().redact_json(&mut value);
+        let json_line = serde_json::to_string(&value).map_err(|e| {
+            ActorError::from(format!("Failed to serialize conversation event: {}", e))
+        })?;
 
         writeln!(self.conversation_writer, "{}", json_line)
             .map_err(|e| ActorError::from(format!("Failed to write conversation log: {}", e)))
