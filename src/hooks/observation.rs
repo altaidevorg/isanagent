@@ -59,6 +59,11 @@ pub fn start_observation_hooks(params: ObservationHooksParams) -> Option<Observa
     let webhook_url = params.webhook_url.clone();
     let hmac_secret = params.webhook_hmac_secret.clone();
     let metadata_keys = Arc::new(params.metadata_keys);
+    // Reuse the process-wide static redactor instead of re-scanning the env and recompiling every
+    // pattern here. Applied in the background consumer (off the agent hot path) so a secret that
+    // lands in tool output never reaches the JSONL journal or the third-party webhook. Redacting
+    // here does NOT affect what the executed child or the model sees.
+    let redactor = crate::redact::shared();
 
     tokio::spawn(async move {
         let client = reqwest::Client::builder()
@@ -66,7 +71,8 @@ pub fn start_observation_hooks(params: ObservationHooksParams) -> Option<Observa
             .build()
             .ok();
 
-        while let Some(envelope) = rx.recv().await {
+        while let Some(mut envelope) = rx.recv().await {
+            redactor.redact_json(&mut envelope);
             if let Some(ref path) = jsonl_path {
                 if let Err(e) = append_jsonl(path, &envelope).await {
                     log::warn!("hooks observation jsonl: {}", e);
