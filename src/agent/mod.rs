@@ -151,6 +151,14 @@ fn estimate_context_tokens(context: &[crate::utils::ChatMessage]) -> usize {
     context.iter().map(estimate_message_tokens).sum()
 }
 
+/// Best available context-size estimate for the compaction trigger: the larger of the bytes/4
+/// heuristic and the last LLM call's exact `usage.prompt_tokens`. The heuristic under-counts the
+/// code/JSON/non-English payloads this agent produces, while `prompt_tokens` is the provider's
+/// ground-truth input count — so the max guards against silently overflowing the context window.
+fn effective_context_tokens(estimate: usize, last_prompt_tokens: Option<u32>) -> usize {
+    estimate.max(last_prompt_tokens.unwrap_or(0) as usize)
+}
+
 /// Trim context from the front (oldest messages) to stay within a token budget.
 /// Preserves the system message at index 0 and never splits tool_call/tool pairs.
 /// A marker message is inserted only when messages were actually removed.
@@ -2382,6 +2390,11 @@ impl AgentLogic {
         let mut consecutive_doom_detections: usize = 0;
         // Set when the doom loop persists past the nudge budget; branches the terminal message.
         let mut doom_loop_stuck = false;
+        // Ground-truth input size from the most recent LLM call's `usage.prompt_tokens` (exact,
+        // server-counted). The bytes/4 heuristic under-counts code/JSON/non-English — exactly what
+        // this agent generates — so the compaction trigger uses `max(estimate, last_prompt_tokens)`
+        // to avoid silently overflowing the context window. Updated after each provider response.
+        let mut last_prompt_tokens: Option<u32> = None;
 
         while iterations < max_iterations {
             if cancel_token.is_cancelled() {
@@ -2682,6 +2695,12 @@ impl AgentLogic {
                                     )
                                     .with_chat_id(&inbound.chat_id),
                                 ));
+                                // The context just shrank, so the pre-compaction `prompt_tokens` is
+                                // now stale. Clear it; otherwise, if the retried call returns no
+                                // usage stats (mock/local provider, transient gap), the end-of-turn
+                                // check would read the old huge value via `effective_context_tokens`
+                                // and immediately fire a redundant compaction right after this one.
+                                last_prompt_tokens = None;
                                 // Next iteration refetches context (now smaller due
                                 // to AddSummary + UpdateThreadMetadata) and re-runs
                                 // the chat call. No iteration counter refund — the
@@ -2793,6 +2812,10 @@ impl AgentLogic {
 
             // Log USAGE telemetry
             if let Some(usage) = &response.usage {
+                // Remember the exact server-counted input size for the compaction trigger.
+                if usage.prompt_tokens > 0 {
+                    last_prompt_tokens = Some(usage.prompt_tokens);
+                }
                 let usage_evt = TelemetryEvent::AgentUsage {
                     chat_id: inbound.chat_id.clone(),
                     model: "llm_provider".to_string(),
@@ -3167,7 +3190,15 @@ impl AgentLogic {
                 // Auto-compaction check
                 let current_context = mem.get_context_since_reflection().await?;
                 let user_turns = current_context.iter().filter(|m| m.role == "user").count();
-                let approx_tokens: usize = estimate_context_tokens(&current_context);
+                // Prefer the ground truth: `last_prompt_tokens` is the exact input size the provider
+                // counted for the most recent request, which (at this end-of-turn point) covers
+                // nearly the entire current context — only the just-produced final assistant message
+                // is newer. Taking the max with the bytes/4 estimate corrects the heuristic's
+                // under-count on code/JSON-heavy contexts so a real overflow triggers compaction.
+                let approx_tokens: usize = effective_context_tokens(
+                    estimate_context_tokens(&current_context),
+                    last_prompt_tokens,
+                );
 
                 // PR-3: pull the model's context window from the provider; if known,
                 // tighten the absolute token threshold to whichever is smaller of:
@@ -4247,6 +4278,19 @@ mod tests {
             super::estimate_context_tokens(std::slice::from_ref(&msg)),
             100
         );
+    }
+
+    #[test]
+    fn effective_context_tokens_prefers_ground_truth() {
+        // No usage yet -> fall back to the estimate.
+        assert_eq!(super::effective_context_tokens(1000, None), 1000);
+        // Provider's exact count exceeds the bytes/4 under-estimate -> use the ground truth so a
+        // real overflow still triggers compaction.
+        assert_eq!(super::effective_context_tokens(1000, Some(9000)), 9000);
+        // Estimate larger (e.g. messages added since the last call) -> keep the estimate.
+        assert_eq!(super::effective_context_tokens(9000, Some(1000)), 9000);
+        // A zero ground-truth never lowers the estimate.
+        assert_eq!(super::effective_context_tokens(1000, Some(0)), 1000);
     }
 
     #[tokio::test]
