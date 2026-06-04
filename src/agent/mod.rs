@@ -127,19 +127,36 @@ fn context_has_tool_call(context: &[crate::utils::ChatMessage], tool_name: &str)
 /// Uses char_count / 4 as the token estimate (same heuristic as compaction logic).
 const MAX_CONTEXT_TOKENS_DEFAULT: usize = 120_000;
 
+/// After this many *consecutive* doom-loop detections, stop nudging and terminate the run with a
+/// "stuck" message. Detection itself already requires 3 repeated calls, so this gives the model
+/// two corrective nudges before a hard stop rather than letting it spin to `max_iterations`.
+const DOOM_LOOP_HARD_STOP_AFTER: usize = 3;
+
+/// Approximate token count for one message: text content **plus** tool_call argument bytes, /4.
+/// Counting tool_call args matters for tool-heavy turns — omitting them under-counts the context
+/// and lets the compaction threshold fire late. Shared by context trimming and the
+/// auto-compaction threshold so both estimate consistently.
+fn estimate_message_tokens(msg: &crate::utils::ChatMessage) -> usize {
+    let text_len = msg.content.as_ref().map_or(0, |c| c.text_content().len());
+    let args_len = msg.tool_calls.as_ref().map_or(0, |tcs| {
+        tcs.iter()
+            .map(|t| t.function.arguments.len())
+            .sum::<usize>()
+    });
+    (text_len + args_len) / 4
+}
+
+/// Approximate token count for a whole context (sum of [`estimate_message_tokens`]).
+fn estimate_context_tokens(context: &[crate::utils::ChatMessage]) -> usize {
+    context.iter().map(estimate_message_tokens).sum()
+}
+
 /// Trim context from the front (oldest messages) to stay within a token budget.
 /// Preserves the system message at index 0 and never splits tool_call/tool pairs.
 /// A marker message is inserted only when messages were actually removed.
 fn trim_context_to_budget(context: &mut Vec<crate::utils::ChatMessage>, max_tokens: usize) {
-    // Token estimation heuristic: 1 token ≈ 4 characters for English text.
-    // This is the same heuristic used by the existing compaction logic.
-    let estimate_msg_tokens = |msg: &crate::utils::ChatMessage| -> usize {
-        let text_len = msg.content.as_ref().map_or(0, |c| c.text_content().len());
-        let args_len = msg.tool_calls.as_ref().map_or(0, |tcs| {
-            tcs.iter().map(|t| t.function.arguments.len()).sum()
-        });
-        (text_len + args_len) / 4
-    };
+    // Token estimation heuristic: 1 token ≈ 4 characters for English text (text + tool_call args).
+    let estimate_msg_tokens = estimate_message_tokens;
 
     // Quick check: under budget or too small to trim
     if context.len() <= 2 {
@@ -1625,10 +1642,7 @@ impl AgentLogic {
             .iter()
             .filter(|m| m.role == "user")
             .count();
-        let approx_tokens: usize = current_context
-            .iter()
-            .map(|m| m.content.as_ref().map_or(0, |c| c.text_content().len()) / 4)
-            .sum();
+        let approx_tokens: usize = estimate_context_tokens(&current_context);
 
         // Most recent summary keyed by the same channel:chat_id prefix
         // — same scheme used at the threshold-trigger site.
@@ -2193,6 +2207,11 @@ impl AgentLogic {
         // per inbound. A second overflow within the same turn surfaces the
         // failure to the user instead of looping on compact-and-retry.
         let mut overflow_recovery_used = false;
+        // P1.4: count consecutive doom-loop detections so we can escalate from an advisory
+        // nudge to a hard stop. Reset to 0 on any iteration with no detection.
+        let mut consecutive_doom_detections: usize = 0;
+        // Set when the doom loop persists past the nudge budget; branches the terminal message.
+        let mut doom_loop_stuck = false;
 
         while iterations < max_iterations {
             if cancel_token.is_cancelled() {
@@ -2367,6 +2386,32 @@ impl AgentLogic {
 
             if doom_loop_enabled {
                 if let Some(prompt) = doom_loop::check_for_doom_loop_prompt(&context) {
+                    // Escalate ONLY while the loop is still active at the tail — a stale run can
+                    // linger in the lookback window after the model corrects itself, and counting
+                    // those would hard-stop a model that already recovered (see
+                    // `doom_loop_active_at_tail`). The advisory nudge still fires on any detection.
+                    if doom_loop::doom_loop_active_at_tail(&context) {
+                        consecutive_doom_detections += 1;
+                        if consecutive_doom_detections >= DOOM_LOOP_HARD_STOP_AFTER {
+                            // Nudges didn't break the loop — hard stop so the run doesn't spin to
+                            // max_iterations re-receiving the same advice.
+                            doom_loop_stuck = true;
+                            let _ = logger_tx.send(BusMessage::Log(
+                                LogEvent::warn(
+                                    &name,
+                                    &format!(
+                                        "Doom loop still active after {} consecutive detections — stopping the run.",
+                                        consecutive_doom_detections
+                                    ),
+                                )
+                                .with_chat_id(&inbound.chat_id),
+                            ));
+                            break;
+                        }
+                    } else {
+                        // Detected in the window but the model has moved on — don't escalate.
+                        consecutive_doom_detections = 0;
+                    }
                     let correction = crate::utils::ChatMessage::user(&prompt);
                     mem.add_message(correction.clone()).await?;
                     context.push(correction);
@@ -2377,6 +2422,9 @@ impl AgentLogic {
                         )
                         .with_chat_id(&inbound.chat_id),
                     ));
+                } else {
+                    // No loop in the window — reset so only *consecutive active* loops escalate.
+                    consecutive_doom_detections = 0;
                 }
             }
 
@@ -2420,11 +2468,8 @@ impl AgentLogic {
                     // refetches a smaller post-compaction context and will retry
                     // the chat call naturally. A second overflow in the same turn
                     // surfaces the failure to the user.
-                    let tokens_before_u32 = context
-                        .iter()
-                        .map(|m| m.content.as_ref().map_or(0, |c| c.text_content().len()) / 4)
-                        .sum::<usize>()
-                        .min(u32::MAX as usize) as u32;
+                    let tokens_before_u32 =
+                        estimate_context_tokens(&context).min(u32::MAX as usize) as u32;
                     let turns_before_u32 = context
                         .iter()
                         .filter(|m| m.role == "user")
@@ -2936,10 +2981,7 @@ impl AgentLogic {
                 // Auto-compaction check
                 let current_context = mem.get_context_since_reflection().await?;
                 let user_turns = current_context.iter().filter(|m| m.role == "user").count();
-                let approx_tokens: usize = current_context
-                    .iter()
-                    .map(|msg| msg.content.as_ref().map_or(0, |c| c.text_content().len()) / 4)
-                    .sum();
+                let approx_tokens: usize = estimate_context_tokens(&current_context);
 
                 // PR-3: pull the model's context window from the provider; if known,
                 // tighten the absolute token threshold to whichever is smaller of:
@@ -3008,7 +3050,16 @@ impl AgentLogic {
             }
         }
 
-        let max_iter_msg = "Agent reached max reasoning iterations.".to_string();
+        // The loop exits either by hitting max_iterations or by the doom-loop hard stop; surface
+        // the matching terminal message (max-iter wording is unchanged for non-doom exits).
+        let max_iter_msg = if doom_loop_stuck {
+            "Stopped: the agent kept repeating the same action with no progress and did not \
+             recover after corrective nudges. Try rephrasing the request or breaking it into \
+             smaller steps."
+                .to_string()
+        } else {
+            "Agent reached max reasoning iterations.".to_string()
+        };
         persist_terminal_assistant_message(
             &mut mem,
             &logger_tx,
@@ -3370,10 +3421,78 @@ mod tests {
         }
     }
 
+    /// Always returns the SAME tool call — drives the doom-loop detector to fire repeatedly.
+    #[derive(Clone)]
+    struct IdenticalToolCallProvider;
+
+    #[async_trait]
+    impl Provider for IdenticalToolCallProvider {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<serde_json::Value>,
+        ) -> Result<LLMResponse, LLMError> {
+            Ok(LLMResponse {
+                content: String::new(),
+                tool_calls: Some(vec![crate::utils::ToolCallRequest {
+                    id: "call_loop".to_string(),
+                    tool_type: "function".to_string(),
+                    extra_content: None,
+                    function: crate::utils::ToolCallFunction {
+                        name: "looping_tool".to_string(),
+                        arguments: "{\"x\":1}".to_string(),
+                    },
+                }]),
+                reasoning_content: None,
+                usage: None,
+            })
+        }
+    }
+
+    /// Loops identically for the first 3 calls (triggers detection + a nudge), then emits
+    /// distinct tool calls — simulating a model that corrects itself after the nudge.
+    #[derive(Clone)]
+    struct CorrectingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for CorrectingProvider {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<serde_json::Value>,
+        ) -> Result<LLMResponse, LLMError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            // First 3: identical args (X,X,X → detection). After: distinct args (loop no longer
+            // active at the tail), so escalation must reset rather than hard-stop.
+            let arguments = if n < 3 {
+                "{\"x\":0}".to_string()
+            } else {
+                format!("{{\"x\":{n}}}")
+            };
+            Ok(LLMResponse {
+                content: String::new(),
+                tool_calls: Some(vec![crate::utils::ToolCallRequest {
+                    id: format!("call_{n}"),
+                    tool_type: "function".to_string(),
+                    extra_content: None,
+                    function: crate::utils::ToolCallFunction {
+                        name: "looping_tool".to_string(),
+                        arguments,
+                    },
+                }]),
+                reasoning_content: None,
+                usage: None,
+            })
+        }
+    }
+
     async fn run_loop_once_for_test(
         provider: Box<dyn Provider>,
         max_iterations: usize,
         cancelled_before_start: bool,
+        doom_loop_enabled: bool,
     ) -> (Result<String, String>, Vec<ChatMessage>) {
         let memory_actor = SqliteMemoryActor::new(":memory:").expect("memory actor");
         let memory_node = NodeHandle::new(memory_actor, 16, 1, Duration::from_millis(1));
@@ -3381,7 +3500,10 @@ mod tests {
         let tools = Arc::new(ToolRegistry::new());
         let skills_temp = LocalTempDir::new();
         let skills = Arc::new(SkillRegistry::new(skills_temp.path().clone()));
-        let (outbound_tx, _outbound_rx) = mpsc::channel::<BusMessage>(8);
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<BusMessage>(8);
+        // Drain outbound telemetry so the loop's `send().await` never blocks on a full buffer
+        // (tool-call-returning providers emit several messages per iteration).
+        tokio::spawn(async move { while outbound_rx.recv().await.is_some() {} });
         let (logger_tx, _logger_rx) = create_logger_channel(32);
         let cancel_token = tokio_util::sync::CancellationToken::new();
         if cancelled_before_start {
@@ -3412,7 +3534,7 @@ mod tests {
                 .with_reasoning_cancel(cancel_token),
             is_subagent: false,
             subagent_allowlist: None,
-            doom_loop_enabled: false,
+            doom_loop_enabled,
             harness_runtime_summary: String::new(),
             forbid_final_without_tools: false,
             shell_policy: Arc::new(crate::config::ResolvedShellPolicy {
@@ -3835,7 +3957,7 @@ mod tests {
     #[tokio::test]
     async fn run_reasoning_loop_persists_terminal_message_on_llm_failure() {
         let (result, context) =
-            run_loop_once_for_test(Box::new(NonTransientErrorProvider), 2, false).await;
+            run_loop_once_for_test(Box::new(NonTransientErrorProvider), 2, false, false).await;
         assert!(result.is_err(), "expected llm failure");
         let last = context.last().expect("last message");
         assert_eq!(last.role, "assistant");
@@ -3852,7 +3974,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_reasoning_loop_persists_terminal_message_on_max_iterations() {
-        let (result, context) = run_loop_once_for_test(Box::new(DummyProvider), 0, false).await;
+        let (result, context) =
+            run_loop_once_for_test(Box::new(DummyProvider), 0, false, false).await;
         assert_eq!(
             result.expect("max iterations fallback"),
             "Agent reached max reasoning iterations."
@@ -3867,9 +3990,73 @@ mod tests {
         assert_eq!(text, "Agent reached max reasoning iterations.");
     }
 
+    // P1.4: a model that ignores the doom-loop nudges is hard-stopped with a "stuck" message
+    // well before max_iterations, instead of spinning to the iteration cap.
+    #[tokio::test]
+    async fn doom_loop_escalates_to_hard_stop() {
+        // max_iterations is high; the doom escalation should terminate the run much earlier.
+        let (result, _context) =
+            run_loop_once_for_test(Box::new(IdenticalToolCallProvider), 50, false, true).await;
+        let msg = result.expect("terminal message");
+        assert!(
+            msg.starts_with("Stopped:") && msg.contains("repeating"),
+            "expected doom-loop stuck message, got: {msg}"
+        );
+        // Must NOT have run to the iteration cap.
+        assert_ne!(msg, "Agent reached max reasoning iterations.");
+    }
+
+    // P1.4: when doom detection is disabled, the same repeating provider runs to the cap
+    // (escalation must be gated on doom_loop_enabled).
+    #[tokio::test]
+    async fn doom_loop_disabled_runs_to_max_iterations() {
+        let (result, _context) =
+            run_loop_once_for_test(Box::new(IdenticalToolCallProvider), 3, false, false).await;
+        assert_eq!(
+            result.expect("terminal message"),
+            "Agent reached max reasoning iterations."
+        );
+    }
+
+    // P1.4 (review regression): a model that loops then CORRECTS after the nudge must NOT be
+    // hard-stopped — escalation counts only loops still active at the tail, so the stale run
+    // lingering in the lookback window can't force a stop. Reaches the cap instead.
+    #[tokio::test]
+    async fn doom_loop_does_not_stop_after_model_corrects() {
+        let provider = Box::new(CorrectingProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let (result, _context) = run_loop_once_for_test(provider, 8, false, true).await;
+        assert_eq!(
+            result.expect("terminal message"),
+            "Agent reached max reasoning iterations.",
+            "a model that corrected after a nudge must not be hard-stopped"
+        );
+    }
+
+    // P1.4: the shared token estimator counts tool_call argument bytes, not just content text
+    // (the compaction sites previously under-counted tool-heavy turns).
+    #[test]
+    fn estimate_tokens_counts_tool_call_args() {
+        let mut msg = ChatMessage::assistant("");
+        msg.content = None;
+        msg.tool_calls = Some(vec![crate::utils::ToolCallRequest {
+            id: "1".to_string(),
+            tool_type: "function".to_string(),
+            extra_content: None,
+            function: crate::utils::ToolCallFunction {
+                name: "t".to_string(),
+                arguments: "x".repeat(400), // 400 bytes / 4 = 100 tokens
+            },
+        }]);
+        assert_eq!(super::estimate_message_tokens(&msg), 100);
+        assert_eq!(super::estimate_context_tokens(std::slice::from_ref(&msg)), 100);
+    }
+
     #[tokio::test]
     async fn run_reasoning_loop_persists_terminal_message_on_cancel() {
-        let (result, context) = run_loop_once_for_test(Box::new(DummyProvider), 2, true).await;
+        let (result, context) =
+            run_loop_once_for_test(Box::new(DummyProvider), 2, true, false).await;
         assert_eq!(result.expect("cancelled run"), "");
         let last = context.last().expect("last message");
         assert_eq!(last.role, "assistant");
