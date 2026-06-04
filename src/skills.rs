@@ -234,9 +234,17 @@ impl SkillRegistry {
     }
 
     /// Installs skills from a remote GitHub repository.
+    /// If `specific_skill` is Some, only that skill will be installed.
     /// Returns a list of installed skill names.
-    pub async fn install_skills_from_repo(&mut self, repo_url: &str) -> Result<Vec<String>, String> {
-        info!("Installing skills from repository: {}", repo_url);
+    pub async fn install_skills_from_repo(&mut self, repo_url: &str, specific_skill: Option<&str>) -> Result<Vec<String>, String> {
+        // Support shorthand owner/repo format
+        let full_repo_url = if !repo_url.contains("://") && repo_url.contains('/') {
+            format!("https://github.com/{}", repo_url)
+        } else {
+            repo_url.to_string()
+        };
+
+        info!("Installing skills from repository: {} (specific: {:?})", full_repo_url, specific_skill);
 
         // 1. Create a temporary directory
         let temp_dir = std::env::temp_dir().join(format!("isanagent-skills-{}", uuid::Uuid::new_v4()));
@@ -247,7 +255,7 @@ impl SkillRegistry {
             .arg("clone")
             .arg("--depth")
             .arg("1")
-            .arg(repo_url)
+            .arg(&full_repo_url)
             .arg(&temp_dir)
             .status()
             .map_err(|e| format!("Failed to execute git clone: {}. Make sure 'git' is installed and in your PATH.", e))?;
@@ -267,6 +275,13 @@ impl SkillRegistry {
                 
                 // Parse to get the skill name
                 if let Some(def) = Self::parse_skill_md(&skill_md_path.to_path_buf()) {
+                    // Filter if specific skill requested
+                    if let Some(requested) = specific_skill {
+                        if def.name != requested {
+                            continue;
+                        }
+                    }
+
                     let dest_dir = self.skills_dir.join(&def.name);
                     
                     if dest_dir.exists() {
@@ -280,12 +295,21 @@ impl SkillRegistry {
                     copy_dir_recursive(skill_dir, &dest_dir)?;
                     
                     installed_skills.push(def.name);
+
+                    // If we found the specific skill, we can stop
+                    if specific_skill.is_some() {
+                        break;
+                    }
                 }
             }
         }
 
         // 4. Cleanup
         let _ = fs::remove_dir_all(&temp_dir);
+
+        if specific_skill.is_some() && installed_skills.is_empty() {
+            return Err(format!("Skill '{}' not found in repository {}", specific_skill.unwrap(), full_repo_url));
+        }
 
         // 5. Re-scan for skills
         self.scan_for_skills();

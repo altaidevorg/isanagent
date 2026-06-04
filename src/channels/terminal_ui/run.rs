@@ -157,7 +157,8 @@ const TERMINAL_HELP: &str = r#"Commands (leading slash):
   /agents        Open the sub-agent task pane (running / finished named agents, plan steps)
   /chats         Open past sessions (saved terminal threads from workspace memory)
   /help, /?      Show this help
-  /skills add <url> Add remote skills from a GitHub repository
+  /skills add <url_or_shorthand> [skill_name] Add remote skills
+
 Keys:
   Enter             Send the compose line; in past-sessions pane: load selected and continue
   Tab / Ctrl+T      Next pane: transcript → past sessions → executions → tool activity → sub-agents
@@ -2582,14 +2583,19 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             if text.to_ascii_lowercase().starts_with("/skills ") {
                                 let arg = text.strip_prefix("/skills ").unwrap_or("").trim();
                                 if arg.starts_with("add ") {
-                                    let repo_url = arg.strip_prefix("add ").unwrap_or("").trim();
-                                    if repo_url.is_empty() {
+                                    let repo_part = arg.strip_prefix("add ").unwrap_or("").trim();
+                                    if repo_part.is_empty() {
                                         app.cells.push(Cell::System {
-                                            message: "Usage: /skills add <repo_url>".into(),
+                                            message: "Usage: /skills add <repo_url_or_shorthand> [skill_name]".into(),
                                         });
                                     } else {
+                                        let mut parts = repo_part.split_whitespace();
+                                        let repo_url = parts.next().unwrap_or("").to_string();
+                                        let skill_name = parts.next().map(|s| s.to_string());
+
                                         let msg = BusMessage::InstallSkill {
-                                            repo_url: repo_url.to_string(),
+                                            repo_url: repo_url.clone(),
+                                            skill_name,
                                         };
                                         if bus_tx.blocking_send(msg).is_err() {
                                             app.cells.push(Cell::System {
@@ -2603,7 +2609,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                     }
                                 } else {
                                     app.cells.push(Cell::System {
-                                        message: "Usage: /skills add <repo_url>".into(),
+                                        message: "Usage: /skills add <repo_url_or_shorthand> [skill_name]".into(),
                                     });
                                 }
                                 continue;

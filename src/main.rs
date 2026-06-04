@@ -107,8 +107,11 @@ struct SkillsArgs {
 enum SkillCommands {
     /// Add skills from a remote GitHub repository
     Add {
-        /// Repository URL (e.g., https://github.com/vercel-labs/skills)
+        /// Repository URL (e.g., https://github.com/vercel-labs/skills) or shorthand (owner/repo)
         repo_url: String,
+        /// Optional specific skill name to install
+        #[arg(short, long)]
+        skill: Option<String>,
     },
     /// List all installed skills
     List,
@@ -1523,9 +1526,13 @@ async fn run_skills(
     let mut skills = SkillRegistry::new(workspace.skills_path());
 
     match args.command {
-        SkillCommands::Add { repo_url } => {
-            println!("Adding skills from {}...", repo_url);
-            match skills.install_skills_from_repo(&repo_url).await {
+        SkillCommands::Add { repo_url, skill } => {
+            if let Some(ref name) = skill {
+                println!("Adding skill '{}' from {}...", name, repo_url);
+            } else {
+                println!("Adding all skills from {}...", repo_url);
+            }
+            match skills.install_skills_from_repo(&repo_url, skill.as_deref()).await {
                 Ok(installed) => {
                     if installed.is_empty() {
                         println!("No skills found in the repository.");

@@ -1438,14 +1438,14 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 )));
                 return Ok(None);
             }
-            BusMessage::InstallSkill { repo_url } => {
+            BusMessage::InstallSkill { repo_url, skill_name } => {
                 let skills_arc = self.skills.clone();
                 let logger_tx = self.logger_tx.clone();
                 let name = self.name.clone();
                 
                 tokio::spawn(async move {
                     let mut skills_guard = skills_arc.write().await;
-                    match skills_guard.install_skills_from_repo(&repo_url).await {
+                    match skills_guard.install_skills_from_repo(&repo_url, skill_name.as_deref()).await {
                         Ok(installed) => {
                             let msg = if installed.is_empty() {
                                 "No skills found in the repository.".to_string()

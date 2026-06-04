@@ -289,9 +289,13 @@ impl LoggingActor {
                         .unwrap_or("-"),
                 ),
             ),
-            BusMessage::InstallSkill { repo_url } => LogEvent::info(
+            BusMessage::InstallSkill { repo_url, skill_name } => LogEvent::info(
                 "BusMessage",
-                &format!("InstallSkill requested for repo={}", repo_url),
+                &format!(
+                    "InstallSkill requested for repo={} specific={}",
+                    repo_url,
+                    skill_name.as_deref().unwrap_or("-")
+                ),
             ),
         };
 
