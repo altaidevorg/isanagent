@@ -151,7 +151,7 @@ pub struct ExecutionJobRecord {
     pub label: Option<String>,
     /// Human-facing summary for UI and audits (optional).
     pub description: Option<String>,
-    /// Originating tool name (`execution_run`, `execution_run_background`, `colab_mcp_tool_call`, …).
+    /// Originating tool name (`execution_run`, `execution_run_background`, …).
     pub tool_name: String,
     pub status: AtomicU8,
     /// Wall-clock finish time for eviction ordering (`0` while not terminal).
@@ -323,8 +323,8 @@ impl ExecutionJobManager {
     ///
     /// Prefers the cooperative provider-level cancel (`provider.cancel`) when supported.
     /// Falls back to `cancel_job_force` (best-effort `JoinHandle::abort`) when the provider
-    /// does not support cooperative interrupts (e.g. `colab_mcp`). On the abort path the local
-    /// wait is dropped immediately, but remote work (e.g. a Colab cell) may continue running.
+    /// does not support cooperative interrupts. On the abort path the local
+    /// wait is dropped immediately, but remote work may continue running.
     pub async fn cancel_job(&self, job_id: &str) -> Result<CancelOutcome, String> {
         let rec = self
             .get(job_id)
@@ -332,8 +332,7 @@ impl ExecutionJobManager {
         if rec.is_terminal() {
             return Err("Job already finished".to_string());
         }
-        // Cancel through the provider that owns this session — important when local + colab
-        // sessions coexist and only one of them supports cooperative interrupt.
+        // Cancel through the provider that owns this session.
         let session_provider = self
             .inner
             .harness
@@ -354,7 +353,7 @@ impl ExecutionJobManager {
         Ok(CancelOutcome {
             cancel_kind: "abort",
             note: Some(
-                "Best-effort abort: the local wait was dropped, but the remote work may keep running until it finishes naturally (e.g. a Colab cell on Google's side)."
+                "Best-effort abort: the local wait was dropped, but the remote work may keep running until it finishes naturally."
                     .to_string(),
             ),
         })
@@ -386,7 +385,7 @@ impl ExecutionJobManager {
                 if kind == "abort" {
                     m.insert(
                         "cancel_note".to_string(),
-                        json!("Best-effort abort: local wait was dropped; remote work may keep running until it finishes naturally (e.g. a Colab cell on Google's side)."),
+                        json!("Best-effort abort: local wait was dropped; remote work may keep running until it finishes naturally."),
                     );
                 }
             }
@@ -784,8 +783,6 @@ impl ExecutionJobManager {
     /// Spawn an arbitrary future as a tracked background job.
     ///
     /// The future's `RunResult` (or `ExecutionError`) is recorded just like `spawn_run`'s.
-    /// Used by `colab_mcp_tool_call` (auto-promote) and similar tool-side wrappers that already
-    /// wrap their own provider-level work into a `RunResult`.
     pub fn spawn_arbitrary(&self, req: SpawnArbitraryRequest) -> Result<String, String> {
         let SpawnArbitraryRequest {
             sid,
@@ -862,7 +859,6 @@ impl ExecutionJobManager {
                 channel,
                 provider_id: prov,
                 started,
-                started_ts,
                 tool_name,
                 run_out,
             })
@@ -878,7 +874,7 @@ impl ExecutionJobManager {
 
     /// Adopt an already-running [`JoinHandle`] (auto-promote path) into the job manager.
     ///
-    /// Used by sync tools (`colab_mcp_tool_call`, `execution_run`) that started their work
+    /// Used by sync tools (e.g. `execution_run`) that started their work
     /// inline, then crossed the auto-promote bound and need to hand the in-flight task to the
     /// job manager. The manager takes over completion bookkeeping (status, telemetry, journal).
     pub fn adopt_inflight(&self, req: AdoptInflightRequest) -> Result<String, String> {
@@ -959,7 +955,6 @@ impl ExecutionJobManager {
                 channel,
                 provider_id: prov,
                 started,
-                started_ts,
                 tool_name,
                 run_out,
             })
@@ -970,8 +965,7 @@ impl ExecutionJobManager {
     }
 
     /// Best-effort cancel by aborting the spawned tokio task. Used when the provider does not
-    /// support cooperative cancel (e.g. `colab_mcp`). The remote work (e.g. a Colab cell) may
-    /// keep running on the other side until it finishes naturally.
+    /// support cooperative cancel. The remote work may keep running on the other side until it finishes naturally.
     pub async fn cancel_job_force(&self, job_id: &str) -> Result<(), String> {
         let rec = self
             .get(job_id)
@@ -1069,7 +1063,6 @@ struct FinalizeArbitraryParams {
     channel: String,
     provider_id: String,
     started: Instant,
-    started_ts: String,
     tool_name: String,
     run_out: Result<RunResult, ExecutionError>,
 }
@@ -1084,7 +1077,6 @@ async fn finalize_arbitrary_job(p: FinalizeArbitraryParams) {
         channel,
         provider_id,
         started,
-        started_ts,
         tool_name,
         run_out,
     } = p;
@@ -1167,23 +1159,6 @@ async fn finalize_arbitrary_job(p: FinalizeArbitraryParams) {
             {
                 warn!("execution_jobs audit: {e}");
             }
-            // Tool-call style journal (e.g. for `colab_mcp_tool_call`).
-            if tool_name == "colab_mcp_tool_call" {
-                if let Err(e) = write_colab_mcp_call_journal(
-                    &ws,
-                    &sid,
-                    &job_id,
-                    &started_ts,
-                    &ts_finish,
-                    duration_ms,
-                    &result.stdout,
-                    rec.description.as_deref(),
-                )
-                .await
-                {
-                    warn!("colab_mcp_tool_call journal: {e}");
-                }
-            }
             info!(
                 "execution_job_done job={} session={} provider={} status=completed tool={}",
                 job_id, sid, provider_id, tool_name
@@ -1264,106 +1239,12 @@ async fn finalize_arbitrary_job(p: FinalizeArbitraryParams) {
             {
                 warn!("execution_jobs audit: {log_e}");
             }
-            if tool_name == "colab_mcp_tool_call" {
-                if let Err(jerr) = write_colab_mcp_call_journal(
-                    &ws,
-                    &sid,
-                    &job_id,
-                    &started_ts,
-                    &ts_finish,
-                    duration_ms,
-                    &format!("error: {es}"),
-                    rec.description.as_deref(),
-                )
-                .await
-                {
-                    warn!("colab_mcp_tool_call journal: {jerr}");
-                }
-            }
             info!(
                 "execution_job_done job={} session={} provider={} status={} tool={}",
                 job_id, sid, provider_id, status_label, tool_name
             );
         }
     }
-}
-
-/// Persist a JSON file at `.system_generated/execution_history/colab_mcp_tool_call/{session}/{job_id}/result.json`.
-#[allow(clippy::too_many_arguments)] // Journal row mirrors persisted JSON fields.
-pub(crate) async fn write_colab_mcp_call_journal(
-    workspace_dir: &Path,
-    session_id: &SessionId,
-    job_id: &str,
-    started_rfc3339: &str,
-    finished_rfc3339: &str,
-    duration_ms: u64,
-    body: &str,
-    description: Option<&str>,
-) -> Result<(), String> {
-    let session_seg = crate::execution::sanitize_session_segment(session_id);
-    let dir = workspace_dir
-        .join(".system_generated")
-        .join("execution_history")
-        .join("colab_mcp_tool_call")
-        .join(&session_seg)
-        .join(job_id);
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .map_err(|e| format!("colab_mcp_call mkdir: {e}"))?;
-    let line = json!({
-        "schema_version": 1,
-        "tool_name": "colab_mcp_tool_call",
-        "session_id": session_id.to_string(),
-        "job_id": job_id,
-        "started_rfc3339": started_rfc3339,
-        "finished_rfc3339": finished_rfc3339,
-        "duration_ms": duration_ms,
-        "description": description,
-        "result_excerpt": truncate_for_journal(body, 64 * 1024),
-    });
-    let pretty = serde_json::to_string_pretty(&line).map_err(|e| e.to_string())?;
-    tokio::fs::write(dir.join("result.json"), pretty.as_bytes())
-        .await
-        .map_err(|e| format!("colab_mcp_call result.json: {e}"))?;
-    // Append to a sibling JSONL.
-    let manifest = workspace_dir
-        .join(".system_generated")
-        .join("colab_mcp_calls.jsonl");
-    if let Some(parent) = manifest.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
-    let mut f = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&manifest)
-        .await
-        .map_err(|e| format!("colab_mcp_calls.jsonl open: {e}"))?;
-    let row = json!({
-        "ts": finished_rfc3339,
-        "session_id": session_id.to_string(),
-        "job_id": job_id,
-        "duration_ms": duration_ms,
-        "description": description,
-    });
-    let s = serde_json::to_string(&row).map_err(|e| e.to_string())?;
-    f.write_all(s.as_bytes())
-        .await
-        .map_err(|e| format!("colab_mcp_calls.jsonl write: {e}"))?;
-    f.write_all(b"\n")
-        .await
-        .map_err(|e| format!("colab_mcp_calls.jsonl nl: {e}"))?;
-    Ok(())
-}
-
-fn truncate_for_journal(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}\n... (truncated)", &s[..end])
 }
 
 #[cfg(test)]
@@ -1453,7 +1334,7 @@ mod tests {
         let jid = jobs
             .spawn_arbitrary(SpawnArbitraryRequest {
                 sid: fake_session(),
-                tool_name: "colab_mcp_tool_call".to_string(),
+                tool_name: "execution_run".to_string(),
                 label: None,
                 description: Some("unit-arbitrary".to_string()),
                 chat_id: "chat-test".to_string(),
@@ -1466,7 +1347,7 @@ mod tests {
             let v = jobs.job_status_json(&jid).await.expect("status");
             if v["terminal"].as_bool() == Some(true) {
                 assert_eq!(v["status"].as_str(), Some("completed"));
-                assert_eq!(v["tool_name"].as_str(), Some("colab_mcp_tool_call"));
+                assert_eq!(v["tool_name"].as_str(), Some("execution_run"));
                 return;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1484,7 +1365,7 @@ mod tests {
         let jid = jobs
             .spawn_arbitrary(SpawnArbitraryRequest {
                 sid: fake_session(),
-                tool_name: "colab_mcp_tool_call".to_string(),
+                tool_name: "execution_run".to_string(),
                 label: None,
                 description: None,
                 chat_id: "chat-test".to_string(),
@@ -1557,7 +1438,7 @@ mod tests {
         let job_id = jobs
             .spawn_arbitrary(SpawnArbitraryRequest {
                 sid: fake_session(),
-                tool_name: "colab_mcp_tool_call".to_string(),
+                tool_name: "execution_run".to_string(),
                 label: None,
                 description: Some("followup-test".to_string()),
                 chat_id: "chat-followup".to_string(),
@@ -1611,7 +1492,7 @@ mod tests {
         let _job_id = jobs
             .spawn_arbitrary(SpawnArbitraryRequest {
                 sid: fake_session(),
-                tool_name: "colab_mcp_tool_call".to_string(),
+                tool_name: "execution_run".to_string(),
                 label: None,
                 description: Some("followup-disabled".to_string()),
                 chat_id: "chat-no-followup".to_string(),

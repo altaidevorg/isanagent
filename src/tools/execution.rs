@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use globset::{Glob, GlobSet, GlobSetBuilder};
 use log::info;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -13,10 +12,9 @@ use tokio::sync::mpsc;
 use crate::bus::BusMessage;
 use crate::channels::terminal::build_execution_stream_notice;
 use crate::execution::{
-    append_mcp_call_manifest, persist_successful_execution_run, run_with_auto_promote,
-    sanitize_session_segment, write_mcp_call_journal, AdoptInflightRequest, AutoPromoteOutcome,
-    CwdPolicy, ExecutionError, ExecutionHarness, ExecutionJobManager, InflightSyncRegistry,
-    McpCallJournalParams, McpCallManifestLine, PersistSuccessfulExecutionRunParams, RunEvent,
+    persist_successful_execution_run, run_with_auto_promote, sanitize_session_segment,
+    AdoptInflightRequest, AutoPromoteOutcome, CwdPolicy, ExecutionError, ExecutionHarness,
+    ExecutionJobManager, InflightSyncRegistry, PersistSuccessfulExecutionRunParams, RunEvent,
     RunResult, RunSpec, SessionCreateRequest, SessionId, SpawnBackgroundRunRequest,
 };
 use crate::tool_runtime::current_tool_exec_ctx;
@@ -24,53 +22,6 @@ use crate::traits::Tool;
 
 fn exec_err(e: ExecutionError) -> String {
     e.to_string()
-}
-
-/// Build a glob set for `[harness.execution.colab_mcp].extra_mcp_tool_allowlist`.
-pub fn compile_colab_mcp_tool_allowlist(patterns: &[String]) -> Result<GlobSet, String> {
-    let mut builder = GlobSetBuilder::new();
-    for p in patterns {
-        let t = p.trim();
-        if t.is_empty() {
-            continue;
-        }
-        let g = Glob::new(t).map_err(|e| format!("invalid glob {p:?}: {e}"))?;
-        builder.add(g);
-    }
-    builder
-        .build()
-        .map_err(|e| format!("allowlist glob set error: {e}"))
-}
-
-/// Colab MCP: runtime (CPU / GPU / TPU) is chosen in the **browser**, not via a dedicated MCP tool.
-/// Canonical copy lives under [`ExecutionEnvInfoTool`] → `colab_mcp.runtime_policy`.
-fn colab_mcp_runtime_policy_value() -> Value {
-    json!({
-        "default": "Colab tabs used with MCP typically start on a **CPU** runtime until changed in the browser.",
-        "mcp_limitation": "Colab MCP does not expose a dependable tool to switch Runtime type (CPU / GPU / TPU); after connect, tool lists are mostly notebook-cell oriented.",
-        "when_ask_the_user": "If this session needs **GPU or TPU** (CUDA-heavy ML, large accelerators, etc.), ask the user to open the **Colab browser tab** and use **Runtime → Change runtime type** (pick GPU/TPU as needed), wait until the runtime reconnects, then continue with `execution_run`. After that, `run_code_cell` uses whatever runtime is active (e.g. `torch.cuda.is_available()` may become true).",
-        "when_do_not_ask": "If **CPU** execution is sufficient for the user's goal, do **not** prompt for a runtime change.",
-        "optional_probe": "When unsure whether an accelerator is active, use a short `execution_run` (e.g. `import torch; print(torch.cuda.is_available())`) after any manual runtime change."
-    })
-}
-
-/// Short reminder returned from `execution_session_create` when `default_provider = colab_mcp`.
-fn colab_mcp_runtime_session_note_value() -> Value {
-    json!({
-        "runtime_note": "Colab defaults to CPU; MCP cannot switch GPU/TPU for you. Ask the user to change Runtime in the browser when accelerators are required; do not ask when CPU is enough.",
-        "full_policy": "Call execution_env_info and read colab_mcp.runtime_policy (same text as here, expanded)."
-    })
-}
-
-fn cap_mcp_tool_json_text(s: String, max: usize) -> String {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}\n... (truncated)", &s[..end])
 }
 
 fn require_session_id(args: &Value) -> Result<SessionId, String> {
@@ -145,10 +96,7 @@ impl Tool for ExecutionSessionCreateTool {
          local runs under the workspace sandbox; jupyter uses a Jupyter Server kernel \
          (new or `resume_jupyter_kernel_id`); ssh opens one SSH connection to a configured host \
          (reused until execution_session_close; Python keeps a persistent remote REPL; shell is one-off per run; \
-         execution_run cwd fields refer to remote paths only for ssh); colab_mcp launches a local Colab MCP bridge \
-         process and targets a notebook execution tool exposed by the browser session \
-         (CPU/GPU/TPU runtime is chosen in the Colab browser; see `colab_mcp` in the tool \
-         result when this provider is active). Misconfigured providers are pruned at startup \
+         execution_run cwd fields refer to remote paths only for ssh). Misconfigured providers are pruned at startup \
          (warning logged) and won't appear in `provider`'s allowed values for this run, so \
          passing a known-bad provider is unnecessary. Returns session_id, session capabilities, \
          and a short provider capability summary. Use execution_run or execution_run_background \
@@ -167,7 +115,7 @@ impl Tool for ExecutionSessionCreateTool {
                 "label": { "type": "string", "description": "Optional label for logs" },
                 "language": {
                     "type": "string",
-                    "description": "Optional language hint. Local: shell, sh, bash, cmd, powershell (all map to the host shell — use python_run or exec+uv for Python). Jupyter: python, py, r, R (ir kernel). SSH: python, py, shell, sh, bash (remote exec with code on stdin). Colab MCP MVP currently expects python."
+                    "description": "Optional language hint. Local: shell, sh, bash, cmd, powershell (all map to the host shell — use python_run or exec+uv for Python). Jupyter: python, py, r, R (ir kernel). SSH: python, py, shell, sh, bash (remote exec with code on stdin)."
                 },
                 "resume_jupyter_kernel_id": {
                     "type": "string",
@@ -214,16 +162,13 @@ impl Tool for ExecutionSessionCreateTool {
         self.harness
             .register_session(handle.id.as_str(), &provider_id);
         let summary = self.harness.capabilities_summary();
-        let mut v = json!({
+        let v = json!({
             "session_id": handle.id,
             "session_capabilities": handle.capabilities,
             "provider_capabilities": summary,
             "provider": provider_id,
             "artifact_root_relative": format!(".execution_artifacts/{}/", sanitize_session_segment(&handle.id)),
         });
-        if self.harness.colab_mcp().is_some() && provider_id == "colab_mcp" {
-            v["colab_mcp"] = colab_mcp_runtime_session_note_value();
-        }
         serde_json::to_string_pretty(&v).map_err(|e| e.to_string())
     }
 }
@@ -822,7 +767,7 @@ impl Tool for ExecutionJobCancelTool {
     }
 
     fn description(&self) -> &str {
-        "Best-effort interrupt for a background job by job_id. Prefers the cooperative provider cancel (same capability gate as execution_cancel); when the provider does not support cooperative interrupts (e.g. colab_mcp), falls back to aborting the local wait. On the abort path the remote work (e.g. a Colab cell) may keep running on the other side until it finishes naturally."
+        "Best-effort interrupt for a background job by job_id. Prefers the cooperative provider cancel (same capability gate as execution_cancel); when the provider does not support cooperative interrupts, falls back to aborting the local wait."
     }
 
     fn parameters(&self) -> Value {
@@ -1031,382 +976,6 @@ impl Tool for ExecutionSessionCloseTool {
     }
 }
 
-/// Call an allowlisted MCP tool on an existing Colab MCP execution session (`default_provider = colab_mcp`).
-pub struct ColabMcpToolCallTool {
-    pub harness: Arc<ExecutionHarness>,
-    pub allowlist: GlobSet,
-    pub max_result_chars: usize,
-    /// Job manager used to auto-promote long calls into background jobs.
-    /// `None` disables auto-promote (e.g. unit tests).
-    pub jobs: Option<Arc<ExecutionJobManager>>,
-    /// Per-chat in-flight sync registry; the `/background` slash command pushes onto this to
-    /// promote the current call before the timer fires.
-    pub inflight: Option<Arc<InflightSyncRegistry>>,
-}
-
-#[async_trait]
-impl Tool for ColabMcpToolCallTool {
-    fn name(&self) -> &str {
-        "colab_mcp_tool_call"
-    }
-
-    fn description(&self) -> &str {
-        "Colab MCP only: invoke a proxied MCP tool in the connected browser session. `tool_name` must match a pattern in `[harness.execution.colab_mcp].extra_mcp_tool_allowlist`. Use `list_cached_tool_names: true` to list tool names from the last `tools/list` (refreshed when the server sends `notifications/tools/list_changed`). Prefer `execution_run` for Python code cells. Long calls auto-promote to a background job after auto_promote_after_secs and return a `job_id` envelope; poll with execution_job_status / execution_job_result. Default `timeout_secs` is the harness `default_run_timeout_secs` (no artificial 120s cap). Always pass `description` (short human summary of intent) so the terminal UI shows what's happening instead of raw JSON."
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "session_id": { "type": "string" },
-                "tool_name": { "type": "string", "description": "MCP tool name from tools/list" },
-                "arguments": { "type": "object", "description": "MCP tool arguments (JSON object)" },
-                "list_cached_tool_names": { "type": "boolean", "description": "If true, return cached tool names only" },
-                "description": { "type": "string", "description": "Short human-facing summary of intent (for Ratatui and logs). Strongly recommended; falls back to `colab_mcp:{tool_name}` when omitted." },
-                "timeout_secs": { "type": "integer", "description": "Wall clock for the MCP call (defaults to default_execution_timeout_secs, capped by max_wall_secs). Long calls beyond auto_promote_after_secs return a job_id envelope and keep running in the background." }
-            },
-            "required": ["session_id"]
-        })
-    }
-
-    async fn execute(&self, args: Value) -> Result<String, String> {
-        let cm = self.harness.colab_mcp().ok_or_else(|| {
-            "colab_mcp_tool_call requires [harness.execution] default_provider = \"colab_mcp\""
-                .to_string()
-        })?;
-        let sid = require_session_id(&args)?;
-        if args.get("list_cached_tool_names").and_then(|v| v.as_bool()) == Some(true) {
-            let names = cm
-                .list_cached_mcp_tool_names(&sid)
-                .await
-                .map_err(exec_err)?;
-            return serde_json::to_string_pretty(&json!({ "cached_tool_names": names }))
-                .map_err(|e| e.to_string());
-        }
-        let tool_name = args
-            .get("tool_name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "Missing tool_name (or set list_cached_tool_names: true)".to_string())?;
-        let tool_name = tool_name.trim().to_string();
-        if tool_name.is_empty() {
-            return Err("tool_name must be non-empty".to_string());
-        }
-        if !self.allowlist.is_match(&tool_name) {
-            return Err(format!(
-                "tool_name {tool_name:?} does not match any pattern in extra_mcp_tool_allowlist"
-            ));
-        }
-        let arguments = args
-            .get("arguments")
-            .and_then(|v| v.as_object())
-            .cloned()
-            .unwrap_or_default();
-        let cap_secs = self.harness.max_wall_secs.max(1);
-        let timeout_secs = args
-            .get("timeout_secs")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(self.harness.default_run_timeout_secs)
-            .clamp(1, cap_secs);
-        let description = args
-            .get("description")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("colab_mcp:{tool_name}"));
-
-        let auto_promote = self.harness.auto_promote_after_secs;
-        let (chat_id, channel) = current_tool_exec_ctx()
-            .map(|c| (c.chat_id.clone(), c.channel.clone()))
-            .unwrap_or_else(|| (String::new(), String::new()));
-
-        let call_id = uuid::Uuid::new_v4().to_string();
-        let started = Instant::now();
-        let started_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        let arguments_json: serde_json::Value = serde_json::Value::Object(arguments.clone());
-
-        // Build the work future: timeout-bounded MCP call mapped into a `RunResult`.
-        let cm_for_work = cm.clone();
-        let sid_for_work = sid.clone();
-        let tool_name_for_work = tool_name.clone();
-        let arguments_for_work = arguments.clone();
-        let work = async move {
-            let res = tokio::time::timeout(
-                Duration::from_secs(timeout_secs),
-                cm_for_work.call_mcp_tool_raw(
-                    &sid_for_work,
-                    &tool_name_for_work,
-                    arguments_for_work,
-                ),
-            )
-            .await;
-            match res {
-                Err(_) => Err(ExecutionError::Timeout { timeout_secs }),
-                Ok(Err(e)) => Err(e),
-                Ok(Ok(value)) => {
-                    let stdout = serde_json::to_string(&value)
-                        .unwrap_or_else(|_| "<unserialisable mcp result>".to_string());
-                    Ok(RunResult::new(stdout, "", Some(0)))
-                }
-            }
-        };
-
-        // Decide whether we can use auto-promote at all (need both a job manager and a non-zero
-        // bound). If not, fall through to the original synchronous path.
-        let promote_enabled =
-            self.jobs.is_some() && auto_promote > 0 && auto_promote < timeout_secs;
-        if !promote_enabled {
-            let outcome = work.await;
-            return self
-                .finalize_sync_mcp_call(FinalizeSyncMcpCallParams {
-                    sid: &sid,
-                    call_id: &call_id,
-                    tool_name: &tool_name,
-                    arguments: &arguments_json,
-                    description: Some(description.as_str()),
-                    started,
-                    started_ts: &started_ts,
-                    chat_id: &chat_id,
-                    channel: &channel,
-                    outcome,
-                    auto_promoted: false,
-                    job_id: None,
-                })
-                .await;
-        }
-
-        let jobs = self.jobs.clone().expect("jobs checked above");
-        let inflight = self.inflight.clone();
-        let promote_rx = inflight
-            .as_ref()
-            .filter(|_| !chat_id.is_empty())
-            .map(|reg| reg.register(&chat_id));
-        // Keep the guard alive for the duration of the race; drop it after promote/complete.
-        let (promote_signal_rx, _inflight_guard) = match promote_rx {
-            Some((rx, guard)) => (Some(rx), Some(guard)),
-            None => (None, None),
-        };
-
-        let chat_id_for_promote = chat_id.clone();
-        let channel_for_promote = channel.clone();
-        let sid_for_promote = sid.clone();
-        let tool_name_for_promote = tool_name.clone();
-        let description_for_promote = description.clone();
-
-        let outcome = run_with_auto_promote::<Result<RunResult, ExecutionError>, _, _>(
-            work,
-            Duration::from_secs(auto_promote),
-            promote_signal_rx,
-            move |handle, _reason| {
-                let req = AdoptInflightRequest {
-                    sid: sid_for_promote,
-                    tool_name: tool_name_for_promote,
-                    label: None,
-                    description: Some(description_for_promote),
-                    chat_id: chat_id_for_promote,
-                    channel: channel_for_promote,
-                    join: handle,
-                };
-                jobs.adopt_inflight(req).unwrap_or_else(|e| {
-                    log::warn!("colab_mcp_tool_call: adopt_inflight failed: {e}");
-                    String::new()
-                })
-            },
-        )
-        .await;
-
-        match outcome {
-            AutoPromoteOutcome::Completed(work_outcome) => {
-                self.finalize_sync_mcp_call(FinalizeSyncMcpCallParams {
-                    sid: &sid,
-                    call_id: &call_id,
-                    tool_name: &tool_name,
-                    arguments: &arguments_json,
-                    description: Some(description.as_str()),
-                    started,
-                    started_ts: &started_ts,
-                    chat_id: &chat_id,
-                    channel: &channel,
-                    outcome: work_outcome,
-                    auto_promoted: false,
-                    job_id: None,
-                })
-                .await
-            }
-            AutoPromoteOutcome::Promoted { job_id, reason } => {
-                let envelope = json!({
-                    "auto_promoted": true,
-                    "reason": reason.as_str(),
-                    "job_id": job_id,
-                    "call_id": call_id,
-                    "session_id": sid.to_string(),
-                    "tool_name": tool_name,
-                    "follow_up": "Use execution_job_status / execution_job_result to retrieve the MCP result when it finishes. Use execution_job_cancel for best-effort interrupt (the Colab cell may keep running on Google's side).",
-                });
-                // Journal the auto-promotion event itself; the background completion writes a
-                // separate result.txt when the job finishes (TODO: hook into job completion).
-                let workspace_dir = self.harness.workspace_dir().to_path_buf();
-                let provider_id = self
-                    .harness
-                    .provider_for_session(sid.as_str())
-                    .capabilities()
-                    .provider_id
-                    .to_string();
-                let sid_clone = sid.clone();
-                let call_id_clone = call_id.clone();
-                let tool_name_clone = tool_name.clone();
-                let arguments_clone = arguments_json.clone();
-                let description_clone = description.clone();
-                let chat_id_clone = chat_id.clone();
-                let channel_clone = channel.clone();
-                let started_ts_clone = started_ts.clone();
-                let job_id_clone = job_id.clone();
-                let started_for_journal = started;
-                tokio::spawn(async move {
-                    let finished_ts =
-                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-                    let duration_ms = started_for_journal.elapsed().as_millis() as u64;
-                    let result_summary = format!(
-                        "auto-promoted to background job {job_id_clone} after {auto_promote}s; poll execution_job_status/execution_job_result"
-                    );
-                    if let Err(e) = write_mcp_call_journal(McpCallJournalParams {
-                        workspace_dir: &workspace_dir,
-                        provider_id: &provider_id,
-                        session_id: &sid_clone,
-                        call_id: &call_id_clone,
-                        tool_name: &tool_name_clone,
-                        arguments: &arguments_clone,
-                        started_rfc3339: &started_ts_clone,
-                        finished_rfc3339: &finished_ts,
-                        duration_ms,
-                        status: "promoted",
-                        auto_promoted: true,
-                        job_id: Some(&job_id_clone),
-                        description: Some(description_clone.as_str()),
-                        result: &result_summary,
-                    })
-                    .await
-                    {
-                        log::warn!("colab_mcp_tool_call journal (promoted): {e}");
-                    }
-                    if let Err(e) = append_mcp_call_manifest(
-                        &workspace_dir,
-                        McpCallManifestLine {
-                            ts: &finished_ts,
-                            chat_id: &chat_id_clone,
-                            channel: &channel_clone,
-                            provider_id: &provider_id,
-                            session_id: &sid_clone.to_string(),
-                            call_id: &call_id_clone,
-                            tool_name: &tool_name_clone,
-                            status: "promoted",
-                            duration_ms,
-                            auto_promoted: true,
-                            job_id: Some(&job_id_clone),
-                            description: Some(description_clone.as_str()),
-                            result_len: result_summary.len(),
-                        },
-                    )
-                    .await
-                    {
-                        log::warn!("colab_mcp_tool_call manifest (promoted): {e}");
-                    }
-                });
-                serde_json::to_string_pretty(&envelope).map_err(|e| e.to_string())
-            }
-        }
-    }
-}
-
-struct FinalizeSyncMcpCallParams<'a> {
-    sid: &'a SessionId,
-    call_id: &'a str,
-    tool_name: &'a str,
-    arguments: &'a serde_json::Value,
-    description: Option<&'a str>,
-    started: Instant,
-    started_ts: &'a str,
-    chat_id: &'a str,
-    channel: &'a str,
-    outcome: Result<RunResult, ExecutionError>,
-    auto_promoted: bool,
-    job_id: Option<&'a str>,
-}
-
-impl ColabMcpToolCallTool {
-    async fn finalize_sync_mcp_call(
-        &self,
-        p: FinalizeSyncMcpCallParams<'_>,
-    ) -> Result<String, String> {
-        let finished_ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        let duration_ms = p.started.elapsed().as_millis() as u64;
-        let provider_id = self
-            .harness
-            .provider_for_session(p.sid.as_str())
-            .capabilities()
-            .provider_id
-            .to_string();
-        let workspace_dir = self.harness.workspace_dir().to_path_buf();
-
-        let (status, result_text) = match &p.outcome {
-            Ok(rr) => ("completed", rr.stdout.clone()),
-            Err(ExecutionError::Timeout { timeout_secs }) => (
-                "timeout",
-                format!("colab_mcp_tool_call timeout after {timeout_secs}s"),
-            ),
-            Err(e) => ("failed", format!("Error: {e}")),
-        };
-
-        if let Err(e) = write_mcp_call_journal(McpCallJournalParams {
-            workspace_dir: &workspace_dir,
-            provider_id: &provider_id,
-            session_id: p.sid,
-            call_id: p.call_id,
-            tool_name: p.tool_name,
-            arguments: p.arguments,
-            started_rfc3339: p.started_ts,
-            finished_rfc3339: &finished_ts,
-            duration_ms,
-            status,
-            auto_promoted: p.auto_promoted,
-            job_id: p.job_id,
-            description: p.description,
-            result: &result_text,
-        })
-        .await
-        {
-            log::warn!("colab_mcp_tool_call journal: {e}");
-        }
-        if let Err(e) = append_mcp_call_manifest(
-            &workspace_dir,
-            McpCallManifestLine {
-                ts: &finished_ts,
-                chat_id: p.chat_id,
-                channel: p.channel,
-                provider_id: &provider_id,
-                session_id: &p.sid.to_string(),
-                call_id: p.call_id,
-                tool_name: p.tool_name,
-                status,
-                duration_ms,
-                auto_promoted: p.auto_promoted,
-                job_id: p.job_id,
-                description: p.description,
-                result_len: result_text.len(),
-            },
-        )
-        .await
-        {
-            log::warn!("colab_mcp_tool_call manifest: {e}");
-        }
-
-        match p.outcome {
-            Ok(rr) => Ok(cap_mcp_tool_json_text(rr.stdout, self.max_result_chars)),
-            Err(e) => Err(exec_err(e)),
-        }
-    }
-}
-
 /// Host-oriented snapshot (capabilities + optional python -V).
 pub struct ExecutionEnvInfoTool {
     pub harness: Arc<ExecutionHarness>,
@@ -1419,7 +988,7 @@ impl Tool for ExecutionEnvInfoTool {
     }
 
     fn description(&self) -> &str {
-        "Return provider capability summary. For local execution, also runs python_executable -V on the agent host (best effort). For jupyter, that probe is still the host interpreter (sanity check only); the kernel Python environment is whatever the Jupyter server started for that kernelspec. For ssh, the probe is still the agent host interpreter (not the remote remote_python). For colab_mcp, JSON includes colab_mcp.runtime_policy (CPU default, no MCP runtime switch — user changes Runtime in the browser when GPU/TPU is needed)."
+        "Return provider capability summary. For local execution, also runs python_executable -V on the agent host (best effort). For jupyter, that probe is still the host interpreter (sanity check only); the kernel Python environment is whatever the Jupyter server started for that kernelspec. For ssh, the probe is still the agent host interpreter (not the remote remote_python)."
     }
 
     fn parameters(&self) -> Value {
@@ -1452,21 +1021,6 @@ impl Tool for ExecutionEnvInfoTool {
             "default_run_timeout_secs": def_timeout,
             "timeout_policy": timeout_policy,
         });
-        if self.harness.colab_mcp().is_some() {
-            let auto_promote = self.harness.auto_promote_after_secs;
-            v["colab_mcp"] = json!({
-                "note": "When [harness.execution.colab_mcp] extra_mcp_tool_call_enabled = true and extra_mcp_tool_allowlist is set, tool colab_mcp_tool_call is registered for allowlisted MCP tools.",
-                "colab_mcp_tool_call_default_timeout_secs": def_timeout,
-                "auto_promote_after_secs": auto_promote,
-                "colab_mcp_tool_call_timeout_hint": format!(
-                    "colab_mcp_tool_call wraps a single MCP tools/call; omitting timeout_secs defaults to default_run_timeout_secs ({def_timeout}, capped by max_wall_secs). Calls that exceed auto_promote_after_secs ({auto_promote}) auto-promote to a background job and return a job_id envelope you can poll with execution_job_status / execution_job_result."
-                ),
-                "execution_run_timeout_hint": "execution_run maps to add_code_cell + run_code_cell in notebook mode; both steps share the run's timeout_secs. Set timeout_secs high for training. Colab's browser-side run_code_cell may still enforce its own cap (see tool result / tmp_colab_mcp_probe.py --dump-schemas). Long runs auto-promote to a background job using the same auto_promote_after_secs bound.",
-                "cancel_semantics": "execution_job_cancel and execution_cancel are best-effort for colab_mcp: the local wait is dropped immediately, but the Colab cell may keep running on Google's side until it finishes naturally. cancel_kind=\"abort\" in the job status payload signals this.",
-                "upstream_probe": "tmp_colab_mcp_probe.py documents MCP vs Colab timeouts and can dump live run_code_cell inputSchema.",
-                "runtime_policy": colab_mcp_runtime_policy_value()
-            });
-        }
         let probe = tokio::task::spawn_blocking({
             let exe = exe.to_string();
             move || {
@@ -1498,16 +1052,6 @@ mod tests {
     use crate::execution::ArtifactLimits;
     use crate::execution::ExecutionJobManager;
     use std::time::Duration;
-
-    #[test]
-    fn colab_mcp_allowlist_globset_matches() {
-        let gs =
-            compile_colab_mcp_tool_allowlist(&["mount_*".to_string(), "exact_tool".to_string()])
-                .expect("globset");
-        assert!(gs.is_match("mount_drive"));
-        assert!(gs.is_match("exact_tool"));
-        assert!(!gs.is_match("other_tool"));
-    }
 
     fn temp_dirs() -> (std::path::PathBuf, std::path::PathBuf) {
         let root =
@@ -1959,70 +1503,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
         assert!(saw, "expected terminal non-success after cancel");
-        let close = ExecutionSessionCloseTool { harness };
-        close.execute(json!({ "session_id": sid })).await.unwrap();
-        let _ = std::fs::remove_dir_all(&ws);
-    }
-
-    /// Live Colab MCP smoke for execution tools. Requires:
-    /// - Browser connected via colab-mcp
-    /// - `uvx` available on PATH
-    /// Run manually:
-    /// `cargo test --release -p isanagent colab_mcp_live_execution_roundtrip -- --ignored --nocapture`
-    #[tokio::test]
-    #[ignore]
-    async fn colab_mcp_live_execution_roundtrip() {
-        let (ws, dir) = temp_dirs();
-        let cfg_toml = r#"
-[harness.execution]
-enabled = true
-default_provider = "colab_mcp"
-allowed_providers = ["colab_mcp"]
-max_wall_secs = 180
-max_output_bytes = 262144
-max_sessions = 2
-
-[harness.execution.colab_mcp]
-command = "uvx"
-args = ["git+https://github.com/googlecolab/colab-mcp"]
-startup_timeout_secs = 60
-connect_tool_name = "open_colab_browser_connection"
-"#;
-        let app_cfg: crate::config::AppConfig = toml::from_str(cfg_toml).expect("parse config");
-        let harness =
-            crate::execution::build_execution_harness(ws.clone(), dir.clone(), true, &app_cfg)
-                .expect("build colab harness");
-
-        let create = ExecutionSessionCreateTool {
-            harness: harness.clone(),
-        };
-        let created = create
-            .execute(json!({ "language": "python" }))
-            .await
-            .expect("create session");
-        let cv: Value = serde_json::from_str(&created).expect("json create");
-        let sid = cv["session_id"].as_str().expect("session id").to_string();
-
-        let (otx, _orx) = mpsc::channel::<BusMessage>(8);
-        let run = ExecutionRunTool {
-            harness: harness.clone(),
-            outbound_tx: otx,
-            jobs: None,
-            inflight: None,
-        };
-        let out = run
-            .execute(json!({
-                "session_id": sid,
-                "code": "print('isanagent-colab-smoke')",
-                "timeout_secs": 120
-            }))
-            .await
-            .expect("run");
-        assert!(
-            out.to_ascii_lowercase().contains("isanagent-colab-smoke"),
-            "unexpected output: {out}"
-        );
-
         let close = ExecutionSessionCloseTool { harness };
         close.execute(json!({ "session_id": sid })).await.unwrap();
         let _ = std::fs::remove_dir_all(&ws);

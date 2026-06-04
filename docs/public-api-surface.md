@@ -323,7 +323,7 @@ pub struct AgentLogicParams {
 
 ### 6.4 `ExecutionHarness` — struct [src/execution/harness.rs:32](../src/execution/harness.rs#L32)
 
-Manages execution providers (`local`, `jupyter`, `ssh`, `colab_mcp`). Mostly private fields. Pub fields: `default_run_timeout_secs`, `max_wall_secs`, `auto_promote_after_secs`. Constructed via `pub fn new_with_providers(...)` [src/execution/harness.rs:60](../src/execution/harness.rs#L60) — 10-arg constructor; the builder [`build_execution_harness`](../src/execution/harness.rs#L403) wraps it.
+Manages execution providers (`local`, `jupyter`, `ssh`). Mostly private fields. Pub fields: `default_run_timeout_secs`, `max_wall_secs`, `auto_promote_after_secs`. Constructed via `pub fn new_with_providers(...)` [src/execution/harness.rs:60](../src/execution/harness.rs#L60) — 10-arg constructor; the builder [`build_execution_harness`](../src/execution/harness.rs#L403) wraps it.
 
 ---
 
@@ -402,7 +402,7 @@ Discovered via `grep "fn name(&self) -> &str"` across [src/tools/](../src/tools/
 
 **[src/tools/builtin.rs](../src/tools/builtin.rs) — 16 tools.** `read_file`, `write_file`, `edit_file`, `list_dir`, `glob_files`, `search_text`, `exec`, `web_search`, `web_fetch`, `cron`, `message`, `git_worktree`, `search_memory`, `fetch_memory_by_date`, `get_env`, `python_run`.
 
-**[src/tools/execution.rs](../src/tools/execution.rs) — 12 tools.** `execution_session_create`, `execution_run`, `execution_run_background`, `execution_job_status`, `execution_job_result`, `execution_read_log`, `execution_job_list`, `execution_job_cancel`, `execution_artifact_list`, `execution_cancel`, `execution_session_close`, `colab_mcp_tool_call`, `execution_env_info`.
+**[src/tools/execution.rs](../src/tools/execution.rs) — 11 tools.** `execution_session_create`, `execution_run`, `execution_run_background`, `execution_job_status`, `execution_job_result`, `execution_read_log`, `execution_job_list`, `execution_job_cancel`, `execution_artifact_list`, `execution_cancel`, `execution_session_close`, `execution_env_info`.
 
 **[src/tools/workflow.rs](../src/tools/workflow.rs) — 3 tools.** `todo_write`, `search_tools`, `ask_user`.
 

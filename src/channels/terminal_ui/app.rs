@@ -1102,14 +1102,14 @@ mod tests {
         app.job_strip_started(
             "job-1",
             "sess-1",
-            "colab_mcp_tool_call",
+            "execution_run",
             Some("training"),
             "chat-1",
         );
         assert_eq!(app.jobs_strip.len(), 1);
         let row = app.jobs_strip.front().unwrap();
         assert_eq!(row.job_id, "job-1");
-        assert_eq!(row.tool_name, "colab_mcp_tool_call");
+        assert_eq!(row.tool_name, "execution_run");
         assert_eq!(row.description.as_deref(), Some("training"));
         assert_eq!(row.status, JobStripStatus::Running);
         assert!(app.jobs_strip_has_running());

@@ -3213,7 +3213,7 @@ mod tests {
     use crate::memory::SqliteMemoryActor;
     use crate::multi_tenant_edge::{ActivityHeartbeatClient, HeartbeatTransport};
     use crate::session::SessionManager;
-    use crate::skills::{SharedSkillRegistry, SkillRegistry};
+    use crate::skills::SkillRegistry;
     use crate::tool_activity::SharedToolExecutionActivity;
     use crate::tool_runtime::ToolExecCtx;
     use crate::tools::ToolRegistry;

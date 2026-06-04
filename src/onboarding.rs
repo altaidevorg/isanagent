@@ -32,6 +32,7 @@ const LITERATURE_TO_RECIPE_SKILL_TEMPLATE: &str =
     include_str!("../assets/onboarding/skills/literature-to-recipe/SKILL.md");
 const OOM_RECOVERY_PLAYBOOK_SKILL_TEMPLATE: &str =
     include_str!("../assets/onboarding/skills/oom-recovery-playbook/SKILL.md");
+const COLAB_CLI_SKILL_TEMPLATE: &str = include_str!("../assets/onboarding/skills/colab-cli/SKILL.md");
 
 struct TemplateFile {
     relative_path: &'static str,
@@ -469,7 +470,7 @@ that file is first created. Remove or rename config.toml, or point --workspace a
 }
 
 fn embedded_templates() -> &'static [TemplateFile] {
-    static TEMPLATES: [TemplateFile; 12] = [
+    static TEMPLATES: [TemplateFile; 13] = [
         TemplateFile {
             relative_path: "config.toml",
             contents: CONFIG_TEMPLATE,
@@ -517,6 +518,10 @@ fn embedded_templates() -> &'static [TemplateFile] {
         TemplateFile {
             relative_path: "workspace/skills/oom-recovery-playbook/SKILL.md",
             contents: OOM_RECOVERY_PLAYBOOK_SKILL_TEMPLATE,
+        },
+        TemplateFile {
+            relative_path: "workspace/skills/colab-cli/SKILL.md",
+            contents: COLAB_CLI_SKILL_TEMPLATE,
         },
     ];
 
@@ -692,6 +697,7 @@ fn validate_generated_files(layout: &WorkspaceLayout) -> Result<(), String> {
         "ml-execution-preflight",
         "literature-to-recipe",
         "oom-recovery-playbook",
+        "colab-cli",
         "synthetic-dataset-with-afterimage",
     ] {
         if !skill_names.iter().any(|skill| skill == required) {
@@ -785,7 +791,7 @@ mod tests {
             "expected subagents optional key as comment"
         );
         assert!(
-            s.contains("default_provider = \"colab_mcp\""),
+            s.contains("default_provider = \"local\""),
             "expected execution default_provider from template"
         );
         assert!(

@@ -50,24 +50,10 @@ With **`default_provider = "ssh"`** and valid **`[harness.execution.ssh]`** cred
 
 Expect: stdout from remote; **`execution_cancel`** does not stop the remote process (client wait only).
 
-## 6. Colab MCP run (manual MVP)
-
-Requires:
-- `default_provider = "colab_mcp"`
-- `[harness.execution.colab_mcp]` configured (or defaults)
-- host has `uv` and browser access to Colab.
-
-1. `execution_session_create` (language optional, python recommended).
-2. If not already connected, call `execution_run` with a small code sample (or use the injected `open_colab_browser_connection` tool via MCP client) and complete browser-side connection.
-3. `execution_run` with `print("colab-ok")`.
-4. `execution_session_close`.
-
-Expect: stdout includes tool text from Colab runtime. If tool autodetection fails, set `execute_tool_name` and `execute_code_arg_keys` in config.
-
-## 7. Manifest and telemetry
+## 6. Manifest and telemetry
 
 After any successful **`execution_run`**, check **`workspace_dir/.system_generated/execution_runs.jsonl`** for a new JSON line (timestamp, `chat_id` when invoked from a real chat, `provider_id`, lengths, `artifact_count`, optional `git_head`). Structured logs may also record **`ExecutionRunFinished`** telemetry.
 
-## 8. Doom loop correction (agent behavior)
+## 7. Doom loop correction (agent behavior)
 
 With **`doom_loop_enabled = true`** (default) at the top level of **`config.toml`**, if the model issues the same tool with identical arguments three times in a row, the agent injects a corrective **user** message into history before the next LLM call. Verify in logs: “Doom loop detected”.
