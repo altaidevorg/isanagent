@@ -2185,18 +2185,23 @@ static FALLBACK_PROVIDERS: std::sync::RwLock<Vec<FallbackProviderSpec>> =
     std::sync::RwLock::new(Vec::new());
 
 /// Install (or replace) the fallback provider list. Safe to call repeatedly — each call replaces the
-/// previous list; pass an empty vec to disable failover. A test that sets this should reset it (set
-/// `vec![]`) afterwards so it doesn't leak into other tests in the binary.
+/// previous list; pass an empty vec to disable failover.
+///
+/// **Don't mutate this from tests.** It's process-global and the reasoning-loop tests read it (via
+/// `chat_with_retry` on primary exhaustion), so setting it from a test races the rest of the binary
+/// under Cargo's parallel runner. Drive [`try_fallbacks`] directly instead, as the failover tests do.
 pub fn set_fallback_providers(specs: Vec<FallbackProviderSpec>) {
-    if let Ok(mut guard) = FALLBACK_PROVIDERS.write() {
-        *guard = specs;
-    }
+    // Recover from a poisoned lock: we replace the list wholesale, so any state a panicking writer
+    // left behind is irrelevant — honoring the poison would instead wedge failover config for the
+    // rest of the process.
+    let mut guard = FALLBACK_PROVIDERS.write().unwrap_or_else(|e| e.into_inner());
+    *guard = specs;
 }
 
 /// Snapshot of the current fallback list. Returns an owned clone so the lock isn't held across the
-/// (async) failover chat calls.
+/// (async) failover chat calls. Recovers a poisoned read lock so failover keeps working.
 fn fallback_providers() -> Vec<FallbackProviderSpec> {
-    FALLBACK_PROVIDERS.read().map(|g| g.clone()).unwrap_or_default()
+    FALLBACK_PROVIDERS.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// Result of attempting the configured fallback providers.
@@ -4022,26 +4027,6 @@ mod tests {
         )
         .await;
         assert!(matches!(out, super::FallbackOutcome::Cancelled));
-    }
-
-    #[test]
-    fn set_fallback_providers_is_resettable() {
-        // The list is process-global; this is the only test that mutates it.
-        // A second `set` must replace the first (an `OnceLock` could not), so an
-        // embedder that re-bootstraps on a provider switch gets fresh fallbacks.
-        super::set_fallback_providers(vec![fb_spec("a")]);
-        let first = super::fallback_providers();
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].provider_name, "a");
-
-        super::set_fallback_providers(vec![fb_spec("b"), fb_spec("c")]);
-        let second = super::fallback_providers();
-        assert_eq!(second.len(), 2);
-        assert_eq!(second[0].provider_name, "b");
-
-        // Reset so the global doesn't leak into other tests in this binary.
-        super::set_fallback_providers(vec![]);
-        assert!(super::fallback_providers().is_empty());
     }
 
     #[derive(Clone)]
