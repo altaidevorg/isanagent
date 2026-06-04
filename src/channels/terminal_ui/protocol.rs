@@ -13,7 +13,7 @@ pub const ISANAGENT_EXECUTION_JOB: &str = "isanagent_execution_job";
 pub const ISANAGENT_EXECUTION_JOB_STARTED: &str = "isanagent_execution_job_started";
 pub const METADATA_EXECUTION_JOB_ID: &str = "execution_job_id";
 pub const METADATA_EXECUTION_JOB_STATUS: &str = "execution_job_status";
-/// Originating tool name for a background execution job (e.g. `colab_mcp_tool_call`,
+/// Originating tool name for a background execution job (e.g.
 /// `execution_run_background`, `execution_run` after auto-promote).
 pub const METADATA_EXECUTION_JOB_TOOL_NAME: &str = "execution_job_tool_name";
 /// Short human-facing line for Ratatui execution strip (optional on stream/job notices).

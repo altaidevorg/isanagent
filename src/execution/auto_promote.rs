@@ -4,7 +4,7 @@
 //! [`ExecutionJobManager::adopt_inflight`](super::execution_jobs::ExecutionJobManager::adopt_inflight)
 //! and returns a `job_id` envelope to the model.
 //!
-//! Used by `colab_mcp_tool_call` and `execution_run` to remove the artificial 120s cap on long
+//! Used by `execution_run` to remove the artificial 120s cap on long
 //! Colab/ML runs without making the synchronous path useless for short calls.
 
 use std::time::Duration;

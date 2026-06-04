@@ -1,8 +1,7 @@
 //! Execution plane: Phase 0 contracts (errors, run specs, capabilities, provider trait),
 //! Phase 1 local subprocess provider ([`local::LocalExecutionProvider`]), Phase 3
 //! Jupyter kernel provider ([`jupyter::JupyterExecutionProvider`]), and Phase 4
-//! SSH exec provider ([`ssh::SshExecutionProvider`]) plus Phase 5 Colab MCP provider
-//! ([`colab_mcp::ColabMcpExecutionProvider`]).
+//! SSH exec provider ([`ssh::SshExecutionProvider`]).
 //!
 //! ## Design: object-safe core + capability traits
 //!
@@ -14,7 +13,6 @@
 mod artifacts;
 mod auto_promote;
 mod capabilities;
-mod colab_mcp;
 mod error;
 mod execution_jobs;
 mod harness;
@@ -23,7 +21,6 @@ mod inflight;
 mod jupyter;
 mod jupyter_notebook;
 mod local;
-mod mcp_call_history;
 mod post_run;
 mod preflight;
 mod provider;
@@ -40,7 +37,6 @@ pub use auto_promote::{run_with_auto_promote, AutoPromoteOutcome, PromoteReason}
 pub use capabilities::{
     NetworkPolicy, ProviderCapabilities, ProviderCapabilitiesSnapshot, SessionCapabilities,
 };
-pub use colab_mcp::{ColabMcpExecutionProvider, ColabMcpExecutionProviderConfig};
 pub use error::ExecutionError;
 pub use execution_jobs::{
     job_status_str, AdoptInflightRequest, ArbitraryWork, CancelOutcome, ExecutionJobManager,
@@ -54,10 +50,6 @@ pub use local::{
     build_python_host_command, install_uv_best_effort, parse_uv_pip_list_and_diff,
     uv_binary_available, uv_managed_env_python, uv_requirements_status, LocalExecMode,
     LocalExecutionConfig, LocalExecutionProvider, LocalPythonRuntime,
-};
-pub use mcp_call_history::{
-    append_mcp_call_manifest, mcp_call_history_dir, write_mcp_call_journal, McpCallJournalParams,
-    McpCallManifestLine,
 };
 pub use post_run::{persist_successful_execution_run, PersistSuccessfulExecutionRunParams};
 pub use preflight::{allowed_optional_tool_tags, PREFLIGHT_MARKDOWN};

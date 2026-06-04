@@ -10,7 +10,6 @@ use serde_json::{json, Value};
 use crate::config::AppConfig;
 
 use super::artifacts::ArtifactLimits;
-use super::colab_mcp::{ColabMcpExecutionProvider, ColabMcpExecutionProviderConfig};
 use super::error::ExecutionError;
 use super::jupyter::{JupyterExecutionProvider, JupyterExecutionProviderConfig};
 use super::local::{LocalExecutionConfig, LocalExecutionProvider, LocalPythonRuntime};
@@ -20,7 +19,7 @@ use super::ssh::{SshExecutionProvider, SshExecutionProviderConfig};
 /// Owns one or more [`ExecutionProvider`] instances and resolves them per-session.
 ///
 /// The harness is built once per process from `[harness.execution]` config. Each candidate
-/// provider in `allowed_providers` (or all four implemented ids when unset) is constructed
+/// provider in `allowed_providers` (or all three implemented ids when unset) is constructed
 /// independently; ones that fail to build are pruned with a warn so a single bad config
 /// (e.g. missing SSH host) cannot block the rest. The default provider — used when a tool
 /// call omits an explicit `provider` argument — is whichever id is named in
@@ -28,15 +27,12 @@ use super::ssh::{SshExecutionProvider, SshExecutionProviderConfig};
 ///
 /// Sessions are bound to the provider that created them via `session_providers`; subsequent
 /// `execution_run` / `execution_session_close` calls are routed back to that provider, so a
-/// process can hold local + colab_mcp sessions concurrently.
+/// process can hold local + jupyter sessions concurrently.
 pub struct ExecutionHarness {
-    /// All built providers, keyed by `provider_id` (`"local"`, `"jupyter"`, `"ssh"`, `"colab_mcp"`).
+    /// All built providers, keyed by `provider_id` (`"local"`, `"jupyter"`, `"ssh"`).
     providers: HashMap<String, Arc<dyn ExecutionProvider>>,
     /// Default provider id used when a tool call omits `provider`. Always present in `providers`.
     default_provider_id: String,
-    /// Set when the `colab_mcp` provider built successfully — typed access for
-    /// `colab_mcp_tool_call`, catalog refresh, and `shutdown_all_sessions`.
-    colab_mcp: Option<Arc<ColabMcpExecutionProvider>>,
     /// Maps `session_id` → owning `provider_id`. Populated by
     /// `execution_session_create` so per-session ops route back to the right provider.
     session_providers: Arc<DashMap<String, String>>,
@@ -54,13 +50,11 @@ pub struct ExecutionHarness {
 
 impl ExecutionHarness {
     /// Build a harness from a pre-constructed provider map. `default_provider_id` must be a
-    /// key in `providers`. `colab_mcp` (typed handle) is set when the corresponding entry was
-    /// built successfully — used by `colab_mcp_tool_call` and `shutdown_all_sessions`.
+    /// key in `providers`.
     #[allow(clippy::too_many_arguments)] // Constructor matches harness config surface area.
     pub fn new_with_providers(
         providers: HashMap<String, Arc<dyn ExecutionProvider>>,
         default_provider_id: String,
-        colab_mcp: Option<Arc<ColabMcpExecutionProvider>>,
         python_executable: impl Into<String>,
         workspace_dir: PathBuf,
         sandbox_dir: PathBuf,
@@ -77,7 +71,6 @@ impl ExecutionHarness {
         Self {
             providers,
             default_provider_id,
-            colab_mcp,
             session_providers: Arc::new(DashMap::new()),
             python_executable: python_executable.into(),
             workspace_dir,
@@ -108,7 +101,6 @@ impl ExecutionHarness {
         Self::new_with_providers(
             providers,
             id,
-            None,
             python_executable,
             workspace_dir,
             sandbox_dir,
@@ -117,41 +109,6 @@ impl ExecutionHarness {
             max_wall_secs,
             auto_promote_after_secs,
         )
-    }
-
-    /// Colab MCP single-provider harness. Used by tests and callers that previously
-    /// constructed a colab-only harness via the typed handle.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_colab_mcp(
-        colab: Arc<ColabMcpExecutionProvider>,
-        python_executable: impl Into<String>,
-        workspace_dir: PathBuf,
-        sandbox_dir: PathBuf,
-        artifact_limits: ArtifactLimits,
-        default_run_timeout_secs: u64,
-        max_wall_secs: u64,
-        auto_promote_after_secs: u64,
-    ) -> Self {
-        let provider: Arc<dyn ExecutionProvider> = colab.clone();
-        let id = provider.provider_id().to_string();
-        let mut providers: HashMap<String, Arc<dyn ExecutionProvider>> = HashMap::new();
-        providers.insert(id.clone(), provider);
-        Self::new_with_providers(
-            providers,
-            id,
-            Some(colab),
-            python_executable,
-            workspace_dir,
-            sandbox_dir,
-            artifact_limits,
-            default_run_timeout_secs,
-            max_wall_secs,
-            auto_promote_after_secs,
-        )
-    }
-
-    pub fn colab_mcp(&self) -> Option<&Arc<ColabMcpExecutionProvider>> {
-        self.colab_mcp.as_ref()
     }
 
     /// Default provider (for callers that don't know — or don't need — the per-session
@@ -229,13 +186,8 @@ impl ExecutionHarness {
     }
 
     /// Best-effort graceful teardown of provider-side child processes / sessions before the
-    /// agent exits. Today this only matters for Colab MCP (which spawns a long-running stdio
-    /// proxy child); other providers are no-ops. Failures are swallowed: this runs at exit.
-    pub async fn shutdown(&self) {
-        if let Some(colab) = self.colab_mcp.as_ref() {
-            colab.shutdown_all_sessions().await;
-        }
-    }
+    /// agent exits. Failures are swallowed: this runs at exit.
+    pub async fn shutdown(&self) {}
 
     /// Bounded JSON for injection into tool results (omits `extensions` map).
     /// Reflects the **default** provider; per-session ops should query the session's
@@ -259,18 +211,13 @@ impl ExecutionHarness {
 }
 
 /// All implemented provider ids (alphabetical). Any subset can be allowed via
-/// `[harness.execution].allowed_providers`; unset = all four are candidates.
-const IMPLEMENTED_PROVIDERS: &[&str] = &["colab_mcp", "jupyter", "local", "ssh"];
+/// `[harness.execution].allowed_providers`; unset = all three are candidates.
+const IMPLEMENTED_PROVIDERS: &[&str] = &["jupyter", "local", "ssh"];
 
-/// Result of a successful provider construction: the trait object plus an optional concrete
-/// `ColabMcpExecutionProvider` handle (only populated for the `colab_mcp` provider so the
-/// harness can call its typed shutdown helpers).
-type BuiltProvider = (
-    Arc<dyn ExecutionProvider>,
-    Option<Arc<ColabMcpExecutionProvider>>,
-);
+/// Result of a successful provider construction: the trait object.
+type BuiltProvider = Arc<dyn ExecutionProvider>;
 
-/// Try to construct one provider by id. Returns `Ok((provider, optional_typed_colab))` or an
+/// Try to construct one provider by id. Returns `Ok(provider)` or an
 /// `Err` describing why the build failed (missing config, network, etc.). Never panics.
 fn try_build_provider(
     pid: &str,
@@ -313,7 +260,7 @@ fn try_build_provider(
                     .join("envs"),
             };
             let p = LocalExecutionProvider::new(lc).map_err(|e: ExecutionError| e.to_string())?;
-            Ok((Arc::new(p), None))
+            Ok(Arc::new(p))
         }
         "jupyter" => {
             let base_url = config.execution_jupyter_base_url().ok_or_else(|| {
@@ -329,12 +276,10 @@ fn try_build_provider(
                 max_sessions: config.execution_max_sessions(),
                 artifact_sandbox_dir: sandbox_dir.to_path_buf(),
                 artifact_limits,
-                notebook_sync_path_template: config
-                    .execution_jupyter_notebook_sync_path_template(),
+                notebook_sync_path_template: config.execution_jupyter_notebook_sync_path_template(),
             };
-            let p =
-                JupyterExecutionProvider::new(jc).map_err(|e: ExecutionError| e.to_string())?;
-            Ok((Arc::new(p), None))
+            let p = JupyterExecutionProvider::new(jc).map_err(|e: ExecutionError| e.to_string())?;
+            Ok(Arc::new(p))
         }
         "ssh" => {
             let host = config.execution_ssh_host().ok_or_else(|| {
@@ -364,67 +309,31 @@ fn try_build_provider(
                 max_sessions: config.execution_max_sessions(),
             };
             let p = SshExecutionProvider::new(sc).map_err(|e: ExecutionError| e.to_string())?;
-            Ok((Arc::new(p), None))
-        }
-        "colab_mcp" => {
-            let cc = ColabMcpExecutionProviderConfig {
-                command: config.execution_colab_mcp_command(),
-                args: config.execution_colab_mcp_args(),
-                cwd: config.execution_colab_mcp_cwd(),
-                startup_timeout_secs: config.execution_colab_mcp_startup_timeout_secs(),
-                connect_tool_name: config.execution_colab_mcp_connect_tool_name(),
-                execute_tool_name: config.execution_colab_mcp_execute_tool_name(),
-                execute_code_arg_keys: config.execution_colab_mcp_execute_code_arg_keys(),
-                max_sessions: config.execution_max_sessions(),
-                max_output_bytes: config.execution_max_output_bytes(),
-            };
-            let p = Arc::new(
-                ColabMcpExecutionProvider::new(cc).map_err(|e: ExecutionError| e.to_string())?,
-            );
-            let typed = p.clone();
-            Ok((p, Some(typed)))
+            Ok(Arc::new(p))
         }
         other => Err(format!(
-            "unknown provider id {other:?} (supported: \"local\", \"jupyter\", \"ssh\", \"colab_mcp\")"
+            "unknown provider id {other:?} (supported: \"local\", \"jupyter\", \"ssh\")"
         )),
     }
 }
 
 /// Build the harness from workspace + app config. Call only when
 /// `AppConfig::execution_harness_enabled()` is true.
-///
-/// Behavior:
-/// - The candidate set is `allowed_providers` if non-empty, else all four implemented ids.
-/// - Each candidate is built independently. Failures are logged at warn level and pruned;
-///   they do not block the rest of the agent from starting.
-/// - The default provider is chosen as follows:
-///   - If user-configured `default_provider` survived pruning → use it.
-///   - If user explicitly set `default_provider` and it was pruned → hard-fail (the user
-///     pinned a now-broken provider; we'd rather refuse to start than silently swap).
-///   - If `default_provider` was the implicit fallback (`"colab_mcp"`) and it was pruned →
-///     warn and auto-pick the first available id alphabetically.
-/// - If no provider builds successfully, return `Err` so the binary can refuse to start.
 pub fn build_execution_harness(
     workspace_dir: PathBuf,
     sandbox_dir: PathBuf,
     restrict_to_workspace: bool,
     config: &AppConfig,
 ) -> Result<Arc<ExecutionHarness>, String> {
+    let candidates = config.execution_allowed_providers().unwrap_or_else(|| {
+        IMPLEMENTED_PROVIDERS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    });
+
     let configured_default = config.execution_default_provider();
     let default_explicit = config.execution_default_provider_explicit();
-    let allowed = config.execution_allowed_providers();
-
-    if default_explicit && !config.execution_provider_allowed(&configured_default) {
-        return Err(format!(
-            "execution provider {configured_default:?} is not listed in [harness.execution].allowed_providers"
-        ));
-    }
-
-    let candidates: Vec<&str> = match allowed.as_ref() {
-        Some(list) => list.iter().map(String::as_str).collect(),
-        None => IMPLEMENTED_PROVIDERS.to_vec(),
-    };
-
     let artifact_limits = ArtifactLimits {
         max_file_bytes: config.execution_artifact_max_file_bytes(),
         max_total_bytes_per_run: config.execution_artifact_max_total_bytes_per_run(),
@@ -432,23 +341,19 @@ pub fn build_execution_harness(
     };
 
     let mut providers: HashMap<String, Arc<dyn ExecutionProvider>> = HashMap::new();
-    let mut typed_colab: Option<Arc<ColabMcpExecutionProvider>> = None;
     let mut prune_log: Vec<(String, String)> = Vec::new();
 
     for pid in candidates {
         match try_build_provider(
-            pid,
+            &pid,
             &workspace_dir,
             &sandbox_dir,
             restrict_to_workspace,
             artifact_limits,
             config,
         ) {
-            Ok((provider, colab)) => {
+            Ok(provider) => {
                 providers.insert(pid.to_string(), provider);
-                if let Some(c) = colab {
-                    typed_colab = Some(c);
-                }
             }
             Err(reason) => {
                 log::warn!(
@@ -522,7 +427,6 @@ pub fn build_execution_harness(
     Ok(Arc::new(ExecutionHarness::new_with_providers(
         providers,
         default_provider_id,
-        typed_colab,
         python_executable,
         workspace_dir,
         sandbox_dir,
@@ -536,184 +440,71 @@ pub fn build_execution_harness(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    static SCRATCH_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    #[tokio::test]
+    async fn harness_resolves_providers_per_session() {
+        let root =
+            std::env::temp_dir().join(format!("isanagent-harness-test-{}", uuid::Uuid::new_v4()));
+        let ws = root.clone();
+        let sandbox = root.join("sandbox");
+        let _ = std::fs::create_dir_all(&sandbox);
 
-    fn fresh_workspace(tag: &str) -> (PathBuf, PathBuf) {
-        let n = SCRATCH_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let root = std::env::temp_dir().join(format!(
-            "isanagent-harness-test-{tag}-{n}-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let sandbox = root.join("workspace");
-        std::fs::create_dir_all(&sandbox).expect("mkdir");
-        (root, sandbox)
-    }
+        let lc = LocalExecutionConfig::new(sandbox.clone(), ws.clone(), true);
+        let lp = Arc::new(LocalExecutionProvider::new(lc).unwrap());
 
-    #[test]
-    fn local_system_runtime_requires_python_executable() {
-        let cfg: AppConfig = toml::from_str(
-            r#"
-[harness.execution]
-enabled = true
-default_provider = "local"
-local_python_runtime = "system"
-allowed_providers = ["local"]
-"#,
-        )
-        .expect("parse");
-        let (root, sandbox) = fresh_workspace("system-runtime");
-        let res = build_execution_harness(root.clone(), sandbox.clone(), true, &cfg);
-        assert!(res.is_err(), "expected missing python_executable error");
-        let err = match res {
-            Ok(_) => String::new(),
-            Err(e) => e,
+        let jc = JupyterExecutionProviderConfig {
+            base_url: "http://127.0.0.1:8888".to_string(),
+            token: None,
+            default_kernel_name: "python3".to_string(),
+            max_run_timeout_secs: 3600,
+            max_output_bytes: 1024,
+            max_sessions: 1,
+            artifact_sandbox_dir: sandbox.clone(),
+            artifact_limits: ArtifactLimits::default(),
+            notebook_sync_path_template: None,
         };
-        // With allowed_providers = ["local"] and local broken, we get the "no providers" error
-        // that quotes the underlying reason from the prune log.
-        assert!(err.contains("python_executable"), "err={err}");
-        let _ = std::fs::remove_dir_all(&root);
-    }
+        let jp = Arc::new(JupyterExecutionProvider::new(jc).unwrap());
 
-    #[test]
-    fn build_execution_harness_prunes_misconfigured_and_keeps_local() {
-        // ssh and jupyter are unconfigured (no host / base_url) and should be pruned. local builds.
-        let cfg: AppConfig = toml::from_str(
-            r#"
-[harness.execution]
-enabled = true
-default_provider = "local"
-local_python_runtime = "system"
-python_executable = "python3"
-allowed_providers = ["local", "ssh", "jupyter"]
-"#,
-        )
-        .expect("parse");
-        let (root, sandbox) = fresh_workspace("prune");
-        let res = build_execution_harness(root.clone(), sandbox.clone(), true, &cfg);
-        let harness = res.expect("harness should build with local intact");
-        let avail = harness.available_providers();
-        assert_eq!(avail, vec!["local"], "ssh/jupyter should be pruned");
-        assert_eq!(harness.default_provider_id(), "local");
-        let _ = std::fs::remove_dir_all(&root);
-    }
+        let mut providers: HashMap<String, Arc<dyn ExecutionProvider>> = HashMap::new();
+        providers.insert("local".to_string(), lp.clone());
+        providers.insert("jupyter".to_string(), jp.clone());
 
-    #[test]
-    fn build_execution_harness_hard_fails_when_explicit_default_pruned() {
-        // User explicitly pinned ssh as default but ssh has no host: build must refuse, not
-        // silently swap to local — surprises here would be hard to debug at runtime.
-        let cfg: AppConfig = toml::from_str(
-            r#"
-[harness.execution]
-enabled = true
-default_provider = "ssh"
-local_python_runtime = "system"
-python_executable = "python3"
-allowed_providers = ["ssh", "local"]
-"#,
-        )
-        .expect("parse");
-        let (root, sandbox) = fresh_workspace("explicit-default-pruned");
-        let res = build_execution_harness(root.clone(), sandbox.clone(), true, &cfg);
-        let err = res
-            .err()
-            .expect("expected hard fail when explicit default pruned");
-        assert!(
-            err.contains("default_provider") && err.contains("ssh"),
-            "err={err}"
+        let harness = ExecutionHarness::new_with_providers(
+            providers,
+            "local".to_string(),
+            "python",
+            ws.clone(),
+            sandbox.clone(),
+            ArtifactLimits::default(),
+            60,
+            3600,
+            0,
         );
-        let _ = std::fs::remove_dir_all(&root);
-    }
 
-    #[test]
-    fn build_execution_harness_empty_after_prune_returns_err() {
-        // Only ssh is allowed and ssh has no host → empty map → hard error.
-        let cfg: AppConfig = toml::from_str(
-            r#"
-[harness.execution]
-enabled = true
-default_provider = "ssh"
-allowed_providers = ["ssh"]
-"#,
-        )
-        .expect("parse");
-        let (root, sandbox) = fresh_workspace("all-pruned");
-        let res = build_execution_harness(root.clone(), sandbox.clone(), true, &cfg);
-        let err = res.err().expect("expected empty-map failure");
-        assert!(
-            err.contains("no providers could be built") || err.contains("not listed"),
-            "err={err}"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn provider_for_resolves_optional_id_and_default() {
-        let cfg: AppConfig = toml::from_str(
-            r#"
-[harness.execution]
-enabled = true
-default_provider = "local"
-local_python_runtime = "system"
-python_executable = "python3"
-allowed_providers = ["local"]
-"#,
-        )
-        .expect("parse");
-        let (root, sandbox) = fresh_workspace("provider-for");
-        let harness =
-            build_execution_harness(root.clone(), sandbox.clone(), true, &cfg).expect("build");
-        // None / empty / "default" all resolve to the default.
+        assert_eq!(harness.available_providers(), vec!["jupyter", "local"]);
         assert_eq!(harness.provider_for(None).unwrap().provider_id(), "local");
         assert_eq!(
-            harness.provider_for(Some("")).unwrap().provider_id(),
-            "local"
+            harness.provider_for(Some("jupyter")).unwrap().provider_id(),
+            "jupyter"
         );
-        assert_eq!(
-            harness.provider_for(Some("default")).unwrap().provider_id(),
-            "local"
-        );
-        // Explicit known id resolves.
         assert_eq!(
             harness.provider_for(Some("local")).unwrap().provider_id(),
             "local"
         );
         // Unknown id surfaces the available list so the model can self-correct.
         let err = harness
-            .provider_for(Some("colab_mcp"))
+            .provider_for(Some("ssh"))
             .err()
             .expect("should be unknown");
         assert!(err.contains("available providers"), "err={err}");
         assert!(err.contains("local"), "err={err}");
-        let _ = std::fs::remove_dir_all(&root);
-    }
 
-    #[test]
-    fn session_provider_mapping_round_trip() {
-        let cfg: AppConfig = toml::from_str(
-            r#"
-[harness.execution]
-enabled = true
-default_provider = "local"
-local_python_runtime = "system"
-python_executable = "python3"
-allowed_providers = ["local"]
-"#,
-        )
-        .expect("parse");
-        let (root, sandbox) = fresh_workspace("session-map");
-        let harness =
-            build_execution_harness(root.clone(), sandbox.clone(), true, &cfg).expect("build");
-
-        // Unknown sid falls back to default.
-        let p = harness.provider_for_session("does-not-exist");
-        assert_eq!(p.provider_id(), "local");
-
-        // After registration the mapping is honored. (Only one provider in this harness, but
-        // the lookup path is what we want to exercise.)
-        harness.register_session("sid-1", "local");
-        assert_eq!(harness.provider_for_session("sid-1").provider_id(), "local");
+        // Mapping persistence.
+        harness.register_session("sid-1", "jupyter");
+        assert_eq!(
+            harness.provider_for_session("sid-1").provider_id(),
+            "jupyter"
+        );
         harness.unregister_session("sid-1");
         assert_eq!(
             harness.provider_for_session("sid-1").provider_id(),

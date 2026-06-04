@@ -150,7 +150,7 @@ const TERMINAL_HELP: &str = r#"Commands (leading slash):
   /copy          Copy the last assistant reply to the clipboard
   /install-python Install uv (best effort) in the background; UI stays responsive
   /cancel, /stop Stop the in-flight reply for this chat (drops queued prompts)
-  /background, /bg Promote the in-flight execution_run / colab_mcp_tool_call to a background job
+  /background, /bg Promote the in-flight execution_run to a background job
   /retry         Re-submit the last user message after an LLM-failed banner
   /tools         Open the tool activity pane
   /exec          Open the executions browser (workspace execution_runs.jsonl)
@@ -2415,7 +2415,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                     app.request_quit();
                                 } else {
                                     app.cells.push(Cell::System {
-                                    message: "Promote-to-background requested. If a sync execution_run / colab_mcp_tool_call is in flight it will return a job_id you can poll with execution_job_status.".into(),
+                                    message: "Promote-to-background requested. If a sync execution_run is in flight it will return a job_id you can poll with execution_job_status.".into(),
                                 });
                                 }
                                 continue;
@@ -2601,7 +2601,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                             });
                                         } else {
                                             app.cells.push(Cell::System {
-                                                message: format!("Skill installation requested for repository: {}. Check logs for progress.", repo_url).into(),
+                                                message: format!("Skill installation requested for repository: {}. Check logs for progress.", repo_url),
                                             });
                                         }
                                     }

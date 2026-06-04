@@ -48,29 +48,6 @@ pub struct JupyterExecutionConfig {
     pub notebook_sync_path_template: Option<String>,
 }
 
-/// Google Colab MCP bridge over stdio (`default_provider = "colab_mcp"`).
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
-pub struct ColabMcpExecutionConfig {
-    /// Command to launch the MCP server (default `uvx`).
-    pub command: Option<String>,
-    /// Command args (default `["git+https://github.com/googlecolab/colab-mcp"]`).
-    pub args: Option<Vec<String>>,
-    /// Optional working directory for the MCP process.
-    pub cwd: Option<String>,
-    /// Session-start timeout for MCP init + tools/list handshake (default 30, clamped 5–300).
-    pub startup_timeout_secs: Option<u64>,
-    /// Tool used to trigger browser connection (default `open_colab_browser_connection`).
-    pub connect_tool_name: Option<String>,
-    /// Optional explicit execution tool name; when unset, auto-detected from tools/list.
-    pub execute_tool_name: Option<String>,
-    /// Preferred code argument keys to try in order (default `["code","source","cell","input"]`).
-    pub execute_code_arg_keys: Option<Vec<String>>,
-    /// When true, register agent tool `colab_mcp_tool_call` for allowlisted MCP tools (default true).
-    pub extra_mcp_tool_call_enabled: Option<bool>,
-    /// Glob patterns matched against MCP tool names (e.g. `mount_*`). Default `["*"]`.
-    pub extra_mcp_tool_allowlist: Option<Vec<String>>,
-}
-
 /// Code execution harness (`execution_*` tools). On by default; set `[harness.execution] enabled = false` to disable.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct ExecutionHarnessConfig {
@@ -84,7 +61,7 @@ pub struct ExecutionHarnessConfig {
     pub max_wall_secs: Option<u64>,
     /// Default `timeout_secs` when `execution_run` / `execution_run_background` omit it (default 600 when unset, clamped to `max_wall_secs`).
     pub default_execution_timeout_secs: Option<u64>,
-    /// Short bound after which a synchronous run (`execution_run`, `colab_mcp_tool_call`)
+    /// Short bound after which a synchronous run (`execution_run`)
     /// auto-promotes to a background job and returns a `job_id` envelope.
     /// Default 120 when unset; clamped to `5..=max_wall_secs`. Set to `0` to disable
     /// auto-promotion (synchronous calls then run up to their full `timeout_secs`).
@@ -116,8 +93,6 @@ pub struct ExecutionHarnessConfig {
     pub jupyter: Option<JupyterExecutionConfig>,
     /// Required when `default_provider = "ssh"`.
     pub ssh: Option<SshExecutionConfig>,
-    /// Required when `default_provider = "colab_mcp"`.
-    pub colab_mcp: Option<ColabMcpExecutionConfig>,
     /// When true (default), enqueue a synthetic inbound when a background execution job reaches a terminal state
     /// so the agent can call `execution_job_result` without waiting for the user. Set to false for API-only or
     /// headless runs that must not auto-continue the reasoning loop.
@@ -859,7 +834,7 @@ impl AppConfig {
             .and_then(|e| e.default_provider.as_ref())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "colab_mcp".to_string())
+            .unwrap_or_else(|| "local".to_string())
     }
 
     /// True iff the user explicitly set `[harness.execution].default_provider` to a non-empty
@@ -932,7 +907,7 @@ impl AppConfig {
     }
 
     /// Short bound after which a synchronous run auto-promotes to a background job
-    /// (`execution_run`, `colab_mcp_tool_call`).
+    /// (`execution_run`).
     ///
     /// Returns `0` when auto-promote is explicitly disabled (`auto_promote_after_secs = 0`).
     /// Otherwise returns the configured value clamped to `5..=max_wall_secs`, defaulting to
@@ -1248,128 +1223,6 @@ impl AppConfig {
             .and_then(|s| s.accept_unknown_host_keys)
             .unwrap_or(false)
     }
-
-    pub fn execution_colab_mcp_command(&self) -> String {
-        self.harness
-            .as_ref()
-            .and_then(|h| h.execution.as_ref())
-            .and_then(|e| e.colab_mcp.as_ref())
-            .and_then(|c| c.command.as_ref())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "uvx".to_string())
-    }
-
-    pub fn execution_colab_mcp_args(&self) -> Vec<String> {
-        self.harness
-            .as_ref()
-            .and_then(|h| h.execution.as_ref())
-            .and_then(|e| e.colab_mcp.as_ref())
-            .and_then(|c| c.args.as_ref())
-            .map(|items| {
-                items
-                    .iter()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<_>>()
-            })
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| vec!["git+https://github.com/googlecolab/colab-mcp".to_string()])
-    }
-
-    pub fn execution_colab_mcp_cwd(&self) -> Option<String> {
-        self.harness
-            .as_ref()
-            .and_then(|h| h.execution.as_ref())
-            .and_then(|e| e.colab_mcp.as_ref())
-            .and_then(|c| c.cwd.as_ref())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    }
-
-    pub fn execution_colab_mcp_startup_timeout_secs(&self) -> u64 {
-        const DEFAULT: u64 = 30;
-        const MIN: u64 = 5;
-        const MAX: u64 = 300;
-        self.harness
-            .as_ref()
-            .and_then(|h| h.execution.as_ref())
-            .and_then(|e| e.colab_mcp.as_ref())
-            .and_then(|c| c.startup_timeout_secs)
-            .unwrap_or(DEFAULT)
-            .clamp(MIN, MAX)
-    }
-
-    pub fn execution_colab_mcp_connect_tool_name(&self) -> String {
-        self.harness
-            .as_ref()
-            .and_then(|h| h.execution.as_ref())
-            .and_then(|e| e.colab_mcp.as_ref())
-            .and_then(|c| c.connect_tool_name.as_ref())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "open_colab_browser_connection".to_string())
-    }
-
-    pub fn execution_colab_mcp_execute_tool_name(&self) -> Option<String> {
-        self.harness
-            .as_ref()
-            .and_then(|h| h.execution.as_ref())
-            .and_then(|e| e.colab_mcp.as_ref())
-            .and_then(|c| c.execute_tool_name.as_ref())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    }
-
-    pub fn execution_colab_mcp_execute_code_arg_keys(&self) -> Vec<String> {
-        self.harness
-            .as_ref()
-            .and_then(|h| h.execution.as_ref())
-            .and_then(|e| e.colab_mcp.as_ref())
-            .and_then(|c| c.execute_code_arg_keys.as_ref())
-            .map(|items| {
-                items
-                    .iter()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<_>>()
-            })
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| {
-                vec![
-                    "code".to_string(),
-                    "source".to_string(),
-                    "cell".to_string(),
-                    "input".to_string(),
-                ]
-            })
-    }
-
-    pub fn execution_colab_mcp_extra_mcp_tool_call_enabled(&self) -> bool {
-        self.harness
-            .as_ref()
-            .and_then(|h| h.execution.as_ref())
-            .and_then(|e| e.colab_mcp.as_ref())
-            .and_then(|c| c.extra_mcp_tool_call_enabled)
-            .unwrap_or(true)
-    }
-
-    pub fn execution_colab_mcp_extra_mcp_tool_allowlist(&self) -> Vec<String> {
-        self.harness
-            .as_ref()
-            .and_then(|h| h.execution.as_ref())
-            .and_then(|e| e.colab_mcp.as_ref())
-            .and_then(|c| c.extra_mcp_tool_allowlist.as_ref())
-            .map(|items| {
-                items
-                    .iter()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<_>>()
-            })
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| vec!["*".to_string()])
-    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -1633,7 +1486,7 @@ python_executable = "python3"
         let s = "restrict_to_workspace = true\n";
         let c: AppConfig = toml::from_str(s).expect("parse");
         assert!(c.execution_harness_enabled());
-        assert_eq!(c.execution_default_provider(), "colab_mcp");
+        assert_eq!(c.execution_default_provider(), "local");
     }
 
     #[test]
@@ -1657,7 +1510,7 @@ enabled = true
         assert_eq!(c.execution_max_wall_secs(), 3600);
         assert_eq!(c.execution_default_run_timeout_secs(), 600);
         assert_eq!(c.execution_local_python_runtime(), "uv_managed");
-        assert_eq!(c.execution_default_provider(), "colab_mcp");
+        assert_eq!(c.execution_default_provider(), "local");
     }
 
     #[test]
@@ -1823,67 +1676,6 @@ uv_requirements = ["numpy", "pandas>=2.2"]
         assert_eq!(
             c.execution_uv_requirements(),
             vec!["numpy".to_string(), "pandas>=2.2".to_string()]
-        );
-    }
-
-    #[test]
-    fn harness_execution_colab_mcp_toml() {
-        let s = r#"
-[harness.execution]
-enabled = true
-default_provider = "colab_mcp"
-allowed_providers = ["colab_mcp", "local"]
-
-[harness.execution.colab_mcp]
-command = "uvx"
-args = ["git+https://github.com/googlecolab/colab-mcp"]
-startup_timeout_secs = 45
-connect_tool_name = "open_colab_browser_connection"
-execute_tool_name = "execute_python"
-execute_code_arg_keys = ["code", "source"]
-extra_mcp_tool_call_enabled = true
-extra_mcp_tool_allowlist = ["get_*", "mount_drive"]
-"#;
-        let c: AppConfig = toml::from_str(s).expect("parse");
-        assert_eq!(c.execution_default_provider(), "colab_mcp");
-        assert!(c.execution_provider_allowed("colab_mcp"));
-        assert_eq!(c.execution_colab_mcp_command(), "uvx");
-        assert_eq!(
-            c.execution_colab_mcp_args(),
-            vec!["git+https://github.com/googlecolab/colab-mcp".to_string()]
-        );
-        assert_eq!(c.execution_colab_mcp_startup_timeout_secs(), 45);
-        assert_eq!(
-            c.execution_colab_mcp_connect_tool_name(),
-            "open_colab_browser_connection"
-        );
-        assert_eq!(
-            c.execution_colab_mcp_execute_tool_name().as_deref(),
-            Some("execute_python")
-        );
-        assert_eq!(
-            c.execution_colab_mcp_execute_code_arg_keys(),
-            vec!["code".to_string(), "source".to_string()]
-        );
-        assert!(c.execution_colab_mcp_extra_mcp_tool_call_enabled());
-        assert_eq!(
-            c.execution_colab_mcp_extra_mcp_tool_allowlist(),
-            vec!["get_*".to_string(), "mount_drive".to_string()]
-        );
-    }
-
-    #[test]
-    fn harness_execution_colab_mcp_extra_tools_defaults_enabled() {
-        let s = r#"
-[harness.execution]
-enabled = true
-default_provider = "colab_mcp"
-"#;
-        let c: AppConfig = toml::from_str(s).expect("parse");
-        assert!(c.execution_colab_mcp_extra_mcp_tool_call_enabled());
-        assert_eq!(
-            c.execution_colab_mcp_extra_mcp_tool_allowlist(),
-            vec!["*".to_string()]
         );
     }
 

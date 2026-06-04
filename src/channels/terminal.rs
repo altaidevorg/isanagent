@@ -137,26 +137,12 @@ fn tool_args_preview_execution(args: &str) -> String {
     truncate_display(args, 220)
 }
 
-fn tool_args_preview_colab_mcp(args: &str) -> String {
-    let v: Value = match serde_json::from_str(args) {
-        Ok(v) => v,
-        Err(_) => return truncate_display(args, 220),
-    };
-    let tool_name = v
-        .get("tool_name")
-        .and_then(|x| x.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let description = v
-        .get("description")
-        .and_then(|x| x.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    match (tool_name, description) {
-        (Some(tn), Some(d)) => truncate_display(&format!("{tn}: {d}"), 160),
-        (Some(tn), None) => truncate_display(tn, 160),
-        (None, Some(d)) => truncate_display(d, 160),
-        (None, None) => truncate_display(args, 220),
+fn tool_call_preview_for_terminal(tool_name: &str, args: &str) -> String {
+    match tool_name {
+        "message" => tool_args_preview_message(args),
+        "execution_run" | "execution_run_background" => tool_args_preview_execution(args),
+        _ => tool_args_preview_generic_description(args)
+            .unwrap_or_else(|| truncate_display(args, 220)),
     }
 }
 
@@ -190,16 +176,6 @@ pub fn should_suppress_tool_notice_for_terminal(tool_name: &str, payload: &str) 
     // Result string format is `Message sent to {channel}:{chat_id}` (see MessageTool::execute).
     // Anything else (errors, future formats) keeps the notice visible.
     payload.starts_with("Message sent to terminal:")
-}
-
-fn tool_call_preview_for_terminal(tool_name: &str, args: &str) -> String {
-    match tool_name {
-        "message" => tool_args_preview_message(args),
-        "execution_run" | "execution_run_background" => tool_args_preview_execution(args),
-        "colab_mcp_tool_call" => tool_args_preview_colab_mcp(args),
-        _ => tool_args_preview_generic_description(args)
-            .unwrap_or_else(|| truncate_display(args, 220)),
-    }
 }
 
 /// Live `execution_run` stream line for Ratatui (`content` is usually JSON for [`RunEvent`](crate::execution::RunEvent)).
@@ -714,24 +690,6 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
 #[cfg(test)]
 mod preview_tests {
     use super::*;
-
-    #[test]
-    fn colab_mcp_preview_uses_description_when_set() {
-        let args = r#"{"session_id":"s","tool_name":"foo","description":"warm up the kernel"}"#;
-        let p = tool_call_preview_for_terminal("colab_mcp_tool_call", args);
-        assert!(p.contains("foo"), "preview missing tool_name: {p}");
-        assert!(
-            p.contains("warm up the kernel"),
-            "preview missing description: {p}"
-        );
-    }
-
-    #[test]
-    fn colab_mcp_preview_falls_back_to_tool_name_when_no_description() {
-        let args = r#"{"session_id":"s","tool_name":"foo"}"#;
-        let p = tool_call_preview_for_terminal("colab_mcp_tool_call", args);
-        assert!(p.contains("foo"));
-    }
 
     #[test]
     fn unknown_tool_falls_back_to_generic_description() {

@@ -97,7 +97,7 @@ enabled = true
 [harness.subagents]
 enabled = true
 # cancel_children_on_parent_cancel = false  # default true: explicit cancel (/cancel, BusMessage::Cancel) also stops sub-tasks
-# allowed_tools = ["read_file", "glob_files", "search_text", "edit_file"]  # omit = all tools except nested spawn/plan
+# allowed_tools = ["read_file", "glob_files", "search_text", "edit_file"]  # omit = all tools except nested_spawn/plan
 # wake_on_completion = true    # default true: auto-notify parent when a subagent finishes
 # task_history_retention = 200 # default 200: max completed tasks retained in SQLite per parent chat
 
@@ -137,14 +137,17 @@ enabled = true
 # Execution: docs/execution-user-guide.md
 [harness.execution]
 enabled = true
-default_provider = "colab_mcp"
-allowed_providers = ["local", "jupyter", "colab_mcp"]
+default_provider = "local"
+allowed_providers = ["local", "jupyter", "ssh"]
 local_python_mode = "repl"
 local_python_runtime = "uv_managed"
 uv_binary = "uv"
 uv_python = "3.11"
-uv_requirements = ["afterimage>=0.15.0"]
-# Synchronous execution_run / colab_mcp_tool_call calls that exceed this many seconds are
+uv_requirements = [
+    "afterimage>=0.15.0",
+    "google-colab-cli @ git+https://github.com/monatis/google-colab-cli"
+]
+# Synchronous execution_run calls that exceed this many seconds are
 # transparently auto-promoted to a background job; the tool returns a `job_id` envelope you can
 # poll with execution_job_status / execution_job_result. Set to 0 to disable, or any value
 # between 5 and max_wall_secs. Default: 120.
@@ -175,14 +178,3 @@ kernel_name = "python3"
 # remote_workdir = "/tmp/isanagent-exec"
 # remote_python = "python3"
 # accept_unknown_host_keys = true
-
-# Uncomment to override Colab MCP defaults (browser + uv).
-# [harness.execution.colab_mcp]
-# command = "uvx"
-# args = ["git+https://github.com/googlecolab/colab-mcp"]
-# startup_timeout_secs = 30
-# connect_tool_name = "open_colab_browser_connection"
-# execute_tool_name = "execute_python"
-# execute_code_arg_keys = ["code", "source"]
-# extra_mcp_tool_call_enabled = true
-# extra_mcp_tool_allowlist = ["*"]
