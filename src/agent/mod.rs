@@ -1944,9 +1944,15 @@ pub fn build_fallback_specs(
     candidates
         .into_iter()
         .filter(|c| {
-            !(c.provider_name == primary_provider
-                && c.base_url == primary_base_url
-                && c.model_name == primary_model)
+            // Normalize before comparing so the primary isn't accidentally retried as its own
+            // fallback: trailing slashes on base URLs are insignificant, and provider/model names
+            // are matched case-insensitively (e.g. `https://api.openai.com/v1/` vs `.../v1`, or
+            // `OpenAI` vs `openai`).
+            let norm_c_url = c.base_url.trim_end_matches('/');
+            let norm_p_url = primary_base_url.trim_end_matches('/');
+            !(c.provider_name.eq_ignore_ascii_case(primary_provider)
+                && norm_c_url == norm_p_url
+                && c.model_name.eq_ignore_ascii_case(primary_model))
         })
         .collect()
 }
@@ -2012,7 +2018,19 @@ where
             _ = cancel_token.cancelled() => return FallbackOutcome::Cancelled,
         };
         match res {
-            Ok(resp) => return FallbackOutcome::Ok(resp),
+            Ok(resp) => {
+                let _ = log.logger_tx.send(BusMessage::Log(
+                    LogEvent::info(
+                        log.name,
+                        &format!(
+                            "Fallback succeeded: provider={} model={}",
+                            spec.provider_name, spec.model_name
+                        ),
+                    )
+                    .with_chat_id(log.chat_id),
+                ));
+                return FallbackOutcome::Ok(resp);
+            }
             Err(e) => {
                 let _ = log.logger_tx.send(BusMessage::Log(
                     LogEvent::warn(
@@ -3596,7 +3614,9 @@ mod tests {
     #[test]
     fn build_fallback_specs_excludes_primary_by_full_identity() {
         let candidates = vec![
-            fb_full("anthropic", "https://api.anthropic.com", "claude"), // == primary
+            // Same identity as the primary but with different casing and a trailing slash on the
+            // base URL — must still be excluded after normalization.
+            fb_full("Anthropic", "https://api.anthropic.com/", "Claude"),
             fb_full("openai", "https://api.openai.com", "gpt-4o"),
         ];
         let out = super::build_fallback_specs(
