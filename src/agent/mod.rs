@@ -2176,19 +2176,32 @@ pub fn build_fallback_specs(
         .collect()
 }
 
-/// Process-wide fallback providers, set once at startup (like the primary, these are config).
-/// Empty until set, so failover is simply inert when unconfigured or in tests.
-static FALLBACK_PROVIDERS: std::sync::OnceLock<Vec<FallbackProviderSpec>> = std::sync::OnceLock::new();
+/// Process-wide fallback providers (config, like the primary). Empty until set, so failover is
+/// simply inert when unconfigured. Stored behind an `RwLock` rather than a `OnceLock` so an embedder
+/// that rebuilds its runtime — e.g. a desktop app that re-bootstraps on a provider/model switch —
+/// can refresh the list, keeping the fallbacks consistent with the current primary instead of
+/// frozen at the first call.
+static FALLBACK_PROVIDERS: std::sync::RwLock<Vec<FallbackProviderSpec>> =
+    std::sync::RwLock::new(Vec::new());
 
-/// Install the fallback provider list. Call once at startup, after the primary is built; a second
-/// call is ignored (OnceLock). **Do not call from tests** — the `OnceLock` can't be reset, so it
-/// would pollute every other test in the binary. Tests drive [`try_fallbacks`] directly instead.
+/// Install (or replace) the fallback provider list. Safe to call repeatedly — each call replaces the
+/// previous list; pass an empty vec to disable failover.
+///
+/// **Don't mutate this from tests.** It's process-global and the reasoning-loop tests read it (via
+/// `chat_with_retry` on primary exhaustion), so setting it from a test races the rest of the binary
+/// under Cargo's parallel runner. Drive [`try_fallbacks`] directly instead, as the failover tests do.
 pub fn set_fallback_providers(specs: Vec<FallbackProviderSpec>) {
-    let _ = FALLBACK_PROVIDERS.set(specs);
+    // Recover from a poisoned lock: we replace the list wholesale, so any state a panicking writer
+    // left behind is irrelevant — honoring the poison would instead wedge failover config for the
+    // rest of the process.
+    let mut guard = FALLBACK_PROVIDERS.write().unwrap_or_else(|e| e.into_inner());
+    *guard = specs;
 }
 
-fn fallback_providers() -> &'static [FallbackProviderSpec] {
-    FALLBACK_PROVIDERS.get().map(Vec::as_slice).unwrap_or(&[])
+/// Snapshot of the current fallback list. Returns an owned clone so the lock isn't held across the
+/// (async) failover chat calls. Recovers a poisoned read lock so failover keeps working.
+fn fallback_providers() -> Vec<FallbackProviderSpec> {
+    FALLBACK_PROVIDERS.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// Result of attempting the configured fallback providers.
@@ -2355,8 +2368,9 @@ async fn chat_with_retry(
     // Primary exhausted. Before surfacing a failure, try each configured fallback provider once, so
     // a transient outage / key rotation / model deprecation on the primary doesn't drop a long
     // unattended turn. The primary stays the active provider — failover is per-call.
+    let fallbacks = fallback_providers();
     match try_fallbacks(
-        fallback_providers(),
+        &fallbacks,
         |s| {
             crate::provider::create_provider(&s.provider_name, &s.base_url, &s.api_key, &s.model_name)
         },
