@@ -2612,6 +2612,15 @@ impl AgentLogic {
         // to avoid silently overflowing the context window. Updated after each provider response.
         let mut last_prompt_tokens: Option<u32> = None;
 
+        // Bounds the `forbid_final_without_tools` push: after this many consecutive
+        // text-only replies (no tool call), accept the model's answer instead of
+        // nudging it again. Without this, broad/exploratory prompts where the model
+        // wants to summarize grind through every iteration and dead-end on
+        // "Agent reached max reasoning iterations." Any tool call resets the count,
+        // so normal multi-step work is unaffected.
+        const MAX_FORBID_FINAL_NUDGES: u32 = 3;
+        let mut forbid_final_nudges: u32 = 0;
+
         while iterations < max_iterations {
             if cancel_token.is_cancelled() {
                 let _ = logger_tx.send(BusMessage::Log(
@@ -3230,6 +3239,7 @@ impl AgentLogic {
                         .await?;
                     }
                     tool_invoked = true;
+                    forbid_final_nudges = 0;
                 } else {
                     for tc in tool_calls {
                         if cancel_token.is_cancelled() {
@@ -3342,6 +3352,7 @@ impl AgentLogic {
                         ))
                         .await?;
                         tool_invoked = true;
+                        forbid_final_nudges = 0;
                     }
                 }
             } else {
@@ -3362,7 +3373,11 @@ impl AgentLogic {
                 }
                 let research_nudge =
                     iterations < max_iterations && should_nudge_research_depth(&inbound, &context);
-                if forbid_final_effective && iterations < max_iterations {
+                if forbid_final_effective
+                    && iterations < max_iterations
+                    && forbid_final_nudges < MAX_FORBID_FINAL_NUDGES
+                {
+                    forbid_final_nudges += 1;
                     let nudge = "[SYSTEM: Continue with at least one tool call (or `ask_user` if you are blocked). Plain assistant text alone is not sufficient for this session until the objective is met.]";
                     let correction = crate::utils::ChatMessage::user(nudge);
                     mem.add_message(correction).await?;
