@@ -31,6 +31,7 @@ def main() -> int:
     except ImportError as exc:
         print(json.dumps({"ok": False, "error": f"jax not installed: {exc}"}))
         return 1
+    sys.path.insert(0, str(args.kernel_path.parent.resolve()))
     spec = importlib.util.spec_from_file_location("kernel_module", args.kernel_path)
     if spec is None or spec.loader is None:
         print(json.dumps({"ok": False, "error": "failed to load module spec"}))
