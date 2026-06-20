@@ -66,10 +66,25 @@ def main() -> int:
         syn = run_validator(validators / "jax_syntax_check.py", str(kernel))
         if not syn.get("ok"):
             continue
-        corr = run_validator(
-            validators / "correctness_check.py",
-            str(root / "test_correctness.py"),
-        )
+        dest_kernel = root / "converted_jax.py"
+        backup_kernel = root / "converted_jax.py.bak"
+        has_backup = dest_kernel.is_file()
+        if has_backup:
+            dest_kernel.rename(backup_kernel)
+        try:
+            import shutil
+            shutil.copy(kernel, dest_kernel)
+            corr = run_validator(
+                validators / "correctness_check.py",
+                str(root / "test_correctness.py"),
+            )
+        finally:
+            if has_backup:
+                if dest_kernel.is_file():
+                    dest_kernel.unlink()
+                backup_kernel.rename(dest_kernel)
+            elif dest_kernel.is_file():
+                dest_kernel.unlink()
         if not corr.get("ok"):
             continue
         cell = EliteCell(
