@@ -69,5 +69,5 @@ def insert_cell(archive: dict[str, Any], cell: EliteCell) -> bool:
 
 def sample_top(archive: dict[str, Any], k: int = 3) -> list[dict[str, Any]]:
     cells = list(archive.get("cells", {}).values())
-    cells.sort(key=lambda c: c.get("fitness_latency_ms", 1e18))
+    cells.sort(key=lambda c: c.get("fitness_latency_ms") if c.get("fitness_latency_ms") is not None else 1e18)
     return cells[:k]
