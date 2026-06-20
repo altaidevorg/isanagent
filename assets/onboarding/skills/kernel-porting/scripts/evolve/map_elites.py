@@ -47,11 +47,16 @@ def insert_cell(archive: dict[str, Any], cell: EliteCell) -> bool:
     if cell.inserted_at is None:
         cell.inserted_at = datetime.now(timezone.utc).isoformat()
     key = cell.map_key()
-    replaced = key in archive.setdefault("cells", {})
-    archive["cells"][key] = asdict(cell)
+    cells = archive.setdefault("cells", {})
+    existing = cells.get(key)
+    if existing is None or (cell.fitness_latency_ms or 1e9) < (existing.get("fitness_latency_ms") or 1e9):
+        cells[key] = asdict(cell)
+        replaced = True
+    else:
+        replaced = False
     best = None
     best_lat = float("inf")
-    for c in archive["cells"].values():
+    for c in cells.values():
         lat = c.get("fitness_latency_ms")
         if lat is not None and lat < best_lat:
             best_lat = lat
