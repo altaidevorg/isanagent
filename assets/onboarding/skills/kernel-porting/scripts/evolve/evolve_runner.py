@@ -73,7 +73,6 @@ def main() -> int:
         if has_backup:
             dest_kernel.rename(backup_kernel)
         try:
-        try:
             shutil.copy(kernel, dest_kernel)
             corr = run_validator(
                 validators / "correctness_check.py",
