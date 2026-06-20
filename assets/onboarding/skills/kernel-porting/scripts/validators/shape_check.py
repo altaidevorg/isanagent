@@ -22,6 +22,7 @@ def main() -> int:
     parser.add_argument("--entry", default="validate_shapes")
     args = parser.parse_args()
     os.environ.setdefault("JAX_PLATFORMS", "cpu")
+    sys.path.insert(0, str(args.kernel_path.parent.resolve()))
     spec = importlib.util.spec_from_file_location("kernel_module", args.kernel_path)
     if spec is None or spec.loader is None:
         print(json.dumps({"ok": False, "error": "failed to load module spec"}))
