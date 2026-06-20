@@ -361,8 +361,25 @@ fn should_require_shell_approval(command: &str, patterns: &[String]) -> bool {
 /// UX-compatible; an unrecognized reply simply skips execution and the user can re-confirm.
 fn shell_approval_reply_is_grant(reply: &str) -> bool {
     const AFFIRM: &[&str] = &[
-        "approve", "approved", "approves", "yes", "yep", "yeah", "y", "ok", "okay", "k", "allow",
-        "allowed", "confirm", "confirmed", "accept", "accepted", "proceed", "go", "sure",
+        "approve",
+        "approved",
+        "approves",
+        "yes",
+        "yep",
+        "yeah",
+        "y",
+        "ok",
+        "okay",
+        "k",
+        "allow",
+        "allowed",
+        "confirm",
+        "confirmed",
+        "accept",
+        "accepted",
+        "proceed",
+        "go",
+        "sure",
     ];
     const FILLER: &[&str] = &["please", "it", "this", "that", "ahead", "now", "run", "do"];
 
@@ -371,7 +388,10 @@ fn shell_approval_reply_is_grant(reply: &str) -> bool {
         return false;
     }
     let mut saw_affirmative = false;
-    for tok in r.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()) {
+    for tok in r
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+    {
         if AFFIRM.contains(&tok) {
             saw_affirmative = true;
         } else if !FILLER.contains(&tok) {
@@ -515,10 +535,19 @@ mod code_exec_gate_tests {
         // (the substring false positive: "terminal".contains("rm") is true).
         let patterns = vec!["rm".to_string()];
         assert!(should_require_shell_approval("rm -rf /tmp/x", &patterns));
-        assert!(should_require_shell_approval("echo hi && rm file", &patterns));
+        assert!(should_require_shell_approval(
+            "echo hi && rm file",
+            &patterns
+        ));
         assert!(!should_require_shell_approval("terminal --help", &patterns));
-        assert!(!should_require_shell_approval("warm up the cache", &patterns));
-        assert!(!should_require_shell_approval("npm run platform", &patterns));
+        assert!(!should_require_shell_approval(
+            "warm up the cache",
+            &patterns
+        ));
+        assert!(!should_require_shell_approval(
+            "npm run platform",
+            &patterns
+        ));
         assert!(!should_require_shell_approval("check firmware", &patterns));
     }
 
@@ -1307,6 +1336,7 @@ pub(crate) struct ReasoningLoopCtx {
 pub struct AgentLogicParams {
     pub name: String,
     pub provider: Box<dyn Provider>,
+    pub provider_credentials: crate::provider::ProviderCredentials,
     pub session_manager: SessionManager,
     pub tools: ToolRegistry,
     pub skills: SkillRegistry,
@@ -1358,6 +1388,7 @@ pub struct SubagentHarnessParams {
 pub struct AgentLogic {
     name: String,
     provider: Arc<tokio::sync::RwLock<Box<dyn Provider>>>,
+    provider_credentials: Arc<tokio::sync::RwLock<crate::provider::ProviderCredentials>>,
     session_manager: Arc<SessionManager>,
     tools: Arc<ToolRegistry>,
     skills: SharedSkillRegistry,
@@ -1387,6 +1418,7 @@ impl AgentLogic {
         let AgentLogicParams {
             name,
             provider,
+            provider_credentials,
             session_manager,
             tools,
             skills,
@@ -1416,11 +1448,13 @@ impl AgentLogic {
         let shell_policy = Arc::new(shell_policy);
 
         let provider = Arc::new(tokio::sync::RwLock::new(provider));
+        let provider_credentials = Arc::new(tokio::sync::RwLock::new(provider_credentials));
 
         let subagent_harness = subagent.map(|p| {
             Arc::new(SubagentHarness::new(subagent::SubagentSpawnDeps {
                 agent_name: name.clone(),
                 provider: provider.clone(),
+                provider_credentials: provider_credentials.clone(),
                 session_manager: session_manager.clone(),
                 skills: skills.clone(),
                 system_prompt: subagent_system_prompt,
@@ -1452,6 +1486,7 @@ impl AgentLogic {
         let mut agent = Self {
             name,
             provider,
+            provider_credentials,
             session_manager,
             tools,
             skills,
@@ -1497,6 +1532,16 @@ impl AgentLogic {
     /// Hot-swap the LLM provider at runtime (used by `/model` command).
     pub async fn switch_provider(&self, new_provider: Box<dyn Provider>) {
         *self.provider.write().await = new_provider;
+    }
+
+    pub async fn set_provider_credentials(&self, creds: crate::provider::ProviderCredentials) {
+        *self.provider_credentials.write().await = creds;
+    }
+
+    pub fn provider_credentials_handle(
+        &self,
+    ) -> Arc<tokio::sync::RwLock<crate::provider::ProviderCredentials>> {
+        self.provider_credentials.clone()
     }
 
     pub fn with_tool_execution_activity(
@@ -1622,6 +1667,13 @@ impl ActorLogic<BusMessage> for AgentLogic {
                     &model_name,
                 );
                 self.switch_provider(new_provider).await;
+                self.set_provider_credentials(crate::provider::ProviderCredentials {
+                    provider_name: provider_name.clone(),
+                    base_url: base_url.clone(),
+                    api_key: api_key.clone(),
+                    model_name: model_name.clone(),
+                })
+                .await;
                 let _ = self.logger_tx.send(BusMessage::Log(LogEvent::info(
                     &self.name,
                     &format!(
@@ -2194,14 +2246,19 @@ pub fn set_fallback_providers(specs: Vec<FallbackProviderSpec>) {
     // Recover from a poisoned lock: we replace the list wholesale, so any state a panicking writer
     // left behind is irrelevant — honoring the poison would instead wedge failover config for the
     // rest of the process.
-    let mut guard = FALLBACK_PROVIDERS.write().unwrap_or_else(|e| e.into_inner());
+    let mut guard = FALLBACK_PROVIDERS
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
     *guard = specs;
 }
 
 /// Snapshot of the current fallback list. Returns an owned clone so the lock isn't held across the
 /// (async) failover chat calls. Recovers a poisoned read lock so failover keeps working.
 fn fallback_providers() -> Vec<FallbackProviderSpec> {
-    FALLBACK_PROVIDERS.read().unwrap_or_else(|e| e.into_inner()).clone()
+    FALLBACK_PROVIDERS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 /// Result of attempting the configured fallback providers.
@@ -2372,7 +2429,12 @@ async fn chat_with_retry(
     match try_fallbacks(
         &fallbacks,
         |s| {
-            crate::provider::create_provider(&s.provider_name, &s.base_url, &s.api_key, &s.model_name)
+            crate::provider::create_provider(
+                &s.provider_name,
+                &s.base_url,
+                &s.api_key,
+                &s.model_name,
+            )
         },
         context,
         &tools_payload,
@@ -3980,7 +4042,11 @@ mod tests {
             &[],
             &None,
             &cancel,
-            super::FailoverLogCtx { logger_tx: &logger, name: "agent", chat_id: "c1" },
+            super::FailoverLogCtx {
+                logger_tx: &logger,
+                name: "agent",
+                chat_id: "c1",
+            },
         )
         .await;
         match out {
@@ -4000,7 +4066,11 @@ mod tests {
             &[],
             &None,
             &cancel,
-            super::FailoverLogCtx { logger_tx: &logger, name: "agent", chat_id: "c1" },
+            super::FailoverLogCtx {
+                logger_tx: &logger,
+                name: "agent",
+                chat_id: "c1",
+            },
         )
         .await;
         assert!(matches!(out, super::FallbackOutcome::Exhausted));
@@ -4016,7 +4086,11 @@ mod tests {
             &[],
             &None,
             &cancel,
-            super::FailoverLogCtx { logger_tx: &logger, name: "agent", chat_id: "c1" },
+            super::FailoverLogCtx {
+                logger_tx: &logger,
+                name: "agent",
+                chat_id: "c1",
+            },
         )
         .await;
         assert!(matches!(out, super::FallbackOutcome::Exhausted));
@@ -4038,7 +4112,11 @@ mod tests {
             &[],
             &None,
             &cancel,
-            super::FailoverLogCtx { logger_tx: &logger, name: "agent", chat_id: "c1" },
+            super::FailoverLogCtx {
+                logger_tx: &logger,
+                name: "agent",
+                chat_id: "c1",
+            },
         )
         .await;
         assert!(matches!(out, super::FallbackOutcome::Cancelled));
@@ -4245,6 +4323,7 @@ mod tests {
         let agent = AgentLogic::new(AgentLogicParams {
             name: "TestAgent".to_string(),
             provider,
+            provider_credentials: crate::provider::ProviderCredentials::empty(),
             session_manager,
             tools,
             skills,
@@ -4302,6 +4381,7 @@ mod tests {
         let agent = AgentLogic::new(AgentLogicParams {
             name: "TestAgent".to_string(),
             provider: Box::new(DummyProvider),
+            provider_credentials: crate::provider::ProviderCredentials::empty(),
             session_manager,
             tools,
             skills,

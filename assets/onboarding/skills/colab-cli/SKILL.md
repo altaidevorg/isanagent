@@ -36,6 +36,19 @@ The `colab-cli` provides a command-line interface that you can invoke via `exec`
 - **Artifact Extraction:** After running a script that generates images, `colab-cli` may provide paths to extracted artifacts. Check the command output.
 - **Cleanup:** Always run `colab stop` when the task is complete to avoid wasting the user's Colab compute units.
 
+## TPU provisioning (JAX / Pallas)
+
+For MaxEvolve kernel profiling on Google TPUs:
+
+1. `colab start --tpu tpuv6e` (or `tpuv5e` when available in your account)
+2. Install JAX on the remote VM (example shell one-liner):
+   `colab shell "pip install -U 'jax[tpu]' -f https://storage.googleapis.com/jax-releases/libtpu_releases.html"`
+3. Upload or sync `profile_script.py` and run: `colab exec -f profile_script.py`
+4. Capture `RESULT_LATENCY_MS=` / `RESULT_TFLOPS=` lines for `kernel_db_insert`
+5. **`colab stop`** when done
+
+For GPU profiling (Hopper/L4/A100), use `colab start --gpu` and install CUDA-enabled `jax[cuda12]`.
+
 ## Configuration
 
 Local configuration and session state are stored in `~/.config/colab-cli/`. You can inspect `sessions.json` there to see persistent session metadata.

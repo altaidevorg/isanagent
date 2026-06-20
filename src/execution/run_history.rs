@@ -98,10 +98,14 @@ pub async fn write_run_journal(p: RunJournalParams<'_>) -> Result<PathBuf, Strin
         .await
         .map_err(|e| format!("run journal source write: {e}"))?;
 
-    let (stdout, stdout_truncated) =
-        truncate_field(redactor.redact(&p.result.stdout).into_owned(), MAX_INLINE_TEXT);
-    let (stderr, stderr_truncated) =
-        truncate_field(redactor.redact(&p.result.stderr).into_owned(), MAX_INLINE_TEXT);
+    let (stdout, stdout_truncated) = truncate_field(
+        redactor.redact(&p.result.stdout).into_owned(),
+        MAX_INLINE_TEXT,
+    );
+    let (stderr, stderr_truncated) = truncate_field(
+        redactor.redact(&p.result.stderr).into_owned(),
+        MAX_INLINE_TEXT,
+    );
 
     let journal = RunJournal {
         schema_version: 1,
@@ -144,7 +148,8 @@ mod tests {
     #[tokio::test]
     async fn run_journal_redacts_secrets_in_code_stdout_stderr() {
         // Use format-identifiable secrets so the test does not depend on the process environment.
-        let ws = std::env::temp_dir().join(format!("isanagent_runjournal_{}", uuid::Uuid::new_v4()));
+        let ws =
+            std::env::temp_dir().join(format!("isanagent_runjournal_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&ws).unwrap();
         let sid = SessionId::new("sess1");
         let result = RunResult::new(
@@ -177,9 +182,18 @@ mod tests {
         assert!(source.contains("[REDACTED_STRIPE_KEY]"), "source: {source}");
         assert!(!source.contains("sk_live_0123456789"), "source: {source}");
         // stdout/stderr (run.json)
-        assert!(run_json.contains("[REDACTED_AWS_KEY]"), "run.json: {run_json}");
-        assert!(!run_json.contains("AKIAIOSFODNN7EXAMPLE"), "run.json: {run_json}");
-        assert!(run_json.contains("[REDACTED_GITHUB_TOKEN]"), "run.json: {run_json}");
+        assert!(
+            run_json.contains("[REDACTED_AWS_KEY]"),
+            "run.json: {run_json}"
+        );
+        assert!(
+            !run_json.contains("AKIAIOSFODNN7EXAMPLE"),
+            "run.json: {run_json}"
+        );
+        assert!(
+            run_json.contains("[REDACTED_GITHUB_TOKEN]"),
+            "run.json: {run_json}"
+        );
         assert!(!run_json.contains("ghp_0123456789"), "run.json: {run_json}");
 
         let _ = std::fs::remove_dir_all(&ws);
