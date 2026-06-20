@@ -49,7 +49,9 @@ def insert_cell(archive: dict[str, Any], cell: EliteCell) -> bool:
     key = cell.map_key()
     cells = archive.setdefault("cells", {})
     existing = cells.get(key)
-    if existing is None or (cell.fitness_latency_ms or 1e9) < (existing.get("fitness_latency_ms") or 1e9):
+    cell_lat = cell.fitness_latency_ms if cell.fitness_latency_ms is not None else 1e9
+    exist_lat = existing.get("fitness_latency_ms") if existing and existing.get("fitness_latency_ms") is not None else 1e9
+    if existing is None or cell_lat < exist_lat:
         cells[key] = asdict(cell)
         replaced = True
     else:
