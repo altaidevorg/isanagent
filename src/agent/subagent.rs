@@ -430,6 +430,7 @@ impl SubagentHarness {
                         m.temperature.map(|t| t as f32),
                     )
                 } else {
+                    drop(creds);
                     dyn_clone::clone_box(&**self.inner.deps.provider.read().await)
                 }
             } else {
