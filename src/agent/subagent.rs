@@ -48,6 +48,8 @@ pub struct SubagentSpawnDeps {
     pub agent_name: String,
     /// Shared provider reference — reads the current provider (updates with `/model` switch).
     pub provider: Arc<tokio::sync::RwLock<Box<dyn Provider>>>,
+    /// Credentials for the active provider session (updated with `/model` switch).
+    pub provider_credentials: Arc<tokio::sync::RwLock<crate::provider::ProviderCredentials>>,
     pub session_manager: Arc<SessionManager>,
     pub skills: SharedSkillRegistry,
     pub system_prompt: String,
@@ -418,7 +420,25 @@ impl SubagentHarness {
             .and_then(|m| m.max_iterations)
             .unwrap_or(self.inner.deps.max_iterations);
 
-        let provider = dyn_clone::clone_box(&**self.inner.deps.provider.read().await);
+        let provider = if let Some(ref m) = manifest {
+            if m.model.is_some() || m.temperature.is_some() {
+                let creds = self.inner.deps.provider_credentials.read().await;
+                if creds.is_usable() {
+                    crate::provider::provider_for_agent(
+                        &creds,
+                        m.model.as_deref(),
+                        m.temperature.map(|t| t as f32),
+                    )
+                } else {
+                    drop(creds);
+                    dyn_clone::clone_box(&**self.inner.deps.provider.read().await)
+                }
+            } else {
+                dyn_clone::clone_box(&**self.inner.deps.provider.read().await)
+            }
+        } else {
+            dyn_clone::clone_box(&**self.inner.deps.provider.read().await)
+        };
 
         let label = match (&agent_name, &display_name) {
             (Some(a), Some(d)) => format!("{a}: {d}"),
@@ -893,6 +913,9 @@ struct PlanStep {
     #[serde(default)]
     depends_on: Vec<String>,
     prompt: String,
+    /// Optional named agent for this step (e.g. `gpu_to_jax`).
+    #[serde(default)]
+    agent: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -911,7 +934,7 @@ impl Tool for SubagentPlanTool {
     }
 
     fn description(&self) -> &str {
-        "Run a multi-step plan: JSON object {\"steps\":[{\"id\":\"1\",\"depends_on\":[],\"prompt\":\"...\"}, ...]}. Steps run in dependency order (sequential). Recommended deep-research pattern: discovery -> deep read -> contradiction check -> synthesis. Each step sees prior steps' assistant-facing final output (subagent_spawn result text) in its prompt prefix."
+        "Run a multi-step plan: JSON object {\"steps\":[{\"id\":\"1\",\"depends_on\":[],\"prompt\":\"...\",\"agent\":\"optional_agent_name\"}, ...]}. Steps run in dependency order (sequential). Optional per-step `agent` selects a named sub-agent. Recommended deep-research pattern: discovery -> deep read -> contradiction check -> synthesis. Each step sees prior steps' assistant-facing final output (subagent_spawn result text) in its prompt prefix."
     }
 
     fn parameters(&self) -> Value {
@@ -940,12 +963,14 @@ impl Tool for SubagentPlanTool {
 
         let mut deps: HashMap<String, Vec<String>> = HashMap::new();
         let mut prompts: HashMap<String, String> = HashMap::new();
+        let mut agents: HashMap<String, Option<String>> = HashMap::new();
         for s in &plan.steps {
             if s.id.is_empty() || s.prompt.is_empty() {
                 return Err("Each step needs non-empty id and prompt".to_string());
             }
             deps.insert(s.id.clone(), s.depends_on.clone());
             prompts.insert(s.id.clone(), s.prompt.clone());
+            agents.insert(s.id.clone(), s.agent.clone());
         }
 
         let mut done: HashSet<String> = HashSet::new();
@@ -987,7 +1012,7 @@ impl Tool for SubagentPlanTool {
                         prompt: body,
                         wait: true,
                         display_name: Some(label),
-                        agent_name: None,
+                        agent_name: agents.get(&step_id).cloned().flatten(),
                         background_job_id: p.background_job_id,
                     })
                     .await?;
@@ -1275,6 +1300,9 @@ mod tests {
         let harness = Arc::new(SubagentHarness::new(SubagentSpawnDeps {
             agent_name: "SubagentTest".to_string(),
             provider: Arc::new(tokio::sync::RwLock::new(Box::new(NeverUsedProvider))),
+            provider_credentials: Arc::new(tokio::sync::RwLock::new(
+                crate::provider::ProviderCredentials::empty(),
+            )),
             session_manager,
             skills,
             system_prompt: "test system prompt".to_string(),

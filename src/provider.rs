@@ -4,21 +4,67 @@ use crate::utils::{
     TokenUsage, ToolCallFunction, ToolCallRequest,
 };
 
+/// Live credentials for the active LLM session (updated on `/model` switch).
+#[derive(Clone, Debug)]
+pub struct ProviderCredentials {
+    pub provider_name: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub model_name: String,
+}
+
+impl ProviderCredentials {
+    pub fn empty() -> Self {
+        Self {
+            provider_name: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            model_name: String::new(),
+        }
+    }
+
+    pub fn is_usable(&self) -> bool {
+        !self.api_key.is_empty() && !self.model_name.is_empty()
+    }
+}
+
 /// Create a boxed [`Provider`] for the given provider name.
 ///
 /// Routes `"anthropic"` to [`AnthropicProvider`] (Messages API) and everything else to
-/// [`OpenAIProvider`] (OpenAI-compatible chat completions). Temperature is set to 0.3.
+/// [`OpenAIProvider`] (OpenAI-compatible chat completions). Temperature defaults to 0.3.
 pub fn create_provider(
     provider_name: &str,
     base_url: &str,
     api_key: &str,
     model_name: &str,
 ) -> Box<dyn Provider> {
-    if provider_name == "anthropic" {
-        Box::new(AnthropicProvider::new(base_url, api_key, model_name).with_temperature(0.3))
+    provider_for_agent(
+        &ProviderCredentials {
+            provider_name: provider_name.to_string(),
+            base_url: base_url.to_string(),
+            api_key: api_key.to_string(),
+            model_name: model_name.to_string(),
+        },
+        None,
+        None,
+    )
+}
+
+/// Build a provider for a sub-agent, optionally overriding model and temperature.
+pub fn provider_for_agent(
+    creds: &ProviderCredentials,
+    model_override: Option<&str>,
+    temperature_override: Option<f32>,
+) -> Box<dyn Provider> {
+    let model = model_override.unwrap_or(&creds.model_name);
+    let temp = temperature_override.unwrap_or(0.3);
+    if creds.provider_name == "anthropic" {
+        Box::new(
+            AnthropicProvider::new(&creds.base_url, &creds.api_key, model).with_temperature(temp),
+        )
     } else {
-        let client =
-            LLMClient::new_openai_compatible(base_url, api_key, model_name).with_temperature(0.3);
+        let client = LLMClient::new_openai_compatible(&creds.base_url, &creds.api_key, model)
+            .with_temperature(temp);
         Box::new(OpenAIProvider::new(client))
     }
 }

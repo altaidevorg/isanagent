@@ -512,6 +512,13 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     tools.register(Box::new(TodoWriteTool {
         memory_node: memory_node.clone(),
     }));
+    if workspace.config.kernel_porting_harness_enabled() {
+        isanagent::tools::kernel_porting::register_kernel_porting_tools(
+            &mut tools,
+            workspace.sandbox_dir.clone(),
+            std::sync::Arc::new(workspace.config.clone()),
+        );
+    }
     let tool_catalog = tools.catalog_handle();
     tools.register(Box::new(ToolSearchTool {
         catalog: tool_catalog,
@@ -643,6 +650,17 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             Box::new(isanagent::provider::NoKeyProvider),
             Box::new(isanagent::provider::NoKeyProvider),
         )
+    };
+
+    let provider_credentials = if let (Some(cfg), Some(key)) = (&provider_cfg, &api_key) {
+        isanagent::provider::ProviderCredentials {
+            provider_name: cfg.provider_name.clone(),
+            base_url: cfg.resolved_base_url().unwrap_or_default(),
+            api_key: key.clone(),
+            model_name: model_name.clone(),
+        }
+    } else {
+        isanagent::provider::ProviderCredentials::empty()
     };
 
     // 5.5 Setup Reflection Engine
@@ -780,6 +798,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     let agent_logic = AgentLogic::new(AgentLogicParams {
         name: "isanagent".to_string(),
         provider,
+        provider_credentials,
         session_manager,
         tools,
         skills,

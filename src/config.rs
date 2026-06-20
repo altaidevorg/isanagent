@@ -252,12 +252,28 @@ pub struct NotificationsConfig {
     pub enabled: Option<bool>,
 }
 
+/// MaxEvolve kernel porting (`kernel_db_*` tools). See `docs/kernel-porting-user-guide.md`.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct KernelPortingHarnessConfig {
+    pub enabled: Option<bool>,
+    /// Sandbox-relative root for kernel projects (default `kernels/projects`).
+    pub default_project_root: Option<String>,
+    /// Sandbox-relative JSON schema path for MAP-Elites archives.
+    pub map_elites_schema: Option<String>,
+    /// Max elite entries retained per project archive (default 500).
+    pub max_archive_entries: Option<usize>,
+    /// Default mutation batch size hint for evolve orchestrator (default 4).
+    pub mutation_batch_size: Option<usize>,
+}
+
 /// Optional harness features (see `docs/harness-implementation-plan.md`).
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct HarnessConfig {
     pub git_worktree: Option<GitWorktreeConfig>,
     /// Background sub-agents, task tools, and optional plan execution (Phase 5).
     pub subagents: Option<SubagentHarnessConfig>,
+    /// Triton→Pallas porting and MAP-Elites evolution tools.
+    pub kernel_porting: Option<KernelPortingHarnessConfig>,
     /// Named agent definitions loaded from `[agents.<name>]` (Phase 5b).
     #[serde(default)]
     pub agents: std::collections::HashMap<String, AgentDefinition>,
@@ -648,6 +664,53 @@ impl AppConfig {
             None => true,
             Some(e) => e.enabled.unwrap_or(true),
         }
+    }
+
+    /// When true under `[harness.kernel_porting]`, `kernel_db_*` tools are registered.
+    pub fn kernel_porting_harness_enabled(&self) -> bool {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.kernel_porting.as_ref())
+            .and_then(|k| k.enabled)
+            .unwrap_or(false)
+    }
+
+    pub fn kernel_porting_default_project_root(&self) -> String {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.kernel_porting.as_ref())
+            .and_then(|k| k.default_project_root.as_ref())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "kernels/projects".to_string())
+    }
+
+    pub fn kernel_porting_map_elites_schema(&self) -> String {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.kernel_porting.as_ref())
+            .and_then(|k| k.map_elites_schema.as_ref())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| ".agents/kernel-porting/map_elites.schema.json".to_string())
+    }
+
+    pub fn kernel_porting_max_archive_entries(&self) -> usize {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.kernel_porting.as_ref())
+            .and_then(|k| k.max_archive_entries)
+            .unwrap_or(500)
+            .clamp(10, 10_000)
+    }
+
+    pub fn kernel_porting_mutation_batch_size(&self) -> usize {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.kernel_porting.as_ref())
+            .and_then(|k| k.mutation_batch_size)
+            .unwrap_or(4)
+            .clamp(1, 64)
     }
 
     /// `[harness.ml_engineer] enabled = true` appends ML policy overlay to the system prompt.

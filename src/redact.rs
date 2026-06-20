@@ -209,8 +209,14 @@ mod tests {
             ),
             ("HOME".to_string(), "/home/appuser".to_string()), // not a secret name
             ("DEBUG".to_string(), "1".to_string()),            // too short + not secret
-            ("DB_PASSWORD".to_string(), "correct-horse-battery".to_string()),
-            ("SENTRY_DSN".to_string(), "https://abc123def456@sentry.io/42".to_string()),
+            (
+                "DB_PASSWORD".to_string(),
+                "correct-horse-battery".to_string(),
+            ),
+            (
+                "SENTRY_DSN".to_string(),
+                "https://abc123def456@sentry.io/42".to_string(),
+            ),
         ])
     }
 
@@ -255,7 +261,10 @@ mod tests {
         ]);
         let out = r.redact("val=abcdef1234EXTRA end");
         assert!(out.contains("[REDACTED:B_TOKEN]"), "got: {out}");
-        assert!(!out.contains("abcdef1234"), "no fragment should survive: {out}");
+        assert!(
+            !out.contains("abcdef1234"),
+            "no fragment should survive: {out}"
+        );
     }
 
     #[test]
@@ -282,7 +291,9 @@ mod tests {
         assert!(r
             .redact("stripe sk_live_0123456789abcdefghij")
             .contains("[REDACTED_STRIPE_KEY]"));
-        assert!(r.redact("plain prose with no secrets").contains("plain prose"));
+        assert!(r
+            .redact("plain prose with no secrets")
+            .contains("plain prose"));
     }
 
     #[test]
@@ -291,7 +302,10 @@ mod tests {
         // Generic assignment keeps the key name, drops the value.
         let out = r.redact("password = hunter2longenough");
         assert!(out.contains("[REDACTED]"), "got: {out}");
-        assert!(!out.contains("hunter2longenough"), "value must be gone: {out}");
+        assert!(
+            !out.contains("hunter2longenough"),
+            "value must be gone: {out}"
+        );
         // Quoted assignment keeps its delimiter and BOTH quotes intact (no mangling to
         // `api_key=[REDACTED]"`).
         let quoted = r.redact(r#"{"api_key": "abcdef123456"}"#);
@@ -299,7 +313,10 @@ mod tests {
             quoted.contains(r#""api_key": "[REDACTED]""#),
             "quotes/delimiter must be preserved: {quoted}"
         );
-        assert!(!quoted.contains("abcdef123456"), "value must be gone: {quoted}");
+        assert!(
+            !quoted.contains("abcdef123456"),
+            "value must be gone: {quoted}"
+        );
         // Full PEM block (body + footer) is masked, not just the header.
         let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAK...\nabcd1234\n-----END RSA PRIVATE KEY-----";
         let red = r.redact(pem);

@@ -804,7 +804,10 @@ pub fn tool_output_signals_failure(tool_name: &str, raw_output: &str) -> bool {
             }
         }
     }
-    if matches!(tool_name, "edit_file" | "list_dir" | "glob_files" | "search_text") {
+    if matches!(
+        tool_name,
+        "edit_file" | "list_dir" | "glob_files" | "search_text"
+    ) {
         let head = raw_output.trim_start();
         if head.starts_with("Error:") || head.starts_with("Error reading dir:") {
             return true;
@@ -994,7 +997,10 @@ mod tests {
     #[test]
     fn inband_failure_ignores_successful_runner_output() {
         // No trailing exit marker -> success.
-        assert!(!tool_output_signals_failure("exec", "build succeeded\nall good"));
+        assert!(!tool_output_signals_failure(
+            "exec",
+            "build succeeded\nall good"
+        ));
         assert!(!tool_output_signals_failure("python_run", "42\n"));
         // "(no output)" sentinel must not be treated as failure.
         assert!(!tool_output_signals_failure("exec", "(no output)"));
@@ -1027,7 +1033,10 @@ mod tests {
             "search_text",
             "src/main.rs:10: fn main() {"
         ));
-        assert!(!tool_output_signals_failure("list_dir", "foo/\nbar.rs\nbaz.rs"));
+        assert!(!tool_output_signals_failure(
+            "list_dir",
+            "foo/\nbar.rs\nbaz.rs"
+        ));
     }
 
     #[test]
@@ -1041,7 +1050,10 @@ mod tests {
             "Error: this is line one of a saved log file"
         ));
         // Likewise the exit rule is scoped to the runners only.
-        assert!(!tool_output_signals_failure("read_file", "build.log\nExit code: 7"));
+        assert!(!tool_output_signals_failure(
+            "read_file",
+            "build.log\nExit code: 7"
+        ));
         // An unrelated tool with an "Error:"-looking payload is left alone.
         assert!(!tool_output_signals_failure(
             "web_search",
@@ -1065,7 +1077,10 @@ mod tests {
         // Documented, accepted false positive: a *successful* command whose own final line forges
         // the marker. Locked in as intentional so a future change is a conscious decision, not a
         // silent regression. Consequence is at most a spurious retry, never a masked real failure.
-        assert!(tool_output_signals_failure("exec", "echo test\nExit code: 1"));
+        assert!(tool_output_signals_failure(
+            "exec",
+            "echo test\nExit code: 1"
+        ));
     }
 
     #[test]
@@ -1075,7 +1090,10 @@ mod tests {
             "exec",
             &Err("Failed to execute command".to_string())
         ));
-        assert!(tool_call_is_error("read_file", &Err("not found".to_string())));
+        assert!(tool_call_is_error(
+            "read_file",
+            &Err("not found".to_string())
+        ));
         // In-band failures surfaced through `Ok`.
         assert!(tool_call_is_error(
             "edit_file",

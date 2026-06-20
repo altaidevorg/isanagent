@@ -2616,7 +2616,11 @@ mod exec_failure_tests {
             }))
             .await
             .expect("exec returns Ok with the captured output");
-        assert!(out.len() > 10_000, "expected truncation to engage: {}", out.len());
+        assert!(
+            out.len() > 10_000,
+            "expected truncation to engage: {}",
+            out.len()
+        );
         assert!(out.contains("(truncated,"), "expected truncation notice");
         assert_eq!(last_nonempty_line(&out), "Exit code: 7");
         assert!(crate::utils::tool_output_signals_failure("exec", &out));
@@ -2631,7 +2635,10 @@ mod exec_failure_tests {
             }))
             .await
             .expect("exec returns Ok");
-        assert!(out.contains("[advisory]"), "grep-like advisory expected: {out}");
+        assert!(
+            out.contains("[advisory]"),
+            "grep-like advisory expected: {out}"
+        );
         assert_eq!(last_nonempty_line(&out), "Exit code: 2");
         assert!(crate::utils::tool_output_signals_failure("exec", &out));
     }

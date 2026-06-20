@@ -165,10 +165,10 @@ impl CheckpointStore {
             return Err("invalid checkpoint id".to_string());
         }
         let dir = self.root.join(id);
-        let meta_bytes =
-            std::fs::read(dir.join("meta.json")).map_err(|e| format!("checkpoint {id} not found: {e}"))?;
-        let m: Meta =
-            serde_json::from_slice(&meta_bytes).map_err(|e| format!("checkpoint meta parse: {e}"))?;
+        let meta_bytes = std::fs::read(dir.join("meta.json"))
+            .map_err(|e| format!("checkpoint {id} not found: {e}"))?;
+        let m: Meta = serde_json::from_slice(&meta_bytes)
+            .map_err(|e| format!("checkpoint meta parse: {e}"))?;
         let target = PathBuf::from(&m.path);
         if m.existed {
             // SECURITY: re-validate the write target against the LIVE filesystem, not just the
@@ -232,8 +232,9 @@ impl CheckpointStore {
         let parent = target
             .parent()
             .ok_or_else(|| "checkpoint target has no parent directory".to_string())?;
-        let safe_parent = crate::tools::builtin::resolve_path(&parent.to_string_lossy(), base, true)
-            .map_err(|e| format!("checkpoint target parent rejected: {e}"))?;
+        let safe_parent =
+            crate::tools::builtin::resolve_path(&parent.to_string_lossy(), base, true)
+                .map_err(|e| format!("checkpoint target parent rejected: {e}"))?;
         // Defense in depth: `resolve_path` canonicalizes *existing* components but appends a
         // non-existent trailing component lexically, so it can return a path whose final parent
         // segment was not actually resolved through the symlink boundary. Re-check the resolved
@@ -244,7 +245,9 @@ impl CheckpointStore {
         // `openat2(RESOLVE_NO_SYMLINKS)` + `unlinkat` (tracked as a follow-up).
         match std::fs::symlink_metadata(&safe_parent) {
             Ok(meta) if meta.file_type().is_symlink() => {
-                return Err("checkpoint target parent is now a symlink; refusing to delete".to_string())
+                return Err(
+                    "checkpoint target parent is now a symlink; refusing to delete".to_string(),
+                )
             }
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -294,7 +297,10 @@ impl Tool for CheckpointTool {
         let Some(store) = store() else {
             return Ok("Checkpointing is disabled (set checkpoint_enabled = true).".to_string());
         };
-        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("list");
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("list");
         match action {
             "list" => {
                 let entries = store.list();
@@ -366,7 +372,10 @@ mod tests {
         let id = store.list()[0].id.clone();
         assert!(!store.list()[0].existed);
         store.restore(&id).unwrap();
-        assert!(!file.exists(), "restoring a creation should remove the file");
+        assert!(
+            !file.exists(),
+            "restoring a creation should remove the file"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -394,7 +403,10 @@ mod tests {
         );
         std::fs::write(dir.join("meta.json"), meta).unwrap();
 
-        assert!(store.restore("crafted").is_err(), "must refuse out-of-base meta");
+        assert!(
+            store.restore("crafted").is_err(),
+            "must refuse out-of-base meta"
+        );
         assert!(!outside.exists(), "must not write the payload outside base");
         let _ = std::fs::remove_dir_all(&base);
     }
