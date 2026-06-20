@@ -29,7 +29,7 @@ def main() -> int:
     env["JAX_PLATFORMS"] = "cpu"
     env.setdefault("PYTEST_ADDOPTS", "-q")
     proc = subprocess.run(
-        ["uv", "run", "-m", "pytest", str(args.test_path), "-q"],
+        ["uv", "run", "pytest", str(args.test_path), "-q"],
         capture_output=True,
         text=True,
         env=env,
