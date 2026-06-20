@@ -29,8 +29,7 @@ class EliteCell:
     inserted_at: str | None = None
 
     def map_key(self) -> str:
-        lat = int((self.fitness_latency_ms or 1e9) * 100)
-        return f"{lat}:{self.complexity_loc or 0}:{self.tile_volume or 0}"
+        return f"{self.complexity_loc or 0}:{self.tile_volume or 0}"
 
 
 def load_archive(path: Path) -> dict[str, Any]:
