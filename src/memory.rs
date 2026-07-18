@@ -489,8 +489,10 @@ pub enum MemoryMessage {
     /// - `keep_user_messages == 0`: delete the entire thread (equivalent to
     ///   `Clear { keep_last: 0 }`).
     ///
-    /// Deleted tool-result cache rows and reflection metadata that pointed
-    /// into the removed range are pruned in the same transaction.
+    /// On any real truncation the thread's `session_summaries` and
+    /// `session_metadata` are cleared (a rewind invalidates the reflection
+    /// derived from the discarded turns), and `tool_result_cache` rows for the
+    /// dropped tool_call_ids are pruned — all in the same transaction.
     TruncateAfterUserMessage {
         thread_id: String,
         keep_user_messages: usize,
@@ -1086,33 +1088,31 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     };
 
                     for tcid in &dropped_tool_call_ids {
-                        let _ = tx.execute(
+                        tx.execute(
                             "DELETE FROM tool_result_cache WHERE tool_call_id = ?1",
                             params![tcid],
-                        );
+                        )
+                        .map_err(|e| e.to_string())?;
                     }
 
-                    // Reflection metadata may point at a now-deleted message.
-                    // Drop the stale pointer (or the whole row on full delete)
-                    // so the next reflection pass rescans from a valid state.
-                    if keep_user_messages == 0 {
-                        // Full wipe — match Clear { keep_last: 0 } exactly,
-                        // including the thread's summary so no orphan remains.
-                        let _ = tx.execute(
+                    // A rewind discards turns the thread's reflection/summary
+                    // were derived from, so on any real truncation (partial or
+                    // full) clear both — the next reflection rescans from a
+                    // consistent state instead of "remembering" deleted turns.
+                    // The no-op path (keep >= 1 but the thread has fewer user
+                    // messages than requested) touches neither. Errors here
+                    // would leave the thread inconsistent, so propagate.
+                    if cutoff.is_some() || keep_user_messages == 0 {
+                        tx.execute(
                             "DELETE FROM session_metadata WHERE thread_id = ?1",
                             params![thread_id],
-                        );
-                        let _ = tx.execute(
+                        )
+                        .map_err(|e| e.to_string())?;
+                        tx.execute(
                             "DELETE FROM session_summaries WHERE thread_id = ?1",
                             params![thread_id],
-                        );
-                    } else if let Some(cutoff_id) = cutoff {
-                        let _ = tx.execute(
-                            "DELETE FROM session_metadata
-                             WHERE thread_id = ?1
-                               AND COALESCE(last_reflection_msg_id, -1) > ?2",
-                            params![thread_id, cutoff_id],
-                        );
+                        )
+                        .map_err(|e| e.to_string())?;
                     }
 
                     tx.commit().map_err(|e| e.to_string())?;
@@ -2486,6 +2486,20 @@ mod root_thread_id_tests {
         .expect("send metadata");
         rx.await.expect("reply").expect("metadata ok");
 
+        // Add a thread summary — a rewind must invalidate it (it was derived
+        // from the turns being discarded).
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.send_packet(MemoryMessage::AddSummary {
+            thread_id: thread_id.to_string(),
+            summary: "stale summary".to_string(),
+            key_info: "k".to_string(),
+            knowledge_gaps: "g".to_string(),
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .expect("send summary");
+        rx.await.expect("reply").expect("summary ok");
+
         // Sanity: cache is present before the rewind.
         let (tx, rx) = tokio::sync::oneshot::channel();
         node.send_packet(MemoryMessage::FetchToolResult {
@@ -2498,6 +2512,18 @@ mod root_thread_id_tests {
             rx.await.expect("reply").expect("fetch ok"),
             Some("full tool result".to_string())
         );
+
+        // Sanity: summary is present before the rewind.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.send_packet(MemoryMessage::GetRecentSummaries {
+            thread_id: thread_id.to_string(),
+            limit: 10,
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .expect("send get-summaries");
+        let summaries = rx.await.expect("reply").expect("summaries ok");
+        assert_eq!(summaries.len(), 1);
 
         // Rewind to u1 — drops ids 2..4.
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -2531,5 +2557,17 @@ mod root_thread_id_tests {
         .expect("send get-metadata");
         let (last_id, _time) = rx.await.expect("reply").expect("metadata ok");
         assert_eq!(last_id, None);
+
+        // Summary was derived from the discarded turns → cleared.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.send_packet(MemoryMessage::GetRecentSummaries {
+            thread_id: thread_id.to_string(),
+            limit: 10,
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .expect("send get-summaries");
+        let summaries = rx.await.expect("reply").expect("summaries ok");
+        assert!(summaries.is_empty());
     }
 }
