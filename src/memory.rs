@@ -1148,8 +1148,14 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     // Drop the stale pointer (or the whole row on full delete)
                     // so the next reflection pass rescans from a valid state.
                     if keep_user_messages == 0 {
+                        // Full wipe — match Clear { keep_last: 0 } exactly,
+                        // including the thread's summary so no orphan remains.
                         let _ = tx.execute(
                             "DELETE FROM session_metadata WHERE thread_id = ?1",
+                            params![thread_id],
+                        );
+                        let _ = tx.execute(
+                            "DELETE FROM session_summaries WHERE thread_id = ?1",
                             params![thread_id],
                         );
                     } else if let Some(cutoff_id) = cutoff {
