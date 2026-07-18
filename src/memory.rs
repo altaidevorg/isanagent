@@ -470,6 +470,32 @@ pub enum MemoryMessage {
         keep_last: usize,
         reply: SharedReply<Result<(), String>>,
     },
+    /// Tail-truncation: delete every message in `thread_id` that comes *after*
+    /// the `keep_user_messages`-th user-role row (counting from 1, in insert
+    /// order), keeping that user message and everything before it. Returns the
+    /// number of deleted rows.
+    ///
+    /// This is the rewind counterpart to [`MemoryMessage::Clear`]: `Clear`
+    /// trims the *head* (keeps the most recent N rows, for compaction), while
+    /// `TruncateAfterUserMessage` trims the *tail* (keeps the oldest rows up to
+    /// a given user turn). Host apps use it to implement conversation edit /
+    /// retry / checkpoint-rollback — because the backend owns the durable
+    /// history, the rewind has to happen here, not in the client.
+    ///
+    /// Semantics:
+    /// - `keep_user_messages >= 1`: keep through the N-th user message
+    ///   (inclusive); delete everything strictly after it. If the thread has
+    ///   fewer than N user messages this is a no-op (returns `0`).
+    /// - `keep_user_messages == 0`: delete the entire thread (equivalent to
+    ///   `Clear { keep_last: 0 }`).
+    ///
+    /// Deleted tool-result cache rows and reflection metadata that pointed
+    /// into the removed range are pruned in the same transaction.
+    TruncateAfterUserMessage {
+        thread_id: String,
+        keep_user_messages: usize,
+        reply: SharedReply<Result<usize, String>>,
+    },
     // --- Reflection and Summary Messages ---
     AddSummary {
         thread_id: String,
@@ -1004,6 +1030,139 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     }
                     tx.commit().map_err(|e| e.to_string())?;
                     Ok(())
+                })();
+                let _ = reply.send(res);
+            }
+            MemoryMessage::TruncateAfterUserMessage {
+                thread_id,
+                keep_user_messages,
+                reply,
+            } => {
+                let res = (|| -> Result<usize, String> {
+                    let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+
+                    // Resolve the row id of the keep-th user message (1-based,
+                    // insert order). `None` means "nothing to keep": either an
+                    // explicit full-delete request (keep == 0) or the thread
+                    // has fewer user messages than requested (no-op).
+                    let cutoff: Option<i64> = if keep_user_messages == 0 {
+                        None
+                    } else {
+                        let offset = i64::try_from(keep_user_messages.saturating_sub(1))
+                            .map_err(|_| "keep_user_messages is too large".to_string())?;
+                        tx.query_row(
+                            "SELECT id FROM messages
+                             WHERE thread_id = ?1 AND role = 'user'
+                             ORDER BY id ASC LIMIT 1 OFFSET ?2",
+                            params![thread_id, offset],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .optional()
+                        .map_err(|e| e.to_string())?
+                    };
+
+                    // Gather tool_call_ids of the rows we're about to drop so
+                    // their cached tool results can be pruned together. Tool
+                    // results live on role='tool' rows carrying tool_call_id.
+                    let collect_tool_call_ids =
+                        |tx: &rusqlite::Transaction,
+                         after: Option<i64>|
+                         -> Result<Vec<String>, String> {
+                            let mut stmt = match after {
+                                Some(_) => tx
+                                    .prepare(
+                                        "SELECT tool_call_id FROM messages
+                                     WHERE thread_id = ?1 AND id > ?2
+                                       AND tool_call_id IS NOT NULL",
+                                    )
+                                    .map_err(|e| e.to_string())?,
+                                None => tx
+                                    .prepare(
+                                        "SELECT tool_call_id FROM messages
+                                     WHERE thread_id = ?1 AND tool_call_id IS NOT NULL",
+                                    )
+                                    .map_err(|e| e.to_string())?,
+                            };
+                            let mut out: Vec<String> = Vec::new();
+                            match after {
+                                Some(id) => {
+                                    let rows = stmt
+                                        .query_map(params![thread_id, id], |r| {
+                                            r.get::<_, Option<String>>(0)
+                                        })
+                                        .map_err(|e| e.to_string())?;
+                                    for row in rows {
+                                        if let Ok(Some(v)) = row {
+                                            out.push(v);
+                                        }
+                                    }
+                                }
+                                None => {
+                                    let rows = stmt
+                                        .query_map(params![thread_id], |r| {
+                                            r.get::<_, Option<String>>(0)
+                                        })
+                                        .map_err(|e| e.to_string())?;
+                                    for row in rows {
+                                        if let Ok(Some(v)) = row {
+                                            out.push(v);
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(out)
+                        };
+
+                    let (deleted, dropped_tool_call_ids) = match cutoff {
+                        Some(cutoff_id) => {
+                            let ids = collect_tool_call_ids(&tx, Some(cutoff_id))?;
+                            let n = tx
+                                .execute(
+                                    "DELETE FROM messages WHERE thread_id = ?1 AND id > ?2",
+                                    params![thread_id, cutoff_id],
+                                )
+                                .map_err(|e| e.to_string())?;
+                            (n, ids)
+                        }
+                        None if keep_user_messages == 0 => {
+                            let ids = collect_tool_call_ids(&tx, None)?;
+                            let n = tx
+                                .execute(
+                                    "DELETE FROM messages WHERE thread_id = ?1",
+                                    params![thread_id],
+                                )
+                                .map_err(|e| e.to_string())?;
+                            (n, ids)
+                        }
+                        None => (0usize, Vec::new()),
+                    };
+
+                    for tcid in &dropped_tool_call_ids {
+                        let _ = tx.execute(
+                            "DELETE FROM tool_result_cache WHERE tool_call_id = ?1",
+                            params![tcid],
+                        );
+                    }
+
+                    // Reflection metadata may point at a now-deleted message.
+                    // Drop the stale pointer (or the whole row on full delete)
+                    // so the next reflection pass rescans from a valid state.
+                    if keep_user_messages == 0 {
+                        let _ = tx.execute(
+                            "DELETE FROM session_metadata WHERE thread_id = ?1",
+                            params![thread_id],
+                        );
+                    } else if let Some(cutoff_id) = cutoff {
+                        let _ = tx.execute(
+                            "DELETE FROM session_metadata
+                             WHERE thread_id = ?1
+                               AND COALESCE(last_reflection_msg_id, -1) > ?2",
+                            params![thread_id, cutoff_id],
+                        );
+                    }
+
+                    tx.commit().map_err(|e| e.to_string())?;
+                    Ok(deleted)
                 })();
                 let _ = reply.send(res);
             }
@@ -2130,7 +2289,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
 
 #[cfg(test)]
 mod root_thread_id_tests {
-    use super::{is_root_session_thread_id, SqliteMemoryActor};
+    use super::{is_root_session_thread_id, MemoryMessage, SharedReply, SqliteMemoryActor};
     use crate::session::SessionManager;
     use crate::traits::Memory;
     use crate::NodeHandle;
@@ -2183,5 +2342,82 @@ mod root_thread_id_tests {
             })
             .collect();
         assert_eq!(contents, vec!["first".to_string(), "second".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn truncate_after_user_message_rewinds_to_nth_user_turn() {
+        let actor = SqliteMemoryActor::new(":memory:").expect("memory actor");
+        let node = NodeHandle::new(actor, 16, 1, Duration::from_millis(1));
+        let manager = SessionManager::new(node.clone());
+        let thread_id = "terminal:550e8400-e29b-41d4-a716-446655440000:";
+        let mut session = manager.get_session(thread_id).await.expect("session");
+
+        session
+            .add_message(crate::utils::ChatMessage::user("u1"))
+            .await
+            .expect("add u1");
+        session
+            .add_message(crate::utils::ChatMessage::assistant("a1"))
+            .await
+            .expect("add a1");
+        session
+            .add_message(crate::utils::ChatMessage::user("u2"))
+            .await
+            .expect("add u2");
+        session
+            .add_message(crate::utils::ChatMessage::assistant("a2"))
+            .await
+            .expect("add a2");
+
+        // Rewind to the first user message: drop a1, u2, a2 (3 rows).
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.send_packet(MemoryMessage::TruncateAfterUserMessage {
+            thread_id: thread_id.to_string(),
+            keep_user_messages: 1,
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .expect("send truncate");
+        let deleted = rx.await.expect("reply").expect("truncate ok");
+        assert_eq!(deleted, 3);
+
+        let contents: Vec<String> = session
+            .get_context()
+            .await
+            .expect("context")
+            .iter()
+            .map(|m| {
+                m.content
+                    .as_ref()
+                    .map(|c| c.text_content())
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(contents, vec!["u1".to_string()]);
+
+        // keep_user_messages beyond the user count is a no-op.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.send_packet(MemoryMessage::TruncateAfterUserMessage {
+            thread_id: thread_id.to_string(),
+            keep_user_messages: 5,
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .expect("send truncate");
+        let deleted = rx.await.expect("reply").expect("truncate ok");
+        assert_eq!(deleted, 0);
+
+        // keep_user_messages == 0 wipes the thread.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.send_packet(MemoryMessage::TruncateAfterUserMessage {
+            thread_id: thread_id.to_string(),
+            keep_user_messages: 0,
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .expect("send truncate");
+        let deleted = rx.await.expect("reply").expect("truncate ok");
+        assert_eq!(deleted, 1);
+        assert!(session.get_context().await.expect("context").is_empty());
     }
 }
