@@ -28,6 +28,7 @@ which = "6.0.1"
 regex = "1.10.6"
 globset = "0.4.15"
 walkdir = "2.5.0"
+ignore = "0.4"
 include_dir = "0.7"
 diffy = "0.4.2"
 shellexpand = "3.1.2"
@@ -71,3 +72,4 @@ debug = false
 
 [dev-dependencies]
 tower = { version = "0.5.2", features = ["util"] }
+tempfile = "3"

@@ -2138,6 +2138,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ignore"
+version = "0.4.30"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b009b6744c1445efd7244084e25e498636412effb6760b55067553baa925cc7"
+dependencies = [
+ "crossbeam-deque",
+ "globset",
+ "log",
+ "memchr",
+ "regex-automata",
+ "same-file",
+ "walkdir",
+ "winapi-util",
+]
+
+[[package]]
 name = "image"
 version = "0.25.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2329,6 +2345,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "htmd",
+ "ignore",
  "imap",
  "include_dir",
  "lettre",
@@ -2350,6 +2367,7 @@ dependencies = [
  "sha2 0.10.9",
  "shellexpand",
  "syntect",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
