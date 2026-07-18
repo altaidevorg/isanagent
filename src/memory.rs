@@ -1061,61 +1061,9 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                         .map_err(|e| e.to_string())?
                     };
 
-                    // Gather tool_call_ids of the rows we're about to drop so
-                    // their cached tool results can be pruned together. Tool
-                    // results live on role='tool' rows carrying tool_call_id.
-                    let collect_tool_call_ids =
-                        |tx: &rusqlite::Transaction,
-                         after: Option<i64>|
-                         -> Result<Vec<String>, String> {
-                            let mut stmt = match after {
-                                Some(_) => tx
-                                    .prepare(
-                                        "SELECT tool_call_id FROM messages
-                                     WHERE thread_id = ?1 AND id > ?2
-                                       AND tool_call_id IS NOT NULL",
-                                    )
-                                    .map_err(|e| e.to_string())?,
-                                None => tx
-                                    .prepare(
-                                        "SELECT tool_call_id FROM messages
-                                     WHERE thread_id = ?1 AND tool_call_id IS NOT NULL",
-                                    )
-                                    .map_err(|e| e.to_string())?,
-                            };
-                            let mut out: Vec<String> = Vec::new();
-                            match after {
-                                Some(id) => {
-                                    let rows = stmt
-                                        .query_map(params![thread_id, id], |r| {
-                                            r.get::<_, Option<String>>(0)
-                                        })
-                                        .map_err(|e| e.to_string())?;
-                                    for row in rows {
-                                        if let Ok(Some(v)) = row {
-                                            out.push(v);
-                                        }
-                                    }
-                                }
-                                None => {
-                                    let rows = stmt
-                                        .query_map(params![thread_id], |r| {
-                                            r.get::<_, Option<String>>(0)
-                                        })
-                                        .map_err(|e| e.to_string())?;
-                                    for row in rows {
-                                        if let Ok(Some(v)) = row {
-                                            out.push(v);
-                                        }
-                                    }
-                                }
-                            }
-                            Ok(out)
-                        };
-
                     let (deleted, dropped_tool_call_ids) = match cutoff {
                         Some(cutoff_id) => {
-                            let ids = collect_tool_call_ids(&tx, Some(cutoff_id))?;
+                            let ids = dropped_tool_call_ids(&tx, &thread_id, Some(cutoff_id))?;
                             let n = tx
                                 .execute(
                                     "DELETE FROM messages WHERE thread_id = ?1 AND id > ?2",
@@ -1125,7 +1073,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                             (n, ids)
                         }
                         None if keep_user_messages == 0 => {
-                            let ids = collect_tool_call_ids(&tx, None)?;
+                            let ids = dropped_tool_call_ids(&tx, &thread_id, None)?;
                             let n = tx
                                 .execute(
                                     "DELETE FROM messages WHERE thread_id = ?1",
@@ -2293,6 +2241,54 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
     }
 }
 
+/// Collect the `tool_call_id`s of messages a rewind is about to remove, so
+/// their cached tool results can be pruned in the same transaction. Tool
+/// results live on `role='tool'` rows carrying `tool_call_id`. `after =
+/// Some(id)` restricts to rows with `id > after`; `None` covers the whole
+/// thread (used by the full-wipe path).
+fn dropped_tool_call_ids(
+    tx: &rusqlite::Transaction,
+    thread_id: &str,
+    after: Option<i64>,
+) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    match after {
+        Some(id) => {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT tool_call_id FROM messages
+                     WHERE thread_id = ?1 AND id > ?2 AND tool_call_id IS NOT NULL",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![thread_id, id], |r| r.get::<_, Option<String>>(0))
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                if let Ok(Some(v)) = row {
+                    out.push(v);
+                }
+            }
+        }
+        None => {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT tool_call_id FROM messages
+                     WHERE thread_id = ?1 AND tool_call_id IS NOT NULL",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![thread_id], |r| r.get::<_, Option<String>>(0))
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                if let Ok(Some(v)) = row {
+                    out.push(v);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod root_thread_id_tests {
     use super::{is_root_session_thread_id, MemoryMessage, SharedReply, SqliteMemoryActor};
@@ -2425,5 +2421,115 @@ mod root_thread_id_tests {
         let deleted = rx.await.expect("reply").expect("truncate ok");
         assert_eq!(deleted, 1);
         assert!(session.get_context().await.expect("context").is_empty());
+    }
+
+    #[tokio::test]
+    async fn truncate_prunes_dropped_tool_cache_and_stale_metadata() {
+        let actor = SqliteMemoryActor::new(":memory:").expect("memory actor");
+        let node = NodeHandle::new(actor, 16, 1, Duration::from_millis(1));
+        let manager = SessionManager::new(node.clone());
+        let thread_id = "terminal:660e8400-e29b-41d4-a716-446655440099:";
+        let mut session = manager.get_session(thread_id).await.expect("session");
+
+        // Layout (ids 1..4): u1, a tool-result row carrying tool_call_id, u2, a2.
+        // Rewinding to u1 (keep=1) drops ids 2..4 — the tool row feeds the cache
+        // prune; a2 (id=4) backs the stale reflection pointer.
+        session
+            .add_message(crate::utils::ChatMessage::user("u1"))
+            .await
+            .expect("add u1");
+        session
+            .add_message(crate::utils::ChatMessage {
+                role: "tool".to_string(),
+                content: Some(crate::utils::MessageContent::Text(
+                    "tool result".to_string(),
+                )),
+                name: None,
+                tool_calls: None,
+                tool_call_id: Some("call_1".to_string()),
+                reasoning_content: None,
+                is_error: None,
+            })
+            .await
+            .expect("add tool");
+        session
+            .add_message(crate::utils::ChatMessage::user("u2"))
+            .await
+            .expect("add u2");
+        session
+            .add_message(crate::utils::ChatMessage::assistant("a2"))
+            .await
+            .expect("add a2");
+
+        // Cache the tool result and point reflection at a2 (id=4, doomed).
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.send_packet(MemoryMessage::CacheToolResult {
+            tool_call_id: "call_1".to_string(),
+            chat_id: thread_id.to_string(),
+            session_key: thread_id.to_string(),
+            tool_name: "demo".to_string(),
+            full_content: "full tool result".to_string(),
+            compact_summary: "summary".to_string(),
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .expect("send cache");
+        rx.await.expect("reply").expect("cache ok");
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.send_packet(MemoryMessage::UpdateThreadMetadata {
+            thread_id: thread_id.to_string(),
+            last_reflection_msg_id: Some(4),
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .expect("send metadata");
+        rx.await.expect("reply").expect("metadata ok");
+
+        // Sanity: cache is present before the rewind.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.send_packet(MemoryMessage::FetchToolResult {
+            tool_call_id: "call_1".to_string(),
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .expect("send fetch");
+        assert_eq!(
+            rx.await.expect("reply").expect("fetch ok"),
+            Some("full tool result".to_string())
+        );
+
+        // Rewind to u1 — drops ids 2..4.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.send_packet(MemoryMessage::TruncateAfterUserMessage {
+            thread_id: thread_id.to_string(),
+            keep_user_messages: 1,
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .expect("send truncate");
+        let deleted = rx.await.expect("reply").expect("truncate ok");
+        assert_eq!(deleted, 3);
+
+        // Cached tool result for "call_1" was pruned with its message.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.send_packet(MemoryMessage::FetchToolResult {
+            tool_call_id: "call_1".to_string(),
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .expect("send fetch");
+        assert_eq!(rx.await.expect("reply").expect("fetch ok"), None);
+
+        // Reflection pointer (id=4) was stale → metadata reset to default.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.send_packet(MemoryMessage::GetThreadMetadata {
+            thread_id: thread_id.to_string(),
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .expect("send get-metadata");
+        let (last_id, _time) = rx.await.expect("reply").expect("metadata ok");
+        assert_eq!(last_id, None);
     }
 }
