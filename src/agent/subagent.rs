@@ -310,13 +310,14 @@ impl SubagentHarness {
             // process running after its agent turn is gone.
             .kill_on_drop(true);
 
-        let timeout = std::time::Duration::from_secs(60);
-        let output = tokio::time::timeout(timeout, command.output())
-            .await
-            .map_err(|_| format!("Semble Scout search timed out after {}s", timeout.as_secs()))?
-            .map_err(|e| {
-                format!("Semble Scout could not start `uvx`: {e}. Install uv first, then retry.")
-            })?;
+        // The first `uvx` run may need to download Semble and its model assets.
+        // Do not impose an arbitrary timeout here: on a slow but healthy
+        // network that would turn a one-time install into a false failure.
+        // `kill_on_drop(true)` still cleans up the child if the runtime itself
+        // drops this task during shutdown.
+        let output = command.output().await.map_err(|e| {
+            format!("Semble Scout could not start `uvx`: {e}. Install uv first, then retry.")
+        })?;
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if !output.status.success() {
