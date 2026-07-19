@@ -368,6 +368,31 @@ mod scoped_tools_tests {
         assert!(err.contains("not available"));
     }
 
+    #[tokio::test]
+    async fn system_initiated_ask_user_bypasses_subagent_allowlist() {
+        // Regression for PR #62 review feedback: system-initiated approval prompts
+        // (shell + edit policy gates) call ask_user with allowlist=None so a
+        // restricted sub-agent allowlist (e.g. {write_file} / {exec}) can still
+        // surface the approval dialog.
+        let mut r = ToolRegistry::new();
+        r.register(Box::new(NamedTool { n: "ask_user" }));
+        r.register(Box::new(NamedTool { n: "write_file" }));
+
+        // A sub-agent allowlisted to {write_file} (no ask_user) blocks a direct
+        // ask_user call — this is the failure the None-allowlist bypass avoids.
+        let allow: HashSet<String> = ["write_file".to_string()].into_iter().collect();
+        let err = r
+            .execute_tool_scoped("ask_user", Value::Null, Some(&allow), true)
+            .await
+            .unwrap_err();
+        assert!(err.contains("not allowed"), "{err}");
+
+        // With allowlist=None the system-initiated ask_user succeeds.
+        r.execute_tool_scoped("ask_user", Value::Null, None, true)
+            .await
+            .expect("system-initiated ask_user must bypass the allowlist");
+    }
+
     #[test]
     fn list_scoped_filters_allowlist_and_nested_tools() {
         let mut r = ToolRegistry::new();

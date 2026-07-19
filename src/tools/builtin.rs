@@ -361,7 +361,14 @@ impl Tool for WriteFileTool {
             .ok_or("Missing 'content' argument")?;
         let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
         let before = match fs::read_to_string(&actual_path) {
-            Ok(content) => Some(content),
+            Ok(current_content) => {
+                // No-op write: the file already holds the exact content. Skip the
+                // approval prompt — there is no mutation to review.
+                if current_content == content {
+                    return Ok(None);
+                }
+                Some(current_content)
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(format!("Could not preview write target: {error}")),
         };
@@ -515,6 +522,12 @@ impl Tool for EditFileTool {
             .get("replace_all")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // No-op edit: identical old/new text produces an empty diff. Skip the
+        // approval prompt — there is no mutation to review. (execute() separately
+        // returns an "identical" error so the model learns the edit was a no-op.)
+        if old_text == new_text {
+            return Ok(None);
+        }
         let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
         let before = fs::read_to_string(&actual_path)
             .map_err(|error| format!("Could not preview edit target: {error}"))?;
@@ -2715,6 +2728,47 @@ mod mutation_preview_tests {
         let preview = tool.preview_mutation(&args).await.unwrap().unwrap();
         assert!(preview.diff.contains("-beta"), "{}", preview.diff);
         assert!(preview.diff.contains("+gamma"), "{}", preview.diff);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn write_preview_skips_noop_when_content_unchanged() {
+        // PR #62 review #4: writing identical content is a no-op; skip the prompt.
+        let root = workspace();
+        fs::write(root.join("same.txt"), "identical\n").unwrap();
+        let tool = WriteFileTool {
+            workspace_dir: root.clone(),
+            restrict_to_workspace: true,
+        };
+        let args = json!({ "path": "same.txt", "content": "identical\n" });
+        assert!(
+            tool.preview_mutation(&args).await.unwrap().is_none(),
+            "identical-content write must be a no-op preview"
+        );
+        // A genuinely different write still produces a preview.
+        let changed = json!({ "path": "same.txt", "content": "new\n" });
+        assert!(tool.preview_mutation(&changed).await.unwrap().is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn edit_preview_skips_noop_when_old_equals_new() {
+        // PR #62 review #3: identical old/new text is a no-op; skip the prompt.
+        let root = workspace();
+        fs::write(root.join("notes.txt"), "alpha\nbeta\n").unwrap();
+        let tool = EditFileTool {
+            workspace_dir: root.clone(),
+            restrict_to_workspace: true,
+        };
+        let args = json!({
+            "path": "notes.txt",
+            "old_text": "beta",
+            "new_text": "beta"
+        });
+        assert!(
+            tool.preview_mutation(&args).await.unwrap().is_none(),
+            "identical old/new text must be a no-op preview"
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

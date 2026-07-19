@@ -424,6 +424,17 @@ fn edit_policy_mode_for_session(
     }
 }
 
+/// Reason shown when the edit policy blocks a mutation. Unattended sessions
+/// default to Deny independently of plan mode, so the message distinguishes the
+/// two cases rather than hardcoding "plan mode active" everywhere (PR #62 review #2).
+fn edit_policy_block_reason(unattended_session: bool) -> &'static str {
+    if unattended_session {
+        "File edit blocked by policy: unattended edit mode is active."
+    } else {
+        "File edit blocked by policy: plan mode active — finalize or apply the plan first."
+    }
+}
+
 fn command_preview(command: &str) -> String {
     const MAX_PREVIEW: usize = 160;
     if command.len() <= MAX_PREVIEW {
@@ -492,6 +503,26 @@ mod code_exec_gate_tests {
         assert!(is_code_exec_tool("execution_run_background"));
         assert!(!is_code_exec_tool("read_file"));
         assert!(!is_code_exec_tool("web_search"));
+    }
+
+    #[test]
+    fn file_mutate_category_covers_write_and_edit_only() {
+        assert!(is_file_mutate_tool("write_file"));
+        assert!(is_file_mutate_tool("edit_file"));
+        assert!(!is_file_mutate_tool("read_file"));
+        assert!(!is_file_mutate_tool("exec"));
+        assert!(!is_file_mutate_tool("list_dir"));
+        assert!(!is_file_mutate_tool("search_text"));
+    }
+
+    #[test]
+    fn edit_block_reason_distinguishes_unattended_and_plan_mode() {
+        // PR #62 review #2: the Deny message must match why the edit was blocked.
+        let unattended = edit_policy_block_reason(true);
+        assert!(unattended.contains("unattended"), "{unattended}");
+        assert!(!unattended.contains("plan mode"), "{unattended}");
+        let plan = edit_policy_block_reason(false);
+        assert!(plan.contains("plan mode"), "{plan}");
     }
 
     #[test]
@@ -826,11 +857,14 @@ async fn execute_tool_call_with_activity(
                                 "timeout_secs": 1800,
                                 "allow_empty": false
                             });
+                            // System-initiated approval prompt: bypass the sub-agent tool
+                            // allowlist so a restricted sub-agent (e.g. allowlist={exec})
+                            // can still surface the approval dialog.
                             let ask_result = tools
                                 .execute_tool_scoped(
                                     "ask_user",
                                     ask_payload,
-                                    allow.as_deref(),
+                                    None,
                                     is_subagent,
                                 )
                                 .await;
@@ -916,8 +950,7 @@ async fn execute_tool_call_with_activity(
                 ShellPolicyMode::Allow => {}
                 ShellPolicyMode::Deny => {
                     return ToolExecutionFinished::Completed(Err(
-                        "File edit blocked by policy: plan mode active — finalize or apply the plan first."
-                            .to_string(),
+                        edit_policy_block_reason(runtime.unattended_session).to_string(),
                     ));
                 }
                 ShellPolicyMode::Ask => {
@@ -951,11 +984,14 @@ async fn execute_tool_call_with_activity(
                                 }
                             }
                         });
+                        // System-initiated approval prompt: bypass the sub-agent tool
+                        // allowlist so a restricted sub-agent (e.g. allowlist={write_file})
+                        // can still surface the edit approval dialog.
                         let reply = match tools
                             .execute_tool_scoped(
                                 "ask_user",
                                 ask_payload,
-                                allow.as_deref(),
+                                None,
                                 is_subagent,
                             )
                             .await
