@@ -183,6 +183,10 @@ pub struct ShellPolicyConfig {
     pub unattended_default: Option<String>,
     /// Extra lowercase substrings that should require approval in `ask` mode.
     pub interactive_requires_approval_for: Option<Vec<String>>,
+    /// File edit mode: `ask`, `deny`, or `allow` (default `ask`).
+    pub edit_mode: Option<String>,
+    /// File edit mode for unattended/autonomous sessions (default `deny`).
+    pub edit_unattended_default: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,6 +200,9 @@ pub enum ShellPolicyMode {
 pub struct ResolvedShellPolicy {
     pub interactive_mode: ShellPolicyMode,
     pub unattended_mode: ShellPolicyMode,
+    /// File mutation policy, intentionally independent from shell execution.
+    pub interactive_edit_mode: ShellPolicyMode,
+    pub unattended_edit_mode: ShellPolicyMode,
     pub approval_patterns: Vec<String>,
 }
 
@@ -753,6 +760,14 @@ impl AppConfig {
             shell_cfg.and_then(|s| s.unattended_default.as_deref()),
             ShellPolicyMode::Deny,
         );
+        let interactive_edit_mode = parse_shell_policy_mode(
+            shell_cfg.and_then(|s| s.edit_mode.as_deref()),
+            ShellPolicyMode::Ask,
+        );
+        let unattended_edit_mode = parse_shell_policy_mode(
+            shell_cfg.and_then(|s| s.edit_unattended_default.as_deref()),
+            ShellPolicyMode::Deny,
+        );
         let mut approval_patterns = vec![
             "rm -rf".to_string(),
             "rm -fr".to_string(),
@@ -778,6 +793,8 @@ impl AppConfig {
         ResolvedShellPolicy {
             interactive_mode,
             unattended_mode,
+            interactive_edit_mode,
+            unattended_edit_mode,
             approval_patterns,
         }
     }

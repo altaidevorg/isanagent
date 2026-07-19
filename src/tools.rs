@@ -1,4 +1,4 @@
-use crate::traits::Tool;
+use crate::traits::{MutationPreview, Tool};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -116,6 +116,63 @@ impl ToolRegistry {
         }
     }
 
+    /// Ask a tool for its file-mutation preview without executing it.
+    pub async fn preview_mutation_scoped(
+        &self,
+        name: &str,
+        args: &Value,
+        allowlist: Option<&HashSet<String>>,
+        is_subagent: bool,
+    ) -> Result<Option<MutationPreview>, String> {
+        self.authorize_scoped(name, allowlist, is_subagent)?;
+        match self.get_tool(name) {
+            Some(tool) => tool.preview_mutation(args).await,
+            None => Err(format!("Tool '{}' not found", name)),
+        }
+    }
+
+    /// Execute with a preview previously approved by the user.
+    pub async fn execute_tool_scoped_with_approved_mutation(
+        &self,
+        name: &str,
+        args: Value,
+        approved_preview: Option<&MutationPreview>,
+        allowlist: Option<&HashSet<String>>,
+        is_subagent: bool,
+    ) -> Result<String, String> {
+        self.authorize_scoped(name, allowlist, is_subagent)?;
+        match self.get_tool(name) {
+            Some(tool) => {
+                tool.execute_with_approved_mutation(args, approved_preview)
+                    .await
+            }
+            None => Err(format!("Tool '{}' not found", name)),
+        }
+    }
+
+    fn authorize_scoped(
+        &self,
+        name: &str,
+        allowlist: Option<&HashSet<String>>,
+        is_subagent: bool,
+    ) -> Result<(), String> {
+        if is_subagent && Self::is_subagent_restricted_tool(name) {
+            return Err(format!(
+                "Tool '{}' is not available inside a sub-agent run",
+                name
+            ));
+        }
+        if let Some(set) = allowlist {
+            if !set.is_empty() && !set.contains(name) {
+                return Err(format!(
+                    "Tool '{}' is not allowed for this sub-agent (allowlist)",
+                    name
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Tools that must not run inside a sub-agent loop (prevents unbounded recursion).
     pub fn is_subagent_restricted_tool(name: &str) -> bool {
         matches!(name, "subagent_spawn" | "subagent_plan_execute")
@@ -182,20 +239,7 @@ impl ToolRegistry {
         allowlist: Option<&HashSet<String>>,
         is_subagent: bool,
     ) -> Result<String, String> {
-        if is_subagent && Self::is_subagent_restricted_tool(name) {
-            return Err(format!(
-                "Tool '{}' is not available inside a sub-agent run",
-                name
-            ));
-        }
-        if let Some(set) = allowlist {
-            if !set.is_empty() && !set.contains(name) {
-                return Err(format!(
-                    "Tool '{}' is not allowed for this sub-agent (allowlist)",
-                    name
-                ));
-            }
-        }
+        self.authorize_scoped(name, allowlist, is_subagent)?;
         self.execute_tool(name, args).await
     }
 }

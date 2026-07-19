@@ -1325,6 +1325,8 @@ mod tests {
             shell_policy: Arc::new(ResolvedShellPolicy {
                 interactive_mode: crate::config::ShellPolicyMode::Ask,
                 unattended_mode: crate::config::ShellPolicyMode::Deny,
+                interactive_edit_mode: crate::config::ShellPolicyMode::Ask,
+                unattended_edit_mode: crate::config::ShellPolicyMode::Deny,
                 approval_patterns: Vec::new(),
             }),
             hook_tool_ctx: None,
