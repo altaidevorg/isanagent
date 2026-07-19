@@ -84,15 +84,20 @@ impl AgentRegistry {
             return String::new();
         }
         let mut s = String::from("\n\n## Available Specialized Agents\n\n");
-        s.push_str("You are a coordinator. Delegate work to specialized sub-agents using the `agent_spawn` tool. ");
+        s.push_str("You are a coordinator. Delegate work to specialized agents using the `subagent_spawn` tool. ");
         s.push_str(
             "Use `agent_list` to refresh your knowledge of available agents at any time.\n\n",
         );
         for m in &visible {
-            let tools_summary = match &m.allowed_tools {
-                None => "inherits harness allowlist".to_string(),
-                Some(v) if v.is_empty() => "read-only, no tools".to_string(),
-                Some(v) => v.join(", "),
+            let tools_summary = if m.mode == AgentMode::SembleScout {
+                "local Semble code search only (no model, arbitrary shell, or project writes)"
+                    .to_string()
+            } else {
+                match &m.allowed_tools {
+                    None => "inherits harness allowlist".to_string(),
+                    Some(v) if v.is_empty() => "read-only, no tools".to_string(),
+                    Some(v) => v.join(", "),
+                }
             };
             let iter_hint = match m.max_iterations {
                 Some(n) => format!(", max {} iterations", n),
@@ -104,6 +109,7 @@ impl AgentRegistry {
             ));
         }
         s.push_str("\nGuidelines:\n- For research: delegate to a research-capable agent.\n");
+        s.push_str("- For exploring an unfamiliar local codebase, delegate to Semble Scout before broad grep or full-file reads.\n");
         s.push_str("- For code changes: delegate to a coder agent.\n");
         s.push_str("- For review: delegate to a read-only review agent.\n");
         s.push_str("- Use `wait=false` for parallel work; `wait=true` when result is needed.\n");
@@ -168,6 +174,21 @@ fn resolve_system_prompt(def: &AgentDefinition, sandbox_dir: &std::path::Path) -
 
 pub fn default_agent_definitions() -> HashMap<String, AgentDefinition> {
     let mut map = HashMap::new();
+    map.insert(
+        "semble-scout".to_string(),
+        AgentDefinition {
+            description: "Find the most relevant local code snippets for a natural-language or symbol query using Semble".to_string(),
+            mode: AgentMode::SembleScout,
+            system_prompt: None,
+            system_prompt_file: None,
+            allowed_tools: Some(vec![]),
+            model: None,
+            temperature: None,
+            max_iterations: None,
+            hidden: false,
+            color: Some("#8B5CF6".into()),
+        },
+    );
     map.insert(
         "researcher".to_string(),
         AgentDefinition {
@@ -275,7 +296,11 @@ mod tests {
     #[test]
     fn default_agents_have_expected_roles() {
         let defs = default_agent_definitions();
-        assert_eq!(defs.len(), 3);
+        assert_eq!(defs.len(), 4);
+        assert!(matches!(
+            defs.get("semble-scout").map(|agent| agent.mode.clone()),
+            Some(AgentMode::SembleScout)
+        ));
         assert!(defs.contains_key("researcher"));
         assert!(defs.contains_key("coder"));
         assert!(defs.contains_key("evaluator"));

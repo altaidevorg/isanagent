@@ -627,17 +627,15 @@ async fn run_ssh_channel_oneway(
             break;
         };
         match msg {
-            ChannelMsg::Data { data } => {
-                if stdout.len() < max_each {
-                    let take = (max_each - stdout.len()).min(data.len());
-                    stdout.extend_from_slice(&data[..take]);
-                }
+            ChannelMsg::Data { data } if stdout.len() < max_each => {
+                let take = (max_each - stdout.len()).min(data.len());
+                stdout.extend_from_slice(&data[..take]);
             }
-            ChannelMsg::ExtendedData { data, ext } => {
-                if ext == SSH_STDERR && stderr.len() < max_each {
-                    let take = (max_each - stderr.len()).min(data.len());
-                    stderr.extend_from_slice(&data[..take]);
-                }
+            ChannelMsg::ExtendedData { data, ext }
+                if ext == SSH_STDERR && stderr.len() < max_each =>
+            {
+                let take = (max_each - stderr.len()).min(data.len());
+                stderr.extend_from_slice(&data[..take]);
             }
             ChannelMsg::ExitStatus { exit_status } => {
                 code = Some(exit_status);

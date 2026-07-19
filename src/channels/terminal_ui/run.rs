@@ -545,8 +545,7 @@ fn jobs_strip_lines(app: &App, max_width: usize, include_stream_tail: bool) -> V
         if let Some(last) = app
             .execution_stream_recent
             .lines()
-            .filter(|s| !s.trim().is_empty())
-            .next_back()
+            .rfind(|s| !s.trim().is_empty())
         {
             let label = app
                 .execution_stream_label
@@ -1591,12 +1590,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 .and_then(|v| v.as_str())
             {
                 // General background job output: update strip, don't add to transcript.
-                if let Some(line) = msg
-                    .content
-                    .lines()
-                    .filter(|l| !l.trim().is_empty())
-                    .next_back()
-                {
+                if let Some(line) = msg.content.lines().rfind(|l| !l.trim().is_empty()) {
                     app.job_strip_set_last_line(jid, line);
                 }
 

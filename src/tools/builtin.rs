@@ -1330,8 +1330,7 @@ async fn web_search_duckduckgo(query: &str, max_output_chars: usize) -> Result<S
     let titles: Vec<_> = document.select(&title_selector).take(5).collect();
     let snippets: Vec<_> = document.select(&snippet_selector).take(5).collect();
 
-    for (i, (title_elem, snippet_elem)) in titles.into_iter().zip(snippets.into_iter()).enumerate()
-    {
+    for (i, (title_elem, snippet_elem)) in titles.into_iter().zip(snippets).enumerate() {
         let title = title_elem.text().collect::<Vec<_>>().join(" ");
         let link = title_elem.value().attr("href").unwrap_or("");
         let snippet = snippet_elem
@@ -2107,7 +2106,7 @@ fn git_worktree_path_argument(git_root: &Path, wt: &Path) -> String {
 fn strip_windows_extended_path_prefix(path: &Path) -> PathBuf {
     #[cfg(not(windows))]
     {
-        return path.to_path_buf();
+        path.to_path_buf()
     }
     #[cfg(windows)]
     {
