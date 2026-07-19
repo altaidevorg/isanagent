@@ -342,11 +342,10 @@ impl SkillRegistry {
             }
         }
 
-        if specific_skill.is_some() && installed_skills.is_empty() {
+        if let Some(skill) = specific_skill.filter(|_| installed_skills.is_empty()) {
             return Err(format!(
                 "Skill '{}' not found in repository {}",
-                specific_skill.unwrap(),
-                full_repo_url
+                skill, full_repo_url
             ));
         }
 

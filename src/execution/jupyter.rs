@@ -818,16 +818,12 @@ fn fold_execute_ws_message(v: &Value, exec_msg_id: &str, ctx: &mut ExecuteFoldCt
             // Shell reply: sync status / exit only. Traceback belongs on iopub `error` to avoid duplicates.
             let status = v["content"]["status"].as_str().unwrap_or("");
             match status {
-                "error" => {
-                    if ctx.exit_code.is_none() || *ctx.exit_code == Some(0) {
-                        *ctx.exit_code = Some(1);
-                    }
+                "error" if ctx.exit_code.is_none() || *ctx.exit_code == Some(0) => {
+                    *ctx.exit_code = Some(1);
                 }
                 "abort" => *ctx.exit_code = Some(130),
-                "ok" => {
-                    if ctx.exit_code.is_none() || *ctx.exit_code == Some(0) {
-                        *ctx.exit_code = Some(0);
-                    }
+                "ok" if ctx.exit_code.is_none() || *ctx.exit_code == Some(0) => {
+                    *ctx.exit_code = Some(0);
                 }
                 _ => {}
             }

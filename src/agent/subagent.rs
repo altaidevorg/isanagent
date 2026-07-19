@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use serde::Deserialize;
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
 use super::ReasoningLoopCtx;
@@ -17,7 +18,7 @@ use crate::channels::terminal_ui::protocol::{
     METADATA_SUBAGENT_STATUS, METADATA_SUBAGENT_TASK_ID,
 };
 use crate::clarification::ClarificationHub;
-use crate::config::ResolvedShellPolicy;
+use crate::config::{AgentMode, ResolvedShellPolicy};
 use crate::logging::LoggerHandle;
 use crate::memory::{MemoryMessage, SharedReply};
 use crate::session::SessionManager;
@@ -82,6 +83,9 @@ pub struct SubagentSpawnDeps {
     pub task_history_retention: usize,
     /// Optional extra bus sender for enqueuing synthetic follow-up messages.
     pub bus_tx: Option<tokio::sync::mpsc::Sender<BusMessage>>,
+    /// Project root used by deterministic local worker agents. The worker
+    /// never accepts a root from an LLM tool argument.
+    pub workspace_dir: PathBuf,
 }
 
 struct TaskRecord {
@@ -260,6 +264,64 @@ impl SubagentHarness {
             .ok_or_else(|| "Subagent harness is not wired to tools yet".to_string())
     }
 
+    /// Run Semble as a constrained local worker. The LLM controls only the
+    /// query text; the search root, executable shape, cache location, and
+    /// content policy are owned by the host application.
+    async fn run_semble_scout(workspace_dir: &Path, query: &str) -> Result<String, String> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Err("Semble Scout needs a non-empty code search query.".to_string());
+        }
+        if !workspace_dir.is_dir() {
+            return Err(format!(
+                "Semble Scout workspace is unavailable: {}",
+                workspace_dir.display()
+            ));
+        }
+
+        let cache_dir = workspace_dir
+            .join(".isanagent")
+            .join("cache")
+            .join("semble");
+        tokio::fs::create_dir_all(&cache_dir)
+            .await
+            .map_err(|e| format!("Could not prepare Semble cache: {e}"))?;
+
+        let mut command = tokio::process::Command::new("uvx");
+        command
+            .args(["--from", "semble[mcp]==0.5.1", "semble", "search", query])
+            .arg(workspace_dir)
+            .args([
+                "--content",
+                "code",
+                "--top-k",
+                "8",
+                "--max-snippet-lines",
+                "16",
+            ])
+            .current_dir(workspace_dir)
+            .env("SEMBLE_CACHE_LOCATION", &cache_dir)
+            // A cancelled parent must not leave a package install or indexer
+            // process running after its agent turn is gone.
+            .kill_on_drop(true);
+
+        let output = command.output().await.map_err(|e| {
+            format!("Semble Scout could not start `uvx`: {e}. Install uv first, then retry.")
+        })?;
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if !output.status.success() {
+            let detail = if stderr.is_empty() { stdout } else { stderr };
+            return Err(format!("Semble Scout search failed: {detail}"));
+        }
+        if stdout.is_empty() {
+            return Ok("Semble Scout found no matching code snippets.".to_string());
+        }
+        Ok(format!(
+            "Semble Scout results (local code search):\n\n{stdout}"
+        ))
+    }
+
     pub async fn spawn(&self, spec: SubagentSpawnSpec) -> Result<String, String> {
         let SubagentSpawnSpec {
             parent_channel,
@@ -300,6 +362,24 @@ impl SubagentHarness {
             }
             None => None,
         };
+
+        // Semble Scout is deliberately a named agent rather than an MCP
+        // integration: no LLM/provider is spawned for it. It receives the
+        // coordinator's query, searches only the configured project root,
+        // and returns the retrieved snippets directly to that coordinator.
+        if manifest
+            .as_ref()
+            .is_some_and(|agent| agent.mode == AgentMode::SembleScout)
+        {
+            let result = Self::run_semble_scout(&self.inner.deps.workspace_dir, &prompt).await?;
+            return Ok(serde_json::json!({
+                "agent": "semble-scout",
+                "status": "completed",
+                "wait": true,
+                "result": result,
+            })
+            .to_string());
+        }
 
         let tools = self.tools()?;
         let task_id = uuid::Uuid::new_v4().simple().to_string();
@@ -1334,6 +1414,7 @@ mod tests {
             wake_on_completion: false,
             task_history_retention: 20,
             bus_tx: None,
+            workspace_dir: skills_dir.path().to_path_buf(),
         }));
 
         let err = harness
@@ -1354,5 +1435,15 @@ mod tests {
             err.contains("Named agents are not configured"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn semble_scout_rejects_a_missing_workspace_before_spawning_processes() {
+        let missing =
+            std::env::temp_dir().join(format!("isanagent-absent-{}", uuid::Uuid::new_v4()));
+        let err = SubagentHarness::run_semble_scout(&missing, "find agent startup")
+            .await
+            .expect_err("missing workspace must be rejected");
+        assert!(err.contains("workspace is unavailable"));
     }
 }

@@ -1474,6 +1474,9 @@ pub struct SubagentHarnessParams {
     pub wake_on_completion: bool,
     pub task_history_retention: usize,
     pub bus_tx: Option<tokio::sync::mpsc::Sender<crate::bus::BusMessage>>,
+    /// Canonical project root available to deterministic local worker agents.
+    /// This is intentionally separate from IsanAgent's state directory.
+    pub workspace_dir: std::path::PathBuf,
 }
 
 /// The central logic for an autonomous Agent running inside an ActorNode.
@@ -1573,6 +1576,7 @@ impl AgentLogic {
                 wake_on_completion: p.wake_on_completion,
                 task_history_retention: p.task_history_retention,
                 bus_tx: p.bus_tx.clone(),
+                workspace_dir: p.workspace_dir.clone(),
             }))
         });
 

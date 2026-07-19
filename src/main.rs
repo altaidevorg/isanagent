@@ -790,6 +790,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             wake_on_completion: workspace.config.subagent_wake_on_completion(),
             task_history_retention: workspace.config.subagent_task_history_retention(),
             bus_tx: Some(bus_tx.clone()),
+            workspace_dir: workspace.sandbox_dir.clone(),
         })
     } else {
         None

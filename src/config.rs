@@ -161,6 +161,10 @@ pub enum AgentMode {
     /// Invoked by the coordinator via tools.
     #[default]
     Subagent,
+    /// A deterministic, local-only code retrieval worker powered by Semble.
+    /// It never invokes an LLM and may only search the configured workspace.
+    #[serde(rename = "semble_scout")]
+    SembleScout,
 }
 
 /// HF ml-intern–style ML policy overlay + optional autonomy hints (see `assets/ml_engineer_overlay.md`).
