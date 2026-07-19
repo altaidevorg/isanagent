@@ -289,25 +289,34 @@ impl SubagentHarness {
 
         let mut command = tokio::process::Command::new("uvx");
         command
-            .args(["--from", "semble[mcp]==0.5.1", "semble", "search", query])
-            .arg(workspace_dir)
             .args([
+                "--from",
+                "semble[mcp]==0.5.1",
+                "semble",
+                "search",
                 "--content",
                 "code",
                 "--top-k",
                 "8",
                 "--max-snippet-lines",
                 "16",
+                "--",
+                query,
             ])
+            .arg(workspace_dir)
             .current_dir(workspace_dir)
             .env("SEMBLE_CACHE_LOCATION", &cache_dir)
             // A cancelled parent must not leave a package install or indexer
             // process running after its agent turn is gone.
             .kill_on_drop(true);
 
-        let output = command.output().await.map_err(|e| {
-            format!("Semble Scout could not start `uvx`: {e}. Install uv first, then retry.")
-        })?;
+        let timeout = std::time::Duration::from_secs(60);
+        let output = tokio::time::timeout(timeout, command.output())
+            .await
+            .map_err(|_| format!("Semble Scout search timed out after {}s", timeout.as_secs()))?
+            .map_err(|e| {
+                format!("Semble Scout could not start `uvx`: {e}. Install uv first, then retry.")
+            })?;
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if !output.status.success() {
