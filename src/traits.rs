@@ -1,6 +1,19 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
+/// A bounded, user-facing description of a pending file mutation.
+///
+/// The agent dispatcher creates this before asking for approval. `base_fingerprint`
+/// identifies the exact file state the user reviewed; mutation tools re-check it
+/// immediately before writing so an intervening edit is detected.
+#[derive(Debug, Clone)]
+pub struct MutationPreview {
+    pub path: String,
+    pub diff: String,
+    pub diff_truncated: bool,
+    pub base_fingerprint: String,
+}
+
 // --- Trait Definitions ---
 
 /// A Provider abstracts the generation capabilities of an LLM.
@@ -63,4 +76,24 @@ pub trait Tool: Send + Sync {
 
     /// Execute the tool with the given JSON arguments.
     async fn execute(&self, args: Value) -> Result<String, String>;
+
+    /// Return a preview for a file mutation, if this tool performs one.
+    ///
+    /// The default keeps existing tools source-compatible and lets the central
+    /// dispatcher apply a single policy to the small set of mutation tools.
+    async fn preview_mutation(&self, _args: &Value) -> Result<Option<MutationPreview>, String> {
+        Ok(None)
+    }
+
+    /// Execute a mutation after the dispatcher has obtained user approval.
+    ///
+    /// Mutation tools override this to validate `approved_preview` before
+    /// writing. Non-mutation tools retain the normal execution path.
+    async fn execute_with_approved_mutation(
+        &self,
+        args: Value,
+        _approved_preview: Option<&MutationPreview>,
+    ) -> Result<String, String> {
+        self.execute(args).await
+    }
 }

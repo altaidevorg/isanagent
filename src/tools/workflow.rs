@@ -321,6 +321,10 @@ impl Tool for AskUserTool {
                 "allow_empty": {
                     "type": "boolean",
                     "description": "If false (default), treat whitespace-only replies as invalid and keep waiting until timeout."
+                },
+                "metadata": {
+                    "type": "object",
+                    "description": "Optional UI-only structured metadata attached to the clarification event. Do not put secrets here."
                 }
             },
             "required": ["prompt"]
@@ -525,6 +529,15 @@ impl Tool for AskUserTool {
         body.push_str(prompt);
 
         let mut metadata = HashMap::new();
+        if let Some(extra) = args.get("metadata").and_then(|v| v.as_object()) {
+            // Metadata is deliberately restricted to a JSON object and is carried only on
+            // the outbound clarification event. Callers must keep it bounded and secret-free.
+            metadata.extend(
+                extra
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+        }
         metadata.insert(
             METADATA_CLARIFICATION.to_string(),
             serde_json::Value::Bool(true),

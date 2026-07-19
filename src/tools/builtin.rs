@@ -2,13 +2,14 @@ use async_trait::async_trait;
 use chrono::Utc;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tokio::time::{timeout, Duration};
 use walkdir::WalkDir;
 
 use crate::config::JinaWebBackend;
-use crate::traits::Tool;
+use crate::traits::{MutationPreview, Tool};
 use crate::utils::{join_lexically_under_root, normalize_sandbox_relative_input};
 use crate::NodeHandle;
 
@@ -18,6 +19,8 @@ const MAX_GLOB_RESULTS: usize = 500;
 const MAX_SEARCH_TEXT_CHARS: usize = 20_000;
 /// Maximum unified-diff lines included in `edit_file` output.
 const MAX_DIFF_OUTPUT_LINES: usize = 80;
+/// Bound approval metadata so a large write cannot flood the UI event channel.
+const MAX_EDIT_APPROVAL_DIFF_CHARS: usize = 16_000;
 
 /// Resolves a path against the workspace and enforces boundary restrictions.
 pub fn resolve_path(path: &str, workspace_dir: &Path, restrict: bool) -> Result<PathBuf, String> {
@@ -120,6 +123,85 @@ fn truncate_diff_output(diff: String) -> String {
 fn unified_diff_snippet(old: &str, new: &str) -> String {
     let patch = diffy::create_patch(old, new);
     truncate_diff_output(patch.to_string())
+}
+
+fn truncate_approval_diff(mut diff: String) -> (String, bool) {
+    if diff.len() <= MAX_EDIT_APPROVAL_DIFF_CHARS {
+        return (diff, false);
+    }
+    let mut end = MAX_EDIT_APPROVAL_DIFF_CHARS;
+    while !diff.is_char_boundary(end) {
+        end -= 1;
+    }
+    diff.truncate(end);
+    diff.push_str("\n... (approval diff truncated)");
+    (diff, true)
+}
+
+fn content_fingerprint(content: Option<&str>) -> String {
+    match content {
+        Some(content) => format!("sha256:{:x}", Sha256::digest(content.as_bytes())),
+        None => "absent".to_string(),
+    }
+}
+
+fn display_mutation_path(actual_path: &Path, workspace_dir: &Path) -> String {
+    // `resolve_path` returns a canonical target. Canonicalize the workspace too
+    // so `/var` versus `/private/var` aliases on macOS still produce a relative
+    // user-facing path and a stable approval identity.
+    let canonical_workspace =
+        fs::canonicalize(workspace_dir).unwrap_or_else(|_| workspace_dir.to_path_buf());
+    actual_path
+        .strip_prefix(&canonical_workspace)
+        .unwrap_or(actual_path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn mutation_preview(
+    workspace_dir: &Path,
+    restrict_to_workspace: bool,
+    path_str: &str,
+    before: Option<&str>,
+    after: &str,
+) -> Result<MutationPreview, String> {
+    let actual_path = resolve_path(path_str, workspace_dir, restrict_to_workspace)?;
+    let display_path = display_mutation_path(&actual_path, workspace_dir);
+    let (diff, diff_truncated) =
+        truncate_approval_diff(unified_diff_snippet(before.unwrap_or(""), after));
+    Ok(MutationPreview {
+        path: display_path,
+        diff,
+        diff_truncated,
+        base_fingerprint: content_fingerprint(before),
+    })
+}
+
+fn validate_approved_preview(
+    workspace_dir: &Path,
+    restrict_to_workspace: bool,
+    path_str: &str,
+    approved_preview: &MutationPreview,
+) -> Result<(), String> {
+    let actual_path = resolve_path(path_str, workspace_dir, restrict_to_workspace)?;
+    let display_path = display_mutation_path(&actual_path, workspace_dir);
+    if display_path != approved_preview.path {
+        return Err(
+            "Edit approval no longer matches the requested path; request a new approval.".into(),
+        );
+    }
+    let current = match fs::read_to_string(&actual_path) {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("Could not re-read approved edit target: {error}")),
+    };
+    if content_fingerprint(current.as_deref()) != approved_preview.base_fingerprint {
+        return Err(
+            "Edit target changed after approval; request a new approval with an updated diff."
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 fn ripgrep_available() -> bool {
@@ -267,6 +349,58 @@ impl Tool for WriteFileTool {
             .map(|_| format!("Successfully wrote to {}", actual_path.display()))
             .map_err(|e| e.to_string())
     }
+
+    async fn preview_mutation(&self, args: &Value) -> Result<Option<MutationPreview>, String> {
+        let path_str = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'path' argument")?;
+        let content = args
+            .get("content")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'content' argument")?;
+        let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
+        let before = match fs::read_to_string(&actual_path) {
+            Ok(current_content) => {
+                // No-op write: the file already holds the exact content. Skip the
+                // approval prompt — there is no mutation to review.
+                if current_content == content {
+                    return Ok(None);
+                }
+                Some(current_content)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(format!("Could not preview write target: {error}")),
+        };
+        mutation_preview(
+            &self.workspace_dir,
+            self.restrict_to_workspace,
+            path_str,
+            before.as_deref(),
+            content,
+        )
+        .map(Some)
+    }
+
+    async fn execute_with_approved_mutation(
+        &self,
+        args: Value,
+        approved_preview: Option<&MutationPreview>,
+    ) -> Result<String, String> {
+        if let Some(preview) = approved_preview {
+            let path_str = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing 'path' argument")?;
+            validate_approved_preview(
+                &self.workspace_dir,
+                self.restrict_to_workspace,
+                path_str,
+                preview,
+            )?;
+        }
+        self.execute(args).await
+    }
 }
 
 pub struct EditFileTool {
@@ -369,6 +503,74 @@ impl Tool for EditFileTool {
             actual_path.display(),
             diff
         ))
+    }
+
+    async fn preview_mutation(&self, args: &Value) -> Result<Option<MutationPreview>, String> {
+        let path_str = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'path' argument")?;
+        let old_text = args
+            .get("old_text")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'old_text' argument")?;
+        let new_text = args
+            .get("new_text")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'new_text' argument")?;
+        let replace_all = args
+            .get("replace_all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        // No-op edit: identical old/new text produces an empty diff. Skip the
+        // approval prompt — there is no mutation to review. (execute() separately
+        // returns an "identical" error so the model learns the edit was a no-op.)
+        if old_text == new_text {
+            return Ok(None);
+        }
+        let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
+        let before = fs::read_to_string(&actual_path)
+            .map_err(|error| format!("Could not preview edit target: {error}"))?;
+        if !before.contains(old_text) {
+            return Ok(None);
+        }
+        let count = before.matches(old_text).count();
+        if count > 1 && !replace_all {
+            return Ok(None);
+        }
+        let after = if replace_all {
+            before.replace(old_text, new_text)
+        } else {
+            before.replacen(old_text, new_text, 1)
+        };
+        mutation_preview(
+            &self.workspace_dir,
+            self.restrict_to_workspace,
+            path_str,
+            Some(&before),
+            &after,
+        )
+        .map(Some)
+    }
+
+    async fn execute_with_approved_mutation(
+        &self,
+        args: Value,
+        approved_preview: Option<&MutationPreview>,
+    ) -> Result<String, String> {
+        if let Some(preview) = approved_preview {
+            let path_str = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing 'path' argument")?;
+            validate_approved_preview(
+                &self.workspace_dir,
+                self.restrict_to_workspace,
+                path_str,
+                preview,
+            )?;
+        }
+        self.execute(args).await
     }
 }
 
@@ -2450,6 +2652,124 @@ mod glob_files_tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod mutation_preview_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn workspace() -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("isanagent_mutation_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[tokio::test]
+    async fn write_preview_records_absent_file_and_approved_write_succeeds() {
+        let root = workspace();
+        let tool = WriteFileTool {
+            workspace_dir: root.clone(),
+            restrict_to_workspace: true,
+        };
+        let args = json!({ "path": "new.txt", "content": "new content\n" });
+        let preview = tool.preview_mutation(&args).await.unwrap().unwrap();
+        assert_eq!(preview.path, "new.txt");
+        assert_eq!(preview.base_fingerprint, "absent");
+        assert!(preview.diff.contains("+new content"));
+
+        tool.execute_with_approved_mutation(args, Some(&preview))
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("new.txt")).unwrap(),
+            "new content\n"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn approved_write_rejects_intervening_change() {
+        let root = workspace();
+        let target = root.join("notes.txt");
+        fs::write(&target, "before\n").unwrap();
+        let tool = WriteFileTool {
+            workspace_dir: root.clone(),
+            restrict_to_workspace: true,
+        };
+        let args = json!({ "path": "notes.txt", "content": "approved\n" });
+        let preview = tool.preview_mutation(&args).await.unwrap().unwrap();
+        fs::write(&target, "changed elsewhere\n").unwrap();
+
+        let error = tool
+            .execute_with_approved_mutation(args, Some(&preview))
+            .await
+            .expect_err("intervening change must invalidate approval");
+        assert!(error.contains("changed after approval"), "{error}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "changed elsewhere\n");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn edit_preview_describes_exact_replacement() {
+        let root = workspace();
+        fs::write(root.join("notes.txt"), "alpha\nbeta\n").unwrap();
+        let tool = EditFileTool {
+            workspace_dir: root.clone(),
+            restrict_to_workspace: true,
+        };
+        let args = json!({
+            "path": "notes.txt",
+            "old_text": "beta",
+            "new_text": "gamma"
+        });
+        let preview = tool.preview_mutation(&args).await.unwrap().unwrap();
+        assert!(preview.diff.contains("-beta"), "{}", preview.diff);
+        assert!(preview.diff.contains("+gamma"), "{}", preview.diff);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn write_preview_skips_noop_when_content_unchanged() {
+        // PR #62 review #4: writing identical content is a no-op; skip the prompt.
+        let root = workspace();
+        fs::write(root.join("same.txt"), "identical\n").unwrap();
+        let tool = WriteFileTool {
+            workspace_dir: root.clone(),
+            restrict_to_workspace: true,
+        };
+        let args = json!({ "path": "same.txt", "content": "identical\n" });
+        assert!(
+            tool.preview_mutation(&args).await.unwrap().is_none(),
+            "identical-content write must be a no-op preview"
+        );
+        // A genuinely different write still produces a preview.
+        let changed = json!({ "path": "same.txt", "content": "new\n" });
+        assert!(tool.preview_mutation(&changed).await.unwrap().is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn edit_preview_skips_noop_when_old_equals_new() {
+        // PR #62 review #3: identical old/new text is a no-op; skip the prompt.
+        let root = workspace();
+        fs::write(root.join("notes.txt"), "alpha\nbeta\n").unwrap();
+        let tool = EditFileTool {
+            workspace_dir: root.clone(),
+            restrict_to_workspace: true,
+        };
+        let args = json!({
+            "path": "notes.txt",
+            "old_text": "beta",
+            "new_text": "beta"
+        });
+        assert!(
+            tool.preview_mutation(&args).await.unwrap().is_none(),
+            "identical old/new text must be a no-op preview"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }
 

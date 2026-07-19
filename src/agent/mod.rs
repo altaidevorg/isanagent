@@ -413,6 +413,28 @@ fn shell_policy_mode_for_session(
     }
 }
 
+fn edit_policy_mode_for_session(
+    policy: &ResolvedShellPolicy,
+    unattended_session: bool,
+) -> ShellPolicyMode {
+    if unattended_session {
+        policy.unattended_edit_mode
+    } else {
+        policy.interactive_edit_mode
+    }
+}
+
+/// Reason shown when the edit policy blocks a mutation. Unattended sessions
+/// default to Deny independently of plan mode, so the message distinguishes the
+/// two cases rather than hardcoding "plan mode active" everywhere (PR #62 review #2).
+fn edit_policy_block_reason(unattended_session: bool) -> &'static str {
+    if unattended_session {
+        "File edit blocked by policy: unattended edit mode is active."
+    } else {
+        "File edit blocked by policy: plan mode active — finalize or apply the plan first."
+    }
+}
+
 fn command_preview(command: &str) -> String {
     const MAX_PREVIEW: usize = 160;
     if command.len() <= MAX_PREVIEW {
@@ -431,6 +453,11 @@ fn is_code_exec_tool(tool_name: &str) -> bool {
         tool_name,
         "exec" | "python_run" | "execution_run" | "execution_run_background"
     )
+}
+
+/// Tools that mutate a workspace file and therefore need the edit policy gate.
+fn is_file_mutate_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "write_file" | "edit_file")
 }
 
 /// Code-exec tools that run *arbitrary* code (Python source / session cells) where the
@@ -476,6 +503,26 @@ mod code_exec_gate_tests {
         assert!(is_code_exec_tool("execution_run_background"));
         assert!(!is_code_exec_tool("read_file"));
         assert!(!is_code_exec_tool("web_search"));
+    }
+
+    #[test]
+    fn file_mutate_category_covers_write_and_edit_only() {
+        assert!(is_file_mutate_tool("write_file"));
+        assert!(is_file_mutate_tool("edit_file"));
+        assert!(!is_file_mutate_tool("read_file"));
+        assert!(!is_file_mutate_tool("exec"));
+        assert!(!is_file_mutate_tool("list_dir"));
+        assert!(!is_file_mutate_tool("search_text"));
+    }
+
+    #[test]
+    fn edit_block_reason_distinguishes_unattended_and_plan_mode() {
+        // PR #62 review #2: the Deny message must match why the edit was blocked.
+        let unattended = edit_policy_block_reason(true);
+        assert!(unattended.contains("unattended"), "{unattended}");
+        assert!(!unattended.contains("plan mode"), "{unattended}");
+        let plan = edit_policy_block_reason(false);
+        assert!(plan.contains("plan mode"), "{plan}");
     }
 
     #[test]
@@ -754,6 +801,7 @@ async fn execute_tool_call_with_activity(
 
     with_tool_exec_and_progress_scope(tool_exec_ctx, progress_emitter, async move {
         let mut args = args;
+        let mut approved_mutation_preview = None;
         let activity_handle = tool_execution_activity
             .as_ref()
             .map(|a| a.start(chat_id.as_str(), tool_name.as_str()));
@@ -809,11 +857,14 @@ async fn execute_tool_call_with_activity(
                                 "timeout_secs": 1800,
                                 "allow_empty": false
                             });
+                            // System-initiated approval prompt: bypass the sub-agent tool
+                            // allowlist so a restricted sub-agent (e.g. allowlist={exec})
+                            // can still surface the approval dialog.
                             let ask_result = tools
                                 .execute_tool_scoped(
                                     "ask_user",
                                     ask_payload,
-                                    allow.as_deref(),
+                                    None,
                                     is_subagent,
                                 )
                                 .await;
@@ -892,18 +943,96 @@ async fn execute_tool_call_with_activity(
             }
         }
 
+        // Run this after steering hooks: a hook may rewrite the arguments, and the
+        // user must see the exact mutation that will be executed.
+        if is_file_mutate_tool(&tool_name) {
+            match edit_policy_mode_for_session(&runtime.shell_policy, runtime.unattended_session) {
+                ShellPolicyMode::Allow => {}
+                ShellPolicyMode::Deny => {
+                    return ToolExecutionFinished::Completed(Err(
+                        edit_policy_block_reason(runtime.unattended_session).to_string(),
+                    ));
+                }
+                ShellPolicyMode::Ask => {
+                    let preview = match tools
+                        .preview_mutation_scoped(&tool_name, &args, allow.as_deref(), is_subagent)
+                        .await
+                    {
+                        Ok(preview) => preview,
+                        // Invalid/no-op edits retain their ordinary tool result; there is no
+                        // mutation to approve in that case.
+                        Err(error) => {
+                            return ToolExecutionFinished::Completed(Err(format!(
+                                "Could not prepare edit approval: {error}"
+                            )));
+                        }
+                    };
+                    if let Some(preview) = preview {
+                        let ask_payload = serde_json::json!({
+                            "prompt": format!(
+                                "Approve edit to `{}`? Review the attached diff, then reply with approve or deny.",
+                                preview.path
+                            ),
+                            "choices": ["approve", "deny"],
+                            "timeout_secs": 1800,
+                            "allow_empty": false,
+                            "metadata": {
+                                "edit_diff": {
+                                    "file": preview.path,
+                                    "diff": preview.diff,
+                                    "truncated": preview.diff_truncated,
+                                }
+                            }
+                        });
+                        // System-initiated approval prompt: bypass the sub-agent tool
+                        // allowlist so a restricted sub-agent (e.g. allowlist={write_file})
+                        // can still surface the edit approval dialog.
+                        let reply = match tools
+                            .execute_tool_scoped(
+                                "ask_user",
+                                ask_payload,
+                                None,
+                                is_subagent,
+                            )
+                            .await
+                        {
+                            Ok(reply) => reply,
+                            Err(error) => {
+                                return ToolExecutionFinished::Completed(Err(format!(
+                                    "Edit policy approval failed: {error}"
+                                )));
+                            }
+                        };
+                        if !shell_approval_reply_is_grant(&reply) {
+                            return ToolExecutionFinished::Completed(Err(
+                                "Edit not approved by user; mutation skipped.".to_string(),
+                            ));
+                        }
+                        approved_mutation_preview = Some(preview);
+                    }
+                }
+            }
+        }
+
         let args_for_post = args.clone();
         let completed = match cancel_owned.as_ref() {
             None => Some(
                 tools
-                    .execute_tool_scoped(&tool_name, args, allow.as_deref(), is_subagent)
+                    .execute_tool_scoped_with_approved_mutation(
+                        &tool_name,
+                        args,
+                        approved_mutation_preview.as_ref(),
+                        allow.as_deref(),
+                        is_subagent,
+                    )
                     .await,
             ),
             Some(token) => {
                 tokio::select! {
-                    res = tools.execute_tool_scoped(
+                    res = tools.execute_tool_scoped_with_approved_mutation(
                         &tool_name,
                         args,
+                        approved_mutation_preview.as_ref(),
                         allow.as_deref(),
                         is_subagent,
                     ) => Some(res),
@@ -4257,6 +4386,8 @@ mod tests {
             shell_policy: Arc::new(crate::config::ResolvedShellPolicy {
                 interactive_mode: crate::config::ShellPolicyMode::Ask,
                 unattended_mode: crate::config::ShellPolicyMode::Deny,
+                interactive_edit_mode: crate::config::ShellPolicyMode::Ask,
+                unattended_edit_mode: crate::config::ShellPolicyMode::Deny,
                 approval_patterns: Vec::new(),
             }),
             hook_tool_ctx: None,
@@ -4344,6 +4475,8 @@ mod tests {
             shell_policy: crate::config::ResolvedShellPolicy {
                 interactive_mode: crate::config::ShellPolicyMode::Ask,
                 unattended_mode: crate::config::ShellPolicyMode::Deny,
+                interactive_edit_mode: crate::config::ShellPolicyMode::Ask,
+                unattended_edit_mode: crate::config::ShellPolicyMode::Deny,
                 approval_patterns: Vec::new(),
             },
             hook_tool_ctx: None,
@@ -4402,6 +4535,8 @@ mod tests {
             shell_policy: crate::config::ResolvedShellPolicy {
                 interactive_mode: crate::config::ShellPolicyMode::Ask,
                 unattended_mode: crate::config::ShellPolicyMode::Deny,
+                interactive_edit_mode: crate::config::ShellPolicyMode::Ask,
+                unattended_edit_mode: crate::config::ShellPolicyMode::Deny,
                 approval_patterns: Vec::new(),
             },
             hook_tool_ctx: None,
