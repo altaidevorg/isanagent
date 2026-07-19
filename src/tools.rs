@@ -6,6 +6,7 @@ use std::sync::{Arc, RwLock};
 pub mod builtin;
 pub mod compact;
 pub mod execution;
+pub mod isanagent_ignore;
 pub mod kernel_porting;
 pub mod ml_domain;
 pub mod recall;

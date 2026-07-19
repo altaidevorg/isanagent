@@ -170,6 +170,13 @@ impl Tool for ReadFileTool {
 
         let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
 
+        if super::isanagent_ignore::is_ignored(&actual_path, false) {
+            return Err(format!(
+                "blocked by .isanagentignore: {}",
+                actual_path.display()
+            ));
+        }
+
         let start_line = args
             .get("start_line")
             .and_then(|v| v.as_u64())
@@ -413,6 +420,9 @@ impl Tool for ListDirTool {
         let mut items = Vec::new();
         while let Some(Ok(entry)) = entries.next() {
             let metadata = entry.metadata().map_err(|e| e.to_string())?;
+            if super::isanagent_ignore::is_ignored(&entry.path(), metadata.is_dir()) {
+                continue;
+            }
             let prefix = if metadata.is_dir() { "📁" } else { "📄" };
             items.push(format!(
                 "{} {}",
@@ -514,6 +524,9 @@ impl Tool for GlobFilesTool {
                 Err(_) => continue,
             };
             let path = entry.path();
+            if super::isanagent_ignore::is_ignored(path, entry.file_type().is_dir()) {
+                continue;
+            }
             if !path.is_file() {
                 continue;
             }
@@ -594,6 +607,10 @@ async fn search_text_ripgrep(
     if let Some(g) = file_glob {
         cmd.arg("--glob");
         cmd.arg(g);
+    }
+    if let Some(ignore_file) = super::isanagent_ignore::find_ignore_file(search_path) {
+        cmd.arg("--ignore-file");
+        cmd.arg(ignore_file);
     }
     cmd.arg("--");
     cmd.arg(pattern);
@@ -710,6 +727,9 @@ fn search_text_native(
                 Err(_) => continue,
             };
             let path = entry.path();
+            if super::isanagent_ignore::is_ignored(path, entry.file_type().is_dir()) {
+                continue;
+            }
             if !path.is_file() {
                 continue;
             }
