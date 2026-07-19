@@ -84,7 +84,7 @@ impl AgentRegistry {
             return String::new();
         }
         let mut s = String::from("\n\n## Available Specialized Agents\n\n");
-        s.push_str("You are a coordinator. Delegate work to specialized sub-agents using the `agent_spawn` tool. ");
+        s.push_str("You are a coordinator. Delegate work to specialized agents using the `subagent_spawn` tool. ");
         s.push_str(
             "Use `agent_list` to refresh your knowledge of available agents at any time.\n\n",
         );
