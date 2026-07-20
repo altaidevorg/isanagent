@@ -9,6 +9,7 @@ use tokio::time::{timeout, Duration};
 use walkdir::WalkDir;
 
 use crate::config::JinaWebBackend;
+use crate::tool_runtime::{current_tool_exec_ctx, ToolExecCtx};
 use crate::traits::{MutationPreview, Tool};
 use crate::utils::{join_lexically_under_root, normalize_sandbox_relative_input};
 use crate::NodeHandle;
@@ -1636,6 +1637,43 @@ pub struct CronTool {
     pub db_path: String,
 }
 
+/// Resolve the cron destination from the trusted per-invocation runtime
+/// context when one exists. The `chat_id` / `channel` arguments predate
+/// `ToolExecCtx` and remain supported only for callers that do not install a
+/// context (for example, external integrations that invoke a tool directly).
+///
+/// A model must never be able to redirect a scheduled action to another
+/// conversation by fabricating a destination in tool arguments.
+fn cron_target_from_args(
+    args: &Value,
+    exec_ctx: Option<&ToolExecCtx>,
+) -> Result<(String, String), String> {
+    let supplied_chat_id = args.get("chat_id").and_then(|v| v.as_str());
+    let supplied_channel = args.get("channel").and_then(|v| v.as_str());
+
+    if let Some(ctx) = exec_ctx {
+        if let Some(chat_id) = supplied_chat_id {
+            if chat_id != ctx.chat_id {
+                return Err("cron chat_id does not match the current tool session".to_string());
+            }
+        }
+        if let Some(channel) = supplied_channel {
+            if channel != ctx.channel {
+                return Err("cron channel does not match the current tool session".to_string());
+            }
+        }
+        return Ok((ctx.chat_id.clone(), ctx.channel.clone()));
+    }
+
+    let chat_id = supplied_chat_id.ok_or("Missing 'chat_id' for add action")?;
+    let channel = supplied_channel.ok_or("Missing 'channel' for add action")?;
+    Ok((chat_id.to_string(), channel.to_string()))
+}
+
+fn cron_job_is_in_scope(job: &crate::scheduler::ActiveJob, exec_ctx: &ToolExecCtx) -> bool {
+    job.chat_id == exec_ctx.chat_id && job.channel == exec_ctx.channel
+}
+
 #[async_trait]
 impl Tool for CronTool {
     fn name(&self) -> &str {
@@ -1643,7 +1681,7 @@ impl Tool for CronTool {
     }
 
     fn description(&self) -> &str {
-        "Manage scheduled tasks. Supports repeating intervals, exact times, or standard cron expressions."
+        "Manage scheduled tasks. Supports repeating intervals, exact times, or standard cron expressions. When called by an agent, schedules are bound to the current conversation and cannot target another chat."
     }
 
     fn parameters(&self) -> Value {
@@ -1664,11 +1702,11 @@ impl Tool for CronTool {
                 },
                 "chat_id": {
                     "type": "string",
-                    "description": "The target chat ID. You must extract this explicitly from the RUNTIME CONTEXT block. Required for 'add' action."
+                    "description": "Legacy direct-call destination. Agent calls are bound to their current session; if supplied, this must match that session."
                 },
                 "channel": {
                     "type": "string",
-                    "description": "The target channel (e.g., 'terminal', 'slack'). Extract this from the RUNTIME CONTEXT block. Required for 'add' action."
+                    "description": "Legacy direct-call destination. Agent calls are bound to their current session; if supplied, this must match that session."
                 },
                 "every_seconds": {
                     "type": "integer",
@@ -1697,10 +1735,14 @@ impl Tool for CronTool {
 
     async fn execute(&self, args: Value) -> Result<String, String> {
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("add");
+        let exec_ctx = current_tool_exec_ctx();
 
         if action == "list" {
             let store = crate::scheduler::CronStore::new(&self.db_path)?;
-            let jobs = store.load_jobs()?;
+            let mut jobs = store.load_jobs()?;
+            if let Some(ctx) = exec_ctx.as_ref() {
+                jobs.retain(|job| cron_job_is_in_scope(job, ctx));
+            }
 
             if jobs.is_empty() {
                 return Ok("No active cron jobs found.".to_string());
@@ -1735,6 +1777,17 @@ impl Tool for CronTool {
                 .get("job_id")
                 .and_then(|v| v.as_str())
                 .ok_or("Missing 'job_id' for remove action")?;
+            if let Some(ctx) = exec_ctx.as_ref() {
+                let job = if let Some(scheduler) = self.mte_cron_scheduler.as_ref() {
+                    scheduler.find_job(job_id)?
+                } else {
+                    crate::scheduler::CronStore::new(&self.db_path)?.find_job(job_id)?
+                };
+                let job = job.ok_or("Job was not found in the current conversation")?;
+                if !cron_job_is_in_scope(&job, ctx) {
+                    return Err("Job does not belong to the current conversation".to_string());
+                }
+            }
             if let Some(scheduler) = self.mte_cron_scheduler.as_ref() {
                 let removed = scheduler.remove_job(job_id, Utc::now()).await?;
                 return if removed {
@@ -1759,14 +1812,7 @@ impl Tool for CronTool {
                 .get("message")
                 .and_then(|v| v.as_str())
                 .ok_or("Missing 'message' for add action")?;
-            let chat_id = args
-                .get("chat_id")
-                .and_then(|v| v.as_str())
-                .ok_or("Missing 'chat_id' for add action")?;
-            let channel = args
-                .get("channel")
-                .and_then(|v| v.as_str())
-                .ok_or("Missing 'channel' for add action")?;
+            let (chat_id, channel) = cron_target_from_args(&args, exec_ctx.as_ref())?;
             let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
             let specified_schedule_count = [
                 args.get("every_seconds").is_some(),
@@ -1818,8 +1864,8 @@ impl Tool for CronTool {
                             schedule,
                             message: message.to_string(),
                             last_run_at_ms: None,
-                            chat_id: chat_id.to_string(),
-                            channel: channel.to_string(),
+                            chat_id: chat_id.clone(),
+                            channel: channel.clone(),
                             webhook_token: crate::scheduler::generate_webhook_token(),
                         },
                         Utc::now(),
@@ -1835,8 +1881,8 @@ impl Tool for CronTool {
                 id: id.clone(),
                 schedule,
                 message: message.to_string(),
-                chat_id: chat_id.to_string(),
-                channel: channel.to_string(),
+                chat_id,
+                channel,
             };
 
             let json_str = serde_json::to_string(&cmd).map_err(|e| e.to_string())?;
@@ -1851,6 +1897,83 @@ impl Tool for CronTool {
         }
 
         Err(format!("Unknown action '{}'", action))
+    }
+}
+
+#[cfg(test)]
+mod cron_tool_tests {
+    use super::CronTool;
+    use crate::logging::create_logger_channel;
+    use crate::scheduler::{ActiveJob, CronActor, CronSchedulingMode, CronStore, ScheduleKind};
+    use crate::tool_runtime::{with_tool_exec_scope, ToolExecCtx};
+    use crate::traits::Tool;
+    use crate::NodeHandle;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn cron_tool_scopes_list_and_rejects_cross_chat_destinations() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("agent.db");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let store = CronStore::new(&db_path_str).expect("cron store");
+        for (id, chat_id) in [("own-job", "chat-1"), ("other-job", "chat-2")] {
+            store
+                .insert_job(&ActiveJob {
+                    id: id.to_string(),
+                    schedule: ScheduleKind::Every { every_ms: 60_000 },
+                    message: "wake up".to_string(),
+                    last_run_at_ms: None,
+                    chat_id: chat_id.to_string(),
+                    channel: "tauri".to_string(),
+                    webhook_token: "test-token".to_string(),
+                })
+                .expect("insert cron job");
+        }
+
+        let (logger, _logger_rx) = create_logger_channel(8);
+        let (bus_tx, _bus_rx) = mpsc::channel(1);
+        let actor = CronActor::new(
+            "test-cron",
+            &db_path_str,
+            logger,
+            CronSchedulingMode::Local,
+            bus_tx,
+        )
+        .expect("cron actor");
+        let tool = CronTool {
+            cron_node: NodeHandle::new(actor, 8, 1, std::time::Duration::from_millis(1)),
+            multi_tenant_edge_cron_enabled: false,
+            mte_cron_scheduler: None,
+            db_path: db_path_str,
+        };
+
+        with_tool_exec_scope(ToolExecCtx::new("tauri", "chat-1", None), async {
+            let list = tool
+                .execute(serde_json::json!({ "action": "list" }))
+                .await
+                .expect("scoped list");
+            assert!(list.contains("own-job"));
+            assert!(!list.contains("other-job"));
+
+            let err = tool
+                .execute(serde_json::json!({
+                    "action": "add",
+                    "message": "wake up",
+                    "chat_id": "chat-2",
+                    "channel": "tauri",
+                    "every_seconds": 60
+                }))
+                .await
+                .expect_err("cross-chat add must fail");
+            assert!(err.contains("does not match"));
+
+            let err = tool
+                .execute(serde_json::json!({ "action": "remove", "job_id": "other-job" }))
+                .await
+                .expect_err("cross-chat remove must fail");
+            assert!(err.contains("does not belong"));
+        })
+        .await;
     }
 }
 
