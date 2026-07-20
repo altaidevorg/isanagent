@@ -490,6 +490,12 @@ impl MultiTenantEdgeCronScheduler {
         Ok(())
     }
 
+    /// Load one active job so embedding hosts can authorize an operation
+    /// against its persisted destination before removing it.
+    pub fn find_job(&self, id: &str) -> Result<Option<ActiveJob>, String> {
+        self.store.find_job(id)
+    }
+
     pub async fn remove_job(&self, id: &str, now: DateTime<Utc>) -> Result<bool, String> {
         let existing_job = self.store.find_job(id)?;
         let Some(existing_job) = existing_job else {
