@@ -2170,7 +2170,11 @@ impl AgentLogic {
         let _ = memory_node
             .send_packet(MemoryMessage::ListBackgroundJobs {
                 chat_id: Some(chat_id.to_string()),
-                channel: Some(inbound.channel.clone()),
+                // A background job may have been created through a different
+                // channel for this same chat. Native recovery deliberately
+                // remains chat-scoped; host embedders opt into channel scope
+                // when their UI needs an isolated inbox.
+                channel: None,
                 limit: 10,
                 reply: SharedReply::new(tx),
             })
@@ -2185,7 +2189,7 @@ impl AgentLogic {
                     .send_packet(MemoryMessage::ListClarificationTickets {
                         job_id: Some(job.job_id.clone()),
                         chat_id: Some(chat_id.to_string()),
-                        channel: Some(inbound.channel.clone()),
+                        channel: None,
                         status: Some("waiting".to_string()),
                         limit: 1,
                         reply: SharedReply::new(tx2),
