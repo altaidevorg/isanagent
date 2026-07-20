@@ -37,6 +37,9 @@ pub enum CronCommand {
     Remove {
         id: String,
     },
+    /// Reload durable jobs after a trusted embedding host has updated the
+    /// store directly and needs this local scheduler to observe the change.
+    Reload,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -748,6 +751,19 @@ impl ActorLogic<String> for CronActor {
                             &format!("Removed job '{}'", id),
                         )));
             }
+            CronCommand::Reload => {
+                self.jobs = self.store.load_jobs().map_err(ActorError::from)?;
+                // Cache entries correspond to persisted expressions. Rebuild
+                // lazily on the next tick, matching startup behavior and
+                // preserving the existing invalid-expression diagnostics.
+                self.cron_schedule_cache.clear();
+                let _ =
+                    self.logger_tx
+                        .send(crate::bus::BusMessage::Log(crate::bus::LogEvent::info(
+                            &self.name,
+                            &format!("Reloaded {} cron jobs from database.", self.jobs.len()),
+                        )));
+            }
         }
 
         Ok(None)
@@ -1057,10 +1073,13 @@ fn decode_schedule(schedule_json: &str) -> Result<ScheduleKind, rusqlite::Error>
 mod tests {
     use super::{
         build_multi_tenant_edge_cron_rules, generate_webhook_token,
-        sync_multi_tenant_edge_cron_jobs, validate_multi_tenant_edge_runtime, ActiveJob, CronStore,
-        MultiTenantEdgeCronScheduler, PendingCronTriggerFinalize, ScheduleKind,
+        sync_multi_tenant_edge_cron_jobs, validate_multi_tenant_edge_runtime, ActiveJob, CronActor,
+        CronCommand, CronSchedulingMode, CronStore, MultiTenantEdgeCronScheduler,
+        PendingCronTriggerFinalize, ScheduleKind,
     };
+    use crate::logging::create_logger_channel;
     use crate::multi_tenant_edge::{CronRegistrationClient, CronRule, CronTransport};
+    use crate::ActorLogic;
     use async_trait::async_trait;
     use chrono::{Datelike, Timelike, Utc};
     use reqwest::StatusCode;
@@ -1099,6 +1118,44 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[tokio::test]
+    async fn reload_command_observes_host_persisted_jobs() {
+        let temp = LocalTempDir::new();
+        let db_path = temp.db_path();
+        let db_path_str = db_path.to_string_lossy();
+        let store = CronStore::new(&db_path_str).expect("cron store");
+        let (logger, _logger_rx) = create_logger_channel(8);
+        let (bus_tx, _bus_rx) = tokio::sync::mpsc::channel(1);
+        let mut actor = CronActor::new(
+            "test-cron",
+            &db_path_str,
+            logger,
+            CronSchedulingMode::Local,
+            bus_tx,
+        )
+        .expect("cron actor");
+        assert!(actor.jobs.is_empty());
+
+        store
+            .insert_job(&ActiveJob {
+                id: "host-job".to_string(),
+                schedule: ScheduleKind::Every { every_ms: 60_000 },
+                message: "wake up".to_string(),
+                last_run_at_ms: None,
+                chat_id: "chat-1".to_string(),
+                channel: "tauri".to_string(),
+                webhook_token: generate_webhook_token(),
+            })
+            .expect("persist host job");
+
+        actor
+            .process(serde_json::to_string(&CronCommand::Reload).expect("serialize reload"))
+            .await
+            .expect("reload command");
+        assert_eq!(actor.jobs.len(), 1);
+        assert_eq!(actor.jobs[0].id, "host-job");
     }
 
     #[derive(Clone)]
