@@ -127,33 +127,28 @@ fn sqlite_datetime_to_unix_ms(s: &str) -> i64 {
 /// hosts with prefixed IDs (for example `s-…`) undiscoverable.  The delimiter is
 /// still reserved for the thread namespace, so IDs may not contain `:`.
 /// Sub-threads such as `terminal:s-abc:subagent-…` return false.
-pub fn is_root_session_thread_id(channel: &str, thread_id: &str) -> bool {
-    let Some(rest) = thread_id
-        .strip_prefix(channel)
-        .and_then(|value| value.strip_prefix(':'))
-    else {
-        return false;
-    };
-    let Some(chat_id) = rest.strip_suffix(':') else {
-        return false;
-    };
+const MAX_ROOT_CHAT_ID_LEN: usize = 512;
 
-    !chat_id.is_empty()
-        && chat_id.len() <= 512
+fn root_chat_id<'a>(channel: &str, thread_id: &'a str) -> Option<&'a str> {
+    let chat_id = thread_id
+        .strip_prefix(channel)?
+        .strip_prefix(':')?
+        .strip_suffix(':')?;
+
+    (!chat_id.is_empty()
+        && chat_id.len() <= MAX_ROOT_CHAT_ID_LEN
         && !chat_id.contains(':')
-        && !chat_id.chars().any(char::is_control)
+        && !chat_id.chars().any(char::is_control))
+    .then_some(chat_id)
+}
+
+pub fn is_root_session_thread_id(channel: &str, thread_id: &str) -> bool {
+    root_chat_id(channel, thread_id).is_some()
 }
 
 /// Parse the opaque `chat_id` from a root `thread_id`, or return `None`.
 pub fn chat_id_from_root_thread_id(channel: &str, thread_id: &str) -> Option<String> {
-    if !is_root_session_thread_id(channel, thread_id) {
-        return None;
-    }
-    thread_id
-        .strip_prefix(channel)
-        .and_then(|value| value.strip_prefix(':'))
-        .and_then(|value| value.strip_suffix(':'))
-        .map(std::string::ToString::to_string)
+    root_chat_id(channel, thread_id).map(std::string::ToString::to_string)
 }
 
 /// Max characters taken from the first line of user content for root-thread list previews.
