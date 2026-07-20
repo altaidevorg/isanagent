@@ -120,29 +120,40 @@ fn sqlite_datetime_to_unix_ms(s: &str) -> i64 {
         .unwrap_or(0)
 }
 
-/// True when `thread_id` is a main session for `channel` (`<channel>:<id>:` with empty sub-thread part).
-/// Sub-threads such as `terminal:uuid:subagent-…` return false.
+/// True when `thread_id` is a main session for `channel` (`<channel>:<chat-id>:`).
+///
+/// Chat IDs are opaque identifiers owned by the host application.  Older hosts
+/// commonly used UUIDs, but requiring that format makes persisted sessions from
+/// hosts with prefixed IDs (for example `s-…`) undiscoverable.  The delimiter is
+/// still reserved for the thread namespace, so IDs may not contain `:`.
+/// Sub-threads such as `terminal:s-abc:subagent-…` return false.
 pub fn is_root_session_thread_id(channel: &str, thread_id: &str) -> bool {
-    let parts: Vec<&str> = thread_id.split(':').collect();
-    if parts.len() != 3 {
+    let Some(rest) = thread_id
+        .strip_prefix(channel)
+        .and_then(|value| value.strip_prefix(':'))
+    else {
         return false;
-    }
-    if parts[0] != channel {
+    };
+    let Some(chat_id) = rest.strip_suffix(':') else {
         return false;
-    }
-    if uuid::Uuid::parse_str(parts[1]).is_err() {
-        return false;
-    }
-    parts[2].is_empty()
+    };
+
+    !chat_id.is_empty()
+        && chat_id.len() <= 512
+        && !chat_id.contains(':')
+        && !chat_id.chars().any(char::is_control)
 }
 
-/// Parse `chat_id` (UUID) from a root `thread_id`, or return `None`.
+/// Parse the opaque `chat_id` from a root `thread_id`, or return `None`.
 pub fn chat_id_from_root_thread_id(channel: &str, thread_id: &str) -> Option<String> {
     if !is_root_session_thread_id(channel, thread_id) {
         return None;
     }
-    let parts: Vec<&str> = thread_id.split(':').collect();
-    parts.get(1).map(std::string::ToString::to_string)
+    thread_id
+        .strip_prefix(channel)
+        .and_then(|value| value.strip_prefix(':'))
+        .and_then(|value| value.strip_suffix(':'))
+        .map(std::string::ToString::to_string)
 }
 
 /// Max characters taken from the first line of user content for root-thread list previews.
@@ -2291,7 +2302,10 @@ fn dropped_tool_call_ids(
 
 #[cfg(test)]
 mod root_thread_id_tests {
-    use super::{is_root_session_thread_id, MemoryMessage, SharedReply, SqliteMemoryActor};
+    use super::{
+        chat_id_from_root_thread_id, is_root_session_thread_id, MemoryMessage, SharedReply,
+        SqliteMemoryActor,
+    };
     use crate::session::SessionManager;
     use crate::traits::Memory;
     use crate::NodeHandle;
@@ -2304,6 +2318,16 @@ mod root_thread_id_tests {
     }
 
     #[test]
+    fn root_main_thread_accepts_opaque_chat_id() {
+        let tid = "tauri:s-01JQ8QBK7T3SZ8RMS4ZK93XMBQ:";
+        assert!(is_root_session_thread_id("tauri", tid));
+        assert_eq!(
+            chat_id_from_root_thread_id("tauri", tid).as_deref(),
+            Some("s-01JQ8QBK7T3SZ8RMS4ZK93XMBQ")
+        );
+    }
+
+    #[test]
     fn not_root_when_subthread() {
         let tid = "terminal:550e8400-e29b-41d4-a716-446655440000:subagent-abc";
         assert!(!is_root_session_thread_id("terminal", tid));
@@ -2312,6 +2336,12 @@ mod root_thread_id_tests {
     #[test]
     fn not_root_short_string() {
         assert!(!is_root_session_thread_id("terminal", "nope"));
+    }
+
+    #[test]
+    fn not_root_when_chat_id_is_empty_or_contains_delimiter() {
+        assert!(!is_root_session_thread_id("tauri", "tauri::"));
+        assert!(!is_root_session_thread_id("tauri", "tauri:s-abc:extra:"));
     }
 
     #[tokio::test]
