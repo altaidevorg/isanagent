@@ -2170,6 +2170,7 @@ impl AgentLogic {
         let _ = memory_node
             .send_packet(MemoryMessage::ListBackgroundJobs {
                 chat_id: Some(chat_id.to_string()),
+                channel: None,
                 limit: 10,
                 reply: SharedReply::new(tx),
             })
@@ -2184,6 +2185,7 @@ impl AgentLogic {
                     .send_packet(MemoryMessage::ListClarificationTickets {
                         job_id: Some(job.job_id.clone()),
                         chat_id: Some(chat_id.to_string()),
+                        channel: None,
                         status: Some("waiting".to_string()),
                         limit: 1,
                         reply: SharedReply::new(tx2),

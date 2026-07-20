@@ -1957,6 +1957,8 @@ struct JobsQuery {
     #[serde(default)]
     chat_id: Option<String>,
     #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
     limit: Option<usize>,
 }
 
@@ -1964,6 +1966,8 @@ struct JobsQuery {
 struct NotificationsQuery {
     #[serde(default)]
     chat_id: Option<String>,
+    #[serde(default)]
+    channel: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
     #[serde(default)]
@@ -2373,6 +2377,7 @@ async fn handle_list_background_jobs(
     let res = memory_request(&state.memory_node, |reply| {
         MemoryMessage::ListBackgroundJobs {
             chat_id: params.chat_id,
+            channel: params.channel,
             limit: params.limit.unwrap_or(100),
             reply,
         }
@@ -2392,6 +2397,7 @@ async fn handle_list_notifications(
     let res = memory_request(&state.memory_node, |reply| {
         MemoryMessage::ListNotifications {
             chat_id: params.chat_id,
+            channel: params.channel,
             limit: params.limit.unwrap_or(100),
             unseen_only: params.unseen_only.unwrap_or(false),
             reply,

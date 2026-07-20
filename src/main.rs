@@ -1341,6 +1341,7 @@ async fn recover_background_jobs_on_startup(
     if memory_node
         .send_packet(MemoryMessage::ListBackgroundJobs {
             chat_id: None,
+            channel: None,
             limit: 500,
             reply: SharedReply::new(tx),
         })
