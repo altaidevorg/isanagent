@@ -226,6 +226,23 @@ impl AnthropicProvider {
                                             json!({"type": "text", "text": format!("[image: {}]", image_url.url)})
                                         }
                                     }
+                                    crate::utils::ContentPart::Document { document } => {
+                                        // Anthropic has a first-class document block. Keeping the
+                                        // original PDF bytes lets the selected model perform its
+                                        // own visual/text understanding (including scanned pages).
+                                        let mut block = json!({
+                                            "type": "document",
+                                            "source": {
+                                                "type": "base64",
+                                                "media_type": document.media_type,
+                                                "data": document.data,
+                                            }
+                                        });
+                                        if let Some(name) = &document.name {
+                                            block["title"] = json!(name);
+                                        }
+                                        block
+                                    }
                                 })
                                 .collect();
                             json!(anthropic_parts)

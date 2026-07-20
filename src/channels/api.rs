@@ -1531,6 +1531,7 @@ fn text_and_images_from_message(message: &ChatMessage) -> (String, Vec<String>) 
                 match part {
                     ContentPart::Text { text } => texts.push(text.as_str()),
                     ContentPart::ImageUrl { image_url } => urls.push(image_url.url.clone()),
+                    ContentPart::Document { .. } => texts.push("[document attachment]"),
                 }
             }
             (texts.join("\n\n"), urls)

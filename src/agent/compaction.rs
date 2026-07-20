@@ -752,6 +752,7 @@ fn render_content(content: &MessageContent, strip_images: bool) -> String {
                 ContentPart::Text { text } => Some(text.clone()),
                 ContentPart::ImageUrl { .. } if strip_images => None,
                 ContentPart::ImageUrl { .. } => Some("[image]".to_string()),
+                ContentPart::Document { .. } => Some("[document]".to_string()),
             })
             .collect::<Vec<_>>()
             .join("\n"),
