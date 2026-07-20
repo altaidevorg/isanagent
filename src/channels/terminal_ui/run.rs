@@ -1424,6 +1424,10 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         let _ = memory_node
                             .send_packet(crate::memory::MemoryMessage::ListBackgroundJobs {
                                 chat_id: None,
+                                // The terminal's inbox is intentionally
+                                // workspace-global: jobs may originate in a
+                                // different channel and must stay visible.
+                                channel: None,
                                 limit: 50,
                                 reply: crate::memory::SharedReply::new(jtx),
                             })
@@ -1437,6 +1441,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         let _ = memory_node
                             .send_packet(crate::memory::MemoryMessage::ListNotifications {
                                 chat_id: None,
+                                channel: None,
                                 limit: 50,
                                 unseen_only: false,
                                 reply: crate::memory::SharedReply::new(ntx),

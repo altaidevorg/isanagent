@@ -657,8 +657,11 @@ pub enum MemoryMessage {
         record: BackgroundJobRecord,
         reply: SharedReply<Result<(), String>>,
     },
+    /// List background jobs, optionally scoped to one host channel before the
+    /// result limit is applied.
     ListBackgroundJobs {
         chat_id: Option<String>,
+        channel: Option<String>,
         limit: usize,
         reply: SharedReply<Result<Vec<BackgroundJobRecord>, String>>,
     },
@@ -672,8 +675,11 @@ pub enum MemoryMessage {
         record: NotificationRecord,
         reply: SharedReply<Result<(), String>>,
     },
+    /// List notifications, optionally scoped to one host channel before the
+    /// result limit is applied.
     ListNotifications {
         chat_id: Option<String>,
+        channel: Option<String>,
         limit: usize,
         unseen_only: bool,
         reply: SharedReply<Result<Vec<NotificationRecord>, String>>,
@@ -705,10 +711,12 @@ pub enum MemoryMessage {
         response: String,
         reply: SharedReply<Result<(), String>>,
     },
-    /// List clarification tickets with optional filters.
+    /// List clarification tickets with optional filters. `channel` is applied
+    /// in SQLite before the limit so one host cannot starve another's inbox.
     ListClarificationTickets {
         job_id: Option<String>,
         chat_id: Option<String>,
+        channel: Option<String>,
         status: Option<String>,
         limit: usize,
         reply: SharedReply<Result<Vec<ClarificationTicketRecord>, String>>,
@@ -1869,6 +1877,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
             }
             MemoryMessage::ListBackgroundJobs {
                 chat_id,
+                channel,
                 limit,
                 reply,
             } => {
@@ -1885,6 +1894,10 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     if let Some(cid) = chat_id {
                         filters.push("chat_id = ?");
                         params_vec.push(Box::new(cid));
+                    }
+                    if let Some(ch) = channel {
+                        filters.push("channel = ?");
+                        params_vec.push(Box::new(ch));
                     }
 
                     if !filters.is_empty() {
@@ -1955,6 +1968,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
             }
             MemoryMessage::ListNotifications {
                 chat_id,
+                channel,
                 limit,
                 unseen_only,
                 reply,
@@ -1968,6 +1982,10 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     if let Some(cid) = chat_id {
                         filters.push("chat_id = ?");
                         params_vec.push(Box::new(cid));
+                    }
+                    if let Some(ch) = channel {
+                        filters.push("channel = ?");
+                        params_vec.push(Box::new(ch));
                     }
                     if unseen_only {
                         filters.push("seen_at_ms IS NULL");
@@ -2183,6 +2201,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
             MemoryMessage::ListClarificationTickets {
                 job_id,
                 chat_id,
+                channel,
                 status,
                 limit,
                 reply,
@@ -2200,6 +2219,10 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     if let Some(cid) = chat_id {
                         filters.push("chat_id = ?");
                         params_vec.push(Box::new(cid));
+                    }
+                    if let Some(ch) = channel {
+                        filters.push("channel = ?");
+                        params_vec.push(Box::new(ch));
                     }
                     if let Some(s) = status {
                         filters.push("status = ?");
@@ -2298,7 +2321,8 @@ fn dropped_tool_call_ids(
 #[cfg(test)]
 mod root_thread_id_tests {
     use super::{
-        chat_id_from_root_thread_id, is_root_session_thread_id, MemoryMessage, SharedReply,
+        chat_id_from_root_thread_id, is_root_session_thread_id, BackgroundJobRecord,
+        ClarificationTicketRecord, MemoryMessage, NotificationRecord, SharedReply,
         SqliteMemoryActor,
     };
     use crate::session::SessionManager;
@@ -2337,6 +2361,151 @@ mod root_thread_id_tests {
     fn not_root_when_chat_id_is_empty_or_contains_delimiter() {
         assert!(!is_root_session_thread_id("tauri", "tauri::"));
         assert!(!is_root_session_thread_id("tauri", "tauri:s-abc:extra:"));
+    }
+
+    #[tokio::test]
+    async fn channel_scoped_inbox_query_filters_before_limit() {
+        let actor = SqliteMemoryActor::new(":memory:").expect("memory actor");
+        let node = NodeHandle::new(actor, 16, 1, Duration::from_millis(1));
+
+        for (id, channel, created_at_ms) in [
+            ("tauri-notification", "tauri", 1_i64),
+            ("terminal-notification", "terminal", 2_i64),
+        ] {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            node.send_packet(MemoryMessage::InsertNotification {
+                record: NotificationRecord {
+                    notification_id: id.to_string(),
+                    chat_id: "chat-1".to_string(),
+                    channel: channel.to_string(),
+                    thread_id: None,
+                    kind: "test".to_string(),
+                    title: "Test".to_string(),
+                    body: "Test".to_string(),
+                    action_kind: None,
+                    action_payload: None,
+                    seen_at_ms: None,
+                    resolved_at_ms: None,
+                    created_at_ms,
+                },
+                reply: SharedReply::new(tx),
+            })
+            .await
+            .expect("enqueue notification");
+            rx.await
+                .expect("notification actor reply")
+                .expect("insert notification");
+        }
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.send_packet(MemoryMessage::ListNotifications {
+            chat_id: None,
+            channel: Some("tauri".to_string()),
+            limit: 1,
+            unseen_only: false,
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .expect("enqueue list");
+        let rows = rx
+            .await
+            .expect("notification actor reply")
+            .expect("list notifications");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].notification_id, "tauri-notification");
+
+        for (id, channel, updated_at_ms) in [
+            ("tauri-job", "tauri", 1_i64),
+            ("terminal-job", "terminal", 2_i64),
+        ] {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            node.send_packet(MemoryMessage::UpsertBackgroundJob {
+                record: BackgroundJobRecord {
+                    job_id: id.to_string(),
+                    kind: "test".to_string(),
+                    chat_id: "chat-1".to_string(),
+                    channel: channel.to_string(),
+                    thread_id: None,
+                    state: "waiting".to_string(),
+                    payload_json: "{}".to_string(),
+                    resume_after_restart: false,
+                    detached: false,
+                    last_error: None,
+                    created_at_ms: updated_at_ms,
+                    updated_at_ms,
+                },
+                reply: SharedReply::new(tx),
+            })
+            .await
+            .expect("enqueue background job");
+            rx.await
+                .expect("background job actor reply")
+                .expect("insert background job");
+        }
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.send_packet(MemoryMessage::ListBackgroundJobs {
+            chat_id: None,
+            channel: Some("tauri".to_string()),
+            limit: 1,
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .expect("enqueue background job list");
+        let jobs = rx
+            .await
+            .expect("background job actor reply")
+            .expect("list background jobs");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_id, "tauri-job");
+
+        for (id, channel, updated_at_ms) in [
+            ("tauri-ticket", "tauri", 1_i64),
+            ("terminal-ticket", "terminal", 2_i64),
+        ] {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            node.send_packet(MemoryMessage::UpsertClarificationTicket {
+                record: ClarificationTicketRecord {
+                    ticket_id: id.to_string(),
+                    job_id: id.to_string(),
+                    chat_id: "chat-1".to_string(),
+                    channel: channel.to_string(),
+                    thread_id: None,
+                    tool_call_id: None,
+                    prompt: "Test".to_string(),
+                    choices_json: None,
+                    response: None,
+                    status: "waiting".to_string(),
+                    created_at_ms: updated_at_ms,
+                    updated_at_ms,
+                },
+                reply: SharedReply::new(tx),
+            })
+            .await
+            .expect("enqueue clarification ticket");
+            rx.await
+                .expect("clarification ticket actor reply")
+                .expect("insert clarification ticket");
+        }
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.send_packet(MemoryMessage::ListClarificationTickets {
+            job_id: None,
+            chat_id: None,
+            channel: Some("tauri".to_string()),
+            status: None,
+            limit: 1,
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .expect("enqueue clarification ticket list");
+        let tickets = rx
+            .await
+            .expect("clarification ticket actor reply")
+            .expect("list clarification tickets");
+        assert_eq!(tickets.len(), 1);
+        assert_eq!(tickets[0].ticket_id, "tauri-ticket");
     }
 
     #[tokio::test]
