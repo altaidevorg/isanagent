@@ -2112,11 +2112,41 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     let now = Utc::now().timestamp_millis();
                     let tx = self.conn.transaction().map_err(|e| e.to_string())?;
 
-                    // 1. Resolve ticket
-                    tx.execute(
-                        "UPDATE clarification_tickets SET response = ?1, status = 'answered', updated_at_ms = ?2 WHERE ticket_id = ?3",
-                        params![response, now, ticket_id],
-                    ).map_err(|e| format!("resolve clarification ticket: {}", e))?;
+                    // Claim the waiting ticket before making any state changes. This is
+                    // the single-writer gate for a user reply: a second delivery must not
+                    // resume the same background job a second time.
+                    let stored_job_id: Option<String> = tx
+                        .query_row(
+                            "SELECT job_id FROM clarification_tickets
+                             WHERE ticket_id = ?1 AND status = 'waiting'",
+                            params![ticket_id],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(|e| format!("load clarification ticket: {}", e))?;
+                    let stored_job_id = stored_job_id.ok_or_else(|| {
+                        "clarification ticket was not found or is no longer waiting".to_string()
+                    })?;
+                    if stored_job_id != job_id {
+                        return Err(
+                            "clarification ticket does not belong to this background job"
+                                .to_string(),
+                        );
+                    }
+
+                    // 1. Resolve the claimed ticket. Keep the status predicate here as a
+                    // defensive compare-and-set in case this handler changes in the future.
+                    let ticket_rows = tx
+                        .execute(
+                            "UPDATE clarification_tickets
+                             SET response = ?1, status = 'answered', updated_at_ms = ?2
+                             WHERE ticket_id = ?3 AND status = 'waiting'",
+                            params![response, now, ticket_id],
+                        )
+                        .map_err(|e| format!("resolve clarification ticket: {}", e))?;
+                    if ticket_rows != 1 {
+                        return Err("clarification ticket could not be claimed".to_string());
+                    }
 
                     // 2. Resolve related notifications
                     tx.execute(
@@ -2125,10 +2155,15 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     ).map_err(|e| format!("resolve related notifications: {}", e))?;
 
                     // 3. Update job state to running
-                    tx.execute(
-                        "UPDATE background_jobs SET state = 'running', updated_at_ms = ?1 WHERE job_id = ?2",
-                        params![now, job_id],
-                    ).map_err(|e| format!("update job state to running: {}", e))?;
+                    let job_rows = tx
+                        .execute(
+                            "UPDATE background_jobs SET state = 'running', updated_at_ms = ?1 WHERE job_id = ?2",
+                            params![now, job_id],
+                        )
+                        .map_err(|e| format!("update job state to running: {}", e))?;
+                    if job_rows != 1 {
+                        return Err("background job was not found".to_string());
+                    }
 
                     tx.commit().map_err(|e| e.to_string())?;
                     Ok(())
@@ -2506,6 +2541,134 @@ mod root_thread_id_tests {
             .expect("list clarification tickets");
         assert_eq!(tickets.len(), 1);
         assert_eq!(tickets[0].ticket_id, "tauri-ticket");
+    }
+
+    #[tokio::test]
+    async fn resolving_a_clarification_ticket_claims_it_once() {
+        let actor = SqliteMemoryActor::new(":memory:").expect("memory actor");
+        let node = NodeHandle::new(actor, 16, 1, Duration::from_millis(1));
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.send_packet(MemoryMessage::UpsertBackgroundJob {
+            record: BackgroundJobRecord {
+                job_id: "job-1".to_string(),
+                kind: "test".to_string(),
+                chat_id: "chat-1".to_string(),
+                channel: "tauri".to_string(),
+                thread_id: None,
+                state: "waiting".to_string(),
+                payload_json: "{}".to_string(),
+                resume_after_restart: false,
+                detached: false,
+                last_error: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .expect("enqueue background job");
+        rx.await
+            .expect("background job actor reply")
+            .expect("insert background job");
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.send_packet(MemoryMessage::UpsertClarificationTicket {
+            record: ClarificationTicketRecord {
+                ticket_id: "ticket-1".to_string(),
+                job_id: "job-1".to_string(),
+                chat_id: "chat-1".to_string(),
+                channel: "tauri".to_string(),
+                thread_id: None,
+                tool_call_id: None,
+                prompt: "Continue?".to_string(),
+                choices_json: None,
+                response: None,
+                status: "waiting".to_string(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .expect("enqueue clarification ticket");
+        rx.await
+            .expect("clarification ticket actor reply")
+            .expect("insert clarification ticket");
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.send_packet(MemoryMessage::ResolveClarificationTicketFull {
+            ticket_id: "ticket-1".to_string(),
+            job_id: "wrong-job".to_string(),
+            response: "yes".to_string(),
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .expect("enqueue mismatched resolve");
+        let err = rx
+            .await
+            .expect("mismatched resolve actor reply")
+            .expect_err("mismatched job must fail");
+        assert!(err.contains("does not belong"));
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.send_packet(MemoryMessage::ResolveClarificationTicketFull {
+            ticket_id: "ticket-1".to_string(),
+            job_id: "job-1".to_string(),
+            response: "yes".to_string(),
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .expect("enqueue resolve");
+        rx.await
+            .expect("resolve actor reply")
+            .expect("first resolve succeeds");
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.send_packet(MemoryMessage::ResolveClarificationTicketFull {
+            ticket_id: "ticket-1".to_string(),
+            job_id: "job-1".to_string(),
+            response: "duplicate".to_string(),
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .expect("enqueue duplicate resolve");
+        let err = rx
+            .await
+            .expect("duplicate resolve actor reply")
+            .expect_err("duplicate resolve must fail");
+        assert!(err.contains("no longer waiting"));
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.send_packet(MemoryMessage::GetClarificationTicket {
+            ticket_id: "ticket-1".to_string(),
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .expect("enqueue ticket lookup");
+        let ticket = rx
+            .await
+            .expect("ticket lookup actor reply")
+            .expect("ticket lookup")
+            .expect("ticket exists");
+        assert_eq!(ticket.status, "answered");
+        assert_eq!(ticket.response.as_deref(), Some("yes"));
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.send_packet(MemoryMessage::ListBackgroundJobs {
+            chat_id: Some("chat-1".to_string()),
+            channel: Some("tauri".to_string()),
+            limit: 1,
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .expect("enqueue job lookup");
+        let jobs = rx
+            .await
+            .expect("job lookup actor reply")
+            .expect("job lookup");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].state, "running");
     }
 
     #[tokio::test]
