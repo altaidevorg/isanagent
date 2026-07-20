@@ -1777,12 +1777,12 @@ impl Tool for CronTool {
                 .get("job_id")
                 .and_then(|v| v.as_str())
                 .ok_or("Missing 'job_id' for remove action")?;
-            let job = if let Some(scheduler) = self.mte_cron_scheduler.as_ref() {
-                scheduler.find_job(job_id)?
-            } else {
-                crate::scheduler::CronStore::new(&self.db_path)?.find_job(job_id)?
-            };
             if let Some(ctx) = exec_ctx.as_ref() {
+                let job = if let Some(scheduler) = self.mte_cron_scheduler.as_ref() {
+                    scheduler.find_job(job_id)?
+                } else {
+                    crate::scheduler::CronStore::new(&self.db_path)?.find_job(job_id)?
+                };
                 let job = job.ok_or("Job was not found in the current conversation")?;
                 if !cron_job_is_in_scope(&job, ctx) {
                     return Err("Job does not belong to the current conversation".to_string());
