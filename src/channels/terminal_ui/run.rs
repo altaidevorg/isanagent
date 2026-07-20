@@ -1381,6 +1381,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         let crons_tx = crons_tx.clone();
         let jobs_tx = jobs_tx.clone();
         let notifications_tx = notifications_tx.clone();
+        let poll_channel_name = channel_name.clone();
         let spawn_result = std::thread::Builder::new()
             .name("ui-db-poller".into())
             .spawn(move || {
@@ -1424,7 +1425,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         let _ = memory_node
                             .send_packet(crate::memory::MemoryMessage::ListBackgroundJobs {
                                 chat_id: None,
-                                channel: None,
+                                channel: Some(poll_channel_name.clone()),
                                 limit: 50,
                                 reply: crate::memory::SharedReply::new(jtx),
                             })
@@ -1438,7 +1439,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         let _ = memory_node
                             .send_packet(crate::memory::MemoryMessage::ListNotifications {
                                 chat_id: None,
-                                channel: None,
+                                channel: Some(poll_channel_name.clone()),
                                 limit: 50,
                                 unseen_only: false,
                                 reply: crate::memory::SharedReply::new(ntx),

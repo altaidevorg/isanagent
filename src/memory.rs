@@ -2321,8 +2321,9 @@ fn dropped_tool_call_ids(
 #[cfg(test)]
 mod root_thread_id_tests {
     use super::{
-        chat_id_from_root_thread_id, is_root_session_thread_id, MemoryMessage, NotificationRecord,
-        SharedReply, SqliteMemoryActor,
+        chat_id_from_root_thread_id, is_root_session_thread_id, BackgroundJobRecord,
+        ClarificationTicketRecord, MemoryMessage, NotificationRecord, SharedReply,
+        SqliteMemoryActor,
     };
     use crate::session::SessionManager;
     use crate::traits::Memory;
@@ -2413,6 +2414,98 @@ mod root_thread_id_tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].notification_id, "tauri-notification");
+
+        for (id, channel, updated_at_ms) in [
+            ("tauri-job", "tauri", 1_i64),
+            ("terminal-job", "terminal", 2_i64),
+        ] {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            node.send_packet(MemoryMessage::UpsertBackgroundJob {
+                record: BackgroundJobRecord {
+                    job_id: id.to_string(),
+                    kind: "test".to_string(),
+                    chat_id: "chat-1".to_string(),
+                    channel: channel.to_string(),
+                    thread_id: None,
+                    state: "waiting".to_string(),
+                    payload_json: "{}".to_string(),
+                    resume_after_restart: false,
+                    detached: false,
+                    last_error: None,
+                    created_at_ms: updated_at_ms,
+                    updated_at_ms,
+                },
+                reply: SharedReply::new(tx),
+            })
+            .await
+            .expect("enqueue background job");
+            rx.await
+                .expect("background job actor reply")
+                .expect("insert background job");
+        }
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.send_packet(MemoryMessage::ListBackgroundJobs {
+            chat_id: None,
+            channel: Some("tauri".to_string()),
+            limit: 1,
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .expect("enqueue background job list");
+        let jobs = rx
+            .await
+            .expect("background job actor reply")
+            .expect("list background jobs");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_id, "tauri-job");
+
+        for (id, channel, updated_at_ms) in [
+            ("tauri-ticket", "tauri", 1_i64),
+            ("terminal-ticket", "terminal", 2_i64),
+        ] {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            node.send_packet(MemoryMessage::UpsertClarificationTicket {
+                record: ClarificationTicketRecord {
+                    ticket_id: id.to_string(),
+                    job_id: id.to_string(),
+                    chat_id: "chat-1".to_string(),
+                    channel: channel.to_string(),
+                    thread_id: None,
+                    tool_call_id: None,
+                    prompt: "Test".to_string(),
+                    choices_json: None,
+                    response: None,
+                    status: "waiting".to_string(),
+                    created_at_ms: updated_at_ms,
+                    updated_at_ms,
+                },
+                reply: SharedReply::new(tx),
+            })
+            .await
+            .expect("enqueue clarification ticket");
+            rx.await
+                .expect("clarification ticket actor reply")
+                .expect("insert clarification ticket");
+        }
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.send_packet(MemoryMessage::ListClarificationTickets {
+            job_id: None,
+            chat_id: None,
+            channel: Some("tauri".to_string()),
+            status: None,
+            limit: 1,
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .expect("enqueue clarification ticket list");
+        let tickets = rx
+            .await
+            .expect("clarification ticket actor reply")
+            .expect("list clarification tickets");
+        assert_eq!(tickets.len(), 1);
+        assert_eq!(tickets[0].ticket_id, "tauri-ticket");
     }
 
     #[tokio::test]
