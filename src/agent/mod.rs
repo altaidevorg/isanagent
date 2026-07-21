@@ -1989,7 +1989,10 @@ impl ActorLogic<BusMessage> for AgentLogic {
                         h.cancel_children_for_parent(&chat_id);
                     }
                 }
-                if let Some((_, token)) = self.cancellation_tokens.remove(&chat_id) {
+                // Keep ownership registered until the reasoning task emits its
+                // terminal lifecycle event and finalizes. New inbound arriving
+                // during cancellation must queue behind that acknowledgement.
+                if let Some(token) = self.cancellation_tokens.get(&chat_id) {
                     token.cancel();
                     let _ = self.logger_tx.send(BusMessage::Log(
                         LogEvent::info(
@@ -5326,6 +5329,69 @@ mod tests {
             1,
             "queued follow-up must not run provider.chat after Cancel cleared the queue"
         );
+    }
+
+    #[tokio::test]
+    async fn inbound_after_cancel_waits_for_old_terminal_before_new_start() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mut agent, mut outbound_rx) =
+            build_agent_with_provider(Box::new(LongSleepProvider { calls }));
+        let chat_id = "cancel-serialization-chat";
+        agent
+            .process(BusMessage::Inbound(test_inbound(chat_id, "first")))
+            .await
+            .expect("start first run");
+
+        let first_run_id = loop {
+            match outbound_rx.recv().await {
+                Some(BusMessage::RunLifecycle(RunLifecycleEvent::Started {
+                    run_id,
+                    chat_id: event_chat,
+                })) if event_chat == chat_id => break run_id,
+                Some(_) => continue,
+                None => panic!("outbound channel closed before first start"),
+            }
+        };
+
+        agent
+            .process(BusMessage::Cancel(chat_id.to_string()))
+            .await
+            .expect("cancel accepted");
+        agent
+            .process(BusMessage::Inbound(test_inbound(chat_id, "second")))
+            .await
+            .expect("queue second run while cancellation unwinds");
+
+        let first_after_cancel = loop {
+            match outbound_rx.recv().await {
+                Some(BusMessage::RunLifecycle(event)) => break event,
+                Some(_) => continue,
+                None => panic!("outbound channel closed during cancellation"),
+            }
+        };
+        assert!(matches!(
+            first_after_cancel,
+            RunLifecycleEvent::Terminated {
+                run_id,
+                chat_id: event_chat,
+                outcome: RunOutcome::Cancelled,
+            } if run_id == first_run_id && event_chat == chat_id
+        ));
+
+        let second_start = loop {
+            match outbound_rx.recv().await {
+                Some(BusMessage::RunLifecycle(event @ RunLifecycleEvent::Started { .. })) => {
+                    break event;
+                }
+                Some(_) => continue,
+                None => panic!("outbound channel closed before second start"),
+            }
+        };
+        assert!(matches!(
+            second_start,
+            RunLifecycleEvent::Started { run_id, chat_id: event_chat }
+                if run_id != first_run_id && event_chat == chat_id
+        ));
     }
 
     #[tokio::test]
