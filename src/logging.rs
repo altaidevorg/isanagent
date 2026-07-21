@@ -415,9 +415,13 @@ impl LoggingActor {
         let mut total_bytes = 0u64;
         let mut rotated = Vec::new();
         for entry in fs::read_dir(&self.logs_dir)? {
-            let entry = entry?;
+            let Ok(entry) = entry else {
+                continue;
+            };
             let path = entry.path();
-            let metadata = entry.metadata()?;
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
             if !metadata.is_file() || !recognized_log_file(&path) {
                 continue;
             }
@@ -439,8 +443,9 @@ impl LoggingActor {
             if total_bytes <= self.max_total_bytes {
                 break;
             }
-            fs::remove_file(&path)?;
-            total_bytes = total_bytes.saturating_sub(bytes);
+            if fs::remove_file(&path).is_ok() {
+                total_bytes = total_bytes.saturating_sub(bytes);
+            }
         }
         Ok(())
     }

@@ -1519,7 +1519,7 @@ fn spawn_main_chat_reasoning_turn(
             Arc::ptr_eq(stored, &task_token_arc)
         });
 
-        let next_inbound = pending_inbound.get(&task_chat_id).and_then(|r| {
+        let mut next_inbound = pending_inbound.get(&task_chat_id).and_then(|r| {
             let mut g = match r.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => {
@@ -1536,10 +1536,30 @@ fn spawn_main_chat_reasoning_turn(
             g.pop_front()
         });
 
-        if let Some(mut next_inbound) = next_inbound {
-            match ensure_run_id(&mut next_inbound) {
+        while let Some(mut inbound) = next_inbound {
+            let next_from_queue = || {
+                pending_inbound.get(&task_chat_id).and_then(|r| {
+                    let mut g = match r.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => {
+                            let _ = logger_tx.send(BusMessage::Log(
+                                LogEvent::warn(
+                                    "AgentLogic",
+                                    "pending_inbound mutex poisoned after reasoning turn; recovering queue.",
+                                )
+                                .with_chat_id(&task_chat_id),
+                            ));
+                            poisoned.into_inner()
+                        }
+                    };
+                    g.pop_front()
+                })
+            };
+
+            match ensure_run_id(&mut inbound) {
                 Ok(next_run_id) => {
-                    spawn_main_chat_reasoning_turn(args_for_chain, next_inbound, next_run_id);
+                    spawn_main_chat_reasoning_turn(args_for_chain, inbound, next_run_id);
+                    break;
                 }
                 Err(error) => {
                     let _ = logger_tx.send(BusMessage::Log(
@@ -1549,6 +1569,7 @@ fn spawn_main_chat_reasoning_turn(
                         )
                         .with_chat_id(&task_chat_id),
                     ));
+                    next_inbound = next_from_queue();
                 }
             }
         }
@@ -1980,7 +2001,26 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 return Ok(None);
             }
             BusMessage::Inbound(mut inbound) => {
-                let run_id = ensure_run_id(&mut inbound).map_err(ActorError::from)?;
+                let run_id = match ensure_run_id(&mut inbound) {
+                    Ok(run_id) => run_id,
+                    Err(error) => {
+                        let _ = self.logger_tx.send(BusMessage::Log(
+                            LogEvent::error(
+                                &self.name,
+                                &format!("Rejecting inbound message: {}", error),
+                            )
+                            .with_chat_id(&inbound.chat_id),
+                        ));
+                        let notice = crate::channels::terminal::build_channel_error_notice(
+                            &inbound.channel,
+                            &inbound.chat_id,
+                            inbound.thread_id.as_deref(),
+                            &error,
+                        );
+                        let _ = self.outbound_tx.send(BusMessage::Outbound(notice)).await;
+                        return Ok(None);
+                    }
+                };
                 let chat_id = inbound.chat_id.clone();
                 let session_key = inbound.clarification_session_key();
                 if self
@@ -3973,6 +4013,7 @@ mod tests {
         Router,
     };
     use serde_json::Value;
+    use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -4866,6 +4907,91 @@ mod tests {
                 .get(METADATA_RUN_ID)
                 .and_then(|value| value.as_str()),
             Some(generated.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_tauri_inbound_is_rejected_without_stopping_the_actor() {
+        let provider = RespondingProvider {
+            tag: "done".to_string(),
+        };
+        let (mut agent, mut outbound_rx) = build_agent_with_provider(Box::new(provider));
+        let mut invalid = test_inbound("invalid-run-id", "hello");
+        invalid.channel = "tauri".to_string();
+
+        assert!(matches!(
+            agent.process(BusMessage::Inbound(invalid)).await,
+            Ok(None)
+        ));
+        assert!(matches!(
+            outbound_rx.recv().await,
+            Some(BusMessage::Outbound(_))
+        ));
+
+        let mut valid = test_inbound("valid-after-rejection", "hello");
+        valid.channel = "tauri".to_string();
+        valid.metadata.insert(
+            METADATA_RUN_ID.to_string(),
+            serde_json::json!("valid-run-id"),
+        );
+        agent
+            .process(BusMessage::Inbound(valid))
+            .await
+            .expect("actor remains usable after rejecting malformed inbound");
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), outbound_rx.recv()).await,
+            Ok(Some(BusMessage::RunLifecycle(
+                RunLifecycleEvent::Started { .. }
+            )))
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_queued_inbound_does_not_strand_following_valid_message() {
+        let (unblock_tx, unblock_rx) = tokio::sync::oneshot::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = GateFirstChatProvider {
+            calls: calls.clone(),
+            first_unblock: Arc::new(tokio::sync::Mutex::new(Some(unblock_rx))),
+        };
+        let (mut agent, _outbound_rx) = build_agent_with_provider(Box::new(provider));
+        let chat_id = "skip-invalid-queued";
+        agent
+            .process(BusMessage::Inbound(test_inbound(chat_id, "first")))
+            .await
+            .expect("start first turn");
+        for _ in 0..200 {
+            if calls.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let mut invalid = test_inbound(chat_id, "invalid queued");
+        invalid.channel = "tauri".to_string();
+        let mut valid = test_inbound(chat_id, "valid queued");
+        valid.channel = "tauri".to_string();
+        valid.metadata.insert(
+            METADATA_RUN_ID.to_string(),
+            serde_json::json!("queued-run-id"),
+        );
+        agent.pending_inbound.insert(
+            chat_id.to_string(),
+            Mutex::new(VecDeque::from([invalid, valid])),
+        );
+
+        unblock_tx.send(()).expect("unblock first turn");
+        for _ in 0..400 {
+            if calls.load(Ordering::SeqCst) == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the valid queued message must run after the invalid item is dropped"
         );
     }
 
