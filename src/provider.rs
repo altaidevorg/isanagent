@@ -62,6 +62,10 @@ pub fn provider_for_agent(
         Box::new(
             AnthropicProvider::new(&creds.base_url, &creds.api_key, model).with_temperature(temp),
         )
+    } else if creds.provider_name == "gemini"
+        && creds.base_url.contains("generativelanguage.googleapis.com")
+    {
+        Box::new(GeminiProvider::new(&creds.base_url, &creds.api_key, model).with_temperature(temp))
     } else {
         let client = LLMClient::new_openai_compatible(&creds.base_url, &creds.api_key, model)
             .with_temperature(temp);
@@ -72,6 +76,7 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use log::debug;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::time::Duration;
 
 /// Placeholder provider used when no API key is configured at startup.
@@ -160,6 +165,279 @@ impl Provider for OpenAIProvider {
     ) -> Result<LLMResponse, LLMError> {
         let messages = messages_with_document_text_fallback(messages);
         self.client.chat(&messages, tools).await
+    }
+}
+
+/// Native Gemini GenerateContent provider.
+///
+/// Gemini's OpenAI-compatible endpoint is useful for text chat, but does not expose the
+/// first-class PDF input supported by Gemini. This provider uses the documented Gemini wire
+/// format so document attachments retain visual understanding instead of falling back to text.
+#[derive(Clone)]
+pub struct GeminiProvider {
+    api_key: String,
+    model: String,
+    base_url: String,
+    temperature: f32,
+    client: reqwest::Client,
+}
+
+impl GeminiProvider {
+    pub fn new(openai_compatible_url: &str, api_key: &str, model: &str) -> Self {
+        let origin = openai_compatible_url
+            .split("/v1beta/")
+            .next()
+            .unwrap_or(openai_compatible_url)
+            .trim_end_matches('/');
+        Self {
+            api_key: api_key.to_string(),
+            model: model.to_string(),
+            base_url: format!("{origin}/v1beta/models/{model}:generateContent"),
+            temperature: 0.3,
+            client: build_reqwest_client(),
+        }
+    }
+
+    pub fn with_temperature(mut self, temperature: f32) -> Self {
+        self.temperature = temperature;
+        self
+    }
+
+    fn convert_tools(tools: &Value) -> Value {
+        let declarations: Vec<Value> = tools
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|tool| tool.get("function").cloned())
+            .collect();
+        json!([{"functionDeclarations": declarations}])
+    }
+
+    fn data_uri_part(url: &str) -> Value {
+        let Some((prefix, data)) = url.split_once(',') else {
+            return json!({"text": format!("[image: {url}]")});
+        };
+        let Some(media_type) = prefix
+            .strip_prefix("data:")
+            .and_then(|value| value.strip_suffix(";base64"))
+        else {
+            return json!({"text": format!("[image: {url}]")});
+        };
+        json!({"inlineData": {"mimeType": media_type, "data": data}})
+    }
+
+    /// Convert internal history to Gemini's Content/Part schema.
+    fn convert_messages(messages: &[ChatMessage]) -> (Option<Value>, Vec<Value>) {
+        let mut system_parts = Vec::new();
+        let mut contents = Vec::new();
+        let mut tool_names = HashMap::<String, String>::new();
+
+        for message in messages {
+            match message.role.as_str() {
+                "system" => {
+                    if let Some(content) = &message.content {
+                        system_parts.push(content.text_content());
+                    }
+                }
+                "user" => {
+                    let parts = match &message.content {
+                        Some(MessageContent::Text(text)) => vec![json!({"text": text})],
+                        Some(MessageContent::Parts(parts)) => parts
+                            .iter()
+                            .map(|part| match part {
+                                ContentPart::Text { text } => json!({"text": text}),
+                                ContentPart::ImageUrl { image_url }
+                                    if image_url.url.starts_with("data:") =>
+                                {
+                                    Self::data_uri_part(&image_url.url)
+                                }
+                                ContentPart::ImageUrl { image_url } => {
+                                    json!({"text": format!("[image: {}]", image_url.url)})
+                                }
+                                ContentPart::Document { document } => json!({
+                                    "inlineData": {
+                                        "mimeType": document.media_type,
+                                        "data": document.data,
+                                    }
+                                }),
+                            })
+                            .collect(),
+                        None => vec![json!({"text": ""})],
+                    };
+                    contents.push(json!({"role": "user", "parts": parts}));
+                }
+                "assistant" => {
+                    let mut parts = Vec::new();
+                    if let Some(content) = &message.content {
+                        let text = content.text_content();
+                        if !text.is_empty() {
+                            parts.push(json!({"text": text}));
+                        }
+                    }
+                    if let Some(calls) = &message.tool_calls {
+                        for call in calls {
+                            tool_names.insert(call.id.clone(), call.function.name.clone());
+                            let args = serde_json::from_str::<Value>(&call.function.arguments)
+                                .unwrap_or_else(|_| json!({}));
+                            let function_call = json!({
+                                "name": call.function.name,
+                                "args": args,
+                                "id": call.id,
+                            });
+                            let mut part = json!({"functionCall": function_call});
+                            if let Some(extra) = &call.extra_content {
+                                if let Some(signature) = extra
+                                    .get("thoughtSignature")
+                                    .or_else(|| extra.get("thought_signature"))
+                                {
+                                    part["thoughtSignature"] = signature.clone();
+                                }
+                            }
+                            parts.push(part);
+                        }
+                    }
+                    if parts.is_empty() {
+                        parts.push(json!({"text": ""}));
+                    }
+                    contents.push(json!({"role": "model", "parts": parts}));
+                }
+                "tool" => {
+                    let id = message.tool_call_id.as_deref().unwrap_or("");
+                    let name = message
+                        .name
+                        .as_deref()
+                        .or_else(|| tool_names.get(id).map(String::as_str))
+                        .unwrap_or("unknown_tool");
+                    let result = message
+                        .content
+                        .as_ref()
+                        .map(MessageContent::text_content)
+                        .unwrap_or_default();
+                    let mut response = json!({"result": result});
+                    if message.is_error == Some(true) {
+                        response["error"] = json!(true);
+                    }
+                    contents.push(json!({
+                        "role": "user",
+                        "parts": [{"functionResponse": {"name": name, "response": response, "id": id}}]
+                    }));
+                }
+                _ => {}
+            }
+        }
+
+        let system = (!system_parts.is_empty())
+            .then(|| json!({"parts": [{"text": system_parts.join("\n\n")} ]}));
+        (system, contents)
+    }
+}
+
+#[async_trait]
+impl Provider for GeminiProvider {
+    async fn chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<Value>,
+    ) -> Result<LLMResponse, LLMError> {
+        let (system_instruction, contents) = Self::convert_messages(messages);
+        let mut body = json!({
+            "contents": contents,
+            "generationConfig": {"temperature": self.temperature},
+        });
+        if let Some(system_instruction) = system_instruction {
+            body["systemInstruction"] = system_instruction;
+        }
+        if let Some(tools) = tools {
+            let tools = Self::convert_tools(&tools);
+            if tools[0]["functionDeclarations"]
+                .as_array()
+                .is_some_and(|declarations| !declarations.is_empty())
+            {
+                body["tools"] = tools;
+            }
+        }
+
+        let res = self
+            .client
+            .post(&self.base_url)
+            .header("x-goog-api-key", &self.api_key)
+            .header("Content-Type", "application/json")
+            .timeout(Duration::from_secs(120))
+            .json(&body)
+            .send()
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::BAD_REQUEST
+                && LLMError::looks_like_context_overflow(&text)
+            {
+                return Err(LLMError::ContextOverflow {
+                    tokens_attempted: 0,
+                    max: None,
+                });
+            }
+            return Err(LLMError::ApiError(crate::utils::format_api_error(
+                status.as_u16(),
+                &text,
+                &self.base_url,
+                &self.model,
+            )));
+        }
+
+        let response: Value = res.json().await?;
+        let parts = response["candidates"][0]["content"]["parts"]
+            .as_array()
+            .ok_or(LLMError::NoContent)?;
+        let mut text_parts = Vec::new();
+        let mut tool_calls = Vec::new();
+        for (index, part) in parts.iter().enumerate() {
+            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                text_parts.push(text);
+            }
+            if let Some(call) = part.get("functionCall") {
+                let name = call["name"].as_str().unwrap_or("unknown_tool").to_string();
+                let id = call["id"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("gemini_call_{index}"));
+                let mut extra_content = serde_json::Map::new();
+                if let Some(signature) = part
+                    .get("thoughtSignature")
+                    .or_else(|| part.get("thought_signature"))
+                {
+                    extra_content.insert("thought_signature".to_string(), signature.clone());
+                }
+                tool_calls.push(ToolCallRequest {
+                    id,
+                    tool_type: "function".to_string(),
+                    extra_content: (!extra_content.is_empty())
+                        .then_some(Value::Object(extra_content)),
+                    function: ToolCallFunction {
+                        name,
+                        arguments: call
+                            .get("args")
+                            .cloned()
+                            .unwrap_or_else(|| json!({}))
+                            .to_string(),
+                    },
+                });
+            }
+        }
+
+        let usage = response.get("usageMetadata").map(|usage| TokenUsage {
+            prompt_tokens: usage["promptTokenCount"].as_u64().unwrap_or(0) as u32,
+            completion_tokens: usage["candidatesTokenCount"].as_u64().unwrap_or(0) as u32,
+            total_tokens: usage["totalTokenCount"].as_u64().unwrap_or(0) as u32,
+            cache_read_tokens: usage["cachedContentTokenCount"].as_u64().unwrap_or(0) as u32,
+            cache_creation_tokens: 0,
+        });
+        Ok(LLMResponse {
+            content: text_parts.join(""),
+            tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+            reasoning_content: None,
+            usage,
+        })
     }
 }
 
@@ -583,8 +861,10 @@ impl Provider for AnthropicProvider {
 
 #[cfg(test)]
 mod is_error_tests {
-    use super::{messages_with_document_text_fallback, AnthropicProvider};
-    use crate::utils::{ChatMessage, ContentPart, Document, MessageContent};
+    use super::{messages_with_document_text_fallback, AnthropicProvider, GeminiProvider};
+    use crate::utils::{
+        ChatMessage, ContentPart, Document, MessageContent, ToolCallFunction, ToolCallRequest,
+    };
 
     fn pdf_message() -> ChatMessage {
         ChatMessage::user_multimodal(
@@ -704,5 +984,89 @@ mod is_error_tests {
             "OpenAI-compatible request must not contain IsanAgent document parts"
         );
         assert!(matches!(parts[1], ContentPart::Text { .. }));
+    }
+
+    #[test]
+    fn gemini_keeps_pdf_as_native_inline_data() {
+        let messages = vec![ChatMessage::system("Follow the document."), pdf_message()];
+        let (system, contents) = GeminiProvider::convert_messages(&messages);
+
+        assert_eq!(
+            system.expect("system instruction")["parts"][0]["text"],
+            serde_json::json!("Follow the document.")
+        );
+        assert_eq!(
+            contents[0]["role"],
+            serde_json::json!("user"),
+            "PDF must remain attached to the user turn"
+        );
+        assert_eq!(
+            contents[0]["parts"][1]["inlineData"]["mimeType"],
+            serde_json::json!("application/pdf")
+        );
+        assert_eq!(
+            contents[0]["parts"][1]["inlineData"]["data"],
+            serde_json::json!("not-valid-pdf-data")
+        );
+    }
+
+    #[test]
+    fn gemini_preserves_tool_call_ids_and_results() {
+        let mut assistant = ChatMessage::assistant("");
+        assistant.tool_calls = Some(vec![ToolCallRequest {
+            id: "gemini-call-1".to_string(),
+            tool_type: "function".to_string(),
+            extra_content: Some(serde_json::json!({"thought_signature": "signed"})),
+            function: ToolCallFunction {
+                name: "read_file".to_string(),
+                arguments: "{\"path\":\"README.md\"}".to_string(),
+            },
+        }]);
+        let messages = vec![
+            assistant,
+            ChatMessage::tool("contents", "gemini-call-1", Some("read_file")),
+        ];
+
+        let (_system, contents) = GeminiProvider::convert_messages(&messages);
+        assert_eq!(
+            contents[0]["role"],
+            serde_json::json!("model"),
+            "assistant turns are Gemini model turns"
+        );
+        assert_eq!(
+            contents[0]["parts"][0]["functionCall"]["id"],
+            serde_json::json!("gemini-call-1")
+        );
+        assert_eq!(
+            contents[0]["parts"][0]["thoughtSignature"],
+            serde_json::json!("signed")
+        );
+        assert!(
+            contents[0]["parts"][0]["functionCall"]
+                .get("thoughtSignature")
+                .is_none(),
+            "thought signatures belong to the surrounding Gemini Part, not FunctionCall"
+        );
+        assert_eq!(
+            contents[1]["parts"][0]["functionResponse"]["name"],
+            serde_json::json!("read_file")
+        );
+        assert_eq!(
+            contents[1]["parts"][0]["functionResponse"]["id"],
+            serde_json::json!("gemini-call-1")
+        );
+    }
+
+    #[test]
+    fn gemini_uses_native_generate_content_endpoint() {
+        let provider = GeminiProvider::new(
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+            "test-key",
+            "gemini-2.5-flash",
+        );
+        assert_eq!(
+            provider.base_url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+        );
     }
 }
