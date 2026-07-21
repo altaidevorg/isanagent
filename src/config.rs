@@ -311,6 +311,33 @@ pub struct GitWorktreeConfig {
     pub allow_path_outside_sandbox: Option<bool>,
 }
 
+/// Best-effort workspace diagnostic logging. These limits apply only to the
+/// inspectable `.system_generated/logs/` files; SQLite remains the durable
+/// source of truth for conversations and run state.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct LoggingConfig {
+    /// Disable file-backed diagnostic logging entirely. Defaults to enabled.
+    pub enabled: Option<bool>,
+    /// Active-file byte limit for `conversation.jsonl`.
+    pub conversation_max_bytes: Option<u64>,
+    /// Active-file byte limit for `runtime.log`.
+    pub runtime_max_bytes: Option<u64>,
+    /// Number of rotated files retained for each diagnostic log.
+    pub retained_generations: Option<usize>,
+    /// Aggregate byte cap for recognized diagnostic log files in one workspace.
+    pub max_total_bytes: Option<u64>,
+}
+
+/// Fully bounded diagnostic-log settings consumed by the logging actor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectiveLoggingConfig {
+    pub enabled: bool,
+    pub conversation_max_bytes: u64,
+    pub runtime_max_bytes: u64,
+    pub retained_generations: usize,
+    pub max_total_bytes: u64,
+}
+
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct AppConfig {
     pub restrict_to_workspace: Option<bool>,
@@ -339,6 +366,8 @@ pub struct AppConfig {
     pub multi_tenant_edge: Option<MultiTenantEdgeConfig>,
     /// When `enabled`, `web_search` / `web_fetch` use [Jina Reader](https://r.jina.ai/) and search (`s.jina.ai`).
     pub jina: Option<JinaConfig>,
+    /// Bounded, file-backed diagnostic logs under `.system_generated/logs/`.
+    pub logging: Option<LoggingConfig>,
     pub harness: Option<HarnessConfig>,
     /// Named agent definitions (`[agents.<name>]` in config.toml). Top-level alias for
     /// `harness.agents` when the user keeps agents in the root of config.toml.
@@ -504,6 +533,56 @@ impl AppConfig {
     pub fn resolved_max_tool_output_chars(&self) -> Option<usize> {
         self.max_tool_output_chars
             .or_else(|| self.terminal.as_ref().and_then(|t| t.max_tool_output_chars))
+    }
+
+    /// Resolved bounds for file-backed diagnostic logs. Invalid or missing
+    /// values always resolve to bounded settings; they can never enable
+    /// unbounded workspace log growth.
+    pub fn effective_logging_config(&self) -> EffectiveLoggingConfig {
+        const DEFAULT_CONVERSATION_MAX_BYTES: u64 = 20 * 1024 * 1024;
+        const DEFAULT_RUNTIME_MAX_BYTES: u64 = 10 * 1024 * 1024;
+        const DEFAULT_RETAINED_GENERATIONS: usize = 2;
+        const DEFAULT_TOTAL_MAX_BYTES: u64 = 90 * 1024 * 1024;
+        const MIN_ACTIVE_FILE_BYTES: u64 = 256;
+        const MAX_ACTIVE_FILE_BYTES: u64 = 512 * 1024 * 1024;
+        const MAX_RETAINED_GENERATIONS: usize = 32;
+        const MAX_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
+
+        let logging = self.logging.as_ref();
+        let bounded_bytes = |configured: Option<u64>, default: u64| {
+            configured
+                .filter(|bytes| *bytes >= MIN_ACTIVE_FILE_BYTES)
+                .map(|bytes| bytes.min(MAX_ACTIVE_FILE_BYTES))
+                .unwrap_or(default)
+        };
+        let conversation_max_bytes = bounded_bytes(
+            logging.and_then(|config| config.conversation_max_bytes),
+            DEFAULT_CONVERSATION_MAX_BYTES,
+        );
+        let runtime_max_bytes = bounded_bytes(
+            logging.and_then(|config| config.runtime_max_bytes),
+            DEFAULT_RUNTIME_MAX_BYTES,
+        );
+        let retained_generations = logging
+            .and_then(|config| config.retained_generations)
+            .unwrap_or(DEFAULT_RETAINED_GENERATIONS)
+            .min(MAX_RETAINED_GENERATIONS);
+        let minimum_total = conversation_max_bytes.saturating_add(runtime_max_bytes);
+        let default_total = DEFAULT_TOTAL_MAX_BYTES.max(minimum_total);
+        let max_total_bytes = logging
+            .and_then(|config| config.max_total_bytes)
+            .filter(|bytes| *bytes >= minimum_total)
+            .map(|bytes| bytes.min(MAX_TOTAL_BYTES))
+            .filter(|bytes| *bytes >= minimum_total)
+            .unwrap_or(default_total);
+
+        EffectiveLoggingConfig {
+            enabled: logging.and_then(|config| config.enabled).unwrap_or(true),
+            conversation_max_bytes,
+            runtime_max_bytes,
+            retained_generations,
+            max_total_bytes,
+        }
     }
 
     /// At least one inbound channel other than terminal (API, Slack, or Email).
@@ -1543,6 +1622,80 @@ pub struct EmailConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logging_config_uses_bounded_defaults() {
+        let config: AppConfig = toml::from_str("").expect("parse empty config");
+
+        assert_eq!(
+            config.effective_logging_config(),
+            EffectiveLoggingConfig {
+                enabled: true,
+                conversation_max_bytes: 20 * 1024 * 1024,
+                runtime_max_bytes: 10 * 1024 * 1024,
+                retained_generations: 2,
+                max_total_bytes: 90 * 1024 * 1024,
+            }
+        );
+    }
+
+    #[test]
+    fn logging_config_parses_explicit_bounded_values() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[logging]
+enabled = false
+conversation_max_bytes = 1024
+runtime_max_bytes = 2048
+retained_generations = 3
+max_total_bytes = 4096
+"#,
+        )
+        .expect("parse logging config");
+
+        assert_eq!(
+            config.effective_logging_config(),
+            EffectiveLoggingConfig {
+                enabled: false,
+                conversation_max_bytes: 1024,
+                runtime_max_bytes: 2048,
+                retained_generations: 3,
+                max_total_bytes: 4096,
+            }
+        );
+    }
+
+    #[test]
+    fn logging_config_invalid_values_stay_bounded() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[logging]
+conversation_max_bytes = 0
+runtime_max_bytes = 999999999999
+retained_generations = 999
+max_total_bytes = 1
+"#,
+        )
+        .expect("parse logging config");
+        let effective = config.effective_logging_config();
+
+        assert_eq!(effective.conversation_max_bytes, 20 * 1024 * 1024);
+        assert_eq!(effective.runtime_max_bytes, 512 * 1024 * 1024);
+        assert_eq!(effective.retained_generations, 32);
+        assert_eq!(effective.max_total_bytes, 532 * 1024 * 1024);
+    }
+
+    #[test]
+    fn logging_config_rejects_integer_overflow() {
+        let parsed = toml::from_str::<AppConfig>(
+            r#"
+[logging]
+conversation_max_bytes = 18446744073709551616
+"#,
+        );
+
+        assert!(parsed.is_err());
+    }
 
     #[test]
     fn harness_execution_toml_roundtrip() {

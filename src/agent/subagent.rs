@@ -573,6 +573,7 @@ impl SubagentHarness {
             outbound_tx: self.inner.deps.outbound_tx.clone(),
             logger_tx: self.inner.deps.logger_tx.clone(),
             inbound,
+            run_id: format!("subagent-{task_id}"),
             cancel_token: task_cancel.clone(),
             clarification_hub: self.inner.deps.clarification_hub.clone(),
             tool_exec_ctx,

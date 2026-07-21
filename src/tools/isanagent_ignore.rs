@@ -97,19 +97,11 @@ pub fn is_ignored(target: &Path, is_dir: bool) -> bool {
         .ok();
 
     let mut guard = cache().lock().expect("isanagentignore cache poisoned");
-    let needs_rebuild = guard
-        .get(&dir)
-        .is_none_or(|entry| entry.mtime != mtime);
+    let needs_rebuild = guard.get(&dir).is_none_or(|entry| entry.mtime != mtime);
     if needs_rebuild {
         match build_matcher(&dir) {
             Some(m) => {
-                guard.insert(
-                    dir.clone(),
-                    CachedMatcher {
-                        matcher: m,
-                        mtime,
-                    },
-                );
+                guard.insert(dir.clone(), CachedMatcher { matcher: m, mtime });
             }
             None => {
                 guard.remove(&dir);
@@ -128,9 +120,7 @@ pub fn is_ignored(target: &Path, is_dir: bool) -> bool {
     // `matched_path_or_any_parents` walks ancestor components so a file inside
     // an ignored directory is caught — matches `.gitignore` semantics.
     matches!(
-        entry
-            .matcher
-            .matched_path_or_any_parents(rel, is_dir),
+        entry.matcher.matched_path_or_any_parents(rel, is_dir),
         Match::Ignore(_)
     )
 }

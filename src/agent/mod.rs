@@ -15,7 +15,10 @@ pub use subagent::SubagentHarness;
 use crate::clarification::ClarificationHub;
 use crate::tool_runtime::{with_tool_exec_and_progress_scope, ToolExecCtx, ToolProgressEmitter};
 
-use crate::bus::{BusMessage, InboundMessage, LogEvent, OutboundMessage, TelemetryEvent};
+use crate::bus::{
+    BusMessage, InboundMessage, LogEvent, OutboundMessage, RunBudgetSnapshot, RunFailureKind,
+    RunLifecycleEvent, RunOutcome, RunStuckReason, TelemetryEvent, METADATA_RUN_ID,
+};
 use crate::config::{ResolvedShellPolicy, ShellPolicyMode};
 use crate::hooks::{
     run_post_tool_hooks, run_pre_tool_hooks, run_user_prompt_hooks, HookObservationMeta,
@@ -93,6 +96,29 @@ fn metadata_truthy(meta: &HashMap<String, serde_json::Value>, key: &str) -> bool
                     .unwrap_or(false)
         })
         .unwrap_or(false)
+}
+
+fn ensure_run_id(inbound: &mut InboundMessage) -> Result<String, String> {
+    if let Some(run_id) = inbound
+        .metadata
+        .get(METADATA_RUN_ID)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|run_id| !run_id.is_empty())
+    {
+        return Ok(run_id.to_string());
+    }
+
+    if inbound.channel.eq_ignore_ascii_case("tauri") {
+        return Err("Tauri inbound messages require a non-empty isanagent_run_id".to_string());
+    }
+
+    let run_id = format!("legacy-{}", uuid::Uuid::new_v4());
+    inbound.metadata.insert(
+        METADATA_RUN_ID.to_string(),
+        serde_json::Value::String(run_id.clone()),
+    );
+    Ok(run_id)
 }
 
 fn text_looks_like_research_request(content: &str) -> bool {
@@ -1175,7 +1201,61 @@ fn send_background_job_notification(
     let _ = outbound_tx.try_send(BusMessage::Outbound(notice));
 }
 
-fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus::InboundMessage) {
+fn classify_run_outcome(
+    result: &Result<Result<String, String>, Box<dyn std::any::Any + Send>>,
+    cancelled: bool,
+    max_iterations: usize,
+) -> RunOutcome {
+    if cancelled {
+        return RunOutcome::Cancelled;
+    }
+
+    match result {
+        Err(_) => RunOutcome::Failed {
+            failure: RunFailureKind::Internal,
+            retryable: false,
+        },
+        Ok(Err(error)) => {
+            let lower = error.to_ascii_lowercase();
+            let failure = if lower.contains("provider") || lower.contains("llm") {
+                RunFailureKind::Provider
+            } else if lower.contains("tool") {
+                RunFailureKind::Tool
+            } else if lower.contains("persist") || lower.contains("memory") {
+                RunFailureKind::Persistence
+            } else if lower.contains("protocol") || lower.contains("metadata") {
+                RunFailureKind::Protocol
+            } else {
+                RunFailureKind::Internal
+            };
+            let retryable = matches!(failure, RunFailureKind::Provider);
+            RunOutcome::Failed { failure, retryable }
+        }
+        Ok(Ok(message)) if message.starts_with(WAITING_FOR_USER_RESULT_PREFIX) => {
+            RunOutcome::Completed
+        }
+        Ok(Ok(message)) if message.starts_with("Stopped: the agent kept repeating") => {
+            RunOutcome::Stuck {
+                reason: RunStuckReason::DoomLoop,
+            }
+        }
+        Ok(Ok(message)) if message == "Agent reached max reasoning iterations." => {
+            RunOutcome::BudgetExhausted {
+                budget: RunBudgetSnapshot {
+                    iterations_used: max_iterations,
+                    iterations_limit: max_iterations,
+                },
+            }
+        }
+        Ok(Ok(_)) => RunOutcome::Completed,
+    }
+}
+
+fn spawn_main_chat_reasoning_turn(
+    args: ReasoningSpawnArgs,
+    inbound: crate::bus::InboundMessage,
+    run_id: String,
+) {
     let chat_id = inbound.chat_id.clone();
     let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
     args.cancellation_tokens
@@ -1245,6 +1325,23 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
             .with_chat_id(&task_chat_id),
         ));
 
+        if outbound_tx
+            .send(BusMessage::RunLifecycle(RunLifecycleEvent::Started {
+                run_id: run_id.clone(),
+                chat_id: task_chat_id.clone(),
+            }))
+            .await
+            .is_err()
+        {
+            let _ = logger_tx.send(BusMessage::Log(
+                LogEvent::warn(
+                    &agent_name,
+                    "Could not deliver RunLifecycle::Started; continuing reasoning task.",
+                )
+                .with_chat_id(&task_chat_id),
+            ));
+        }
+
         if let Some(ref jid) = background_job_id {
             send_background_job_notification(
                 &outbound_tx,
@@ -1273,6 +1370,7 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
             outbound_tx: outbound_tx.clone(),
             logger_tx: logger_tx.clone(),
             inbound,
+            run_id: run_id.clone(),
             cancel_token: task_token_arc.as_ref().clone(),
             clarification_hub,
             tool_exec_ctx,
@@ -1360,6 +1458,25 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
             }
         }
 
+        let outcome = classify_run_outcome(&res, task_token_arc.is_cancelled(), max_iterations);
+        if outbound_tx
+            .send(BusMessage::RunLifecycle(RunLifecycleEvent::Terminated {
+                run_id: run_id.clone(),
+                chat_id: task_chat_id.clone(),
+                outcome,
+            }))
+            .await
+            .is_err()
+        {
+            let _ = logger_tx.send(BusMessage::Log(
+                LogEvent::warn(
+                    &agent_name,
+                    "Could not deliver RunLifecycle::Terminated after reasoning task completion.",
+                )
+                .with_chat_id(&task_chat_id),
+            ));
+        }
+
         if let Some(job_id) = background_job_id {
             let (state, last_error) = match &res {
                 Ok(Ok(s)) if s.starts_with(WAITING_FOR_USER_RESULT_PREFIX) => ("waiting", None),
@@ -1419,8 +1536,21 @@ fn spawn_main_chat_reasoning_turn(args: ReasoningSpawnArgs, inbound: crate::bus:
             g.pop_front()
         });
 
-        if let Some(next_inbound) = next_inbound {
-            spawn_main_chat_reasoning_turn(args_for_chain, next_inbound);
+        if let Some(mut next_inbound) = next_inbound {
+            match ensure_run_id(&mut next_inbound) {
+                Ok(next_run_id) => {
+                    spawn_main_chat_reasoning_turn(args_for_chain, next_inbound, next_run_id);
+                }
+                Err(error) => {
+                    let _ = logger_tx.send(BusMessage::Log(
+                        LogEvent::error(
+                            "AgentLogic",
+                            &format!("Dropping queued inbound without valid run ID: {}", error),
+                        )
+                        .with_chat_id(&task_chat_id),
+                    ));
+                }
+            }
         }
     });
 }
@@ -1441,6 +1571,7 @@ pub(crate) struct ReasoningLoopCtx {
     pub(crate) outbound_tx: mpsc::Sender<BusMessage>,
     pub(crate) logger_tx: LoggerHandle,
     pub(crate) inbound: crate::bus::InboundMessage,
+    pub(crate) run_id: String,
     pub(crate) cancel_token: tokio_util::sync::CancellationToken,
     pub(crate) clarification_hub: Arc<ClarificationHub>,
     pub(crate) tool_exec_ctx: ToolExecCtx,
@@ -1848,7 +1979,8 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 });
                 return Ok(None);
             }
-            BusMessage::Inbound(inbound) => {
+            BusMessage::Inbound(mut inbound) => {
+                let run_id = ensure_run_id(&mut inbound).map_err(ActorError::from)?;
                 let chat_id = inbound.chat_id.clone();
                 let session_key = inbound.clarification_session_key();
                 if self
@@ -1941,7 +2073,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                     return res;
                 }
 
-                spawn_main_chat_reasoning_turn(self.reasoning_spawn_args().await, inbound);
+                spawn_main_chat_reasoning_turn(self.reasoning_spawn_args().await, inbound, run_id);
 
                 Ok(None)
             }
@@ -1971,6 +2103,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
             }
             BusMessage::Outbound(_)
             | BusMessage::Telemetry(_)
+            | BusMessage::RunLifecycle(_)
             | BusMessage::LoggerControl(_)
             | BusMessage::Log(_)
             | BusMessage::PromoteSyncToBackground(_)
@@ -2313,7 +2446,8 @@ impl AgentLogic {
             serde_json::json!(job_id),
         );
 
-        spawn_main_chat_reasoning_turn(self.reasoning_spawn_args().await, resumed_inbound);
+        let run_id = ensure_run_id(&mut resumed_inbound)?;
+        spawn_main_chat_reasoning_turn(self.reasoning_spawn_args().await, resumed_inbound, run_id);
         Ok(())
     }
 }
@@ -2648,6 +2782,7 @@ impl AgentLogic {
             outbound_tx,
             logger_tx,
             inbound,
+            run_id: _run_id,
             cancel_token,
             clarification_hub,
             tool_exec_ctx,
@@ -3845,7 +3980,10 @@ mod tests {
     use tokio::sync::mpsc;
     use tower::util::ServiceExt;
 
-    use crate::bus::{clarification_session_key, BusMessage, InboundMessage};
+    use crate::bus::{
+        clarification_session_key, BusMessage, InboundMessage, RunLifecycleEvent, RunOutcome,
+        RunStuckReason, METADATA_RUN_ID,
+    };
     use crate::clarification::ClarificationHub;
     use crate::logging::create_logger_channel;
     use crate::memory::SqliteMemoryActor;
@@ -4384,6 +4522,7 @@ mod tests {
             outbound_tx,
             logger_tx,
             inbound,
+            run_id: "test-run-id".to_string(),
             cancel_token: cancel_token.clone(),
             clarification_hub: ClarificationHub::shared(),
             tool_exec_ctx: ToolExecCtx::new("terminal", "loop-test-chat", None)
@@ -4710,6 +4849,99 @@ mod tests {
             attachments: vec![],
             metadata: Default::default(),
         }
+    }
+
+    #[test]
+    fn run_id_is_required_for_tauri_and_backfilled_for_legacy_channels() {
+        let mut tauri = test_inbound("run-id-tauri", "hello");
+        tauri.channel = "tauri".to_string();
+        assert!(super::ensure_run_id(&mut tauri).is_err());
+
+        let mut legacy = test_inbound("run-id-terminal", "hello");
+        let generated = super::ensure_run_id(&mut legacy).expect("legacy run id");
+        assert!(generated.starts_with("legacy-"));
+        assert_eq!(
+            legacy
+                .metadata
+                .get(METADATA_RUN_ID)
+                .and_then(|value| value.as_str()),
+            Some(generated.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn started_lifecycle_event_preserves_caller_run_id() {
+        let provider = RespondingProvider {
+            tag: "done".to_string(),
+        };
+        let (mut agent, mut outbound_rx) = build_agent_with_provider(Box::new(provider));
+        let mut inbound = test_inbound("run-id-chat", "hello");
+        inbound.channel = "tauri".to_string();
+        inbound.metadata.insert(
+            METADATA_RUN_ID.to_string(),
+            serde_json::json!("caller-run-123"),
+        );
+
+        agent
+            .process(BusMessage::Inbound(inbound))
+            .await
+            .expect("process inbound");
+
+        let event = tokio::time::timeout(Duration::from_secs(2), outbound_rx.recv())
+            .await
+            .expect("started lifecycle event before timeout")
+            .expect("outbound event");
+        assert!(matches!(
+            event,
+            BusMessage::RunLifecycle(RunLifecycleEvent::Started { run_id, chat_id })
+                if run_id == "caller-run-123" && chat_id == "run-id-chat"
+        ));
+
+        let terminal = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(BusMessage::RunLifecycle(
+                    event @ RunLifecycleEvent::Terminated { .. },
+                )) = outbound_rx.recv().await
+                {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("terminal lifecycle event before timeout");
+        assert!(matches!(
+            terminal,
+            RunLifecycleEvent::Terminated { run_id, chat_id, outcome: RunOutcome::Completed }
+                if run_id == "caller-run-123" && chat_id == "run-id-chat"
+        ));
+    }
+
+    #[test]
+    fn terminal_outcome_classifies_budget_and_doom_loop_without_generic_success() {
+        let budget = super::classify_run_outcome(
+            &Ok(Ok("Agent reached max reasoning iterations.".to_string())),
+            false,
+            7,
+        );
+        assert!(matches!(
+            budget,
+            RunOutcome::BudgetExhausted { budget }
+                if budget.iterations_used == 7 && budget.iterations_limit == 7
+        ));
+
+        let stuck = super::classify_run_outcome(
+            &Ok(Ok(
+                "Stopped: the agent kept repeating the same action with no progress".to_string(),
+            )),
+            false,
+            7,
+        );
+        assert_eq!(
+            stuck,
+            RunOutcome::Stuck {
+                reason: RunStuckReason::DoomLoop,
+            }
+        );
     }
 
     #[tokio::test]
