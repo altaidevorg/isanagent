@@ -1,5 +1,5 @@
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{
     mpsc::{sync_channel, Receiver, SyncSender},
@@ -10,9 +10,12 @@ use async_trait::async_trait;
 use log::{Level, LevelFilter, Log, Metadata, Record, SetLoggerError};
 use regex::Regex;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::time::Duration;
 
 use crate::bus::{BusMessage, LogEvent, LogLevel, LoggerControlMessage, TelemetryEvent};
+use crate::config::{AppConfig, EffectiveLoggingConfig};
+use crate::log_rotation::{RotatingLineWriter, WriteLineOutcome};
 use crate::{ActorError, ActorLogic};
 
 pub const LOGGER_QUEUE_CAPACITY: usize = 4096;
@@ -148,8 +151,11 @@ fn sanitize_message(message: &str) -> String {
 
 /// The sole component responsible for writing workspace log files.
 pub struct LoggingActor {
-    conversation_writer: BufWriter<File>,
-    runtime_writer: BufWriter<File>,
+    conversation_writer: Option<RotatingLineWriter>,
+    runtime_writer: Option<RotatingLineWriter>,
+    logs_dir: PathBuf,
+    max_total_bytes: u64,
+    failure_reported: bool,
 }
 
 struct LoggingFallbackActor {
@@ -175,54 +181,114 @@ pub fn create_logging_actor_or_fallback(workspace_dir: PathBuf) -> Box<dyn Actor
 
 impl LoggingActor {
     pub fn new(workspace_dir: PathBuf) -> Result<Self, String> {
-        let logs_dir = workspace_dir.join(".system_generated").join("logs");
-        std::fs::create_dir_all(&logs_dir)
-            .map_err(|e| format!("Failed to create logs directory: {}", e))?;
-
-        Ok(Self {
-            conversation_writer: open_writer(&logs_dir.join("conversation.jsonl"))?,
-            runtime_writer: open_writer(&logs_dir.join("runtime.log"))?,
-        })
+        let logging_config = load_logging_config(&workspace_dir);
+        Self::new_with_config(workspace_dir, logging_config)
     }
 
-    fn write_conversation(&mut self, packet: &BusMessage) -> Result<(), ActorError> {
+    pub fn new_with_config(
+        workspace_dir: PathBuf,
+        logging_config: EffectiveLoggingConfig,
+    ) -> Result<Self, String> {
+        let logs_dir = workspace_dir.join(".system_generated").join("logs");
+        fs::create_dir_all(&logs_dir)
+            .map_err(|e| format!("Failed to create logs directory: {}", e))?;
+
+        let mut actor = Self {
+            conversation_writer: None,
+            runtime_writer: None,
+            logs_dir: logs_dir.clone(),
+            max_total_bytes: logging_config.max_total_bytes,
+            failure_reported: false,
+        };
+        if !logging_config.enabled {
+            return Ok(actor);
+        }
+
+        actor.conversation_writer = Some(
+            RotatingLineWriter::new(
+                logs_dir.join("conversation.jsonl"),
+                logging_config.conversation_max_bytes,
+                logging_config.retained_generations,
+            )
+            .map_err(|e| format!("Failed to open conversation log: {}", e))?,
+        );
+        actor.runtime_writer = Some(
+            RotatingLineWriter::new(
+                logs_dir.join("runtime.log"),
+                logging_config.runtime_max_bytes,
+                logging_config.retained_generations,
+            )
+            .map_err(|e| format!("Failed to open runtime log: {}", e))?,
+        );
+        actor
+            .enforce_total_log_cap()
+            .map_err(|e| format!("Failed to enforce diagnostic log cap: {}", e))?;
+        Ok(actor)
+    }
+
+    fn write_conversation(&mut self, packet: &BusMessage) {
         // Serialize to a `Value` first so secrets can be redacted before this analytical journal
         // hits disk — tool results / inbound text routinely carry keys (an `env` dump, an echoed
         // `$OPENAI_API_KEY`). `conversation.jsonl` is write-only telemetry (agent memory lives in
         // SQLite), so redaction here never affects what the agent can recall or use.
-        let mut value = match packet {
+        let serialized = match packet {
             BusMessage::Inbound(inv) => serde_json::to_value(inv),
             BusMessage::Outbound(out) => serde_json::to_value(out),
             BusMessage::Telemetry(tel) => serde_json::to_value(tel),
-            BusMessage::Log(_) => return Ok(()),
-            BusMessage::LoggerControl(_) => return Ok(()),
-            BusMessage::Cancel(_) => return Ok(()),
-            BusMessage::PromoteSyncToBackground(_) => return Ok(()),
-            BusMessage::SetTerminalSessionChat { .. } => return Ok(()),
-            BusMessage::SwitchModel { .. } => return Ok(()),
+            BusMessage::RunLifecycle(event) => serde_json::to_value(event),
+            BusMessage::Log(_) => return,
+            BusMessage::LoggerControl(_) => return,
+            BusMessage::Cancel(_) => return,
+            BusMessage::PromoteSyncToBackground(_) => return,
+            BusMessage::SetTerminalSessionChat { .. } => return,
+            BusMessage::SwitchModel { .. } => return,
             // PR-5: a manual trigger is internal control flow; the resulting
             // `CompactionTriggered` / `CompactionCompleted` telemetry pair already
             // shows up in the conversation log via the `Telemetry(_)` arm above.
-            BusMessage::TriggerCompaction { .. } => return Ok(()),
-            BusMessage::InstallSkill { .. } => return Ok(()),
-        }
-        .map_err(|e| ActorError::from(format!("Failed to serialize conversation event: {}", e)))?;
+            BusMessage::TriggerCompaction { .. } => return,
+            BusMessage::InstallSkill { .. } => return,
+        };
+        let mut value = match serialized {
+            Ok(value) => value,
+            Err(error) => {
+                self.disable_after_failure("serialize conversation event", error.to_string());
+                return;
+            }
+        };
 
         crate::redact::shared().redact_json(&mut value);
-        let json_line = serde_json::to_string(&value).map_err(|e| {
-            ActorError::from(format!("Failed to serialize conversation event: {}", e))
-        })?;
-
-        writeln!(self.conversation_writer, "{}", json_line)
-            .map_err(|e| ActorError::from(format!("Failed to write conversation log: {}", e)))
+        let json_line = match serde_json::to_string(&value) {
+            Ok(line) => line,
+            Err(error) => {
+                self.disable_after_failure("encode conversation event", error.to_string());
+                return;
+            }
+        };
+        let event_kind = conversation_event_kind(packet);
+        let result = match self.conversation_writer.as_mut() {
+            Some(writer) => write_conversation_record(writer, &json_line, event_kind),
+            None => return,
+        };
+        if let Err(error) = result {
+            self.disable_after_failure("write conversation log", error);
+            return;
+        }
+        self.enforce_total_or_disable();
     }
 
-    fn write_runtime_event(&mut self, event: &LogEvent) -> Result<(), ActorError> {
-        writeln!(self.runtime_writer, "{}", event.format_line())
-            .map_err(|e| ActorError::from(format!("Failed to write runtime log: {}", e)))
+    fn write_runtime_event(&mut self, event: &LogEvent) {
+        let result = match self.runtime_writer.as_mut() {
+            Some(writer) => write_runtime_record(writer, &event.format_line()),
+            None => return,
+        };
+        if let Err(error) = result {
+            self.disable_after_failure("write runtime log", error);
+            return;
+        }
+        self.enforce_total_or_disable();
     }
 
-    fn write_shadow_runtime_event(&mut self, packet: &BusMessage) -> Result<(), ActorError> {
+    fn write_shadow_runtime_event(&mut self, packet: &BusMessage) {
         let event = match packet {
             BusMessage::Inbound(msg) => LogEvent::info(
                 "BusMessage",
@@ -254,8 +320,11 @@ impl LoggingActor {
                 "metadata": msg.metadata,
             })),
             BusMessage::Telemetry(telemetry) => telemetry_to_log_event(telemetry),
-            BusMessage::Log(_) => return Ok(()),
-            BusMessage::LoggerControl(_) => return Ok(()),
+            BusMessage::RunLifecycle(event) => {
+                LogEvent::info("BusMessage", &format!("RunLifecycle event={event:?}"))
+            }
+            BusMessage::Log(_) => return,
+            BusMessage::LoggerControl(_) => return,
             BusMessage::Cancel(chat_id) => LogEvent::info(
                 "BusMessage",
                 &format!("Cancel reasoning loop for chat_id={}", chat_id),
@@ -311,33 +380,228 @@ impl LoggingActor {
             ),
         };
 
-        self.write_runtime_event(&event)
+        self.write_runtime_event(&event);
     }
 
-    fn flush_all(&mut self) -> Result<(), ActorError> {
-        self.conversation_writer
-            .flush()
-            .map_err(|e| ActorError::from(format!("Failed to flush conversation log: {}", e)))?;
-        self.runtime_writer
-            .flush()
-            .map_err(|e| ActorError::from(format!("Failed to flush runtime log: {}", e)))?;
+    fn flush_all(&mut self) {
+        let conversation_result = self
+            .conversation_writer
+            .as_mut()
+            .map(RotatingLineWriter::flush)
+            .transpose();
+        if let Err(error) = conversation_result {
+            self.disable_after_failure("flush conversation log", error.to_string());
+            return;
+        }
+        let runtime_result = self
+            .runtime_writer
+            .as_mut()
+            .map(RotatingLineWriter::flush)
+            .transpose();
+        if let Err(error) = runtime_result {
+            self.disable_after_failure("flush runtime log", error.to_string());
+            return;
+        }
+        self.enforce_total_or_disable();
+    }
+
+    fn enforce_total_or_disable(&mut self) {
+        if let Err(error) = self.enforce_total_log_cap() {
+            self.disable_after_failure("enforce diagnostic log cap", error.to_string());
+        }
+    }
+
+    fn enforce_total_log_cap(&self) -> io::Result<()> {
+        let mut total_bytes = 0u64;
+        let mut rotated = Vec::new();
+        for entry in fs::read_dir(&self.logs_dir)? {
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let path = entry.path();
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if !metadata.is_file() || !recognized_log_file(&path) {
+                continue;
+            }
+            let bytes = self.active_log_bytes(&path).unwrap_or(metadata.len());
+            total_bytes = total_bytes.saturating_add(bytes);
+            if is_rotated_log_file(&path) {
+                rotated.push((
+                    metadata
+                        .modified()
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                    path,
+                    bytes,
+                ));
+            }
+        }
+
+        rotated.sort_by_key(|(modified, path, _)| (*modified, path.clone()));
+        for (_, path, bytes) in rotated {
+            if total_bytes <= self.max_total_bytes {
+                break;
+            }
+            if fs::remove_file(&path).is_ok() {
+                total_bytes = total_bytes.saturating_sub(bytes);
+            }
+        }
         Ok(())
+    }
+
+    fn active_log_bytes(&self, path: &Path) -> Option<u64> {
+        let name = path.file_name()?.to_str()?;
+        match name {
+            "conversation.jsonl" => self
+                .conversation_writer
+                .as_ref()
+                .map(RotatingLineWriter::current_bytes),
+            "runtime.log" => self
+                .runtime_writer
+                .as_ref()
+                .map(RotatingLineWriter::current_bytes),
+            _ => None,
+        }
+    }
+
+    fn disable_after_failure(&mut self, operation: &str, error: String) {
+        self.conversation_writer = None;
+        self.runtime_writer = None;
+        if !self.failure_reported {
+            self.failure_reported = true;
+            eprintln!(
+                "IsanAgent diagnostic logging disabled after {}: {}",
+                operation,
+                sanitize_message(&error)
+            );
+        }
     }
 }
 
 impl Drop for LoggingActor {
     fn drop(&mut self) {
-        let _ = self.flush_all();
+        self.flush_all();
     }
 }
 
-fn open_writer(path: &Path) -> Result<BufWriter<File>, String> {
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
-    Ok(BufWriter::new(file))
+fn load_logging_config(workspace_dir: &Path) -> EffectiveLoggingConfig {
+    let config_path = workspace_dir.join("config.toml");
+    fs::read_to_string(config_path)
+        .ok()
+        .and_then(|contents| toml::from_str::<AppConfig>(&contents).ok())
+        .map(|config| config.effective_logging_config())
+        .unwrap_or_else(|| AppConfig::default().effective_logging_config())
+}
+
+fn conversation_event_kind(packet: &BusMessage) -> &'static str {
+    match packet {
+        BusMessage::Inbound(_) => "inbound",
+        BusMessage::Outbound(_) => "outbound",
+        BusMessage::Telemetry(_) => "telemetry",
+        BusMessage::RunLifecycle(_) => "run_lifecycle",
+        _ => "internal",
+    }
+}
+
+fn write_conversation_record(
+    writer: &mut RotatingLineWriter,
+    json_line: &str,
+    event_kind: &str,
+) -> Result<(), String> {
+    match writer
+        .write_line(json_line)
+        .map_err(|error| error.to_string())?
+    {
+        WriteLineOutcome::Written => Ok(()),
+        WriteLineOutcome::RecordTooLarge {
+            record_bytes,
+            max_record_bytes: _,
+        } => {
+            let digest = format!("{:x}", Sha256::digest(json_line.as_bytes()));
+            let replacement = json!({
+                "type": "truncated_log_record",
+                "original_event_type": event_kind,
+                "original_bytes": record_bytes,
+                "sha256": digest,
+            })
+            .to_string();
+            match writer
+                .write_line(&replacement)
+                .map_err(|error| error.to_string())?
+            {
+                WriteLineOutcome::Written => Ok(()),
+                WriteLineOutcome::RecordTooLarge { .. } => Err(
+                    "conversation log record limit is too small for a truncation marker"
+                        .to_string(),
+                ),
+            }
+        }
+    }
+}
+
+fn write_runtime_record(writer: &mut RotatingLineWriter, line: &str) -> Result<(), String> {
+    match writer.write_line(line).map_err(|error| error.to_string())? {
+        WriteLineOutcome::Written => Ok(()),
+        WriteLineOutcome::RecordTooLarge {
+            record_bytes,
+            max_record_bytes,
+        } => {
+            let replacement = truncate_runtime_line(line, record_bytes, max_record_bytes);
+            match writer
+                .write_line(&replacement)
+                .map_err(|error| error.to_string())?
+            {
+                WriteLineOutcome::Written => Ok(()),
+                WriteLineOutcome::RecordTooLarge { .. } => {
+                    Err("runtime log record limit is too small for a truncation marker".to_string())
+                }
+            }
+        }
+    }
+}
+
+fn truncate_runtime_line(line: &str, original_bytes: u64, max_record_bytes: u64) -> String {
+    let max_record_bytes = max_record_bytes as usize;
+    let marker = format!(" [truncated original_bytes={original_bytes}]");
+    if marker.len() >= max_record_bytes {
+        return "~".repeat(max_record_bytes);
+    }
+    let prefix_limit = max_record_bytes - marker.len();
+    format!("{}{}", truncate_utf8(line, prefix_limit), marker)
+}
+
+fn truncate_utf8(input: &str, max_bytes: usize) -> &str {
+    if input.len() <= max_bytes {
+        return input;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    &input[..end]
+}
+
+fn log_generation(path: &Path, base: &str) -> Option<usize> {
+    let name = path.file_name()?.to_str()?;
+    name.strip_prefix(&format!("{base}."))?
+        .parse::<usize>()
+        .ok()
+        .filter(|generation| *generation > 0)
+}
+
+fn recognized_log_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    matches!(name, "conversation.jsonl" | "runtime.log")
+        || log_generation(path, "conversation.jsonl").is_some()
+        || log_generation(path, "runtime.log").is_some()
+}
+
+fn is_rotated_log_file(path: &Path) -> bool {
+    log_generation(path, "conversation.jsonl").is_some()
+        || log_generation(path, "runtime.log").is_some()
 }
 
 fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
@@ -739,7 +1003,7 @@ impl ActorLogic<BusMessage> for LoggingActor {
     }
 
     async fn on_tick(&mut self) -> Result<Option<(String, BusMessage)>, ActorError> {
-        self.flush_all()?;
+        self.flush_all();
         Ok(None)
     }
 
@@ -749,17 +1013,17 @@ impl ActorLogic<BusMessage> for LoggingActor {
     ) -> Result<Option<(String, BusMessage)>, ActorError> {
         match &packet {
             BusMessage::LoggerControl(LoggerControlMessage::Flush) => {
-                self.flush_all()?;
+                self.flush_all();
                 return Ok(Some((
                     "logger_control".to_string(),
                     BusMessage::LoggerControl(LoggerControlMessage::Flushed),
                 )));
             }
             BusMessage::LoggerControl(LoggerControlMessage::Flushed) => return Ok(None),
-            BusMessage::Log(event) => self.write_runtime_event(event)?,
+            BusMessage::Log(event) => self.write_runtime_event(event),
             _ => {
-                self.write_conversation(&packet)?;
-                self.write_shadow_runtime_event(&packet)?;
+                self.write_conversation(&packet);
+                self.write_shadow_runtime_event(&packet);
             }
         }
 
@@ -797,8 +1061,155 @@ impl ActorLogic<BusMessage> for LoggingFallbackActor {
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_message, should_capture};
+    use super::{recognized_log_file, sanitize_message, should_capture, LoggingActor};
+    use crate::bus::{BusMessage, InboundMessage, LogEvent};
+    use crate::config::EffectiveLoggingConfig;
     use log::Level;
+    use std::collections::HashMap;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn logging_config(max_total_bytes: u64) -> EffectiveLoggingConfig {
+        EffectiveLoggingConfig {
+            enabled: true,
+            conversation_max_bytes: 256,
+            runtime_max_bytes: 256,
+            retained_generations: 2,
+            max_total_bytes,
+        }
+    }
+
+    fn inbound(content: String) -> BusMessage {
+        BusMessage::Inbound(InboundMessage {
+            channel: "test".to_string(),
+            sender_id: "sender".to_string(),
+            chat_id: "chat".to_string(),
+            thread_id: None,
+            content,
+            attachments: Vec::new(),
+            metadata: HashMap::new(),
+        })
+    }
+
+    #[test]
+    fn conversation_rotation_keeps_jsonl_valid_and_redacted() {
+        let workspace = tempdir().expect("tempdir");
+        let mut actor = LoggingActor::new_with_config(
+            workspace.path().to_path_buf(),
+            logging_config(90 * 1024 * 1024),
+        )
+        .expect("logger");
+        let secret = "Bearer abc.def-0123456789";
+
+        for _ in 0..4 {
+            actor.write_conversation(&inbound(format!("{secret} {}", "x".repeat(80))));
+        }
+        actor.write_conversation(&inbound("x".repeat(4096)));
+        actor.flush_all();
+
+        let logs_dir = workspace.path().join(".system_generated/logs");
+        for entry in fs::read_dir(logs_dir).expect("read logs") {
+            let path = entry.expect("entry").path();
+            if !recognized_log_file(&path) {
+                continue;
+            }
+            let contents = fs::read_to_string(&path).expect("read log");
+            assert!(!contents.contains(secret));
+            for line in contents.lines() {
+                serde_json::from_str::<serde_json::Value>(line).expect("valid JSONL record");
+            }
+        }
+    }
+
+    #[test]
+    fn total_log_cap_removes_only_rotated_logs() {
+        let workspace = tempdir().expect("tempdir");
+        let mut actor =
+            LoggingActor::new_with_config(workspace.path().to_path_buf(), logging_config(512))
+                .expect("logger");
+
+        for index in 0..8 {
+            actor.write_conversation(&inbound(format!("message-{index}-{}", "x".repeat(80))));
+            actor.write_runtime_event(&LogEvent::info("test", &"y".repeat(180)));
+        }
+        actor.flush_all();
+
+        let logs_dir = workspace.path().join(".system_generated/logs");
+        let files = fs::read_dir(logs_dir)
+            .expect("read logs")
+            .map(|entry| entry.expect("entry"))
+            .filter(|entry| recognized_log_file(&entry.path()))
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().to_string(),
+                    entry.metadata().expect("metadata").len(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let total: u64 = files.iter().map(|(_, bytes)| *bytes).sum();
+        assert!(
+            total <= 512,
+            "diagnostic logs total {total} bytes: {files:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_runtime_record_is_marked_without_breaking_logging() {
+        let workspace = tempdir().expect("tempdir");
+        let mut actor = LoggingActor::new_with_config(
+            workspace.path().to_path_buf(),
+            logging_config(90 * 1024 * 1024),
+        )
+        .expect("logger");
+
+        actor.write_runtime_event(&LogEvent::info("test", &"x".repeat(4096)));
+        actor.flush_all();
+
+        let runtime_log = workspace.path().join(".system_generated/logs/runtime.log");
+        let contents = fs::read_to_string(runtime_log).expect("read runtime log");
+        assert!(contents.contains("truncated original_bytes="));
+    }
+
+    #[test]
+    fn workspace_logging_config_can_disable_file_logging() {
+        let workspace = tempdir().expect("tempdir");
+        fs::write(
+            workspace.path().join("config.toml"),
+            "[logging]\nenabled = false\n",
+        )
+        .expect("write config");
+        let mut actor = LoggingActor::new(workspace.path().to_path_buf()).expect("logger");
+
+        actor.write_conversation(&inbound("do not write".to_string()));
+        actor.flush_all();
+
+        assert!(!workspace
+            .path()
+            .join(".system_generated/logs/conversation.jsonl")
+            .exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn created_log_files_are_user_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempdir().expect("tempdir");
+        let _actor = LoggingActor::new_with_config(
+            workspace.path().to_path_buf(),
+            logging_config(90 * 1024 * 1024),
+        )
+        .expect("logger");
+        let conversation = workspace
+            .path()
+            .join(".system_generated/logs/conversation.jsonl");
+        let mode = fs::metadata(conversation)
+            .expect("metadata")
+            .permissions()
+            .mode();
+
+        assert_eq!(mode & 0o077, 0);
+    }
 
     #[test]
     fn sanitize_message_masks_secrets_and_emails() {

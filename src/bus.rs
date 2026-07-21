@@ -18,6 +18,8 @@ pub const METADATA_SYNTHETIC_BACKGROUND_RESUME: &str = "isanagent_synthetic_back
 pub const METADATA_BACKGROUND_JOB_ID: &str = "isanagent_background_job_id";
 /// Inbound metadata: the ID of the clarification ticket being replied to.
 pub const METADATA_CLARIFICATION_TICKET_ID: &str = "clarification_ticket_id";
+/// Trusted caller-provided identifier for one foreground reasoning run.
+pub const METADATA_RUN_ID: &str = "isanagent_run_id";
 
 /// An inbound message received from a Channel (e.g. Slack, Email).
 //
@@ -578,6 +580,63 @@ mod tests {
 }
 
 /// A wrapper used to distinguish routing intents inside the Agent network.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RunFailureKind {
+    ProviderRetriesExhausted,
+    Provider,
+    Tool,
+    Protocol,
+    Persistence,
+    Internal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStuckReason {
+    DoomLoop,
+    RepeatedRootCause,
+    NoProgress,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunBudgetSnapshot {
+    pub iterations_used: usize,
+    pub iterations_limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RunOutcome {
+    Completed,
+    Failed {
+        failure: RunFailureKind,
+        retryable: bool,
+    },
+    Cancelled,
+    Stuck {
+        reason: RunStuckReason,
+    },
+    BudgetExhausted {
+        budget: RunBudgetSnapshot,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RunLifecycleEvent {
+    Started {
+        run_id: String,
+        chat_id: String,
+    },
+    Terminated {
+        run_id: String,
+        chat_id: String,
+        outcome: RunOutcome,
+    },
+}
+
+/// A wrapper used to distinguish routing intents inside the Agent network.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum BusMessage {
@@ -586,6 +645,8 @@ pub enum BusMessage {
     Telemetry(TelemetryEvent),
     /// Verbose structured log event for file-based diagnostics.
     Log(LogEvent),
+    /// Typed foreground reasoning-run lifecycle signal.
+    RunLifecycle(RunLifecycleEvent),
     /// Internal control flow for deterministic logger flush/shutdown.
     LoggerControl(LoggerControlMessage),
     /// Signal to interrupt an active reasoning loop for a specific chat.
@@ -632,4 +693,55 @@ pub enum BusMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         skill_name: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod run_lifecycle_tests {
+    use super::{RunBudgetSnapshot, RunFailureKind, RunLifecycleEvent, RunOutcome, RunStuckReason};
+
+    #[test]
+    fn lifecycle_events_round_trip_for_every_terminal_outcome() {
+        let outcomes = vec![
+            RunOutcome::Completed,
+            RunOutcome::Failed {
+                failure: RunFailureKind::ProviderRetriesExhausted,
+                retryable: true,
+            },
+            RunOutcome::Cancelled,
+            RunOutcome::Stuck {
+                reason: RunStuckReason::RepeatedRootCause,
+            },
+            RunOutcome::BudgetExhausted {
+                budget: RunBudgetSnapshot {
+                    iterations_used: 24,
+                    iterations_limit: 24,
+                },
+            },
+        ];
+
+        for outcome in outcomes {
+            let event = RunLifecycleEvent::Terminated {
+                run_id: "run-123".to_string(),
+                chat_id: "chat-456".to_string(),
+                outcome,
+            };
+            let encoded = serde_json::to_string(&event).expect("serialize lifecycle event");
+            let decoded: RunLifecycleEvent =
+                serde_json::from_str(&encoded).expect("deserialize lifecycle event");
+            assert_eq!(decoded, event);
+        }
+    }
+
+    #[test]
+    fn started_lifecycle_event_round_trips() {
+        let event = RunLifecycleEvent::Started {
+            run_id: "run-123".to_string(),
+            chat_id: "chat-456".to_string(),
+        };
+
+        let encoded = serde_json::to_string(&event).expect("serialize lifecycle event");
+        let decoded: RunLifecycleEvent =
+            serde_json::from_str(&encoded).expect("deserialize lifecycle event");
+        assert_eq!(decoded, event);
+    }
 }
