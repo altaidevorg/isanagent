@@ -1141,12 +1141,18 @@ struct ReasoningSpawnArgs {
     logger_tx: LoggerHandle,
     clarification_hub: Arc<ClarificationHub>,
     doom_loop_enabled: bool,
-    cancellation_tokens: Arc<dashmap::DashMap<String, Arc<tokio_util::sync::CancellationToken>>>,
+    cancellation_tokens: Arc<dashmap::DashMap<String, ActiveRunHandle>>,
     pending_inbound: Arc<dashmap::DashMap<String, Mutex<VecDeque<crate::bus::InboundMessage>>>>,
     harness_runtime_summary: String,
     forbid_final_without_tools: bool,
     shell_policy: Arc<ResolvedShellPolicy>,
     hook_tool_ctx: Option<Arc<ToolCallHookContext>>,
+}
+
+#[derive(Clone)]
+struct ActiveRunHandle {
+    run_id: String,
+    token: Arc<tokio_util::sync::CancellationToken>,
 }
 
 fn send_background_job_notification(
@@ -1311,8 +1317,13 @@ fn spawn_main_chat_reasoning_turn(
 ) {
     let chat_id = inbound.chat_id.clone();
     let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
-    args.cancellation_tokens
-        .insert(chat_id.clone(), cancel_token.clone());
+    args.cancellation_tokens.insert(
+        chat_id.clone(),
+        ActiveRunHandle {
+            run_id: run_id.clone(),
+            token: cancel_token.clone(),
+        },
+    );
 
     let args_for_chain = args.clone();
     let cancellation_tokens = args.cancellation_tokens.clone();
@@ -1579,7 +1590,7 @@ fn spawn_main_chat_reasoning_turn(
         }
 
         let _ = cancellation_tokens.remove_if(&task_chat_id, |_key, stored| {
-            Arc::ptr_eq(stored, &task_token_arc)
+            Arc::ptr_eq(&stored.token, &task_token_arc)
         });
 
         let mut next_inbound = pending_inbound.get(&task_chat_id).and_then(|r| {
@@ -1748,7 +1759,7 @@ pub struct AgentLogic {
     tool_execution_activity: Option<SharedToolExecutionActivity>,
     outbound_tx: mpsc::Sender<BusMessage>,
     logger_tx: LoggerHandle,
-    cancellation_tokens: Arc<dashmap::DashMap<String, Arc<tokio_util::sync::CancellationToken>>>,
+    cancellation_tokens: Arc<dashmap::DashMap<String, ActiveRunHandle>>,
     /// FIFO per `chat_id` when a new user inbound arrives while main reasoning is active.
     pending_inbound: Arc<dashmap::DashMap<String, Mutex<VecDeque<crate::bus::InboundMessage>>>>,
     clarification_hub: Arc<ClarificationHub>,
@@ -1968,6 +1979,47 @@ impl AgentLogic {
             }
         }
     }
+
+    fn cancel_active_run(&self, chat_id: &str, expected_run_id: Option<&str>) -> bool {
+        let active = self
+            .cancellation_tokens
+            .get(chat_id)
+            .map(|entry| entry.value().clone());
+        let Some(active) = active else {
+            if expected_run_id.is_none() {
+                self.pending_inbound.remove(chat_id);
+            }
+            return false;
+        };
+        if expected_run_id.is_some_and(|run_id| run_id != active.run_id) {
+            let _ = self.logger_tx.send(BusMessage::Log(
+                LogEvent::warn(
+                    &self.name,
+                    &format!(
+                        "Ignored cancellation for chat_id {} because run_id did not match the active run.",
+                        chat_id
+                    ),
+                )
+                .with_chat_id(chat_id),
+            ));
+            return false;
+        }
+        if let Some(harness) = &self.subagent_harness {
+            if harness.cancel_children_on_parent_cancel() {
+                harness.cancel_children_for_parent(chat_id);
+            }
+        }
+        active.token.cancel();
+        let _ = self.logger_tx.send(BusMessage::Log(
+            LogEvent::info(
+                &self.name,
+                &format!("Cancelled reasoning loop for chat_id: {}", chat_id),
+            )
+            .with_chat_id(chat_id),
+        ));
+        self.pending_inbound.remove(chat_id);
+        true
+    }
 }
 
 /// The Agent processes incoming BusMessages, updates memory based on session key,
@@ -1984,29 +2036,14 @@ impl ActorLogic<BusMessage> for AgentLogic {
     ) -> Result<Option<(String, BusMessage)>, ActorError> {
         match packet {
             BusMessage::Cancel(chat_id) => {
-                if let Some(h) = &self.subagent_harness {
-                    if h.cancel_children_on_parent_cancel() {
-                        h.cancel_children_for_parent(&chat_id);
-                    }
-                }
                 // Keep ownership registered until the reasoning task emits its
                 // terminal lifecycle event and finalizes. New inbound arriving
                 // during cancellation must queue behind that acknowledgement.
-                if let Some(token) = self
-                    .cancellation_tokens
-                    .get(&chat_id)
-                    .map(|entry| entry.value().clone())
-                {
-                    token.cancel();
-                    let _ = self.logger_tx.send(BusMessage::Log(
-                        LogEvent::info(
-                            &self.name,
-                            &format!("Cancelled reasoning loop for chat_id: {}", chat_id),
-                        )
-                        .with_chat_id(&chat_id),
-                    ));
-                }
-                self.pending_inbound.remove(&chat_id);
+                self.cancel_active_run(&chat_id, None);
+                return Ok(None);
+            }
+            BusMessage::CancelRun { chat_id, run_id } => {
+                self.cancel_active_run(&chat_id, Some(&run_id));
                 return Ok(None);
             }
             BusMessage::SwitchModel {
@@ -5395,6 +5432,79 @@ mod tests {
             second_start,
             RunLifecycleEvent::Started { run_id, chat_id: event_chat }
                 if run_id != first_run_id && event_chat == chat_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn exact_cancel_does_not_interrupt_a_different_run() {
+        let (mut agent, mut outbound_rx) = build_agent_with_provider(Box::new(LongSleepProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+        let chat_id = "exact-cancel-chat";
+        agent
+            .process(BusMessage::Inbound(test_inbound(chat_id, "first")))
+            .await
+            .expect("start run");
+        let run_id = loop {
+            match outbound_rx.recv().await {
+                Some(BusMessage::RunLifecycle(RunLifecycleEvent::Started {
+                    run_id,
+                    chat_id: event_chat,
+                })) if event_chat == chat_id => break run_id,
+                Some(_) => continue,
+                None => panic!("outbound channel closed before start"),
+            }
+        };
+
+        agent
+            .process(BusMessage::CancelRun {
+                chat_id: chat_id.to_string(),
+                run_id: "wrong-run".to_string(),
+            })
+            .await
+            .expect("wrong cancel is handled");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), async {
+                loop {
+                    match outbound_rx.recv().await {
+                        Some(BusMessage::RunLifecycle(RunLifecycleEvent::Terminated {
+                            ..
+                        })) => {
+                            return;
+                        }
+                        Some(_) => continue,
+                        None => return,
+                    }
+                }
+            })
+            .await
+            .is_err(),
+            "a mismatched cancel must not terminate the active run"
+        );
+
+        agent
+            .process(BusMessage::CancelRun {
+                chat_id: chat_id.to_string(),
+                run_id: run_id.clone(),
+            })
+            .await
+            .expect("exact cancel is accepted");
+        let terminal = loop {
+            match outbound_rx.recv().await {
+                Some(BusMessage::RunLifecycle(event @ RunLifecycleEvent::Terminated { .. })) => {
+                    break event;
+                }
+                Some(_) => continue,
+                None => panic!("outbound channel closed before terminal"),
+            }
+        };
+        assert!(matches!(
+            terminal,
+            RunLifecycleEvent::Terminated {
+                run_id: terminal_run_id,
+                chat_id: event_chat,
+                outcome: RunOutcome::Cancelled,
+            } if terminal_run_id == run_id && event_chat == chat_id
         ));
     }
 

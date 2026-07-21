@@ -651,6 +651,13 @@ pub enum BusMessage {
     LoggerControl(LoggerControlMessage),
     /// Signal to interrupt an active reasoning loop for a specific chat.
     Cancel(String),
+    /// Signal to interrupt one exact active reasoning run. Hosts with a
+    /// lifecycle coordinator must use this instead of chat-only cancellation
+    /// so a delayed stop cannot cancel a later run for the same chat.
+    CancelRun {
+        chat_id: String,
+        run_id: String,
+    },
     /// Signal to promote the current in-flight synchronous tool call (if any) to
     /// a background `ExecutionJobManager` job for the given chat. Triggered by
     /// the `/background` slash command.

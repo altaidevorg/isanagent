@@ -989,11 +989,14 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                 *active_terminal_session_for_bus.write().await = chat_id.clone();
                 continue;
             }
-            // Only route Inbound, Cancel, and SwitchModel messages to the agent logic.
+            // Only route Inbound, cancellation, and SwitchModel messages to the agent logic.
             // This prevents the agent from being flooded with its own telemetry or other system messages.
             if matches!(
                 msg,
-                BusMessage::Inbound(_) | BusMessage::Cancel(_) | BusMessage::SwitchModel { .. }
+                BusMessage::Inbound(_)
+                    | BusMessage::Cancel(_)
+                    | BusMessage::CancelRun { .. }
+                    | BusMessage::SwitchModel { .. }
             ) {
                 let _ = agent_tx.send_packet(msg).await;
             }
