@@ -1201,53 +1201,106 @@ fn send_background_job_notification(
     let _ = outbound_tx.try_send(BusMessage::Outbound(notice));
 }
 
-fn classify_run_outcome(
-    result: &Result<Result<String, String>, Box<dyn std::any::Any + Send>>,
-    cancelled: bool,
-    max_iterations: usize,
-) -> RunOutcome {
-    if cancelled {
-        return RunOutcome::Cancelled;
+/// The reasoning loop's terminal state. This deliberately keeps the user-visible
+/// assistant text separate from the lifecycle outcome: lifecycle consumers must
+/// never infer state from a localized or provider-supplied message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReasoningLoopExit {
+    Completed {
+        assistant_text: String,
+    },
+    WaitingForUser {
+        ticket_id: String,
+    },
+    Cancelled {
+        assistant_text: String,
+    },
+    Stuck {
+        assistant_text: String,
+        reason: RunStuckReason,
+    },
+    BudgetExhausted {
+        assistant_text: String,
+        budget: RunBudgetSnapshot,
+    },
+    Failed {
+        assistant_text: String,
+        failure: RunFailureKind,
+        retryable: bool,
+    },
+}
+
+impl ReasoningLoopExit {
+    fn lifecycle_outcome(&self) -> RunOutcome {
+        match self {
+            Self::Completed { .. } | Self::WaitingForUser { .. } => RunOutcome::Completed,
+            Self::Cancelled { .. } => RunOutcome::Cancelled,
+            Self::Stuck { reason, .. } => RunOutcome::Stuck {
+                reason: reason.clone(),
+            },
+            Self::BudgetExhausted { budget, .. } => RunOutcome::BudgetExhausted {
+                budget: budget.clone(),
+            },
+            Self::Failed {
+                failure, retryable, ..
+            } => RunOutcome::Failed {
+                failure: failure.clone(),
+                retryable: *retryable,
+            },
+        }
     }
 
-    match result {
-        Err(_) => RunOutcome::Failed {
+    pub(crate) fn assistant_text(&self) -> Option<&str> {
+        match self {
+            Self::Completed { assistant_text }
+            | Self::Cancelled { assistant_text }
+            | Self::Stuck { assistant_text, .. }
+            | Self::BudgetExhausted { assistant_text, .. }
+            | Self::Failed { assistant_text, .. } => Some(assistant_text),
+            Self::WaitingForUser { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReasoningLoopError {
+    message: String,
+    failure: RunFailureKind,
+    retryable: bool,
+}
+
+impl ReasoningLoopError {
+    fn persistence(error: impl std::fmt::Display) -> Self {
+        Self {
+            message: error.to_string(),
+            failure: RunFailureKind::Persistence,
+            retryable: false,
+        }
+    }
+
+    fn protocol(message: String) -> Self {
+        Self {
+            message,
+            failure: RunFailureKind::Protocol,
+            retryable: false,
+        }
+    }
+
+    fn lifecycle_outcome(&self) -> RunOutcome {
+        RunOutcome::Failed {
+            failure: self.failure.clone(),
+            retryable: self.retryable,
+        }
+    }
+}
+
+impl From<String> for ReasoningLoopError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
             failure: RunFailureKind::Internal,
             retryable: false,
-        },
-        Ok(Err(error)) => {
-            let lower = error.to_ascii_lowercase();
-            let failure = if lower.contains("provider") || lower.contains("llm") {
-                RunFailureKind::Provider
-            } else if lower.contains("tool") {
-                RunFailureKind::Tool
-            } else if lower.contains("persist") || lower.contains("memory") {
-                RunFailureKind::Persistence
-            } else if lower.contains("protocol") || lower.contains("metadata") {
-                RunFailureKind::Protocol
-            } else {
-                RunFailureKind::Internal
-            };
-            let retryable = matches!(failure, RunFailureKind::Provider);
-            RunOutcome::Failed { failure, retryable }
         }
-        Ok(Ok(message)) if message.starts_with(WAITING_FOR_USER_RESULT_PREFIX) => {
-            RunOutcome::Completed
-        }
-        Ok(Ok(message)) if message.starts_with("Stopped: the agent kept repeating") => {
-            RunOutcome::Stuck {
-                reason: RunStuckReason::DoomLoop,
-            }
-        }
-        Ok(Ok(message)) if message == "Agent reached max reasoning iterations." => {
-            RunOutcome::BudgetExhausted {
-                budget: RunBudgetSnapshot {
-                    iterations_used: max_iterations,
-                    iterations_limit: max_iterations,
-                },
-            }
-        }
-        Ok(Ok(_)) => RunOutcome::Completed,
     }
 }
 
@@ -1391,7 +1444,10 @@ fn spawn_main_chat_reasoning_turn(
                 let _ = logger_tx.send(BusMessage::Log(
                     LogEvent::error(
                         "AgentLogic",
-                        &format!("Reasoning loop failed for chat_id {}: {}", task_chat_id, e),
+                        &format!(
+                            "Reasoning loop failed for chat_id {}: {}",
+                            task_chat_id, e.message
+                        ),
                     )
                     .with_chat_id(&task_chat_id),
                 ));
@@ -1399,11 +1455,11 @@ fn spawn_main_chat_reasoning_turn(
                     &inbound_channel,
                     &task_chat_id,
                     inbound_thread_id.as_deref(),
-                    e,
+                    &e.message,
                 );
                 let _ = outbound_tx.send(BusMessage::Outbound(notice)).await;
             }
-            Ok(Ok(_)) if task_token_arc.is_cancelled() => {
+            Ok(Ok(ReasoningLoopExit::Cancelled { .. })) => {
                 let _ = logger_tx.send(BusMessage::Log(
                     LogEvent::info(
                         &agent_name,
@@ -1458,7 +1514,14 @@ fn spawn_main_chat_reasoning_turn(
             }
         }
 
-        let outcome = classify_run_outcome(&res, task_token_arc.is_cancelled(), max_iterations);
+        let outcome = match &res {
+            Ok(Ok(exit)) => exit.lifecycle_outcome(),
+            Ok(Err(error)) => error.lifecycle_outcome(),
+            Err(_) => RunOutcome::Failed {
+                failure: RunFailureKind::Internal,
+                retryable: false,
+            },
+        };
         if outbound_tx
             .send(BusMessage::RunLifecycle(RunLifecycleEvent::Terminated {
                 run_id: run_id.clone(),
@@ -1479,15 +1542,15 @@ fn spawn_main_chat_reasoning_turn(
 
         if let Some(job_id) = background_job_id {
             let (state, last_error) = match &res {
-                Ok(Ok(s)) if s.starts_with(WAITING_FOR_USER_RESULT_PREFIX) => ("waiting", None),
-                Ok(Ok(_)) => {
-                    if task_token_arc.is_cancelled() {
-                        ("failed", Some("Cancelled".to_string()))
-                    } else {
-                        ("completed", None)
-                    }
+                Ok(Ok(ReasoningLoopExit::WaitingForUser { .. })) => ("waiting", None),
+                Ok(Ok(ReasoningLoopExit::Cancelled { .. })) => {
+                    ("failed", Some("Cancelled".to_string()))
                 }
-                Ok(Err(e)) => ("failed", Some(e.to_string())),
+                Ok(Ok(ReasoningLoopExit::Failed { assistant_text, .. })) => {
+                    ("failed", Some(assistant_text.clone()))
+                }
+                Ok(Ok(_)) => ("completed", None),
+                Ok(Err(e)) => ("failed", Some(e.message.clone())),
                 Err(_) => ("failed", Some("Panic in reasoning loop".to_string())),
             };
 
@@ -2805,7 +2868,9 @@ fn build_llm_failed_banner(
 }
 
 impl AgentLogic {
-    pub(crate) async fn run_reasoning_loop(ctx: ReasoningLoopCtx) -> Result<String, String> {
+    pub(crate) async fn run_reasoning_loop(
+        ctx: ReasoningLoopCtx,
+    ) -> Result<ReasoningLoopExit, ReasoningLoopError> {
         let ReasoningLoopCtx {
             name,
             provider,
@@ -2839,7 +2904,10 @@ impl AgentLogic {
         let session_key = tool_exec_ctx.session_key.clone();
         let cancel_notice = "Request cancelled while the agent was processing this turn.";
 
-        let mut mem = session_manager.get_session(&session_key).await?;
+        let mut mem = session_manager
+            .get_session(&session_key)
+            .await
+            .map_err(ReasoningLoopError::persistence)?;
 
         macro_rules! persist_and_cancel {
             () => {{
@@ -2851,7 +2919,9 @@ impl AgentLogic {
                     cancel_notice,
                 )
                 .await;
-                return Ok(String::new());
+                return Ok(ReasoningLoopExit::Cancelled {
+                    assistant_text: cancel_notice.to_string(),
+                });
             }};
         }
 
@@ -2937,7 +3007,9 @@ impl AgentLogic {
                 )
                 .await
                 {
-                    UserPromptHookOutcome::Block(msg) => return Err(msg),
+                    UserPromptHookOutcome::Block(msg) => {
+                        return Err(ReasoningLoopError::protocol(msg));
+                    }
                     UserPromptHookOutcome::InjectPrefix(prefix) => {
                         contextualized_content = format!("{}\n{}", prefix, contextualized_content);
                     }
@@ -2955,7 +3027,9 @@ impl AgentLogic {
                 &inbound.attachments,
             )
         };
-        mem.add_message(user_msg).await?;
+        mem.add_message(user_msg)
+            .await
+            .map_err(ReasoningLoopError::persistence)?;
 
         // Emit an initial thought so the user knows reasoning has started
         let _ = outbound_tx
@@ -3199,7 +3273,9 @@ impl AgentLogic {
                         consecutive_doom_detections = 0;
                     }
                     let correction = crate::utils::ChatMessage::user(&prompt);
-                    mem.add_message(correction.clone()).await?;
+                    mem.add_message(correction.clone())
+                        .await
+                        .map_err(ReasoningLoopError::persistence)?;
                     context.push(correction);
                     let _ = logger_tx.send(BusMessage::Log(
                         LogEvent::warn(
@@ -3374,7 +3450,11 @@ impl AgentLogic {
                         );
                     }
                     let _ = outbound_tx.send(BusMessage::Outbound(banner)).await;
-                    return Err(err);
+                    return Ok(ReasoningLoopExit::Failed {
+                        assistant_text: persisted,
+                        failure: RunFailureKind::Provider,
+                        retryable: false,
+                    });
                 }
                 ChatRetryOutcome::Failed(err) => {
                     let persisted = format!(
@@ -3403,7 +3483,11 @@ impl AgentLogic {
                         );
                     }
                     let _ = outbound_tx.send(BusMessage::Outbound(banner)).await;
-                    return Err(err);
+                    return Ok(ReasoningLoopExit::Failed {
+                        assistant_text: persisted,
+                        failure: RunFailureKind::ProviderRetriesExhausted,
+                        retryable: true,
+                    });
                 }
             };
 
@@ -3462,7 +3546,9 @@ impl AgentLogic {
                     reasoning_content: response.reasoning_content.clone(),
                     is_error: None,
                 };
-                mem.add_message(assistant_msg).await?;
+                mem.add_message(assistant_msg)
+                    .await
+                    .map_err(ReasoningLoopError::persistence)?;
 
                 let parallel_ok = !is_subagent
                     && tool_calls.len() > 1
@@ -3568,10 +3654,7 @@ impl AgentLogic {
                             ToolExecutionFinished::Completed(res) => res,
                             ToolExecutionFinished::Waiting(ticket_id) => {
                                 // Break the iteration loop; the job is now in 'waiting' state.
-                                return Ok(format!(
-                                    "{}{}",
-                                    WAITING_FOR_USER_RESULT_PREFIX, ticket_id
-                                ));
+                                return Ok(ReasoningLoopExit::WaitingForUser { ticket_id });
                             }
                             ToolExecutionFinished::Cancelled => {
                                 persist_and_cancel!();
@@ -3612,7 +3695,8 @@ impl AgentLogic {
                             Some(tool_name.as_str()),
                             is_error,
                         ))
-                        .await?;
+                        .await
+                        .map_err(ReasoningLoopError::persistence)?;
                     }
                     tool_invoked = true;
                     forbid_final_nudges = 0;
@@ -3679,10 +3763,7 @@ impl AgentLogic {
                             ToolExecutionFinished::Completed(res) => res,
                             ToolExecutionFinished::Waiting(ticket_id) => {
                                 // Break the iteration loop; the job is now in 'waiting' state.
-                                return Ok(format!(
-                                    "{}{}",
-                                    WAITING_FOR_USER_RESULT_PREFIX, ticket_id
-                                ));
+                                return Ok(ReasoningLoopExit::WaitingForUser { ticket_id });
                             }
                             ToolExecutionFinished::Cancelled => {
                                 persist_and_cancel!();
@@ -3726,7 +3807,8 @@ impl AgentLogic {
                             Some(tool_name.as_str()),
                             is_error,
                         ))
-                        .await?;
+                        .await
+                        .map_err(ReasoningLoopError::persistence)?;
                         tool_invoked = true;
                         forbid_final_nudges = 0;
                     }
@@ -3734,7 +3816,9 @@ impl AgentLogic {
             } else {
                 let mut assistant_msg = crate::utils::ChatMessage::assistant(&response_text);
                 assistant_msg.reasoning_content = response.reasoning_content.clone();
-                mem.add_message(assistant_msg).await?;
+                mem.add_message(assistant_msg)
+                    .await
+                    .map_err(ReasoningLoopError::persistence)?;
             }
 
             if !tool_invoked {
@@ -3744,7 +3828,9 @@ impl AgentLogic {
                 {
                     let nudge = "[SYSTEM: You used tools but did not produce a text reply for the user. Please summarize your findings or answer the user's question now.]";
                     let correction = crate::utils::ChatMessage::user(nudge);
-                    mem.add_message(correction).await?;
+                    mem.add_message(correction)
+                        .await
+                        .map_err(ReasoningLoopError::persistence)?;
                     continue;
                 }
                 let research_nudge =
@@ -3756,7 +3842,9 @@ impl AgentLogic {
                     forbid_final_nudges += 1;
                     let nudge = "[SYSTEM: Continue with at least one tool call (or `ask_user` if you are blocked). Plain assistant text alone is not sufficient for this session until the objective is met.]";
                     let correction = crate::utils::ChatMessage::user(nudge);
-                    mem.add_message(correction).await?;
+                    mem.add_message(correction)
+                        .await
+                        .map_err(ReasoningLoopError::persistence)?;
                     continue;
                 }
                 if research_nudge {
@@ -3769,7 +3857,9 @@ impl AgentLogic {
                         .await;
                     let nudge = "[SYSTEM: Research depth check — you used discovery search but did not fetch primary sources. Before finalizing, use `web_fetch`/`arxiv_fetch` (and/or `hf_hub_file_fetch`) on concrete sources, cross-verify at least two sources, then synthesize findings with explicit uncertainties.]";
                     let correction = crate::utils::ChatMessage::user(nudge);
-                    mem.add_message(correction).await?;
+                    mem.add_message(correction)
+                        .await
+                        .map_err(ReasoningLoopError::persistence)?;
                     continue;
                 }
                 // Final outbound text
@@ -3799,7 +3889,10 @@ impl AgentLogic {
                 ));
 
                 // Auto-compaction check
-                let current_context = mem.get_context_since_reflection().await?;
+                let current_context = mem
+                    .get_context_since_reflection()
+                    .await
+                    .map_err(ReasoningLoopError::persistence)?;
                 let user_turns = current_context.iter().filter(|m| m.role == "user").count();
                 // Prefer the ground truth: `last_prompt_tokens` is the exact input size the provider
                 // counted for the most recent request, which (at this end-of-turn point) covers
@@ -3877,7 +3970,9 @@ impl AgentLogic {
                 }
 
                 let _ = outbound_tx.send(BusMessage::Outbound(outbound)).await;
-                return Ok(final_response);
+                return Ok(ReasoningLoopExit::Completed {
+                    assistant_text: final_response,
+                });
             }
         }
 
@@ -3907,7 +4002,20 @@ impl AgentLogic {
             metadata: HashMap::new(),
         };
         let _ = outbound_tx.send(BusMessage::Outbound(fallback)).await;
-        Ok(max_iter_msg)
+        if doom_loop_stuck {
+            Ok(ReasoningLoopExit::Stuck {
+                assistant_text: max_iter_msg,
+                reason: RunStuckReason::DoomLoop,
+            })
+        } else {
+            Ok(ReasoningLoopExit::BudgetExhausted {
+                assistant_text: max_iter_msg,
+                budget: RunBudgetSnapshot {
+                    iterations_used: max_iterations,
+                    iterations_limit: max_iterations,
+                },
+            })
+        }
     }
 }
 
@@ -4003,7 +4111,7 @@ impl Tool for LoadSkillTool {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentLogic, AgentLogicParams, ReasoningLoopCtx};
+    use super::{AgentLogic, AgentLogicParams, ReasoningLoopCtx, ReasoningLoopExit};
     use async_trait::async_trait;
     use axum::{
         body::Body,
@@ -4022,8 +4130,8 @@ mod tests {
     use tower::util::ServiceExt;
 
     use crate::bus::{
-        clarification_session_key, BusMessage, InboundMessage, RunLifecycleEvent, RunOutcome,
-        RunStuckReason, METADATA_RUN_ID,
+        clarification_session_key, BusMessage, InboundMessage, RunBudgetSnapshot, RunFailureKind,
+        RunLifecycleEvent, RunOutcome, RunStuckReason, METADATA_RUN_ID,
     };
     use crate::clarification::ClarificationHub;
     use crate::logging::create_logger_channel;
@@ -4526,7 +4634,10 @@ mod tests {
         max_iterations: usize,
         cancelled_before_start: bool,
         doom_loop_enabled: bool,
-    ) -> (Result<String, String>, Vec<ChatMessage>) {
+    ) -> (
+        Result<ReasoningLoopExit, super::ReasoningLoopError>,
+        Vec<ChatMessage>,
+    ) {
         let memory_actor = SqliteMemoryActor::new(":memory:").expect("memory actor");
         let memory_node = NodeHandle::new(memory_actor, 16, 1, Duration::from_millis(1));
         let session_manager = Arc::new(SessionManager::new(memory_node));
@@ -5042,26 +5153,89 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn terminal_outcome_classifies_budget_and_doom_loop_without_generic_success() {
-        let budget = super::classify_run_outcome(
-            &Ok(Ok("Agent reached max reasoning iterations.".to_string())),
-            false,
-            7,
+    #[tokio::test]
+    async fn provider_retry_exhaustion_emits_one_typed_lifecycle_pair() {
+        let (mut agent, mut outbound_rx) =
+            build_agent_with_provider(Box::new(NonTransientErrorProvider));
+        let mut inbound = test_inbound("provider-terminal-chat", "hello");
+        inbound.channel = "tauri".to_string();
+        inbound.metadata.insert(
+            METADATA_RUN_ID.to_string(),
+            serde_json::json!("provider-terminal-run"),
         );
+        agent
+            .process(BusMessage::Inbound(inbound))
+            .await
+            .expect("process inbound");
+
+        let mut lifecycle_events = Vec::new();
+        while lifecycle_events.len() < 2 {
+            let event = tokio::time::timeout(Duration::from_secs(2), outbound_rx.recv())
+                .await
+                .expect("lifecycle event before timeout")
+                .expect("outbound channel remains open");
+            if let BusMessage::RunLifecycle(event) = event {
+                lifecycle_events.push(event);
+            }
+        }
+
+        assert!(matches!(
+            lifecycle_events.as_slice(),
+            [
+                RunLifecycleEvent::Started { run_id, chat_id },
+                RunLifecycleEvent::Terminated {
+                    run_id: terminal_run_id,
+                    chat_id: terminal_chat_id,
+                    outcome: RunOutcome::Failed {
+                        failure: RunFailureKind::ProviderRetriesExhausted,
+                        retryable: true,
+                    },
+                },
+            ] if run_id == "provider-terminal-run"
+                && chat_id == "provider-terminal-chat"
+                && terminal_run_id == run_id
+                && terminal_chat_id == chat_id
+        ));
+
+        let extra_lifecycle = tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                match outbound_rx.recv().await {
+                    Some(BusMessage::RunLifecycle(event)) => return Some(event),
+                    Some(_) => continue,
+                    None => return None,
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten();
+        assert!(
+            extra_lifecycle.is_none(),
+            "only one lifecycle pair is emitted"
+        );
+    }
+
+    #[test]
+    fn typed_terminal_exits_preserve_budget_and_doom_loop_outcomes() {
+        let budget = ReasoningLoopExit::BudgetExhausted {
+            assistant_text: "any localized assistant text".to_string(),
+            budget: RunBudgetSnapshot {
+                iterations_used: 7,
+                iterations_limit: 7,
+            },
+        }
+        .lifecycle_outcome();
         assert!(matches!(
             budget,
             RunOutcome::BudgetExhausted { budget }
                 if budget.iterations_used == 7 && budget.iterations_limit == 7
         ));
 
-        let stuck = super::classify_run_outcome(
-            &Ok(Ok(
-                "Stopped: the agent kept repeating the same action with no progress".to_string(),
-            )),
-            false,
-            7,
-        );
+        let stuck = ReasoningLoopExit::Stuck {
+            assistant_text: "unrelated assistant text".to_string(),
+            reason: RunStuckReason::DoomLoop,
+        }
+        .lifecycle_outcome();
         assert_eq!(
             stuck,
             RunOutcome::Stuck {
@@ -5180,7 +5354,14 @@ mod tests {
     async fn run_reasoning_loop_persists_terminal_message_on_llm_failure() {
         let (result, context) =
             run_loop_once_for_test(Box::new(NonTransientErrorProvider), 2, false, false).await;
-        assert!(result.is_err(), "expected llm failure");
+        assert!(matches!(
+            result,
+            Ok(ReasoningLoopExit::Failed {
+                failure: RunFailureKind::ProviderRetriesExhausted,
+                retryable: true,
+                ..
+            })
+        ));
         let last = context.last().expect("last message");
         assert_eq!(last.role, "assistant");
         let text = last
@@ -5198,10 +5379,10 @@ mod tests {
     async fn run_reasoning_loop_persists_terminal_message_on_max_iterations() {
         let (result, context) =
             run_loop_once_for_test(Box::new(DummyProvider), 0, false, false).await;
-        assert_eq!(
+        assert!(matches!(
             result.expect("max iterations fallback"),
-            "Agent reached max reasoning iterations."
-        );
+            ReasoningLoopExit::BudgetExhausted { .. }
+        ));
         let last = context.last().expect("last message");
         assert_eq!(last.role, "assistant");
         let text = last
@@ -5219,7 +5400,9 @@ mod tests {
         // max_iterations is high; the doom escalation should terminate the run much earlier.
         let (result, _context) =
             run_loop_once_for_test(Box::new(IdenticalToolCallProvider), 50, false, true).await;
-        let msg = result.expect("terminal message");
+        let exit = result.expect("terminal message");
+        assert!(matches!(&exit, ReasoningLoopExit::Stuck { .. }));
+        let msg = exit.assistant_text().expect("stuck assistant text");
         assert!(
             msg.starts_with("Stopped:") && msg.contains("repeating"),
             "expected doom-loop stuck message, got: {msg}"
@@ -5234,10 +5417,10 @@ mod tests {
     async fn doom_loop_disabled_runs_to_max_iterations() {
         let (result, _context) =
             run_loop_once_for_test(Box::new(IdenticalToolCallProvider), 3, false, false).await;
-        assert_eq!(
+        assert!(matches!(
             result.expect("terminal message"),
-            "Agent reached max reasoning iterations."
-        );
+            ReasoningLoopExit::BudgetExhausted { .. }
+        ));
     }
 
     // P1.4 (review regression): a model that loops then CORRECTS after the nudge must NOT be
@@ -5249,11 +5432,10 @@ mod tests {
             calls: Arc::new(AtomicUsize::new(0)),
         });
         let (result, _context) = run_loop_once_for_test(provider, 8, false, true).await;
-        assert_eq!(
+        assert!(matches!(
             result.expect("terminal message"),
-            "Agent reached max reasoning iterations.",
-            "a model that corrected after a nudge must not be hard-stopped"
-        );
+            ReasoningLoopExit::BudgetExhausted { .. }
+        ));
     }
 
     // P1.4: the shared token estimator counts tool_call argument bytes, not just content text
@@ -5295,7 +5477,10 @@ mod tests {
     async fn run_reasoning_loop_persists_terminal_message_on_cancel() {
         let (result, context) =
             run_loop_once_for_test(Box::new(DummyProvider), 2, true, false).await;
-        assert_eq!(result.expect("cancelled run"), "");
+        assert!(matches!(
+            result.expect("cancelled run"),
+            ReasoningLoopExit::Cancelled { .. }
+        ));
         let last = context.last().expect("last message");
         assert_eq!(last.role, "assistant");
         let text = last
