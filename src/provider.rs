@@ -255,8 +255,8 @@ impl GeminiProvider {
                                     json!({"text": format!("[image: {}]", image_url.url)})
                                 }
                                 ContentPart::Document { document } => json!({
-                                    "inline_data": {
-                                        "mime_type": document.media_type,
+                                    "inlineData": {
+                                        "mimeType": document.media_type,
                                         "data": document.data,
                                     }
                                 }),
@@ -279,20 +279,21 @@ impl GeminiProvider {
                             tool_names.insert(call.id.clone(), call.function.name.clone());
                             let args = serde_json::from_str::<Value>(&call.function.arguments)
                                 .unwrap_or_else(|_| json!({}));
-                            let mut function_call = json!({
+                            let function_call = json!({
                                 "name": call.function.name,
                                 "args": args,
                                 "id": call.id,
                             });
+                            let mut part = json!({"functionCall": function_call});
                             if let Some(extra) = &call.extra_content {
                                 if let Some(signature) = extra
                                     .get("thoughtSignature")
                                     .or_else(|| extra.get("thought_signature"))
                                 {
-                                    function_call["thoughtSignature"] = signature.clone();
+                                    part["thoughtSignature"] = signature.clone();
                                 }
                             }
-                            parts.push(json!({"functionCall": function_call}));
+                            parts.push(part);
                         }
                     }
                     if parts.is_empty() {
@@ -344,7 +345,7 @@ impl Provider for GeminiProvider {
             "generationConfig": {"temperature": self.temperature},
         });
         if let Some(system_instruction) = system_instruction {
-            body["system_instruction"] = system_instruction;
+            body["systemInstruction"] = system_instruction;
         }
         if let Some(tools) = tools {
             let tools = Self::convert_tools(&tools);
@@ -401,9 +402,9 @@ impl Provider for GeminiProvider {
                     .map(str::to_string)
                     .unwrap_or_else(|| format!("gemini_call_{index}"));
                 let mut extra_content = serde_json::Map::new();
-                if let Some(signature) = call
+                if let Some(signature) = part
                     .get("thoughtSignature")
-                    .or_else(|| call.get("thought_signature"))
+                    .or_else(|| part.get("thought_signature"))
                 {
                     extra_content.insert("thought_signature".to_string(), signature.clone());
                 }
@@ -1000,11 +1001,11 @@ mod is_error_tests {
             "PDF must remain attached to the user turn"
         );
         assert_eq!(
-            contents[0]["parts"][1]["inline_data"]["mime_type"],
+            contents[0]["parts"][1]["inlineData"]["mimeType"],
             serde_json::json!("application/pdf")
         );
         assert_eq!(
-            contents[0]["parts"][1]["inline_data"]["data"],
+            contents[0]["parts"][1]["inlineData"]["data"],
             serde_json::json!("not-valid-pdf-data")
         );
     }
@@ -1037,8 +1038,14 @@ mod is_error_tests {
             serde_json::json!("gemini-call-1")
         );
         assert_eq!(
-            contents[0]["parts"][0]["functionCall"]["thoughtSignature"],
+            contents[0]["parts"][0]["thoughtSignature"],
             serde_json::json!("signed")
+        );
+        assert!(
+            contents[0]["parts"][0]["functionCall"]
+                .get("thoughtSignature")
+                .is_none(),
+            "thought signatures belong to the surrounding Gemini Part, not FunctionCall"
         );
         assert_eq!(
             contents[1]["parts"][0]["functionResponse"]["name"],
