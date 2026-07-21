@@ -14,6 +14,8 @@ static ONBOARD_SYNTHETIC_SKILL_DIR: Dir<'static> =
     include_dir!("$CARGO_MANIFEST_DIR/assets/onboarding/skills/synthetic-dataset-with-afterimage");
 static ONBOARD_KERNEL_PORTING_SKILL_DIR: Dir<'static> =
     include_dir!("$CARGO_MANIFEST_DIR/assets/onboarding/skills/kernel-porting");
+static ONBOARD_AUTOTRAINESS_SKILL_DIR: Dir<'static> =
+    include_dir!("$CARGO_MANIFEST_DIR/assets/onboarding/skills/autotrainess");
 static ONBOARD_KERNEL_AGENT_PROMPTS_DIR: Dir<'static> =
     include_dir!("$CARGO_MANIFEST_DIR/assets/onboarding/agents/prompts");
 static ONBOARD_KERNEL_REFERENCE_DIR: Dir<'static> =
@@ -567,6 +569,7 @@ fn write_all_templates(
 
     write_embedded_synthetic_skill_tree(&layout.root, report)?;
     write_embedded_kernel_porting_tree(&layout.root, report)?;
+    write_embedded_autotrainess_tree(&layout.root, report)?;
 
     let overlay_ref = workspace_ml_engineer_overlay_reference();
     write_if_missing_string(
@@ -594,6 +597,7 @@ directory (merged by `compile_system_prompt`).\n\n---\n\n{}",
 
 const SYNTHETIC_SKILL_REL_PREFIX: &str = "workspace/skills/synthetic-dataset-with-afterimage";
 const KERNEL_PORTING_SKILL_REL_PREFIX: &str = "workspace/skills/kernel-porting";
+const AUTOTRAINESS_SKILL_REL_PREFIX: &str = "workspace/skills/autotrainess";
 const KERNEL_AGENT_PROMPTS_REL_PREFIX: &str = "workspace/.agents/prompts";
 const KERNEL_REFERENCE_REL_PREFIX: &str = "workspace/kernels/reference";
 const KERNEL_BENCHMARKS_REL_PREFIX: &str = "workspace/benchmarks";
@@ -671,6 +675,36 @@ fn write_embedded_kernel_porting_tree(
         if !schema_dest.exists() && fs::copy(&schema_src, &schema_dest).is_ok() {
             report.created.push(PathBuf::from(
                 "workspace/.agents/kernel-porting/map_elites.schema.json",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn write_embedded_autotrainess_tree(
+    root: &Path,
+    report: &mut BootstrapReport,
+) -> Result<(), String> {
+    write_embedded_dir_recursive(
+        &ONBOARD_AUTOTRAINESS_SKILL_DIR,
+        root,
+        AUTOTRAINESS_SKILL_REL_PREFIX,
+        Path::new(""),
+        report,
+    )?;
+    // Convenience copy: iteration plan accessible at .agents/autotrainess/
+    let plan_src = root.join(format!(
+        "{}/iteration_plan.json",
+        AUTOTRAINESS_SKILL_REL_PREFIX
+    ));
+    let plan_dest = root.join("workspace/.agents/autotrainess/iteration_plan.json");
+    if plan_src.exists() {
+        if let Some(parent) = plan_dest.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if !plan_dest.exists() && fs::copy(&plan_src, &plan_dest).is_ok() {
+            report.created.push(PathBuf::from(
+                "workspace/.agents/autotrainess/iteration_plan.json",
             ));
         }
     }

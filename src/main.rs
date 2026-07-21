@@ -519,6 +519,13 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             std::sync::Arc::new(workspace.config.clone()),
         );
     }
+    if workspace.config.autotrainess_harness_enabled() {
+        isanagent::tools::autotrainess::register_autotrainess_tools(
+            &mut tools,
+            workspace.sandbox_dir.clone(),
+            std::sync::Arc::new(workspace.config.clone()),
+        );
+    }
     let tool_catalog = tools.catalog_handle();
     tools.register(Box::new(ToolSearchTool {
         catalog: tool_catalog,

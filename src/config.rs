@@ -266,6 +266,16 @@ pub struct KernelPortingHarnessConfig {
     pub mutation_batch_size: Option<usize>,
 }
 
+/// AutoTrainess autonomous post-training (`train_db_*` tools). See `docs/autotrainess-user-guide.md`.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct AutoTrainessHarnessConfig {
+    pub enabled: Option<bool>,
+    /// Sandbox-relative root for training projects (default `train/projects`).
+    pub default_project_root: Option<String>,
+    /// Max iteration entries retained per project ledger (default 500).
+    pub max_log_entries: Option<usize>,
+}
+
 /// Optional harness features (see `docs/harness-implementation-plan.md`).
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct HarnessConfig {
@@ -274,6 +284,8 @@ pub struct HarnessConfig {
     pub subagents: Option<SubagentHarnessConfig>,
     /// Triton→Pallas porting and MAP-Elites evolution tools.
     pub kernel_porting: Option<KernelPortingHarnessConfig>,
+    /// AutoTrainess experiment ledger and post-training workflow tools.
+    pub autotrainess: Option<AutoTrainessHarnessConfig>,
     /// Named agent definitions loaded from `[agents.<name>]` (Phase 5b).
     #[serde(default)]
     pub agents: std::collections::HashMap<String, AgentDefinition>,
@@ -711,6 +723,34 @@ impl AppConfig {
             .and_then(|k| k.mutation_batch_size)
             .unwrap_or(4)
             .clamp(1, 64)
+    }
+
+    /// When true under `[harness.autotrainess]`, `train_db_*` tools are registered.
+    pub fn autotrainess_harness_enabled(&self) -> bool {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.autotrainess.as_ref())
+            .and_then(|a| a.enabled)
+            .unwrap_or(false)
+    }
+
+    pub fn autotrainess_default_project_root(&self) -> String {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.autotrainess.as_ref())
+            .and_then(|a| a.default_project_root.as_ref())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "train/projects".to_string())
+    }
+
+    pub fn autotrainess_max_log_entries(&self) -> usize {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.autotrainess.as_ref())
+            .and_then(|a| a.max_log_entries)
+            .unwrap_or(500)
+            .clamp(10, 10_000)
     }
 
     /// `[harness.ml_engineer] enabled = true` appends ML policy overlay to the system prompt.
