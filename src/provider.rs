@@ -223,7 +223,7 @@ impl GeminiProvider {
         else {
             return json!({"text": format!("[image: {url}]")});
         };
-        json!({"inline_data": {"mime_type": media_type, "data": data}})
+        json!({"inlineData": {"mimeType": media_type, "data": data}})
     }
 
     /// Convert internal history to Gemini's Content/Part schema.
