@@ -605,26 +605,46 @@ impl SubagentHarness {
         tokio::spawn(async move {
             let outcome = super::AgentLogic::run_reasoning_loop(ctx).await;
             let (status_str, result_opt, err_opt) = match outcome {
-                Ok(text) => {
-                    if rec.cancel.is_cancelled() {
-                        rec.status
-                            .store(ST_CANCELLED, std::sync::atomic::Ordering::Release);
-                        ("cancelled".to_string(), None, Some("cancelled".to_string()))
-                    } else {
-                        {
-                            let mut r = rec.result.write().await;
-                            *r = Some(text.clone());
-                        }
-                        rec.status
-                            .store(ST_COMPLETED, std::sync::atomic::Ordering::Release);
-                        ("completed".to_string(), Some(text), None)
-                    }
+                Ok(super::ReasoningLoopExit::Cancelled { .. }) => {
+                    rec.status
+                        .store(ST_CANCELLED, std::sync::atomic::Ordering::Release);
+                    ("cancelled".to_string(), None, Some("cancelled".to_string()))
                 }
-                Err(e) => {
-                    *rec.error.write().await = Some(e.clone());
+                Ok(super::ReasoningLoopExit::Failed { assistant_text, .. }) => {
+                    *rec.error.write().await = Some(assistant_text.clone());
                     rec.status
                         .store(ST_FAILED, std::sync::atomic::Ordering::Release);
-                    ("failed".to_string(), None, Some(e))
+                    ("failed".to_string(), None, Some(assistant_text))
+                }
+                Ok(super::ReasoningLoopExit::WaitingForUser { ticket_id }) => {
+                    // Keep the established parent-agent handoff contract. A subagent
+                    // caller receives this result and uses the prefix to surface the
+                    // outstanding clarification instead of treating it as an empty
+                    // successful completion.
+                    let text = format!("{}{}", super::WAITING_FOR_USER_RESULT_PREFIX, ticket_id);
+                    {
+                        let mut r = rec.result.write().await;
+                        *r = Some(text.clone());
+                    }
+                    rec.status
+                        .store(ST_COMPLETED, std::sync::atomic::Ordering::Release);
+                    ("completed".to_string(), Some(text), None)
+                }
+                Ok(exit) => {
+                    let text = exit.assistant_text().unwrap_or_default().to_string();
+                    {
+                        let mut r = rec.result.write().await;
+                        *r = Some(text.clone());
+                    }
+                    rec.status
+                        .store(ST_COMPLETED, std::sync::atomic::Ordering::Release);
+                    ("completed".to_string(), Some(text), None)
+                }
+                Err(e) => {
+                    *rec.error.write().await = Some(e.message.clone());
+                    rec.status
+                        .store(ST_FAILED, std::sync::atomic::Ordering::Release);
+                    ("failed".to_string(), None, Some(e.message))
                 }
             };
 
