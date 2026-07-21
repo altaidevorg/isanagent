@@ -1992,7 +1992,11 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 // Keep ownership registered until the reasoning task emits its
                 // terminal lifecycle event and finalizes. New inbound arriving
                 // during cancellation must queue behind that acknowledgement.
-                if let Some(token) = self.cancellation_tokens.get(&chat_id) {
+                if let Some(token) = self
+                    .cancellation_tokens
+                    .get(&chat_id)
+                    .map(|entry| entry.value().clone())
+                {
                     token.cancel();
                     let _ = self.logger_tx.send(BusMessage::Log(
                         LogEvent::info(
