@@ -25,6 +25,17 @@ pub enum ContentPart {
     Text { text: String },
     /// An image referenced by URL or base64 data URI.
     ImageUrl { image_url: ImageUrl },
+    /// A model-native document attachment. Currently used for PDFs, with the
+    /// original base64 payload preserved instead of host-side OCR/extraction.
+    Document { document: Document },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Document {
+    pub data: String,
+    pub media_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// Image reference inside a content part.
@@ -59,6 +70,7 @@ impl MessageContent {
                 .filter_map(|p| match p {
                     ContentPart::Text { text } => Some(text.as_str()),
                     ContentPart::ImageUrl { .. } => None,
+                    ContentPart::Document { .. } => None,
                 })
                 .collect::<Vec<_>>()
                 .join("\n\n"),

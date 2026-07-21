@@ -1,7 +1,7 @@
 use crate::traits::Provider;
 use crate::utils::{
-    build_reqwest_client, ChatMessage, LLMClient, LLMError, LLMResponse, MessageContent,
-    TokenUsage, ToolCallFunction, ToolCallRequest,
+    build_reqwest_client, ChatMessage, ContentPart, Document, LLMClient, LLMError, LLMResponse,
+    MessageContent, TokenUsage, ToolCallFunction, ToolCallRequest,
 };
 
 /// Live credentials for the active LLM session (updated on `/model` switch).
@@ -69,6 +69,7 @@ pub fn provider_for_agent(
     }
 }
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use log::debug;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -104,6 +105,52 @@ impl OpenAIProvider {
     }
 }
 
+/// Convert a document attachment into text for APIs that do not support IsanAgent's
+/// internal `document` content part. Keeping this conversion at the provider boundary
+/// means strict OpenAI-compatible endpoints never receive an unknown content-part type.
+fn document_text_fallback(document: &Document) -> String {
+    let label = document.name.as_deref().unwrap_or("attached document");
+
+    if document.media_type != "application/pdf" {
+        return format!(
+            "[Document attachment: {label} ({})]\n\nThis document format cannot be sent natively to the selected model.",
+            document.media_type
+        );
+    }
+
+    let extracted = BASE64_STANDARD
+        .decode(&document.data)
+        .map_err(|error| format!("invalid base64 payload: {error}"))
+        .and_then(|pdf_bytes| crate::utils::extract_markdown_from_pdf_bytes(&pdf_bytes));
+
+    match extracted {
+        Ok(text) if !text.trim().is_empty() => format!("[PDF attachment: {label}]\n\n{text}"),
+        Ok(_) | Err(_) => format!(
+            "[PDF attachment: {label}]\n\nThe PDF could not be converted to text for the selected model."
+        ),
+    }
+}
+
+/// Replace document parts with text before they reach an OpenAI-compatible API.
+fn messages_with_document_text_fallback(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    messages
+        .iter()
+        .cloned()
+        .map(|mut message| {
+            if let Some(MessageContent::Parts(parts)) = &mut message.content {
+                for part in parts {
+                    if let ContentPart::Document { document } = part {
+                        *part = ContentPart::Text {
+                            text: document_text_fallback(document),
+                        };
+                    }
+                }
+            }
+            message
+        })
+        .collect()
+}
+
 #[async_trait]
 impl Provider for OpenAIProvider {
     async fn chat(
@@ -111,7 +158,8 @@ impl Provider for OpenAIProvider {
         messages: &[ChatMessage],
         tools: Option<serde_json::Value>,
     ) -> Result<LLMResponse, LLMError> {
-        self.client.chat(messages, tools).await
+        let messages = messages_with_document_text_fallback(messages);
+        self.client.chat(&messages, tools).await
     }
 }
 
@@ -179,7 +227,7 @@ impl AnthropicProvider {
 
     /// Convert internal ChatMessage list to Anthropic's format.
     /// Returns (system_prompt, messages_array).
-    fn convert_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) {
+    fn convert_messages(model: &str, messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) {
         let mut system_parts: Vec<String> = Vec::new();
         let mut anthropic_messages: Vec<Value> = Vec::new();
 
@@ -224,6 +272,32 @@ impl AnthropicProvider {
                                             // Anthropic only supports base64 image sources;
                                             // non-data URIs fall back to a text placeholder.
                                             json!({"type": "text", "text": format!("[image: {}]", image_url.url)})
+                                        }
+                                    }
+                                    crate::utils::ContentPart::Document { document } => {
+                                        // Native document blocks are only supported by Sonnet.
+                                        // Other Anthropic models must receive ordinary text;
+                                        // otherwise the Messages API rejects the request.
+                                        if model.to_ascii_lowercase().contains("sonnet")
+                                            && document.media_type == "application/pdf"
+                                        {
+                                            let mut block = json!({
+                                                "type": "document",
+                                                "source": {
+                                                    "type": "base64",
+                                                    "media_type": document.media_type,
+                                                    "data": document.data,
+                                                }
+                                            });
+                                            if let Some(name) = &document.name {
+                                                block["title"] = json!(name);
+                                            }
+                                            block
+                                        } else {
+                                            json!({
+                                                "type": "text",
+                                                "text": document_text_fallback(document)
+                                            })
                                         }
                                     }
                                 })
@@ -364,7 +438,7 @@ impl Provider for AnthropicProvider {
             messages.len()
         );
 
-        let (system, anthropic_messages) = Self::convert_messages(messages);
+        let (system, anthropic_messages) = Self::convert_messages(&self.model, messages);
 
         let mut body = json!({
             "model": self.model,
@@ -509,8 +583,21 @@ impl Provider for AnthropicProvider {
 
 #[cfg(test)]
 mod is_error_tests {
-    use super::AnthropicProvider;
-    use crate::utils::ChatMessage;
+    use super::{messages_with_document_text_fallback, AnthropicProvider};
+    use crate::utils::{ChatMessage, ContentPart, Document, MessageContent};
+
+    fn pdf_message() -> ChatMessage {
+        ChatMessage::user_multimodal(
+            "Please summarize this file.",
+            &[ContentPart::Document {
+                document: Document {
+                    data: "not-valid-pdf-data".to_string(),
+                    media_type: "application/pdf".to_string(),
+                    name: Some("report.pdf".to_string()),
+                },
+            }],
+        )
+    }
 
     /// Collect every `tool_result` content block across the converted Anthropic messages.
     fn tool_result_blocks(msgs: &[serde_json::Value]) -> Vec<serde_json::Value> {
@@ -534,7 +621,7 @@ mod is_error_tests {
             ChatMessage::tool_with_error("ok output", "call_2", Some("exec"), false),
             ChatMessage::tool("legacy output", "call_3", Some("exec")), // is_error == None
         ];
-        let (_system, anthropic) = AnthropicProvider::convert_messages(&msgs);
+        let (_system, anthropic) = AnthropicProvider::convert_messages("claude-3-5-sonnet", &msgs);
         let blocks = tool_result_blocks(&anthropic);
         assert_eq!(
             blocks.len(),
@@ -575,5 +662,47 @@ mod is_error_tests {
             body["messages"][0].get("is_error").is_none(),
             "is_error leaked inside the messages array: {body}"
         );
+    }
+
+    #[test]
+    fn anthropic_uses_native_pdf_blocks_only_for_sonnet() {
+        let messages = vec![pdf_message()];
+
+        let (_system, sonnet) =
+            AnthropicProvider::convert_messages("claude-3-5-sonnet-latest", &messages);
+        assert_eq!(
+            sonnet[0]["content"][1]["type"],
+            serde_json::json!("document"),
+            "Sonnet should retain the native PDF block"
+        );
+
+        let (_system, haiku) = AnthropicProvider::convert_messages("claude-3-5-haiku", &messages);
+        assert_eq!(
+            haiku[0]["content"][1]["type"],
+            serde_json::json!("text"),
+            "models without native document support must receive text"
+        );
+        assert!(
+            haiku[0]["content"][1]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("report.pdf")),
+            "the fallback should identify the attached document"
+        );
+    }
+
+    #[test]
+    fn openai_compatible_messages_never_include_document_parts() {
+        let messages = messages_with_document_text_fallback(&[pdf_message()]);
+        let Some(MessageContent::Parts(parts)) = &messages[0].content else {
+            panic!("expected multimodal parts");
+        };
+
+        assert!(
+            parts
+                .iter()
+                .all(|part| !matches!(part, ContentPart::Document { .. })),
+            "OpenAI-compatible request must not contain IsanAgent document parts"
+        );
+        assert!(matches!(parts[1], ContentPart::Text { .. }));
     }
 }
