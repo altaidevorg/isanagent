@@ -579,10 +579,10 @@ UV_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu124" \
 uv run --script train.py 2>&1 | tee "$out/logs/train.log"
 ```
 
-Preflight inside the workflow step:
+Preflight should live inside `train.py` and run through the same PEP 723 path as
+training. Put checks like this near script startup:
 
-```bash
-PYTHONNOUSERSITE=1 .venv/bin/python - <<'PY'
+```python
 import torch, transformers, sentence_transformers
 print("torch=", torch.__version__)
 print("transformers=", transformers.__version__)
@@ -592,7 +592,6 @@ if tuple(map(int, torch.__version__.split("+", 1)[0].split(".")[:2])) < (2, 6):
     raise RuntimeError("PyTorch >=2.6 required")
 if not torch.cuda.is_available():
     raise RuntimeError("CUDA unavailable")
-PY
 ```
 
 Training run command:
@@ -605,7 +604,9 @@ DISABLE_TRACKIO=1 \
 MODEL_NAME="${ALTAI_PARAM_MODEL_NAME}" \
 OUTPUT_DIR="$out" \
 PYTHONNOUSERSITE=1 \
-.venv/bin/python train.py 2>&1 | tee "$out/logs/train.log"
+UV_INDEX_URL="https://pypi.org/simple" \
+UV_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu124" \
+uv run --script train.py 2>&1 | tee "$out/logs/train.log"
 ```
 
 Expected success signals from the tested ThunderCompute A6000 smoke path:

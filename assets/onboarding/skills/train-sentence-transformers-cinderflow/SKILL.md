@@ -412,10 +412,10 @@ Before `cinderflow workflow validate` and `workflow submit`, inspect generated
 workflow YAML and stop if any of these checks fail:
 
 ```bash
-rg '\$\{inputs\.' workflow.yaml && exit 1
-rg '\$\{ inputs\.' workflow.yaml && exit 1
-rg '<BASE64' workflow.yaml && exit 1
-rg 'echo "[A-Za-z0-9+/=]{80,}" \| base64 -d' workflow.yaml && exit 1
+if rg -q '\$\{inputs\.' workflow.yaml; then exit 1; fi
+if rg -q '\$\{ inputs\.' workflow.yaml; then exit 1; fi
+if rg -q '<BASE64' workflow.yaml; then exit 1; fi
+if rg -q 'echo "[A-Za-z0-9+/=]{80,}" \| base64 -d' workflow.yaml; then exit 1; fi
 ```
 
 Interpretation:
@@ -442,7 +442,7 @@ with:
 Inside the shell command, read the resolved values from `ALTAI_PARAM_*`:
 
 ```bash
-TRAIN_SIZE="${ALTAI_PARAM_TRAIN_SIZE}" MAX_STEPS="${ALTAI_PARAM_MAX_STEPS}" MODEL_NAME="${ALTAI_PARAM_MODEL_NAME}" PYTHONNOUSERSITE=1 .venv/bin/python train.py
+TRAIN_SIZE="${ALTAI_PARAM_TRAIN_SIZE}" MAX_STEPS="${ALTAI_PARAM_MAX_STEPS}" MODEL_NAME="${ALTAI_PARAM_MODEL_NAME}" PYTHONNOUSERSITE=1 uv run --script train.py
 ```
 
 Never use these invalid forms:
@@ -463,8 +463,8 @@ Before submit, inspect the generated YAML and stop if any invalid substitution
 pattern is present:
 
 ```bash
-rg '\$\{inputs\.' workflow.yaml && exit 1
-rg '\$\{ inputs\.' workflow.yaml && exit 1
+if rg -q '\$\{inputs\.' workflow.yaml; then exit 1; fi
+if rg -q '\$\{ inputs\.' workflow.yaml; then exit 1; fi
 ```
 
 If logs show `ValueError: invalid literal for int() with base 10: '${inputs...}'`
@@ -488,7 +488,7 @@ Default to this flow for sentence-transformers smoke tests and training runs:
    It must use Altai v1 double-brace input substitution, e.g. `${{ inputs.max_steps }}`. Never use `${ inputs.max_steps }`, which remains a literal string and can cause `ValueError: invalid literal for int() with base 10`.
    - The generated workflow must decode the Base64 payload with `printf '%s'`, not `echo`. A failure `base64: invalid input` means the workflow generation is wrong and the training script never started.
    - Before validation/submission, reject generated YAML that contains `${inputs.` or `${ inputs.`. Altai v1 input substitution must use double braces such as `${{ inputs.train_size }}`. Single-brace forms are passed through literally and can crash Python with errors like `ValueError: invalid literal for int() with base 10: '${inputs.train_size}'`.
-   - Prefer passing input values through the step `with` map and reading the corresponding `ALTAI_PARAM_*` environment variables inside the shell command. Example: set `train_size: ${{ inputs.train_size }}` in `with`, then run `TRAIN_SIZE="${ALTAI_PARAM_TRAIN_SIZE}" .venv/bin/python train.py`.
+   - Prefer passing input values through the step `with` map and reading the corresponding `ALTAI_PARAM_*` environment variables inside the shell command. Example: set `train_size: ${{ inputs.train_size }}` in `with`, then run `TRAIN_SIZE="${ALTAI_PARAM_TRAIN_SIZE}" uv run --script train.py`.
 
 10. Validate the workflow with `cinderflow workflow validate <workflow.yaml> --json`.
 11. Confirm `GPU_ID` is the exact returned `thundercompute-*` id with `cinderflow gpu status "$GPU_ID" --json`; do not use stale SSH GPU ids.

@@ -27,10 +27,14 @@ ship with `uv`. Prefix dependency installation, preflight, and training commands
 with `PYTHONNOUSERSITE=1` to prevent system/user site-packages from leaking into
 the isolated environment.
 
-Always tee training output to a declared artifact path:
+Always tee training output to a declared artifact path. In native mode, use the
+same `uv run --script train.py` command for preflight and training:
 
 ```bash
-PYTHONNOUSERSITE=1 .venv/bin/python train.py 2>&1 | tee "${CINDERFLOW_OUTPUTS:-/outputs}/logs/train.log"
+PYTHONNOUSERSITE=1 \
+UV_INDEX_URL="https://pypi.org/simple" \
+UV_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu124" \
+uv run --script train.py 2>&1 | tee "${CINDERFLOW_OUTPUTS:-/outputs}/logs/train.log"
 ```
 
 Declare at least `train_log` and `verdict` outputs for smoke runs.
@@ -111,17 +115,14 @@ Do not respond to this by running dependency installation and training through `
 
 ## Isolated Python environment requirements
 
-Use a workspace-local virtual environment. Do not use system Python or system
-`pip` for sentence-transformers smoke runs. ThunderCompute images may contain
-preinstalled `torchvision` builds that are incompatible with the torch version
-you install; this commonly surfaces as:
+For the default native workflow, use PEP 723 metadata plus `uv run --script train.py`; do not manually invoke `.venv/bin/python`. Use a workspace-local `.venv` only for container mode or explicit dependency-resolution debugging. Do not use system Python or system `pip` for sentence-transformers smoke runs. ThunderCompute images may contain preinstalled `torchvision` builds that are incompatible with the torch version you install; this commonly surfaces as:
 
 ```text
 RuntimeError: operator torchvision::nms does not exist
 ```
 
 This is not fixed by uninstalling system `torchvision`, and agents should not try
-to modify system packages. Recreate/use an isolated venv and run with
+to modify system packages. For container/debugging fallback, recreate/use an isolated venv and run with
 `PYTHONNOUSERSITE=1`:
 
 ```bash
@@ -325,9 +326,51 @@ Input substitution must use Altai v1 double braces: `${{ inputs.max_steps }}`. N
 
 Default to a repo-less native step for generated sentence-transformers scripts.
 Use `uv` through PEP 723 script metadata when running native. Use the container
-pattern below only when the user explicitly asks for containerized execution or
-a specific image; container images usually need `python3 -m venv` because `uv` is
+pattern only when the user explicitly asks for containerized execution or a
+specific image; container images usually need `python3 -m venv` because `uv` is
 not guaranteed to be installed.
+
+Default native shape:
+
+```yaml
+steps:
+  - id: train_native
+    execution: native
+    with:
+      command:
+        - bash
+        - -lc
+        - |
+          set -euo pipefail
+          out="${CINDERFLOW_OUTPUTS:-/outputs}"
+          work="$HOME/.cinderflow/workspaces/default/${ALTAI_PARAM_RUN_NAME:-st-native}-${CINDERFLOW_JOB_ID:-manual}"
+          mkdir -p "$work" "$out/logs" "$out/metrics"
+          cd "$work"
+          printf '%s' '<BASE64_ENCODED_SCRIPT>' | base64 -d > train.py
+          python -m py_compile train.py
+          if ! command -v uv >/dev/null 2>&1; then
+            curl -LsSf https://astral.sh/uv/install.sh | sh
+            export PATH="$HOME/.local/bin:$PATH"
+          fi
+          MODEL_NAME="${ALTAI_PARAM_MODEL_NAME}" \
+          RUN_NAME="${ALTAI_PARAM_RUN_NAME}" \
+          MAX_STEPS="${ALTAI_PARAM_MAX_STEPS}" \
+          PYTHONNOUSERSITE=1 \
+          UV_INDEX_URL="https://pypi.org/simple" \
+          UV_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu124" \
+          uv run --script train.py 2>&1 | tee "$out/logs/train.log"
+    outputs:
+      train_log:
+        type: file
+        path: /outputs/logs/train.log
+        role: logs
+      verdict:
+        type: file
+        path: /outputs/metrics/verdict.txt
+        role: metrics
+```
+
+Container fallback shape:
 
 ```yaml
 steps:
