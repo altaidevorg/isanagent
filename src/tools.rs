@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
+pub mod autotrainess;
 pub mod builtin;
 pub mod compact;
 pub mod execution;

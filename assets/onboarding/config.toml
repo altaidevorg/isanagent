@@ -191,6 +191,11 @@ map_elites_schema = ".agents/kernel-porting/map_elites.schema.json"
 max_archive_entries = 500
 mutation_batch_size = 4
 
+[harness.autotrainess]
+enabled = true
+default_project_root = "train/projects"
+max_log_entries = 500
+
 # MaxEvolve named agents (defining [agents.*] replaces built-in researcher/coder/evaluator defaults)
 [agents.researcher]
 description = "Research topics, find papers, and gather context from web and files"
@@ -269,3 +274,38 @@ system_prompt_file = ".agents/prompts/kernel_explainer.md"
 allowed_tools = ["read_file", "search_text", "web_search", "web_fetch", "arxiv_search", "arxiv_fetch"]
 temperature = 0.2
 hidden = true
+
+# AutoTrainess named agents
+[agents.train_orchestrator]
+description = "Coordinates AutoTrainess autonomous post-training loop (plan→data→train→eval→log)"
+system_prompt_file = ".agents/prompts/train_orchestrator.md"
+allowed_tools = ["subagent_spawn", "subagent_plan_execute", "task_dashboard", "task_list", "task_get", "agent_list", "todo_write", "read_file", "write_file", "ask_user", "load_skill_instructions", "train_db_init", "train_db_append", "train_db_list", "train_db_status", "train_db_get"]
+temperature = 0.2
+max_iterations = 40
+
+[agents.train_planner]
+description = "Plans the next AutoTrainess experiment iteration from prior evidence"
+system_prompt_file = ".agents/prompts/train_planner.md"
+allowed_tools = ["read_file", "write_file", "search_text", "glob_files", "list_dir", "web_search", "web_fetch", "arxiv_search", "arxiv_fetch", "train_db_list", "train_db_status", "train_db_get"]
+temperature = 0.1
+
+[agents.data_prep]
+description = "Selects, constructs, and validates benchmark-aligned training data"
+system_prompt_file = ".agents/prompts/data_prep.md"
+allowed_tools = ["read_file", "write_file", "edit_file", "search_text", "glob_files", "list_dir", "web_search", "web_fetch", "execution_session_create", "execution_run", "execution_env_info", "load_skill_instructions"]
+temperature = 0.1
+max_iterations = 30
+
+[agents.trainer]
+description = "Runs LlamaFactory SFT/RL and exports final_model/"
+system_prompt_file = ".agents/prompts/trainer.md"
+allowed_tools = ["read_file", "write_file", "edit_file", "execution_session_create", "execution_run", "execution_run_background", "execution_job_status", "execution_job_result", "execution_env_info", "load_skill_instructions"]
+temperature = 0.1
+max_iterations = 25
+
+[agents.train_evaluator]
+description = "Runs real benchmark evaluation and failure-mode diagnosis"
+system_prompt_file = ".agents/prompts/train_evaluator.md"
+allowed_tools = ["read_file", "write_file", "edit_file", "search_text", "glob_files", "execution_session_create", "execution_run", "execution_run_background", "execution_job_status", "execution_job_result", "load_skill_instructions"]
+temperature = 0.0
+max_iterations = 25
