@@ -616,6 +616,20 @@ impl SubagentHarness {
                         .store(ST_FAILED, std::sync::atomic::Ordering::Release);
                     ("failed".to_string(), None, Some(assistant_text))
                 }
+                Ok(super::ReasoningLoopExit::WaitingForUser { ticket_id }) => {
+                    // Keep the established parent-agent handoff contract. A subagent
+                    // caller receives this result and uses the prefix to surface the
+                    // outstanding clarification instead of treating it as an empty
+                    // successful completion.
+                    let text = format!("{}{}", super::WAITING_FOR_USER_RESULT_PREFIX, ticket_id);
+                    {
+                        let mut r = rec.result.write().await;
+                        *r = Some(text.clone());
+                    }
+                    rec.status
+                        .store(ST_COMPLETED, std::sync::atomic::Ordering::Release);
+                    ("completed".to_string(), Some(text), None)
+                }
                 Ok(exit) => {
                     let text = exit.assistant_text().unwrap_or_default().to_string();
                     {
