@@ -283,6 +283,15 @@ Constructor: `pub fn new(db_path: &str) -> Result<Self, String>` [src/memory.rs:
 
 The central reasoning actor. All fields private. Constructed via `pub fn new(params: AgentLogicParams) -> Self` [src/agent/mod.rs:1073](../src/agent/mod.rs#L1073). Implements `ActorLogic<BusMessage>` at [src/agent/mod.rs:1270](../src/agent/mod.rs#L1270).
 
+Provider configuration changes must use
+`switch_provider_with_credentials(provider, credentials)` so the provider and
+the credential identity become visible in one write. The older
+`switch_provider(provider)` and `set_provider_credentials(credentials)` methods
+remain source-compatible migration shims: the former clears credential identity
+and disables fallback for later admissions, while the latter rebuilds a standard
+provider from the supplied credentials. Custom provider embedders must migrate
+to the paired method. No supported API exposes a mutable credential handle.
+
 > **Overhaul touchpoint.** PR-5 adds a pub method `trigger_compaction(chat_id, options)` to this struct.
 
 ### 6.2 `AgentLogicParams` — struct [src/agent/mod.rs:999](../src/agent/mod.rs#L999)
