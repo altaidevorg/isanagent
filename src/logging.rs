@@ -702,10 +702,16 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             chat_id,
             tool_name,
             args,
+            tool_call_id,
             ..
         } => LogEvent::debug(
             "Telemetry",
-            &format!("ToolCallStarted tool={} args_len={}", tool_name, args.len()),
+            &format!(
+                "ToolCallStarted tool={} args_len={} id={}",
+                tool_name,
+                args.len(),
+                tool_call_id.as_deref().unwrap_or("-")
+            ),
         )
         .with_chat_id(chat_id),
         TelemetryEvent::ToolCallFinished {
@@ -713,14 +719,16 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             tool_name,
             result,
             is_error,
+            tool_call_id,
             ..
         } => LogEvent::debug(
             "Telemetry",
             &format!(
-                "ToolCallFinished tool={} result_len={} is_error={}",
+                "ToolCallFinished tool={} result_len={} is_error={} id={}",
                 tool_name,
                 result.len(),
-                is_error
+                is_error,
+                tool_call_id.as_deref().unwrap_or("-")
             ),
         )
         .with_chat_id(chat_id),

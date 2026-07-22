@@ -84,15 +84,21 @@ enum StreamEvent {
     ToolCallStarted {
         tool_name: String,
         args: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<String>,
     },
     ToolProgress {
         tool_name: String,
         message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<String>,
     },
     ToolCallFinished {
         tool_name: String,
         result: String,
         is_error: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<String>,
     },
     AgentThought {
         thought: String,
@@ -619,14 +625,16 @@ impl ApiChannel {
                 chat_id,
                 tool_name,
                 args,
+                tool_call_id,
                 ..
             } => {
                 if let Some(pending) = self.pending_requests.get(&chat_id) {
                     if let PendingRequest::Stream(pending) = pending.value() {
-                        if let Err(e) = pending
-                            .stream_tx
-                            .try_send(StreamEvent::ToolCallStarted { tool_name, args })
-                        {
+                        if let Err(e) = pending.stream_tx.try_send(StreamEvent::ToolCallStarted {
+                            tool_name,
+                            args,
+                            tool_call_id,
+                        }) {
                             error!("Failed to send tool_call_started to stream: {}", e);
                         }
                     }
@@ -636,14 +644,16 @@ impl ApiChannel {
                 chat_id,
                 tool_name,
                 message,
+                tool_call_id,
                 ..
             } => {
                 if let Some(pending) = self.pending_requests.get(&chat_id) {
                     if let PendingRequest::Stream(pending) = pending.value() {
-                        if let Err(e) = pending
-                            .stream_tx
-                            .try_send(StreamEvent::ToolProgress { tool_name, message })
-                        {
+                        if let Err(e) = pending.stream_tx.try_send(StreamEvent::ToolProgress {
+                            tool_name,
+                            message,
+                            tool_call_id,
+                        }) {
                             error!("Failed to send tool_progress to stream: {}", e);
                         }
                     }
@@ -654,6 +664,7 @@ impl ApiChannel {
                 tool_name,
                 result,
                 is_error,
+                tool_call_id,
                 ..
             } => {
                 if let Some(pending) = self.pending_requests.get(&chat_id) {
@@ -662,6 +673,7 @@ impl ApiChannel {
                             tool_name,
                             result,
                             is_error,
+                            tool_call_id,
                         }) {
                             error!("Failed to send tool_call_finished to stream: {}", e);
                         }
@@ -2602,11 +2614,40 @@ mod tests {
                 tool_name: "read_file".to_string(),
                 result: result.to_string(),
                 is_error,
+                tool_call_id: Some("call-42".to_string()),
             };
             let encoded = serde_json::to_value(event).expect("serialize stream event");
 
             assert_eq!(encoded["type"], "tool_call_finished");
             assert_eq!(encoded["is_error"], is_error);
+            assert_eq!(encoded["tool_call_id"], "call-42");
+        }
+    }
+
+    #[test]
+    fn streamed_tool_lifecycle_uses_one_correlation_id() {
+        let events = [
+            StreamEvent::ToolCallStarted {
+                tool_name: "exec".to_string(),
+                args: r#"{"cmd":"cargo test"}"#.to_string(),
+                tool_call_id: Some("call-7".to_string()),
+            },
+            StreamEvent::ToolProgress {
+                tool_name: "exec".to_string(),
+                message: "still running".to_string(),
+                tool_call_id: Some("call-7".to_string()),
+            },
+            StreamEvent::ToolCallFinished {
+                tool_name: "exec".to_string(),
+                result: "done".to_string(),
+                is_error: false,
+                tool_call_id: Some("call-7".to_string()),
+            },
+        ];
+
+        for event in events {
+            let encoded = serde_json::to_value(event).expect("serialize stream event");
+            assert_eq!(encoded["tool_call_id"], "call-7");
         }
     }
 
