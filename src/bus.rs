@@ -175,6 +175,8 @@ pub enum TelemetryEvent {
         chat_id: String,
         tool_name: String,
         args: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<String>,
         background_job_id: Option<String>,
     },
     ToolCallFinished {
@@ -185,6 +187,8 @@ pub enum TelemetryEvent {
         /// persisted before this field was added still deserializes.
         #[serde(default)]
         is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<String>,
         background_job_id: Option<String>,
     },
     /// Mid–tool-call status (e.g. uv-managed Python env setup); not a tool result.

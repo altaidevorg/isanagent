@@ -901,6 +901,7 @@ async fn log_tool_invocation_start(
             chat_id: inbound.chat_id.clone(),
             tool_name: tool_name.to_string(),
             args: args_str.clone(),
+            tool_call_id: Some(tc.id.clone()),
             background_job_id: crate::bus::get_background_job_id(&inbound.metadata),
         }))
         .await;
@@ -925,6 +926,7 @@ async fn log_tool_invocation_start(
             chat_id: inbound.chat_id.clone(),
             tool_name: tool_name.to_string(),
             args: args_str.clone(),
+            tool_call_id: Some(tc.id.clone()),
             background_job_id: crate::bus::get_background_job_id(&inbound.metadata),
         },
     );
@@ -3989,6 +3991,7 @@ impl AgentLogic {
                             tool_name: tool_name.clone(),
                             result: tool_result_text.clone(),
                             is_error,
+                            tool_call_id: Some(tc.id.clone()),
                             background_job_id: crate::bus::get_background_job_id(&inbound.metadata),
                         };
                         let _ = outbound_tx.send(BusMessage::Telemetry(tfin.clone())).await;
@@ -4100,6 +4103,7 @@ impl AgentLogic {
                             tool_name: tn,
                             result: tool_result_text.clone(),
                             is_error,
+                            tool_call_id: Some(tc.id.clone()),
                             background_job_id: crate::bus::get_background_job_id(&inbound.metadata),
                         };
                         let _ = outbound_tx.send(BusMessage::Telemetry(tfin.clone())).await;
