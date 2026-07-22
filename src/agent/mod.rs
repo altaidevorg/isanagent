@@ -5624,6 +5624,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn steering_at_provider_boundary_is_persisted_before_the_next_response() {
+        let (unblock_tx, unblock_rx) = tokio::sync::oneshot::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = GateFirstChatProvider {
+            calls: calls.clone(),
+            first_unblock: Arc::new(tokio::sync::Mutex::new(Some(unblock_rx))),
+        };
+        let (mut agent, mut outbound_rx) = build_agent_with_provider(Box::new(provider));
+        let chat_id = "steer-provider-boundary";
+        agent
+            .process(BusMessage::Inbound(test_inbound(
+                chat_id,
+                "original request",
+            )))
+            .await
+            .expect("start run");
+        let run_id = loop {
+            match outbound_rx.recv().await {
+                Some(BusMessage::RunLifecycle(RunLifecycleEvent::Started { run_id, .. })) => {
+                    break run_id
+                }
+                Some(_) => continue,
+                None => panic!("outbound channel closed before start"),
+            }
+        };
+        agent
+            .process(BusMessage::Steer {
+                chat_id: chat_id.to_string(),
+                run_id,
+                content: "use the revised direction".to_string(),
+            })
+            .await
+            .expect("queue steering");
+        unblock_tx
+            .send(())
+            .expect("release first provider response");
+        loop {
+            match outbound_rx.recv().await {
+                Some(BusMessage::RunLifecycle(RunLifecycleEvent::Terminated { .. })) => break,
+                Some(_) => continue,
+                None => panic!("outbound channel closed before terminal"),
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let session_key = clarification_session_key("terminal", chat_id, None);
+        let session = agent
+            .session_manager
+            .get_session(&session_key)
+            .await
+            .expect("session");
+        let context = session.get_context().await.expect("context");
+        let text: Vec<_> = context
+            .iter()
+            .map(|m| {
+                m.content
+                    .as_ref()
+                    .map(|content| content.text_content())
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert!(text
+            .iter()
+            .any(|value| value == "use the revised direction"));
+        assert!(text.iter().any(|value| value == "ok-1"));
+        assert!(!text.iter().any(|value| value == "ok-0"));
+    }
+
+    #[tokio::test]
     async fn clarification_inbound_routes_via_hub_before_reasoning_spawn() {
         let hub = Arc::new(ClarificationHub::new());
         let chat_id = "clar-chat";
