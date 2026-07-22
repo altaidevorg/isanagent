@@ -1142,6 +1142,7 @@ struct ReasoningSpawnArgs {
     clarification_hub: Arc<ClarificationHub>,
     doom_loop_enabled: bool,
     cancellation_tokens: Arc<dashmap::DashMap<String, ActiveRunHandle>>,
+    steering_requests: Arc<dashmap::DashMap<String, SteeringRequest>>,
     pending_inbound: Arc<dashmap::DashMap<String, Mutex<VecDeque<crate::bus::InboundMessage>>>>,
     harness_runtime_summary: String,
     forbid_final_without_tools: bool,
@@ -1153,6 +1154,12 @@ struct ReasoningSpawnArgs {
 struct ActiveRunHandle {
     run_id: String,
     token: Arc<tokio_util::sync::CancellationToken>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SteeringRequest {
+    run_id: String,
+    content: String,
 }
 
 fn send_background_job_notification(
@@ -1327,6 +1334,7 @@ fn spawn_main_chat_reasoning_turn(
 
     let args_for_chain = args.clone();
     let cancellation_tokens = args.cancellation_tokens.clone();
+    let steering_requests = args.steering_requests.clone();
     let pending_inbound = args.pending_inbound.clone();
     let name = args.name.clone();
     let provider = dyn_clone::clone_box(&*args.provider);
@@ -1435,6 +1443,7 @@ fn spawn_main_chat_reasoning_turn(
             logger_tx: logger_tx.clone(),
             inbound,
             run_id: run_id.clone(),
+            steering_requests,
             cancel_token: task_token_arc.as_ref().clone(),
             clarification_hub,
             tool_exec_ctx,
@@ -1667,6 +1676,7 @@ pub(crate) struct ReasoningLoopCtx {
     pub(crate) logger_tx: LoggerHandle,
     pub(crate) inbound: crate::bus::InboundMessage,
     pub(crate) run_id: String,
+    pub(crate) steering_requests: Arc<dashmap::DashMap<String, SteeringRequest>>,
     pub(crate) cancel_token: tokio_util::sync::CancellationToken,
     pub(crate) clarification_hub: Arc<ClarificationHub>,
     pub(crate) tool_exec_ctx: ToolExecCtx,
@@ -1760,6 +1770,7 @@ pub struct AgentLogic {
     outbound_tx: mpsc::Sender<BusMessage>,
     logger_tx: LoggerHandle,
     cancellation_tokens: Arc<dashmap::DashMap<String, ActiveRunHandle>>,
+    steering_requests: Arc<dashmap::DashMap<String, SteeringRequest>>,
     /// FIFO per `chat_id` when a new user inbound arrives while main reasoning is active.
     pending_inbound: Arc<dashmap::DashMap<String, Mutex<VecDeque<crate::bus::InboundMessage>>>>,
     clarification_hub: Arc<ClarificationHub>,
@@ -1859,6 +1870,7 @@ impl AgentLogic {
             outbound_tx,
             logger_tx,
             cancellation_tokens: Arc::new(dashmap::DashMap::new()),
+            steering_requests: Arc::new(dashmap::DashMap::new()),
             pending_inbound: Arc::new(dashmap::DashMap::new()),
             clarification_hub,
             subagent_harness: subagent_harness.clone(),
@@ -1931,6 +1943,7 @@ impl AgentLogic {
             clarification_hub: self.clarification_hub.clone(),
             doom_loop_enabled: self.doom_loop_enabled,
             cancellation_tokens: self.cancellation_tokens.clone(),
+            steering_requests: self.steering_requests.clone(),
             pending_inbound: self.pending_inbound.clone(),
             harness_runtime_summary: self.harness_runtime_summary.clone(),
             forbid_final_without_tools: self.forbid_final_without_tools,
@@ -2044,6 +2057,24 @@ impl ActorLogic<BusMessage> for AgentLogic {
             }
             BusMessage::CancelRun { chat_id, run_id } => {
                 self.cancel_active_run(&chat_id, Some(&run_id));
+                return Ok(None);
+            }
+            BusMessage::Steer {
+                chat_id,
+                run_id,
+                content,
+            } => {
+                if content.trim().is_empty() {
+                    return Ok(None);
+                }
+                if self
+                    .cancellation_tokens
+                    .get(&chat_id)
+                    .is_some_and(|active| active.run_id == run_id)
+                {
+                    self.steering_requests
+                        .insert(chat_id, SteeringRequest { run_id, content });
+                }
                 return Ok(None);
             }
             BusMessage::SwitchModel {
@@ -2931,7 +2962,8 @@ impl AgentLogic {
             outbound_tx,
             logger_tx,
             inbound,
-            run_id: _run_id,
+            run_id,
+            steering_requests,
             cancel_token,
             clarification_hub,
             tool_exec_ctx,
@@ -3124,6 +3156,21 @@ impl AgentLogic {
                 persist_and_cancel!();
             }
             iterations += 1;
+
+            // Tool paths return to the loop only after their result has been
+            // persisted. Consume steering before this next iteration performs
+            // compaction, calls another tool, or calls the provider.
+            if let Some((_, steering)) = steering_requests.remove(&inbound.chat_id) {
+                if steering.run_id == run_id {
+                    mem.add_message(crate::utils::ChatMessage::user(&steering.content))
+                        .await
+                        .map_err(ReasoningLoopError::persistence)?;
+                    consecutive_doom_detections = 0;
+                    forbid_final_nudges = 0;
+                } else {
+                    steering_requests.insert(inbound.chat_id.clone(), steering);
+                }
+            }
 
             let _ = logger_tx.send(BusMessage::Log(
                 LogEvent::debug(
@@ -3538,6 +3585,21 @@ impl AgentLogic {
             let _ = logger_tx.send(BusMessage::Log(
                 LogEvent::debug(&name, "Provider responded.").with_chat_id(&inbound.chat_id),
             ));
+
+            // A steering request is consumed only at a safe boundary: the
+            // provider has returned, but its proposed response has not yet
+            // been persisted or allowed to start another tool call.
+            if let Some((_, steering)) = steering_requests.remove(&inbound.chat_id) {
+                if steering.run_id == run_id {
+                    mem.add_message(crate::utils::ChatMessage::user(&steering.content))
+                        .await
+                        .map_err(ReasoningLoopError::persistence)?;
+                    consecutive_doom_detections = 0;
+                    forbid_final_nudges = 0;
+                    continue;
+                }
+                steering_requests.insert(inbound.chat_id.clone(), steering);
+            }
 
             // Log USAGE telemetry
             if let Some(usage) = &response.usage {
@@ -4719,6 +4781,7 @@ mod tests {
             logger_tx,
             inbound,
             run_id: "test-run-id".to_string(),
+            steering_requests: Arc::new(dashmap::DashMap::new()),
             cancel_token: cancel_token.clone(),
             clarification_hub: ClarificationHub::shared(),
             tool_exec_ctx: ToolExecCtx::new("terminal", "loop-test-chat", None)
@@ -5506,6 +5569,58 @@ mod tests {
                 outcome: RunOutcome::Cancelled,
             } if terminal_run_id == run_id && event_chat == chat_id
         ));
+    }
+
+    #[tokio::test]
+    async fn steer_is_accepted_only_for_the_exact_active_run() {
+        let (mut agent, mut outbound_rx) = build_agent_with_provider(Box::new(LongSleepProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+        let chat_id = "steer-run-chat";
+        agent
+            .process(BusMessage::Inbound(test_inbound(chat_id, "first")))
+            .await
+            .expect("start run");
+        let run_id = loop {
+            match outbound_rx.recv().await {
+                Some(BusMessage::RunLifecycle(RunLifecycleEvent::Started { run_id, .. })) => {
+                    break run_id
+                }
+                Some(_) => continue,
+                None => panic!("outbound channel closed before start"),
+            }
+        };
+
+        agent
+            .process(BusMessage::Steer {
+                chat_id: chat_id.to_string(),
+                run_id: "stale-run".to_string(),
+                content: "ignore this".to_string(),
+            })
+            .await
+            .expect("stale steer is handled");
+        assert!(!agent.steering_requests.contains_key(chat_id));
+
+        agent
+            .process(BusMessage::Steer {
+                chat_id: chat_id.to_string(),
+                run_id: run_id.clone(),
+                content: "change direction".to_string(),
+            })
+            .await
+            .expect("exact steer is handled");
+        let stored = agent.steering_requests.get(chat_id).expect("stored steer");
+        assert_eq!(stored.run_id, run_id);
+        assert_eq!(stored.content, "change direction");
+        drop(stored);
+
+        agent
+            .process(BusMessage::CancelRun {
+                chat_id: chat_id.to_string(),
+                run_id,
+            })
+            .await
+            .expect("cancel test run");
     }
 
     #[tokio::test]

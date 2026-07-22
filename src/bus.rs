@@ -658,6 +658,13 @@ pub enum BusMessage {
         chat_id: String,
         run_id: String,
     },
+    /// Apply new user direction to one exact active run at its next safe
+    /// boundary, after the provider or current tool call completes.
+    Steer {
+        chat_id: String,
+        run_id: String,
+        content: String,
+    },
     /// Signal to promote the current in-flight synchronous tool call (if any) to
     /// a background `ExecutionJobManager` job for the given chat. Triggered by
     /// the `/background` slash command.
