@@ -55,11 +55,6 @@ fn truncate_leading_ellipsis(s: &str, max_chars: usize) -> String {
     format!("…{tail}")
 }
 
-fn tool_result_looks_like_failure(result: &str) -> bool {
-    // Single source of truth shared with the agent loop's is_error computation.
-    crate::utils::tool_output_looks_like_failure(result)
-}
-
 fn summarize_message_tool_result(t: &str) -> Option<String> {
     const PREFIX: &str = "Message sent to ";
     let rest = t.strip_prefix(PREFIX)?;
@@ -465,6 +460,7 @@ pub fn build_tool_result_terminal_notice(
     chat_id: &str,
     tool_name: &str,
     result: &str,
+    is_error: bool,
     tool_call_id: Option<&str>,
     background_job_id: Option<&str>,
 ) -> OutboundMessage {
@@ -473,11 +469,7 @@ pub fn build_tool_result_terminal_notice(
     let content = format!("{tool_name} → {summary}");
     let mut metadata = HashMap::new();
     metadata.insert(ISANAGENT_TOOL_NOTIFY.to_string(), json!(true));
-    let phase = if tool_result_looks_like_failure(result) {
-        "fail"
-    } else {
-        "result"
-    };
+    let phase = if is_error { "fail" } else { "result" };
     metadata.insert(ISANAGENT_TOOL_PHASE.to_string(), json!(phase));
     metadata.insert(METADATA_TOOL_NAME.to_string(), json!(tool_name));
     metadata.insert(METADATA_TOOL_RESULT_PREVIEW.to_string(), json!(summary));
@@ -791,6 +783,7 @@ mod preview_tests {
             "chat-1",
             "execution_run",
             "exit 0 in 12ms",
+            false,
             Some("call-abc"),
             None,
         );
@@ -806,8 +799,14 @@ mod preview_tests {
     #[test]
     fn build_tool_result_terminal_notice_keeps_text_preview_for_long_outputs() {
         let long = "x".repeat(200);
-        let notice =
-            build_tool_result_terminal_notice("chat-1", "execution_run", long.as_str(), None, None);
+        let notice = build_tool_result_terminal_notice(
+            "chat-1",
+            "execution_run",
+            long.as_str(),
+            false,
+            None,
+            None,
+        );
         let preview = notice
             .metadata
             .get(METADATA_TOOL_RESULT_PREVIEW)
@@ -820,14 +819,55 @@ mod preview_tests {
     #[test]
     fn build_tool_result_terminal_notice_sets_char_count_metadata_for_long_outputs() {
         let long = "x".repeat(200);
-        let notice =
-            build_tool_result_terminal_notice("chat-1", "execution_run", long.as_str(), None, None);
+        let notice = build_tool_result_terminal_notice(
+            "chat-1",
+            "execution_run",
+            long.as_str(),
+            false,
+            None,
+            None,
+        );
         assert_eq!(
             notice
                 .metadata
                 .get(METADATA_TOOL_RESULT_CHAR_COUNT)
                 .and_then(|v| v.as_u64()),
             Some(200)
+        );
+    }
+
+    #[test]
+    fn tool_result_terminal_phase_uses_typed_status_not_result_text() {
+        let text_that_looks_like_error = build_tool_result_terminal_notice(
+            "chat-1",
+            "read_file",
+            "Error: this is an expected literal from the file",
+            false,
+            None,
+            None,
+        );
+        assert_eq!(
+            text_that_looks_like_error
+                .metadata
+                .get(ISANAGENT_TOOL_PHASE)
+                .and_then(|value| value.as_str()),
+            Some("result"),
+        );
+
+        let generic_native_error = build_tool_result_terminal_notice(
+            "chat-1",
+            "write_file",
+            "Permission denied by workspace policy",
+            true,
+            None,
+            None,
+        );
+        assert_eq!(
+            generic_native_error
+                .metadata
+                .get(ISANAGENT_TOOL_PHASE)
+                .and_then(|value| value.as_str()),
+            Some("fail"),
         );
     }
 }
