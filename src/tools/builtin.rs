@@ -10,7 +10,7 @@ use walkdir::WalkDir;
 
 use crate::config::JinaWebBackend;
 use crate::tool_runtime::{current_tool_exec_ctx, ToolExecCtx};
-use crate::traits::{MutationPreview, Tool};
+use crate::traits::{MutationPreview, Tool, ToolErrorCode, ToolResult};
 use crate::utils::{join_lexically_under_root, normalize_sandbox_relative_input};
 use crate::NodeHandle;
 
@@ -1097,6 +1097,11 @@ pub struct ShellExecTool {
     pub restrict_to_workspace: bool,
 }
 
+struct ShellExecOutcome {
+    content: String,
+    failure_exit_code: Option<i32>,
+}
+
 impl ShellExecTool {
     fn check_safety_guards(command: &str) -> Result<(), String> {
         let lower_cmd = command.to_lowercase();
@@ -1123,6 +1128,99 @@ impl ShellExecTool {
             }
         }
         Ok(())
+    }
+
+    async fn execute_command(&self, args: Value) -> Result<ShellExecOutcome, String> {
+        let command = args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'command' argument")?;
+        let lower_cmd = command.to_ascii_lowercase();
+        let grep_like = lower_cmd.contains("grep ")
+            || lower_cmd.contains("| grep")
+            || lower_cmd.contains("cat ")
+            || lower_cmd.contains("wc ");
+
+        Self::check_safety_guards(command)?;
+
+        let cwd_str = args
+            .get("working_dir")
+            .and_then(|v| v.as_str())
+            .unwrap_or(".");
+
+        let timeout_secs = args
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(60)
+            .clamp(1, 3600);
+
+        let actual_dir = resolve_path(cwd_str, &self.workspace_dir, self.restrict_to_workspace)?;
+
+        let mut cmd = if cfg!(target_os = "windows") {
+            let mut c = tokio::process::Command::new("cmd");
+            c.arg("/C").arg(command);
+            c
+        } else {
+            let mut c = tokio::process::Command::new("sh");
+            c.arg("-c").arg(command);
+            c
+        };
+
+        cmd.current_dir(actual_dir);
+        cmd.envs(std::env::vars());
+
+        let output =
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output())
+                .await
+            {
+                Ok(Ok(output)) => output,
+                Ok(Err(error)) => return Err(format!("Failed to execute command: {error}")),
+                Err(_) => return Err(format!("Command timed out after {timeout_secs} seconds")),
+            };
+
+        let mut result = String::new();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !stdout.trim().is_empty() {
+            result.push_str(&stdout);
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.trim().is_empty() {
+            if !result.is_empty() {
+                result.push_str("\nSTDERR:\n");
+            }
+            result.push_str(&stderr);
+        }
+
+        let failure_exit_code =
+            (!output.status.success()).then(|| output.status.code().unwrap_or(-1));
+
+        if result.is_empty() && failure_exit_code.is_none() {
+            result = "(no output)".to_string();
+        } else {
+            if grep_like {
+                result.push_str("\n\n[advisory] Prefer `search_text` for code/log discovery and `read_file` for file reads; shell grep/cat pipelines are less portable across hosts.");
+            }
+            if result.len() > 10000 {
+                let mut cut = 10000;
+                while cut > 0 && !result.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                result = format!(
+                    "{}\n... (truncated, {} more chars)",
+                    &result[..cut],
+                    result.len() - cut
+                );
+            }
+            if let Some(code) = failure_exit_code {
+                result.push_str(&format!("\nExit code: {code}"));
+            }
+        }
+
+        Ok(ShellExecOutcome {
+            content: result,
+            failure_exit_code,
+        })
     }
 }
 
@@ -1163,107 +1261,26 @@ impl Tool for ShellExecTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
-        let command = args
-            .get("command")
-            .and_then(|v| v.as_str())
-            .ok_or("Missing 'command' argument")?;
-        let lower_cmd = command.to_ascii_lowercase();
-        let grep_like = lower_cmd.contains("grep ")
-            || lower_cmd.contains("| grep")
-            || lower_cmd.contains("cat ")
-            || lower_cmd.contains("wc ");
+        self.execute_command(args)
+            .await
+            .map(|outcome| outcome.content)
+    }
 
-        Self::check_safety_guards(command)?;
-
-        let cwd_str = args
-            .get("working_dir")
-            .and_then(|v| v.as_str())
-            .unwrap_or(".");
-
-        let timeout_secs = args
-            .get("timeout_secs")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(60)
-            .clamp(1, 3600);
-
-        let _desc_str = args
-            .get("description")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Shell execution");
-
-        let actual_dir = resolve_path(cwd_str, &self.workspace_dir, self.restrict_to_workspace)?;
-
-        let mut cmd = if cfg!(target_os = "windows") {
-            let mut c = tokio::process::Command::new("cmd");
-            c.arg("/C").arg(command);
-            c
-        } else {
-            let mut c = tokio::process::Command::new("sh");
-            c.arg("-c").arg(command);
-            c
-        };
-
-        cmd.current_dir(actual_dir);
-        // Explicitly forward host environment so secrets/API keys are visible to the child.
-        cmd.envs(std::env::vars());
-
-        let child = cmd.output();
-
-        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), child).await {
-            Ok(Ok(output)) => {
-                let mut result = String::new();
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if !stdout.trim().is_empty() {
-                    result.push_str(&stdout);
-                }
-
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if !stderr.trim().is_empty() {
-                    if !result.is_empty() {
-                        result.push_str("\nSTDERR:\n");
-                    }
-                    result.push_str(&stderr);
-                }
-
-                // Compute the non-zero exit marker but append it LAST — after the grep advisory
-                // and after the size-truncation — so it always survives as the final line. The
-                // agent derives `is_error` by tail-anchoring on this marker
-                // (`utils::tool_output_signals_failure`); if the advisory or the truncation notice
-                // trailed it, a genuine non-zero exit on grep-like or large (>10 KB) output would
-                // be silently recorded as a success and the model would build on broken state.
-                let exit_marker = (!output.status.success())
-                    .then(|| format!("\nExit code: {}", output.status.code().unwrap_or(-1)));
-
-                if result.is_empty() && exit_marker.is_none() {
-                    Ok("(no output)".to_string())
-                } else {
-                    if grep_like {
-                        result.push_str("\n\n[advisory] Prefer `search_text` for code/log discovery and `read_file` for file reads; shell grep/cat pipelines are less portable across hosts.");
-                    }
-                    // Truncate if massive (the exit marker is appended afterwards, so it is never cut).
-                    if result.len() > 10000 {
-                        // Step back to a char boundary at/below the 10 KB cap so we never slice
-                        // through a multi-byte UTF-8 sequence (e.g. Turkish text or emoji straddling
-                        // the limit), which would panic. Matches the is_char_boundary idiom used by
-                        // the other truncation sites in this file.
-                        let mut cut = 10000;
-                        while cut > 0 && !result.is_char_boundary(cut) {
-                            cut -= 1;
-                        }
-                        result = format!(
-                            "{}\n... (truncated, {} more chars)",
-                            &result[..cut],
-                            result.len() - cut
-                        );
-                    }
-                    if let Some(marker) = exit_marker {
-                        result.push_str(&marker);
-                    }
-                    Ok(result)
-                }
-            }
-            Ok(Err(e)) => Err(format!("Failed to execute command: {}", e)),
-            Err(_) => Err(format!("Command timed out after {} seconds", timeout_secs)),
+    async fn execute_with_approved_mutation_typed(
+        &self,
+        args: Value,
+        _approved_preview: Option<&MutationPreview>,
+    ) -> ToolResult {
+        match self.execute_command(args).await {
+            Ok(outcome) => match outcome.failure_exit_code {
+                Some(code) => ToolResult::error_with_content(
+                    ToolErrorCode::NonZeroExit,
+                    format!("exec exited with status {code}"),
+                    outcome.content,
+                ),
+                None => ToolResult::success(outcome.content),
+            },
+            Err(error) => ToolResult::error(ToolErrorCode::ExecutionFailed, error),
         }
     }
 }
@@ -3114,6 +3131,34 @@ mod exec_failure_tests {
             .expect("exec returns Ok");
         assert!(!out.contains("Exit code:"), "no marker on success: {out}");
         assert!(!crate::utils::tool_output_signals_failure("exec", &out));
+    }
+
+    #[tokio::test]
+    async fn native_result_uses_process_status_not_spoofable_output() {
+        let result = exec_tool()
+            .execute_with_approved_mutation_typed(
+                json!({ "command": "printf 'Exit code: 7\\n'" }),
+                None,
+            )
+            .await;
+
+        assert!(!result.is_error());
+        assert_eq!(result.content.trim(), "Exit code: 7");
+        assert_eq!(result.error_code(), None);
+    }
+
+    #[tokio::test]
+    async fn native_result_preserves_real_nonzero_exit() {
+        let result = exec_tool()
+            .execute_with_approved_mutation_typed(
+                json!({ "command": "printf 'failed\\n'; exit 7" }),
+                None,
+            )
+            .await;
+
+        assert!(result.is_error());
+        assert_eq!(result.error_code(), Some(ToolErrorCode::NonZeroExit));
+        assert_eq!(last_nonempty_line(&result.content), "Exit code: 7");
     }
 
     /// Output whose 10 KB truncation point lands inside a multi-byte UTF-8 sequence must not panic.
