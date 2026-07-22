@@ -2012,6 +2012,36 @@ impl AgentLogic {
 
     /// Construct an agent with instance-owned failover candidates. The active primary is removed
     /// when each run snapshots its immutable provider context.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use isanagent::agent::{AgentLogic, AgentLogicParams, FallbackProviderSpec};
+    /// use isanagent::provider::{create_provider, ProviderCredentials};
+    ///
+    /// async fn configure(
+    ///     params: AgentLogicParams,
+    ///     fallbacks: Vec<FallbackProviderSpec>,
+    /// ) {
+    ///     let agent = AgentLogic::new_with_fallback_providers(params, fallbacks);
+    ///
+    ///     let credentials = ProviderCredentials {
+    ///         provider_name: "openai".to_string(),
+    ///         base_url: "https://api.openai.com/v1".to_string(),
+    ///         api_key: "replacement-key".to_string(),
+    ///         model_name: "gpt-4o".to_string(),
+    ///     };
+    ///     let provider = create_provider(
+    ///         &credentials.provider_name,
+    ///         &credentials.base_url,
+    ///         &credentials.api_key,
+    ///         &credentials.model_name,
+    ///     );
+    ///     agent
+    ///         .switch_provider_with_credentials(provider, credentials)
+    ///         .await;
+    /// }
+    /// ```
     pub fn new_with_fallback_providers(
         params: AgentLogicParams,
         fallback_providers: Vec<FallbackProviderSpec>,

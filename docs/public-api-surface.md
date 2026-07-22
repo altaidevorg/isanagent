@@ -279,6 +279,23 @@ Constructor: `pub fn new(db_path: &str) -> Result<Self, String>` [src/memory.rs:
 
 ## 6. Top-level orchestrator types
 
+### 0.11 migration: run-scoped provider configuration
+
+Version 0.11 intentionally removes the process-global and independently
+mutable provider-credential APIs. These removals are breaking changes:
+
+| Removed 0.10 API | 0.11 replacement |
+| --- | --- |
+| `set_fallback_providers(specs)` | Pass `specs` to `AgentLogic::new_with_fallback_providers(params, specs)`. |
+| `agent.provider_credentials_handle()` followed by independent writes | Build the matching provider and call `agent.switch_provider_with_credentials(provider, credentials).await`. |
+
+`switch_provider(provider)` and `set_provider_credentials(credentials)` remain
+temporary compatibility shims. The provider-only form clears credential
+identity and disables failover for later admissions; the credential-only form
+rebuilds a standard provider. Custom provider embedders should migrate directly
+to `switch_provider_with_credentials` so the provider and its credentials become
+visible atomically.
+
 ### 6.1 `AgentLogic` — struct [src/agent/mod.rs:1045](../src/agent/mod.rs#L1045)
 
 The central reasoning actor. All fields private. Constructed via `pub fn new(params: AgentLogicParams) -> Self` [src/agent/mod.rs:1073](../src/agent/mod.rs#L1073). Implements `ActorLogic<BusMessage>` at [src/agent/mod.rs:1270](../src/agent/mod.rs#L1270).
