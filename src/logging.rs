@@ -239,6 +239,7 @@ impl LoggingActor {
             BusMessage::Log(_) => return,
             BusMessage::LoggerControl(_) => return,
             BusMessage::Cancel(_) => return,
+            BusMessage::CancelRun { .. } => return,
             BusMessage::PromoteSyncToBackground(_) => return,
             BusMessage::SetTerminalSessionChat { .. } => return,
             BusMessage::SwitchModel { .. } => return,
@@ -328,6 +329,14 @@ impl LoggingActor {
             BusMessage::Cancel(chat_id) => LogEvent::info(
                 "BusMessage",
                 &format!("Cancel reasoning loop for chat_id={}", chat_id),
+            )
+            .with_chat_id(chat_id),
+            BusMessage::CancelRun { chat_id, run_id } => LogEvent::info(
+                "BusMessage",
+                &format!(
+                    "Cancel reasoning loop for chat_id={} run_id={}",
+                    chat_id, run_id
+                ),
             )
             .with_chat_id(chat_id),
             BusMessage::PromoteSyncToBackground(chat_id) => LogEvent::info(
