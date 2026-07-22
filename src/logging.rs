@@ -647,16 +647,17 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             channel,
             tool_name,
             result,
-            is_error: _,
+            is_error,
             tool_call_id,
             background_job_id,
         } => LogEvent::info(
             "Telemetry",
             &format!(
-                "ToolResult channel={} tool={} result_len={} id={} bg={}",
+                "ToolResult channel={} tool={} result_len={} is_error={} id={} bg={}",
                 channel,
                 tool_name,
                 result.len(),
+                is_error,
                 tool_call_id.as_deref().unwrap_or("-"),
                 background_job_id.as_deref().unwrap_or("-"),
             ),
@@ -1088,8 +1089,10 @@ impl ActorLogic<BusMessage> for LoggingFallbackActor {
 
 #[cfg(test)]
 mod tests {
-    use super::{recognized_log_file, sanitize_message, should_capture, LoggingActor};
-    use crate::bus::{BusMessage, InboundMessage, LogEvent};
+    use super::{
+        recognized_log_file, sanitize_message, should_capture, telemetry_to_log_event, LoggingActor,
+    };
+    use crate::bus::{BusMessage, InboundMessage, LogEvent, TelemetryEvent};
     use crate::config::EffectiveLoggingConfig;
     use log::Level;
     use std::collections::HashMap;
@@ -1116,6 +1119,24 @@ mod tests {
             attachments: Vec::new(),
             metadata: HashMap::new(),
         })
+    }
+
+    #[test]
+    fn tool_result_diagnostic_uses_typed_error_status() {
+        for (is_error, result) in [(false, "error: harmless text"), (true, "all good")] {
+            let event = telemetry_to_log_event(&TelemetryEvent::ToolResult {
+                chat_id: "chat".to_string(),
+                channel: "api".to_string(),
+                tool_name: "exec".to_string(),
+                result: result.to_string(),
+                is_error,
+                tool_call_id: Some("call-7".to_string()),
+                background_job_id: None,
+            });
+
+            assert!(event.message.contains(&format!("is_error={is_error}")));
+            assert!(event.message.contains("id=call-7"));
+        }
     }
 
     #[test]
