@@ -596,10 +596,9 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         .map(|c| c.model_name.clone())
         .unwrap_or_else(|| "(no model)".to_string());
 
-    let (provider, reflection_provider, fallback_providers): (
+    let (provider, reflection_provider): (
         Box<dyn isanagent::traits::Provider>,
         Box<dyn isanagent::traits::Provider>,
-        Vec<isanagent::agent::FallbackProviderSpec>,
     ) = if let (Some(cfg), Some(key)) = (&provider_cfg, &api_key) {
         let base_url = cfg.resolved_base_url().map_err(std::io::Error::other)?;
         let p1 =
@@ -607,9 +606,10 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         let p2 =
             isanagent::provider::create_provider(&cfg.provider_name, &base_url, key, &model_name);
 
-        // Keep all configured providers as immutable candidates owned by this AgentLogic. Each run
-        // filters its own primary by full (provider, base_url, model) identity while snapshotting,
-        // so concurrent runs and `/model` switches cannot rewrite one another's fallback policy.
+        // Cross-provider failover: register every *other* configured provider with a resolvable
+        // key as a fallback, so an exhausted-retry failure on the primary (a 5xx/529 outage, a
+        // rotated key, a deprecated model) fails over instead of dropping the turn. The primary is
+        // excluded by full (provider, base_url, model) identity via `build_fallback_specs`.
         let candidates: Vec<isanagent::agent::FallbackProviderSpec> = expanded_providers
             .values()
             .filter_map(|fb_cfg| {
@@ -623,20 +623,21 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                 })
             })
             .collect();
-        let initial_fallbacks = isanagent::agent::build_fallback_specs(
+        let fallbacks = isanagent::agent::build_fallback_specs(
             &cfg.provider_name,
             &base_url,
             &model_name,
-            candidates.clone(),
+            candidates,
         );
-        if !initial_fallbacks.is_empty() {
+        if !fallbacks.is_empty() {
             log::info!(
                 "Cross-provider failover enabled with {} fallback provider(s).",
-                initial_fallbacks.len()
+                fallbacks.len()
             );
         }
+        isanagent::agent::set_fallback_providers(fallbacks);
 
-        (p1, p2, candidates)
+        (p1, p2)
     } else {
         // No API key found — list the env vars the user could set.
         let env_vars: Vec<String> = expanded_providers
@@ -655,7 +656,6 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         (
             Box::new(isanagent::provider::NoKeyProvider),
             Box::new(isanagent::provider::NoKeyProvider),
-            Vec::new(),
         )
     };
 
@@ -803,33 +803,30 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         None
     };
 
-    let agent_logic = AgentLogic::new_with_fallback_providers(
-        AgentLogicParams {
-            name: "isanagent".to_string(),
-            provider,
-            provider_credentials,
-            session_manager,
-            tools,
-            skills,
-            system_prompt,
-            max_iterations,
-            max_tool_output_chars,
-            max_recent_summaries,
-            short_term_threshold_turns,
-            short_term_threshold_tokens,
-            outbound_tx: global_outbound_tx.clone(),
-            logger_tx: logger_bus_tx.clone(),
-            clarification_hub,
-            subagent,
-            doom_loop_enabled: workspace.config.doom_loop_enabled(),
-            harness_runtime_summary,
-            subagent_system_prompt,
-            forbid_final_without_tools,
-            shell_policy,
-            hook_tool_ctx,
-        },
-        fallback_providers,
-    );
+    let agent_logic = AgentLogic::new(AgentLogicParams {
+        name: "isanagent".to_string(),
+        provider,
+        provider_credentials,
+        session_manager,
+        tools,
+        skills,
+        system_prompt,
+        max_iterations,
+        max_tool_output_chars,
+        max_recent_summaries,
+        short_term_threshold_turns,
+        short_term_threshold_tokens,
+        outbound_tx: global_outbound_tx.clone(),
+        logger_tx: logger_bus_tx.clone(),
+        clarification_hub,
+        subagent,
+        doom_loop_enabled: workspace.config.doom_loop_enabled(),
+        harness_runtime_summary,
+        subagent_system_prompt,
+        forbid_final_without_tools,
+        shell_policy,
+        hook_tool_ctx,
+    });
     let agent_logic = if let Some(tool_execution_activity) = tool_execution_activity {
         agent_logic.with_tool_execution_activity(tool_execution_activity)
     } else {
