@@ -3988,6 +3988,7 @@ impl AgentLogic {
                             chat_id: inbound.chat_id.clone(),
                             tool_name: tool_name.clone(),
                             result: tool_result_text.clone(),
+                            is_error,
                             background_job_id: crate::bus::get_background_job_id(&inbound.metadata),
                         };
                         let _ = outbound_tx.send(BusMessage::Telemetry(tfin.clone())).await;
@@ -4098,6 +4099,7 @@ impl AgentLogic {
                             chat_id: inbound.chat_id.clone(),
                             tool_name: tn,
                             result: tool_result_text.clone(),
+                            is_error,
                             background_job_id: crate::bus::get_background_job_id(&inbound.metadata),
                         };
                         let _ = outbound_tx.send(BusMessage::Telemetry(tfin.clone())).await;
