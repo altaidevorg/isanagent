@@ -1142,7 +1142,6 @@ struct ReasoningSpawnArgs {
     clarification_hub: Arc<ClarificationHub>,
     doom_loop_enabled: bool,
     cancellation_tokens: Arc<dashmap::DashMap<String, ActiveRunHandle>>,
-    steering_requests: Arc<dashmap::DashMap<String, SteeringRequest>>,
     pending_inbound: Arc<dashmap::DashMap<String, Mutex<VecDeque<crate::bus::InboundMessage>>>>,
     harness_runtime_summary: String,
     forbid_final_without_tools: bool,
@@ -1154,12 +1153,53 @@ struct ReasoningSpawnArgs {
 struct ActiveRunHandle {
     run_id: String,
     token: Arc<tokio_util::sync::CancellationToken>,
+    steering: Arc<Mutex<SteeringInbox>>,
 }
 
-#[derive(Clone)]
-pub(crate) struct SteeringRequest {
-    run_id: String,
-    content: String,
+pub(crate) struct SteeringInbox {
+    accepting: bool,
+    pending: VecDeque<String>,
+}
+
+impl SteeringInbox {
+    pub(crate) fn open() -> Self {
+        Self {
+            accepting: true,
+            pending: VecDeque::new(),
+        }
+    }
+
+    fn push(&mut self, content: String) -> bool {
+        if !self.accepting {
+            return false;
+        }
+        self.pending.push_back(content);
+        true
+    }
+
+    fn drain(&mut self) -> Vec<String> {
+        self.pending.drain(..).collect()
+    }
+
+    fn close(&mut self) {
+        self.accepting = false;
+        self.pending.clear();
+    }
+
+    fn close_or_drain(&mut self) -> Vec<String> {
+        if self.pending.is_empty() {
+            self.accepting = false;
+            Vec::new()
+        } else {
+            self.drain()
+        }
+    }
+}
+
+fn steering_guard(inbox: &Mutex<SteeringInbox>) -> std::sync::MutexGuard<'_, SteeringInbox> {
+    inbox
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn send_background_job_notification(
@@ -1324,17 +1364,18 @@ fn spawn_main_chat_reasoning_turn(
 ) {
     let chat_id = inbound.chat_id.clone();
     let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
+    let steering = Arc::new(Mutex::new(SteeringInbox::open()));
     args.cancellation_tokens.insert(
         chat_id.clone(),
         ActiveRunHandle {
             run_id: run_id.clone(),
             token: cancel_token.clone(),
+            steering: steering.clone(),
         },
     );
 
     let args_for_chain = args.clone();
     let cancellation_tokens = args.cancellation_tokens.clone();
-    let steering_requests = args.steering_requests.clone();
     let pending_inbound = args.pending_inbound.clone();
     let name = args.name.clone();
     let provider = dyn_clone::clone_box(&*args.provider);
@@ -1443,7 +1484,7 @@ fn spawn_main_chat_reasoning_turn(
             logger_tx: logger_tx.clone(),
             inbound,
             run_id: run_id.clone(),
-            steering_requests,
+            steering,
             cancel_token: task_token_arc.as_ref().clone(),
             clarification_hub,
             tool_exec_ctx,
@@ -1676,7 +1717,7 @@ pub(crate) struct ReasoningLoopCtx {
     pub(crate) logger_tx: LoggerHandle,
     pub(crate) inbound: crate::bus::InboundMessage,
     pub(crate) run_id: String,
-    pub(crate) steering_requests: Arc<dashmap::DashMap<String, SteeringRequest>>,
+    pub(crate) steering: Arc<Mutex<SteeringInbox>>,
     pub(crate) cancel_token: tokio_util::sync::CancellationToken,
     pub(crate) clarification_hub: Arc<ClarificationHub>,
     pub(crate) tool_exec_ctx: ToolExecCtx,
@@ -1770,7 +1811,6 @@ pub struct AgentLogic {
     outbound_tx: mpsc::Sender<BusMessage>,
     logger_tx: LoggerHandle,
     cancellation_tokens: Arc<dashmap::DashMap<String, ActiveRunHandle>>,
-    steering_requests: Arc<dashmap::DashMap<String, SteeringRequest>>,
     /// FIFO per `chat_id` when a new user inbound arrives while main reasoning is active.
     pending_inbound: Arc<dashmap::DashMap<String, Mutex<VecDeque<crate::bus::InboundMessage>>>>,
     clarification_hub: Arc<ClarificationHub>,
@@ -1870,7 +1910,6 @@ impl AgentLogic {
             outbound_tx,
             logger_tx,
             cancellation_tokens: Arc::new(dashmap::DashMap::new()),
-            steering_requests: Arc::new(dashmap::DashMap::new()),
             pending_inbound: Arc::new(dashmap::DashMap::new()),
             clarification_hub,
             subagent_harness: subagent_harness.clone(),
@@ -1943,7 +1982,6 @@ impl AgentLogic {
             clarification_hub: self.clarification_hub.clone(),
             doom_loop_enabled: self.doom_loop_enabled,
             cancellation_tokens: self.cancellation_tokens.clone(),
-            steering_requests: self.steering_requests.clone(),
             pending_inbound: self.pending_inbound.clone(),
             harness_runtime_summary: self.harness_runtime_summary.clone(),
             forbid_final_without_tools: self.forbid_final_without_tools,
@@ -2022,6 +2060,7 @@ impl AgentLogic {
                 harness.cancel_children_for_parent(chat_id);
             }
         }
+        steering_guard(&active.steering).close();
         active.token.cancel();
         let _ = self.logger_tx.send(BusMessage::Log(
             LogEvent::info(
@@ -2067,13 +2106,10 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 if content.trim().is_empty() {
                     return Ok(None);
                 }
-                if self
-                    .cancellation_tokens
-                    .get(&chat_id)
-                    .is_some_and(|active| active.run_id == run_id)
-                {
-                    self.steering_requests
-                        .insert(chat_id, SteeringRequest { run_id, content });
+                if let Some(active) = self.cancellation_tokens.get(&chat_id) {
+                    if active.run_id == run_id {
+                        steering_guard(&active.steering).push(content);
+                    }
                 }
                 return Ok(None);
             }
@@ -2962,8 +2998,8 @@ impl AgentLogic {
             outbound_tx,
             logger_tx,
             inbound,
-            run_id,
-            steering_requests,
+            run_id: _run_id,
+            steering,
             cancel_token,
             clarification_hub,
             tool_exec_ctx,
@@ -3160,16 +3196,15 @@ impl AgentLogic {
             // Tool paths return to the loop only after their result has been
             // persisted. Consume steering before this next iteration performs
             // compaction, calls another tool, or calls the provider.
-            if let Some((_, steering)) = steering_requests.remove(&inbound.chat_id) {
-                if steering.run_id == run_id {
-                    mem.add_message(crate::utils::ChatMessage::user(&steering.content))
+            let pending_steering = steering_guard(&steering).drain();
+            if !pending_steering.is_empty() {
+                for content in pending_steering {
+                    mem.add_message(crate::utils::ChatMessage::user(&content))
                         .await
                         .map_err(ReasoningLoopError::persistence)?;
-                    consecutive_doom_detections = 0;
-                    forbid_final_nudges = 0;
-                } else {
-                    steering_requests.insert(inbound.chat_id.clone(), steering);
                 }
+                consecutive_doom_detections = 0;
+                forbid_final_nudges = 0;
             }
 
             let _ = logger_tx.send(BusMessage::Log(
@@ -3589,16 +3624,16 @@ impl AgentLogic {
             // A steering request is consumed only at a safe boundary: the
             // provider has returned, but its proposed response has not yet
             // been persisted or allowed to start another tool call.
-            if let Some((_, steering)) = steering_requests.remove(&inbound.chat_id) {
-                if steering.run_id == run_id {
-                    mem.add_message(crate::utils::ChatMessage::user(&steering.content))
+            let pending_steering = steering_guard(&steering).drain();
+            if !pending_steering.is_empty() {
+                for content in pending_steering {
+                    mem.add_message(crate::utils::ChatMessage::user(&content))
                         .await
                         .map_err(ReasoningLoopError::persistence)?;
-                    consecutive_doom_detections = 0;
-                    forbid_final_nudges = 0;
-                    continue;
                 }
-                steering_requests.insert(inbound.chat_id.clone(), steering);
+                consecutive_doom_detections = 0;
+                forbid_final_nudges = 0;
+                continue;
             }
 
             // Log USAGE telemetry
@@ -3968,6 +4003,22 @@ impl AgentLogic {
                         .map_err(ReasoningLoopError::persistence)?;
                     continue;
                 }
+
+                // Atomically close steering acceptance before committing the
+                // final response. A request racing this boundary is therefore
+                // either drained and incorporated, or rejected by `push`; it
+                // can never be acknowledged into a stale next-run inbox.
+                let final_steering = steering_guard(&steering).close_or_drain();
+                if !final_steering.is_empty() {
+                    for content in final_steering {
+                        mem.add_message(crate::utils::ChatMessage::user(&content))
+                            .await
+                            .map_err(ReasoningLoopError::persistence)?;
+                    }
+                    consecutive_doom_detections = 0;
+                    forbid_final_nudges = 0;
+                    continue;
+                }
                 // Final outbound text
                 let final_response = thinking_strip_re
                     .replace_all(&response_text, "")
@@ -4217,7 +4268,10 @@ impl Tool for LoadSkillTool {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentLogic, AgentLogicParams, ReasoningLoopCtx, ReasoningLoopExit};
+    use super::{
+        steering_guard, AgentLogic, AgentLogicParams, ReasoningLoopCtx, ReasoningLoopExit,
+        SteeringInbox,
+    };
     use async_trait::async_trait;
     use axum::{
         body::Body,
@@ -4781,7 +4835,7 @@ mod tests {
             logger_tx,
             inbound,
             run_id: "test-run-id".to_string(),
-            steering_requests: Arc::new(dashmap::DashMap::new()),
+            steering: Arc::new(Mutex::new(SteeringInbox::open())),
             cancel_token: cancel_token.clone(),
             clarification_hub: ClarificationHub::shared(),
             tool_exec_ctx: ToolExecCtx::new("terminal", "loop-test-chat", None)
@@ -5599,7 +5653,10 @@ mod tests {
             })
             .await
             .expect("stale steer is handled");
-        assert!(!agent.steering_requests.contains_key(chat_id));
+        {
+            let active = agent.cancellation_tokens.get(chat_id).expect("active run");
+            assert!(steering_guard(&active.steering).pending.is_empty());
+        }
 
         agent
             .process(BusMessage::Steer {
@@ -5609,10 +5666,14 @@ mod tests {
             })
             .await
             .expect("exact steer is handled");
-        let stored = agent.steering_requests.get(chat_id).expect("stored steer");
-        assert_eq!(stored.run_id, run_id);
-        assert_eq!(stored.content, "change direction");
-        drop(stored);
+        {
+            let active = agent.cancellation_tokens.get(chat_id).expect("active run");
+            let inbox = steering_guard(&active.steering);
+            assert_eq!(
+                inbox.pending.front().map(String::as_str),
+                Some("change direction")
+            );
+        }
 
         agent
             .process(BusMessage::CancelRun {
@@ -5621,6 +5682,19 @@ mod tests {
             })
             .await
             .expect("cancel test run");
+    }
+
+    #[test]
+    fn steering_final_boundary_is_atomic_and_never_leaks_to_a_later_run() {
+        let mut inbox = SteeringInbox::open();
+        assert!(inbox.push("first revision".to_string()));
+        assert_eq!(inbox.close_or_drain(), vec!["first revision"]);
+        assert!(inbox.accepting, "draining a revision keeps this run open");
+
+        assert!(inbox.close_or_drain().is_empty());
+        assert!(!inbox.accepting, "empty final boundary closes acceptance");
+        assert!(!inbox.push("too late".to_string()));
+        assert!(inbox.pending.is_empty());
     }
 
     #[tokio::test]
