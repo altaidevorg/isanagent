@@ -279,9 +279,35 @@ Constructor: `pub fn new(db_path: &str) -> Result<Self, String>` [src/memory.rs:
 
 ## 6. Top-level orchestrator types
 
+### 0.11 migration: run-scoped provider configuration
+
+Version 0.11 intentionally removes the process-global and independently
+mutable provider-credential APIs. These removals are breaking changes:
+
+| Removed 0.10 API | 0.11 replacement |
+| --- | --- |
+| `set_fallback_providers(specs)` | Pass `specs` to `AgentLogic::new_with_fallback_providers(params, specs)`. |
+| `agent.provider_credentials_handle()` followed by independent writes | Build the matching provider and call `agent.switch_provider_with_credentials(provider, credentials).await`. |
+
+`switch_provider(provider)` and `set_provider_credentials(credentials)` remain
+temporary compatibility shims. The provider-only form clears credential
+identity and disables failover for later admissions; the credential-only form
+rebuilds a standard provider. Custom provider embedders should migrate directly
+to `switch_provider_with_credentials` so the provider and its credentials become
+visible atomically.
+
 ### 6.1 `AgentLogic` — struct [src/agent/mod.rs:1045](../src/agent/mod.rs#L1045)
 
 The central reasoning actor. All fields private. Constructed via `pub fn new(params: AgentLogicParams) -> Self` [src/agent/mod.rs:1073](../src/agent/mod.rs#L1073). Implements `ActorLogic<BusMessage>` at [src/agent/mod.rs:1270](../src/agent/mod.rs#L1270).
+
+Provider configuration changes must use
+`switch_provider_with_credentials(provider, credentials)` so the provider and
+the credential identity become visible in one write. The older
+`switch_provider(provider)` and `set_provider_credentials(credentials)` methods
+remain source-compatible migration shims: the former clears credential identity
+and disables fallback for later admissions, while the latter rebuilds a standard
+provider from the supplied credentials. Custom provider embedders must migrate
+to the paired method. No supported API exposes a mutable credential handle.
 
 > **Overhaul touchpoint.** PR-5 adds a pub method `trigger_compaction(chat_id, options)` to this struct.
 
@@ -293,6 +319,7 @@ Constructor params for `AgentLogic::new`. **All fields `pub`** — embedding cra
 pub struct AgentLogicParams {
     pub name: String,
     pub provider: Box<dyn Provider>,
+    pub provider_credentials: ProviderCredentials,
     pub session_manager: SessionManager,
     pub tools: ToolRegistry,
     pub skills: SkillRegistry,
@@ -314,6 +341,8 @@ pub struct AgentLogicParams {
     pub hook_tool_ctx: Option<Arc<ToolCallHookContext>>,
 }
 ```
+
+`AgentLogic::new(params)` preserves the compatibility path with no failover candidates. Embedding crates that configure failover use `AgentLogic::new_with_fallback_providers(params, candidates)`. The candidate vector is owned by that `AgentLogic`; every admitted main-agent or sub-agent run snapshots its provider, credential identity, and filtered fallbacks. Runtime model switches therefore affect only later admissions.
 
 **This struct is on the critical compatibility path.** Adding fields here is breaking without `#[non_exhaustive]` because constructors enumerate every field. Phase 0.0b must add the marker and document the workaround (use struct-update syntax with a default).
 
