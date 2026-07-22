@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use regex::Regex;
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -310,8 +311,44 @@ pub const WAITING_FOR_USER_RESULT_PREFIX: &str = "WAITING:";
 
 enum ToolExecutionFinished {
     Completed(Result<String, String>),
+    InvalidArguments(InvalidToolArguments),
     Cancelled,
     Waiting(String), // The ticket ID
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct InvalidToolArguments {
+    error: InvalidToolArgumentsDetail,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct InvalidToolArgumentsDetail {
+    code: &'static str,
+    diagnostic: String,
+}
+
+impl InvalidToolArguments {
+    fn from_json_error(error: serde_json::Error) -> Self {
+        Self {
+            error: InvalidToolArgumentsDetail {
+                code: "invalid_tool_arguments",
+                diagnostic: format!(
+                    "Malformed JSON at line {} column {} ({:?})",
+                    error.line(),
+                    error.column(),
+                    error.classify()
+                ),
+            },
+        }
+    }
+
+    fn to_tool_output(&self) -> String {
+        serde_json::to_string(self).expect("invalid-tool-arguments payload is serializable")
+    }
+}
+
+fn parse_tool_arguments(raw: &str) -> Result<Value, InvalidToolArguments> {
+    serde_json::from_str(raw).map_err(InvalidToolArguments::from_json_error)
 }
 
 fn extract_exec_command(args: &Value) -> Option<String> {
@@ -1970,6 +2007,7 @@ impl AgentLogic {
         .await
         {
             ToolExecutionFinished::Completed(res) => res,
+            ToolExecutionFinished::InvalidArguments(error) => Err(error.to_tool_output()),
             ToolExecutionFinished::Waiting(ticket_id) => Err(format!(
                 "tool call waiting for clarification ticket: {}",
                 ticket_id
@@ -3638,21 +3676,21 @@ impl AgentLogic {
                         let inbound_meta_for_tool = inbound_metadata.clone();
                         let chat_id = inbound.chat_id.clone();
                         let tool_name = tc.function.name.clone();
-                        let args =
-                            serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
-                                .unwrap_or_else(|_| serde_json::json!({}));
+                        let parsed_args = parse_tool_arguments(&tc.function.arguments);
                         if tool_name == "exec" {
-                            if let Some(cmd) = extract_exec_command(&args) {
-                                if shell_command_uses_grep_like(&cmd) {
-                                    let _ = outbound_tx
-                                        .send(BusMessage::Telemetry(
-                                            TelemetryEvent::ShellGrepLikeDetected {
-                                                chat_id: inbound.chat_id.clone(),
-                                                channel: inbound.channel.clone(),
-                                                command_preview: command_preview(&cmd),
-                                            },
-                                        ))
-                                        .await;
+                            if let Ok(args) = &parsed_args {
+                                if let Some(cmd) = extract_exec_command(args) {
+                                    if shell_command_uses_grep_like(&cmd) {
+                                        let _ = outbound_tx
+                                            .send(BusMessage::Telemetry(
+                                                TelemetryEvent::ShellGrepLikeDetected {
+                                                    chat_id: inbound.chat_id.clone(),
+                                                    channel: inbound.channel.clone(),
+                                                    command_preview: command_preview(&cmd),
+                                                },
+                                            ))
+                                            .await;
+                                    }
                                 }
                             }
                         }
@@ -3665,6 +3703,12 @@ impl AgentLogic {
                         let channel_for_call = inbound.channel.clone();
                         let tool_call_id = Some(tc.id.clone());
                         futures_vec.push(async move {
+                            let args = match parsed_args {
+                                Ok(args) => args,
+                                Err(error) => {
+                                    return ToolExecutionFinished::InvalidArguments(error)
+                                }
+                            };
                             execute_tool_call_with_activity(
                                 &tools,
                                 tool_execution_activity,
@@ -3694,8 +3738,11 @@ impl AgentLogic {
                         if cancel_token.is_cancelled() {
                             persist_and_cancel!();
                         }
-                        let tool_result = match fin {
-                            ToolExecutionFinished::Completed(res) => res,
+                        let (tool_result, typed_error) = match fin {
+                            ToolExecutionFinished::Completed(res) => (res, false),
+                            ToolExecutionFinished::InvalidArguments(error) => {
+                                (Ok(error.to_tool_output()), true)
+                            }
                             ToolExecutionFinished::Waiting(ticket_id) => {
                                 // Break the iteration loop; the job is now in 'waiting' state.
                                 return Ok(ReasoningLoopExit::WaitingForUser { ticket_id });
@@ -3710,8 +3757,8 @@ impl AgentLogic {
                         // tool_output_looks_like_failure (text-only, all tools) missed non-zero
                         // exits whose output did not start with "Error:" and false-flagged content
                         // tools like read_file; tool_call_is_error is tool-scoped and exit-aware.
-                        let is_error =
-                            crate::utils::tool_call_is_error(&tc.function.name, &tool_result);
+                        let is_error = typed_error
+                            || crate::utils::tool_call_is_error(&tc.function.name, &tool_result);
                         let tool_result_text = finalize_tool_output(tool_result);
                         let tool_name = tc.function.name.clone();
                         let tr = TelemetryEvent::ToolResult {
@@ -3763,48 +3810,57 @@ impl AgentLogic {
 
                         let tool_name = &tc.function.name;
                         let args_str = &tc.function.arguments;
-                        let args = serde_json::from_str::<serde_json::Value>(args_str)
-                            .unwrap_or_else(|_| serde_json::json!({}));
+                        let parsed_args = parse_tool_arguments(args_str);
                         if tool_name == "exec" {
-                            if let Some(cmd) = extract_exec_command(&args) {
-                                if shell_command_uses_grep_like(&cmd) {
-                                    let _ = outbound_tx
-                                        .send(BusMessage::Telemetry(
-                                            TelemetryEvent::ShellGrepLikeDetected {
-                                                chat_id: inbound.chat_id.clone(),
-                                                channel: inbound.channel.clone(),
-                                                command_preview: command_preview(&cmd),
-                                            },
-                                        ))
-                                        .await;
+                            if let Ok(args) = &parsed_args {
+                                if let Some(cmd) = extract_exec_command(args) {
+                                    if shell_command_uses_grep_like(&cmd) {
+                                        let _ = outbound_tx
+                                            .send(BusMessage::Telemetry(
+                                                TelemetryEvent::ShellGrepLikeDetected {
+                                                    chat_id: inbound.chat_id.clone(),
+                                                    channel: inbound.channel.clone(),
+                                                    command_preview: command_preview(&cmd),
+                                                },
+                                            ))
+                                            .await;
+                                    }
                                 }
                             }
                         }
 
-                        let tool_result = match execute_tool_call_with_activity(
-                            &tools,
-                            tool_execution_activity.clone(),
-                            &inbound.chat_id,
-                            &inbound.channel,
-                            &outbound_tx,
-                            tool_name,
-                            Some(tc.id.clone()),
-                            args,
-                            Some(&cancel_token),
-                            ToolCallRuntime {
-                                session: tool_exec_ctx.clone(),
-                                hub: clarification_hub.clone(),
-                                is_subagent,
-                                subagent_allowlist: subagent_allowlist.clone(),
-                                shell_policy: shell_policy.clone(),
-                                unattended_session,
-                                hook_tool_ctx: hook_tool_ctx.clone(),
-                                inbound_metadata: inbound_metadata.clone(),
-                            },
-                        )
-                        .await
-                        {
-                            ToolExecutionFinished::Completed(res) => res,
+                        let finished = match parsed_args {
+                            Ok(args) => {
+                                execute_tool_call_with_activity(
+                                    &tools,
+                                    tool_execution_activity.clone(),
+                                    &inbound.chat_id,
+                                    &inbound.channel,
+                                    &outbound_tx,
+                                    tool_name,
+                                    Some(tc.id.clone()),
+                                    args,
+                                    Some(&cancel_token),
+                                    ToolCallRuntime {
+                                        session: tool_exec_ctx.clone(),
+                                        hub: clarification_hub.clone(),
+                                        is_subagent,
+                                        subagent_allowlist: subagent_allowlist.clone(),
+                                        shell_policy: shell_policy.clone(),
+                                        unattended_session,
+                                        hook_tool_ctx: hook_tool_ctx.clone(),
+                                        inbound_metadata: inbound_metadata.clone(),
+                                    },
+                                )
+                                .await
+                            }
+                            Err(error) => ToolExecutionFinished::InvalidArguments(error),
+                        };
+                        let (tool_result, typed_error) = match finished {
+                            ToolExecutionFinished::Completed(res) => (res, false),
+                            ToolExecutionFinished::InvalidArguments(error) => {
+                                (Ok(error.to_tool_output()), true)
+                            }
                             ToolExecutionFinished::Waiting(ticket_id) => {
                                 // Break the iteration loop; the job is now in 'waiting' state.
                                 return Ok(ReasoningLoopExit::WaitingForUser { ticket_id });
@@ -3820,8 +3876,8 @@ impl AgentLogic {
                         // tool_output_looks_like_failure (text-only, all tools) missed non-zero
                         // exits whose output did not start with "Error:" and false-flagged content
                         // tools like read_file; tool_call_is_error is tool-scoped and exit-aware.
-                        let is_error =
-                            crate::utils::tool_call_is_error(&tc.function.name, &tool_result);
+                        let is_error = typed_error
+                            || crate::utils::tool_call_is_error(&tc.function.name, &tool_result);
                         let tool_result_text = finalize_tool_output(tool_result);
 
                         let tr = TelemetryEvent::ToolResult {
@@ -4667,6 +4723,51 @@ mod tests {
                         arguments,
                     },
                 }]),
+                reasoning_content: None,
+                usage: None,
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct MalformedToolArgumentsProvider {
+        calls: Arc<AtomicUsize>,
+        tool_names: Vec<String>,
+    }
+
+    #[async_trait]
+    impl Provider for MalformedToolArgumentsProvider {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<serde_json::Value>,
+        ) -> Result<LLMResponse, LLMError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call > 0 {
+                return Ok(LLMResponse {
+                    content: "recovered after invalid arguments".to_string(),
+                    tool_calls: None,
+                    reasoning_content: None,
+                    usage: None,
+                });
+            }
+            let tool_calls = self
+                .tool_names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| crate::utils::ToolCallRequest {
+                    id: format!("malformed-{index}"),
+                    tool_type: "function".to_string(),
+                    extra_content: None,
+                    function: crate::utils::ToolCallFunction {
+                        name: name.clone(),
+                        arguments: "{\"unterminated\":".to_string(),
+                    },
+                })
+                .collect();
+            Ok(LLMResponse {
+                content: String::new(),
+                tool_calls: Some(tool_calls),
                 reasoning_content: None,
                 usage: None,
             })
@@ -5571,6 +5672,53 @@ mod tests {
             .map(|c| c.text_content())
             .unwrap_or_default();
         assert_eq!(text, "Agent reached max reasoning iterations.");
+    }
+
+    fn invalid_argument_codes(context: &[ChatMessage]) -> Vec<String> {
+        context
+            .iter()
+            .filter(|message| message.role == "tool")
+            .filter_map(|message| message.content.as_ref())
+            .filter_map(|content| serde_json::from_str::<Value>(&content.text_content()).ok())
+            .filter_map(|payload| {
+                payload
+                    .pointer("/error/code")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn sequential_malformed_tool_arguments_return_typed_error_without_dispatch() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = MalformedToolArgumentsProvider {
+            calls: calls.clone(),
+            tool_names: vec!["slow_tool".to_string()],
+        };
+        let (result, context) = run_loop_once_for_test(Box::new(provider), 2, false, false).await;
+
+        assert!(matches!(result, Ok(ReasoningLoopExit::Completed { .. })));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(invalid_argument_codes(&context), ["invalid_tool_arguments"]);
+    }
+
+    #[tokio::test]
+    async fn parallel_malformed_tool_arguments_return_typed_errors_without_dispatch() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = MalformedToolArgumentsProvider {
+            calls: calls.clone(),
+            // Both names are classified parallel-safe, forcing the join_all path.
+            tool_names: vec!["read_file".to_string(), "list_dir".to_string()],
+        };
+        let (result, context) = run_loop_once_for_test(Box::new(provider), 2, false, false).await;
+
+        assert!(matches!(result, Ok(ReasoningLoopExit::Completed { .. })));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            invalid_argument_codes(&context),
+            ["invalid_tool_arguments", "invalid_tool_arguments"]
+        );
     }
 
     // P1.4: a model that ignores the doom-loop nudges is hard-stopped with a "stuck" message
