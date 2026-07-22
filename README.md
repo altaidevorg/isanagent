@@ -103,8 +103,6 @@ model_name = "claude-sonnet-4-6"
 
 Use `/model` in the TUI to open the interactive model selector, or `/model gemini-2-5-flash` to switch directly. Your choice is remembered across restarts.
 
-Provider selection is isolated per accepted run. Switching models does not alter an in-flight run; messages accepted after the switch use the new provider and credentials even if they wait in that chat's FIFO. Configured failover candidates are also snapshotted per run, so concurrent chats cannot overwrite one another's fallback policy.
-
 ### Skill management
 
 isanagent supports installing specialized **skills** (structured procedures and instructions) from remote GitHub repositories. You can install an entire repository of skills or a specific one using shorthand `owner/repo` or full URLs.
