@@ -996,6 +996,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                 BusMessage::Inbound(_)
                     | BusMessage::Cancel(_)
                     | BusMessage::CancelRun { .. }
+                    | BusMessage::Steer { .. }
                     | BusMessage::SwitchModel { .. }
             ) {
                 let _ = agent_tx.send_packet(msg).await;
