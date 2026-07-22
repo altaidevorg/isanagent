@@ -122,21 +122,26 @@ fn ensure_run_id(inbound: &mut InboundMessage) -> Result<String, String> {
 }
 
 fn text_looks_like_research_request(content: &str) -> bool {
-    let lower = content.to_ascii_lowercase();
-    [
-        "research",
-        "literature",
-        "paper",
-        "state-of-the-art",
-        "state of the art",
-        "survey",
-        "arxiv",
-        "evidence",
-        "cite",
-        "compare methods",
-    ]
-    .iter()
-    .any(|k| lower.contains(k))
+    static RESEARCH_REQUEST_RE: OnceLock<Regex> = OnceLock::new();
+    RESEARCH_REQUEST_RE
+        .get_or_init(|| {
+            Regex::new(
+                r"(?ix)
+                \b(?:
+                    research(?:er|ers|ing|ed)? |
+                    literature |
+                    papers? |
+                    state[-\s]+of[-\s]+the[-\s]+art |
+                    surveys? |
+                    arxiv |
+                    evidence |
+                    cite |
+                    compare\s+methods
+                )\b",
+            )
+            .expect("research-request regex")
+        })
+        .is_match(content)
 }
 
 fn context_has_tool_call(context: &[crate::utils::ChatMessage], tool_name: &str) -> bool {
@@ -245,6 +250,14 @@ fn trim_context_to_budget(context: &mut Vec<crate::utils::ChatMessage>, max_toke
 fn repair_tool_call_context(context: &mut Vec<crate::utils::ChatMessage>) {
     let mut i = 0;
     while i < context.len() {
+        // A tool result without an immediately preceding assistant tool-call
+        // block is invalid for strict providers. It can be left behind by
+        // legacy/corrupt history, so discard it before context trimming.
+        if context[i].role == "tool" {
+            context.remove(i);
+            continue;
+        }
+
         let tool_call_ids: Vec<String> = match &context[i].tool_calls {
             Some(calls) if context[i].role == "assistant" && !calls.is_empty() => {
                 calls.iter().map(|tc| tc.id.clone()).collect()
@@ -255,14 +268,22 @@ fn repair_tool_call_context(context: &mut Vec<crate::utils::ChatMessage>) {
             }
         };
 
-        // Collect the set of tool_call_ids that have responses immediately following
+        // Keep at most one response for each requested id. Mismatched,
+        // id-less, and duplicate tool rows are orphaned protocol records and
+        // would make strict providers reject the whole request.
+        let requested: HashSet<String> = tool_call_ids.iter().cloned().collect();
         let mut responded: HashSet<String> = HashSet::new();
         let mut j = i + 1;
         while j < context.len() && context[j].role == "tool" {
-            if let Some(ref id) = context[j].tool_call_id {
-                responded.insert(id.clone());
+            let keep = context[j]
+                .tool_call_id
+                .as_deref()
+                .is_some_and(|id| requested.contains(id) && responded.insert(id.to_string()));
+            if keep {
+                j += 1;
+            } else {
+                context.remove(j);
             }
-            j += 1;
         }
 
         // Append placeholder tool responses for any missing tool_call_ids at end of tool block
@@ -684,6 +705,97 @@ mod code_exec_gate_tests {
             err.as_ref().err().map(String::as_str),
             Some("boom\n\n[post-tool hook]\nlint output")
         );
+    }
+}
+
+#[cfg(test)]
+mod context_hardening_tests {
+    use super::*;
+
+    fn assistant_with_calls(ids: &[&str]) -> crate::utils::ChatMessage {
+        let mut message = crate::utils::ChatMessage::assistant("");
+        message.content = None;
+        message.tool_calls = Some(
+            ids.iter()
+                .map(|id| crate::utils::ToolCallRequest {
+                    id: (*id).to_string(),
+                    tool_type: "function".to_string(),
+                    extra_content: None,
+                    function: crate::utils::ToolCallFunction {
+                        name: "read_file".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                })
+                .collect(),
+        );
+        message
+    }
+
+    #[test]
+    fn research_detection_uses_word_and_phrase_boundaries() {
+        for positive in [
+            "Research this topic",
+            "review the papers",
+            "give me state-of-the-art evidence",
+            "cite primary sources",
+            "compare methods",
+        ] {
+            assert!(text_looks_like_research_request(positive), "{positive}");
+        }
+        for negative in [
+            "I am excited about this",
+            "the paperclip is broken",
+            "surveying the room",
+            "compare methodologies later",
+        ] {
+            assert!(!text_looks_like_research_request(negative), "{negative}");
+        }
+    }
+
+    #[test]
+    fn repair_removes_orphan_mismatched_and_duplicate_tool_results() {
+        let mut context = vec![
+            crate::utils::ChatMessage::system("system"),
+            crate::utils::ChatMessage::tool("orphan", "orphan", None),
+            assistant_with_calls(&["a", "b"]),
+            crate::utils::ChatMessage::tool("first", "a", None),
+            crate::utils::ChatMessage::tool("duplicate", "a", None),
+            crate::utils::ChatMessage::tool("wrong", "other", None),
+            crate::utils::ChatMessage::user("next"),
+        ];
+
+        repair_tool_call_context(&mut context);
+
+        let tool_ids: Vec<_> = context
+            .iter()
+            .filter(|message| message.role == "tool")
+            .filter_map(|message| message.tool_call_id.as_deref())
+            .collect();
+        assert_eq!(tool_ids, ["a", "b"]);
+        assert!(context.iter().all(|message| {
+            message
+                .content
+                .as_ref()
+                .is_none_or(|content| !content.text_content().contains("orphan"))
+        }));
+    }
+
+    #[test]
+    fn trimming_keeps_assistant_tool_blocks_atomic() {
+        let mut context = vec![
+            crate::utils::ChatMessage::system("system"),
+            crate::utils::ChatMessage::user(&"x".repeat(400)),
+            assistant_with_calls(&["call"]),
+            crate::utils::ChatMessage::tool("result", "call", None),
+            crate::utils::ChatMessage::user("recent"),
+        ];
+
+        trim_context_to_budget(&mut context, 1);
+
+        assert!(!context.iter().any(|message| message.role == "tool"));
+        assert!(!context
+            .iter()
+            .any(|message| message.role == "assistant" && message.tool_calls.is_some()));
     }
 }
 
