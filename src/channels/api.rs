@@ -92,6 +92,7 @@ enum StreamEvent {
     ToolCallFinished {
         tool_name: String,
         result: String,
+        is_error: bool,
     },
     AgentThought {
         thought: String,
@@ -652,14 +653,16 @@ impl ApiChannel {
                 chat_id,
                 tool_name,
                 result,
+                is_error,
                 ..
             } => {
                 if let Some(pending) = self.pending_requests.get(&chat_id) {
                     if let PendingRequest::Stream(pending) = pending.value() {
-                        if let Err(e) = pending
-                            .stream_tx
-                            .try_send(StreamEvent::ToolCallFinished { tool_name, result })
-                        {
+                        if let Err(e) = pending.stream_tx.try_send(StreamEvent::ToolCallFinished {
+                            tool_name,
+                            result,
+                            is_error,
+                        }) {
                             error!("Failed to send tool_call_finished to stream: {}", e);
                         }
                     }
@@ -2567,7 +2570,7 @@ fn log_api(logger_tx: &LoggerHandle, event: LogEvent) {
 mod tests {
     use super::{
         bearer_token_matches, build_router, is_loopback_bind, validate_bind_security, ApiState,
-        PendingRequest, EMBEDDED_UI_ASSETS,
+        PendingRequest, StreamEvent, EMBEDDED_UI_ASSETS,
     };
     use crate::bus::{BusMessage, OutboundMessage};
     use crate::channels::api_store::ResponseStore;
@@ -2588,6 +2591,24 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::sync::{mpsc, oneshot};
     use tower::ServiceExt;
+
+    #[test]
+    fn streamed_tool_completion_preserves_typed_error_status() {
+        for (result, is_error) in [
+            ("Error: this is file content, not a failure", false),
+            ("native failure without a text prefix", true),
+        ] {
+            let event = StreamEvent::ToolCallFinished {
+                tool_name: "read_file".to_string(),
+                result: result.to_string(),
+                is_error,
+            };
+            let encoded = serde_json::to_value(event).expect("serialize stream event");
+
+            assert_eq!(encoded["type"], "tool_call_finished");
+            assert_eq!(encoded["is_error"], is_error);
+        }
+    }
 
     struct LocalTempDir {
         path: std::path::PathBuf,

@@ -130,7 +130,7 @@ pub struct OutboundMessage {
 | `AgentThought` | `chat_id`, `thought`, `background_job_id` |
 | `AgentUsage` | `chat_id`, `model`, `prompt_tokens`, `completion_tokens`, `total_tokens`, `background_job_id` |
 | `ToolCallStarted` | `chat_id`, `tool_name`, `args`, `background_job_id` |
-| `ToolCallFinished` | `chat_id`, `tool_name`, `result`, `background_job_id` |
+| `ToolCallFinished` | `chat_id`, `tool_name`, `result`, `is_error`, `background_job_id` |
 | `ToolProgress` | `chat_id`, `channel`, `tool_name`, `tool_call_id`, `message`, `background_job_id` |
 | `CronTrigger` | `job_id`, `message` |
 | `ExecutionRunFinished` | `chat_id`, `channel`, `provider_id`, `session_id`, `exit_code`, `duration_ms`, `stdout_len`, `stderr_len`, `artifact_count`, `git_head`, `description` |

@@ -181,6 +181,10 @@ pub enum TelemetryEvent {
         chat_id: String,
         tool_name: String,
         result: String,
+        /// Authoritative executor status. Defaults to success so telemetry
+        /// persisted before this field was added still deserializes.
+        #[serde(default)]
+        is_error: bool,
         background_job_id: Option<String>,
     },
     /// Mid–tool-call status (e.g. uv-managed Python env setup); not a tool result.
@@ -535,7 +539,7 @@ fn redact_chat_id(chat_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{clarification_session_key, InboundMessage, LogEvent, LogLevel};
+    use super::{clarification_session_key, InboundMessage, LogEvent, LogLevel, TelemetryEvent};
     use crate::tool_runtime::ToolExecCtx;
 
     #[test]
@@ -557,6 +561,28 @@ mod tests {
             metadata: Default::default(),
         };
         assert_eq!(inbound.clarification_session_key(), "api:x:");
+    }
+
+    #[test]
+    fn legacy_tool_completion_defaults_to_success_status() {
+        let encoded = serde_json::json!({
+            "ToolCallFinished": {
+                "chat_id": "chat-1",
+                "tool_name": "read_file",
+                "result": "Error: literal file content",
+                "background_job_id": null
+            }
+        });
+        let event: TelemetryEvent =
+            serde_json::from_value(encoded).expect("deserialize legacy telemetry");
+
+        assert!(matches!(
+            event,
+            TelemetryEvent::ToolCallFinished {
+                is_error: false,
+                ..
+            }
+        ));
     }
 
     #[test]
