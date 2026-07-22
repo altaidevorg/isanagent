@@ -629,10 +629,56 @@ pub enum RunStuckReason {
     NoProgress,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum RunBudgetLimit {
+    LlmTurns,
+    WallTime,
+    Tokens,
+    ProviderRetries,
+    ContextRecoveries,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunBudgetSnapshot {
     pub iterations_used: usize,
     pub iterations_limit: usize,
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    #[serde(default)]
+    pub elapsed_limit_ms: u64,
+    #[serde(default)]
+    pub tokens_used: u64,
+    #[serde(default)]
+    pub tokens_limit: u64,
+    #[serde(default)]
+    pub provider_retries_used: u32,
+    #[serde(default)]
+    pub provider_retries_limit: u32,
+    #[serde(default)]
+    pub context_recoveries_used: u32,
+    #[serde(default)]
+    pub context_recoveries_limit: u32,
+    #[serde(default)]
+    pub no_progress_turns: usize,
+    #[serde(default)]
+    pub repeated_root_cause_failures: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exhausted_limit: Option<RunBudgetLimit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RunBudgetWarningReason {
+    ApproachingLimit { limit: RunBudgetLimit },
+    RepeatedRootCause { failures: usize },
+    NoProgress { turns: usize },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunBudgetWarning {
+    pub reason: RunBudgetWarningReason,
+    pub budget: RunBudgetSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -658,6 +704,11 @@ pub enum RunLifecycleEvent {
     Started {
         run_id: String,
         chat_id: String,
+    },
+    Warning {
+        run_id: String,
+        chat_id: String,
+        warning: RunBudgetWarning,
     },
     Terminated {
         run_id: String,
@@ -741,7 +792,10 @@ pub enum BusMessage {
 
 #[cfg(test)]
 mod run_lifecycle_tests {
-    use super::{RunBudgetSnapshot, RunFailureKind, RunLifecycleEvent, RunOutcome, RunStuckReason};
+    use super::{
+        RunBudgetLimit, RunBudgetSnapshot, RunBudgetWarning, RunBudgetWarningReason,
+        RunFailureKind, RunLifecycleEvent, RunOutcome, RunStuckReason,
+    };
 
     #[test]
     fn lifecycle_events_round_trip_for_every_terminal_outcome() {
@@ -759,6 +813,7 @@ mod run_lifecycle_tests {
                 budget: RunBudgetSnapshot {
                     iterations_used: 24,
                     iterations_limit: 24,
+                    ..RunBudgetSnapshot::default()
                 },
             },
         ];
@@ -786,6 +841,32 @@ mod run_lifecycle_tests {
         let encoded = serde_json::to_string(&event).expect("serialize lifecycle event");
         let decoded: RunLifecycleEvent =
             serde_json::from_str(&encoded).expect("deserialize lifecycle event");
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn budget_warning_round_trips_without_becoming_terminal() {
+        let event = RunLifecycleEvent::Warning {
+            run_id: "run-123".to_string(),
+            chat_id: "chat-456".to_string(),
+            warning: RunBudgetWarning {
+                reason: RunBudgetWarningReason::ApproachingLimit {
+                    limit: RunBudgetLimit::Tokens,
+                },
+                budget: RunBudgetSnapshot {
+                    iterations_used: 12,
+                    iterations_limit: 50,
+                    tokens_used: 4_000_000,
+                    tokens_limit: 5_000_000,
+                    ..RunBudgetSnapshot::default()
+                },
+            },
+        };
+
+        let encoded = serde_json::to_string(&event).expect("serialize lifecycle warning");
+        assert!(encoded.contains("\"type\":\"warning\""));
+        let decoded: RunLifecycleEvent =
+            serde_json::from_str(&encoded).expect("deserialize lifecycle warning");
         assert_eq!(decoded, event);
     }
 }

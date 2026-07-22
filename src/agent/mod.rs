@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::mpsc;
 
+mod budget;
 pub mod compaction;
 mod doom_loop;
 pub mod registry;
@@ -15,6 +16,10 @@ pub use subagent::SubagentHarness;
 
 use crate::clarification::ClarificationHub;
 use crate::tool_runtime::{with_tool_exec_and_progress_scope, ToolExecCtx, ToolProgressEmitter};
+
+use self::budget::{
+    tool_intent_signature, BudgetController, BudgetDecision, BudgetLimits, ProgressKind,
+};
 
 use crate::bus::{
     BusMessage, InboundMessage, LogEvent, OutboundMessage, RunBudgetSnapshot, RunFailureKind,
@@ -2991,7 +2996,10 @@ where
 
 /// Outcome of a `provider.chat` invocation that may be retried for transient errors.
 enum ChatRetryOutcome {
-    Ok(crate::utils::LLMResponse),
+    Ok {
+        response: crate::utils::LLMResponse,
+        retries: u32,
+    },
     /// Cancellation token fired during a chat or sleep; caller exits the reasoning loop.
     Cancelled,
     /// Retries exhausted; final user-facing error string. The caller is expected to surface
@@ -3034,7 +3042,12 @@ async fn chat_with_retry(
             }
         };
         match res {
-            Ok(resp) => return ChatRetryOutcome::Ok(resp),
+            Ok(resp) => {
+                return ChatRetryOutcome::Ok {
+                    response: resp,
+                    retries: attempt,
+                }
+            }
             Err(crate::utils::LLMError::ContextOverflow {
                 tokens_attempted,
                 max,
@@ -3102,7 +3115,12 @@ async fn chat_with_retry(
     )
     .await
     {
-        FallbackOutcome::Ok(resp) => return ChatRetryOutcome::Ok(resp),
+        FallbackOutcome::Ok(resp) => {
+            return ChatRetryOutcome::Ok {
+                response: resp,
+                retries: MAX_ATTEMPTS.saturating_sub(1),
+            }
+        }
         FallbackOutcome::Cancelled => return ChatRetryOutcome::Cancelled,
         FallbackOutcome::Exhausted => {}
     }
@@ -3166,7 +3184,7 @@ impl AgentLogic {
             outbound_tx,
             logger_tx,
             inbound,
-            run_id: _run_id,
+            run_id,
             steering,
             cancel_token,
             clarification_hub,
@@ -3188,6 +3206,115 @@ impl AgentLogic {
             .get_session(&session_key)
             .await
             .map_err(ReasoningLoopError::persistence)?;
+
+        let run_started_at = std::time::Instant::now();
+        let mut budget = BudgetController::new(BudgetLimits::for_run(max_iterations));
+
+        macro_rules! apply_budget_decision {
+            ($decision:expr) => {{
+                match $decision {
+                    BudgetDecision::Continue => {}
+                    BudgetDecision::Warning(warning) => {
+                        let _ = logger_tx.send(BusMessage::Log(
+                            LogEvent::warn(
+                                &name,
+                                &format!("Run budget warning: {:?}", warning.reason),
+                            )
+                            .with_chat_id(&inbound.chat_id),
+                        ));
+                        let _ = outbound_tx
+                            .send(BusMessage::RunLifecycle(RunLifecycleEvent::Warning {
+                                run_id: run_id.clone(),
+                                chat_id: inbound.chat_id.clone(),
+                                warning,
+                            }))
+                            .await;
+                    }
+                    BudgetDecision::Stuck {
+                        reason,
+                        snapshot: _,
+                    } => {
+                        let message = match reason {
+                            RunStuckReason::RepeatedRootCause => {
+                                "Stopped: the same typed tool failure repeated without measurable \
+                                 progress. Change the failing input or policy, steer the run, or \
+                                 continue with a new budget segment."
+                            }
+                            RunStuckReason::NoProgress => {
+                                "Stopped: the run continued without observable progress. Steer the \
+                                 run, break the task into a smaller step, or continue with a new \
+                                 budget segment."
+                            }
+                            RunStuckReason::DoomLoop => {
+                                "Stopped: the agent kept repeating the same action with no progress."
+                            }
+                        }
+                        .to_string();
+                        persist_terminal_assistant_message(
+                            &mut mem,
+                            &logger_tx,
+                            &name,
+                            &inbound.chat_id,
+                            &message,
+                        )
+                        .await;
+                        let _ = outbound_tx
+                            .send(BusMessage::Outbound(OutboundMessage {
+                                channel: inbound.channel.clone(),
+                                chat_id: inbound.chat_id.clone(),
+                                thread_id: inbound.thread_id.clone(),
+                                content: message.clone(),
+                                metadata: HashMap::new(),
+                            }))
+                            .await;
+                        return Ok(ReasoningLoopExit::Stuck {
+                            assistant_text: message,
+                            reason,
+                        });
+                    }
+                    BudgetDecision::BudgetExhausted(snapshot) => {
+                        let limit = match snapshot.exhausted_limit {
+                            Some(crate::bus::RunBudgetLimit::LlmTurns) => "LLM-turn",
+                            Some(crate::bus::RunBudgetLimit::WallTime) => "wall-time",
+                            Some(crate::bus::RunBudgetLimit::Tokens) => "token",
+                            Some(crate::bus::RunBudgetLimit::ProviderRetries) => {
+                                "provider-retry"
+                            }
+                            Some(crate::bus::RunBudgetLimit::ContextRecoveries) => {
+                                "context-recovery"
+                            }
+                            None => "run",
+                        };
+                        let message = format!(
+                            "Stopped: the run exhausted its {limit} budget after {} LLM turns. \
+                             Continue with a new budget segment or steer the task.",
+                            snapshot.iterations_used
+                        );
+                        persist_terminal_assistant_message(
+                            &mut mem,
+                            &logger_tx,
+                            &name,
+                            &inbound.chat_id,
+                            &message,
+                        )
+                        .await;
+                        let _ = outbound_tx
+                            .send(BusMessage::Outbound(OutboundMessage {
+                                channel: inbound.channel.clone(),
+                                chat_id: inbound.chat_id.clone(),
+                                thread_id: inbound.thread_id.clone(),
+                                content: message.clone(),
+                                metadata: HashMap::new(),
+                            }))
+                            .await;
+                        return Ok(ReasoningLoopExit::BudgetExhausted {
+                            assistant_text: message,
+                            budget: snapshot,
+                        });
+                    }
+                }
+            }};
+        }
 
         macro_rules! persist_and_cancel {
             () => {{
@@ -3326,7 +3453,7 @@ impl AgentLogic {
         });
 
         // 2. Loop until no more tool calls or max iterations reached
-        let mut iterations = 0;
+        let mut iterations: usize;
         // PR-4.1: hard cap — at most one emergency context-overflow recovery
         // per inbound. A second overflow within the same turn surfaces the
         // failure to the user instead of looping on compact-and-retry.
@@ -3334,8 +3461,6 @@ impl AgentLogic {
         // P1.4: count consecutive doom-loop detections so we can escalate from an advisory
         // nudge to a hard stop. Reset to 0 on any iteration with no detection.
         let mut consecutive_doom_detections: usize = 0;
-        // Set when the doom loop persists past the nudge budget; branches the terminal message.
-        let mut doom_loop_stuck = false;
         // Ground-truth input size from the most recent LLM call's `usage.prompt_tokens` (exact,
         // server-counted). The bytes/4 heuristic under-counts code/JSON/non-English — exactly what
         // this agent generates — so the compaction trigger uses `max(estimate, last_prompt_tokens)`
@@ -3343,15 +3468,14 @@ impl AgentLogic {
         let mut last_prompt_tokens: Option<u32> = None;
 
         // Bounds the `forbid_final_without_tools` push: after this many consecutive
-        // text-only replies (no tool call), accept the model's answer instead of
-        // nudging it again. Without this, broad/exploratory prompts where the model
-        // wants to summarize grind through every iteration and dead-end on
-        // "Agent reached max reasoning iterations." Any tool call resets the count,
-        // so normal multi-step work is unaffected.
+        // text-only replies (no tool call), stop injecting the same nudge. If the
+        // model then proposes prose-only completion, the progress controller turns
+        // the unresolved warning into `Stuck::NoProgress` instead of claiming the
+        // task completed. Any tool call resets the count.
         const MAX_FORBID_FINAL_NUDGES: u32 = 3;
         let mut forbid_final_nudges: u32 = 0;
 
-        while iterations < max_iterations {
+        loop {
             if cancel_token.is_cancelled() {
                 let _ = logger_tx.send(BusMessage::Log(
                     LogEvent::info(&name, "Reasoning loop cancelled before iteration start.")
@@ -3359,8 +3483,6 @@ impl AgentLogic {
                 ));
                 persist_and_cancel!();
             }
-            iterations += 1;
-
             // Tool paths return to the loop only after their result has been
             // persisted. Consume steering before this next iteration performs
             // compaction, calls another tool, or calls the provider.
@@ -3373,7 +3495,11 @@ impl AgentLogic {
                 }
                 consecutive_doom_detections = 0;
                 forbid_final_nudges = 0;
+                apply_budget_decision!(budget.record_progress(ProgressKind::Steering));
             }
+
+            apply_budget_decision!(budget.start_turn(run_started_at.elapsed()));
+            iterations = budget.snapshot().iterations_used;
 
             let _ = logger_tx.send(BusMessage::Log(
                 LogEvent::debug(
@@ -3546,7 +3672,6 @@ impl AgentLogic {
                         if consecutive_doom_detections >= DOOM_LOOP_HARD_STOP_AFTER {
                             // Nudges didn't break the loop — hard stop so the run doesn't spin to
                             // max_iterations re-receiving the same advice.
-                            doom_loop_stuck = true;
                             let _ = logger_tx.send(BusMessage::Log(
                                 LogEvent::warn(
                                     &name,
@@ -3599,7 +3724,7 @@ impl AgentLogic {
                 tools.list_tools_scoped(subagent_allowlist.as_deref(), is_subagent)
             ));
 
-            let response = match chat_with_retry(
+            let (response, provider_retries) = match chat_with_retry(
                 provider.as_ref(),
                 &context,
                 tools_payload,
@@ -3610,7 +3735,7 @@ impl AgentLogic {
             )
             .await
             {
-                ChatRetryOutcome::Ok(resp) => resp,
+                ChatRetryOutcome::Ok { response, retries } => (response, retries),
                 ChatRetryOutcome::Cancelled => {
                     persist_and_cancel!();
                 }
@@ -3672,6 +3797,9 @@ impl AgentLogic {
                                 // check would read the old huge value via `effective_context_tokens`
                                 // and immediately fire a redundant compaction right after this one.
                                 last_prompt_tokens = None;
+                                apply_budget_decision!(
+                                    budget.record_context_recovery(run_started_at.elapsed())
+                                );
                                 // Next iteration refetches context (now smaller due
                                 // to AddSummary + UpdateThreadMetadata) and re-runs
                                 // the chat call. No iteration counter refund — the
@@ -3785,6 +3913,16 @@ impl AgentLogic {
                 }
             };
 
+            apply_budget_decision!(budget.record_provider_retries(provider_retries));
+            if let Some(usage) = &response.usage {
+                let consumed_tokens = if usage.total_tokens > 0 {
+                    usage.total_tokens
+                } else {
+                    usage.prompt_tokens.saturating_add(usage.completion_tokens)
+                };
+                apply_budget_decision!(budget.record_tokens(u64::from(consumed_tokens)));
+            }
+
             let _ = logger_tx.send(BusMessage::Log(
                 LogEvent::debug(&name, "Provider responded.").with_chat_id(&inbound.chat_id),
             ));
@@ -3801,6 +3939,7 @@ impl AgentLogic {
                 }
                 consecutive_doom_detections = 0;
                 forbid_final_nudges = 0;
+                apply_budget_decision!(budget.record_progress(ProgressKind::Steering));
                 continue;
             }
 
@@ -3879,6 +4018,10 @@ impl AgentLogic {
                         if cancel_token.is_cancelled() {
                             persist_and_cancel!();
                         }
+                        apply_budget_decision!(budget.record_tool_call(tool_intent_signature(
+                            &tc.function.name,
+                            &tc.function.arguments,
+                        )));
                         log_tool_invocation_start(
                             &logger_tx,
                             &outbound_tx,
@@ -3973,8 +4116,24 @@ impl AgentLogic {
                         // Status is authoritative at the executor boundary. Legacy string
                         // classification is isolated inside ToolRegistry and never runs here.
                         let is_error = tool_result.is_error();
-                        let tool_result_text = finalize_tool_output(tool_result);
                         let tool_name = tc.function.name.clone();
+                        let budget_decision = if is_error {
+                            let error_code = tool_result
+                                .error_code()
+                                .map(|code| format!("{code:?}"))
+                                .unwrap_or_else(|| "unknown".to_string());
+                            budget.record_tool_failure(format!(
+                                "{}:{}",
+                                tool_name.to_ascii_lowercase(),
+                                error_code
+                            ))
+                        } else {
+                            budget.record_tool_success(tool_intent_signature(
+                                &tool_name,
+                                &tc.function.arguments,
+                            ))
+                        };
+                        let tool_result_text = finalize_tool_output(tool_result);
                         let tr = TelemetryEvent::ToolResult {
                             chat_id: inbound.chat_id.clone(),
                             channel: inbound.channel.clone(),
@@ -4004,6 +4163,8 @@ impl AgentLogic {
                         ))
                         .await
                         .map_err(ReasoningLoopError::persistence)?;
+                        apply_budget_decision!(budget_decision);
+                        apply_budget_decision!(budget.record_elapsed(run_started_at.elapsed()));
                     }
                     tool_invoked = true;
                     forbid_final_nudges = 0;
@@ -4012,6 +4173,11 @@ impl AgentLogic {
                         if cancel_token.is_cancelled() {
                             persist_and_cancel!();
                         }
+
+                        apply_budget_decision!(budget.record_tool_call(tool_intent_signature(
+                            &tc.function.name,
+                            &tc.function.arguments,
+                        )));
 
                         log_tool_invocation_start(
                             &logger_tx,
@@ -4084,6 +4250,22 @@ impl AgentLogic {
                         };
 
                         let is_error = tool_result.is_error();
+                        let budget_decision = if is_error {
+                            let error_code = tool_result
+                                .error_code()
+                                .map(|code| format!("{code:?}"))
+                                .unwrap_or_else(|| "unknown".to_string());
+                            budget.record_tool_failure(format!(
+                                "{}:{}",
+                                tool_name.to_ascii_lowercase(),
+                                error_code
+                            ))
+                        } else {
+                            budget.record_tool_success(tool_intent_signature(
+                                tool_name,
+                                &tc.function.arguments,
+                            ))
+                        };
                         let tool_result_text = finalize_tool_output(tool_result);
 
                         let tr = TelemetryEvent::ToolResult {
@@ -4117,6 +4299,8 @@ impl AgentLogic {
                         ))
                         .await
                         .map_err(ReasoningLoopError::persistence)?;
+                        apply_budget_decision!(budget_decision);
+                        apply_budget_decision!(budget.record_elapsed(run_started_at.elapsed()));
                         tool_invoked = true;
                         forbid_final_nudges = 0;
                     }
@@ -4184,8 +4368,10 @@ impl AgentLogic {
                     }
                     consecutive_doom_detections = 0;
                     forbid_final_nudges = 0;
+                    apply_budget_decision!(budget.record_progress(ProgressKind::Steering));
                     continue;
                 }
+                apply_budget_decision!(budget.propose_completion());
                 // Final outbound text
                 let final_response = thinking_strip_re
                     .replace_all(&response_text, "")
@@ -4300,16 +4486,13 @@ impl AgentLogic {
             }
         }
 
-        // The loop exits either by hitting max_iterations or by the doom-loop hard stop; surface
-        // the matching terminal message (max-iter wording is unchanged for non-doom exits).
-        let max_iter_msg = if doom_loop_stuck {
-            "Stopped: the agent kept repeating the same action with no progress and did not \
-             recover after corrective nudges. Try rephrasing the request or breaking it into \
-             smaller steps."
-                .to_string()
-        } else {
-            "Agent reached max reasoning iterations.".to_string()
-        };
+        // `break` is reserved for the legacy doom-loop detector. All budget and progress
+        // terminals return through `apply_budget_decision!`, so terminal outcomes cannot race.
+        let max_iter_msg =
+            "Stopped: the agent kept repeating the same action with no progress and \
+                            did not recover after corrective nudges. Try rephrasing the request or \
+                            breaking it into smaller steps."
+                .to_string();
         persist_terminal_assistant_message(
             &mut mem,
             &logger_tx,
@@ -4326,20 +4509,10 @@ impl AgentLogic {
             metadata: HashMap::new(),
         };
         let _ = outbound_tx.send(BusMessage::Outbound(fallback)).await;
-        if doom_loop_stuck {
-            Ok(ReasoningLoopExit::Stuck {
-                assistant_text: max_iter_msg,
-                reason: RunStuckReason::DoomLoop,
-            })
-        } else {
-            Ok(ReasoningLoopExit::BudgetExhausted {
-                assistant_text: max_iter_msg,
-                budget: RunBudgetSnapshot {
-                    iterations_used: max_iterations,
-                    iterations_limit: max_iterations,
-                },
-            })
-        }
+        Ok(ReasoningLoopExit::Stuck {
+            assistant_text: max_iter_msg,
+            reason: RunStuckReason::DoomLoop,
+        })
     }
 }
 
@@ -5010,6 +5183,26 @@ mod tests {
         Result<ReasoningLoopExit, super::ReasoningLoopError>,
         Vec<ChatMessage>,
     ) {
+        run_loop_once_for_test_with_autonomy(
+            provider,
+            max_iterations,
+            cancelled_before_start,
+            doom_loop_enabled,
+            false,
+        )
+        .await
+    }
+
+    async fn run_loop_once_for_test_with_autonomy(
+        provider: Box<dyn Provider>,
+        max_iterations: usize,
+        cancelled_before_start: bool,
+        doom_loop_enabled: bool,
+        forbid_final_without_tools: bool,
+    ) -> (
+        Result<ReasoningLoopExit, super::ReasoningLoopError>,
+        Vec<ChatMessage>,
+    ) {
         let memory_actor = SqliteMemoryActor::new(":memory:").expect("memory actor");
         let memory_node = NodeHandle::new(memory_actor, 16, 1, Duration::from_millis(1));
         let session_manager = Arc::new(SessionManager::new(memory_node));
@@ -5056,7 +5249,7 @@ mod tests {
             subagent_allowlist: None,
             doom_loop_enabled,
             harness_runtime_summary: String::new(),
-            forbid_final_without_tools: false,
+            forbid_final_without_tools,
             shell_policy: Arc::new(crate::config::ResolvedShellPolicy {
                 interactive_mode: crate::config::ShellPolicyMode::Ask,
                 unattended_mode: crate::config::ShellPolicyMode::Deny,
@@ -5588,6 +5781,81 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn repeated_root_cause_emits_warning_then_one_stuck_terminal() {
+        let (mut agent, mut outbound_rx) =
+            build_agent_with_provider(Box::new(IdenticalToolCallProvider));
+        let mut inbound = test_inbound("budget-warning-chat", "hello");
+        inbound.channel = "tauri".to_string();
+        inbound.metadata.insert(
+            METADATA_RUN_ID.to_string(),
+            serde_json::json!("budget-warning-run"),
+        );
+        agent
+            .process(BusMessage::Inbound(inbound))
+            .await
+            .expect("process inbound");
+
+        let mut lifecycle_events = Vec::new();
+        while lifecycle_events.len() < 3 {
+            let event = tokio::time::timeout(Duration::from_secs(2), outbound_rx.recv())
+                .await
+                .expect("lifecycle event before timeout")
+                .expect("outbound channel remains open");
+            if let BusMessage::RunLifecycle(event) = event {
+                lifecycle_events.push(event);
+            }
+        }
+
+        assert!(matches!(
+            lifecycle_events.as_slice(),
+            [
+                RunLifecycleEvent::Started { run_id, chat_id },
+                RunLifecycleEvent::Warning {
+                    run_id: warning_run_id,
+                    chat_id: warning_chat_id,
+                    warning: crate::bus::RunBudgetWarning {
+                        reason: crate::bus::RunBudgetWarningReason::RepeatedRootCause {
+                            failures: 2
+                        },
+                        ..
+                    },
+                },
+                RunLifecycleEvent::Terminated {
+                    run_id: terminal_run_id,
+                    chat_id: terminal_chat_id,
+                    outcome: RunOutcome::Stuck {
+                        reason: RunStuckReason::RepeatedRootCause,
+                    },
+                },
+            ] if run_id == "budget-warning-run"
+                && chat_id == "budget-warning-chat"
+                && warning_run_id == run_id
+                && warning_chat_id == chat_id
+                && terminal_run_id == run_id
+                && terminal_chat_id == chat_id
+        ));
+
+        let extra_terminal = tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                match outbound_rx.recv().await {
+                    Some(BusMessage::RunLifecycle(
+                        event @ RunLifecycleEvent::Terminated { .. },
+                    )) => return Some(event),
+                    Some(_) => continue,
+                    None => return None,
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten();
+        assert!(
+            extra_terminal.is_none(),
+            "only one terminal event is emitted"
+        );
+    }
+
     #[test]
     fn typed_terminal_exits_preserve_budget_and_doom_loop_outcomes() {
         let budget = ReasoningLoopExit::BudgetExhausted {
@@ -5595,6 +5863,7 @@ mod tests {
             budget: RunBudgetSnapshot {
                 iterations_used: 7,
                 iterations_limit: 7,
+                ..RunBudgetSnapshot::default()
             },
         }
         .lifecycle_outcome();
@@ -6039,7 +6308,29 @@ mod tests {
             .as_ref()
             .map(|c| c.text_content())
             .unwrap_or_default();
-        assert_eq!(text, "Agent reached max reasoning iterations.");
+        assert!(text.contains("exhausted its LLM-turn budget"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn unresolved_no_progress_warning_cannot_complete_from_prose_alone() {
+        let provider = Box::new(RespondingProvider {
+            tag: "premature completion".to_string(),
+        });
+        let (result, context) =
+            run_loop_once_for_test_with_autonomy(provider, 10, false, false, true).await;
+        assert!(matches!(
+            result.expect("typed stuck terminal"),
+            ReasoningLoopExit::Stuck {
+                reason: RunStuckReason::NoProgress,
+                ..
+            }
+        ));
+        let terminal_text = context
+            .last()
+            .and_then(|message| message.content.as_ref())
+            .map(|content| content.text_content())
+            .unwrap_or_default();
+        assert!(terminal_text.contains("without observable progress"));
     }
 
     fn invalid_argument_codes(context: &[ChatMessage]) -> Vec<String> {
@@ -6089,48 +6380,58 @@ mod tests {
         );
     }
 
-    // P1.4: a model that ignores the doom-loop nudges is hard-stopped with a "stuck" message
-    // well before max_iterations, instead of spinning to the iteration cap.
+    // Typed root-cause detection is earlier and more specific than the legacy context-pattern
+    // detector for repeated failed calls, so it must stop this trace before the emergency ceiling.
     #[tokio::test]
-    async fn doom_loop_escalates_to_hard_stop() {
+    async fn repeated_typed_root_cause_preempts_legacy_doom_loop() {
         // max_iterations is high; the doom escalation should terminate the run much earlier.
         let (result, _context) =
             run_loop_once_for_test(Box::new(IdenticalToolCallProvider), 50, false, true).await;
         let exit = result.expect("terminal message");
-        assert!(matches!(&exit, ReasoningLoopExit::Stuck { .. }));
+        assert!(matches!(
+            &exit,
+            ReasoningLoopExit::Stuck {
+                reason: RunStuckReason::RepeatedRootCause,
+                ..
+            }
+        ));
         let msg = exit.assistant_text().expect("stuck assistant text");
         assert!(
-            msg.starts_with("Stopped:") && msg.contains("repeating"),
-            "expected doom-loop stuck message, got: {msg}"
+            msg.starts_with("Stopped:") && msg.contains("typed tool failure"),
+            "expected typed-root-cause stuck message, got: {msg}"
         );
         // Must NOT have run to the iteration cap.
         assert_ne!(msg, "Agent reached max reasoning iterations.");
     }
 
-    // P1.4: when doom detection is disabled, the same repeating provider runs to the cap
-    // (escalation must be gated on doom_loop_enabled).
+    // The typed progress controller is independent of the optional legacy doom detector.
     #[tokio::test]
-    async fn doom_loop_disabled_runs_to_max_iterations() {
+    async fn repeated_typed_root_cause_does_not_depend_on_doom_detection() {
         let (result, _context) =
             run_loop_once_for_test(Box::new(IdenticalToolCallProvider), 3, false, false).await;
         assert!(matches!(
             result.expect("terminal message"),
-            ReasoningLoopExit::BudgetExhausted { .. }
+            ReasoningLoopExit::Stuck {
+                reason: RunStuckReason::RepeatedRootCause,
+                ..
+            }
         ));
     }
 
-    // P1.4 (review regression): a model that loops then CORRECTS after the nudge must NOT be
-    // hard-stopped — escalation counts only loops still active at the tail, so the stale run
-    // lingering in the lookback window can't force a stop. Reaches the cap instead.
+    // Merely varying arguments is not measurable progress when every call still reaches the same
+    // typed root cause. This is the historical max-iteration failure shape T17 must stop.
     #[tokio::test]
-    async fn doom_loop_does_not_stop_after_model_corrects() {
+    async fn varied_arguments_do_not_mask_the_same_typed_root_cause() {
         let provider = Box::new(CorrectingProvider {
             calls: Arc::new(AtomicUsize::new(0)),
         });
         let (result, _context) = run_loop_once_for_test(provider, 8, false, true).await;
         assert!(matches!(
             result.expect("terminal message"),
-            ReasoningLoopExit::BudgetExhausted { .. }
+            ReasoningLoopExit::Stuck {
+                reason: RunStuckReason::RepeatedRootCause,
+                ..
+            }
         ));
     }
 
