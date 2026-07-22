@@ -31,7 +31,7 @@ use crate::session::SessionManager;
 use crate::skills::{SharedSkillRegistry, SkillRegistry};
 use crate::tool_activity::SharedToolExecutionActivity;
 use crate::tools::ToolRegistry;
-use crate::traits::{Memory, Provider, Tool};
+use crate::traits::{Memory, Provider, Tool, ToolErrorCode, ToolResult};
 use crate::NodeHandle;
 use crate::{ActorError, ActorLogic};
 use futures::{future::join_all, FutureExt};
@@ -310,10 +310,15 @@ pub const WAIT_SIGNAL_PREFIX: &str = "ISANAGENT_WAIT_FOR_USER:";
 pub const WAITING_FOR_USER_RESULT_PREFIX: &str = "WAITING:";
 
 enum ToolExecutionFinished {
-    Completed(Result<String, String>),
-    InvalidArguments(InvalidToolArguments),
+    Completed(ToolResult),
     Cancelled,
     Waiting(String), // The ticket ID
+}
+
+impl ToolExecutionFinished {
+    fn error(code: ToolErrorCode, message: impl Into<String>) -> Self {
+        Self::Completed(ToolResult::error(code, message))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -342,8 +347,16 @@ impl InvalidToolArguments {
         }
     }
 
-    fn to_tool_output(&self) -> String {
-        serde_json::to_string(self).expect("invalid-tool-arguments payload is serializable")
+    fn to_tool_result(&self) -> ToolResult {
+        let content = serde_json::to_string(self).unwrap_or_else(|_| {
+            r#"{"error":{"code":"invalid_tool_arguments","diagnostic":"Malformed JSON"}}"#
+                .to_string()
+        });
+        ToolResult::error_with_content(
+            ToolErrorCode::InvalidToolArguments,
+            self.error.diagnostic.clone(),
+            content,
+        )
     }
 }
 
@@ -360,20 +373,12 @@ fn extract_exec_command(args: &Value) -> Option<String> {
 
 /// Append post_tool verification-hook output (build/test/lint results) to a tool result, preserving
 /// Ok/Err polarity so the model sees it alongside the tool's own output and can self-correct.
-fn append_post_tool_output(res: Result<String, String>, hook_out: &str) -> Result<String, String> {
+fn append_post_tool_output(mut result: ToolResult, hook_out: &str) -> ToolResult {
     let note = format!("\n\n[post-tool hook]\n{hook_out}");
-    // `res` is owned, so append the note onto the existing buffer in place rather than allocating a
+    // `result` is owned, so append onto the existing buffer in place rather than allocating a
     // fresh string and copying the (potentially large) tool output into it.
-    match res {
-        Ok(mut s) => {
-            s.push_str(&note);
-            Ok(s)
-        }
-        Err(mut s) => {
-            s.push_str(&note);
-            Err(s)
-        }
-    }
+    result.content.push_str(&note);
+    result
 }
 
 /// Lowercase and collapse every run of whitespace (spaces, tabs, newlines) to a single space so a
@@ -709,18 +714,17 @@ mod code_exec_gate_tests {
 
     #[test]
     fn append_post_tool_output_preserves_polarity() {
-        // Appends to an Ok result, staying Ok (verification output is informational).
-        let ok = append_post_tool_output(Ok("applied".into()), "tests passed");
-        assert_eq!(
-            ok.as_deref(),
-            Ok("applied\n\n[post-tool hook]\ntests passed")
+        // Appends to a success, preserving its typed status.
+        let ok = append_post_tool_output(ToolResult::success("applied"), "tests passed");
+        assert_eq!(ok.content, "applied\n\n[post-tool hook]\ntests passed");
+        assert!(!ok.is_error());
+        // Appends to an error without replacing its typed root cause.
+        let err = append_post_tool_output(
+            ToolResult::error(ToolErrorCode::ExecutionFailed, "boom"),
+            "lint output",
         );
-        // Appends to an Err result, staying Err (the tool itself failed).
-        let err = append_post_tool_output(Err("boom".into()), "lint output");
-        assert_eq!(
-            err.as_ref().err().map(String::as_str),
-            Some("boom\n\n[post-tool hook]\nlint output")
-        );
+        assert_eq!(err.content, "Error: boom\n\n[post-tool hook]\nlint output");
+        assert_eq!(err.error_code(), Some(ToolErrorCode::ExecutionFailed));
     }
 }
 
@@ -894,10 +898,13 @@ async fn execute_tool_call_with_activity(
                                     command_preview: preview,
                                 }))
                                 .await;
-                            return ToolExecutionFinished::Completed(Err(format!(
-                                "Command blocked by shell policy (mode=deny): {}",
-                                command
-                            )));
+                            return ToolExecutionFinished::error(
+                                ToolErrorCode::PolicyDenied,
+                                format!(
+                                    "Command blocked by shell policy (mode=deny): {}",
+                                    command
+                                ),
+                            );
                         }
                     }
                     ShellPolicyMode::Ask => {
@@ -948,10 +955,10 @@ async fn execute_tool_call_with_activity(
                                                 },
                                             ))
                                             .await;
-                                        return ToolExecutionFinished::Completed(Err(
-                                            "Command not approved by user; execution skipped."
-                                                .to_string(),
-                                        ));
+                                        return ToolExecutionFinished::error(
+                                            ToolErrorCode::PolicyDenied,
+                                            "Command not approved by user; execution skipped.",
+                                        );
                                     }
                                     let _ = outbound_tx
                                         .send(BusMessage::Telemetry(
@@ -966,10 +973,10 @@ async fn execute_tool_call_with_activity(
                                         .await;
                                 }
                                 Err(e) => {
-                                    return ToolExecutionFinished::Completed(Err(format!(
-                                        "Shell policy approval failed: {}",
-                                        e
-                                    )));
+                                    return ToolExecutionFinished::error(
+                                        ToolErrorCode::ExecutionFailed,
+                                        format!("Shell policy approval failed: {}", e),
+                                    );
                                 }
                             }
                         }
@@ -997,7 +1004,7 @@ async fn execute_tool_call_with_activity(
                 .await
                 {
                     PreToolOutcome::Block(msg) => {
-                        return ToolExecutionFinished::Completed(Err(msg));
+                        return ToolExecutionFinished::error(ToolErrorCode::PolicyDenied, msg);
                     }
                     PreToolOutcome::Proceed(new_args) => {
                         args = new_args;
@@ -1012,9 +1019,10 @@ async fn execute_tool_call_with_activity(
             match edit_policy_mode_for_session(&runtime.shell_policy, runtime.unattended_session) {
                 ShellPolicyMode::Allow => {}
                 ShellPolicyMode::Deny => {
-                    return ToolExecutionFinished::Completed(Err(
-                        edit_policy_block_reason(runtime.unattended_session).to_string(),
-                    ));
+                    return ToolExecutionFinished::error(
+                        ToolErrorCode::PolicyDenied,
+                        edit_policy_block_reason(runtime.unattended_session),
+                    );
                 }
                 ShellPolicyMode::Ask => {
                     let preview = match tools
@@ -1025,9 +1033,10 @@ async fn execute_tool_call_with_activity(
                         // Invalid/no-op edits retain their ordinary tool result; there is no
                         // mutation to approve in that case.
                         Err(error) => {
-                            return ToolExecutionFinished::Completed(Err(format!(
-                                "Could not prepare edit approval: {error}"
-                            )));
+                            return ToolExecutionFinished::error(
+                                ToolErrorCode::ExecutionFailed,
+                                format!("Could not prepare edit approval: {error}"),
+                            );
                         }
                     };
                     if let Some(preview) = preview {
@@ -1061,15 +1070,17 @@ async fn execute_tool_call_with_activity(
                         {
                             Ok(reply) => reply,
                             Err(error) => {
-                                return ToolExecutionFinished::Completed(Err(format!(
-                                    "Edit policy approval failed: {error}"
-                                )));
+                                return ToolExecutionFinished::error(
+                                    ToolErrorCode::ExecutionFailed,
+                                    format!("Edit policy approval failed: {error}"),
+                                );
                             }
                         };
                         if !shell_approval_reply_is_grant(&reply) {
-                            return ToolExecutionFinished::Completed(Err(
-                                "Edit not approved by user; mutation skipped.".to_string(),
-                            ));
+                            return ToolExecutionFinished::error(
+                                ToolErrorCode::PolicyDenied,
+                                "Edit not approved by user; mutation skipped.",
+                            );
                         }
                         approved_mutation_preview = Some(preview);
                     }
@@ -1081,7 +1092,7 @@ async fn execute_tool_call_with_activity(
         let completed = match cancel_owned.as_ref() {
             None => Some(
                 tools
-                    .execute_tool_scoped_with_approved_mutation(
+                    .execute_tool_scoped_with_approved_mutation_result(
                         &tool_name,
                         args,
                         approved_mutation_preview.as_ref(),
@@ -1092,7 +1103,7 @@ async fn execute_tool_call_with_activity(
             ),
             Some(token) => {
                 tokio::select! {
-                    res = tools.execute_tool_scoped_with_approved_mutation(
+                    res = tools.execute_tool_scoped_with_approved_mutation_result(
                         &tool_name,
                         args,
                         approved_mutation_preview.as_ref(),
@@ -1108,7 +1119,12 @@ async fn execute_tool_call_with_activity(
         if let Some(ref hc) = runtime.hook_tool_ctx {
             if let Some(st) = &hc.steering {
                 let res_for_hook = match &completed {
-                    Some(r) => r.clone(),
+                    Some(result) if result.is_error() => Err(result
+                        .error
+                        .as_ref()
+                        .map(|error| error.message.clone())
+                        .unwrap_or_else(|| result.content.clone())),
+                    Some(result) => Ok(result.content.clone()),
                     None => Err("tool call cancelled".to_string()),
                 };
                 let hook_session = HookSessionInfo {
@@ -1135,19 +1151,19 @@ async fn execute_tool_call_with_activity(
         }
 
         match completed {
-            Some(res) => {
-                if let Err(ref e) = res {
-                    if let Some(ticket_id) = e.strip_prefix(WAIT_SIGNAL_PREFIX) {
+            Some(result) => {
+                if let Some(error) = &result.error {
+                    if let Some(ticket_id) = error.message.strip_prefix(WAIT_SIGNAL_PREFIX) {
                         return ToolExecutionFinished::Waiting(ticket_id.to_string());
                     }
                 }
                 // Append any post_tool verification-hook output so the model sees test/lint/build
                 // results (including failures) and can self-correct. Ok/Err polarity is preserved.
-                let res = match post_tool_output {
-                    Some(hook_out) => append_post_tool_output(res, &hook_out),
-                    None => res,
+                let result = match post_tool_output {
+                    Some(hook_out) => append_post_tool_output(result, &hook_out),
+                    None => result,
                 };
-                ToolExecutionFinished::Completed(res)
+                ToolExecutionFinished::Completed(result)
             }
             None => {
                 hub.cancel_wait(&session_key);
@@ -2006,8 +2022,7 @@ impl AgentLogic {
         )
         .await
         {
-            ToolExecutionFinished::Completed(res) => res,
-            ToolExecutionFinished::InvalidArguments(error) => Err(error.to_tool_output()),
+            ToolExecutionFinished::Completed(result) => result.into_legacy_result(),
             ToolExecutionFinished::Waiting(ticket_id) => Err(format!(
                 "tool call waiting for clarification ticket: {}",
                 ticket_id
@@ -3638,18 +3653,13 @@ impl AgentLogic {
                         crate::tools::ToolRegistry::is_parallel_safe_tool(tc.function.name.as_str())
                     });
 
-                let finalize_tool_output = |res: Result<String, String>| -> String {
-                    match res {
-                        Ok(mut output) => {
-                            crate::utils::truncate_utf8_safe(
-                                &mut output,
-                                max_tool_output_chars,
-                                "\n... [TRUNCATED FOR LENGTH]",
-                            );
-                            output
-                        }
-                        Err(e) => format!("Error: {}", e),
-                    }
+                let finalize_tool_output = |mut result: ToolResult| -> String {
+                    crate::utils::truncate_utf8_safe(
+                        &mut result.content,
+                        max_tool_output_chars,
+                        "\n... [TRUNCATED FOR LENGTH]",
+                    );
+                    result.content
                 };
 
                 if parallel_ok {
@@ -3706,7 +3716,7 @@ impl AgentLogic {
                             let args = match parsed_args {
                                 Ok(args) => args,
                                 Err(error) => {
-                                    return ToolExecutionFinished::InvalidArguments(error)
+                                    return ToolExecutionFinished::Completed(error.to_tool_result())
                                 }
                             };
                             execute_tool_call_with_activity(
@@ -3738,11 +3748,8 @@ impl AgentLogic {
                         if cancel_token.is_cancelled() {
                             persist_and_cancel!();
                         }
-                        let (tool_result, typed_error) = match fin {
-                            ToolExecutionFinished::Completed(res) => (res, false),
-                            ToolExecutionFinished::InvalidArguments(error) => {
-                                (Ok(error.to_tool_output()), true)
-                            }
+                        let tool_result = match fin {
+                            ToolExecutionFinished::Completed(result) => result,
                             ToolExecutionFinished::Waiting(ticket_id) => {
                                 // Break the iteration loop; the job is now in 'waiting' state.
                                 return Ok(ReasoningLoopExit::WaitingForUser { ticket_id });
@@ -3751,14 +3758,9 @@ impl AgentLogic {
                                 persist_and_cancel!();
                             }
                         };
-                        // Compute is_error from the RAW result (a dispatch Err, or an in-band Ok
-                        // failure — a non-zero runner `Exit code:` or a scoped `Error:` payload)
-                        // BEFORE finalize_tool_output truncates the tail-anchored exit marker away.
-                        // tool_output_looks_like_failure (text-only, all tools) missed non-zero
-                        // exits whose output did not start with "Error:" and false-flagged content
-                        // tools like read_file; tool_call_is_error is tool-scoped and exit-aware.
-                        let is_error = typed_error
-                            || crate::utils::tool_call_is_error(&tc.function.name, &tool_result);
+                        // Status is authoritative at the executor boundary. Legacy string
+                        // classification is isolated inside ToolRegistry and never runs here.
+                        let is_error = tool_result.is_error();
                         let tool_result_text = finalize_tool_output(tool_result);
                         let tool_name = tc.function.name.clone();
                         let tr = TelemetryEvent::ToolResult {
@@ -3854,13 +3856,10 @@ impl AgentLogic {
                                 )
                                 .await
                             }
-                            Err(error) => ToolExecutionFinished::InvalidArguments(error),
+                            Err(error) => ToolExecutionFinished::Completed(error.to_tool_result()),
                         };
-                        let (tool_result, typed_error) = match finished {
-                            ToolExecutionFinished::Completed(res) => (res, false),
-                            ToolExecutionFinished::InvalidArguments(error) => {
-                                (Ok(error.to_tool_output()), true)
-                            }
+                        let tool_result = match finished {
+                            ToolExecutionFinished::Completed(result) => result,
                             ToolExecutionFinished::Waiting(ticket_id) => {
                                 // Break the iteration loop; the job is now in 'waiting' state.
                                 return Ok(ReasoningLoopExit::WaitingForUser { ticket_id });
@@ -3870,14 +3869,7 @@ impl AgentLogic {
                             }
                         };
 
-                        // Compute is_error from the RAW result (a dispatch Err, or an in-band Ok
-                        // failure — a non-zero runner `Exit code:` or a scoped `Error:` payload)
-                        // BEFORE finalize_tool_output truncates the tail-anchored exit marker away.
-                        // tool_output_looks_like_failure (text-only, all tools) missed non-zero
-                        // exits whose output did not start with "Error:" and false-flagged content
-                        // tools like read_file; tool_call_is_error is tool-scoped and exit-aware.
-                        let is_error = typed_error
-                            || crate::utils::tool_call_is_error(&tc.function.name, &tool_result);
+                        let is_error = tool_result.is_error();
                         let tool_result_text = finalize_tool_output(tool_result);
 
                         let tr = TelemetryEvent::ToolResult {

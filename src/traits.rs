@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// A bounded, user-facing description of a pending file mutation.
@@ -12,6 +13,125 @@ pub struct MutationPreview {
     pub diff: String,
     pub diff_truncated: bool,
     pub base_fingerprint: String,
+}
+
+/// Machine-readable outcome of one tool dispatch. The reasoning loop and
+/// telemetry must use this status instead of inferring success from prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResultStatus {
+    Success,
+    Error,
+}
+
+/// Stable root-cause categories produced at the central tool boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolErrorCode {
+    InvalidToolArguments,
+    NotFound,
+    NotAllowed,
+    PolicyDenied,
+    ExecutionFailed,
+    NonZeroExit,
+    LegacyReportedFailure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolResultError {
+    pub code: ToolErrorCode,
+    pub message: String,
+}
+
+/// Canonical result returned by the central executor boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub status: ToolResultStatus,
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ToolResultError>,
+    /// True only while an old `Result<String, String>` is crossing the registry
+    /// adapter. A natively typed result is never reclassified from its text.
+    #[serde(skip)]
+    legacy: bool,
+}
+
+impl ToolResult {
+    pub fn success(content: impl Into<String>) -> Self {
+        Self {
+            status: ToolResultStatus::Success,
+            content: content.into(),
+            error: None,
+            legacy: false,
+        }
+    }
+
+    pub fn error(code: ToolErrorCode, message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self::error_with_content(code, message.clone(), format!("Error: {message}"))
+    }
+
+    pub fn error_with_content(
+        code: ToolErrorCode,
+        message: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self {
+            status: ToolResultStatus::Error,
+            content: content.into(),
+            error: Some(ToolResultError {
+                code,
+                message: message.into(),
+            }),
+            legacy: false,
+        }
+    }
+
+    pub fn is_error(&self) -> bool {
+        self.status == ToolResultStatus::Error
+    }
+
+    pub fn error_code(&self) -> Option<ToolErrorCode> {
+        self.error.as_ref().map(|error| error.code)
+    }
+
+    pub fn into_legacy_result(self) -> Result<String, String> {
+        match self.status {
+            ToolResultStatus::Success => Ok(self.content),
+            ToolResultStatus::Error => Err(self
+                .error
+                .map(|error| error.message)
+                .unwrap_or(self.content)),
+        }
+    }
+
+    pub(crate) fn from_legacy(result: Result<String, String>) -> Self {
+        match result {
+            Ok(content) => Self {
+                status: ToolResultStatus::Success,
+                content,
+                error: None,
+                legacy: true,
+            },
+            Err(message) => Self {
+                status: ToolResultStatus::Error,
+                content: format!("Error: {message}"),
+                error: Some(ToolResultError {
+                    code: ToolErrorCode::ExecutionFailed,
+                    message,
+                }),
+                legacy: true,
+            },
+        }
+    }
+
+    pub(crate) fn is_legacy(&self) -> bool {
+        self.legacy
+    }
+
+    pub(crate) fn mark_normalized(&mut self) {
+        self.legacy = false;
+    }
 }
 
 // --- Trait Definitions ---
@@ -95,5 +215,19 @@ pub trait Tool: Send + Sync {
         _approved_preview: Option<&MutationPreview>,
     ) -> Result<String, String> {
         self.execute(args).await
+    }
+
+    /// Canonical typed execution hook used by the central dispatcher. Existing
+    /// tools inherit one compatibility adapter around the legacy mutation-aware
+    /// method; migrated tools override this hook and their typed status is final.
+    async fn execute_with_approved_mutation_typed(
+        &self,
+        args: Value,
+        approved_preview: Option<&MutationPreview>,
+    ) -> ToolResult {
+        ToolResult::from_legacy(
+            self.execute_with_approved_mutation(args, approved_preview)
+                .await,
+        )
     }
 }

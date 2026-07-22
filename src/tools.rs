@@ -1,4 +1,4 @@
-use crate::traits::{MutationPreview, Tool};
+use crate::traits::{MutationPreview, Tool, ToolErrorCode, ToolResult};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -12,6 +12,33 @@ pub mod kernel_porting;
 pub mod ml_domain;
 pub mod recall;
 pub mod workflow;
+
+/// Convert one legacy `Result<String, String>` into the typed contract. This is
+/// the only text-classification fallback in the executor: natively typed tool
+/// results bypass it completely and therefore cannot be overwritten by prose.
+fn normalize_legacy_tool_result(tool_name: &str, mut result: ToolResult) -> ToolResult {
+    if !result.is_legacy() {
+        return result;
+    }
+    result.mark_normalized();
+    if result.is_error() {
+        return result;
+    }
+    if !crate::utils::tool_output_signals_failure(tool_name, &result.content) {
+        return result;
+    }
+
+    let code = if matches!(tool_name, "exec" | "python_run") {
+        ToolErrorCode::NonZeroExit
+    } else {
+        ToolErrorCode::LegacyReportedFailure
+    };
+    let message = match code {
+        ToolErrorCode::NonZeroExit => format!("{tool_name} exited with a non-zero status"),
+        _ => format!("{tool_name} reported a failure"),
+    };
+    ToolResult::error_with_content(code, message, result.content)
+}
 
 /// Score `(name, description)` entries for a free-text `query`. Higher is better.
 pub fn search_tool_index(
@@ -117,6 +144,19 @@ impl ToolRegistry {
         }
     }
 
+    /// Execute through the typed central boundary. Typed tool implementations
+    /// are authoritative; only legacy results pass through the compatibility
+    /// classifier above.
+    pub async fn execute_tool_result(&self, name: &str, args: Value) -> ToolResult {
+        match self.get_tool(name) {
+            Some(tool) => normalize_legacy_tool_result(
+                name,
+                tool.execute_with_approved_mutation_typed(args, None).await,
+            ),
+            None => ToolResult::error(ToolErrorCode::NotFound, format!("Tool '{name}' not found")),
+        }
+    }
+
     /// Ask a tool for its file-mutation preview without executing it.
     pub async fn preview_mutation_scoped(
         &self,
@@ -148,6 +188,28 @@ impl ToolRegistry {
                     .await
             }
             None => Err(format!("Tool '{}' not found", name)),
+        }
+    }
+
+    /// Typed mutation execution used by the reasoning loop.
+    pub async fn execute_tool_scoped_with_approved_mutation_result(
+        &self,
+        name: &str,
+        args: Value,
+        approved_preview: Option<&MutationPreview>,
+        allowlist: Option<&HashSet<String>>,
+        is_subagent: bool,
+    ) -> ToolResult {
+        if let Err(error) = self.authorize_scoped(name, allowlist, is_subagent) {
+            return ToolResult::error(ToolErrorCode::NotAllowed, error);
+        }
+        match self.get_tool(name) {
+            Some(tool) => normalize_legacy_tool_result(
+                name,
+                tool.execute_with_approved_mutation_typed(args, approved_preview)
+                    .await,
+            ),
+            None => ToolResult::error(ToolErrorCode::NotFound, format!("Tool '{name}' not found")),
         }
     }
 
@@ -408,5 +470,177 @@ mod scoped_tools_tests {
             .map(|v| v["function"]["name"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(names, vec!["read_file"]);
+    }
+}
+
+#[cfg(test)]
+mod typed_result_tests {
+    use super::{Tool, ToolRegistry};
+    use crate::traits::{ToolErrorCode, ToolResult, ToolResultStatus};
+    use async_trait::async_trait;
+    use serde_json::Value;
+
+    struct LegacyTool {
+        name: &'static str,
+        output: &'static str,
+    }
+
+    #[async_trait]
+    impl Tool for LegacyTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "legacy test tool"
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({})
+        }
+
+        async fn execute(&self, _args: Value) -> Result<String, String> {
+            Ok(self.output.to_string())
+        }
+    }
+
+    struct NativeTypedTool;
+
+    #[async_trait]
+    impl Tool for NativeTypedTool {
+        fn name(&self) -> &str {
+            "typed"
+        }
+
+        fn description(&self) -> &str {
+            "typed test tool"
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({})
+        }
+
+        async fn execute(&self, _args: Value) -> Result<String, String> {
+            Ok("legacy path must not decide status".to_string())
+        }
+
+        async fn execute_with_approved_mutation_typed(
+            &self,
+            _args: Value,
+            _approved_preview: Option<&crate::traits::MutationPreview>,
+        ) -> ToolResult {
+            ToolResult::error_with_content(
+                ToolErrorCode::PolicyDenied,
+                "denied by typed policy",
+                "request was denied without a legacy error marker",
+            )
+        }
+    }
+
+    struct NativeTypedSuccessTool;
+
+    #[async_trait]
+    impl Tool for NativeTypedSuccessTool {
+        fn name(&self) -> &str {
+            "typed_success"
+        }
+
+        fn description(&self) -> &str {
+            "typed success test tool"
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({})
+        }
+
+        async fn execute(&self, _args: Value) -> Result<String, String> {
+            Err("legacy path must not decide status".to_string())
+        }
+
+        async fn execute_with_approved_mutation_typed(
+            &self,
+            _args: Value,
+            _approved_preview: Option<&crate::traits::MutationPreview>,
+        ) -> ToolResult {
+            ToolResult::success("Error: this is literal successful content")
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_result_is_authoritative_and_serializes_stable_codes() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(NativeTypedTool));
+
+        let result = registry.execute_tool_result("typed", Value::Null).await;
+        assert_eq!(result.status, ToolResultStatus::Error);
+        assert_eq!(result.error_code(), Some(ToolErrorCode::PolicyDenied));
+        let wire = serde_json::to_value(&result).expect("serialize typed result");
+        assert_eq!(wire["status"], "error");
+        assert_eq!(wire["error"]["code"], "policy_denied");
+    }
+
+    #[tokio::test]
+    async fn scoped_dispatch_does_not_bypass_native_typed_result() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(NativeTypedTool));
+
+        let result = registry
+            .execute_tool_scoped_with_approved_mutation_result(
+                "typed",
+                Value::Null,
+                None,
+                None,
+                false,
+            )
+            .await;
+
+        assert_eq!(result.error_code(), Some(ToolErrorCode::PolicyDenied));
+        assert_eq!(
+            result.content,
+            "request was denied without a legacy error marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_typed_success_is_not_reclassified_from_its_content() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(NativeTypedSuccessTool));
+
+        let result = registry
+            .execute_tool_result("typed_success", Value::Null)
+            .await;
+
+        assert_eq!(result.status, ToolResultStatus::Success);
+        assert_eq!(result.error, None);
+        assert_eq!(result.content, "Error: this is literal successful content");
+    }
+
+    #[tokio::test]
+    async fn legacy_mapping_is_scoped_and_cannot_false_flag_file_content() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(LegacyTool {
+            name: "exec",
+            output: "build failed\nExit code: 7",
+        }));
+        registry.register(Box::new(LegacyTool {
+            name: "read_file",
+            output: "Error: this is saved file content",
+        }));
+
+        let failed = registry.execute_tool_result("exec", Value::Null).await;
+        assert_eq!(failed.error_code(), Some(ToolErrorCode::NonZeroExit));
+        assert_eq!(failed.content, "build failed\nExit code: 7");
+
+        let content = registry.execute_tool_result("read_file", Value::Null).await;
+        assert_eq!(content.status, ToolResultStatus::Success);
+        assert_eq!(content.error, None);
+    }
+
+    #[tokio::test]
+    async fn registry_failures_have_typed_root_causes() {
+        let registry = ToolRegistry::new();
+        let result = registry.execute_tool_result("missing", Value::Null).await;
+        assert_eq!(result.error_code(), Some(ToolErrorCode::NotFound));
+        assert!(result.content.contains("missing"));
     }
 }
