@@ -122,7 +122,7 @@ fn ensure_run_id(inbound: &mut InboundMessage) -> Result<String, String> {
 }
 
 fn text_looks_like_research_request(content: &str) -> bool {
-    static RESEARCH_REQUEST_RE: OnceLock<Regex> = OnceLock::new();
+    static RESEARCH_REQUEST_RE: OnceLock<Option<Regex>> = OnceLock::new();
     RESEARCH_REQUEST_RE
         .get_or_init(|| {
             Regex::new(
@@ -139,9 +139,10 @@ fn text_looks_like_research_request(content: &str) -> bool {
                     compare\s+methods
                 )\b",
             )
-            .expect("research-request regex")
+            .ok()
         })
-        .is_match(content)
+        .as_ref()
+        .is_some_and(|regex| regex.is_match(content))
 }
 
 fn context_has_tool_call(context: &[crate::utils::ChatMessage], tool_name: &str) -> bool {
