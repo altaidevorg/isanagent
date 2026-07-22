@@ -2621,77 +2621,6 @@ pub struct PythonRunTool {
     pub workspace_dir: PathBuf,
 }
 
-struct PythonRunOutcome {
-    content: String,
-    failure_exit_code: Option<i32>,
-}
-
-impl PythonRunTool {
-    async fn execute_code(&self, args: Value) -> Result<PythonRunOutcome, String> {
-        let code = args
-            .get("code")
-            .and_then(|v| v.as_str())
-            .ok_or("Missing 'code' argument")?;
-
-        let mut cmd = tokio::process::Command::new("uv");
-        cmd.arg("run");
-        cmd.arg("python");
-        cmd.arg("-");
-        cmd.current_dir(&self.workspace_dir);
-        cmd.envs(std::env::vars());
-        cmd.stdin(std::process::Stdio::piped());
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-
-        let mut child = cmd
-            .spawn()
-            .map_err(|error| format!("Failed to spawn python: {error}"))?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            stdin
-                .write_all(code.as_bytes())
-                .await
-                .map_err(|error| format!("Failed to write to python stdin: {error}"))?;
-        }
-
-        let output =
-            tokio::time::timeout(std::time::Duration::from_secs(60), child.wait_with_output())
-                .await
-                .map_err(|_| "Python execution timed out after 60 seconds")?
-                .map_err(|error| format!("Failed to wait for python: {error}"))?;
-
-        let mut result = String::new();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if !stdout.trim().is_empty() {
-            result.push_str(&stdout);
-        }
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.trim().is_empty() {
-            if !result.is_empty() {
-                result.push_str("\nSTDERR:\n");
-            }
-            result.push_str(&stderr);
-        }
-
-        let failure_exit_code =
-            (!output.status.success()).then(|| output.status.code().unwrap_or(-1));
-        if let Some(code) = failure_exit_code {
-            result.push_str(&format!("\nExit code: {code}"));
-        }
-
-        if result.is_empty() {
-            result = "(no output)".to_string();
-        }
-
-        Ok(PythonRunOutcome {
-            content: result,
-            failure_exit_code,
-        })
-    }
-}
-
 #[async_trait]
 impl Tool for PythonRunTool {
     fn name(&self) -> &str {
@@ -2716,24 +2645,70 @@ impl Tool for PythonRunTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
-        self.execute_code(args).await.map(|outcome| outcome.content)
-    }
+        let code = args
+            .get("code")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'code' argument")?;
 
-    async fn execute_with_approved_mutation_typed(
-        &self,
-        args: Value,
-        _approved_preview: Option<&MutationPreview>,
-    ) -> ToolResult {
-        match self.execute_code(args).await {
-            Ok(outcome) => match outcome.failure_exit_code {
-                Some(code) => ToolResult::error_with_content(
-                    ToolErrorCode::NonZeroExit,
-                    format!("python_run exited with status {code}"),
-                    outcome.content,
-                ),
-                None => ToolResult::success(outcome.content),
-            },
-            Err(error) => ToolResult::error(ToolErrorCode::ExecutionFailed, error),
+        let mut cmd = tokio::process::Command::new("uv");
+        cmd.arg("run");
+        cmd.arg("python");
+        cmd.arg("-");
+        cmd.current_dir(&self.workspace_dir);
+        // Explicitly forward host environment so secrets/API keys are visible to the child.
+        cmd.envs(std::env::vars());
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to spawn python: {}", e))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin
+                .write_all(code.as_bytes())
+                .await
+                .map_err(|e| format!("Failed to write to python stdin: {}", e))?;
+        }
+
+        let output =
+            tokio::time::timeout(std::time::Duration::from_secs(60), child.wait_with_output())
+                .await
+                .map_err(|_| "Python execution timed out after 60 seconds")?
+                .map_err(|e| format!("Failed to wait for python: {}", e))?;
+
+        let mut result = String::new();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !stdout.trim().is_empty() {
+            result.push_str(&stdout);
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.trim().is_empty() {
+            if !result.is_empty() {
+                result.push_str("\nSTDERR:\n");
+            }
+            result.push_str(&stderr);
+        }
+
+        // Keep this the LAST append to `result`: the agent tail-anchors on the final `Exit code:`
+        // line to derive is_error (utils::tool_output_signals_failure). python_run currently has no
+        // grep advisory and no size truncation, so the marker is already the final line; if either
+        // is ever added here, append it BEFORE this marker (see the exec path in ShellExecTool,
+        // which appends the marker last for exactly this invariant).
+        if !output.status.success() {
+            result.push_str(&format!(
+                "\nExit code: {}",
+                output.status.code().unwrap_or(-1)
+            ));
+        }
+
+        if result.is_empty() {
+            Ok("(no output)".to_string())
+        } else {
+            Ok(result)
         }
     }
 }
@@ -3066,20 +3041,6 @@ mod python_run_tests {
     use serde_json::json;
     use std::fs;
 
-    fn python_tool() -> Option<(PythonRunTool, PathBuf)> {
-        if which::which("uv").is_err() {
-            return None;
-        }
-        let root = std::env::temp_dir().join(format!("isanagent_py_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&root).unwrap();
-        Some((
-            PythonRunTool {
-                workspace_dir: root.clone(),
-            },
-            root,
-        ))
-    }
-
     #[tokio::test]
     async fn test_python_run_basic() {
         if which::which("python").is_err() && which::which("python3").is_err() {
@@ -3103,43 +3064,6 @@ mod python_run_tests {
         }
         assert!(out.contains("hello from python"));
         let _ = fs::remove_dir_all(&root);
-    }
-
-    #[tokio::test]
-    async fn native_result_uses_python_status_not_spoofable_output() {
-        let Some((tool, root)) = python_tool() else {
-            return;
-        };
-        let result = tool
-            .execute_with_approved_mutation_typed(json!({ "code": "print('Exit code: 7')" }), None)
-            .await;
-
-        assert!(!result.is_error());
-        assert_eq!(result.content.trim(), "Exit code: 7");
-        assert_eq!(result.error_code(), None);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn native_result_preserves_real_python_failure() {
-        let Some((tool, root)) = python_tool() else {
-            return;
-        };
-        let result = tool
-            .execute_with_approved_mutation_typed(json!({ "code": "raise SystemExit(7)" }), None)
-            .await;
-
-        assert!(result.is_error());
-        assert_eq!(result.error_code(), Some(ToolErrorCode::NonZeroExit));
-        assert_eq!(
-            result
-                .content
-                .lines()
-                .rev()
-                .find(|line| !line.trim().is_empty()),
-            Some("Exit code: 7")
-        );
-        let _ = fs::remove_dir_all(root);
     }
 }
 
