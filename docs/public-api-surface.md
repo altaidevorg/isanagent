@@ -293,6 +293,7 @@ Constructor params for `AgentLogic::new`. **All fields `pub`** — embedding cra
 pub struct AgentLogicParams {
     pub name: String,
     pub provider: Box<dyn Provider>,
+    pub provider_credentials: ProviderCredentials,
     pub session_manager: SessionManager,
     pub tools: ToolRegistry,
     pub skills: SkillRegistry,
@@ -314,6 +315,8 @@ pub struct AgentLogicParams {
     pub hook_tool_ctx: Option<Arc<ToolCallHookContext>>,
 }
 ```
+
+`AgentLogic::new(params)` preserves the compatibility path with no failover candidates. Embedding crates that configure failover use `AgentLogic::new_with_fallback_providers(params, candidates)`. The candidate vector is owned by that `AgentLogic`; every admitted main-agent or sub-agent run snapshots its provider, credential identity, and filtered fallbacks. Runtime model switches therefore affect only later admissions.
 
 **This struct is on the critical compatibility path.** Adding fields here is breaking without `#[non_exhaustive]` because constructors enumerate every field. Phase 0.0b must add the marker and document the workaround (use struct-update syntax with a default).
 

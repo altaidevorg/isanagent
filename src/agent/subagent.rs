@@ -10,7 +10,7 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
-use super::ReasoningLoopCtx;
+use super::{ActiveProviderConfig, ReasoningLoopCtx, RunProviderContext};
 use crate::bus::{BusMessage, InboundMessage, OutboundMessage, TelemetryEvent};
 use crate::channels::terminal_ui::protocol::{
     ISANAGENT_SUBAGENT_TASK_FINISHED, ISANAGENT_SUBAGENT_TASK_STARTED,
@@ -26,7 +26,7 @@ use crate::skills::SharedSkillRegistry;
 use crate::tool_activity::SharedToolExecutionActivity;
 use crate::tool_runtime::ToolExecCtx;
 use crate::tools::ToolRegistry;
-use crate::traits::{Provider, Tool};
+use crate::traits::Tool;
 use crate::NodeHandle;
 use tokio::sync::oneshot;
 
@@ -47,10 +47,10 @@ pub struct SubagentSpawnSpec {
 /// Shared wiring for each spawned sub-agent run.
 pub struct SubagentSpawnDeps {
     pub agent_name: String,
-    /// Shared provider reference — reads the current provider (updates with `/model` switch).
-    pub provider: Arc<tokio::sync::RwLock<Box<dyn Provider>>>,
-    /// Credentials for the active provider session (updated with `/model` switch).
-    pub provider_credentials: Arc<tokio::sync::RwLock<crate::provider::ProviderCredentials>>,
+    /// Atomic provider + credentials pair, updated together by `/model`.
+    pub(crate) provider_config: Arc<tokio::sync::RwLock<ActiveProviderConfig>>,
+    /// Immutable candidate list; the selected primary is filtered from each run snapshot.
+    pub(crate) fallback_candidates: Arc<Vec<super::FallbackProviderSpec>>,
     pub session_manager: Arc<SessionManager>,
     pub skills: SharedSkillRegistry,
     pub system_prompt: String,
@@ -510,25 +510,35 @@ impl SubagentHarness {
             .and_then(|m| m.max_iterations)
             .unwrap_or(self.inner.deps.max_iterations);
 
+        let active = self.inner.deps.provider_config.read().await;
+        let mut run_credentials = active.credentials.clone();
         let provider = if let Some(ref m) = manifest {
             if m.model.is_some() || m.temperature.is_some() {
-                let creds = self.inner.deps.provider_credentials.read().await;
-                if creds.is_usable() {
+                if run_credentials.is_usable() {
+                    if let Some(model) = &m.model {
+                        run_credentials.model_name = model.clone();
+                    }
                     crate::provider::provider_for_agent(
-                        &creds,
+                        &run_credentials,
                         m.model.as_deref(),
                         m.temperature.map(|t| t as f32),
                     )
                 } else {
-                    drop(creds);
-                    dyn_clone::clone_box(&**self.inner.deps.provider.read().await)
+                    dyn_clone::clone_box(&*active.provider)
                 }
             } else {
-                dyn_clone::clone_box(&**self.inner.deps.provider.read().await)
+                dyn_clone::clone_box(&*active.provider)
             }
         } else {
-            dyn_clone::clone_box(&**self.inner.deps.provider.read().await)
+            dyn_clone::clone_box(&*active.provider)
         };
+        drop(active);
+        let run_active = ActiveProviderConfig {
+            provider,
+            credentials: run_credentials,
+        };
+        let run_provider =
+            RunProviderContext::snapshot(&run_active, &self.inner.deps.fallback_candidates);
 
         let label = match (&agent_name, &display_name) {
             (Some(a), Some(d)) => format!("{a}: {d}"),
@@ -559,7 +569,7 @@ impl SubagentHarness {
 
         let ctx = ReasoningLoopCtx {
             name: self.inner.deps.agent_name.clone(),
-            provider,
+            run_provider,
             session_manager: self.inner.deps.session_manager.clone(),
             tools,
             skills: self.inner.deps.skills.clone(),
@@ -1411,10 +1421,11 @@ mod tests {
         let (logger_tx, _logger_rx) = create_logger_channel(16);
         let harness = Arc::new(SubagentHarness::new(SubagentSpawnDeps {
             agent_name: "SubagentTest".to_string(),
-            provider: Arc::new(tokio::sync::RwLock::new(Box::new(NeverUsedProvider))),
-            provider_credentials: Arc::new(tokio::sync::RwLock::new(
-                crate::provider::ProviderCredentials::empty(),
-            )),
+            provider_config: Arc::new(tokio::sync::RwLock::new(ActiveProviderConfig {
+                provider: Box::new(NeverUsedProvider),
+                credentials: crate::provider::ProviderCredentials::empty(),
+            })),
+            fallback_candidates: Arc::new(Vec::new()),
             session_manager,
             skills,
             system_prompt: "test system prompt".to_string(),

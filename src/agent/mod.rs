@@ -1297,7 +1297,6 @@ async fn execute_tool_call_with_activity(
 #[derive(Clone)]
 struct ReasoningSpawnArgs {
     name: String,
-    provider: Box<dyn Provider>,
     session_manager: Arc<SessionManager>,
     tools: Arc<ToolRegistry>,
     skills: SharedSkillRegistry,
@@ -1313,11 +1312,17 @@ struct ReasoningSpawnArgs {
     clarification_hub: Arc<ClarificationHub>,
     doom_loop_enabled: bool,
     cancellation_tokens: Arc<dashmap::DashMap<String, ActiveRunHandle>>,
-    pending_inbound: Arc<dashmap::DashMap<String, Mutex<VecDeque<crate::bus::InboundMessage>>>>,
+    pending_inbound: Arc<dashmap::DashMap<String, Mutex<VecDeque<QueuedInbound>>>>,
     harness_runtime_summary: String,
     forbid_final_without_tools: bool,
     shell_policy: Arc<ResolvedShellPolicy>,
     hook_tool_ctx: Option<Arc<ToolCallHookContext>>,
+}
+
+#[derive(Clone)]
+struct QueuedInbound {
+    inbound: crate::bus::InboundMessage,
+    run_provider: RunProviderContext,
 }
 
 #[derive(Clone)]
@@ -1532,6 +1537,7 @@ fn spawn_main_chat_reasoning_turn(
     args: ReasoningSpawnArgs,
     inbound: crate::bus::InboundMessage,
     run_id: String,
+    run_provider: RunProviderContext,
 ) {
     let chat_id = inbound.chat_id.clone();
     let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
@@ -1549,7 +1555,6 @@ fn spawn_main_chat_reasoning_turn(
     let cancellation_tokens = args.cancellation_tokens.clone();
     let pending_inbound = args.pending_inbound.clone();
     let name = args.name.clone();
-    let provider = dyn_clone::clone_box(&*args.provider);
     let session_manager = args.session_manager.clone();
     let session_manager_for_chain = session_manager.clone();
     let tools = args.tools.clone();
@@ -1640,7 +1645,7 @@ fn spawn_main_chat_reasoning_turn(
 
         let res = AssertUnwindSafe(AgentLogic::run_reasoning_loop(ReasoningLoopCtx {
             name,
-            provider,
+            run_provider,
             session_manager,
             tools,
             skills,
@@ -1831,7 +1836,7 @@ fn spawn_main_chat_reasoning_turn(
             g.pop_front()
         });
 
-        while let Some(mut inbound) = next_inbound {
+        while let Some(mut queued) = next_inbound {
             let next_from_queue = || {
                 pending_inbound.get(&task_chat_id).and_then(|r| {
                     let mut g = match r.lock() {
@@ -1851,9 +1856,14 @@ fn spawn_main_chat_reasoning_turn(
                 })
             };
 
-            match ensure_run_id(&mut inbound) {
+            match ensure_run_id(&mut queued.inbound) {
                 Ok(next_run_id) => {
-                    spawn_main_chat_reasoning_turn(args_for_chain, inbound, next_run_id);
+                    spawn_main_chat_reasoning_turn(
+                        args_for_chain,
+                        queued.inbound,
+                        next_run_id,
+                        queued.run_provider,
+                    );
                     break;
                 }
                 Err(error) => {
@@ -1873,7 +1883,7 @@ fn spawn_main_chat_reasoning_turn(
 
 pub(crate) struct ReasoningLoopCtx {
     pub(crate) name: String,
-    pub(crate) provider: Box<dyn Provider>,
+    pub(crate) run_provider: RunProviderContext,
     pub(crate) session_manager: Arc<SessionManager>,
     pub(crate) tools: Arc<ToolRegistry>,
     pub(crate) skills: SharedSkillRegistry,
@@ -1967,8 +1977,8 @@ pub struct SubagentHarnessParams {
 /// It holds a LLM Provider, a persistent Memory context, and available Tools.
 pub struct AgentLogic {
     name: String,
-    provider: Arc<tokio::sync::RwLock<Box<dyn Provider>>>,
-    provider_credentials: Arc<tokio::sync::RwLock<crate::provider::ProviderCredentials>>,
+    provider_config: Arc<tokio::sync::RwLock<ActiveProviderConfig>>,
+    fallback_candidates: Arc<Vec<FallbackProviderSpec>>,
     session_manager: Arc<SessionManager>,
     tools: Arc<ToolRegistry>,
     skills: SharedSkillRegistry,
@@ -1983,7 +1993,7 @@ pub struct AgentLogic {
     logger_tx: LoggerHandle,
     cancellation_tokens: Arc<dashmap::DashMap<String, ActiveRunHandle>>,
     /// FIFO per `chat_id` when a new user inbound arrives while main reasoning is active.
-    pending_inbound: Arc<dashmap::DashMap<String, Mutex<VecDeque<crate::bus::InboundMessage>>>>,
+    pending_inbound: Arc<dashmap::DashMap<String, Mutex<VecDeque<QueuedInbound>>>>,
     clarification_hub: Arc<ClarificationHub>,
     subagent_harness: Option<Arc<SubagentHarness>>,
     doom_loop_enabled: bool,
@@ -1995,6 +2005,15 @@ pub struct AgentLogic {
 
 impl AgentLogic {
     pub fn new(params: AgentLogicParams) -> Self {
+        Self::new_with_fallback_providers(params, Vec::new())
+    }
+
+    /// Construct an agent with instance-owned failover candidates. The active primary is removed
+    /// when each run snapshots its immutable provider context.
+    pub fn new_with_fallback_providers(
+        params: AgentLogicParams,
+        fallback_providers: Vec<FallbackProviderSpec>,
+    ) -> Self {
         let AgentLogicParams {
             name,
             provider,
@@ -2027,14 +2046,17 @@ impl AgentLogic {
         let memory_node = session_manager.get_memory_node();
         let shell_policy = Arc::new(shell_policy);
 
-        let provider = Arc::new(tokio::sync::RwLock::new(provider));
-        let provider_credentials = Arc::new(tokio::sync::RwLock::new(provider_credentials));
+        let provider_config = Arc::new(tokio::sync::RwLock::new(ActiveProviderConfig {
+            provider,
+            credentials: provider_credentials,
+        }));
+        let fallback_candidates = Arc::new(fallback_providers);
 
         let subagent_harness = subagent.map(|p| {
             Arc::new(SubagentHarness::new(subagent::SubagentSpawnDeps {
                 agent_name: name.clone(),
-                provider: provider.clone(),
-                provider_credentials: provider_credentials.clone(),
+                provider_config: provider_config.clone(),
+                fallback_candidates: fallback_candidates.clone(),
                 session_manager: session_manager.clone(),
                 skills: skills.clone(),
                 system_prompt: subagent_system_prompt,
@@ -2066,8 +2088,8 @@ impl AgentLogic {
 
         let mut agent = Self {
             name,
-            provider,
-            provider_credentials,
+            provider_config,
+            fallback_candidates,
             session_manager,
             tools,
             skills,
@@ -2112,17 +2134,24 @@ impl AgentLogic {
 
     /// Hot-swap the LLM provider at runtime (used by `/model` command).
     pub async fn switch_provider(&self, new_provider: Box<dyn Provider>) {
-        *self.provider.write().await = new_provider;
+        self.provider_config.write().await.provider = new_provider;
     }
 
     pub async fn set_provider_credentials(&self, creds: crate::provider::ProviderCredentials) {
-        *self.provider_credentials.write().await = creds;
+        self.provider_config.write().await.credentials = creds;
     }
 
-    pub fn provider_credentials_handle(
+    /// Atomically replace the provider object and the credentials that created it. Active and
+    /// already-queued runs keep their immutable snapshots; subsequent admissions see this pair.
+    pub async fn switch_provider_with_credentials(
         &self,
-    ) -> Arc<tokio::sync::RwLock<crate::provider::ProviderCredentials>> {
-        self.provider_credentials.clone()
+        provider: Box<dyn Provider>,
+        credentials: crate::provider::ProviderCredentials,
+    ) {
+        *self.provider_config.write().await = ActiveProviderConfig {
+            provider,
+            credentials,
+        };
     }
 
     pub fn with_tool_execution_activity(
@@ -2133,11 +2162,9 @@ impl AgentLogic {
         self
     }
 
-    async fn reasoning_spawn_args(&self) -> ReasoningSpawnArgs {
-        let provider_guard = self.provider.read().await;
+    fn reasoning_spawn_args(&self) -> ReasoningSpawnArgs {
         ReasoningSpawnArgs {
             name: self.name.clone(),
-            provider: dyn_clone::clone_box(&**provider_guard),
             session_manager: self.session_manager.clone(),
             tools: self.tools.clone(),
             skills: self.skills.clone(),
@@ -2159,6 +2186,11 @@ impl AgentLogic {
             shell_policy: self.shell_policy.clone(),
             hook_tool_ctx: self.hook_tool_ctx.clone(),
         }
+    }
+
+    async fn run_provider_context(&self) -> RunProviderContext {
+        let active = self.provider_config.read().await;
+        RunProviderContext::snapshot(&active, &self.fallback_candidates)
     }
 
     #[cfg(test)]
@@ -2296,13 +2328,15 @@ impl ActorLogic<BusMessage> for AgentLogic {
                     &api_key,
                     &model_name,
                 );
-                self.switch_provider(new_provider).await;
-                self.set_provider_credentials(crate::provider::ProviderCredentials {
-                    provider_name: provider_name.clone(),
-                    base_url: base_url.clone(),
-                    api_key: api_key.clone(),
-                    model_name: model_name.clone(),
-                })
+                self.switch_provider_with_credentials(
+                    new_provider,
+                    crate::provider::ProviderCredentials {
+                        provider_name: provider_name.clone(),
+                        base_url: base_url.clone(),
+                        api_key: api_key.clone(),
+                        model_name: model_name.clone(),
+                    },
+                )
                 .await;
                 let _ = self.logger_tx.send(BusMessage::Log(LogEvent::info(
                     &self.name,
@@ -2402,6 +2436,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                     .with_chat_id(&chat_id),
                 ));
 
+                let run_provider = self.run_provider_context().await;
                 if self.cancellation_tokens.contains_key(&chat_id) {
                     // Check if this is a synthetic cron trigger. If so, drop it if we're already busy.
                     if metadata_truthy(
@@ -2435,7 +2470,10 @@ impl ActorLogic<BusMessage> for AgentLogic {
                             poisoned.into_inner()
                         }
                     };
-                    guard.push_back(inbound);
+                    guard.push_back(QueuedInbound {
+                        inbound,
+                        run_provider,
+                    });
                     let _ = self.logger_tx.send(BusMessage::Log(
                         LogEvent::debug(
                             &self.name,
@@ -2458,7 +2496,12 @@ impl ActorLogic<BusMessage> for AgentLogic {
                     return res;
                 }
 
-                spawn_main_chat_reasoning_turn(self.reasoning_spawn_args().await, inbound, run_id);
+                spawn_main_chat_reasoning_turn(
+                    self.reasoning_spawn_args(),
+                    inbound,
+                    run_id,
+                    run_provider,
+                );
 
                 Ok(None)
             }
@@ -2581,7 +2624,7 @@ impl AgentLogic {
             .unwrap_or_default();
 
         let memory_node = self.session_manager.get_memory_node();
-        let provider_guard = self.provider.read().await;
+        let provider_guard = self.provider_config.read().await;
         // Manual triggers have no per-call cancellation; a token that never
         // fires keeps `do_compaction`'s `select!` valid without altering behavior.
         let cancel_token = tokio_util::sync::CancellationToken::new();
@@ -2596,7 +2639,7 @@ impl AgentLogic {
                 current_context: &current_context,
                 existing_summary: recent.first().map(|s| s.as_str()),
                 focus_instructions: focus_instructions.as_deref(),
-                provider: provider_guard.as_ref(),
+                provider: provider_guard.provider.as_ref(),
                 memory_node: &memory_node,
                 outbound_tx: &self.outbound_tx,
                 cancel_token: &cancel_token,
@@ -2832,7 +2875,13 @@ impl AgentLogic {
         );
 
         let run_id = ensure_run_id(&mut resumed_inbound)?;
-        spawn_main_chat_reasoning_turn(self.reasoning_spawn_args().await, resumed_inbound, run_id);
+        let run_provider = self.run_provider_context().await;
+        spawn_main_chat_reasoning_turn(
+            self.reasoning_spawn_args(),
+            resumed_inbound,
+            run_id,
+            run_provider,
+        );
         Ok(())
     }
 }
@@ -2886,37 +2935,61 @@ pub fn build_fallback_specs(
         .collect()
 }
 
-/// Process-wide fallback providers (config, like the primary). Empty until set, so failover is
-/// simply inert when unconfigured. Stored behind an `RwLock` rather than a `OnceLock` so an embedder
-/// that rebuilds its runtime — e.g. a desktop app that re-bootstraps on a provider/model switch —
-/// can refresh the list, keeping the fallbacks consistent with the current primary instead of
-/// frozen at the first call.
-static FALLBACK_PROVIDERS: std::sync::RwLock<Vec<FallbackProviderSpec>> =
-    std::sync::RwLock::new(Vec::new());
-
-/// Install (or replace) the fallback provider list. Safe to call repeatedly — each call replaces the
-/// previous list; pass an empty vec to disable failover.
-///
-/// **Don't mutate this from tests.** It's process-global and the reasoning-loop tests read it (via
-/// `chat_with_retry` on primary exhaustion), so setting it from a test races the rest of the binary
-/// under Cargo's parallel runner. Drive [`try_fallbacks`] directly instead, as the failover tests do.
-pub fn set_fallback_providers(specs: Vec<FallbackProviderSpec>) {
-    // Recover from a poisoned lock: we replace the list wholesale, so any state a panicking writer
-    // left behind is irrelevant — honoring the poison would instead wedge failover config for the
-    // rest of the process.
-    let mut guard = FALLBACK_PROVIDERS
-        .write()
-        .unwrap_or_else(|e| e.into_inner());
-    *guard = specs;
+/// Provider object and the exact credentials that created it. Keeping them behind one lock makes a
+/// model switch atomic: a run can never snapshot the old provider with the new credential identity
+/// (or vice versa).
+pub(crate) struct ActiveProviderConfig {
+    pub(crate) provider: Box<dyn Provider>,
+    pub(crate) credentials: crate::provider::ProviderCredentials,
 }
 
-/// Snapshot of the current fallback list. Returns an owned clone so the lock isn't held across the
-/// (async) failover chat calls. Recovers a poisoned read lock so failover keeps working.
-fn fallback_providers() -> Vec<FallbackProviderSpec> {
-    FALLBACK_PROVIDERS
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProviderRunIdentity {
+    provider_name: String,
+    model_name: String,
+    secret_identity: String,
+}
+
+/// Immutable provider/fallback ownership for one accepted run. This value is also stored with a
+/// queued inbound, so a later `/model` switch cannot rewrite already-admitted work.
+#[derive(Clone)]
+pub(crate) struct RunProviderContext {
+    provider: Box<dyn Provider>,
+    fallback_providers: Vec<FallbackProviderSpec>,
+    identity: ProviderRunIdentity,
+}
+
+impl RunProviderContext {
+    pub(crate) fn snapshot(
+        active: &ActiveProviderConfig,
+        candidates: &[FallbackProviderSpec],
+    ) -> Self {
+        let credentials = &active.credentials;
+        let fallback_providers = build_fallback_specs(
+            &credentials.provider_name,
+            &credentials.base_url,
+            &credentials.model_name,
+            candidates.to_vec(),
+        );
+        Self {
+            provider: dyn_clone::clone_box(&*active.provider),
+            fallback_providers,
+            identity: ProviderRunIdentity {
+                provider_name: credentials.provider_name.clone(),
+                model_name: credentials.model_name.clone(),
+                secret_identity: provider_secret_identity(&credentials.api_key),
+            },
+        }
+    }
+}
+
+fn provider_secret_identity(api_key: &str) -> String {
+    if api_key.is_empty() {
+        return "none".to_string();
+    }
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(api_key.as_bytes());
+    format!("sha256:{}", &hex::encode(digest)[..16])
 }
 
 /// Result of attempting the configured fallback providers.
@@ -3020,11 +3093,15 @@ async fn chat_with_retry(
     provider: &dyn crate::traits::Provider,
     context: &[crate::utils::ChatMessage],
     tools_payload: Option<serde_json::Value>,
+    fallback_providers: &[FallbackProviderSpec],
     cancel_token: &tokio_util::sync::CancellationToken,
-    logger_tx: &LoggerHandle,
-    name: &str,
-    chat_id: &str,
+    log_ctx: FailoverLogCtx<'_>,
 ) -> ChatRetryOutcome {
+    let FailoverLogCtx {
+        logger_tx,
+        name,
+        chat_id,
+    } = log_ctx;
     const MAX_ATTEMPTS: u32 = 3;
     const BACKOFF_BASE_MS: u64 = 1000;
     let mut last_err: Option<crate::utils::LLMError> = None;
@@ -3091,9 +3168,8 @@ async fn chat_with_retry(
     // Primary exhausted. Before surfacing a failure, try each configured fallback provider once, so
     // a transient outage / key rotation / model deprecation on the primary doesn't drop a long
     // unattended turn. The primary stays the active provider — failover is per-call.
-    let fallbacks = fallback_providers();
     match try_fallbacks(
-        &fallbacks,
+        fallback_providers,
         |s| {
             crate::provider::create_provider(
                 &s.provider_name,
@@ -3181,7 +3257,7 @@ impl AgentLogic {
     ) -> Result<ReasoningLoopExit, ReasoningLoopError> {
         let ReasoningLoopCtx {
             name,
-            provider,
+            run_provider,
             session_manager,
             tools,
             skills,
@@ -3210,6 +3286,12 @@ impl AgentLogic {
             inbound_metadata,
         } = ctx;
 
+        let RunProviderContext {
+            provider,
+            fallback_providers,
+            identity: provider_identity,
+        } = run_provider;
+
         let session_key = tool_exec_ctx.session_key.clone();
         let cancel_notice = "Request cancelled while the agent was processing this turn.";
 
@@ -3217,6 +3299,20 @@ impl AgentLogic {
             .get_session(&session_key)
             .await
             .map_err(ReasoningLoopError::persistence)?;
+
+        let _ = logger_tx.send(BusMessage::Log(
+            LogEvent::debug(
+                &name,
+                &format!(
+                    "Run provider snapshot provider={} model={} credential={} fallbacks={}",
+                    provider_identity.provider_name,
+                    provider_identity.model_name,
+                    provider_identity.secret_identity,
+                    fallback_providers.len(),
+                ),
+            )
+            .with_chat_id(&inbound.chat_id),
+        ));
 
         let run_started_at = std::time::Instant::now();
         let mut budget = BudgetController::new(BudgetLimits::for_run(max_iterations));
@@ -3739,10 +3835,13 @@ impl AgentLogic {
                 provider.as_ref(),
                 &context,
                 tools_payload,
+                &fallback_providers,
                 &cancel_token,
-                &logger_tx,
-                &name,
-                &inbound.chat_id,
+                FailoverLogCtx {
+                    logger_tx: &logger_tx,
+                    name: &name,
+                    chat_id: &inbound.chat_id,
+                },
             )
             .await
             {
@@ -4614,8 +4713,9 @@ impl Tool for LoadSkillTool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_llm_failed_banner, steering_guard, AgentLogic, AgentLogicParams, ReasoningLoopCtx,
-        ReasoningLoopExit, SteeringInbox,
+        build_llm_failed_banner, steering_guard, ActiveProviderConfig, AgentLogic,
+        AgentLogicParams, QueuedInbound, ReasoningLoopCtx, ReasoningLoopExit, RunProviderContext,
+        SteeringInbox,
     };
     use async_trait::async_trait;
     use axum::{
@@ -5006,6 +5106,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_agents_snapshot_distinct_provider_credentials_and_fallbacks() {
+        let (agent_a, _rx_a) = build_agent_with_provider_state(
+            Box::new(RespondingProvider { tag: "a".into() }),
+            provider_credentials("provider-a", "https://a.test/v1/", "secret-a", "model-a"),
+            vec![
+                fb_full("provider-a", "https://a.test/v1", "model-a"),
+                fb_full("fallback-a", "https://fallback-a.test", "fallback-model-a"),
+            ],
+            ClarificationHub::shared(),
+        );
+        let (agent_b, _rx_b) = build_agent_with_provider_state(
+            Box::new(RespondingProvider { tag: "b".into() }),
+            provider_credentials("provider-b", "https://b.test/v1", "secret-b", "model-b"),
+            vec![
+                fb_full("provider-b", "https://b.test/v1/", "model-b"),
+                fb_full("fallback-b", "https://fallback-b.test", "fallback-model-b"),
+            ],
+            ClarificationHub::shared(),
+        );
+
+        let (context_a, context_b) = tokio::join!(
+            agent_a.run_provider_context(),
+            agent_b.run_provider_context()
+        );
+
+        assert_eq!(context_a.identity.provider_name, "provider-a");
+        assert_eq!(context_a.identity.model_name, "model-a");
+        assert_eq!(context_a.fallback_providers.len(), 1);
+        assert_eq!(context_a.fallback_providers[0].provider_name, "fallback-a");
+        assert_eq!(context_b.identity.provider_name, "provider-b");
+        assert_eq!(context_b.identity.model_name, "model-b");
+        assert_eq!(context_b.fallback_providers.len(), 1);
+        assert_eq!(context_b.fallback_providers[0].provider_name, "fallback-b");
+        assert_ne!(
+            context_a.identity.secret_identity,
+            context_b.identity.secret_identity
+        );
+        assert!(!context_a.identity.secret_identity.contains("secret-a"));
+        assert!(!context_b.identity.secret_identity.contains("secret-b"));
+    }
+
+    #[tokio::test]
     async fn try_fallbacks_returns_first_success() {
         let (logger, _rx) = crate::logging::create_logger_channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -5278,9 +5420,16 @@ mod tests {
         let inbound = test_inbound("loop-test-chat", "hello");
         let session_key = inbound.clarification_session_key();
         let inbound_metadata = Arc::new(inbound.metadata.clone());
+        let run_provider = RunProviderContext::snapshot(
+            &ActiveProviderConfig {
+                provider,
+                credentials: crate::provider::ProviderCredentials::empty(),
+            },
+            &[],
+        );
         let result = AgentLogic::run_reasoning_loop(ReasoningLoopCtx {
             name: "LoopTestAgent".to_string(),
-            provider,
+            run_provider,
             session_manager: session_manager.clone(),
             tools,
             skills,
@@ -5357,6 +5506,20 @@ mod tests {
         provider: Box<dyn Provider>,
         clarification_hub: Arc<ClarificationHub>,
     ) -> (AgentLogic, mpsc::Receiver<BusMessage>) {
+        build_agent_with_provider_state(
+            provider,
+            crate::provider::ProviderCredentials::empty(),
+            Vec::new(),
+            clarification_hub,
+        )
+    }
+
+    fn build_agent_with_provider_state(
+        provider: Box<dyn Provider>,
+        provider_credentials: crate::provider::ProviderCredentials,
+        fallback_providers: Vec<super::FallbackProviderSpec>,
+        clarification_hub: Arc<ClarificationHub>,
+    ) -> (AgentLogic, mpsc::Receiver<BusMessage>) {
         let memory_actor = SqliteMemoryActor::new(":memory:").expect("memory actor");
         let memory_node = NodeHandle::new(memory_actor, 16, 1, Duration::from_millis(1));
         let session_manager = SessionManager::new(memory_node);
@@ -5373,36 +5536,39 @@ mod tests {
         let (outbound_tx, outbound_rx) = mpsc::channel::<BusMessage>(64);
         let (logger_tx, _logger_rx) = create_logger_channel(32);
 
-        let agent = AgentLogic::new(AgentLogicParams {
-            name: "TestAgent".to_string(),
-            provider,
-            provider_credentials: crate::provider::ProviderCredentials::empty(),
-            session_manager,
-            tools,
-            skills,
-            system_prompt: "test system prompt".to_string(),
-            max_iterations: 4,
-            max_tool_output_chars: 4_000,
-            max_recent_summaries: 0,
-            short_term_threshold_turns: 10,
-            short_term_threshold_tokens: 10_000,
-            outbound_tx,
-            logger_tx,
-            clarification_hub,
-            subagent: None,
-            doom_loop_enabled: false,
-            harness_runtime_summary: String::new(),
-            subagent_system_prompt: "test system prompt".to_string(),
-            forbid_final_without_tools: false,
-            shell_policy: crate::config::ResolvedShellPolicy {
-                interactive_mode: crate::config::ShellPolicyMode::Ask,
-                unattended_mode: crate::config::ShellPolicyMode::Deny,
-                interactive_edit_mode: crate::config::ShellPolicyMode::Ask,
-                unattended_edit_mode: crate::config::ShellPolicyMode::Deny,
-                approval_patterns: Vec::new(),
+        let agent = AgentLogic::new_with_fallback_providers(
+            AgentLogicParams {
+                name: "TestAgent".to_string(),
+                provider,
+                provider_credentials,
+                session_manager,
+                tools,
+                skills,
+                system_prompt: "test system prompt".to_string(),
+                max_iterations: 4,
+                max_tool_output_chars: 4_000,
+                max_recent_summaries: 0,
+                short_term_threshold_turns: 10,
+                short_term_threshold_tokens: 10_000,
+                outbound_tx,
+                logger_tx,
+                clarification_hub,
+                subagent: None,
+                doom_loop_enabled: false,
+                harness_runtime_summary: String::new(),
+                subagent_system_prompt: "test system prompt".to_string(),
+                forbid_final_without_tools: false,
+                shell_policy: crate::config::ResolvedShellPolicy {
+                    interactive_mode: crate::config::ShellPolicyMode::Ask,
+                    unattended_mode: crate::config::ShellPolicyMode::Deny,
+                    interactive_edit_mode: crate::config::ShellPolicyMode::Ask,
+                    unattended_edit_mode: crate::config::ShellPolicyMode::Deny,
+                    approval_patterns: Vec::new(),
+                },
+                hook_tool_ctx: None,
             },
-            hook_tool_ctx: None,
-        });
+            fallback_providers,
+        );
 
         (agent, outbound_rx)
     }
@@ -5411,6 +5577,20 @@ mod tests {
         provider: Box<dyn Provider>,
     ) -> (AgentLogic, mpsc::Receiver<BusMessage>) {
         build_agent_with_provider_and_hub(provider, ClarificationHub::shared())
+    }
+
+    fn provider_credentials(
+        provider_name: &str,
+        base_url: &str,
+        api_key: &str,
+        model_name: &str,
+    ) -> crate::provider::ProviderCredentials {
+        crate::provider::ProviderCredentials {
+            provider_name: provider_name.to_string(),
+            base_url: base_url.to_string(),
+            api_key: api_key.to_string(),
+            model_name: model_name.to_string(),
+        }
     }
 
     fn build_test_agent(
@@ -5708,9 +5888,19 @@ mod tests {
             METADATA_RUN_ID.to_string(),
             serde_json::json!("queued-run-id"),
         );
+        let run_provider = agent.run_provider_context().await;
         agent.pending_inbound.insert(
             chat_id.to_string(),
-            Mutex::new(VecDeque::from([invalid, valid])),
+            Mutex::new(VecDeque::from([
+                QueuedInbound {
+                    inbound: invalid,
+                    run_provider: run_provider.clone(),
+                },
+                QueuedInbound {
+                    inbound: valid,
+                    run_provider,
+                },
+            ])),
         );
 
         unblock_tx.send(()).expect("unblock first turn");
@@ -5725,6 +5915,85 @@ mod tests {
             2,
             "the valid queued message must run after the invalid item is dropped"
         );
+    }
+
+    #[tokio::test]
+    async fn model_switch_preserves_active_run_and_updates_later_queued_admission() {
+        let (unblock_tx, unblock_rx) = tokio::sync::oneshot::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider_a = GateFirstChatProvider {
+            calls: calls.clone(),
+            first_unblock: Arc::new(tokio::sync::Mutex::new(Some(unblock_rx))),
+        };
+        let (mut agent, mut outbound_rx) = build_agent_with_provider_state(
+            Box::new(provider_a),
+            provider_credentials("provider-a", "https://a.test", "secret-a", "model-a"),
+            Vec::new(),
+            ClarificationHub::shared(),
+        );
+        let chat_id = "run-provider-admission";
+
+        agent
+            .process(BusMessage::Inbound(test_inbound(chat_id, "first")))
+            .await
+            .expect("start provider-a turn");
+        for _ in 0..200 {
+            if calls.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        agent
+            .switch_provider_with_credentials(
+                Box::new(RespondingProvider {
+                    tag: "provider-b".to_string(),
+                }),
+                provider_credentials("provider-b", "https://b.test", "secret-b", "model-b"),
+            )
+            .await;
+        agent
+            .process(BusMessage::Inbound(test_inbound(chat_id, "second")))
+            .await
+            .expect("queue provider-b turn");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            agent
+                .pending_inbound
+                .get(chat_id)
+                .expect("queued second turn")
+                .lock()
+                .expect("pending queue lock")
+                .len(),
+            1
+        );
+
+        unblock_tx.send(()).expect("release provider-a turn");
+        let (responses, terminal_count) = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut responses = Vec::new();
+            let mut terminal_count = 0;
+            while terminal_count < 2 {
+                match outbound_rx.recv().await.expect("outbound channel open") {
+                    BusMessage::Outbound(outbound) if outbound.chat_id == chat_id => {
+                        responses.push(outbound.content);
+                    }
+                    BusMessage::RunLifecycle(RunLifecycleEvent::Terminated {
+                        chat_id: event_chat,
+                        ..
+                    }) if event_chat == chat_id => terminal_count += 1,
+                    _ => {}
+                }
+            }
+            (responses, terminal_count)
+        })
+        .await
+        .expect("both run snapshots complete");
+
+        assert_eq!(terminal_count, 2);
+        assert_eq!(responses, vec!["ok-0", "provider-b"]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
