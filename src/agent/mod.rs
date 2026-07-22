@@ -3130,28 +3130,41 @@ async fn chat_with_retry(
     )
 }
 
-/// Build the user-facing terminal banner for an exhausted-retry LLM failure.
-/// Carries the `isanagent_llm_retry_available` metadata flag so the terminal UI can
-/// gate `/retry` on the banner being active.
+/// Build the user-facing banner for an LLM failure.
+///
+/// Only the terminal channel exposes the `/retry` command and its accompanying
+/// metadata flag. Other clients receive a channel-neutral recovery hint and use
+/// the typed lifecycle outcome to decide whether to offer retry controls.
 fn build_llm_failed_banner(
     channel: &str,
     chat_id: &str,
     thread_id: Option<&str>,
     error: &str,
+    retryable: bool,
 ) -> OutboundMessage {
-    let content = format!(
-        "LLM call failed after 3 attempts: {error}\nPress /retry to try again or /cancel to abandon."
-    );
+    let content = if channel == "terminal" && retryable {
+        format!(
+            "LLM call failed after 3 attempts: {error}\nPress /retry to try again or /cancel to abandon."
+        )
+    } else if retryable {
+        format!(
+            "LLM call failed after provider retries were exhausted: {error}\nThis run can be retried from the client."
+        )
+    } else {
+        format!("LLM call failed: {error}")
+    };
     let mut metadata: HashMap<String, serde_json::Value> = HashMap::new();
     if channel == "terminal" {
         metadata.insert(
             crate::channels::terminal_ui::protocol::ISANAGENT_TERMINAL_ERROR.to_string(),
             serde_json::json!(true),
         );
-        metadata.insert(
-            crate::channels::terminal_ui::protocol::ISANAGENT_LLM_RETRY_AVAILABLE.to_string(),
-            serde_json::json!(true),
-        );
+        if retryable {
+            metadata.insert(
+                crate::channels::terminal_ui::protocol::ISANAGENT_LLM_RETRY_AVAILABLE.to_string(),
+                serde_json::json!(true),
+            );
+        }
     }
     OutboundMessage {
         channel: channel.to_string(),
@@ -3844,9 +3857,14 @@ impl AgentLogic {
                         max.map(|m| m.to_string())
                             .unwrap_or_else(|| "?".to_string()),
                     );
-                    let persisted = format!(
-                        "LLM call failed: {err}\nPress /retry to try again or /cancel to abandon."
+                    let mut banner = build_llm_failed_banner(
+                        &inbound.channel,
+                        &inbound.chat_id,
+                        inbound.thread_id.as_deref(),
+                        &err,
+                        false,
                     );
+                    let persisted = banner.content.clone();
                     persist_terminal_assistant_message(
                         &mut mem,
                         &logger_tx,
@@ -3855,12 +3873,6 @@ impl AgentLogic {
                         &persisted,
                     )
                     .await;
-                    let mut banner = build_llm_failed_banner(
-                        &inbound.channel,
-                        &inbound.chat_id,
-                        inbound.thread_id.as_deref(),
-                        &err,
-                    );
                     if let Some(job_id) =
                         inbound.metadata.get(crate::bus::METADATA_BACKGROUND_JOB_ID)
                     {
@@ -3877,9 +3889,14 @@ impl AgentLogic {
                     });
                 }
                 ChatRetryOutcome::Failed(err) => {
-                    let persisted = format!(
-                        "LLM call failed after 3 attempts: {err}\nPress /retry to try again or /cancel to abandon."
+                    let mut banner = build_llm_failed_banner(
+                        &inbound.channel,
+                        &inbound.chat_id,
+                        inbound.thread_id.as_deref(),
+                        &err,
+                        true,
                     );
+                    let persisted = banner.content.clone();
                     persist_terminal_assistant_message(
                         &mut mem,
                         &logger_tx,
@@ -3888,12 +3905,6 @@ impl AgentLogic {
                         &persisted,
                     )
                     .await;
-                    let mut banner = build_llm_failed_banner(
-                        &inbound.channel,
-                        &inbound.chat_id,
-                        inbound.thread_id.as_deref(),
-                        &err,
-                    );
                     if let Some(job_id) =
                         inbound.metadata.get(crate::bus::METADATA_BACKGROUND_JOB_ID)
                     {
@@ -4603,8 +4614,8 @@ impl Tool for LoadSkillTool {
 #[cfg(test)]
 mod tests {
     use super::{
-        steering_guard, AgentLogic, AgentLogicParams, ReasoningLoopCtx, ReasoningLoopExit,
-        SteeringInbox,
+        build_llm_failed_banner, steering_guard, AgentLogic, AgentLogicParams, ReasoningLoopCtx,
+        ReasoningLoopExit, SteeringInbox,
     };
     use async_trait::async_trait;
     use axum::{
@@ -4671,6 +4682,56 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn tauri_retryable_failure_does_not_advertise_terminal_commands() {
+        let banner = build_llm_failed_banner("tauri", "chat-1", None, "provider unavailable", true);
+
+        assert!(!banner.content.contains("/retry"));
+        assert!(banner.content.contains("retried from the client"));
+        assert!(!banner
+            .metadata
+            .contains_key(crate::channels::terminal_ui::protocol::ISANAGENT_LLM_RETRY_AVAILABLE));
+        assert!(!banner
+            .metadata
+            .contains_key(crate::channels::terminal_ui::protocol::ISANAGENT_TERMINAL_ERROR));
+    }
+
+    #[test]
+    fn terminal_retryable_failure_advertises_retry_command() {
+        let banner =
+            build_llm_failed_banner("terminal", "chat-1", None, "provider unavailable", true);
+
+        assert!(banner.content.contains("Press /retry"));
+        assert_eq!(
+            banner
+                .metadata
+                .get(crate::channels::terminal_ui::protocol::ISANAGENT_LLM_RETRY_AVAILABLE),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            banner
+                .metadata
+                .get(crate::channels::terminal_ui::protocol::ISANAGENT_TERMINAL_ERROR),
+            Some(&serde_json::json!(true))
+        );
+    }
+
+    #[test]
+    fn terminal_non_retryable_failure_does_not_offer_retry() {
+        let banner = build_llm_failed_banner("terminal", "chat-1", None, "context overflow", false);
+
+        assert!(!banner.content.contains("/retry"));
+        assert!(!banner
+            .metadata
+            .contains_key(crate::channels::terminal_ui::protocol::ISANAGENT_LLM_RETRY_AVAILABLE));
+        assert_eq!(
+            banner
+                .metadata
+                .get(crate::channels::terminal_ui::protocol::ISANAGENT_TERMINAL_ERROR),
+            Some(&serde_json::json!(true))
+        );
     }
 
     #[derive(Clone)]
