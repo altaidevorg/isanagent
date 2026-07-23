@@ -139,5 +139,8 @@ After implementing a feature, follow this exact workflow to deliver high-quality
 3. Run `cargo fmt` so that it's always well-formatted, avoiding unnecessary diffs that simply come from formatting.
 4. This is a living document --keep this document up-to-date as you introduce new features and/or architectures.
 
+## Releases & ALTAI sync
+Pushing to `main` runs `.github/workflows/release-artifacts.yml`, which publishes rolling tag **`main-latest`** binaries. After that release job, an optional **`notify-altai-app`** step dispatches `isanagent-released` to `altaidevorg/altai-app` when secret `ALTAI_APP_DISPATCH_TOKEN` is set (cross-repo PAT). ALTAI also refreshes the crate from `branch = "main"` on every local/CI/release build via `cargo update -p isanagent`.
+
 ## Note for Windows
 On windows, building the project in debug mode causes a PDB-related linker error. Build the project in release mode on Windows instead.
