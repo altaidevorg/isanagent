@@ -221,7 +221,10 @@ impl Tool for ReadFileTool {
     }
 
     fn description(&self) -> &str {
-        "Read the contents of a local file. Provide the absolute or relative path to the file. You can read specific lines by specifying start_line and end_line (1-indexed, inclusive) capped at a maximum of 100 lines per call, so you can call this tool multiple times to read a file with more than 100 lines when needed."
+        "Read a slice of a local file. REQUIRED on every call: path, start_line, and end_line \
+(1-indexed, inclusive). Each call returns at most 100 lines — never omit the line range, \
+and never rely on a default. For longer files, issue multiple read_file calls with adjacent \
+ranges (e.g. 1–100, then 101–200). Prefer absolute or workspace-relative paths."
     }
 
     fn parameters(&self) -> Value {
@@ -230,15 +233,15 @@ impl Tool for ReadFileTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to read"
+                    "description": "Absolute or workspace-relative path to the file to read"
                 },
                 "start_line": {
                     "type": "integer",
-                    "description": "Starting line number (1-indexed, inclusive)"
+                    "description": "Required. First line to include (1-indexed, inclusive). Always pass explicitly — there is no default."
                 },
                 "end_line": {
                     "type": "integer",
-                    "description": "Ending line number (1-indexed, inclusive)"
+                    "description": "Required. Last line to include (1-indexed, inclusive). Must be >= start_line. The tool caps each call at 100 lines even if the range is wider."
                 }
             },
             "required": ["path", "start_line", "end_line"]
@@ -263,11 +266,17 @@ impl Tool for ReadFileTool {
         let start_line = args
             .get("start_line")
             .and_then(|v| v.as_u64())
-            .ok_or("Missing 'start_line' argument")?;
+            .ok_or(
+                "Missing required 'start_line'. Every read_file call must pass start_line and \
+end_line (1-indexed, inclusive); max 100 lines per call — e.g. start_line=1, end_line=100.",
+            )?;
         let end_line = args
             .get("end_line")
             .and_then(|v| v.as_u64())
-            .ok_or("Missing 'end_line' argument")?;
+            .ok_or(
+                "Missing required 'end_line'. Every read_file call must pass start_line and \
+end_line (1-indexed, inclusive); max 100 lines per call — e.g. start_line=1, end_line=100.",
+            )?;
 
         let content = fs::read_to_string(&actual_path).map_err(|e| e.to_string())?;
 
