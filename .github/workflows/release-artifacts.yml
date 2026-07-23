@@ -94,3 +94,26 @@ jobs:
           replacesArtifacts: true
           makeLatest: true
           artifacts: "artifacts/*"
+
+  notify-altai-app:
+    name: Notify altai-app to sync
+    needs: release
+    runs-on: ubuntu-24.04
+    # Cross-repo repository_dispatch needs a PAT (or fine-grained token)
+    # with `contents:write` on altaidevorg/altai-app. Opt in via repo variable
+    # ALTAI_APP_DISPATCH_ENABLED=true; skip when unset/false.
+    if: ${{ vars.ALTAI_APP_DISPATCH_ENABLED == 'true' }}
+    steps:
+      - name: Dispatch isanagent-released to altai-app
+        env:
+          GH_TOKEN: ${{ secrets.ALTAI_APP_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "ALTAI_APP_DISPATCH_TOKEN not set; skipping altai-app notify (daily sync + cargo update still apply)."
+            exit 0
+          fi
+          gh api repos/altaidevorg/altai-app/dispatches \
+            -f event_type=isanagent-released \
+            -f "client_payload[isanagent_sha]=${{ github.sha }}" \
+            -f "client_payload[source_run]=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
