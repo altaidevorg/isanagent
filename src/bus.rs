@@ -710,6 +710,12 @@ pub enum RunLifecycleEvent {
         chat_id: String,
         warning: RunBudgetWarning,
     },
+    /// A previously emitted non-terminal budget warning was resolved by measurable progress
+    /// (for example a successful tool result that clears a repeated-root-cause latch).
+    WarningCleared {
+        run_id: String,
+        chat_id: String,
+    },
     Terminated {
         run_id: String,
         chat_id: String,
@@ -867,6 +873,19 @@ mod run_lifecycle_tests {
         assert!(encoded.contains("\"type\":\"warning\""));
         let decoded: RunLifecycleEvent =
             serde_json::from_str(&encoded).expect("deserialize lifecycle warning");
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn budget_warning_cleared_round_trips() {
+        let event = RunLifecycleEvent::WarningCleared {
+            run_id: "run-123".to_string(),
+            chat_id: "chat-456".to_string(),
+        };
+        let encoded = serde_json::to_string(&event).expect("serialize warning_cleared");
+        assert!(encoded.contains("\"type\":\"warning_cleared\""));
+        let decoded: RunLifecycleEvent =
+            serde_json::from_str(&encoded).expect("deserialize warning_cleared");
         assert_eq!(decoded, event);
     }
 }
