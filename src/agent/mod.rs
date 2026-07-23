@@ -3350,6 +3350,9 @@ impl AgentLogic {
                 match $decision {
                     BudgetDecision::Continue => {}
                     BudgetDecision::Warning(warning) => {
+                        // A new live warning supersedes any clearance latch from this
+                        // observation (e.g. NoProgress cleared then ApproachingLimit raised).
+                        let _ = budget.take_warning_cleared();
                         let _ = logger_tx.send(BusMessage::Log(
                             LogEvent::warn(
                                 &name,

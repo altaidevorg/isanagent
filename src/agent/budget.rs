@@ -196,6 +196,14 @@ impl BudgetController {
         if self.last_root_cause.as_ref() == Some(&root_cause) {
             self.repeated_root_cause_failures = self.repeated_root_cause_failures.saturating_add(1);
         } else {
+            // A different typed key means the previous repeated-root-cause warning is stale
+            // (e.g. intent-scoped NonZeroExit for `pnpm test` then `pnpm lint`).
+            if self
+                .emitted_warnings
+                .remove(&WarningKey::RepeatedRootCause)
+            {
+                self.warning_cleared = true;
+            }
             self.last_root_cause = Some(root_cause);
             self.repeated_root_cause_failures = 1;
         }
@@ -725,6 +733,28 @@ mod tests {
             controller.record_tool_failure(key_b),
             BudgetDecision::Continue
         );
+        assert_eq!(controller.snapshot().repeated_root_cause_failures, 1);
+    }
+
+    #[test]
+    fn switching_intent_after_warning_latches_warning_cleared() {
+        let mut controller = BudgetController::new(test_limits(50));
+        let _ = controller.start_turn(Duration::ZERO);
+        let intent_a = tool_intent_signature("exec", r#"{"command":"pnpm test"}"#);
+        let intent_b = tool_intent_signature("exec", r#"{"command":"pnpm lint"}"#);
+        let key_a = typed_failure_key("exec", ToolErrorCode::NonZeroExit, &intent_a);
+        let key_b = typed_failure_key("exec", ToolErrorCode::NonZeroExit, &intent_b);
+        let _ = controller.record_tool_failure(key_a.clone());
+        assert!(matches!(
+            controller.record_tool_failure(key_a),
+            BudgetDecision::Warning(..)
+        ));
+        assert!(!controller.take_warning_cleared());
+        assert_eq!(
+            controller.record_tool_failure(key_b),
+            BudgetDecision::Continue
+        );
+        assert!(controller.take_warning_cleared());
         assert_eq!(controller.snapshot().repeated_root_cause_failures, 1);
     }
 
