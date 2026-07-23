@@ -1,94 +1,161 @@
 ---
 name: gliner2
-description: Use GLiNER2 for local or API-based entity extraction, relation extraction, structured JSON extraction, classification, combined schemas, batching, and long documents; also develop, debug, review, and validate the GLiNER2 Python repository when its source is available. Use when an agent needs to design GLiNER2 schemas, write extraction code, interpret outputs, choose local versus API inference, or change GLiNER2 implementation, training, LoRA/PEFT, packaging, compatibility, tests, tutorials, or releases.
+description: Use GLiNER2 for local or hosted named-entity and relation extraction, schema-driven structured output, text classification, combined inference, dataset preparation, evaluation, full fine-tuning, and LoRA/PEFT adapters. Use when an agent needs to select a GLiNER2 model, design or validate extraction schemas, run inference, interpret outputs, prepare GLiNER2 JSONL data, specialize a model for a domain, train or load adapters, or diagnose GLiNER2 consumer-workflow failures.
 ---
 
-# GLiNER2 Repository
+# Use GLiNER2
 
-## Choose the workflow
+GLiNER2 is an encoder-based, schema-conditioned information-extraction system. One unified model can recognize named entities, classify text, extract directional relations, and return schema-driven structured records. It can compose these tasks in one extraction call without using a separate model for each task.
 
-- For using GLiNER2 as an installed library or API, read [references/usage.md](references/usage.md) completely. It is self-contained and does not require this repository.
-- For modifying or reviewing GLiNER2 source, follow the repository workflow below and consult the reference only when public API behavior is relevant.
-- If the installed package differs from the reference, inspect its version and callable signatures. Do not assume repository-internal modules are available to a library consumer.
+Use GLiNER2 when the output is defined by labels, choices, relations, or fields grounded in an input document. Do not treat it as a general-purpose generative model: validate extracted spans, required fields, closed choices, identifiers, dates, and numeric values in application code.
 
-## Verify consumer code before presenting it
+This skill is self-contained for consuming and specializing GLiNER2. It does not
+require a GLiNER2 repository checkout and must not route ordinary work into
+repository maintenance. The pinned Git dependency below is an installation
+source, not a requirement to inspect or modify repository code.
 
-- Distinguish quick APIs from schema-builder APIs. Their accepted dictionary shapes are not interchangeable. In particular, pass `multi_label=` and `cls_threshold=` as keyword arguments to `Schema.classification`; do not pass a quick-API `{labels, multi_label}` configuration as the builder's `labels` argument.
-- Keep structures flat. Call `structure(name)` with only the structure name, represent repeated records as sibling structures, and chain the next schema method directly. Never call `structure(..., dtype=...)`, nest one structure inside another, or call a nonexistent `end_structure()` method.
-- Request every metadata field later consumed. Code that reads `start` or `end` must set `include_spans=True`; code that reads `confidence` must set `include_confidence=True`.
-- Check capabilities on the actual extractor object. Do not call local-only long-document methods on the hosted API client unless the installed version exposes them.
-- Before long-document work, record `gliner2.__file__`, `gliner2.__version__`, and the four long-method capability checks. The PyPI `1.3.2` wheel can lack methods present in repository source carrying the same version. If any required long method is absent, install the pinned repository source in an isolated environment as described in the usage reference; do not monkeypatch methods onto the class and report that as native support.
-- Match implementation to scale requirements. If the request requires processing multiple long documents or explicitly asks for batching, the representative code must call `batch_extract_long` or `batch_extract_entities_long`; merely mentioning batching while calling a single-document method is insufficient.
-- Treat batching as an execution property, not a method name. A wrapper that loops over documents sequentially or accepts but does not use `batch_size` is not native batch inference; report it separately as sequential fallback behavior.
-- Prefer public exception classes and the client's built-in retry behavior over parsing exception strings or layering retries blindly.
-- Test hosted retry behavior at the adapter/transport layer or inspect its configured retry policy. Monkeypatching `Session.post` bypasses adapter retries and cannot prove retry behavior, although it can still prove that no real request escaped.
-- Inspect or build schemas without loading a model when possible. A model-free schema build should confirm task labels, `multi_label`, thresholds, structures, and choices.
-- Never invent a package or model version. Report the installed version or use an explicit placeholder that the operator must replace.
-- Do not assume Hugging Face-style kwargs are honored by GLiNER2. In the repository version covered by this skill, `from_pretrained(..., revision=...)` does not forward `revision` to downloads. For reproducible model pinning, use a verified local snapshot path and record its immutable revision/hash unless the installed implementation is proven to support revision forwarding.
-- Call code “representative” until it has been executed. Report exactly what was and was not run; never claim “production-ready” from static reasoning alone.
-- Treat span equality as offset-integrity validation, not semantic correctness. Validate extracted values and task quality separately.
-- Score evaluations strictly: assign one status per scenario, require every explicit output and assertion for `PASS`, and use `PARTIAL` when plumbing works but a required field or behavior is missing. Do not double-count subchecks in totals. Report API/implementation validity separately from semantic model quality.
-- Never log secrets, source documents, extracted sensitive spans, or review messages containing those values. Local inference reduces data transfer but does not by itself establish regulatory compliance.
-- Keep extraction-completeness checks separate from mandatory human-review policy. If every result requires clinician, legal, or other expert review, do not set `requires_review` only when extraction is empty.
+## Select a documented model
 
-Before delivering consumer code, run a model-free preflight when the package is available:
+| Model | Parameters | Access | Default use |
+|---|---:|---|---|
+| `fastino/gliner2-base-v1` | 205M | Local | Default inference, evaluation, and fine-tuning |
+| `fastino/gliner2-large-v1` | 340M | Local | Higher-capacity local inference when latency and memory allow |
+| `fastino/gliner2-multi-v1` | about 300M | Local | Multilingual inference and specialization; evaluate each target language |
+| GLiNER XL | 1B | Hosted API | Hosted extraction without local model weights |
 
-1. Construct every schema and call `schema.build()`.
-2. Assert classification labels, `multi_label`, thresholds, structure names, fields, and choices.
-3. Inspect every called method with `hasattr` or `inspect.signature` when capability may vary by version or extractor type. For long-context work, also record the imported package path and source commit; a version string alone is insufficient.
-4. Scan code and logs for invented versions, fabricated timestamps/results, secrets, source text, and extracted sensitive values.
-5. Confirm that mocked tests inject the mock actually used by the function; avoid globals created before patching.
-6. Confirm every requested task is represented by the right GLiNER2 task type: a requested relation must use `relations`, not an entity label containing the word “relation.”
-7. Check empty outputs with content, not mapping truthiness: use `any(items for items in entities.values())` when requested entity keys may map to empty lists.
-8. Recursively validate every span-bearing object, including entity items, relation `head`/`tail` endpoints, and structured fields.
+The base model card is English-tagged, while the multilingual model is the intended choice beyond the base/large language coverage. Fastino describes `gliner2-multi-v1` as broadly multilingual but does not publish task-level quality for every language. Do not infer validated support from tokenizer acceptance or tutorial examples. Read [references/concepts-and-models.md](references/concepts-and-models.md) and evaluate every target language on representative labeled data.
 
-## Work from repository evidence
+## Install with uv
 
-- Read the affected implementation, its public re-exports, nearby tests, and the corresponding tutorial before changing behavior.
-- Treat `README.md` and `tutorial/` as user-facing contracts, but verify claims against code and tests.
-- Preserve unrelated work in the tree. Use `rg` for discovery and `apply_patch` for edits.
-- Prefer the smallest coherent change. Update tests and documentation when public behavior changes.
+Use the verified source revision so local inference, long-context helpers, and
+training APIs match this skill. In an existing uv-managed project:
 
-## Respect the architecture
+```bash
+uv add "gliner2[local] @ git+https://github.com/fastino-ai/GLiNER2.git@31c8abaa4a6d88ae8bb6f2e63cfea9926956497c"
+```
 
-- Keep the base `gliner2` import torch-free. `gliner2/__init__.py` eagerly exposes schemas and the HTTP client but lazy-loads local model and LoRA symbols through `__getattr__`. Do not introduce eager imports of `torch`, `transformers`, `peft`, or local-model modules on the base-import path.
-- Put public schema construction and validation in `gliner2/inference/schema.py` and Pydantic request models in `gliner2/inference/schema_model.py`.
-- Put high-level extraction orchestration in `gliner2/inference/engine.py`, core neural-model behavior and serialization in `gliner2/model.py`, and tokenization/batch preparation in `gliner2/processor.py`.
-- Keep long-document token boundaries, chunk overlap, global-offset remapping, and deduplication behavior in `gliner2/inference/chunking.py` or the matching engine entry points.
-- Keep training examples and datasets in `gliner2/training/data.py`, trainer/configuration behavior in `gliner2/training/trainer.py`, and PEFT compatibility logic in `gliner2/training/lora.py`.
-- Keep cloud behavior isolated in `gliner2/api_client.py`. Tests must mock HTTP and must not require credentials or live services.
+For an isolated experiment:
 
-## Protect public contracts
+```bash
+uv venv .venv-gliner2 --python 3.12
+uv pip install --python .venv-gliner2/bin/python \
+  "gliner2[local] @ git+https://github.com/fastino-ai/GLiNER2.git@31c8abaa4a6d88ae8bb6f2e63cfea9926956497c"
+.venv-gliner2/bin/python your_script.py
+```
 
-- Preserve result shapes for entity, relation, structure, and classification extraction, including `include_confidence` and `include_spans` variants.
-- Preserve character-span correctness: returned text must equal `source[start:end]`. Long-context APIs return offsets into the original document, not a chunk.
-- Compare optimized batch paths with single-example behavior. Account for mixed lengths, padding, masks, truncation, and per-sample span counts.
-- Preserve `max_len` behavior in both inference and the training collator.
-- Treat symbols exported from `gliner2/__init__.py`, method signatures, serialized model files, and adapter directories as compatibility surfaces.
-- Treat legacy LoRA APIs as deprecated compatibility shims unless the task explicitly removes them. Preserve warning categories, adapter config fields, filenames, weight-key translation, round trips, and numerical parity covered by compatibility fixtures.
-- When changing training, check gradient accumulation, evaluation/checkpoint cadence, rank-zero-only writes, distributed samplers, process-group handling, and wrapped versus unwrapped model state.
+The full commit is intentional: update it only after validating the replacement
+revision and all bundled scripts. Do not install into an ambiguous system
+interpreter. If installation, version, source, or capability checks disagree,
+use [references/troubleshooting.md](references/troubleshooting.md).
 
-## Validate proportionally
+## Route the task
 
-Run focused tests first, then broaden when shared code changes. Use the active environment's Python/pytest command; do not assume a particular environment manager.
+| Task | Read | Start from |
+|---|---|---|
+| Choose a model, device, execution mode, or language strategy | [references/concepts-and-models.md](references/concepts-and-models.md) | — |
+| Run NER, classification, relations, combined, batch, API, or long-document inference | [references/inference.md](references/inference.md) | [scripts/infer_entities.py](scripts/infer_entities.py) |
+| Build structures or interpret output shapes | [references/schemas-and-outputs.md](references/schemas-and-outputs.md) | [scripts/infer_structured.py](scripts/infer_structured.py) |
+| Prepare or validate `InputExample`/JSONL training data | [references/training-data.md](references/training-data.md) | [scripts/validate_training_data.py](scripts/validate_training_data.py) |
+| Perform full fine-tuning | [references/fine-tuning.md](references/fine-tuning.md) | [scripts/train_gliner2.py](scripts/train_gliner2.py) |
+| Train, load, save, or merge LoRA adapters | [references/lora-and-adapters.md](references/lora-and-adapters.md) | [scripts/train_gliner2_lora.py](scripts/train_gliner2_lora.py) |
+| Compare a base and specialized model | [references/fine-tuning.md](references/fine-tuning.md) | [scripts/evaluate_gliner2.py](scripts/evaluate_gliner2.py) |
+| Diagnose a failing consumer workflow | [references/troubleshooting.md](references/troubleshooting.md) | — |
 
-- Schema or extraction output: `tests/test_entity_extraction.py`, `tests/test_relation_extraction.py`, `tests/test_structure_extraction.py`.
-- Batching, masks, or spans: `tests/test_batching_correctness.py`, `tests/test_batch_span_mask_trim.py`.
-- Context limits: `tests/test_inference_max_len.py`, `tests/test_train_max_len.py`.
-- API client: `tests/test_api_client_error_handling.py`.
-- Imports, dependencies, or package surface: `tests/test_torch_free_import.py` and the public-surface checks in `tests/test_backwards_compat.py`.
-- LoRA/PEFT, model loading, or serialization: `tests/test_lora_peft.py`, `tests/test_backwards_compat.py`.
-- Trainer logic: `tests/test_trainer_distributed.py`; add `tests/test_trainer_distributed_integration.py` when multiprocessing/distributed behavior changes.
-- End-to-end learning behavior: `tests/test_overfit_ner.py` only when the change can affect optimization or task learning.
+Read each selected reference completely before adapting its script. Copy the bundled script as the starting point instead of recreating a training or inference program from memory.
+Command examples beginning with `scripts/` assume the current directory is this
+skill directory. Otherwise use the script's resolved absolute path or copy the
+script into the consumer project before running it.
 
-Expect some inference and overfitting tests to download pretrained models or require substantial compute. Inspect markers and fixtures before running them, report any unrun tests explicitly, and never weaken assertions merely to avoid those requirements.
+## Recognize named entities
 
-## Keep documentation and releases aligned
+```python
+from gliner2 import GLiNER2
 
-- Update the matching file in `tutorial/` and concise examples in `README.md` for public API changes.
-- Maintain Python 3.8+ compatibility declared in `pyproject.toml` unless the task explicitly changes support.
-- For releases, follow `RELEASE.md`, update `gliner2/__init__.py::__version__`, validate the build, and never upload to PyPI or create a remote release without explicit authorization.
+model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+text = "Apple CEO Tim Cook introduced Vision Pro in Cupertino."
 
-## Finish with evidence
+result = model.extract_entities(
+    text,
+    {
+        "company": "Company or organization names",
+        "person": "Names of people",
+        "product": "Commercial product names",
+        "location": "Cities or physical locations",
+    },
+    include_confidence=True,
+    include_spans=True,
+)
 
-Summarize changed behavior, compatibility implications, tests run and their results, and any validation skipped because it requires model downloads, GPUs, distributed resources, or external credentials.
+for items in result["entities"].values():
+    for item in items:
+        assert text[item["start"]:item["end"]] == item["text"]
+```
+
+Descriptions disambiguate domain labels. Tune thresholds on a held-out evaluation set, not the example used to demonstrate the schema.
+
+## Extract structured records
+
+```python
+from gliner2 import GLiNER2
+
+model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+text = "Invoice INV-42 from Northwind. Status: unpaid. One keyboard costs USD 75."
+schema = (
+    model.create_schema()
+    .structure("invoice")
+        .field("invoice_number", dtype="str")
+        .field("vendor", dtype="str")
+        .field("status", dtype="str", choices=["paid", "unpaid", "partial", "overdue"])
+    .structure("line_item")
+        .field("description", dtype="str")
+        .field("quantity", dtype="str")
+        .field("unit_price", dtype="str")
+        .field("total", dtype="str")
+)
+
+built = schema.build()  # model-free schema inspection is also available through Schema()
+result = model.extract(text, schema, include_confidence=True, include_spans=True)
+```
+
+Structures are flat named records. Repeated line items are sibling `line_item` instances, not children nested inside `invoice`. Split multi-parent documents or associate siblings deterministically downstream.
+
+## Preserve GLiNER2 contracts
+
+- Distinguish quick-API dictionaries from schema-builder calls. Pass builder classification options such as `multi_label` and `cls_threshold` as keyword arguments.
+- Request `include_spans=True` whenever code consumes `start` or `end`; request `include_confidence=True` independently.
+- Expect choice fields such as a structured status to omit character spans.
+- Treat `text[start:end] == item["text"]` as offset integrity, not semantic correctness.
+- Keep relation descriptions directional and validate expected head/tail order.
+- Keep structures flat; do not invent nested builders, `structure(..., dtype=...)`, or `end_structure()`.
+- For repeated structures, validate expected record cardinality and within-record field coherence. Correct spans do not prove that fields from different clauses or events belong to the same sibling record.
+- Prefer a field-specific threshold when one structured field needs more recall. Lowering a global threshold can increase false positives across every task.
+- Detect missing and `null` required fields before deterministic parsing. Never turn a missing amount into zero or a missing identifier into a placeholder.
+- Validate the actual object and imported package path before using less-common, hosted-only, or local-only methods.
+
+## Choose full fine-tuning or LoRA
+
+Improve label descriptions, schema design, thresholds, preprocessing, and deterministic validation before training. Fine-tune only when representative evaluation shows a repeatable domain gap.
+
+Choose full fine-tuning when maximum adaptation justifies updating and storing the complete model. Choose LoRA when smaller trainable state, lower memory use, adapter reuse, or multiple domain specializations matter. In both cases:
+
+1. Validate and split data before loading the model.
+2. Establish a base-model evaluation result.
+3. Run a one-step smoke test before a long job.
+4. Evaluate on held-out data with task-appropriate metrics.
+5. Reload the saved model or adapter into a fresh base model and repeat a bounded inference test.
+
+Example full-training entry point:
+
+```bash
+uv run --script scripts/train_gliner2.py \
+  --output-dir outputs/gliner2-domain \
+  --smoke-test
+```
+
+Use [scripts/train_gliner2_lora.py](scripts/train_gliner2_lora.py) for adapter training. Keep adapter-only artifacts distinct from merged or fully fine-tuned models, and load new adapters through PEFT-native APIs described in the LoRA reference.
+
+## Validate the result
+
+For inference, report API/implementation validity separately from semantic extraction quality. For training, record the resolved model, package path/version, device, precision, dataset counts, seed, config, baseline metrics, final metrics, output path, and reload result.
+
+Do not award a task-level pass merely because code executed. Required fields, expected labels or relations, numeric checks, artifact reload, and explicit scenario requirements must also pass. Use [references/troubleshooting.md](references/troubleshooting.md) when output shape, package capability, batching, retry, threshold, adapter, or environment behavior differs from expectation.
