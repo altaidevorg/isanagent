@@ -2164,31 +2164,6 @@ impl AgentLogic {
         agent
     }
 
-    /// Legacy provider-only switch retained for source compatibility.
-    ///
-    /// The credential identity is cleared in the same write so a newly admitted run can never
-    /// pair this provider with stale credentials or fallback policy. Embedders that have the
-    /// matching credentials must use [`Self::switch_provider_with_credentials`].
-    pub async fn switch_provider(&self, new_provider: Box<dyn Provider>) {
-        *self.provider_config.write().await = ActiveProviderConfig {
-            provider: new_provider,
-            credentials: crate::provider::ProviderCredentials::empty(),
-        };
-    }
-
-    /// Legacy credential-only update retained for source compatibility.
-    ///
-    /// Rebuilding the provider from these credentials keeps the active pair coherent. Custom
-    /// providers must use [`Self::switch_provider_with_credentials`] instead.
-    pub async fn set_provider_credentials(&self, creds: crate::provider::ProviderCredentials) {
-        let provider: Box<dyn Provider> = if creds.is_usable() {
-            crate::provider::provider_for_agent(&creds, None, None)
-        } else {
-            Box::new(crate::provider::NoKeyProvider)
-        };
-        self.switch_provider_with_credentials(provider, creds).await;
-    }
-
     /// Atomically replace the provider object and the credentials that created it. Active and
     /// already-queued runs keep their immutable snapshots; subsequent admissions see this pair.
     pub async fn switch_provider_with_credentials(
@@ -5204,34 +5179,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_provider_switch_cannot_reuse_stale_credentials_or_fallbacks() {
-        let (agent, _rx) = build_agent_with_provider_state(
-            Box::new(RespondingProvider { tag: "old".into() }),
-            provider_credentials("provider-a", "https://a.test", "secret-a", "model-a"),
-            vec![fb_full(
-                "fallback-a",
-                "https://fallback-a.test",
-                "fallback-model-a",
-            )],
-            ClarificationHub::shared(),
-        );
-
-        agent
-            .switch_provider(Box::new(RespondingProvider { tag: "new".into() }))
-            .await;
-
-        let context = agent.run_provider_context().await;
-        assert!(context.identity.provider_name.is_empty());
-        assert!(context.identity.model_name.is_empty());
-        assert_eq!(context.identity.secret_identity, "none");
-        assert!(
-            context.fallback_providers.is_empty(),
-            "a provider-only compatibility switch must disable fallbacks until credentials are paired"
-        );
-    }
-
-    #[tokio::test]
-    async fn legacy_credential_update_replaces_the_complete_active_pair() {
+    async fn atomic_provider_switch_replaces_the_complete_active_pair() {
         let (agent, _rx) = build_agent_with_provider_state(
             Box::new(RespondingProvider { tag: "old".into() }),
             provider_credentials("provider-a", "https://a.test", "secret-a", "model-a"),
@@ -5244,12 +5192,10 @@ mod tests {
         );
 
         agent
-            .set_provider_credentials(provider_credentials(
-                "provider-b",
-                "https://b.test",
-                "secret-b",
-                "model-b",
-            ))
+            .switch_provider_with_credentials(
+                Box::new(RespondingProvider { tag: "new".into() }),
+                provider_credentials("provider-b", "https://b.test", "secret-b", "model-b"),
+            )
             .await;
 
         let context = agent.run_provider_context().await;
