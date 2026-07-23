@@ -100,8 +100,9 @@ jobs:
     needs: release
     runs-on: ubuntu-24.04
     # Cross-repo repository_dispatch needs a PAT (or fine-grained token)
-    # with `contents:write` on altaidevorg/altai-app. Skip quietly when unset.
-    if: ${{ vars.ALTAI_APP_DISPATCH_ENABLED != 'false' }}
+    # with `contents:write` on altaidevorg/altai-app. Opt in via repo variable
+    # ALTAI_APP_DISPATCH_ENABLED=true; skip when unset/false.
+    if: ${{ vars.ALTAI_APP_DISPATCH_ENABLED == 'true' }}
     steps:
       - name: Dispatch isanagent-released to altai-app
         env:
