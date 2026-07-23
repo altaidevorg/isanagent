@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use crate::bus::{
     RunBudgetLimit, RunBudgetSnapshot, RunBudgetWarning, RunBudgetWarningReason, RunStuckReason,
 };
+use crate::traits::ToolErrorCode;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum WarningKey {
@@ -103,6 +104,10 @@ pub(crate) struct BudgetController {
     last_root_cause: Option<String>,
     repeated_root_cause_failures: usize,
     emitted_warnings: HashSet<WarningKey>,
+    /// Set when a previously emitted non-terminal warning is resolved by progress.
+    /// Hosts should drain this via [`Self::take_warning_cleared`] and emit
+    /// `RunLifecycleEvent::WarningCleared`.
+    warning_cleared: bool,
     terminal: Option<BudgetDecision>,
 }
 
@@ -121,8 +126,14 @@ impl BudgetController {
             last_root_cause: None,
             repeated_root_cause_failures: 0,
             emitted_warnings: HashSet::new(),
+            warning_cleared: false,
             terminal: None,
         }
+    }
+
+    /// Drain the latch set when progress resolves a live budget warning.
+    pub(crate) fn take_warning_cleared(&mut self) -> bool {
+        std::mem::take(&mut self.warning_cleared)
     }
 
     /// Admit one more LLM turn. The configured turn limit is an absolute emergency ceiling: a
@@ -196,11 +207,18 @@ impl BudgetController {
             return decision;
         }
         self.no_progress_turns = 0;
-        self.emitted_warnings.remove(&WarningKey::NoProgress);
+        if self.emitted_warnings.remove(&WarningKey::NoProgress) {
+            self.warning_cleared = true;
+        }
         if matches!(kind, ProgressKind::NewEvidence) {
             self.last_root_cause = None;
             self.repeated_root_cause_failures = 0;
-            self.emitted_warnings.remove(&WarningKey::RepeatedRootCause);
+            if self
+                .emitted_warnings
+                .remove(&WarningKey::RepeatedRootCause)
+            {
+                self.warning_cleared = true;
+            }
         }
         self.evaluate()
     }
@@ -344,6 +362,43 @@ impl BudgetController {
 
 fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
+}
+
+/// Build the budget root-cause key for a typed tool failure.
+///
+/// Policy / allow / invalid-args failures stay **coarse** (`tool:code`): varying arguments rarely
+/// fixes them, so the historical doom-loop stop still fires across intents.
+///
+/// Exit / not-found / execution failures are **intent-scoped** (`tool:code:intent`): a failing
+/// `pnpm test` then a failing `pnpm lint` must not count as the same repeated root cause.
+pub(crate) fn typed_failure_key(
+    tool_name: &str,
+    code: ToolErrorCode,
+    intent_sig: &str,
+) -> String {
+    let tool = tool_name.to_ascii_lowercase();
+    let code_label = match code {
+        ToolErrorCode::InvalidToolArguments => "invalid_tool_arguments",
+        ToolErrorCode::NotFound => "not_found",
+        ToolErrorCode::NotAllowed => "not_allowed",
+        ToolErrorCode::PolicyDenied => "policy_denied",
+        ToolErrorCode::ExecutionFailed => "execution_failed",
+        ToolErrorCode::NonZeroExit => "non_zero_exit",
+        ToolErrorCode::LegacyReportedFailure => "legacy_reported_failure",
+    };
+    match code {
+        ToolErrorCode::PolicyDenied
+        | ToolErrorCode::NotAllowed
+        | ToolErrorCode::InvalidToolArguments => {
+            format!("{tool}:{code_label}")
+        }
+        ToolErrorCode::NonZeroExit
+        | ToolErrorCode::NotFound
+        | ToolErrorCode::ExecutionFailed
+        | ToolErrorCode::LegacyReportedFailure => {
+            format!("{tool}:{code_label}:{intent_sig}")
+        }
+    }
 }
 
 /// Canonical, content-free fingerprint for comparing accepted tool intents. JSON object key order
@@ -638,5 +693,109 @@ mod tests {
             tool_intent_signature("exec", r#"{"command":"pwd","timeout":10}"#),
             tool_intent_signature("EXEC", r#"{ "timeout": 10, "command": "pwd" }"#)
         );
+    }
+
+    #[test]
+    fn typed_failure_key_is_coarse_for_policy_and_intent_scoped_for_exits() {
+        let intent_a = tool_intent_signature("exec", r#"{"command":"pnpm test"}"#);
+        let intent_b = tool_intent_signature("exec", r#"{"command":"pnpm lint"}"#);
+        assert_eq!(
+            typed_failure_key("exec", ToolErrorCode::PolicyDenied, &intent_a),
+            typed_failure_key("exec", ToolErrorCode::PolicyDenied, &intent_b),
+        );
+        assert_ne!(
+            typed_failure_key("exec", ToolErrorCode::NonZeroExit, &intent_a),
+            typed_failure_key("exec", ToolErrorCode::NonZeroExit, &intent_b),
+        );
+    }
+
+    #[test]
+    fn different_non_zero_exit_intents_do_not_warn() {
+        let mut controller = BudgetController::new(test_limits(50));
+        let _ = controller.start_turn(Duration::ZERO);
+        let intent_a = tool_intent_signature("exec", r#"{"command":"pnpm test"}"#);
+        let intent_b = tool_intent_signature("exec", r#"{"command":"pnpm lint"}"#);
+        let key_a = typed_failure_key("exec", ToolErrorCode::NonZeroExit, &intent_a);
+        let key_b = typed_failure_key("exec", ToolErrorCode::NonZeroExit, &intent_b);
+        assert_eq!(
+            controller.record_tool_failure(key_a),
+            BudgetDecision::Continue
+        );
+        assert_eq!(
+            controller.record_tool_failure(key_b),
+            BudgetDecision::Continue
+        );
+        assert_eq!(controller.snapshot().repeated_root_cause_failures, 1);
+    }
+
+    #[test]
+    fn identical_non_zero_exit_intent_warns_then_stops() {
+        let mut controller = BudgetController::new(test_limits(50));
+        let _ = controller.start_turn(Duration::ZERO);
+        let intent = tool_intent_signature("exec", r#"{"command":"pnpm test"}"#);
+        let key = typed_failure_key("exec", ToolErrorCode::NonZeroExit, &intent);
+        assert_eq!(
+            controller.record_tool_failure(key.clone()),
+            BudgetDecision::Continue
+        );
+        assert!(matches!(
+            controller.record_tool_failure(key.clone()),
+            BudgetDecision::Warning(RunBudgetWarning {
+                reason: RunBudgetWarningReason::RepeatedRootCause { failures: 2 },
+                ..
+            })
+        ));
+        assert!(matches!(
+            controller.record_tool_failure(key),
+            BudgetDecision::Stuck {
+                reason: RunStuckReason::RepeatedRootCause,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn varied_policy_denied_intents_still_share_one_root_cause() {
+        let mut controller = BudgetController::new(test_limits(50));
+        let _ = controller.start_turn(Duration::ZERO);
+        for step in 0..3 {
+            let intent = tool_intent_signature("exec", &format!(r#"{{"command":"write artifact-{step}"}}"#));
+            let key = typed_failure_key("exec", ToolErrorCode::PolicyDenied, &intent);
+            let decision = controller.record_tool_failure(key);
+            if step < 1 {
+                assert_eq!(decision, BudgetDecision::Continue);
+            } else if step == 1 {
+                assert!(matches!(
+                    decision,
+                    BudgetDecision::Warning(RunBudgetWarning {
+                        reason: RunBudgetWarningReason::RepeatedRootCause { failures: 2 },
+                        ..
+                    })
+                ));
+            } else {
+                assert!(matches!(
+                    decision,
+                    BudgetDecision::Stuck {
+                        reason: RunStuckReason::RepeatedRootCause,
+                        ..
+                    }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn new_evidence_latches_warning_cleared() {
+        let mut controller = BudgetController::new(test_limits(50));
+        let _ = controller.start_turn(Duration::ZERO);
+        let _ = controller.record_tool_failure("exec:policy_denied".into());
+        assert!(matches!(
+            controller.record_tool_failure("exec:policy_denied".into()),
+            BudgetDecision::Warning(..)
+        ));
+        assert!(!controller.take_warning_cleared());
+        let _ = controller.record_progress(ProgressKind::NewEvidence);
+        assert!(controller.take_warning_cleared());
+        assert!(!controller.take_warning_cleared());
     }
 }

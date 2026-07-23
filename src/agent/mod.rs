@@ -18,7 +18,8 @@ use crate::clarification::ClarificationHub;
 use crate::tool_runtime::{with_tool_exec_and_progress_scope, ToolExecCtx, ToolProgressEmitter};
 
 use self::budget::{
-    tool_intent_signature, BudgetController, BudgetDecision, BudgetLimits, ProgressKind,
+    tool_intent_signature, typed_failure_key, BudgetController, BudgetDecision, BudgetLimits,
+    ProgressKind,
 };
 
 use crate::bus::{
@@ -3447,6 +3448,16 @@ impl AgentLogic {
                         });
                     }
                 }
+                if budget.take_warning_cleared() {
+                    let _ = outbound_tx
+                        .send(BusMessage::RunLifecycle(
+                            RunLifecycleEvent::WarningCleared {
+                                run_id: run_id.clone(),
+                                chat_id: inbound.chat_id.clone(),
+                            },
+                        ))
+                        .await;
+                }
             }};
         }
 
@@ -4252,21 +4263,16 @@ impl AgentLogic {
                         // classification is isolated inside ToolRegistry and never runs here.
                         let is_error = tool_result.is_error();
                         let tool_name = tc.function.name.clone();
+                        let intent = tool_intent_signature(&tool_name, &tc.function.arguments);
                         let budget_decision = if is_error {
-                            let error_code = tool_result
+                            let code = tool_result
                                 .error_code()
-                                .map(|code| format!("{code:?}"))
-                                .unwrap_or_else(|| "unknown".to_string());
-                            budget.record_tool_failure(format!(
-                                "{}:{}",
-                                tool_name.to_ascii_lowercase(),
-                                error_code
+                                .unwrap_or(ToolErrorCode::ExecutionFailed);
+                            budget.record_tool_failure(typed_failure_key(
+                                &tool_name, code, &intent,
                             ))
                         } else {
-                            budget.record_tool_success(tool_intent_signature(
-                                &tool_name,
-                                &tc.function.arguments,
-                            ))
+                            budget.record_tool_success(intent)
                         };
                         let tool_result_text = finalize_tool_output(tool_result);
                         let tr = TelemetryEvent::ToolResult {
@@ -4385,21 +4391,17 @@ impl AgentLogic {
                         };
 
                         let is_error = tool_result.is_error();
+                        let intent =
+                            tool_intent_signature(tool_name, &tc.function.arguments);
                         let budget_decision = if is_error {
-                            let error_code = tool_result
+                            let code = tool_result
                                 .error_code()
-                                .map(|code| format!("{code:?}"))
-                                .unwrap_or_else(|| "unknown".to_string());
-                            budget.record_tool_failure(format!(
-                                "{}:{}",
-                                tool_name.to_ascii_lowercase(),
-                                error_code
+                                .unwrap_or(ToolErrorCode::ExecutionFailed);
+                            budget.record_tool_failure(typed_failure_key(
+                                tool_name, code, &intent,
                             ))
                         } else {
-                            budget.record_tool_success(tool_intent_signature(
-                                tool_name,
-                                &tc.function.arguments,
-                            ))
+                            budget.record_tool_success(intent)
                         };
                         let tool_result_text = finalize_tool_output(tool_result);
 
