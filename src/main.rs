@@ -206,6 +206,7 @@ async fn start_embedded_host(
         no_color: false,
         resume: None,
         files: Vec::new(),
+        line_mode: false,
     })
     .await
     .map_err(std::io::Error::other)?;
