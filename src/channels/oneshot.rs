@@ -1,8 +1,9 @@
 //! Headless one-shot channel used by embedding hosts such as ALTAI CLI.
 //!
 //! The channel injects a single inbound prompt, captures the final outbound
-//! assistant message, and rejects interactive clarification/approval waits so
-//! non-TTY callers never hang or silently approve.
+//! assistant message, and either resumes approvals on the controlling TTY
+//! (`/dev/tty`) or rejects them so non-TTY callers never hang or silently
+//! approve.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -13,6 +14,7 @@ use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::bus::{BusMessage, InboundMessage, OutboundMessage, RunLifecycleEvent, RunOutcome};
+use crate::channels::tty_prompt::{prompt_on_tty, tty_available};
 use crate::channels::Channel;
 use crate::utils::ContentPart;
 
@@ -59,8 +61,10 @@ struct OneshotState {
     finished: bool,
 }
 
-/// Captures one-shot progress and completes when the run terminates or an
-/// interactive approval/clarification would otherwise block a non-TTY host.
+/// Captures one-shot progress and completes when the run terminates.
+///
+/// Interactive approvals/clarifications resume via `/dev/tty` when available;
+/// otherwise the run exits with an approval/clarification outcome.
 pub struct OneshotChannel {
     chat_id: String,
     prompt: String,
@@ -70,6 +74,7 @@ pub struct OneshotChannel {
     result_tx: Mutex<Option<oneshot::Sender<OneshotResult>>>,
     shutdown_tx: mpsc::UnboundedSender<()>,
     observe_tx: Option<mpsc::UnboundedSender<BusMessage>>,
+    bus_tx: Mutex<Option<mpsc::Sender<BusMessage>>>,
     started: watch::Sender<bool>,
 }
 
@@ -93,6 +98,7 @@ impl OneshotChannel {
             result_tx: Mutex::new(Some(result_tx)),
             shutdown_tx,
             observe_tx,
+            bus_tx: Mutex::new(None),
             started,
         }
     }
@@ -120,6 +126,59 @@ impl OneshotChannel {
             let _ = tx.send(result);
         }
         let _ = self.shutdown_tx.send(());
+    }
+
+    fn normalize_tty_reply(raw: &str) -> String {
+        let trimmed = raw.trim();
+        if trimmed.chars().count() == 1 {
+            if let Some(mapped) =
+                crate::channels::terminal_ui::approval_hotkey_reply(trimmed.chars().next().unwrap())
+            {
+                return mapped.to_string();
+            }
+        }
+        trimmed.to_string()
+    }
+
+    async fn resume_approval_on_tty(&self, detail: &str) -> Result<bool, String> {
+        let bus_tx = self
+            .bus_tx
+            .lock()
+            .expect("oneshot bus")
+            .clone()
+            .ok_or_else(|| "oneshot bus is not ready for approval resume".to_string())?;
+
+        let prompt = format!(
+            "\n[altai] Approval required\n{detail}\nChoices: approve / deny / always / abort  (y/n/a/x)\n> "
+        );
+        let reply = tokio::task::spawn_blocking(move || prompt_on_tty(&prompt))
+            .await
+            .map_err(|error| format!("tty prompt join failed: {error}"))?
+            .map_err(|error| format!("tty prompt failed: {error}"))?;
+        let reply = Self::normalize_tty_reply(&reply);
+        if reply.eq_ignore_ascii_case("abort")
+            || reply.eq_ignore_ascii_case("cancel")
+            || reply.eq_ignore_ascii_case("quit")
+        {
+            self.complete(OneshotOutcome::Cancelled);
+            return Ok(true);
+        }
+
+        let inbound = InboundMessage {
+            channel: ONESHOT_CHANNEL_NAME.to_string(),
+            sender_id: "altai-cli".to_string(),
+            chat_id: self.chat_id.clone(),
+            thread_id: None,
+            content: reply,
+            attachments: Vec::new(),
+            metadata: HashMap::new(),
+        };
+        self.observe(BusMessage::Inbound(inbound.clone()));
+        bus_tx
+            .send(BusMessage::Inbound(inbound))
+            .await
+            .map_err(|error| format!("failed to enqueue tty approval reply: {error}"))?;
+        Ok(true)
     }
 
     /// Observe host bus traffic that is not delivered through [`Channel::send`].
@@ -151,6 +210,11 @@ impl OneshotChannel {
                 ..
             }) if chat_id == &self.chat_id && decision == "approval_requested" =>
             {
+                // When a controlling TTY is available, wait for the clarification
+                // outbound (handled in `send`) so the user can approve interactively.
+                if tty_available() {
+                    return;
+                }
                 self.complete(OneshotOutcome::ApprovalRequired {
                     detail: command_preview.clone(),
                 });
@@ -184,6 +248,7 @@ impl Channel for OneshotChannel {
     }
 
     async fn start(&self, bus_tx: mpsc::Sender<BusMessage>) -> Result<(), String> {
+        *self.bus_tx.lock().expect("oneshot bus") = Some(bus_tx.clone());
         let mut content = self.prompt.clone();
         // Prefer real multimodal attachments; only keep a path note when loading failed.
         if self.attachments.is_empty() {
@@ -225,7 +290,7 @@ impl Channel for OneshotChannel {
                 .get(crate::bus::METADATA_CLARIFICATION_TICKET_ID)
                 .is_some()
         {
-            if let Some(edit) = msg.metadata.get("edit_diff") {
+            let detail = if let Some(edit) = msg.metadata.get("edit_diff") {
                 let file = edit
                     .get("file")
                     .and_then(|v| v.as_str())
@@ -246,11 +311,25 @@ impl Channel for OneshotChannel {
                     detail.push('\n');
                     detail.push_str(&msg.content);
                 }
+                detail
+            } else {
+                msg.content.clone()
+            };
+
+            if tty_available() {
+                match self.resume_approval_on_tty(&detail).await {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {}
+                    Err(error) => {
+                        eprintln!("altai-cli: tty approval resume failed: {error}");
+                    }
+                }
+            }
+
+            if msg.metadata.get("edit_diff").is_some() {
                 self.complete(OneshotOutcome::ApprovalRequired { detail });
             } else {
-                self.complete(OneshotOutcome::ClarificationRequired {
-                    detail: msg.content.clone(),
-                });
+                self.complete(OneshotOutcome::ClarificationRequired { detail });
             }
             return Ok(());
         }
@@ -290,5 +369,12 @@ mod tests {
             OneshotOutcome::from_run_outcome(&RunOutcome::Cancelled),
             OneshotOutcome::Cancelled
         );
+    }
+
+    #[test]
+    fn normalizes_hotkey_replies() {
+        assert_eq!(OneshotChannel::normalize_tty_reply("y\n"), "approve");
+        assert_eq!(OneshotChannel::normalize_tty_reply("3"), "always");
+        assert_eq!(OneshotChannel::normalize_tty_reply("deny"), "deny");
     }
 }
