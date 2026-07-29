@@ -1265,7 +1265,7 @@ fn apply_host_overrides(config: &mut AppConfig, host: &HostConfig) -> Result<(),
 
         let provider = config.provider.get_or_insert_with(ProviderConfig::default);
         if let Some((provider_name, model_name)) = model.split_once('/') {
-            if provider_name.is_empty() || model_name.is_empty() || model_name.contains('/') {
+            if provider_name.is_empty() || model_name.is_empty() {
                 return Err(format!("invalid provider/model override: {model}"));
             }
             provider.provider_name = provider_name.to_string();
