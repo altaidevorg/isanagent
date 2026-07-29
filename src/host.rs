@@ -85,6 +85,8 @@ pub struct HostConfig {
     pub permission: Option<HostPermissionMode>,
     /// Disable ANSI foreground colors while retaining terminal structure.
     pub no_color: bool,
+    /// Existing terminal chat identifier to load on startup.
+    pub resume: Option<String>,
 }
 
 /// Interactive permission modes exposed to embedding hosts.
@@ -837,7 +839,12 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     let active_terminal_session_chat: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
 
     let terminal_chat_id = if workspace.config.terminal_enabled() {
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = config
+            .resume
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         *active_terminal_session_chat.write().await = id.clone();
         let terminal = Arc::new(TerminalChannel::new(TerminalChannelConfig {
             chat_id: id.clone(),
@@ -857,6 +864,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                 all_providers
             },
             color_enabled: !config.no_color,
+            resume_session: config.resume.is_some(),
         }));
         terminal.start(bus_tx.clone()).await?;
         out_channels.insert(terminal.name().to_string(), terminal);
@@ -1621,6 +1629,7 @@ mod tests {
         assert!(config.model.is_none());
         assert!(config.permission.is_none());
         assert!(!config.no_color);
+        assert!(config.resume.is_none());
     }
 
     #[test]
@@ -1685,6 +1694,7 @@ mod tests {
             model: None,
             permission: None,
             no_color: false,
+            resume: None,
         });
         assert_eq!(host.next_event().await, Some(HostEvent::Starting));
         assert!(host.shutdown());

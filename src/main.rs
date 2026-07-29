@@ -203,6 +203,7 @@ async fn start_embedded_host(
         model: None,
         permission: None,
         no_color: false,
+        resume: None,
     })
     .await
     .map_err(std::io::Error::other)?;
@@ -883,6 +884,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                 all_providers
             },
             color_enabled: !matches!(std::env::var_os("NO_COLOR"), Some(value) if !value.is_empty()),
+            resume_session: false,
         }));
         terminal.start(bus_tx.clone()).await?;
         out_channels.insert(terminal.name().to_string(), terminal);

@@ -1297,6 +1297,8 @@ pub(crate) struct RatatuiMainConfig {
     pub providers: std::collections::HashMap<String, crate::config::ProviderConfig>,
     /// Whether the host permits ANSI foreground colors for this session.
     pub color_enabled: bool,
+    /// Whether `chat_id` names a persisted chat that should be loaded.
+    pub resume_session: bool,
 }
 
 /// Run until user quits. Restores terminal on exit.
@@ -1314,6 +1316,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         memory_node,
         providers,
         color_enabled,
+        resume_session,
     } = config;
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -1349,6 +1352,23 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
     app.cells.push(Cell::System {
         message: opening_banner,
     });
+    if resume_session {
+        match load_thread_transcript_cells(&rt, &memory_node, &chat_id) {
+            Ok(mut cells) => {
+                let sid = &chat_id[..8.min(chat_id.len())];
+                cells.insert(
+                    0,
+                    Cell::System {
+                        message: format!("Resumed session {sid}… — loaded from workspace memory."),
+                    },
+                );
+                app.cells = cells;
+            }
+            Err(error) => app.cells.push(Cell::System {
+                message: format!("Could not load session history: {error}"),
+            }),
+        }
+    }
 
     sync_terminal_session_chat(&bus_tx, &chat_id);
     refresh_conversations_list(&rt, &memory_node, &mut app);
