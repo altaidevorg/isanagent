@@ -201,6 +201,8 @@ async fn start_embedded_host(
         config: config_arg.map(std::path::PathBuf::from),
     })
     .await
+    .map_err(std::io::Error::other)?;
+    Ok(())
 }
 
 #[allow(dead_code)]

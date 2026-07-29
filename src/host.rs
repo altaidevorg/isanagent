@@ -74,10 +74,90 @@ pub struct HostConfig {
     pub config: Option<PathBuf>,
 }
 
-pub type HostResult<T> = Result<T, Box<dyn std::error::Error>>;
+pub type HostError = Box<dyn std::error::Error + Send + Sync>;
+pub type HostResult<T> = Result<T, HostError>;
+
+/// Lifecycle events emitted by a host started through [`spawn_host`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostEvent {
+    /// The host task has been scheduled and is beginning runtime setup.
+    Starting,
+    /// The host task exited normally or with an error.
+    Stopped { outcome: HostExit },
+}
+
+/// The terminal state of a spawned host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostExit {
+    Completed,
+    Failed(String),
+}
+
+/// A running IsanAgent host with explicit lifecycle observation and shutdown.
+pub struct HostHandle {
+    shutdown_tx: mpsc::UnboundedSender<()>,
+    events: mpsc::UnboundedReceiver<HostEvent>,
+    task: tokio::task::JoinHandle<HostResult<()>>,
+}
+
+impl HostHandle {
+    /// Request graceful host shutdown. Returns false only when the host task
+    /// has already stopped accepting control messages.
+    pub fn shutdown(&self) -> bool {
+        self.shutdown_tx.send(()).is_ok()
+    }
+
+    /// Receive the next lifecycle event, or `None` once the host task closes
+    /// its event stream.
+    pub async fn next_event(&mut self) -> Option<HostEvent> {
+        self.events.recv().await
+    }
+
+    /// Wait for the complete host shutdown sequence and surface any startup or
+    /// runtime error from the embedded host.
+    pub async fn wait(self) -> HostResult<()> {
+        self.task
+            .await
+            .map_err(|error| Box::new(error) as HostError)?
+    }
+}
+
+/// Spawn the complete IsanAgent runtime and return explicit lifecycle control.
+///
+/// This is the embedding entry point for applications such as ALTAI. The
+/// existing [`start_host`] function remains available for callers that simply
+/// want to await the host until it exits.
+pub fn spawn_host(config: HostConfig) -> HostHandle {
+    let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
+    let (events_tx, events) = mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        let _ = events_tx.send(HostEvent::Starting);
+        let result = run_host(config, Some(shutdown_rx)).await;
+        let outcome = match &result {
+            Ok(()) => HostExit::Completed,
+            Err(error) => HostExit::Failed(error.to_string()),
+        };
+        let _ = events_tx.send(HostEvent::Stopped { outcome });
+        result
+    });
+
+    HostHandle {
+        shutdown_tx,
+        events,
+        task,
+    }
+}
+
 /// Start the complete IsanAgent runtime, including its terminal channel when
 /// enabled by the selected configuration.
 pub async fn start_host(config: HostConfig) -> HostResult<()> {
+    run_host(config, None).await
+}
+
+async fn run_host(
+    config: HostConfig,
+    mut external_shutdown_rx: Option<mpsc::UnboundedReceiver<()>>,
+) -> HostResult<()> {
     let workspace_arg = config
         .workspace
         .as_ref()
@@ -1103,6 +1183,9 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         _ = shutdown_rx.recv() => {
             log::info!("Shutdown requested (terminal /exit or internal signal).");
         }
+        _ = wait_for_external_shutdown(&mut external_shutdown_rx) => {
+            log::info!("Shutdown requested by embedded host controller.");
+        }
         _ = tokio::signal::ctrl_c() => {
             log::info!("Shutdown requested via Ctrl+C.");
         }
@@ -1145,6 +1228,15 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     }
 
     Ok(())
+}
+
+async fn wait_for_external_shutdown(receiver: &mut Option<mpsc::UnboundedReceiver<()>>) {
+    match receiver {
+        Some(receiver) => {
+            let _ = receiver.recv().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
 }
 
 async fn maybe_prompt_uv_install_on_launch(workspace: &IsanagentWorkspace) {
@@ -1448,11 +1540,44 @@ venv is touched."
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn host_config_defaults_to_the_existing_workspace_resolution() {
         let config = HostConfig::default();
         assert!(config.workspace.is_none());
         assert!(config.config.is_none());
+    }
+
+    #[tokio::test]
+    async fn spawned_host_accepts_an_external_graceful_shutdown() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            "[terminal]\nenabled = false\n\n[api]\nenabled = true\nport = 0\n",
+        )
+        .expect("headless config");
+
+        let mut host = spawn_host(HostConfig {
+            workspace: Some(temp.path().to_path_buf()),
+            config: Some(config_path),
+        });
+        assert_eq!(host.next_event().await, Some(HostEvent::Starting));
+        assert!(host.shutdown());
+
+        let stopped = tokio::time::timeout(Duration::from_secs(10), host.next_event())
+            .await
+            .expect("host should stop promptly");
+        assert_eq!(
+            stopped,
+            Some(HostEvent::Stopped {
+                outcome: HostExit::Completed
+            })
+        );
+        tokio::time::timeout(Duration::from_secs(10), host.wait())
+            .await
+            .expect("host task should join")
+            .expect("host should complete cleanly");
     }
 }
