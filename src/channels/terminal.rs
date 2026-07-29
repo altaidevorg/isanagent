@@ -1,4 +1,4 @@
-use crate::bus::{BusMessage, LogEvent, OutboundMessage};
+use crate::bus::{BusMessage, InboundMessage, LogEvent, OutboundMessage};
 use crate::channels::Channel;
 use crate::config::AppConfig;
 use crate::logging::LoggerHandle;
@@ -539,6 +539,13 @@ pub struct TerminalChannelConfig {
     pub resume_session: bool,
     /// File references composed into the first user message.
     pub initial_files: Vec<PathBuf>,
+    pub mode: TerminalMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalMode {
+    Tui,
+    Line,
 }
 
 /// Stdin/stdout terminal: always Ratatui (alternate screen). Requires an interactive TTY.
@@ -562,6 +569,7 @@ pub struct TerminalChannel {
     color_enabled: bool,
     resume_session: bool,
     initial_files: Vec<PathBuf>,
+    mode: TerminalMode,
 }
 
 impl TerminalChannel {
@@ -579,6 +587,7 @@ impl TerminalChannel {
             color_enabled: config.color_enabled,
             resume_session: config.resume_session,
             initial_files: config.initial_files,
+            mode: config.mode,
         }
     }
 }
@@ -601,6 +610,49 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
         }
 
         let channel_name = self.name().to_string();
+        if self.mode == TerminalMode::Line {
+            let (tx, rx) = std::sync::mpsc::channel::<OutboundMessage>();
+            *self
+                .outbound_ui_tx
+                .lock()
+                .map_err(|_| "terminal outbound bridge poisoned".to_string())? = Some(tx);
+            let chat_id = self.chat_id.clone();
+            let shutdown = self.shutdown_tx.clone();
+            std::thread::spawn(move || {
+                for message in rx {
+                    println!("{}", message.content);
+                }
+            });
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                println!("ALTAI line mode. Type /exit to quit.");
+                for line in std::io::stdin().lock().lines() {
+                    let Ok(content) = line else { break };
+                    if matches!(content.trim(), "/exit" | "/quit") {
+                        let _ = shutdown.send(());
+                        break;
+                    }
+                    if content.trim().is_empty() {
+                        continue;
+                    }
+                    if bus_tx
+                        .blocking_send(BusMessage::Inbound(InboundMessage {
+                            channel: "terminal".into(),
+                            sender_id: "local_user".into(),
+                            chat_id: chat_id.clone(),
+                            thread_id: None,
+                            content,
+                            attachments: Vec::new(),
+                            metadata: Default::default(),
+                        }))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            return Ok(());
+        }
         let chat_id_clone = self.chat_id.clone();
         let status_model = self.status_model.clone();
         let logger_tx = self.logger_tx.clone();

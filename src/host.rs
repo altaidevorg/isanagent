@@ -16,7 +16,7 @@ use crate::bus::{BusMessage, InboundMessage, LoggerControlMessage, TelemetryEven
 use crate::channels::terminal::{
     build_agent_thought_terminal_notice, build_tool_call_terminal_notice,
     build_tool_progress_terminal_notice, build_tool_result_terminal_notice,
-    terminal_startup_suppresses_plain_banner, TerminalChannelConfig,
+    terminal_startup_suppresses_plain_banner, TerminalChannelConfig, TerminalMode,
 };
 use crate::channels::{
     api::ApiChannel, email::EmailChannel, slack::SlackChannel, terminal::TerminalChannel, Channel,
@@ -91,6 +91,7 @@ pub struct HostConfig {
     pub resume: Option<String>,
     /// Files preloaded into the terminal's next composed message.
     pub files: Vec<PathBuf>,
+    pub line_mode: bool,
 }
 
 /// Interactive permission modes exposed to embedding hosts.
@@ -870,6 +871,11 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             color_enabled: !config.no_color,
             resume_session: config.resume.is_some(),
             initial_files: config.files.clone(),
+            mode: if config.line_mode {
+                TerminalMode::Line
+            } else {
+                TerminalMode::Tui
+            },
         }));
         terminal.start(bus_tx.clone()).await?;
         out_channels.insert(terminal.name().to_string(), terminal);
@@ -1659,6 +1665,7 @@ mod tests {
         assert!(!config.no_color);
         assert!(config.resume.is_none());
         assert!(config.files.is_empty());
+        assert!(!config.line_mode);
     }
 
     #[test]
@@ -1745,6 +1752,7 @@ mod tests {
             no_color: false,
             resume: None,
             files: Vec::new(),
+            line_mode: false,
         });
         assert_eq!(host.next_event().await, Some(HostEvent::Starting));
         assert!(host.shutdown());

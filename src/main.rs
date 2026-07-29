@@ -11,7 +11,7 @@ use isanagent::bus::{BusMessage, InboundMessage, LoggerControlMessage, Telemetry
 use isanagent::channels::terminal::{
     build_agent_thought_terminal_notice, build_tool_call_terminal_notice,
     build_tool_progress_terminal_notice, build_tool_result_terminal_notice,
-    terminal_startup_suppresses_plain_banner, TerminalChannelConfig,
+    terminal_startup_suppresses_plain_banner, TerminalChannelConfig, TerminalMode,
 };
 use isanagent::channels::{
     api::ApiChannel, email::EmailChannel, slack::SlackChannel, terminal::TerminalChannel, Channel,
@@ -888,6 +888,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             color_enabled: !matches!(std::env::var_os("NO_COLOR"), Some(value) if !value.is_empty()),
             resume_session: false,
             initial_files: Vec::new(),
+            mode: TerminalMode::Tui,
         }));
         terminal.start(bus_tx.clone()).await?;
         out_channels.insert(terminal.name().to_string(), terminal);
