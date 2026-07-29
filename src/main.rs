@@ -200,6 +200,8 @@ async fn start_embedded_host(
         workspace: workspace_arg.map(std::path::PathBuf::from),
         config: config_arg.map(std::path::PathBuf::from),
         sandbox: None,
+        model: None,
+        permission: None,
     })
     .await
     .map_err(std::io::Error::other)?;

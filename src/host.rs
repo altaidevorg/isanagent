@@ -22,6 +22,7 @@ use crate::channels::{
     api::ApiChannel, email::EmailChannel, slack::SlackChannel, terminal::TerminalChannel, Channel,
 };
 use crate::clarification::ClarificationHub;
+use crate::config::{AppConfig, HarnessConfig, ProviderConfig, ShellPolicyConfig};
 use crate::execution::{ExecutionJobManager, InflightSyncRegistry};
 use crate::logging::{
     create_logger_channel, create_logging_actor_or_fallback, init_runtime_logger,
@@ -77,6 +78,20 @@ pub struct HostConfig {
     /// Project directory exposed to tools. Defaults to IsanAgent's own
     /// workspace sandbox for backward compatibility.
     pub sandbox: Option<PathBuf>,
+    /// Optional `provider/model` or model-only override selected by the host.
+    pub model: Option<String>,
+    /// Optional interactive shell and file-edit policy override selected by
+    /// the host application.
+    pub permission: Option<HostPermissionMode>,
+}
+
+/// Interactive permission modes exposed to embedding hosts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostPermissionMode {
+    Ask,
+    AutoEdit,
+    Plan,
+    Bypass,
 }
 
 pub type HostError = Box<dyn std::error::Error + Send + Sync>;
@@ -211,11 +226,12 @@ async fn run_host(
     println!("Starting Advanced isanagent System...");
     log::info!("Starting Advanced isanagent System.");
 
-    let workspace = IsanagentWorkspace::new_with_sandbox(
+    let mut workspace = IsanagentWorkspace::new_with_sandbox(
         workspace_arg.as_deref(),
         config_arg.as_deref(),
         sandbox,
     )?;
+    apply_host_overrides(&mut workspace.config, &config).map_err(std::io::Error::other)?;
     println!("Loading isanagent workspace at: {:?}", workspace.dir);
     log::info!("Loading isanagent workspace at {:?}", workspace.dir);
 
@@ -1240,6 +1256,47 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     Ok(())
 }
 
+fn apply_host_overrides(config: &mut AppConfig, host: &HostConfig) -> Result<(), String> {
+    if let Some(model) = host.model.as_deref() {
+        let model = model.trim();
+        if model.is_empty() {
+            return Err("model override cannot be empty".to_string());
+        }
+
+        let provider = config.provider.get_or_insert_with(ProviderConfig::default);
+        if let Some((provider_name, model_name)) = model.split_once('/') {
+            if provider_name.is_empty() || model_name.is_empty() || model_name.contains('/') {
+                return Err(format!("invalid provider/model override: {model}"));
+            }
+            provider.provider_name = provider_name.to_string();
+            provider.model_name = model_name.to_string();
+            // Let the provider's conventional key variable be inferred after
+            // changing provider family (for example ANTHROPIC_API_KEY).
+            provider.api_key_env.clear();
+        } else {
+            provider.model_name = model.to_string();
+        }
+    }
+
+    if let Some(permission) = host.permission {
+        let shell_policy = config
+            .harness
+            .get_or_insert_with(HarnessConfig::default)
+            .shell_policy
+            .get_or_insert_with(ShellPolicyConfig::default);
+        let (mode, edit_mode) = match permission {
+            HostPermissionMode::Ask => ("ask", "ask"),
+            HostPermissionMode::AutoEdit => ("ask", "allow"),
+            HostPermissionMode::Plan => ("deny", "deny"),
+            HostPermissionMode::Bypass => ("allow", "allow"),
+        };
+        shell_policy.mode = Some(mode.to_string());
+        shell_policy.edit_mode = Some(edit_mode.to_string());
+    }
+
+    Ok(())
+}
+
 async fn wait_for_external_shutdown(receiver: &mut Option<mpsc::UnboundedReceiver<()>>) {
     match receiver {
         Some(receiver) => {
@@ -1558,6 +1615,53 @@ mod tests {
         assert!(config.workspace.is_none());
         assert!(config.config.is_none());
         assert!(config.sandbox.is_none());
+        assert!(config.model.is_none());
+        assert!(config.permission.is_none());
+    }
+
+    #[test]
+    fn host_model_override_selects_provider_and_model() {
+        let mut config = AppConfig::default();
+        apply_host_overrides(
+            &mut config,
+            &HostConfig {
+                model: Some("anthropic/claude-test".to_string()),
+                ..HostConfig::default()
+            },
+        )
+        .expect("valid model override");
+
+        let provider = config.provider.expect("provider override");
+        assert_eq!(provider.provider_name, "anthropic");
+        assert_eq!(provider.model_name, "claude-test");
+        assert!(provider.api_key_env.is_empty());
+    }
+
+    #[test]
+    fn host_permission_modes_map_to_shell_and_edit_policy() {
+        for (permission, mode, edit_mode) in [
+            (HostPermissionMode::Ask, "ask", "ask"),
+            (HostPermissionMode::AutoEdit, "ask", "allow"),
+            (HostPermissionMode::Plan, "deny", "deny"),
+            (HostPermissionMode::Bypass, "allow", "allow"),
+        ] {
+            let mut config = AppConfig::default();
+            apply_host_overrides(
+                &mut config,
+                &HostConfig {
+                    permission: Some(permission),
+                    ..HostConfig::default()
+                },
+            )
+            .expect("valid permission override");
+
+            let policy = config
+                .harness
+                .and_then(|harness| harness.shell_policy)
+                .expect("shell policy override");
+            assert_eq!(policy.mode.as_deref(), Some(mode));
+            assert_eq!(policy.edit_mode.as_deref(), Some(edit_mode));
+        }
     }
 
     #[tokio::test]
@@ -1574,6 +1678,8 @@ mod tests {
             workspace: Some(temp.path().to_path_buf()),
             config: Some(config_path),
             sandbox: None,
+            model: None,
+            permission: None,
         });
         assert_eq!(host.next_event().await, Some(HostEvent::Starting));
         assert!(host.shutdown());
