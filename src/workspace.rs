@@ -46,6 +46,7 @@ pub fn ensure_workspace_layout(root: &Path) -> Result<WorkspaceLayout, String> {
 pub struct IsanagentWorkspace {
     pub dir: std::path::PathBuf,
     pub sandbox_dir: std::path::PathBuf,
+    pub skills_dir: std::path::PathBuf,
     pub config: AppConfig,
 }
 
@@ -53,8 +54,32 @@ impl IsanagentWorkspace {
     /// Initializes a new workspace at the given path.
     /// If no path is provided, it defaults to `~/.isanagent`.
     pub fn new(path_override: Option<&str>, config_override: Option<&str>) -> Result<Self, String> {
+        Self::new_with_sandbox(path_override, config_override, None)
+    }
+
+    /// Initializes an IsanAgent state workspace with an optional, distinct
+    /// project sandbox. Embedders use this to keep durable state separate from
+    /// the project files that agent tools may read and edit.
+    pub fn new_with_sandbox(
+        path_override: Option<&str>,
+        config_override: Option<&str>,
+        sandbox_override: Option<&Path>,
+    ) -> Result<Self, String> {
         let target_dir = resolve_workspace_root(path_override);
         let layout = ensure_workspace_layout(&target_dir)?;
+        let sandbox_dir = match sandbox_override {
+            Some(path) => {
+                if !path.is_dir() {
+                    return Err(format!(
+                        "Configured sandbox is not a directory: {}",
+                        path.display()
+                    ));
+                }
+                path.canonicalize()
+                    .map_err(|error| format!("Failed to resolve sandbox directory: {error}"))?
+            }
+            None => layout.sandbox_dir,
+        };
 
         // 3. Load config.toml if it exists
         let config_path = config_override
@@ -71,7 +96,8 @@ impl IsanagentWorkspace {
 
         Ok(Self {
             dir: layout.root,
-            sandbox_dir: layout.sandbox_dir,
+            sandbox_dir,
+            skills_dir: layout.skills_dir,
             config,
         })
     }
@@ -81,7 +107,7 @@ impl IsanagentWorkspace {
     }
 
     pub fn skills_path(&self) -> PathBuf {
-        self.sandbox_dir.join("skills")
+        self.skills_dir.clone()
     }
 
     /// Reads an optional markdown file from the workspace sandbox (e.g., AGENTS.md, USER.md, SOUL.md).
@@ -131,5 +157,33 @@ impl IsanagentWorkspace {
         } else {
             prompt_parts.join("\n")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sandbox_override_keeps_state_and_project_roots_distinct() {
+        let state = tempfile::tempdir().expect("state directory");
+        let project = tempfile::tempdir().expect("project directory");
+
+        let workspace = IsanagentWorkspace::new_with_sandbox(
+            Some(state.path().to_str().expect("utf-8 state path")),
+            None,
+            Some(project.path()),
+        )
+        .expect("workspace should initialize");
+
+        assert_eq!(workspace.dir, state.path());
+        assert_eq!(
+            workspace.sandbox_dir,
+            project.path().canonicalize().unwrap()
+        );
+        assert_eq!(
+            workspace.skills_path(),
+            state.path().join("workspace/skills")
+        );
     }
 }

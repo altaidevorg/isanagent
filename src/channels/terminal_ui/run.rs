@@ -42,7 +42,7 @@ use crate::channels::terminal_ui::protocol::{
 };
 use crate::channels::terminal_ui::text_format::truncate_chars_display;
 use crate::channels::terminal_ui::{
-    execution_browser, init_from_env, uses_ansi_color, AgentTaskStatus, App, Cell, JobStripStatus,
+    execution_browser, init, uses_ansi_color, AgentTaskStatus, App, Cell, JobStripStatus,
     ModelSelector, TerminalUiFocus, Theme, ToastKind, ToolNoticePhase, ToolRailEntry,
     TranscriptSelection,
 };
@@ -1295,6 +1295,12 @@ pub(crate) struct RatatuiMainConfig {
     pub memory_node: NodeHandle<MemoryMessage>,
     /// Named alternative providers for `/model` switching.
     pub providers: std::collections::HashMap<String, crate::config::ProviderConfig>,
+    /// Whether the host permits ANSI foreground colors for this session.
+    pub color_enabled: bool,
+    /// Whether `chat_id` names a persisted chat that should be loaded.
+    pub resume_session: bool,
+    /// File references composed into the first user message.
+    pub initial_files: Vec<PathBuf>,
 }
 
 /// Run until user quits. Restores terminal on exit.
@@ -1311,6 +1317,9 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         status_model,
         memory_node,
         providers,
+        color_enabled,
+        resume_session,
+        initial_files,
     } = config;
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -1318,7 +1327,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         .build()
         .map_err(io::Error::other)?;
 
-    init_from_env();
+    init(color_enabled);
 
     let mut stdout = stdout();
     enable_raw_mode()?;
@@ -1346,6 +1355,36 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
     app.cells.push(Cell::System {
         message: opening_banner,
     });
+    if !initial_files.is_empty() {
+        let refs = initial_files
+            .iter()
+            .map(|path| format!("@{}", path.display()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        app.input = format!("{refs} ");
+        app.cursor = app.input.len();
+        app.cells.push(Cell::System {
+            message: "Attached file references were added to the composer for the next message."
+                .into(),
+        });
+    }
+    if resume_session {
+        match load_thread_transcript_cells(&rt, &memory_node, &chat_id) {
+            Ok(mut cells) => {
+                let sid = &chat_id[..8.min(chat_id.len())];
+                cells.insert(
+                    0,
+                    Cell::System {
+                        message: format!("Resumed session {sid}… — loaded from workspace memory."),
+                    },
+                );
+                app.cells = cells;
+            }
+            Err(error) => app.cells.push(Cell::System {
+                message: format!("Could not load session history: {error}"),
+            }),
+        }
+    }
 
     sync_terminal_session_chat(&bus_tx, &chat_id);
     refresh_conversations_list(&rt, &memory_node, &mut app);

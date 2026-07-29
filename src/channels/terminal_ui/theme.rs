@@ -12,6 +12,11 @@ pub fn init_from_env() {
         std::env::var_os("NO_COLOR"),
         Some(s) if !s.is_empty()
     );
+    init(allow);
+}
+
+/// Set the color capability chosen by an embedding host for this TUI session.
+pub fn init(allow: bool) {
     USE_ANSI_COLOR.store(allow, Ordering::Relaxed);
 }
 
