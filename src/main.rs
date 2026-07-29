@@ -199,6 +199,7 @@ async fn start_embedded_host(
     isanagent::host::start_host(isanagent::host::HostConfig {
         workspace: workspace_arg.map(std::path::PathBuf::from),
         config: config_arg.map(std::path::PathBuf::from),
+        sandbox: None,
     })
     .await
     .map_err(std::io::Error::other)?;

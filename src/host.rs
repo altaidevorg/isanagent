@@ -70,8 +70,13 @@ const EXECUTION_HARNESS_SYSTEM_GUIDANCE: &str = r#"
 
 #[derive(Debug, Clone, Default)]
 pub struct HostConfig {
+    /// Durable IsanAgent state directory.
     pub workspace: Option<PathBuf>,
+    /// Path to the IsanAgent TOML configuration file.
     pub config: Option<PathBuf>,
+    /// Project directory exposed to tools. Defaults to IsanAgent's own
+    /// workspace sandbox for backward compatibility.
+    pub sandbox: Option<PathBuf>,
 }
 
 pub type HostError = Box<dyn std::error::Error + Send + Sync>;
@@ -166,6 +171,7 @@ async fn run_host(
         .config
         .as_ref()
         .map(|path| path.to_string_lossy().to_string());
+    let sandbox = config.sandbox.as_deref();
     let workspace_dir = resolve_workspace_root(workspace_arg.as_deref());
 
     let (logger_bus_tx, logger_bus_rx) = create_logger_channel(LOGGER_QUEUE_CAPACITY);
@@ -205,7 +211,11 @@ async fn run_host(
     println!("Starting Advanced isanagent System...");
     log::info!("Starting Advanced isanagent System.");
 
-    let workspace = IsanagentWorkspace::new(workspace_arg.as_deref(), config_arg.as_deref())?;
+    let workspace = IsanagentWorkspace::new_with_sandbox(
+        workspace_arg.as_deref(),
+        config_arg.as_deref(),
+        sandbox,
+    )?;
     println!("Loading isanagent workspace at: {:?}", workspace.dir);
     log::info!("Loading isanagent workspace at {:?}", workspace.dir);
 
@@ -1547,6 +1557,7 @@ mod tests {
         let config = HostConfig::default();
         assert!(config.workspace.is_none());
         assert!(config.config.is_none());
+        assert!(config.sandbox.is_none());
     }
 
     #[tokio::test]
@@ -1562,6 +1573,7 @@ mod tests {
         let mut host = spawn_host(HostConfig {
             workspace: Some(temp.path().to_path_buf()),
             config: Some(config_path),
+            sandbox: None,
         });
         assert_eq!(host.next_event().await, Some(HostEvent::Starting));
         assert!(host.shutdown());
