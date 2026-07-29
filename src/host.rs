@@ -89,6 +89,8 @@ pub struct HostConfig {
     pub no_color: bool,
     /// Existing terminal chat identifier to load on startup.
     pub resume: Option<String>,
+    /// Files preloaded into the terminal's next composed message.
+    pub files: Vec<PathBuf>,
 }
 
 /// Interactive permission modes exposed to embedding hosts.
@@ -867,6 +869,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             },
             color_enabled: !config.no_color,
             resume_session: config.resume.is_some(),
+            initial_files: config.files.clone(),
         }));
         terminal.start(bus_tx.clone()).await?;
         out_channels.insert(terminal.name().to_string(), terminal);
@@ -1655,6 +1658,7 @@ mod tests {
         assert!(config.permission.is_none());
         assert!(!config.no_color);
         assert!(config.resume.is_none());
+        assert!(config.files.is_empty());
     }
 
     #[test]
@@ -1740,6 +1744,7 @@ mod tests {
             permission: None,
             no_color: false,
             resume: None,
+            files: Vec::new(),
         });
         assert_eq!(host.next_event().await, Some(HostEvent::Starting));
         assert!(host.shutdown());

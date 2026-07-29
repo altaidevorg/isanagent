@@ -205,6 +205,7 @@ async fn start_embedded_host(
         permission: None,
         no_color: false,
         resume: None,
+        files: Vec::new(),
     })
     .await
     .map_err(std::io::Error::other)?;
@@ -886,6 +887,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             },
             color_enabled: !matches!(std::env::var_os("NO_COLOR"), Some(value) if !value.is_empty()),
             resume_session: false,
+            initial_files: Vec::new(),
         }));
         terminal.start(bus_tx.clone()).await?;
         out_channels.insert(terminal.name().to_string(), terminal);

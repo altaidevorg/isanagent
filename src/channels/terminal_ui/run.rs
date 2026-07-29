@@ -1299,6 +1299,8 @@ pub(crate) struct RatatuiMainConfig {
     pub color_enabled: bool,
     /// Whether `chat_id` names a persisted chat that should be loaded.
     pub resume_session: bool,
+    /// File references composed into the first user message.
+    pub initial_files: Vec<PathBuf>,
 }
 
 /// Run until user quits. Restores terminal on exit.
@@ -1317,6 +1319,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         providers,
         color_enabled,
         resume_session,
+        initial_files,
     } = config;
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -1352,6 +1355,19 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
     app.cells.push(Cell::System {
         message: opening_banner,
     });
+    if !initial_files.is_empty() {
+        let refs = initial_files
+            .iter()
+            .map(|path| format!("@{}", path.display()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        app.input = format!("{refs} ");
+        app.cursor = app.input.len();
+        app.cells.push(Cell::System {
+            message: "Attached file references were added to the composer for the next message."
+                .into(),
+        });
+    }
     if resume_session {
         match load_thread_transcript_cells(&rt, &memory_node, &chat_id) {
             Ok(mut cells) => {

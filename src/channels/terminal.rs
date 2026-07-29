@@ -537,6 +537,8 @@ pub struct TerminalChannelConfig {
     pub color_enabled: bool,
     /// Load the configured chat's persisted transcript before accepting input.
     pub resume_session: bool,
+    /// File references composed into the first user message.
+    pub initial_files: Vec<PathBuf>,
 }
 
 /// Stdin/stdout terminal: always Ratatui (alternate screen). Requires an interactive TTY.
@@ -559,6 +561,7 @@ pub struct TerminalChannel {
     providers: std::collections::HashMap<String, crate::config::ProviderConfig>,
     color_enabled: bool,
     resume_session: bool,
+    initial_files: Vec<PathBuf>,
 }
 
 impl TerminalChannel {
@@ -575,6 +578,7 @@ impl TerminalChannel {
             providers: config.providers,
             color_enabled: config.color_enabled,
             resume_session: config.resume_session,
+            initial_files: config.initial_files,
         }
     }
 }
@@ -626,6 +630,7 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
         let memory_node_clone = self.memory_node.clone();
         let color_enabled = self.color_enabled;
         let resume_session = self.resume_session;
+        let initial_files = self.initial_files.clone();
 
         let opening_banner = format!(
             "ALTAI isanagent v{} — thread {}\n\
@@ -652,6 +657,7 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
                         providers: providers_clone,
                         color_enabled,
                         resume_session,
+                        initial_files,
                     },
                 );
                 if let Ok(mut g) = bridge.lock() {
