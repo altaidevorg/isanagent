@@ -1,63 +1,59 @@
+//! Public host entry point for embedding the full IsanAgent runtime.
+//!
+//! This module owns the same runtime construction that powers the isanagent
+//! binary. Embedders can now start that runtime without spawning a second
+//! process.
+
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch, RwLock};
 
-use clap::{Args as ClapArgs, Parser, Subcommand};
-use colored::Colorize;
-use isanagent::agent::{AgentLogic, AgentLogicParams};
-use isanagent::bus::{BusMessage, InboundMessage, LoggerControlMessage, TelemetryEvent};
-use isanagent::channels::terminal::{
+use crate::agent::{AgentLogic, AgentLogicParams};
+use crate::bus::{BusMessage, InboundMessage, LoggerControlMessage, TelemetryEvent};
+use crate::channels::terminal::{
     build_agent_thought_terminal_notice, build_tool_call_terminal_notice,
     build_tool_progress_terminal_notice, build_tool_result_terminal_notice,
     terminal_startup_suppresses_plain_banner, TerminalChannelConfig,
 };
-use isanagent::channels::{
+use crate::channels::{
     api::ApiChannel, email::EmailChannel, slack::SlackChannel, terminal::TerminalChannel, Channel,
 };
-use isanagent::clarification::ClarificationHub;
-use isanagent::execution::ExecutionJobManager;
-use isanagent::execution::InflightSyncRegistry;
-use isanagent::logging::{
+use crate::clarification::ClarificationHub;
+use crate::execution::{ExecutionJobManager, InflightSyncRegistry};
+use crate::logging::{
     create_logger_channel, create_logging_actor_or_fallback, init_runtime_logger,
     LOGGER_QUEUE_CAPACITY,
 };
-use isanagent::onboarding::{
-    build_interactive_config_toml, onboard_workspace, BootstrapReport, OnboardOptions,
-};
-use isanagent::onboarding_interactive;
-
-use isanagent::scheduler::{
+use crate::scheduler::{
     validate_multi_tenant_edge_runtime, CronActor, CronSchedulingMode, MultiTenantEdgeCronScheduler,
 };
-use isanagent::session::SessionManager;
-use isanagent::skills::SkillRegistry;
-use isanagent::tools::builtin::{
+use crate::session::SessionManager;
+use crate::skills::SkillRegistry;
+use crate::tools::builtin::{
     CronTool, EditFileTool, GetEnvTool, GitWorktreeTool, GlobFilesTool, ListDirTool, MessageTool,
     PythonRunTool, ReadFileTool, SearchTextTool, ShellExecTool, WebFetchTool, WebSearchTool,
     WriteFileTool,
 };
-use isanagent::tools::execution::{
+use crate::tools::execution::{
     ExecutionArtifactListTool, ExecutionCancelTool, ExecutionEnvInfoTool, ExecutionJobCancelTool,
     ExecutionJobListTool, ExecutionJobResultTool, ExecutionJobStatusTool,
     ExecutionRunBackgroundTool, ExecutionRunTool, ExecutionSessionCloseTool,
     ExecutionSessionCreateTool,
 };
-use isanagent::tools::ml_domain::{ArxivFetchTool, ArxivSearchTool, HfHubFileFetchTool};
-use isanagent::tools::workflow::{AskUserTool, TodoWriteTool, ToolSearchTool};
-use isanagent::tools::ToolRegistry;
-use isanagent::workspace::{resolve_workspace_root, IsanagentWorkspace};
-use isanagent::{NodeHandle, Supervisor, SupervisorPolicy};
+use crate::tools::ml_domain::{ArxivFetchTool, ArxivSearchTool, HfHubFileFetchTool};
+use crate::tools::workflow::{AskUserTool, TodoWriteTool, ToolSearchTool};
+use crate::tools::ToolRegistry;
+use crate::workspace::{resolve_workspace_root, IsanagentWorkspace};
+use crate::{NodeHandle, Supervisor, SupervisorPolicy};
+use colored::Colorize;
 
-// Fallback constants used only when `[provider]` is missing from `config.toml`. With auto-onboard
-// in place these are exercised mainly by tests / unusual configs; the URL is resolved through
-// `provider_registry::lookup` so the registry stays the single source of truth.
 const DEFAULT_PROVIDER_NAME: &str = "gemini";
 const DEFAULT_PROVIDER_MODEL_NAME: &str = "gemini-2.5-flash";
 const DEFAULT_PROVIDER_API_KEY_ENV: &str = "GEMINI_API_KEY";
 
-/// Appended to the workspace system prompt when the execution harness is enabled.
 const EXECUTION_HARNESS_SYSTEM_GUIDANCE: &str = r#"
 
 --- Execution harness ---
@@ -69,145 +65,27 @@ const EXECUTION_HARNESS_SYSTEM_GUIDANCE: &str = r#"
 - Prefer grep-friendly logging in training scripts (plain text lines) so stdout stays searchable in captured logs.
 - Know where outputs live: sandbox-relative paths, execution_artifact_list, run journals under workspace_dir/.system_generated/execution_history/, and execution_runs.jsonl.
 - For Jupyter/SSH: confirm interpreter and (if needed) GPU visibility with a tiny execution_run before a long job.
-- For **Google Colab**: use the **`colab-cli`** skill (invoke `colab` commands via `exec`) instead of `execution_run` with a built-in provider.
+- For Google Colab: use the colab-cli skill (invoke colab commands via exec) instead of execution_run with a built-in provider.
 "#;
 
-/// isanagent: A terminal chat interface and autonomous agent engine
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Commands>,
-
-    /// Optional explicit path to the workspace directory. Defaults to ~/.isanagent
-    #[arg(short, long)]
-    workspace: Option<String>,
-
-    /// Optional path to a config.toml file. Defaults to <workspace>/config.toml
-    #[arg(short, long)]
-    config: Option<String>,
+#[derive(Debug, Clone, Default)]
+pub struct HostConfig {
+    pub workspace: Option<PathBuf>,
+    pub config: Option<PathBuf>,
 }
 
-#[derive(Subcommand, Debug)]
-enum Commands {
-    /// Create workspace layout and starter files; optional flags override generated config.toml
-    Onboard(OnboardArgs),
-    /// Manage skills (add, list, etc.)
-    Skills(SkillsArgs),
-}
-
-#[derive(ClapArgs, Debug)]
-struct SkillsArgs {
-    #[command(subcommand)]
-    command: SkillCommands,
-}
-
-#[derive(Subcommand, Debug)]
-enum SkillCommands {
-    /// Add skills from a remote GitHub repository
-    Add {
-        /// Repository URL (e.g., https://github.com/vercel-labs/skills) or shorthand (owner/repo)
-        repo_url: String,
-        /// Optional specific skill name to install
-        #[arg(short, long)]
-        skill: Option<String>,
-    },
-    /// List all installed skills
-    List,
-}
-
-#[derive(ClapArgs, Debug)]
-struct OnboardArgs {
-    /// Optional explicit path to the workspace directory. Defaults to ~/.isanagent
-    #[arg(short, long)]
-    workspace: Option<String>,
-    /// Textual wizard (ratatui): provider → optional base URL → API key env var name → pick model from /models
-    #[arg(long)]
-    interactive: bool,
-    /// Override embedded defaults for `config.toml` (see `isanagent onboard --help`)
-    #[command(flatten)]
-    options: OnboardOptions,
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
-
-    match cli.command {
-        Some(Commands::Onboard(args)) => run_onboard(cli.workspace, args).await,
-        Some(Commands::Skills(args)) => run_skills(cli.workspace, args).await,
-        None => {
-            // First-run UX: when the user invokes `isanagent` with no `--workspace` and the
-            // default `~/.isanagent` directory does not yet exist, auto-launch the interactive
-            // onboard wizard before starting the agent. Subsequent runs see the directory and
-            // skip straight to `run_isanagent`.
-            if cli.workspace.is_none() {
-                let default_root = resolve_workspace_root(None);
-                if !default_root.exists() {
-                    auto_onboard_then_run(cli.config).await?;
-                    return Ok(());
-                }
-            }
-            start_embedded_host(cli.workspace, cli.config).await
-        }
-    }
-}
-
-/// Runs the interactive onboard against the default workspace path then transitions into
-/// `run_isanagent` in the same invocation. Cancelling the wizard (Ctrl+C / Esc) returns
-/// `Ok(())` without launching the agent so the user can retry on the next run.
-async fn auto_onboard_then_run(
-    config_arg: Option<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Welcome to isanagent. No workspace detected at the default location.");
-    println!("Launching the interactive onboard wizard...");
-    println!();
-
-    let onboard_result = run_onboard_inner(
-        None,
-        OnboardArgs {
-            workspace: None,
-            interactive: true,
-            options: OnboardOptions::default(),
-        },
-        /* chained = */ true,
-    )
-    .await;
-
-    match onboard_result {
-        Ok(()) => {
-            println!();
-            println!("Workspace ready. Launching isanagent...");
-            println!();
-            start_embedded_host(None, config_arg).await
-        }
-        Err(e) => {
-            // The interactive wizard signalled abort (Ctrl+C / Esc) or a concrete failure.
-            // Surface the message and exit cleanly so the shell prompt returns; the user can
-            // re-run when ready.
-            eprintln!("Onboard did not complete: {e}");
-            eprintln!("Run `isanagent onboard --interactive` to try again.");
-            Ok(())
-        }
-    }
-}
-
-async fn start_embedded_host(
-    workspace_arg: Option<String>,
-    config_arg: Option<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    isanagent::host::start_host(isanagent::host::HostConfig {
-        workspace: workspace_arg.map(std::path::PathBuf::from),
-        config: config_arg.map(std::path::PathBuf::from),
-    })
-    .await
-}
-
-#[allow(dead_code)]
-async fn run_isanagent_legacy(
-    workspace_arg: Option<String>,
-    config_arg: Option<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub type HostResult<T> = Result<T, Box<dyn std::error::Error>>;
+/// Start the complete IsanAgent runtime, including its terminal channel when
+/// enabled by the selected configuration.
+pub async fn start_host(config: HostConfig) -> HostResult<()> {
+    let workspace_arg = config
+        .workspace
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string());
+    let config_arg = config
+        .config
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string());
     let workspace_dir = resolve_workspace_root(workspace_arg.as_deref());
 
     let (logger_bus_tx, logger_bus_rx) = create_logger_channel(LOGGER_QUEUE_CAPACITY);
@@ -273,10 +151,10 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     let db_path_str = db_path
         .to_str()
         .ok_or_else(|| std::io::Error::other("workspace DB path is not valid UTF-8"))?;
-    let memory_actor = isanagent::memory::SqliteMemoryActor::new(db_path_str).map_err(|e| {
+    let memory_actor = crate::memory::SqliteMemoryActor::new(db_path_str).map_err(|e| {
         std::io::Error::other(format!("Failed to initialize SqliteMemoryActor: {}", e))
     })?;
-    let memory_node = NodeHandle::<isanagent::memory::MemoryMessage>::new(
+    let memory_node = NodeHandle::<crate::memory::MemoryMessage>::new(
         memory_actor,
         100,
         1,
@@ -311,7 +189,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             .unwrap_or(false);
         validate_multi_tenant_edge_runtime(api_enabled).map_err(std::io::Error::other)?;
 
-        let client = isanagent::multi_tenant_edge::CronRegistrationClient::from_env()
+        let client = crate::multi_tenant_edge::CronRegistrationClient::from_env()
             .map_err(std::io::Error::other)?;
         let scheduler = Arc::new(
             MultiTenantEdgeCronScheduler::new(db_path_str, client)
@@ -397,17 +275,16 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     if workspace.config.checkpoint_enabled() {
         // Backups live in the outer rim (never inside the agent's editable sandbox); restores are
         // confined to the sandbox when the file tools are workspace-restricted.
-        isanagent::checkpoint::init(
+        crate::checkpoint::init(
             workspace.dir.join(".system_generated").join("checkpoints"),
             restrict.then(|| workspace.sandbox_dir.clone()),
         );
-        tools.register(Box::new(isanagent::checkpoint::CheckpointTool));
+        tools.register(Box::new(crate::checkpoint::CheckpointTool));
     }
     let mut inflight_sync_outer: Option<Arc<InflightSyncRegistry>> = None;
-    let mut execution_harness_for_shutdown: Option<Arc<isanagent::execution::ExecutionHarness>> =
-        None;
+    let mut execution_harness_for_shutdown: Option<Arc<crate::execution::ExecutionHarness>> = None;
     if workspace.config.execution_harness_enabled() {
-        let harness = isanagent::execution::build_execution_harness(
+        let harness = crate::execution::build_execution_harness(
             workspace.dir.clone(),
             workspace.sandbox_dir.clone(),
             restrict,
@@ -443,12 +320,10 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             jobs: execution_jobs.clone(),
             max_tool_output_chars,
         }));
-        tools.register(Box::new(
-            isanagent::tools::execution::ExecutionReadLogTool {
-                jobs: execution_jobs.clone(),
-                harness: harness.clone(),
-            },
-        ));
+        tools.register(Box::new(crate::tools::execution::ExecutionReadLogTool {
+            jobs: execution_jobs.clone(),
+            harness: harness.clone(),
+        }));
         tools.register(Box::new(ExecutionJobListTool {
             jobs: execution_jobs.clone(),
         }));
@@ -505,19 +380,19 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     // PR-10: agent-triggered compaction. Tool posts a TriggerCompaction bus
     // message with `AgentSelf` reason; the agent processes it between turns
     // to respect the per-chat FIFO invariant (AGENTS.md).
-    tools.register(Box::new(isanagent::tools::compact::CompactContextTool {
+    tools.register(Box::new(crate::tools::compact::CompactContextTool {
         outbound_tx: global_outbound_tx.clone(),
     }));
     // PR-7: re-materialize tool results that were compacted out of the active
     // conversation. Reads the cache populated by `do_compaction`'s swap step.
-    tools.register(Box::new(isanagent::tools::recall::RecallToolResultTool {
+    tools.register(Box::new(crate::tools::recall::RecallToolResultTool {
         memory_node: memory_node.clone(),
         outbound_tx: global_outbound_tx.clone(),
     }));
-    tools.register(Box::new(isanagent::tools::builtin::SearchMemoryTool {
+    tools.register(Box::new(crate::tools::builtin::SearchMemoryTool {
         memory_node: memory_node.clone(),
     }));
-    tools.register(Box::new(isanagent::tools::builtin::FetchMemoryByDateTool {
+    tools.register(Box::new(crate::tools::builtin::FetchMemoryByDateTool {
         memory_node: memory_node.clone(),
     }));
 
@@ -525,14 +400,14 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         memory_node: memory_node.clone(),
     }));
     if workspace.config.kernel_porting_harness_enabled() {
-        isanagent::tools::kernel_porting::register_kernel_porting_tools(
+        crate::tools::kernel_porting::register_kernel_porting_tools(
             &mut tools,
             workspace.sandbox_dir.clone(),
             std::sync::Arc::new(workspace.config.clone()),
         );
     }
     if workspace.config.autotrainess_harness_enabled() {
-        isanagent::tools::autotrainess::register_autotrainess_tools(
+        crate::tools::autotrainess::register_autotrainess_tools(
             &mut tools,
             workspace.sandbox_dir.clone(),
             std::sync::Arc::new(workspace.config.clone()),
@@ -549,7 +424,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             .config
             .provider
             .clone()
-            .unwrap_or_else(|| isanagent::config::ProviderConfig {
+            .unwrap_or_else(|| crate::config::ProviderConfig {
                 provider_name: DEFAULT_PROVIDER_NAME.to_string(),
                 model_name: DEFAULT_PROVIDER_MODEL_NAME.to_string(),
                 models: None,
@@ -569,7 +444,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    let (provider_cfg, api_key): (Option<isanagent::config::ProviderConfig>, Option<String>) = {
+    let (provider_cfg, api_key): (Option<crate::config::ProviderConfig>, Option<String>) = {
         // 0. Try remembered last model choice
         let mut found_remembered = None;
         if let Some(ref key_name) = remembered_key {
@@ -587,7 +462,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             (Some(default_provider_cfg.clone()), Some(key))
         } else {
             // 2. Try any expanded [providers.*] entry
-            let mut found: Option<(isanagent::config::ProviderConfig, String)> = None;
+            let mut found: Option<(crate::config::ProviderConfig, String)> = None;
             for cfg in expanded_providers.values() {
                 if let Ok(key) = cfg.resolve_api_key() {
                     found = Some((cfg.clone(), key));
@@ -609,25 +484,23 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         .unwrap_or_else(|| "(no model)".to_string());
 
     let (provider, reflection_provider, fallback_providers): (
-        Box<dyn isanagent::traits::Provider>,
-        Box<dyn isanagent::traits::Provider>,
-        Vec<isanagent::agent::FallbackProviderSpec>,
+        Box<dyn crate::traits::Provider>,
+        Box<dyn crate::traits::Provider>,
+        Vec<crate::agent::FallbackProviderSpec>,
     ) = if let (Some(cfg), Some(key)) = (&provider_cfg, &api_key) {
         let base_url = cfg.resolved_base_url().map_err(std::io::Error::other)?;
-        let p1 =
-            isanagent::provider::create_provider(&cfg.provider_name, &base_url, key, &model_name);
-        let p2 =
-            isanagent::provider::create_provider(&cfg.provider_name, &base_url, key, &model_name);
+        let p1 = crate::provider::create_provider(&cfg.provider_name, &base_url, key, &model_name);
+        let p2 = crate::provider::create_provider(&cfg.provider_name, &base_url, key, &model_name);
 
         // Keep all configured providers as immutable candidates owned by this AgentLogic. Each run
         // filters its own primary by full (provider, base_url, model) identity while snapshotting,
         // so concurrent runs and `/model` switches cannot rewrite one another's fallback policy.
-        let candidates: Vec<isanagent::agent::FallbackProviderSpec> = expanded_providers
+        let candidates: Vec<crate::agent::FallbackProviderSpec> = expanded_providers
             .values()
             .filter_map(|fb_cfg| {
                 let fb_key = fb_cfg.resolve_api_key().ok()?;
                 let fb_base = fb_cfg.resolved_base_url().ok()?;
-                Some(isanagent::agent::FallbackProviderSpec {
+                Some(crate::agent::FallbackProviderSpec {
                     provider_name: fb_cfg.provider_name.clone(),
                     base_url: fb_base,
                     api_key: fb_key,
@@ -635,7 +508,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                 })
             })
             .collect();
-        let initial_fallbacks = isanagent::agent::build_fallback_specs(
+        let initial_fallbacks = crate::agent::build_fallback_specs(
             &cfg.provider_name,
             &base_url,
             &model_name,
@@ -665,26 +538,26 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         eprintln!("Or run `isanagent onboard` to create a config.toml, then replace \"<changethis>\" with your key.");
         eprintln!("Use /model at runtime to configure one.");
         (
-            Box::new(isanagent::provider::NoKeyProvider),
-            Box::new(isanagent::provider::NoKeyProvider),
+            Box::new(crate::provider::NoKeyProvider),
+            Box::new(crate::provider::NoKeyProvider),
             Vec::new(),
         )
     };
 
     let provider_credentials = if let (Some(cfg), Some(key)) = (&provider_cfg, &api_key) {
-        isanagent::provider::ProviderCredentials {
+        crate::provider::ProviderCredentials {
             provider_name: cfg.provider_name.clone(),
             base_url: cfg.resolved_base_url().unwrap_or_default(),
             api_key: key.clone(),
             model_name: model_name.clone(),
         }
     } else {
-        isanagent::provider::ProviderCredentials::empty()
+        crate::provider::ProviderCredentials::empty()
     };
 
     // 5.5 Setup Reflection Engine
     let memory_config = workspace.config.memory.clone().unwrap_or_default();
-    let reflection_engine = isanagent::reflection::ReflectionEngine::new(
+    let reflection_engine = crate::reflection::ReflectionEngine::new(
         memory_node.clone(),
         workspace.sandbox_dir.clone(),
         reflection_provider,
@@ -698,7 +571,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     let mut system_prompt = workspace.compile_system_prompt();
     if workspace.config.ml_engineer_harness_enabled() {
         system_prompt.push_str("\n\n");
-        system_prompt.push_str(isanagent::ml_engineer::HARNESS_OVERLAY);
+        system_prompt.push_str(crate::ml_engineer::HARNESS_OVERLAY);
     }
     if workspace.config.execution_harness_enabled() {
         system_prompt.push_str(EXECUTION_HARNESS_SYSTEM_GUIDANCE);
@@ -707,7 +580,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         format!(
             "{}\n{}",
             system_prompt,
-            isanagent::ml_engineer::SUBAGENT_RESEARCH_APPEND
+            crate::ml_engineer::SUBAGENT_RESEARCH_APPEND
         )
     } else {
         system_prompt.clone()
@@ -716,13 +589,13 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     let harness_runtime_summary = workspace.config.runtime_harness_summary_lines().join("\n");
     let forbid_final_without_tools = workspace.config.ml_engineer_forbid_final_without_tools();
     let shell_policy = workspace.config.resolved_shell_policy();
-    let default_harness = isanagent::config::HarnessConfig::default();
+    let default_harness = crate::config::HarnessConfig::default();
     let harness_ref = workspace
         .config
         .harness
         .as_ref()
         .unwrap_or(&default_harness);
-    let hook_tool_ctx = isanagent::hooks::ToolCallHookContext::from_harness_config(
+    let hook_tool_ctx = crate::hooks::ToolCallHookContext::from_harness_config(
         &workspace.dir,
         &workspace.sandbox_dir,
         harness_ref,
@@ -761,11 +634,10 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         .activity_heartbeat_enabled
         .unwrap_or(false)
     {
-        match isanagent::multi_tenant_edge::ActivityHeartbeatClient::from_env(logger_bus_tx.clone())
-        {
+        match crate::multi_tenant_edge::ActivityHeartbeatClient::from_env(logger_bus_tx.clone()) {
             Ok(client) => Some(std::sync::Arc::new(client)),
             Err(error) => {
-                let _ = logger_bus_tx.send(BusMessage::Log(isanagent::bus::LogEvent::warn(
+                let _ = logger_bus_tx.send(BusMessage::Log(crate::bus::LogEvent::warn(
                     "isanagent",
                     &error,
                 )));
@@ -779,11 +651,11 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     // Load agent definitions from config; use built-in defaults when none configured.
     let agent_defs = workspace.config.agent_definitions();
     let agent_defs = if agent_defs.is_empty() {
-        isanagent::agent::registry::default_agent_definitions()
+        crate::agent::registry::default_agent_definitions()
     } else {
         agent_defs
     };
-    let agent_registry = std::sync::Arc::new(isanagent::agent::AgentRegistry::from_definitions(
+    let agent_registry = std::sync::Arc::new(crate::agent::AgentRegistry::from_definitions(
         &agent_defs,
         &workspace.sandbox_dir,
     ));
@@ -795,7 +667,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     }
 
     let subagent = if workspace.config.subagent_harness_enabled() {
-        Some(isanagent::agent::SubagentHarnessParams {
+        Some(crate::agent::SubagentHarnessParams {
             cancel_children_on_parent_cancel: workspace
                 .config
                 .subagent_cancel_children_on_parent_cancel(),
@@ -1027,7 +899,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     let agent_outbound_tx = global_outbound_tx.clone();
     tokio::spawn(async move {
         while let Some(bus_msg) = agent_rx.recv().await {
-            if let isanagent::Message::Packet(packet) = bus_msg {
+            if let crate::Message::Packet(packet) = bus_msg {
                 match packet {
                     BusMessage::Outbound(out) => {
                         let _ = agent_outbound_tx.send(BusMessage::Outbound(out)).await;
@@ -1152,7 +1024,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                     tool_call_id,
                     background_job_id,
                 }) if channel == "terminal" => {
-                    if isanagent::channels::terminal::should_suppress_tool_notice_for_terminal(
+                    if crate::channels::terminal::should_suppress_tool_notice_for_terminal(
                         tool_name, args,
                     ) {
                         // MessageTool already emits its own user-visible Outbound to the
@@ -1184,7 +1056,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                     tool_call_id,
                     background_job_id,
                 }) if channel == "terminal" => {
-                    if isanagent::channels::terminal::should_suppress_tool_notice_for_terminal(
+                    if crate::channels::terminal::should_suppress_tool_notice_for_terminal(
                         tool_name, result,
                     ) {
                         // See ToolCall arm: avoid duplicating the user-visible MessageTool
@@ -1257,7 +1129,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     let _ = logger_bus_tx.send(BusMessage::LoggerControl(LoggerControlMessage::Flush));
     let flush_result = tokio::time::timeout(Duration::from_secs(5), async {
         while let Some(msg) = logger_control_rx.recv().await {
-            if let isanagent::Message::Packet(BusMessage::LoggerControl(
+            if let crate::Message::Packet(BusMessage::LoggerControl(
                 LoggerControlMessage::Flushed,
             )) = msg
             {
@@ -1299,7 +1171,7 @@ provider's environment, or set default_provider=\"local\" and local_python_runti
         return;
     }
     let uv_bin = workspace.config.execution_uv_binary();
-    if !isanagent::execution::uv_binary_available(&uv_bin) {
+    if !crate::execution::uv_binary_available(&uv_bin) {
         let interactive = workspace.config.terminal_enabled()
             && io::stdin().is_terminal()
             && io::stdout().is_terminal();
@@ -1329,7 +1201,7 @@ Install uv manually or run /install-python from terminal mode.",
                 }
                 let ans = line.trim().to_ascii_lowercase();
                 if matches!(ans.as_str(), "yes" | "y") {
-                    match isanagent::execution::install_uv_best_effort() {
+                    match crate::execution::install_uv_best_effort() {
                         Ok(msg) => println!("{msg}"),
                         Err(err) => println!("Auto-install failed: {err}"),
                     }
@@ -1359,11 +1231,11 @@ Install uv manually or run /install-python from terminal mode.",
 }
 
 async fn recover_background_jobs_on_startup(
-    memory_node: &NodeHandle<isanagent::memory::MemoryMessage>,
+    memory_node: &NodeHandle<crate::memory::MemoryMessage>,
     bus_tx: &mpsc::Sender<BusMessage>,
     _outbound_tx: &mpsc::Sender<BusMessage>,
 ) {
-    use isanagent::memory::{MemoryMessage, SharedReply};
+    use crate::memory::{MemoryMessage, SharedReply};
     let (tx, rx) = tokio::sync::oneshot::channel();
     if memory_node
         .send_packet(MemoryMessage::ListBackgroundJobs {
@@ -1395,11 +1267,11 @@ async fn recover_background_jobs_on_startup(
         }
         let mut metadata = std::collections::HashMap::new();
         metadata.insert(
-            isanagent::bus::METADATA_SYNTHETIC_BACKGROUND_RESUME.to_string(),
+            crate::bus::METADATA_SYNTHETIC_BACKGROUND_RESUME.to_string(),
             serde_json::Value::Bool(true),
         );
         metadata.insert(
-            isanagent::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
+            crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
             serde_json::Value::String(row.job_id.clone()),
         );
         if let Err(e) = bus_tx
@@ -1439,7 +1311,7 @@ async fn maybe_prompt_uv_requirements_install(
     uv_bin: &str,
     requirements: &[String],
 ) {
-    let local_cfg = isanagent::execution::LocalExecutionConfig {
+    let local_cfg = crate::execution::LocalExecutionConfig {
         sandbox_dir: workspace.sandbox_dir.clone(),
         workspace_dir: workspace.dir.clone(),
         restrict_to_workspace: true,
@@ -1448,7 +1320,7 @@ async fn maybe_prompt_uv_requirements_install(
         max_sessions: workspace.config.execution_max_sessions(),
         python_executable: workspace.config.execution_python_executable(),
         python_repl: workspace.config.execution_local_python_repl_enabled(),
-        python_runtime: isanagent::execution::LocalPythonRuntime::UvManaged,
+        python_runtime: crate::execution::LocalPythonRuntime::UvManaged,
         uv_binary: uv_bin.to_string(),
         uv_python: workspace.config.execution_uv_python(),
         uv_requirements: requirements.to_vec(),
@@ -1458,7 +1330,7 @@ async fn maybe_prompt_uv_requirements_install(
             .join("uv")
             .join("envs"),
     };
-    let Some(env_python) = isanagent::execution::uv_managed_env_python(&local_cfg) else {
+    let Some(env_python) = crate::execution::uv_managed_env_python(&local_cfg) else {
         return;
     };
     if !env_python.exists() {
@@ -1469,7 +1341,7 @@ async fn maybe_prompt_uv_requirements_install(
     let env_python_owned = env_python.clone();
     let requirements_owned = requirements.to_vec();
     let status = tokio::task::spawn_blocking(move || {
-        isanagent::execution::uv_requirements_status(
+        crate::execution::uv_requirements_status(
             &uv_bin_owned,
             &env_python_owned,
             &requirements_owned,
@@ -1573,213 +1445,14 @@ venv is touched."
     }
 }
 
-async fn run_skills(
-    workspace_arg: Option<String>,
-    args: SkillsArgs,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let workspace = IsanagentWorkspace::new(workspace_arg.as_deref(), None)?;
-    let mut skills = SkillRegistry::new(workspace.skills_path());
-
-    match args.command {
-        SkillCommands::Add { repo_url, skill } => {
-            if let Some(ref name) = skill {
-                println!("Adding skill '{}' from {}...", name, repo_url);
-            } else {
-                println!("Adding all skills from {}...", repo_url);
-            }
-            match skills
-                .install_skills_from_repo(&repo_url, skill.as_deref())
-                .await
-            {
-                Ok(installed) => {
-                    if installed.is_empty() {
-                        println!("No skills found in the repository.");
-                    } else {
-                        println!("Successfully installed {} skills:", installed.len());
-                        for name in installed {
-                            println!("  - {}", name);
-                        }
-                    }
-                }
-                Err(e) => {
-                    return Err(format!("Error installing skills: {}", e).into());
-                }
-            }
-        }
-        SkillCommands::List => {
-            println!("{}", skills.format_skill_directory());
-        }
-    }
-
-    Ok(())
-}
-
-async fn run_onboard(
-    global_workspace: Option<String>,
-    args: OnboardArgs,
-) -> Result<(), Box<dyn std::error::Error>> {
-    run_onboard_inner(global_workspace, args, /* chained = */ false).await
-}
-
-/// Underlying onboard implementation. When `chained` is true the final "Run: isanagent" tip is
-/// suppressed because the caller is about to launch the agent in the same process.
-async fn run_onboard_inner(
-    global_workspace: Option<String>,
-    args: OnboardArgs,
-    chained: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let workspace_arg = args.workspace.or(global_workspace);
-
-    if args.interactive && args.options.has_overrides() {
-        return Err(std::io::Error::other(
-            "Cannot combine --interactive with other config override flags; run `onboard --interactive` alone.",
-        )
-        .into());
-    }
-
-    let interactive_outcome = if args.interactive {
-        let handle = tokio::runtime::Handle::current();
-        Some(
-            tokio::task::spawn_blocking(move || {
-                onboarding_interactive::run_interactive_collect(&handle)
-            })
-            .await?
-            .map_err(std::io::Error::other)?,
-        )
-    } else {
-        None
-    };
-
-    let options = interactive_outcome
-        .as_ref()
-        .map(|o| o.options.clone())
-        .unwrap_or_else(|| args.options);
-
-    let config_overrides_used = options.has_overrides();
-
-    let interactive_merged_toml = if interactive_outcome.is_some() {
-        Some(build_interactive_config_toml(&options).map_err(std::io::Error::other)?)
-    } else {
-        None
-    };
-
-    let options_for_workspace = options.clone();
-    let report = tokio::task::spawn_blocking(move || {
-        let workspace_root = resolve_workspace_root(workspace_arg.as_deref());
-        onboard_workspace(
-            &workspace_root,
-            &options_for_workspace,
-            interactive_merged_toml.as_deref(),
-        )
-    })
-    .await?
-    .map_err(std::io::Error::other)?;
-
-    let env_name = interactive_outcome
-        .as_ref()
-        .and_then(|c| c.options.provider_api_key_env.clone());
-    print_onboarding_report(&report, config_overrides_used, env_name.as_deref(), chained);
-    Ok(())
-}
-
-fn print_onboarding_report(
-    report: &BootstrapReport,
-    config_overrides_used: bool,
-    api_key_env: Option<&str>,
-    chained: bool,
-) {
-    println!("Workspace onboarded at {}", report.root.display());
-    println!();
-
-    if !report.created.is_empty() {
-        println!("Created:");
-        for path in &report.created {
-            println!("- {}", path.display());
-        }
-        println!();
-    }
-
-    if !report.skipped.is_empty() {
-        println!("Skipped:");
-        for path in &report.skipped {
-            println!("- {}", path.display());
-        }
-        println!();
-    }
-
-    if config_overrides_used {
-        println!(
-            "Note: config.toml was generated from merged settings (template comments were omitted)."
-        );
-        println!();
-    }
-
-    println!("Next steps:");
-    match api_key_env {
-        Some(env) => {
-            println!(
-                "1. Ensure {} is set in your environment (see config.toml provider.api_key_env)",
-                env
-            );
-        }
-        None => {
-            println!("1. Set GEMINI_API_KEY (or the env named in provider.api_key_env)");
-        }
-    }
-    println!("2. Update <changethis> placeholders or disable unused channels in config.toml");
-    if !chained {
-        // When the agent is about to launch in the same invocation, suppress the redundant
-        // "Run:" line so the user sees one transition message instead of two competing tips.
-        println!("3. Run: {}", format_next_steps_run_line(&report.root));
-    }
-}
-
-/// Build the `Run:` line for the onboarding banner. When `report_root` resolves to the same path
-/// as the default (`~/.isanagent`), the `--workspace` flag is redundant and is omitted so the
-/// user sees the cleanest invocation that will work.
-fn format_next_steps_run_line(report_root: &std::path::Path) -> String {
-    let default_root = isanagent::workspace::resolve_workspace_root(None);
-    let same = paths_equivalent(report_root, &default_root);
-    if same {
-        "isanagent".to_string()
-    } else {
-        format!("isanagent --workspace {}", report_root.display())
-    }
-}
-
-/// Compare two paths after best-effort canonicalization. Falls back to direct equality when
-/// canonicalize fails (e.g. one of the paths is on a not-yet-existing filesystem branch).
-fn paths_equivalent(a: &std::path::Path, b: &std::path::Path) -> bool {
-    let canon_a = std::fs::canonicalize(a).ok();
-    let canon_b = std::fs::canonicalize(b).ok();
-    match (canon_a, canon_b) {
-        (Some(a), Some(b)) => a == b,
-        _ => a == b,
-    }
-}
-
 #[cfg(test)]
-mod next_steps_tests {
+mod tests {
     use super::*;
 
     #[test]
-    fn omits_workspace_flag_when_root_is_default() {
-        let default_root = isanagent::workspace::resolve_workspace_root(None);
-        let line = format_next_steps_run_line(&default_root);
-        assert_eq!(line, "isanagent", "got {line}");
-    }
-
-    #[test]
-    fn includes_workspace_flag_for_custom_root() {
-        let custom = std::env::temp_dir().join("isanagent-next-steps-test-custom");
-        let line = format_next_steps_run_line(&custom);
-        assert!(
-            line.starts_with("isanagent --workspace "),
-            "expected --workspace prefix, got {line}"
-        );
-        assert!(
-            line.contains(custom.to_string_lossy().as_ref()),
-            "got {line}"
-        );
+    fn host_config_defaults_to_the_existing_workspace_resolution() {
+        let config = HostConfig::default();
+        assert!(config.workspace.is_none());
+        assert!(config.config.is_none());
     }
 }
