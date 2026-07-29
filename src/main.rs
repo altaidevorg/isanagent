@@ -881,7 +881,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                 all_providers
             },
             color_enabled: !matches!(std::env::var_os("NO_COLOR"), Some(value) if !value.is_empty()),
-            theme: isanagent::channels::terminal_ui::HostThemeMode::Auto,
+            theme: isanagent::host::HostThemeMode::Auto,
             resume_session: false,
             initial_files: Vec::new(),
             mode: TerminalMode::Tui,
