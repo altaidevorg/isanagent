@@ -201,6 +201,7 @@ async fn start_embedded_host(
         config: config_arg.map(std::path::PathBuf::from),
         sandbox: None,
         model: None,
+        fallback_model: None,
         permission: None,
         no_color: false,
         resume: None,

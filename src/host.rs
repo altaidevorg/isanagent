@@ -80,6 +80,8 @@ pub struct HostConfig {
     pub sandbox: Option<PathBuf>,
     /// Optional `provider/model` or model-only override selected by the host.
     pub model: Option<String>,
+    /// Optional provider/model used after the primary provider is exhausted.
+    pub fallback_model: Option<String>,
     /// Optional interactive shell and file-edit policy override selected by
     /// the host application.
     pub permission: Option<HostPermissionMode>,
@@ -1289,6 +1291,28 @@ fn apply_host_overrides(config: &mut AppConfig, host: &HostConfig) -> Result<(),
         }
     }
 
+    if let Some(model) = host.fallback_model.as_deref() {
+        let model = model.trim();
+        if model.is_empty() {
+            return Err("fallback model override cannot be empty".to_string());
+        }
+        let mut fallback = config.provider.clone().unwrap_or_default();
+        if let Some((provider_name, model_name)) = model.split_once('/') {
+            if provider_name.is_empty() || model_name.is_empty() {
+                return Err(format!("invalid fallback provider/model override: {model}"));
+            }
+            fallback.provider_name = provider_name.to_string();
+            fallback.model_name = model_name.to_string();
+            fallback.api_key_env.clear();
+        } else {
+            fallback.model_name = model.to_string();
+        }
+        config
+            .providers
+            .get_or_insert_with(Default::default)
+            .insert("__altai_cli_fallback".to_string(), fallback);
+    }
+
     if let Some(permission) = host.permission {
         let shell_policy = config
             .harness
@@ -1627,6 +1651,7 @@ mod tests {
         assert!(config.config.is_none());
         assert!(config.sandbox.is_none());
         assert!(config.model.is_none());
+        assert!(config.fallback_model.is_none());
         assert!(config.permission.is_none());
         assert!(!config.no_color);
         assert!(config.resume.is_none());
@@ -1677,6 +1702,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn host_fallback_override_registers_a_failover_provider() {
+        let mut config = AppConfig::default();
+        apply_host_overrides(
+            &mut config,
+            &HostConfig {
+                fallback_model: Some("openai/gpt-test".to_string()),
+                ..HostConfig::default()
+            },
+        )
+        .expect("valid fallback override");
+        let fallback = config
+            .providers
+            .and_then(|providers| providers.get("__altai_cli_fallback").cloned())
+            .expect("fallback provider");
+        assert_eq!(fallback.provider_name, "openai");
+        assert_eq!(fallback.model_name, "gpt-test");
+    }
+
     #[tokio::test]
     async fn spawned_host_accepts_an_external_graceful_shutdown() {
         let temp = tempfile::tempdir().expect("temporary workspace");
@@ -1692,6 +1736,7 @@ mod tests {
             config: Some(config_path),
             sandbox: None,
             model: None,
+            fallback_model: None,
             permission: None,
             no_color: false,
             resume: None,
