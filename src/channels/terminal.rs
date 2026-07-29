@@ -533,6 +533,8 @@ pub struct TerminalChannelConfig {
     pub status_model: String,
     pub memory_node: NodeHandle<MemoryMessage>,
     pub providers: std::collections::HashMap<String, crate::config::ProviderConfig>,
+    /// Whether the TUI should render ANSI foreground colors.
+    pub color_enabled: bool,
 }
 
 /// Stdin/stdout terminal: always Ratatui (alternate screen). Requires an interactive TTY.
@@ -553,6 +555,7 @@ pub struct TerminalChannel {
     outbound_ui_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<OutboundMessage>>>>,
     /// Named alternative providers for `/model` switching.
     providers: std::collections::HashMap<String, crate::config::ProviderConfig>,
+    color_enabled: bool,
 }
 
 impl TerminalChannel {
@@ -567,6 +570,7 @@ impl TerminalChannel {
             memory_node: config.memory_node,
             outbound_ui_tx: Arc::new(Mutex::new(None)),
             providers: config.providers,
+            color_enabled: config.color_enabled,
         }
     }
 }
@@ -616,6 +620,7 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
         let sandbox_clone = sandbox_dir.clone();
         let log_clone = logger_tx.clone();
         let memory_node_clone = self.memory_node.clone();
+        let color_enabled = self.color_enabled;
 
         let opening_banner = format!(
             "ALTAI isanagent v{} — thread {}\n\
@@ -640,6 +645,7 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
                         status_model,
                         memory_node: memory_node_clone,
                         providers: providers_clone,
+                        color_enabled,
                     },
                 );
                 if let Ok(mut g) = bridge.lock() {

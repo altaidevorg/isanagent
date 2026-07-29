@@ -83,6 +83,8 @@ pub struct HostConfig {
     /// Optional interactive shell and file-edit policy override selected by
     /// the host application.
     pub permission: Option<HostPermissionMode>,
+    /// Disable ANSI foreground colors while retaining terminal structure.
+    pub no_color: bool,
 }
 
 /// Interactive permission modes exposed to embedding hosts.
@@ -854,6 +856,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                 }
                 all_providers
             },
+            color_enabled: !config.no_color,
         }));
         terminal.start(bus_tx.clone()).await?;
         out_channels.insert(terminal.name().to_string(), terminal);
@@ -1617,6 +1620,7 @@ mod tests {
         assert!(config.sandbox.is_none());
         assert!(config.model.is_none());
         assert!(config.permission.is_none());
+        assert!(!config.no_color);
     }
 
     #[test]
@@ -1680,6 +1684,7 @@ mod tests {
             sandbox: None,
             model: None,
             permission: None,
+            no_color: false,
         });
         assert_eq!(host.next_event().await, Some(HostEvent::Starting));
         assert!(host.shutdown());

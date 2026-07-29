@@ -42,7 +42,7 @@ use crate::channels::terminal_ui::protocol::{
 };
 use crate::channels::terminal_ui::text_format::truncate_chars_display;
 use crate::channels::terminal_ui::{
-    execution_browser, init_from_env, uses_ansi_color, AgentTaskStatus, App, Cell, JobStripStatus,
+    execution_browser, init, uses_ansi_color, AgentTaskStatus, App, Cell, JobStripStatus,
     ModelSelector, TerminalUiFocus, Theme, ToastKind, ToolNoticePhase, ToolRailEntry,
     TranscriptSelection,
 };
@@ -1295,6 +1295,8 @@ pub(crate) struct RatatuiMainConfig {
     pub memory_node: NodeHandle<MemoryMessage>,
     /// Named alternative providers for `/model` switching.
     pub providers: std::collections::HashMap<String, crate::config::ProviderConfig>,
+    /// Whether the host permits ANSI foreground colors for this session.
+    pub color_enabled: bool,
 }
 
 /// Run until user quits. Restores terminal on exit.
@@ -1311,6 +1313,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         status_model,
         memory_node,
         providers,
+        color_enabled,
     } = config;
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -1318,7 +1321,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         .build()
         .map_err(io::Error::other)?;
 
-    init_from_env();
+    init(color_enabled);
 
     let mut stdout = stdout();
     enable_raw_mode()?;
