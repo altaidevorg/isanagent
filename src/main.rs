@@ -199,14 +199,7 @@ async fn start_embedded_host(
     isanagent::host::start_host(isanagent::host::HostConfig {
         workspace: workspace_arg.map(std::path::PathBuf::from),
         config: config_arg.map(std::path::PathBuf::from),
-        sandbox: None,
-        model: None,
-        fallback_model: None,
-        permission: None,
-        no_color: false,
-        resume: None,
-        files: Vec::new(),
-        line_mode: false,
+        ..Default::default()
     })
     .await
     .map_err(std::io::Error::other)?;
@@ -876,6 +869,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             workspace_dir: workspace.dir.clone(),
             sandbox_dir: workspace.sandbox_dir.clone(),
             status_model: model_name.clone(),
+            status_permission: "default".into(),
             memory_node: memory_node.clone(),
             providers: {
                 // Merge default [provider] + expanded [providers.*] into one map for /model selector
@@ -887,6 +881,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                 all_providers
             },
             color_enabled: !matches!(std::env::var_os("NO_COLOR"), Some(value) if !value.is_empty()),
+            theme: isanagent::channels::terminal_ui::HostThemeMode::Auto,
             resume_session: false,
             initial_files: Vec::new(),
             mode: TerminalMode::Tui,
