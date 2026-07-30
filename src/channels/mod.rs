@@ -24,6 +24,7 @@ pub trait Channel: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
+pub mod acp;
 pub mod api;
 pub(crate) mod api_store;
 pub mod email;

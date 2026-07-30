@@ -1201,8 +1201,7 @@ mod tests {
         // we can't recall it, so we don't compact it.
         assert!(
             stale.iter().all(|t| !t.1.is_empty()),
-            "no orphans expected; got {:?}",
-            stale
+            "no orphans expected; got {stale:?}"
         );
     }
 

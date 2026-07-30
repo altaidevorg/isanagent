@@ -285,8 +285,7 @@ impl Channel for OneshotChannel {
             == Some(true)
             || msg
                 .metadata
-                .get(crate::bus::METADATA_CLARIFICATION_TICKET_ID)
-                .is_some()
+                .contains_key(crate::bus::METADATA_CLARIFICATION_TICKET_ID)
         {
             let detail = if let Some(edit) = msg.metadata.get("edit_diff") {
                 let file = edit
@@ -324,7 +323,7 @@ impl Channel for OneshotChannel {
                 }
             }
 
-            if msg.metadata.get("edit_diff").is_some() {
+            if msg.metadata.contains_key("edit_diff") {
                 self.complete(OneshotOutcome::ApprovalRequired { detail });
             } else {
                 self.complete(OneshotOutcome::ClarificationRequired { detail });

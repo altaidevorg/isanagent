@@ -845,8 +845,7 @@ mod tests {
             .unwrap();
         assert!(
             out.contains("search_memory"),
-            "expected search_memory in:\n{}",
-            out
+            "expected search_memory in:\n{out}"
         );
         assert!(out.contains("score"));
 

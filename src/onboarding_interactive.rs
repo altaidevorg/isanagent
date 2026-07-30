@@ -342,8 +342,8 @@ pub fn run_interactive_collect(handle: &Handle) -> Result<InteractiveOnboardOutc
 }
 
 fn run_ui_loop(handle: &Handle) -> Result<InteractiveOnboardOutcome, String> {
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))
-        .map_err(|e| format!("terminal: {e}"))?;
+    let mut terminal =
+        Terminal::new(CrosstermBackend::new(io::stdout())).map_err(|e| format!("terminal: {e}"))?;
 
     let client = crate::utils::build_reqwest_client();
     let mut state = UiState::new();
@@ -389,9 +389,7 @@ fn run_ui_loop(handle: &Handle) -> Result<InteractiveOnboardOutcome, String> {
                     }
                     Err(mpsc::TryRecvError::Empty) => {}
                 }
-                if event::poll(Duration::from_millis(50))
-                    .map_err(|e| format!("event poll: {e}"))?
-                {
+                if event::poll(Duration::from_millis(50)).map_err(|e| format!("event poll: {e}"))? {
                     let evt = event::read().map_err(|e| format!("event: {e}"))?;
                     if let Event::Key(key) = evt {
                         if key.kind == KeyEventKind::Release {

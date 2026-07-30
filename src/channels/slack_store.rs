@@ -36,21 +36,13 @@ impl SqliteSlackUserProfileStoreActor {
         let conn = Connection::open(db_path)
             .map_err(|e| format!("Failed to open Slack user profile store: {e}"))?;
         conn.busy_timeout(Duration::from_secs(5)).map_err(|e| {
-            format!(
-                "Failed to configure Slack user profile store busy timeout: {e}"
-            )
+            format!("Failed to configure Slack user profile store busy timeout: {e}")
         })?;
         conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| {
-                format!(
-                    "Failed to enable WAL mode for Slack user profile store: {e}"
-                )
-            })?;
+            .map_err(|e| format!("Failed to enable WAL mode for Slack user profile store: {e}"))?;
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(|e| {
-                format!(
-                    "Failed to tune Slack user profile store synchronous mode: {e}"
-                )
+                format!("Failed to tune Slack user profile store synchronous mode: {e}")
             })?;
         conn.execute(
             "CREATE TABLE IF NOT EXISTS slack_user_profiles (
@@ -66,11 +58,7 @@ impl SqliteSlackUserProfileStoreActor {
              ON slack_user_profiles(fetched_at_unix_secs)",
             [],
         )
-        .map_err(|e| {
-            format!(
-                "Failed to initialize slack_user_profiles fetched_at index: {e}"
-            )
-        })?;
+        .map_err(|e| format!("Failed to initialize slack_user_profiles fetched_at index: {e}"))?;
 
         Ok(Self { conn })
     }

@@ -1113,9 +1113,9 @@ async fn finalize_arbitrary_job(p: FinalizeArbitraryParams) {
                 .filter(|s| !s.is_empty())
             {
                 Some(d) => format!("{d} - completed (exit {exit_s}, {duration_ms} ms)"),
-                None => format!(
-                    "{tool_name} job {job_id} completed (exit {exit_s}, {duration_ms} ms)"
-                ),
+                None => {
+                    format!("{tool_name} job {job_id} completed (exit {exit_s}, {duration_ms} ms)")
+                }
             };
             let notice = build_execution_job_notice(
                 &chat_id,

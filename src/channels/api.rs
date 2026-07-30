@@ -602,9 +602,7 @@ impl Channel for ApiChannel {
                 }
             }
         } else {
-            error!(
-                "ApiChannel: No pending request found for chat_id: {chat_id}"
-            );
+            error!("ApiChannel: No pending request found for chat_id: {chat_id}");
         }
         Ok(())
     }
@@ -1019,18 +1017,20 @@ async fn handle_responses(
 
     let stream_requested = payload.stream.unwrap_or(false);
 
-    let (conv_thread_id, sender_id, model, previous_response_id) =
-        match payload.previous_response_id.as_deref() {
-            Some(previous_response_id) => {
-                let stored = if let Some(stored) = state.responses_cache.get(previous_response_id) {
-                    stored
-                } else {
-                    match state.response_store.get(previous_response_id).await {
-                        Ok(Some(stored)) => {
-                            state
-                                .responses_cache
-                                .insert(previous_response_id.to_string(), stored.clone());
-                            log_api(
+    let (conv_thread_id, sender_id, model, previous_response_id) = match payload
+        .previous_response_id
+        .as_deref()
+    {
+        Some(previous_response_id) => {
+            let stored = if let Some(stored) = state.responses_cache.get(previous_response_id) {
+                stored
+            } else {
+                match state.response_store.get(previous_response_id).await {
+                    Ok(Some(stored)) => {
+                        state
+                            .responses_cache
+                            .insert(previous_response_id.to_string(), stored.clone());
+                        log_api(
                                 &state.logger_tx,
                                 LogEvent::debug(
                                     "ApiChannel",
@@ -1039,10 +1039,10 @@ async fn handle_responses(
                                     ),
                                 ),
                             );
-                            stored
-                        }
-                        Ok(None) => {
-                            log_api(
+                        stored
+                    }
+                    Ok(None) => {
+                        log_api(
                                 &state.logger_tx,
                                 LogEvent::warn(
                                     "ApiChannel",
@@ -1051,75 +1051,75 @@ async fn handle_responses(
                                 ),
                                 ),
                             );
-                            return ApiError::new(
-                                StatusCode::NOT_FOUND,
-                                "previous_response_not_found",
-                                format!("Unknown previous_response_id: {previous_response_id}"),
-                            )
-                            .into_response();
-                        }
-                        Err(e) => {
-                            log_api(
-                                &state.logger_tx,
-                                LogEvent::error(
-                                    "ApiChannel",
-                                    &format!(
-                                        "Failed to load response state for {previous_response_id}: {e}"
-                                    ),
-                                ),
-                            );
-                            return ApiError::new(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "response_store_unavailable",
-                                "Failed to load response state.",
-                            )
-                            .into_response();
-                        }
-                    }
-                };
-
-                (
-                    stored.thread_id,
-                    payload.user.unwrap_or(stored.sender_id),
-                    payload.model.unwrap_or(stored.model),
-                    Some(previous_response_id.to_string()),
-                )
-            }
-            None => {
-                let conv_thread_id = if let Some(ref raw) = payload.thread_id {
-                    let trimmed = raw.trim();
-                    if trimmed.is_empty() {
                         return ApiError::new(
-                            StatusCode::BAD_REQUEST,
-                            "invalid_thread_id",
-                            "thread_id must be a non-empty UUID when provided.",
+                            StatusCode::NOT_FOUND,
+                            "previous_response_not_found",
+                            format!("Unknown previous_response_id: {previous_response_id}"),
                         )
                         .into_response();
                     }
-                    match uuid::Uuid::parse_str(trimmed) {
-                        Ok(u) => u.to_string(),
-                        Err(_) => {
-                            return ApiError::new(
-                                StatusCode::BAD_REQUEST,
-                                "invalid_thread_id",
-                                "thread_id must be a valid UUID.",
-                            )
-                            .into_response();
-                        }
+                    Err(e) => {
+                        log_api(
+                            &state.logger_tx,
+                            LogEvent::error(
+                                "ApiChannel",
+                                &format!(
+                                    "Failed to load response state for {previous_response_id}: {e}"
+                                ),
+                            ),
+                        );
+                        return ApiError::new(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "response_store_unavailable",
+                            "Failed to load response state.",
+                        )
+                        .into_response();
                     }
-                } else {
-                    uuid::Uuid::new_v4().to_string()
-                };
-                (
-                    conv_thread_id,
-                    payload.user.unwrap_or_else(|| DEFAULT_API_USER.to_string()),
-                    payload
-                        .model
-                        .unwrap_or_else(|| DEFAULT_RESPONSE_MODEL.to_string()),
-                    None,
-                )
-            }
-        };
+                }
+            };
+
+            (
+                stored.thread_id,
+                payload.user.unwrap_or(stored.sender_id),
+                payload.model.unwrap_or(stored.model),
+                Some(previous_response_id.to_string()),
+            )
+        }
+        None => {
+            let conv_thread_id = if let Some(ref raw) = payload.thread_id {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    return ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_thread_id",
+                        "thread_id must be a non-empty UUID when provided.",
+                    )
+                    .into_response();
+                }
+                match uuid::Uuid::parse_str(trimmed) {
+                    Ok(u) => u.to_string(),
+                    Err(_) => {
+                        return ApiError::new(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_thread_id",
+                            "thread_id must be a valid UUID.",
+                        )
+                        .into_response();
+                    }
+                }
+            } else {
+                uuid::Uuid::new_v4().to_string()
+            };
+            (
+                conv_thread_id,
+                payload.user.unwrap_or_else(|| DEFAULT_API_USER.to_string()),
+                payload
+                    .model
+                    .unwrap_or_else(|| DEFAULT_RESPONSE_MODEL.to_string()),
+                None,
+            )
+        }
+    };
 
     if stream_requested {
         let (stream_tx, mut stream_rx) = mpsc::channel(100);
@@ -1232,9 +1232,7 @@ async fn handle_responses(
         &state.logger_tx,
         LogEvent::info(
             "ApiChannel",
-            &format!(
-                "Responses request completed with response_id {response_id}"
-            ),
+            &format!("Responses request completed with response_id {response_id}"),
         )
         .with_chat_id(&conv_thread_id),
     );

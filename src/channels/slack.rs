@@ -268,9 +268,7 @@ impl SlackRuntimeState {
                 stale_persisted_name = Some(stored.display_name);
             }
             Ok(None) => {}
-            Err(e) => warn!(
-                "Failed to load cached Slack user profile for {user}: {e}"
-            ),
+            Err(e) => warn!("Failed to load cached Slack user profile for {user}: {e}"),
         }
 
         if let Some(name) = fetcher().await {
@@ -733,9 +731,7 @@ where
                 }
             },
             Err(e) => {
-                error!(
-                    "Slack postMessage network error (attempt {attempt}): {e}"
-                );
+                error!("Slack postMessage network error (attempt {attempt}): {e}");
                 if attempt < max_retries {
                     tokio::time::sleep(backoff).await;
                     backoff *= 2;
@@ -784,9 +780,9 @@ fn classify_post_message_response(response: SlackHttpResponse) -> SlackSendDecis
             error!("Slack postMessage failed with ok=false: {err}");
             SlackSendDecision::Fatal(format!("Slack API returned ok=false: {err}"))
         }
-        Err(e) => SlackSendDecision::Fatal(format!(
-            "Failed to decode Slack postMessage response: {e}"
-        )),
+        Err(e) => {
+            SlackSendDecision::Fatal(format!("Failed to decode Slack postMessage response: {e}"))
+        }
     }
 }
 
@@ -796,9 +792,7 @@ fn validate_simple_slack_api_response(
     body: &str,
 ) -> Result<(), String> {
     if !status.is_success() {
-        return Err(format!(
-            "{action} failed with status {status}: {body}"
-        ));
+        return Err(format!("{action} failed with status {status}: {body}"));
     }
 
     let api_response = serde_json::from_str::<SlackApiResponse>(body)
@@ -977,10 +971,7 @@ async fn run_socket_mode(
             Err(e) => {
                 log_slack(
                     &shared.logger_tx,
-                    LogEvent::error(
-                        "SlackChannel",
-                        &format!("WebSocket connection failed: {e}"),
-                    ),
+                    LogEvent::error("SlackChannel", &format!("WebSocket connection failed: {e}")),
                 );
                 if wait_for_shutdown_or_timeout(shutdown_rx, Duration::from_secs(backoff_secs))
                     .await
@@ -1049,9 +1040,7 @@ async fn run_socket_mode(
             }
         }
 
-        warn!(
-            "Slack Socket Mode disconnected. Reconnecting in {backoff_secs} seconds..."
-        );
+        warn!("Slack Socket Mode disconnected. Reconnecting in {backoff_secs} seconds...");
         if wait_for_shutdown_or_timeout(shutdown_rx, Duration::from_secs(backoff_secs)).await {
             break;
         }
@@ -1707,7 +1696,7 @@ mod tests {
 
     fn sign_for_test(secret: &str, timestamp: &str, body: &[u8]) -> String {
         let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
-        mac.update(format!("v0:{}:", timestamp).as_bytes());
+        mac.update(format!("v0:{timestamp}:").as_bytes());
         mac.update(body);
         format!("v0={}", hex::encode(mac.finalize().into_bytes()))
     }

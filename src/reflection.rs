@@ -126,9 +126,7 @@ impl ReflectionEngine {
             let _ = self.logger_tx.send(BusMessage::Log(
                 LogEvent::debug(
                     "ReflectionEngine",
-                    &format!(
-                        "Thread {session_id} reached short-term reflection threshold (idle)"
-                    ),
+                    &format!("Thread {session_id} reached short-term reflection threshold (idle)"),
                 )
                 .with_chat_id(&session_id),
             ));

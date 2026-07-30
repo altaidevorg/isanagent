@@ -297,11 +297,8 @@ fn apply_onboard_options(cfg: &mut AppConfig, opts: &OnboardOptions) {
 }
 
 fn build_config_toml(options: &OnboardOptions) -> Result<String, String> {
-    let mut cfg: AppConfig = toml::from_str(CONFIG_TEMPLATE).map_err(|e| {
-        format!(
-            "Internal error: embedded config template is invalid TOML: {e}"
-        )
-    })?;
+    let mut cfg: AppConfig = toml::from_str(CONFIG_TEMPLATE)
+        .map_err(|e| format!("Internal error: embedded config template is invalid TOML: {e}"))?;
     apply_onboard_options(&mut cfg, options);
     toml::to_string_pretty(&cfg).map_err(|e| format!("Failed to serialize config.toml: {e}"))
 }
@@ -434,11 +431,8 @@ pub fn build_interactive_config_toml(options: &OnboardOptions) -> Result<String,
     }
 
     let out = doc.to_string();
-    let _: AppConfig = toml::from_str(&out).map_err(|e| {
-        format!(
-            "interactive merged config.toml failed AppConfig validation: {e}"
-        )
-    })?;
+    let _: AppConfig = toml::from_str(&out)
+        .map_err(|e| format!("interactive merged config.toml failed AppConfig validation: {e}"))?;
     Ok(out)
 }
 
