@@ -531,14 +531,10 @@ pub struct TerminalChannelConfig {
     pub workspace_dir: PathBuf,
     pub sandbox_dir: PathBuf,
     pub status_model: String,
-    /// Short permission label for the status bar (`ask`, `plan`, …).
-    pub status_permission: String,
     pub memory_node: NodeHandle<MemoryMessage>,
     pub providers: std::collections::HashMap<String, crate::config::ProviderConfig>,
     /// Whether the TUI should render ANSI foreground colors.
     pub color_enabled: bool,
-    /// Host-selected ALTAI theme (resolved with `color_enabled` / NO_COLOR).
-    pub theme: crate::channels::terminal_ui::HostThemeMode,
     /// Load the configured chat's persisted transcript before accepting input.
     pub resume_session: bool,
     /// File references composed into the first user message.
@@ -564,7 +560,6 @@ pub struct TerminalChannel {
     sandbox_dir: PathBuf,
     /// Provider model id for the status line (e.g. from config).
     status_model: String,
-    status_permission: String,
     /// Workspace memory actor (for past-session list + transcript load in the TUI thread).
     memory_node: NodeHandle<MemoryMessage>,
     /// Outbound messages for the Ratatui thread (set when `start` succeeds).
@@ -572,7 +567,6 @@ pub struct TerminalChannel {
     /// Named alternative providers for `/model` switching.
     providers: std::collections::HashMap<String, crate::config::ProviderConfig>,
     color_enabled: bool,
-    theme: crate::channels::terminal_ui::HostThemeMode,
     resume_session: bool,
     initial_files: Vec<PathBuf>,
     mode: TerminalMode,
@@ -587,12 +581,10 @@ impl TerminalChannel {
             workspace_dir: config.workspace_dir,
             sandbox_dir: config.sandbox_dir,
             status_model: config.status_model,
-            status_permission: config.status_permission,
             memory_node: config.memory_node,
             outbound_ui_tx: Arc::new(Mutex::new(None)),
             providers: config.providers,
             color_enabled: config.color_enabled,
-            theme: config.theme,
             resume_session: config.resume_session,
             initial_files: config.initial_files,
             mode: config.mode,
@@ -619,7 +611,6 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
 
         let channel_name = self.name().to_string();
         if self.mode == TerminalMode::Line {
-            crate::channels::terminal_ui::init_from_host(self.theme, !self.color_enabled);
             let (tx, rx) = std::sync::mpsc::channel::<OutboundMessage>();
             *self
                 .outbound_ui_tx
@@ -627,198 +618,21 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
                 .map_err(|_| "terminal outbound bridge poisoned".to_string())? = Some(tx);
             let chat_id = self.chat_id.clone();
             let shutdown = self.shutdown_tx.clone();
-            let status_model = self.status_model.clone();
-            let status_permission = self.status_permission.clone();
-            let sandbox_label = self
-                .sandbox_dir
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("workspace")
-                .to_string();
-            let session_short = truncate_leading_ellipsis(&chat_id, 13);
             std::thread::spawn(move || {
                 for message in rx {
-                    let is_clarification = message
-                        .metadata
-                        .get(crate::clarification::METADATA_CLARIFICATION)
-                        .and_then(|v| v.as_bool())
-                        == Some(true);
-                    let prefix = if is_clarification {
-                        "approval"
-                    } else if message
-                        .metadata
-                        .get(ISANAGENT_TOOL_NOTIFY)
-                        .and_then(|v| v.as_bool())
-                        == Some(true)
-                    {
-                        "tool"
-                    } else {
-                        "assistant"
-                    };
-                    println!("[{prefix}] {}", message.content);
-                    if let Some(edit) = message.metadata.get("edit_diff") {
-                        let file = edit
-                            .get("file")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("(unknown)");
-                        let truncated = edit
-                            .get("truncated")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        let badge = if truncated { " [truncated]" } else { "" };
-                        println!("[edit_diff] {file}{badge}");
-                        if let Some(diff) = edit.get("diff").and_then(|v| v.as_str()) {
-                            println!("{diff}");
-                        }
-                    }
-                    if is_clarification {
-                        println!(
-                            "[choices] 1=approve 2=deny 3=always 4=abort  (type the word or number)"
-                        );
-                    }
+                    println!("{}", message.content);
                 }
             });
-            let sandbox_dir = self.sandbox_dir.clone();
-            let memory_node = self.memory_node.clone();
-            let channel_name_for_line = channel_name.clone();
-            let mut pending_host_files = self.initial_files.clone();
             std::thread::spawn(move || {
                 use std::io::BufRead;
-                println!(
-                    "ALTAI line mode · {sandbox_label} · {status_model} · {status_permission} · session {session_short}"
-                );
-                println!(
-                    "Commands: /exit · /context · /compact [focus] · @file attachments. Color: {}",
-                    if crate::channels::terminal_ui::uses_ansi_color() {
-                        "on"
-                    } else {
-                        "off (plain)"
-                    }
-                );
-                if !pending_host_files.is_empty() {
-                    let refs = pending_host_files
-                        .iter()
-                        .map(|path| format!("@{}", path.display()))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    println!(
-                        "Pending --file attachments ({refs}) will load with your first message."
-                    );
-                }
-                print!("> ");
-                let _ = std::io::Write::flush(&mut std::io::stdout());
-                let rt = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => rt,
-                    Err(error) => {
-                        eprintln!("line mode runtime failed: {error}");
-                        return;
-                    }
-                };
+                println!("ALTAI line mode. Type /exit to quit.");
                 for line in std::io::stdin().lock().lines() {
                     let Ok(content) = line else { break };
-                    let trimmed = content.trim();
-                    if matches!(trimmed, "/exit" | "/quit") {
+                    if matches!(content.trim(), "/exit" | "/quit") {
                         let _ = shutdown.send(());
                         break;
                     }
-                    if trimmed.is_empty() {
-                        print!("> ");
-                        let _ = std::io::Write::flush(&mut std::io::stdout());
-                        continue;
-                    }
-                    if trimmed.eq_ignore_ascii_case("/context") {
-                        let session_key = crate::bus::clarification_session_key(
-                            &channel_name_for_line,
-                            &chat_id,
-                            None,
-                        );
-                        let messages = rt.block_on(async {
-                            let (tx, rx) = tokio::sync::oneshot::channel();
-                            let _ = memory_node
-                                .send_packet(crate::memory::MemoryMessage::GetContext {
-                                    thread_id: session_key.clone(),
-                                    reply: crate::memory::SharedReply::new(tx),
-                                })
-                                .await;
-                            rx.await.ok().and_then(|r| r.ok()).unwrap_or_default()
-                        });
-                        let user_turns = messages.iter().filter(|m| m.role == "user").count();
-                        let approx_tokens: usize = messages
-                            .iter()
-                            .map(|m| m.content.as_ref().map_or(0, |c| c.text_content().len()) / 4)
-                            .sum();
-                        println!(
-                            "[context] {} message(s) · {} user turn(s) · ~{} tokens (rough estimate). Use /compact to force compaction.",
-                            messages.len(),
-                            user_turns,
-                            approx_tokens
-                        );
-                        print!("> ");
-                        let _ = std::io::Write::flush(&mut std::io::stdout());
-                        continue;
-                    }
-                    if trimmed.eq_ignore_ascii_case("/compact")
-                        || trimmed.to_ascii_lowercase().starts_with("/compact ")
-                    {
-                        let focus = trimmed
-                            .strip_prefix("/compact")
-                            .or_else(|| trimmed.strip_prefix("/COMPACT"))
-                            .unwrap_or("")
-                            .trim()
-                            .to_string();
-                        let session_key = crate::bus::clarification_session_key(
-                            &channel_name_for_line,
-                            &chat_id,
-                            None,
-                        );
-                        let msg = BusMessage::TriggerCompaction {
-                            session_key,
-                            focus_instructions: if focus.is_empty() {
-                                None
-                            } else {
-                                Some(focus.clone())
-                            },
-                            trigger: Some(crate::bus::CompactionTrigger::Manual),
-                        };
-                        if bus_tx.blocking_send(msg).is_err() {
-                            println!("[system] Bus closed; cannot trigger compaction.");
-                            break;
-                        }
-                        if focus.is_empty() {
-                            println!("[system] Compaction requested. It will run between turns.");
-                        } else {
-                            println!(
-                                "[system] Compaction requested with focus: \"{focus}\"."
-                            );
-                        }
-                        print!("> ");
-                        let _ = std::io::Write::flush(&mut std::io::stdout());
-                        continue;
-                    }
-
-                    let (clean_text, mut attachments) =
-                        crate::channels::terminal_ui::parse_terminal_attachments(
-                            &content,
-                            &sandbox_dir,
-                        );
-                    if !pending_host_files.is_empty() {
-                        let (host_parts, warnings) =
-                            crate::channels::terminal_ui::load_host_file_attachments(
-                                &sandbox_dir,
-                                &pending_host_files,
-                            );
-                        for warning in warnings {
-                            eprintln!("Warning: {warning}");
-                        }
-                        attachments.extend(host_parts);
-                        pending_host_files.clear();
-                    }
-                    if clean_text.trim().is_empty() && attachments.is_empty() {
-                        print!("> ");
-                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                    if content.trim().is_empty() {
                         continue;
                     }
                     if bus_tx
@@ -827,20 +641,14 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
                             sender_id: "local_user".into(),
                             chat_id: chat_id.clone(),
                             thread_id: None,
-                            content: if clean_text.is_empty() {
-                                "(attached files)".into()
-                            } else {
-                                clean_text
-                            },
-                            attachments,
+                            content,
+                            attachments: Vec::new(),
                             metadata: Default::default(),
                         }))
                         .is_err()
                     {
                         break;
                     }
-                    print!("> ");
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
                 }
             });
             return Ok(());
@@ -873,14 +681,12 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
         let log_clone = logger_tx.clone();
         let memory_node_clone = self.memory_node.clone();
         let color_enabled = self.color_enabled;
-        let theme = self.theme;
         let resume_session = self.resume_session;
         let initial_files = self.initial_files.clone();
-        let status_permission = self.status_permission.clone();
 
         let opening_banner = format!(
             "ALTAI isanagent v{} — thread {}\n\
-             Commands: /exit, /new, /context, /compact  ·  Attachments: @path (text/image/PDF) inside the workspace.",
+             Commands: /exit, /new  ·  Images: @path/to/file inside the workspace.",
             env!("CARGO_PKG_VERSION"),
             truncate_leading_ellipsis(&chat_id_clone, 13)
         );
@@ -899,11 +705,9 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
                         channel_name,
                         opening_banner,
                         status_model,
-                        status_permission,
                         memory_node: memory_node_clone,
                         providers: providers_clone,
                         color_enabled,
-                        theme,
                         resume_session,
                         initial_files,
                     },
