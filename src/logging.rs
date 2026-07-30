@@ -92,9 +92,17 @@ impl Log for ActorRuntimeLogger {
 
 pub fn init_runtime_logger(sender: LoggerHandle) -> Result<(), SetLoggerError> {
     let _ = LOGGER_SENDER.set(sender);
-    log::set_logger(&ACTOR_RUNTIME_LOGGER)?;
-    log::set_max_level(LevelFilter::Trace);
-    Ok(())
+    match log::set_logger(&ACTOR_RUNTIME_LOGGER) {
+        Ok(()) => {
+            log::set_max_level(LevelFilter::Trace);
+            Ok(())
+        }
+        // A prior host/test in this process may have already installed the logger.
+        Err(_) => {
+            log::set_max_level(LevelFilter::Trace);
+            Ok(())
+        }
+    }
 }
 
 fn should_capture(target: &str, level: Level) -> bool {
