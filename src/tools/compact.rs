@@ -123,7 +123,7 @@ mod tests {
                 assert_eq!(focus_instructions, None);
                 assert!(matches!(trigger, Some(CompactionTrigger::AgentSelf)));
             }
-            other => panic!("expected TriggerCompaction, got {:?}", other),
+            other => panic!("expected TriggerCompaction, got {other:?}"),
         }
     }
 
@@ -150,7 +150,7 @@ mod tests {
                     Some("keep the API design talk")
                 );
             }
-            other => panic!("expected TriggerCompaction, got {:?}", other),
+            other => panic!("expected TriggerCompaction, got {other:?}"),
         }
     }
 
@@ -170,7 +170,7 @@ mod tests {
             BusMessage::TriggerCompaction {
                 focus_instructions, ..
             } => assert_eq!(focus_instructions, None),
-            other => panic!("expected TriggerCompaction, got {:?}", other),
+            other => panic!("expected TriggerCompaction, got {other:?}"),
         }
     }
 

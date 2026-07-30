@@ -90,9 +90,7 @@ impl SkillRegistry {
 
         // Extremely basic frontmatter parsing: looks for --- ... ---
         if lines[0] != "---" {
-            warn!(
-                "Skipping {path:?}: No YAML frontmatter found (must start with '---')"
-            );
+            warn!("Skipping {path:?}: No YAML frontmatter found (must start with '---')");
             return None;
         }
 
@@ -257,9 +255,7 @@ impl SkillRegistry {
             repo_url.to_string()
         };
 
-        info!(
-            "Installing skills from repository: {full_repo_url} (specific: {specific_skill:?})"
-        );
+        info!("Installing skills from repository: {full_repo_url} (specific: {specific_skill:?})");
 
         // 1. Create a temporary directory with a cleanup guard
         let temp_dir_path =
@@ -373,13 +369,10 @@ impl Drop for TempDirGuard {
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     if !dst.exists() {
-        fs::create_dir_all(dst)
-            .map_err(|e| format!("Failed to create directory {dst:?}: {e}"))?;
+        fs::create_dir_all(dst).map_err(|e| format!("Failed to create directory {dst:?}: {e}"))?;
     }
 
-    for entry in
-        fs::read_dir(src).map_err(|e| format!("Failed to read directory {src:?}: {e}"))?
-    {
+    for entry in fs::read_dir(src).map_err(|e| format!("Failed to read directory {src:?}: {e}"))? {
         let entry = entry.map_err(|e| format!("Failed to read entry: {e}"))?;
         let file_type = entry
             .file_type()
@@ -390,11 +383,8 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
         if file_type.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
         } else {
-            fs::copy(&src_path, &dst_path).map_err(|e| {
-                format!(
-                    "Failed to copy file {src_path:?} to {dst_path:?}: {e}"
-                )
-            })?;
+            fs::copy(&src_path, &dst_path)
+                .map_err(|e| format!("Failed to copy file {src_path:?} to {dst_path:?}: {e}"))?;
         }
     }
     Ok(())

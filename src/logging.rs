@@ -342,9 +342,7 @@ impl LoggingActor {
             .with_chat_id(chat_id),
             BusMessage::CancelRun { chat_id, run_id } => LogEvent::info(
                 "BusMessage",
-                &format!(
-                    "Cancel reasoning loop for chat_id={chat_id} run_id={run_id}"
-                ),
+                &format!("Cancel reasoning loop for chat_id={chat_id} run_id={run_id}"),
             )
             .with_chat_id(chat_id),
             BusMessage::Steer {
@@ -370,9 +368,7 @@ impl LoggingActor {
                 ..
             } => LogEvent::info(
                 "BusMessage",
-                &format!(
-                    "SwitchModel provider={provider_name} model={model_name}"
-                ),
+                &format!("SwitchModel provider={provider_name} model={model_name}"),
             ),
             BusMessage::TriggerCompaction {
                 session_key,

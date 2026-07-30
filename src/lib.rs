@@ -6,6 +6,7 @@ use std::ops::{Shr, Sub};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 
+pub mod acp;
 pub mod agent;
 pub mod bus;
 pub mod channels;

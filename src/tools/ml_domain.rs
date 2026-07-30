@@ -302,9 +302,7 @@ impl Tool for HfHubFileFetchTool {
             .map(urlencoding::encode)
             .collect::<Vec<_>>()
             .join("/");
-        let url = format!(
-            "https://huggingface.co/{repo}/resolve/{revision}/{enc_path}"
-        );
+        let url = format!("https://huggingface.co/{repo}/resolve/{revision}/{enc_path}");
 
         let client = reqwest::Client::builder()
             .user_agent(HF_USER_AGENT)

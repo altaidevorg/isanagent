@@ -1417,7 +1417,7 @@ mod tests {
                 assert!(at_ms > now.timestamp_millis());
                 assert!(at_ms > original_at_ms);
             }
-            other => panic!("expected rescheduled one-shot job, got {:?}", other),
+            other => panic!("expected rescheduled one-shot job, got {other:?}"),
         }
         assert_eq!(records.lock().unwrap().len(), 1);
     }

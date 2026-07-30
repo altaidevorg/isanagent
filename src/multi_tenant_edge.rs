@@ -415,11 +415,7 @@ fn build_reqwest_client() -> Result<reqwest::Client, String> {
         .connect_timeout(REQUEST_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
         .build()
-        .map_err(|error| {
-            format!(
-                "failed to build multi-tenant-edge reqwest client: {error}"
-            )
-        })
+        .map_err(|error| format!("failed to build multi-tenant-edge reqwest client: {error}"))
 }
 
 fn is_permanent_heartbeat_failure(status: StatusCode) -> bool {

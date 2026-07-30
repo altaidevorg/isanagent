@@ -287,9 +287,18 @@ pub struct AutoTrainessHarnessConfig {
     pub max_log_entries: Option<usize>,
 }
 
+/// ACP protocol agent config (`[harness.acp]`).
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct AcpHarnessConfig {
+    pub enabled: Option<bool>,
+    pub transport: Option<String>,
+    pub allow_client_mcp: Option<bool>,
+}
+
 /// Optional harness features (see `docs/harness-implementation-plan.md`).
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct HarnessConfig {
+    pub acp: Option<AcpHarnessConfig>,
     pub git_worktree: Option<GitWorktreeConfig>,
     /// Background sub-agents, task tools, and optional plan execution (Phase 5).
     pub subagents: Option<SubagentHarnessConfig>,

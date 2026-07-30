@@ -192,7 +192,7 @@ mod tests {
                 assert_eq!(tool_call_id.as_deref(), Some("call-1"));
                 assert!(message.contains("uv"));
             }
-            other => panic!("unexpected message: {:?}", other),
+            other => panic!("unexpected message: {other:?}"),
         }
     }
 }

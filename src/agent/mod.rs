@@ -2495,9 +2495,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 .await;
                 let _ = self.logger_tx.send(BusMessage::Log(LogEvent::info(
                     &self.name,
-                    &format!(
-                        "Switched to provider={provider_name} model={model_name}"
-                    ),
+                    &format!("Switched to provider={provider_name} model={model_name}"),
                 )));
                 return Ok(None);
             }
@@ -2674,9 +2672,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 {
                     let _ = self.logger_tx.send(BusMessage::Log(LogEvent::warn(
                         &self.name,
-                        &format!(
-                            "TriggerCompaction dropped for session_key={session_key}: {e}"
-                        ),
+                        &format!("TriggerCompaction dropped for session_key={session_key}: {e}"),
                     )));
                 }
                 Ok(None)
@@ -2736,9 +2732,7 @@ impl AgentLogic {
             .split(':')
             .nth(1)
             .ok_or_else(|| {
-                format!(
-                    "Malformed session_key (expected `channel:chat_id:thread`): {session_key}"
-                )
+                format!("Malformed session_key (expected `channel:chat_id:thread`): {session_key}")
             })?
             .to_string();
 
@@ -3776,11 +3770,8 @@ impl AgentLogic {
             iterations = budget.snapshot().iterations_used;
 
             let _ = logger_tx.send(BusMessage::Log(
-                LogEvent::debug(
-                    &name,
-                    &format!("Iteration {iterations}/{max_iterations}"),
-                )
-                .with_chat_id(&inbound.chat_id),
+                LogEvent::debug(&name, &format!("Iteration {iterations}/{max_iterations}"))
+                    .with_chat_id(&inbound.chat_id),
             ));
 
             // PR-7.2: stale tool-result swap pass. Runs at the top of every

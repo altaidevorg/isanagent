@@ -90,6 +90,8 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Run as an Agent Client Protocol (ACP) server over stdio
+    Acp,
     /// Create workspace layout and starter files; optional flags override generated config.toml
     Onboard(OnboardArgs),
     /// Manage skills (add, list, etc.)
@@ -134,6 +136,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
+        Some(Commands::Acp) => {
+            isanagent::host::start_host(isanagent::host::HostConfig {
+                workspace: cli.workspace.map(std::path::PathBuf::from),
+                config: cli.config.map(std::path::PathBuf::from),
+                acp_mode: true,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| e as Box<dyn std::error::Error>)
+        }
         Some(Commands::Onboard(args)) => run_onboard(cli.workspace, args).await,
         Some(Commands::Skills(args)) => run_skills(cli.workspace, args).await,
         None => {
@@ -1174,9 +1186,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                         );
                         if let Some(chan) = delivery_channels.get("terminal") {
                             if let Err(e) = chan.send(notice).await {
-                                log::error!(
-                                    "Failed to deliver tool-call notice to terminal: {e}"
-                                );
+                                log::error!("Failed to deliver tool-call notice to terminal: {e}");
                             }
                         }
                     }
@@ -1428,9 +1438,7 @@ async fn recover_background_jobs_on_startup(
         }
     }
     if count > 0 {
-        log::info!(
-            "Successfully resumed {count} background job(s) on startup."
-        );
+        log::info!("Successfully resumed {count} background job(s) on startup.");
     }
 }
 

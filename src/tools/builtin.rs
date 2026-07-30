@@ -1413,10 +1413,7 @@ async fn web_fetch_direct(url: &str, max_output_chars: usize) -> Result<String, 
         .unwrap_or("");
 
     if content_type.contains("application/json") {
-        let json_body: Value = res
-            .json()
-            .await
-            .map_err(|e| format!("Invalid JSON: {e}"))?;
+        let json_body: Value = res.json().await.map_err(|e| format!("Invalid JSON: {e}"))?;
         let s = serde_json::to_string_pretty(&json_body).unwrap_or_default();
         return Ok(truncate_web_output(s, max_output_chars));
     }
@@ -1517,10 +1514,7 @@ async fn web_fetch_jina(
         .unwrap_or("");
 
     if content_type.contains("application/json") {
-        let json_body: Value = res
-            .json()
-            .await
-            .map_err(|e| format!("Invalid JSON: {e}"))?;
+        let json_body: Value = res.json().await.map_err(|e| format!("Invalid JSON: {e}"))?;
         let s = serde_json::to_string_pretty(&json_body).unwrap_or_default();
         return Ok(truncate_web_output(s, max_output_chars));
     }
@@ -2772,8 +2766,7 @@ mod glob_files_tests {
             .unwrap();
         assert!(
             out.contains("SKILL.md"),
-            "expected SKILL.md in output, got:\n{}",
-            out
+            "expected SKILL.md in output, got:\n{out}"
         );
 
         let flat = tool
@@ -2937,7 +2930,7 @@ mod git_worktree_path_tests {
         fs::create_dir_all(&outside).unwrap();
         let abs = outside.join("wt").to_string_lossy().to_string();
         let res = resolve_git_worktree_agent_path(&abs, &sandbox, true, true);
-        assert!(res.is_ok(), "{:?}", res);
+        assert!(res.is_ok(), "{res:?}");
         let _ = fs::remove_dir_all(&sandbox);
         let _ = fs::remove_dir_all(&outside);
     }
@@ -2955,7 +2948,7 @@ mod git_worktree_path_tests {
             .args(["init", "-b", "main"])
             .current_dir(&repo)
             .status()
-            .unwrap()
+            .expect("git init")
             .success());
         assert!(
             std::process::Command::new("git")
@@ -2980,7 +2973,7 @@ mod git_worktree_path_tests {
             .execute(json!({ "action": "list", "base_path": "repo" }))
             .await
             .expect("list");
-        assert!(!list1.trim().is_empty(), "list: {}", list1);
+        assert!(!list1.trim().is_empty(), "list: {list1}");
 
         tool.execute(json!({
             "action": "add",
@@ -3000,8 +2993,7 @@ mod git_worktree_path_tests {
             .expect("list2");
         assert!(
             list2.contains("wt-side") || list2.contains("wt-branch"),
-            "list2: {}",
-            list2
+            "list2: {list2}"
         );
 
         tool.execute(json!({ "action": "remove", "path": "wt-side" }))
@@ -3052,7 +3044,7 @@ mod python_run_tests {
             .await
             .unwrap();
 
-        println!("PYTHON RUN OUTPUT: {}", out);
+        println!("PYTHON RUN OUTPUT: {out}");
         if out.contains("Microsoft Store") && out.contains("9009") {
             println!("Skipping test due to Windows python app execution alias.");
             return;

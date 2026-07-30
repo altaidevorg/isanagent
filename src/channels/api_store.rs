@@ -82,9 +82,7 @@ impl SqliteApiResponseStoreActor {
             [],
         )
         .map_err(|e| {
-            format!(
-                "Failed to initialize api_responses previous_response_id index: {e}"
-            )
+            format!("Failed to initialize api_responses previous_response_id index: {e}")
         })?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_api_responses_created_at

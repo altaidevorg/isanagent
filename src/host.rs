@@ -110,6 +110,8 @@ pub struct HostConfig {
     /// When set, the host skips network providers and returns these responses
     /// in order (the last response repeats).
     pub scripted_responses: Option<Vec<String>>,
+    /// Run as an Agent Client Protocol (ACP) server over stdio.
+    pub acp_mode: bool,
 }
 
 pub use crate::channels::oneshot::{OneshotOutcome, OneshotResult};
@@ -931,7 +933,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
 
     let active_terminal_session_chat: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
 
-    let terminal_chat_id = if workspace.config.terminal_enabled() {
+    let terminal_chat_id = if workspace.config.terminal_enabled() && !config.acp_mode {
         let id = config
             .resume
             .as_deref()
@@ -1068,6 +1070,22 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             email_ch.start(bus_tx.clone()).await?;
             out_channels.insert(email_ch.name().to_string(), email_ch);
         }
+    }
+
+    // 13.5 Setup ACP Channel
+    let acp_enabled = config.acp_mode
+        || workspace
+            .config
+            .harness
+            .as_ref()
+            .and_then(|h| h.acp.as_ref())
+            .and_then(|a| a.enabled)
+            .unwrap_or(false);
+
+    if acp_enabled {
+        let acp = Arc::new(crate::channels::acp::AcpChannel::new());
+        acp.start(bus_tx.clone()).await?;
+        out_channels.insert(acp.name().to_string(), acp);
     }
 
     // 14. Print clean startup banner (skipped when Ratatui owns the alternate screen)
@@ -1230,7 +1248,16 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                         }
                     }
                 }
-                BusMessage::RunLifecycle(_) => {}
+                BusMessage::RunLifecycle(lifecycle) => {
+                    if let Some(acp_chan) = delivery_channels.get("acp") {
+                        if let Some(acp_chan) = acp_chan
+                            .as_any()
+                            .downcast_ref::<crate::channels::acp::AcpChannel>()
+                        {
+                            acp_chan.handle_run_lifecycle(lifecycle).await;
+                        }
+                    }
+                }
                 BusMessage::Telemetry(TelemetryEvent::AgentThought {
                     chat_id,
                     thought,
@@ -1324,9 +1351,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                         );
                         if let Some(chan) = delivery_channels.get("terminal") {
                             if let Err(e) = chan.send(notice).await {
-                                log::error!(
-                                    "Failed to deliver tool-call notice to terminal: {e}"
-                                );
+                                log::error!("Failed to deliver tool-call notice to terminal: {e}");
                             }
                         }
                     }
@@ -1364,6 +1389,14 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                     }
                 }
                 BusMessage::Telemetry(tel) => {
+                    if let Some(acp_chan) = delivery_channels.get("acp") {
+                        if let Some(acp_chan) = acp_chan
+                            .as_any()
+                            .downcast_ref::<crate::channels::acp::AcpChannel>()
+                        {
+                            acp_chan.handle_telemetry_event(tel).await;
+                        }
+                    }
                     if let Some(api_chan) = delivery_channels.get("api") {
                         if let Some(api_chan) = api_chan.as_any().downcast_ref::<ApiChannel>() {
                             api_chan.handle_telemetry(tel.clone()).await;
@@ -1665,9 +1698,7 @@ async fn recover_background_jobs_on_startup(
         }
     }
     if count > 0 {
-        log::info!(
-            "Successfully resumed {count} background job(s) on startup."
-        );
+        log::info!("Successfully resumed {count} background job(s) on startup.");
     }
 }
 
@@ -1928,6 +1959,7 @@ mod tests {
             oneshot_prompt: None,
             observe_tx: None,
             scripted_responses: None,
+            acp_mode: false,
         });
         assert_eq!(host.next_event().await, Some(HostEvent::Starting));
         assert!(host.shutdown());
@@ -1977,6 +2009,7 @@ mod tests {
                 oneshot_prompt: Some("reply with oneshot-ok".to_string()),
                 observe_tx: None,
                 scripted_responses: Some(vec!["oneshot-ok".to_string()]),
+                acp_mode: false,
             }),
         )
         .await

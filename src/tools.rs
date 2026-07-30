@@ -382,7 +382,7 @@ mod tool_index_tests {
     #[test]
     fn search_respects_limit() {
         let entries: Vec<_> = (0..20)
-            .map(|i| (format!("tool_{}", i), "searchable token xyz".to_string()))
+            .map(|i| (format!("tool_{i}"), "searchable token xyz".to_string()))
             .collect();
         let hits = search_tool_index(&entries, "xyz", 3);
         assert_eq!(hits.len(), 3);
