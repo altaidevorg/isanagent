@@ -455,7 +455,24 @@ fn should_require_shell_approval(command: &str, patterns: &[String]) -> bool {
 /// negative sentence ("never approve", "i can't approve", "approve? actually nope"). The prompt
 /// constrains the choices to approve/deny with `allow_empty = false`, so the strictness is
 /// UX-compatible; an unrecognized reply simply skips execution and the user can re-confirm.
+#[cfg(test)]
 fn shell_approval_reply_is_grant(reply: &str) -> bool {
+    matches!(
+        classify_approval_reply(reply),
+        ApprovalReply::Grant | ApprovalReply::AlwaysThisRun
+    )
+}
+
+/// Four-way approval reply classification for ALTAI CLI / TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalReply {
+    Grant,
+    AlwaysThisRun,
+    Deny,
+    Abort,
+}
+
+fn classify_approval_reply(reply: &str) -> ApprovalReply {
     const AFFIRM: &[&str] = &[
         "approve",
         "approved",
@@ -477,25 +494,65 @@ fn shell_approval_reply_is_grant(reply: &str) -> bool {
         "go",
         "sure",
     ];
-    const FILLER: &[&str] = &["please", "it", "this", "that", "ahead", "now", "run", "do"];
+    const FILLER: &[&str] = &[
+        "please", "it", "this", "that", "ahead", "now", "run", "do", "for",
+    ];
+    const ALWAYS: &[&str] = &["always"];
+    const ABORT: &[&str] = &["abort", "cancel", "quit", "stop"];
 
     let r = reply.trim().to_ascii_lowercase();
     if r.is_empty() {
-        return false;
+        return ApprovalReply::Deny;
     }
-    let mut saw_affirmative = false;
-    for tok in r
+
+    let tokens: Vec<&str> = r
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())
+        .collect();
+
+    if tokens.iter().any(|t| ABORT.contains(t))
+        && !tokens.iter().any(|t| AFFIRM.contains(t) || ALWAYS.contains(t))
     {
-        if AFFIRM.contains(&tok) {
+        return ApprovalReply::Abort;
+    }
+
+    // "always" / "always for this run" — allow only known filler around always.
+    if tokens.iter().any(|t| ALWAYS.contains(t)) {
+        let ok = tokens
+            .iter()
+            .all(|t| ALWAYS.contains(t) || FILLER.contains(t) || AFFIRM.contains(t));
+        if ok {
+            return ApprovalReply::AlwaysThisRun;
+        }
+        return ApprovalReply::Deny;
+    }
+
+    let mut saw_affirmative = false;
+    for tok in &tokens {
+        if AFFIRM.contains(tok) {
             saw_affirmative = true;
-        } else if !FILLER.contains(&tok) {
-            // Negation, caveat, or unmodeled prose -> deny.
-            return false;
+        } else if !FILLER.contains(tok) {
+            return ApprovalReply::Deny;
         }
     }
-    saw_affirmative
+    if saw_affirmative {
+        ApprovalReply::Grant
+    } else {
+        ApprovalReply::Deny
+    }
+}
+
+fn command_preview_with_flag(command: &str) -> (String, bool) {
+    const MAX_PREVIEW: usize = 160;
+    if command.len() <= MAX_PREVIEW {
+        (command.to_string(), false)
+    } else {
+        (format!("{}…", &command[..MAX_PREVIEW]), true)
+    }
+}
+
+fn command_preview(command: &str) -> String {
+    command_preview_with_flag(command).0
 }
 
 fn shell_policy_mode_for_session(
@@ -528,15 +585,6 @@ fn edit_policy_block_reason(unattended_session: bool) -> &'static str {
         "File edit blocked by policy: unattended edit mode is active."
     } else {
         "File edit blocked by policy: plan mode active — finalize or apply the plan first."
-    }
-}
-
-fn command_preview(command: &str) -> String {
-    const MAX_PREVIEW: usize = 160;
-    if command.len() <= MAX_PREVIEW {
-        command.to_string()
-    } else {
-        format!("{}...", &command[..MAX_PREVIEW])
     }
 }
 
@@ -738,6 +786,23 @@ mod code_exec_gate_tests {
         assert!(shell_approval_reply_is_grant("yes do it"));
         assert!(shell_approval_reply_is_grant("yes, please do"));
         assert!(!shell_approval_reply_is_grant("do it"));
+    }
+
+    #[test]
+    fn approval_reply_classifies_always_and_abort() {
+        assert_eq!(
+            classify_approval_reply("always"),
+            ApprovalReply::AlwaysThisRun
+        );
+        assert_eq!(
+            classify_approval_reply("always for this run"),
+            ApprovalReply::AlwaysThisRun
+        );
+        assert_eq!(classify_approval_reply("abort"), ApprovalReply::Abort);
+        assert_eq!(classify_approval_reply("cancel"), ApprovalReply::Abort);
+        assert_eq!(classify_approval_reply("deny"), ApprovalReply::Deny);
+        assert!(shell_approval_reply_is_grant("always"));
+        assert!(!shell_approval_reply_is_grant("abort"));
     }
 
     #[test]
@@ -951,6 +1016,21 @@ struct ToolCallRuntime {
     inbound_metadata: Arc<HashMap<String, serde_json::Value>>,
 }
 
+/// Process-scoped "always for this run" grants (`shell:…` / `edit:…`).
+fn process_approval_grants() -> &'static tokio::sync::Mutex<HashSet<String>> {
+    static GRANTS: std::sync::OnceLock<tokio::sync::Mutex<HashSet<String>>> =
+        std::sync::OnceLock::new();
+    GRANTS.get_or_init(|| tokio::sync::Mutex::new(HashSet::new()))
+}
+
+async fn approval_already_granted(key: &str) -> bool {
+    process_approval_grants().lock().await.contains(key)
+}
+
+async fn remember_approval_grant(key: String) {
+    process_approval_grants().lock().await.insert(key);
+}
+
 /// Runs a tool with optional per-call activity heartbeats and optional cooperative cancellation.
 #[allow(clippy::too_many_arguments)] // Central tool-dispatch path; grouping would obscure call sites.
 async fn execute_tool_call_with_activity(
@@ -1030,21 +1110,30 @@ async fn execute_tool_call_with_activity(
                     }
                     ShellPolicyMode::Ask => {
                         if requires_approval {
+                            let grant_key = format!("shell:{tool_name}:{command}");
+                            if !approval_already_granted(&grant_key).await {
+                            let (preview, preview_truncated) = command_preview_with_flag(&command);
                             let _ = outbound_tx
                                 .send(BusMessage::Telemetry(TelemetryEvent::ShellPolicyDecision {
                                     chat_id: chat_id.clone(),
                                     channel: channel.clone(),
                                     mode: "ask".to_string(),
                                     decision: "approval_requested".to_string(),
-                                    command_preview: preview.clone(),
+                                    command_preview: if preview_truncated {
+                                        format!("{preview} [truncated]")
+                                    } else {
+                                        preview.clone()
+                                    },
                                 }))
                                 .await;
                             let ask_payload = serde_json::json!({
                                 "prompt": format!(
-                                    "Approve running `{}`?\n\n```\n{}\n```\n\nReply with approve or deny.",
-                                    tool_name, command
+                                    "Approve running `{}`?\n\n```\n{}\n```\n\nReply with approve, deny, always (this run), or abort.{}",
+                                    tool_name,
+                                    command,
+                                    if preview_truncated { "\n[command preview truncated in telemetry]" } else { "" }
                                 ),
-                                "choices": ["approve", "deny"],
+                                "choices": ["approve", "deny", "always", "abort"],
                                 "timeout_secs": 1800,
                                 "allow_empty": false
                             });
@@ -1061,37 +1150,62 @@ async fn execute_tool_call_with_activity(
                                 .await;
                             match ask_result {
                                 Ok(reply) => {
-                                    // Deny-default parse: an explicit grant runs; anything else
-                                    // (incl. "do not approve") skips execution.
-                                    let approved = shell_approval_reply_is_grant(&reply);
-                                    if !approved {
-                                        let _ = outbound_tx
-                                            .send(BusMessage::Telemetry(
-                                                TelemetryEvent::ShellPolicyDecision {
-                                                    chat_id: chat_id.clone(),
-                                                    channel: channel.clone(),
-                                                    mode: "ask".to_string(),
-                                                    decision: "approval_denied".to_string(),
-                                                    command_preview: preview,
-                                                },
-                                            ))
-                                            .await;
-                                        return ToolExecutionFinished::error(
-                                            ToolErrorCode::PolicyDenied,
-                                            "Command not approved by user; execution skipped.",
-                                        );
+                                    let classified = classify_approval_reply(&reply);
+                                    match classified {
+                                        ApprovalReply::Grant | ApprovalReply::AlwaysThisRun => {
+                                            if matches!(classified, ApprovalReply::AlwaysThisRun) {
+                                                remember_approval_grant(grant_key).await;
+                                            }
+                                            let _ = outbound_tx
+                                                .send(BusMessage::Telemetry(
+                                                    TelemetryEvent::ShellPolicyDecision {
+                                                        chat_id: chat_id.clone(),
+                                                        channel: channel.clone(),
+                                                        mode: "ask".to_string(),
+                                                        decision: "approval_granted".to_string(),
+                                                        command_preview: preview,
+                                                    },
+                                                ))
+                                                .await;
+                                        }
+                                        ApprovalReply::Abort => {
+                                            let _ = outbound_tx
+                                                .send(BusMessage::Telemetry(
+                                                    TelemetryEvent::ShellPolicyDecision {
+                                                        chat_id: chat_id.clone(),
+                                                        channel: channel.clone(),
+                                                        mode: "ask".to_string(),
+                                                        decision: "approval_denied".to_string(),
+                                                        command_preview: preview,
+                                                    },
+                                                ))
+                                                .await;
+                                            if let Some(token) = cancel_owned.as_ref() {
+                                                token.cancel();
+                                            }
+                                            return ToolExecutionFinished::error(
+                                                ToolErrorCode::PolicyDenied,
+                                                "Command approval aborted by user; execution skipped.",
+                                            );
+                                        }
+                                        ApprovalReply::Deny => {
+                                            let _ = outbound_tx
+                                                .send(BusMessage::Telemetry(
+                                                    TelemetryEvent::ShellPolicyDecision {
+                                                        chat_id: chat_id.clone(),
+                                                        channel: channel.clone(),
+                                                        mode: "ask".to_string(),
+                                                        decision: "approval_denied".to_string(),
+                                                        command_preview: preview,
+                                                    },
+                                                ))
+                                                .await;
+                                            return ToolExecutionFinished::error(
+                                                ToolErrorCode::PolicyDenied,
+                                                "Command not approved by user; execution skipped.",
+                                            );
+                                        }
                                     }
-                                    let _ = outbound_tx
-                                        .send(BusMessage::Telemetry(
-                                            TelemetryEvent::ShellPolicyDecision {
-                                                chat_id: chat_id.clone(),
-                                                channel: channel.clone(),
-                                                mode: "ask".to_string(),
-                                                decision: "approval_granted".to_string(),
-                                                command_preview: preview,
-                                            },
-                                        ))
-                                        .await;
                                 }
                                 Err(e) => {
                                     return ToolExecutionFinished::error(
@@ -1100,6 +1214,7 @@ async fn execute_tool_call_with_activity(
                                     );
                                 }
                             }
+                            } // end if !already_granted
                         }
                     }
                 }
@@ -1161,12 +1276,14 @@ async fn execute_tool_call_with_activity(
                         }
                     };
                     if let Some(preview) = preview {
+                        let grant_key = format!("edit:{}", preview.path);
+                        if !approval_already_granted(&grant_key).await {
                         let ask_payload = serde_json::json!({
                             "prompt": format!(
-                                "Approve edit to `{}`? Review the attached diff, then reply with approve or deny.",
+                                "Approve edit to `{}`? Review the attached diff, then reply with approve, deny, always (this run), or abort.",
                                 preview.path
                             ),
-                            "choices": ["approve", "deny"],
+                            "choices": ["approve", "deny", "always", "abort"],
                             "timeout_secs": 1800,
                             "allow_empty": false,
                             "metadata": {
@@ -1197,12 +1314,28 @@ async fn execute_tool_call_with_activity(
                                 );
                             }
                         };
-                        if !shell_approval_reply_is_grant(&reply) {
-                            return ToolExecutionFinished::error(
-                                ToolErrorCode::PolicyDenied,
-                                "Edit not approved by user; mutation skipped.",
-                            );
+                        match classify_approval_reply(&reply) {
+                            ApprovalReply::Grant => {}
+                            ApprovalReply::AlwaysThisRun => {
+                                remember_approval_grant(grant_key).await;
+                            }
+                            ApprovalReply::Abort => {
+                                if let Some(token) = cancel_owned.as_ref() {
+                                    token.cancel();
+                                }
+                                return ToolExecutionFinished::error(
+                                    ToolErrorCode::PolicyDenied,
+                                    "Edit approval aborted by user; mutation skipped.",
+                                );
+                            }
+                            ApprovalReply::Deny => {
+                                return ToolExecutionFinished::error(
+                                    ToolErrorCode::PolicyDenied,
+                                    "Edit not approved by user; mutation skipped.",
+                                );
+                            }
                         }
+                        } // end if !already_granted
                         approved_mutation_preview = Some(preview);
                     }
                 }

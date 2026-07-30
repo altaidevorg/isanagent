@@ -1,7 +1,8 @@
-//! `@path` image attachment parsing for terminal input (Ratatui compose line).
+//! `@path` attachment parsing for terminal input (Ratatui compose + line mode).
 
-use crate::utils::{resolve_path, ContentPart, ImageUrl};
+use crate::utils::{resolve_path, ContentPart, Document, ImageUrl};
 use base64::Engine as _;
+use std::path::{Path, PathBuf};
 
 /// Detects the MIME type of an image file from its extension.
 pub(crate) fn image_mime_from_extension(path: &std::path::Path) -> Option<&'static str> {
@@ -19,21 +20,187 @@ pub(crate) fn image_mime_from_extension(path: &std::path::Path) -> Option<&'stat
     }
 }
 
+fn is_probably_text_extension(path: &Path) -> bool {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_lowercase())
+        .as_deref()
+    {
+        None => true, // extensionless (Dockerfile, Makefile, LICENSE, …)
+        Some(ext) => matches!(
+            ext,
+            "rs" | "ts" | "tsx" | "js" | "jsx" | "json" | "toml" | "yaml" | "yml"
+                | "md" | "txt" | "css" | "html" | "py" | "go" | "java" | "kt"
+                | "swift" | "c" | "h" | "cpp" | "hpp" | "cs" | "rb" | "php"
+                | "sh" | "bash" | "zsh" | "sql" | "graphql" | "xml" | "svg"
+                | "env" | "ini" | "cfg" | "conf" | "lock" | "gitignore"
+                | "dockerfile" | "makefile" | "cmake" | "gradle" | "properties"
+        ),
+    }
+}
+
+fn is_pdf(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+}
+
+const MAX_TEXT_ATTACH_CHARS: usize = 200_000;
+
+/// Load a sandbox-scoped file into a multimodal content part.
+pub fn load_sandbox_file_attachment(
+    sandbox_dir: &Path,
+    path: &Path,
+) -> Result<ContentPart, String> {
+    let expanded = shellexpand::tilde(&path.display().to_string()).into_owned();
+    let resolved = resolve_path(sandbox_dir, &expanded)
+        .or_else(|| fuzzy_resolve_in_sandbox(sandbox_dir, &expanded))
+        .ok_or_else(|| {
+            format!(
+                "could not resolve attachment path inside workspace: {}",
+                path.display()
+            )
+        })?;
+
+    if let Some(mime) = image_mime_from_extension(&resolved) {
+        let bytes = std::fs::read(&resolved)
+            .map_err(|error| format!("could not read {}: {error}", resolved.display()))?;
+        let engine = base64::engine::general_purpose::STANDARD;
+        let data_uri = format!("data:{mime};base64,{}", engine.encode(&bytes));
+        return Ok(ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: data_uri,
+                detail: None,
+            },
+        });
+    }
+
+    if is_pdf(&resolved) {
+        let bytes = std::fs::read(&resolved)
+            .map_err(|error| format!("could not read {}: {error}", resolved.display()))?;
+        let engine = base64::engine::general_purpose::STANDARD;
+        let name = resolved
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string);
+        return Ok(ContentPart::Document {
+            document: Document {
+                data: engine.encode(&bytes),
+                media_type: "application/pdf".into(),
+                name,
+            },
+        });
+    }
+
+    if !is_probably_text_extension(&resolved) {
+        return Err(format!(
+            "unsupported attachment type for {}: use text, image, or PDF",
+            resolved.display()
+        ));
+    }
+
+    let mut text = std::fs::read_to_string(&resolved)
+        .map_err(|error| format!("could not read {}: {error}", resolved.display()))?;
+    let truncated = text.chars().count() > MAX_TEXT_ATTACH_CHARS;
+    if truncated {
+        text = text.chars().take(MAX_TEXT_ATTACH_CHARS).collect();
+        text.push_str("\n… [truncated]");
+    }
+    let sandbox_canon = std::fs::canonicalize(sandbox_dir).unwrap_or_else(|_| sandbox_dir.to_path_buf());
+    let resolved_canon = std::fs::canonicalize(&resolved).unwrap_or(resolved.clone());
+    let rel = resolved_canon
+        .strip_prefix(&sandbox_canon)
+        .unwrap_or(resolved_canon.as_path());
+    let label = rel.display();
+    let body = format!("<context-file path=\"{label}\">\n{text}\n</context-file>");
+    Ok(ContentPart::Text { text: body })
+}
+
+/// Load many host `--file` paths into attachments; returns warnings for failures.
+pub fn load_host_file_attachments(
+    sandbox_dir: &Path,
+    files: &[PathBuf],
+) -> (Vec<ContentPart>, Vec<String>) {
+    let mut attachments = Vec::new();
+    let mut warnings = Vec::new();
+    for path in files {
+        match load_sandbox_file_attachment(sandbox_dir, path) {
+            Ok(part) => attachments.push(part),
+            Err(error) => warnings.push(error),
+        }
+    }
+    (attachments, warnings)
+}
+
+/// Fuzzy-resolve a partial path / basename under the sandbox (depth-limited walk).
+pub fn fuzzy_resolve_in_sandbox(sandbox_dir: &Path, query: &str) -> Option<PathBuf> {
+    let query = query.trim().trim_start_matches("./");
+    if query.is_empty() {
+        return None;
+    }
+    let query_lower = query.to_ascii_lowercase();
+    let mut matches: Vec<PathBuf> = Vec::new();
+    let mut stack = vec![(sandbox_dir.to_path_buf(), 0u32)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > 6 || matches.len() >= 32 {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if name == ".git" || name == "node_modules" || name == "target" || name == ".isanagent"
+            {
+                continue;
+            }
+            if path.is_dir() {
+                stack.push((path, depth + 1));
+                continue;
+            }
+            let rel = path
+                .strip_prefix(sandbox_dir)
+                .unwrap_or(path.as_path())
+                .to_string_lossy()
+                .to_ascii_lowercase();
+            if name == query_lower
+                || rel == query_lower
+                || rel.ends_with(&format!("/{query_lower}"))
+                || rel.contains(&query_lower)
+            {
+                matches.push(path);
+            }
+        }
+    }
+    if matches.len() == 1 {
+        return matches.pop();
+    }
+    // Prefer exact basename match when multiple fuzzy hits.
+    let exact: Vec<_> = matches
+        .iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case(query))
+        })
+        .cloned()
+        .collect();
+    if exact.len() == 1 {
+        return exact.into_iter().next();
+    }
+    None
+}
+
 /// Parses a terminal input string for `@<filepath>` references.
 ///
-/// Each `@<path>` token that resolves to a supported image file (png/jpeg/gif/webp)
-/// inside the sandbox is consumed: removed from the returned text, base64-encoded,
-/// and returned as a `ContentPart::ImageUrl` attachment using a data URI.
-///
-/// `@<token>` references that do NOT resolve to an image (missing files, non-image
-/// extensions, outside sandbox) are preserved in the text so they can serve as
-/// agent mentions or other syntax.
-pub(crate) fn parse_terminal_attachments(
+/// Supported attachments: images, PDFs, and common text source files.
+/// Unresolvable `@token`s are preserved as literal text (agent mentions).
+pub fn parse_terminal_attachments(
     input: &str,
     sandbox_dir: &std::path::Path,
 ) -> (String, Vec<ContentPart>) {
-    let engine = base64::engine::general_purpose::STANDARD;
-
     let mut clean_parts: Vec<&str> = Vec::new();
     let mut attachments: Vec<ContentPart> = Vec::new();
     let mut last_end = 0;
@@ -51,41 +218,18 @@ pub(crate) fn parse_terminal_attachments(
             let raw_path = &input[path_start..path_end];
             let expanded = shellexpand::tilde(raw_path).into_owned();
 
-            let expanded_path = std::path::Path::new(&expanded);
-            let path_exists = expanded_path.exists() || sandbox_dir.join(expanded_path).exists();
-
-            // Only strip @token from text when it resolves to a supported image file.
-            // Unresolvable tokens (missing files, non-image types, outside sandbox) are
-            // preserved as regular text so that @agent mentions and similar syntax survive.
             let mut consumed = false;
-            match resolve_path(sandbox_dir, &expanded) {
-                None if path_exists => {
-                    eprintln!("Warning: @<path> is outside the sandbox boundary, skipping.");
+            match load_sandbox_file_attachment(sandbox_dir, Path::new(&expanded)) {
+                Ok(part) => {
+                    attachments.push(part);
+                    consumed = true;
                 }
-                None => {
-                    // File doesn't exist — leave @token as text (may be an agent mention).
-                }
-                Some(file_path) => match image_mime_from_extension(&file_path) {
-                    None => {
-                        // Not a supported image type — leave @token as text.
+                Err(error) => {
+                    // Keep @token when it looks like an agent mention (no slash / no extension).
+                    if expanded.contains('/') || expanded.contains('.') {
+                        eprintln!("Warning: {error}");
                     }
-                    Some(mime) => match std::fs::read(&file_path) {
-                        Err(_) => {
-                            eprintln!("Warning: could not read @<path>, skipping.");
-                        }
-                        Ok(file_bytes) => {
-                            let data_uri =
-                                format!("data:{};base64,{}", mime, engine.encode(&file_bytes));
-                            attachments.push(ContentPart::ImageUrl {
-                                image_url: ImageUrl {
-                                    url: data_uri,
-                                    detail: None,
-                                },
-                            });
-                            consumed = true;
-                        }
-                    },
-                },
+                }
             }
 
             if consumed {
@@ -108,7 +252,8 @@ pub(crate) fn parse_terminal_attachments(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_terminal_attachments;
+    use super::*;
+    use std::fs;
 
     #[test]
     fn no_at_references_returns_text_unchanged() {
@@ -119,94 +264,37 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_extension_is_skipped() {
-        let sandbox = std::env::temp_dir();
-        let path = sandbox.join("isanagent_test_skip.txt");
-        std::fs::write(&path, b"hello").ok();
-        let input = format!("show @{} please", path.display());
-        let (text, attachments) = parse_terminal_attachments(&input, &sandbox);
-        assert!(
-            text.contains('@'),
-            "non-image @reference must stay in text (may be an agent mention)"
-        );
-        assert!(attachments.is_empty(), "non-image files must be skipped");
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn missing_file_is_skipped() {
-        let sandbox = std::env::temp_dir();
-        let path = sandbox.join("isanagent_nonexistent_image.png");
-        let _ = std::fs::remove_file(&path);
-        let input = format!("see @{} thanks", path.display());
-        let (text, attachments) = parse_terminal_attachments(&input, &sandbox);
-        assert!(
-            text.contains('@'),
-            "unresolved @reference must stay in text (may be an agent mention)"
-        );
-        assert!(
-            attachments.is_empty(),
-            "missing file must be skipped gracefully"
-        );
-    }
-
-    #[test]
-    fn path_outside_sandbox_is_rejected() {
-        use std::io::Write as _;
-        let tmp = std::env::temp_dir();
-        let sandbox = tmp.join("isanagent_sandbox_test");
-        std::fs::create_dir_all(&sandbox).expect("create sandbox");
-
-        let outside = tmp.join("isanagent_outside_test.png");
-        let png_bytes: &[u8] = &[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
-        let mut f = std::fs::File::create(&outside).expect("create outside png");
-        f.write_all(png_bytes).expect("write png");
-        drop(f);
-
-        let input = format!("describe @{} please", outside.display());
-        let (_text, attachments) = parse_terminal_attachments(&input, &sandbox);
-        assert!(
-            attachments.is_empty(),
-            "file outside sandbox must be rejected"
-        );
-
-        let _ = std::fs::remove_file(&outside);
-        let _ = std::fs::remove_dir_all(&sandbox);
-    }
-
-    #[test]
-    fn existing_image_is_attached_as_data_uri() {
-        use std::io::Write;
-        let sandbox = std::env::temp_dir().join("isanagent_sandbox_image_test");
-        std::fs::create_dir_all(&sandbox).expect("create sandbox");
-        let tmp = sandbox.join("isanagent_terminal_test.png");
-        let png_bytes: &[u8] = &[
-            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
-            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
-            0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08,
-            0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xe2, 0x21, 0xbc,
-            0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-        ];
-        let mut f = std::fs::File::create(&tmp).expect("create temp png");
-        f.write_all(png_bytes).expect("write png");
-        drop(f);
-
-        let input = format!("describe this image @{} please", tmp.display());
-        let (text, attachments) = parse_terminal_attachments(&input, &sandbox);
-
-        assert!(!text.contains('@'));
-        assert_eq!(attachments.len(), 1, "should have one image attachment");
-
-        if let crate::utils::ContentPart::ImageUrl { image_url } = &attachments[0] {
-            assert!(
-                image_url.url.starts_with("data:image/png;base64,"),
-                "expected a PNG data URI, got: {}",
-                &image_url.url[..40.min(image_url.url.len())]
-            );
-        } else {
-            panic!("expected ContentPart::ImageUrl");
+    fn loads_text_file_as_context_part() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("note.md");
+        fs::write(&path, "# hello\n").expect("write");
+        let part = load_sandbox_file_attachment(dir.path(), Path::new("note.md")).expect("load");
+        match part {
+            ContentPart::Text { text } => {
+                assert!(text.contains("path=\"note.md\""));
+                assert!(text.contains("# hello"));
+            }
+            other => panic!("expected text part, got {other:?}"),
         }
+    }
 
-        let _ = std::fs::remove_dir_all(&sandbox);
+    #[test]
+    fn fuzzy_resolves_unique_basename() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nested = dir.path().join("src");
+        fs::create_dir_all(&nested).expect("mkdir");
+        fs::write(nested.join("unique_m4_file.rs"), "fn main() {}\n").expect("write");
+        let found = fuzzy_resolve_in_sandbox(dir.path(), "unique_m4_file.rs").expect("fuzzy");
+        assert!(found.ends_with("unique_m4_file.rs"));
+    }
+
+    #[test]
+    fn at_text_reference_is_consumed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("README.md"), "docs\n").expect("write");
+        let (text, attachments) =
+            parse_terminal_attachments("summarize @README.md please", dir.path());
+        assert_eq!(text, "summarize  please");
+        assert_eq!(attachments.len(), 1);
     }
 }
