@@ -257,12 +257,10 @@ async fn run_isanagent_legacy(
             }
         })?;
 
-    println!("Starting Advanced isanagent System...");
-    log::info!("Starting Advanced isanagent System.");
+    log::debug!("Starting Advanced isanagent System.");
 
     let workspace = IsanagentWorkspace::new(workspace_arg.as_deref(), config_arg.as_deref())?;
-    println!("Loading isanagent workspace at: {:?}", workspace.dir);
-    log::info!("Loading isanagent workspace at {:?}", workspace.dir);
+    log::debug!("Loading isanagent workspace at {:?}", workspace.dir);
 
     if !workspace.config.terminal_enabled() && !workspace.config.has_non_terminal_inbound_channel()
     {

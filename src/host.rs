@@ -286,12 +286,7 @@ async fn run_host(
         .as_ref()
         .map(|prompt| prompt.trim())
         .is_some_and(|prompt| !prompt.is_empty());
-    if oneshot_mode {
-        eprintln!("Starting Advanced isanagent System...");
-    } else {
-        println!("Starting Advanced isanagent System...");
-    }
-    log::info!("Starting Advanced isanagent System.");
+    log::debug!("Starting Advanced isanagent System.");
 
     let mut workspace = IsanagentWorkspace::new_with_sandbox(
         workspace_arg.as_deref(),
@@ -311,11 +306,8 @@ async fn run_host(
             .terminal
             .get_or_insert_with(Default::default);
         terminal.enabled = Some(false);
-        eprintln!("Loading isanagent workspace at: {:?}", workspace.dir);
-    } else {
-        println!("Loading isanagent workspace at: {:?}", workspace.dir);
     }
-    log::info!("Loading isanagent workspace at {:?}", workspace.dir);
+    log::debug!("Loading isanagent workspace at {:?}", workspace.dir);
 
     if oneshot_prompt.is_none()
         && !workspace.config.terminal_enabled()
