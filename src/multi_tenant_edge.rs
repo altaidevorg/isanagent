@@ -580,7 +580,7 @@ mod tests {
         ) -> Result<StatusCode, String> {
             self.records.lock().unwrap().push(CronRequestRecord {
                 url: url.to_string(),
-                authorization: format!("Bearer {}", token),
+                authorization: format!("Bearer {token}"),
                 cron_rules: cron_rules.to_vec(),
             });
             Ok(self.status)

@@ -2325,11 +2325,7 @@ fn dropped_tool_call_ids(
             let rows = stmt
                 .query_map(params![thread_id, id], |r| r.get::<_, Option<String>>(0))
                 .map_err(|e| e.to_string())?;
-            for row in rows {
-                if let Ok(Some(v)) = row {
-                    out.push(v);
-                }
-            }
+            out.extend(rows.flatten().flatten());
         }
         None => {
             let mut stmt = tx
@@ -2341,11 +2337,7 @@ fn dropped_tool_call_ids(
             let rows = stmt
                 .query_map(params![thread_id], |r| r.get::<_, Option<String>>(0))
                 .map_err(|e| e.to_string())?;
-            for row in rows {
-                if let Ok(Some(v)) = row {
-                    out.push(v);
-                }
-            }
+            out.extend(rows.flatten().flatten());
         }
     }
     Ok(out)

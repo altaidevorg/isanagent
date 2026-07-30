@@ -1696,7 +1696,7 @@ mod tests {
 
     fn sign_for_test(secret: &str, timestamp: &str, body: &[u8]) -> String {
         let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
-        mac.update(format!("v0:{}:", timestamp).as_bytes());
+        mac.update(format!("v0:{timestamp}:").as_bytes());
         mac.update(body);
         format!("v0={}", hex::encode(mac.finalize().into_bytes()))
     }

@@ -2381,8 +2381,7 @@ impl AgentLogic {
         {
             ToolExecutionFinished::Completed(result) => result.into_legacy_result(),
             ToolExecutionFinished::Waiting(ticket_id) => Err(format!(
-                "tool call waiting for clarification ticket: {}",
-                ticket_id
+                "tool call waiting for clarification ticket: {ticket_id}"
             )),
             ToolExecutionFinished::Cancelled => {
                 Err("tool call cancelled without cancellation token".to_string())
@@ -5018,7 +5017,7 @@ mod tests {
             let request = axum::http::Request::builder()
                 .method("POST")
                 .uri(parsed_url.path())
-                .header("authorization", format!("Bearer {}", token))
+                .header("authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .map_err(|error| error.to_string())?;
             let response = self
