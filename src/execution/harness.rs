@@ -65,8 +65,7 @@ impl ExecutionHarness {
     ) -> Self {
         debug_assert!(
             providers.contains_key(&default_provider_id),
-            "default_provider_id {} must be a key in providers",
-            default_provider_id
+            "default_provider_id {default_provider_id} must be a key in providers"
         );
         Self {
             providers,

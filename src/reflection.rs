@@ -71,14 +71,14 @@ impl ReflectionEngine {
             if let Err(e) = self.run_short_term_reflection().await {
                 let _ = self.logger_tx.send(BusMessage::Log(LogEvent::error(
                     "ReflectionEngine",
-                    &format!("Short-term reflection failed: {}", e),
+                    &format!("Short-term reflection failed: {e}"),
                 )));
             }
 
             if let Err(e) = self.run_long_term_reflection().await {
                 let _ = self.logger_tx.send(BusMessage::Log(LogEvent::error(
                     "ReflectionEngine",
-                    &format!("Long-term reflection failed: {}", e),
+                    &format!("Long-term reflection failed: {e}"),
                 )));
             }
         }
@@ -127,8 +127,7 @@ impl ReflectionEngine {
                 LogEvent::debug(
                     "ReflectionEngine",
                     &format!(
-                        "Thread {} reached short-term reflection threshold (idle)",
-                        session_id
+                        "Thread {session_id} reached short-term reflection threshold (idle)"
                     ),
                 )
                 .with_chat_id(&session_id),
@@ -221,7 +220,7 @@ impl ReflectionEngine {
                         let _ = self.logger_tx.send(BusMessage::Log(
                             LogEvent::info(
                                 "ReflectionEngine",
-                                &format!("Generated short-term summary for thread {}", session_id),
+                                &format!("Generated short-term summary for thread {session_id}"),
                             )
                             .with_chat_id(&session_id),
                         ));
@@ -231,7 +230,7 @@ impl ReflectionEngine {
                     let _ = self.logger_tx.send(BusMessage::Log(
                         LogEvent::error(
                             "ReflectionEngine",
-                            &format!("Failed to call provider for reflection: {}", e),
+                            &format!("Failed to call provider for reflection: {e}"),
                         )
                         .with_chat_id(&session_id),
                     ));
@@ -286,8 +285,7 @@ impl ReflectionEngine {
             "You are consolidating the agent's long-term memory. Below is the current MEMORY.md content, and a list of recent conversation summaries.\n\
             Rewrite the long-term memory to incorporate any new facts, user preferences, project context, or relationships found in the summaries.\n\
             Maintain a structured, organized markdown document.\n\n\
-            CURRENT MEMORY:\n{}\n\nRECENT SUMMARIES:\n{}",
-            current_memory, summaries_content
+            CURRENT MEMORY:\n{current_memory}\n\nRECENT SUMMARIES:\n{summaries_content}"
         );
 
         let context = vec![ChatMessage::user(&prompt)];

@@ -570,7 +570,7 @@ where
             sender: target.sender.clone(),
         };
         if let Err(e) = self.sender.send(msg).await {
-            log::error!("Failed to wire successor: {}", e);
+            log::error!("Failed to wire successor: {e}");
         }
     }
 
@@ -640,7 +640,7 @@ where
                 sender: target_sender,
             };
             if let Err(e) = source_sender.send(msg).await {
-                error!("Failed to wire successor: {}", e);
+                error!("Failed to wire successor: {e}");
             }
         });
 

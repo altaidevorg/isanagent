@@ -100,7 +100,7 @@ impl AgentRegistry {
                 }
             };
             let iter_hint = match m.max_iterations {
-                Some(n) => format!(", max {} iterations", n),
+                Some(n) => format!(", max {n} iterations"),
                 None => String::new(),
             };
             s.push_str(&format!(

@@ -490,13 +490,13 @@ impl Channel for ApiChannel {
             "ApiChannel",
             "Starting API channel...",
         )));
-        let addr = format!("{}:{}", resolved_bind, port);
+        let addr = format!("{resolved_bind}:{port}");
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
-            .map_err(|e| format!("Failed to bind API port on {}: {}", addr, e))?;
+            .map_err(|e| format!("Failed to bind API port on {addr}: {e}"))?;
         let _ = logger_tx.send(BusMessage::Log(LogEvent::info(
             "ApiChannel",
-            &format!("API channel listening on http://{}", addr),
+            &format!("API channel listening on http://{addr}"),
         )));
 
         let handle = tokio::spawn(async move {
@@ -509,7 +509,7 @@ impl Channel for ApiChannel {
                 }
             });
             if let Err(e) = server.await {
-                error!("API server crashed: {}", e);
+                error!("API server crashed: {e}");
             }
         });
         *self
@@ -566,8 +566,7 @@ impl Channel for ApiChannel {
                                 LogEvent::error(
                                     "ApiChannel",
                                     &format!(
-                                        "Failed to persist streaming response {}: {}",
-                                        response_id, e
+                                        "Failed to persist streaming response {response_id}: {e}"
                                     ),
                                 )
                                 .with_chat_id(&thread_id),
@@ -576,8 +575,7 @@ impl Channel for ApiChannel {
                                 message: "Failed to persist response state.".to_string(),
                             }) {
                                 error!(
-                                    "Failed to send stream error after persist failure: {}",
-                                    send_err
+                                    "Failed to send stream error after persist failure: {send_err}"
                                 );
                             }
                             return Ok(());
@@ -589,8 +587,7 @@ impl Channel for ApiChannel {
                         LogEvent::info(
                             "ApiChannel",
                             &format!(
-                                "Streaming responses request completed with response_id {}",
-                                response_id
+                                "Streaming responses request completed with response_id {response_id}"
                             ),
                         )
                         .with_chat_id(&thread_id),
@@ -600,14 +597,13 @@ impl Channel for ApiChannel {
                         thread_id,
                         response_id,
                     }) {
-                        error!("Failed to send completion to stream: {}", e);
+                        error!("Failed to send completion to stream: {e}");
                     }
                 }
             }
         } else {
             error!(
-                "ApiChannel: No pending request found for chat_id: {}",
-                chat_id
+                "ApiChannel: No pending request found for chat_id: {chat_id}"
             );
         }
         Ok(())
@@ -635,7 +631,7 @@ impl ApiChannel {
                             args,
                             tool_call_id,
                         }) {
-                            error!("Failed to send tool_call_started to stream: {}", e);
+                            error!("Failed to send tool_call_started to stream: {e}");
                         }
                     }
                 }
@@ -654,7 +650,7 @@ impl ApiChannel {
                             message,
                             tool_call_id,
                         }) {
-                            error!("Failed to send tool_progress to stream: {}", e);
+                            error!("Failed to send tool_progress to stream: {e}");
                         }
                     }
                 }
@@ -675,7 +671,7 @@ impl ApiChannel {
                             is_error,
                             tool_call_id,
                         }) {
-                            error!("Failed to send tool_call_finished to stream: {}", e);
+                            error!("Failed to send tool_call_finished to stream: {e}");
                         }
                     }
                 }
@@ -689,7 +685,7 @@ impl ApiChannel {
                             .stream_tx
                             .try_send(StreamEvent::AgentThought { thought })
                         {
-                            error!("Failed to send agent_thought to stream: {}", e);
+                            error!("Failed to send agent_thought to stream: {e}");
                         }
                     }
                 }
@@ -812,7 +808,7 @@ async fn handle_ui_index() -> Response {
 }
 
 async fn handle_ui_asset(AxumPath(asset_path): AxumPath<String>) -> Response {
-    let asset_key = format!("assets/{}", asset_path);
+    let asset_key = format!("assets/{asset_path}");
     match find_ui_asset(&asset_key) {
         Some(asset) => ui_asset_response(asset),
         None => StatusCode::NOT_FOUND.into_response(),
@@ -879,8 +875,7 @@ async fn handle_mte_cron_webhook(
                 LogEvent::error(
                     "ApiChannel",
                     &format!(
-                        "Failed to process multi-tenant-edge cron webhook for job {}: {}",
-                        job_id, error
+                        "Failed to process multi-tenant-edge cron webhook for job {job_id}: {error}"
                     ),
                 ),
             );
@@ -1040,8 +1035,7 @@ async fn handle_responses(
                                 LogEvent::debug(
                                     "ApiChannel",
                                     &format!(
-                                        "Loaded response state from DB for previous_response_id {}",
-                                        previous_response_id
+                                        "Loaded response state from DB for previous_response_id {previous_response_id}"
                                     ),
                                 ),
                             );
@@ -1053,15 +1047,14 @@ async fn handle_responses(
                                 LogEvent::warn(
                                     "ApiChannel",
                                     &format!(
-                                    "Responses request referenced unknown previous_response_id {}",
-                                    previous_response_id
+                                    "Responses request referenced unknown previous_response_id {previous_response_id}"
                                 ),
                                 ),
                             );
                             return ApiError::new(
                                 StatusCode::NOT_FOUND,
                                 "previous_response_not_found",
-                                format!("Unknown previous_response_id: {}", previous_response_id),
+                                format!("Unknown previous_response_id: {previous_response_id}"),
                             )
                             .into_response();
                         }
@@ -1071,8 +1064,7 @@ async fn handle_responses(
                                 LogEvent::error(
                                     "ApiChannel",
                                     &format!(
-                                        "Failed to load response state for {}: {}",
-                                        previous_response_id, e
+                                        "Failed to load response state for {previous_response_id}: {e}"
                                     ),
                                 ),
                             );
@@ -1173,7 +1165,7 @@ async fn handle_responses(
             return ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "agent_queue_unavailable",
-                format!("Failed to enqueue request: {}", e),
+                format!("Failed to enqueue request: {e}"),
             )
             .into_response();
         }
@@ -1183,7 +1175,7 @@ async fn handle_responses(
                 match serde_json::to_string(&event) {
                     Ok(json) => yield Ok::<Event, std::convert::Infallible>(Event::default().data(json)),
                     Err(e) => {
-                        error!("Failed to serialize stream event: {}", e);
+                        error!("Failed to serialize stream event: {e}");
                     }
                 }
             }
@@ -1222,7 +1214,7 @@ async fn handle_responses(
                 &state.logger_tx,
                 LogEvent::error(
                     "ApiChannel",
-                    &format!("Failed to persist response {}: {}", response_id, e),
+                    &format!("Failed to persist response {response_id}: {e}"),
                 )
                 .with_chat_id(&conv_thread_id),
             );
@@ -1241,8 +1233,7 @@ async fn handle_responses(
         LogEvent::info(
             "ApiChannel",
             &format!(
-                "Responses request completed with response_id {}",
-                response_id
+                "Responses request completed with response_id {response_id}"
             ),
         )
         .with_chat_id(&conv_thread_id),
@@ -1306,7 +1297,7 @@ async fn dispatch_agent_turn(
             &state.logger_tx,
             LogEvent::error(
                 "ApiChannel",
-                &format!("API handler failed to send inbound message: {}", e),
+                &format!("API handler failed to send inbound message: {e}"),
             )
             .with_chat_id(&chat_id),
         );
@@ -1467,7 +1458,7 @@ fn collect_input_parts(
             // Handle explicit content part objects (type: "text" / "image_url")
             if let Some(kind) = map.get("type").and_then(Value::as_str) {
                 return collect_content_parts(value, text_segments, attachments)
-                    .map_err(|_| format!("Unsupported content part type: {}", kind));
+                    .map_err(|_| format!("Unsupported content part type: {kind}"));
             }
 
             // Convenience: objects with a top-level `text` field
@@ -1531,7 +1522,7 @@ fn truncate_chat_preview(text: &str) -> String {
     let mut iter = line.chars();
     let chunk: String = iter.by_ref().take(56).collect();
     if iter.next().is_some() {
-        format!("{}…", chunk)
+        format!("{chunk}…")
     } else {
         chunk
     }
@@ -1608,7 +1599,7 @@ fn resolve_memory_thread_id<'a>(state: &ApiState, raw: &'a str) -> Cow<'a, str> 
         if s.ends_with(':') {
             Cow::Borrowed(s)
         } else {
-            Cow::Owned(format!("{}:", s))
+            Cow::Owned(format!("{s}:"))
         }
     } else {
         // Extract the bare ID by taking the last non-empty colon-delimited segment.
@@ -1616,7 +1607,7 @@ fn resolve_memory_thread_id<'a>(state: &ApiState, raw: &'a str) -> Cow<'a, str> 
         // and re-qualifies it with the current channel, preventing cross-channel
         // history access.
         let id = s.rsplit(':').find(|seg| !seg.is_empty()).unwrap_or(s);
-        Cow::Owned(format!("{}{}:", prefix, id))
+        Cow::Owned(format!("{prefix}{id}:"))
     }
 }
 
@@ -1712,7 +1703,7 @@ async fn handle_list_threads(
                         vec![None; rows.len()]
                     }
                     Err(e) => {
-                        error!("thread list preview batch failed: {}", e);
+                        error!("thread list preview batch failed: {e}");
                         vec![None; rows.len()]
                     }
                 };
@@ -2178,7 +2169,7 @@ async fn handle_workspace_file(
         return ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
             "file_too_large",
-            format!("File is {len} bytes (max {}).", WORKSPACE_FILE_MAX_BYTES),
+            format!("File is {len} bytes (max {WORKSPACE_FILE_MAX_BYTES})."),
         )
         .into_response();
     }
@@ -2548,7 +2539,7 @@ async fn handle_clarification_ticket_reply(
         return ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "agent_queue_unavailable",
-            format!("Failed to enqueue ticket response: {}", e),
+            format!("Failed to enqueue ticket response: {e}"),
         )
         .into_response();
     }

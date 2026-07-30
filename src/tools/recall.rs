@@ -70,11 +70,11 @@ impl Tool for RecallToolResultTool {
                 reply: SharedReply::new(tx),
             })
             .await
-            .map_err(|e| format!("memory bus send: {}", e))?;
+            .map_err(|e| format!("memory bus send: {e}"))?;
         let fetched = rx
             .await
             .map_err(|_| "memory actor channel closed".to_string())?
-            .map_err(|e| format!("fetch tool result: {}", e))?;
+            .map_err(|e| format!("fetch tool result: {e}"))?;
 
         match fetched {
             Some(full_content) => {

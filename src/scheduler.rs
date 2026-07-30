@@ -175,7 +175,7 @@ impl CronStore {
 
     pub fn insert_job(&self, job: &ActiveJob) -> Result<(), String> {
         let schedule_json = serde_json::to_string(&job.schedule)
-            .map_err(|e| format!("Failed to serialize schedule: {}", e))?;
+            .map_err(|e| format!("Failed to serialize schedule: {e}"))?;
         let conn = self.lock_conn()?;
         conn.execute(
             "INSERT INTO cron_jobs (
@@ -336,8 +336,7 @@ impl CronStore {
             .map_err(|e| e.to_string())?;
         if deleted == 0 {
             return Err(format!(
-                "Failed to finalize multi-tenant-edge one-shot cron job {} because its claim was no longer valid",
-                job_id
+                "Failed to finalize multi-tenant-edge one-shot cron job {job_id} because its claim was no longer valid"
             ));
         }
         Ok(())
@@ -362,8 +361,7 @@ impl CronStore {
             .map_err(|e| e.to_string())?;
         if updated == 0 {
             return Err(format!(
-                "Failed to mark multi-tenant-edge one-shot cron job {} as delivered because its claim was no longer valid",
-                job_id
+                "Failed to mark multi-tenant-edge one-shot cron job {job_id} as delivered because its claim was no longer valid"
             ));
         }
         Ok(())
@@ -376,7 +374,7 @@ impl CronStore {
         retry_at_ms: i64,
     ) -> Result<(), String> {
         let schedule_json = serde_json::to_string(&ScheduleKind::At { at_ms: retry_at_ms })
-            .map_err(|e| format!("Failed to serialize one-shot retry schedule: {}", e))?;
+            .map_err(|e| format!("Failed to serialize one-shot retry schedule: {e}"))?;
         let conn = self.lock_conn()?;
         let updated = conn
             .execute(
@@ -388,8 +386,7 @@ impl CronStore {
             .map_err(|e| e.to_string())?;
         if updated == 0 {
             return Err(format!(
-                "Failed to reschedule multi-tenant-edge one-shot cron job {} because its claim was no longer valid",
-                job_id
+                "Failed to reschedule multi-tenant-edge one-shot cron job {job_id} because its claim was no longer valid"
             ));
         }
         Ok(())
@@ -411,7 +408,7 @@ impl CronStore {
     ) -> Result<bool, String> {
         let conn = self.lock_conn()?;
 
-        let full_job_id = format!("cron:{}", job_id);
+        let full_job_id = format!("cron:{job_id}");
         let existing_state: Option<String> = conn
             .query_row(
                 "SELECT state FROM background_jobs WHERE job_id = ?1",
@@ -441,7 +438,7 @@ impl CronStore {
             ON CONFLICT(job_id) DO UPDATE SET
                 state = 'running', payload_json = excluded.payload_json, updated_at_ms = excluded.updated_at_ms",
             params![full_job_id, chat_id, channel, payload, now_ms],
-        ).map_err(|e| format!("insert background_jobs from cron: {}", e))?;
+        ).map_err(|e| format!("insert background_jobs from cron: {e}"))?;
         conn.execute(
             "INSERT INTO notifications (
                 notification_id, chat_id, channel, thread_id, kind, title, body, action_kind, action_payload,
@@ -456,7 +453,7 @@ impl CronStore {
                 serde_json::json!({"job_id": full_job_id}).to_string(),
                 now_ms
             ],
-        ).map_err(|e| format!("insert notifications from cron: {}", e))?;
+        ).map_err(|e| format!("insert notifications from cron: {e}"))?;
         Ok(true)
     }
 }
@@ -619,17 +616,15 @@ impl PendingCronTrigger {
                     (None, None) => Ok(PendingCronTriggerFinalize::Completed),
                     (Some(cleanup), None) => Ok(PendingCronTriggerFinalize::CompletedWithWarning(
                         format!(
-                            "Failed to clean up completed one-shot cron job {} after delivery: {}",
-                            job_id, cleanup
+                            "Failed to clean up completed one-shot cron job {job_id} after delivery: {cleanup}"
                         ),
                     )),
                     (None, Some(sync)) => Ok(PendingCronTriggerFinalize::CompletedWithWarning(
-                        format!("Failed to resync edge rules afterward: {}", sync),
+                        format!("Failed to resync edge rules afterward: {sync}"),
                     )),
                     (Some(cleanup), Some(sync)) => Ok(
                         PendingCronTriggerFinalize::CompletedWithWarning(format!(
-                            "Failed to clean up completed one-shot cron job {} after delivery: {}. Failed to resync edge rules afterward: {}",
-                            job_id, cleanup, sync
+                            "Failed to clean up completed one-shot cron job {job_id} after delivery: {cleanup}. Failed to resync edge rules afterward: {sync}"
                         )),
                     ),
                 }
@@ -716,7 +711,7 @@ impl ActorLogic<String> for CronActor {
                 self.store.insert_job(&job).map_err(ActorError::from)?;
                 if let ScheduleKind::Cron { ref cron_expr } = schedule {
                     let parsed_schedule = Schedule::from_str(cron_expr).map_err(|error| {
-                        ActorError::from(format!("Invalid cron expression: {}", error))
+                        ActorError::from(format!("Invalid cron expression: {error}"))
                     })?;
                     self.cron_schedule_cache
                         .insert(cron_expr.clone(), parsed_schedule);
@@ -727,7 +722,7 @@ impl ActorLogic<String> for CronActor {
                     self.logger_tx
                         .send(crate::bus::BusMessage::Log(crate::bus::LogEvent::info(
                             &self.name,
-                            &format!("Added job '{}' with schedule {:?}", id, schedule),
+                            &format!("Added job '{id}' with schedule {schedule:?}"),
                         )));
             }
             CronCommand::Remove { id } => {
@@ -748,7 +743,7 @@ impl ActorLogic<String> for CronActor {
                     self.logger_tx
                         .send(crate::bus::BusMessage::Log(crate::bus::LogEvent::info(
                             &self.name,
-                            &format!("Removed job '{}'", id),
+                            &format!("Removed job '{id}'"),
                         )));
             }
             CronCommand::Reload => {
@@ -879,8 +874,7 @@ impl ActorLogic<String> for CronActor {
         for job_id in jobs_to_remove {
             if let Err(error) = self.store.remove_job(&job_id) {
                 self.log_error(format!(
-                    "Failed to remove expired one-shot cron job {}: {}",
-                    job_id, error
+                    "Failed to remove expired one-shot cron job {job_id}: {error}"
                 ));
             }
         }
@@ -930,7 +924,7 @@ impl ActorLogic<String> for CronActor {
                     let _ = self.logger_tx.send(crate::bus::BusMessage::Log(
                         crate::bus::LogEvent::info(
                             &self.name,
-                            &format!("Fired local cron job {}", job_id),
+                            &format!("Fired local cron job {job_id}"),
                         ),
                     ));
                 }
@@ -939,8 +933,7 @@ impl ActorLogic<String> for CronActor {
                 }
                 Err(error) => {
                     self.log_error(format!(
-                        "Failed to record cron background job for {}: {}",
-                        job_id, error
+                        "Failed to record cron background job for {job_id}: {error}"
                     ));
                 }
             }
@@ -1004,7 +997,7 @@ pub fn validate_multi_tenant_edge_schedule(
 pub fn validate_cron_expression(expr: &str) -> Result<(), String> {
     Schedule::from_str(expr)
         .map(|_| ())
-        .map_err(|error| format!("Invalid cron expression: {}", error))
+        .map_err(|error| format!("Invalid cron expression: {error}"))
 }
 
 pub fn is_six_field_cron_expr(expr: &str) -> bool {
@@ -1044,7 +1037,7 @@ fn build_multi_tenant_edge_cron_rule(
 
 fn at_schedule_to_utc_cron(at_ms: i64) -> Result<String, String> {
     let at = DateTime::<Utc>::from_timestamp_millis(at_ms)
-        .ok_or_else(|| format!("Invalid one-shot 'at' timestamp in cron job: {}", at_ms))?;
+        .ok_or_else(|| format!("Invalid one-shot 'at' timestamp in cron job: {at_ms}"))?;
     Ok(format!(
         "{} {} {} {} {} *",
         at.second(),
@@ -1056,7 +1049,7 @@ fn at_schedule_to_utc_cron(at_ms: i64) -> Result<String, String> {
 }
 
 fn webhook_path(job_id: &str, token: &str) -> String {
-    format!("{}/{}/{}", WEBHOOK_PATH_PREFIX, job_id, token)
+    format!("{WEBHOOK_PATH_PREFIX}/{job_id}/{token}")
 }
 
 fn decode_schedule(schedule_json: &str) -> Result<ScheduleKind, rusqlite::Error> {

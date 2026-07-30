@@ -31,8 +31,7 @@ fn normalize_todo_status(s: &str) -> Result<(), String> {
     match s {
         "pending" | "in_progress" | "completed" => Ok(()),
         _ => Err(format!(
-            "Invalid status {:?}; use pending, in_progress, or completed.",
-            s
+            "Invalid status {s:?}; use pending, in_progress, or completed."
         )),
     }
 }
@@ -129,13 +128,13 @@ impl Tool for TodoWriteTool {
             let content = item
                 .get("content")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| format!("items[{}]: missing content", i))?
+                .ok_or_else(|| format!("items[{i}]: missing content"))?
                 .to_string();
             let status_raw = item
                 .get("status")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| format!("items[{}]: missing status", i))?;
-            normalize_todo_status(status_raw).map_err(|e| format!("items[{}]: {}", i, e))?;
+                .ok_or_else(|| format!("items[{i}]: missing status"))?;
+            normalize_todo_status(status_raw).map_err(|e| format!("items[{i}]: {e}"))?;
             rows.push(TodoRow {
                 content,
                 status: status_raw.to_string(),
@@ -151,10 +150,10 @@ impl Tool for TodoWriteTool {
                 reply: SharedReply::new(tx),
             })
             .await
-            .map_err(|e| format!("todo_write: memory actor: {}", e))?;
+            .map_err(|e| format!("todo_write: memory actor: {e}"))?;
         rx.await
             .map_err(|_| "Memory actor channel closed".to_string())?
-            .map_err(|e| format!("Failed to save todos: {}", e))?;
+            .map_err(|e| format!("Failed to save todos: {e}"))?;
         Ok(summary)
     }
 }
@@ -206,7 +205,7 @@ impl Tool for ToolSearchTool {
         let entries = self
             .catalog
             .read()
-            .map_err(|e| format!("catalog lock: {}", e))?
+            .map_err(|e| format!("catalog lock: {e}"))?
             .clone();
 
         let hits = search_tool_index(&entries, query, limit);
@@ -224,8 +223,7 @@ impl Tool for ToolSearchTool {
             let snippet: String = desc.chars().take(160).collect();
             let ellipses = if desc.len() > 160 { "…" } else { "" };
             out.push_str(&format!(
-                "- **{}** (score {})\n  {}{}\n\n",
-                name, score, snippet, ellipses
+                "- **{name}** (score {score})\n  {snippet}{ellipses}\n\n"
             ));
         }
         Ok(out.trim_end().to_string())
@@ -368,10 +366,10 @@ impl Tool for AskUserTool {
             for (i, v) in arr.iter().enumerate() {
                 let s = v
                     .as_str()
-                    .ok_or_else(|| format!("choices[{}]: expected string", i))?
+                    .ok_or_else(|| format!("choices[{i}]: expected string"))?
                     .trim();
                 if s.is_empty() {
-                    return Err(format!("choices[{}]: must be non-empty", i));
+                    return Err(format!("choices[{i}]: must be non-empty"));
                 }
                 choices.push(s.to_string());
             }
@@ -409,7 +407,7 @@ impl Tool for AskUserTool {
                             } else {
                                 Some(
                                     serde_json::to_string(&choices)
-                                        .map_err(|e| format!("serialize choices: {}", e))?,
+                                        .map_err(|e| format!("serialize choices: {e}"))?,
                                 )
                             },
                             response: None,
@@ -420,10 +418,10 @@ impl Tool for AskUserTool {
                         reply: SharedReply::new(tx),
                     })
                     .await
-                    .map_err(|e| format!("clarification ticket enqueue: {}", e))?;
+                    .map_err(|e| format!("clarification ticket enqueue: {e}"))?;
                 rx.await
                     .map_err(|_| "clarification ticket actor channel closed".to_string())?
-                    .map_err(|e| format!("clarification ticket: {}", e))?;
+                    .map_err(|e| format!("clarification ticket: {e}"))?;
 
                 let notification_id = uuid::Uuid::new_v4().to_string();
                 let (ntx, nrx) = tokio::sync::oneshot::channel();
@@ -446,10 +444,10 @@ impl Tool for AskUserTool {
                         reply: SharedReply::new(ntx),
                     })
                     .await
-                    .map_err(|e| format!("notification enqueue: {}", e))?;
+                    .map_err(|e| format!("notification enqueue: {e}"))?;
                 nrx.await
                     .map_err(|_| "notification actor channel closed".to_string())?
-                    .map_err(|e| format!("notification: {}", e))?;
+                    .map_err(|e| format!("notification: {e}"))?;
                 let _ = self
                     .outbound_tx
                     .send(BusMessage::Telemetry(
@@ -490,15 +488,14 @@ impl Tool for AskUserTool {
                 chat_id: ctx.chat_id.clone(),
                 thread_id: ctx.thread_id.clone(),
                 content: format!(
-                    "Background task needs input and has been paused.\n\nQuestion: {}\nTicket: {}",
-                    prompt, ticket_id
+                    "Background task needs input and has been paused.\n\nQuestion: {prompt}\nTicket: {ticket_id}"
                 ),
                 metadata,
             };
             self.outbound_tx
                 .send(BusMessage::Outbound(outbound))
                 .await
-                .map_err(|e| format!("failed to send clarification ticket notification: {}", e))?;
+                .map_err(|e| format!("failed to send clarification ticket notification: {e}"))?;
 
             // Update job state to waiting
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -560,7 +557,7 @@ impl Tool for AskUserTool {
         self.outbound_tx
             .send(BusMessage::Outbound(outbound))
             .await
-            .map_err(|e| format!("failed to send clarification prompt: {}", e))?;
+            .map_err(|e| format!("failed to send clarification prompt: {e}"))?;
 
         let reply = match timeout_secs {
             Some(timeout_secs) => {
@@ -568,8 +565,7 @@ impl Tool for AskUserTool {
                 match tokio::time::timeout(wait, rx).await {
                     Err(_) => {
                         return Err(format!(
-                            "Timed out after {}s waiting for a user reply to ask_user.",
-                            timeout_secs
+                            "Timed out after {timeout_secs}s waiting for a user reply to ask_user."
                         ));
                     }
                     Ok(Err(_)) => {
@@ -603,14 +599,13 @@ impl Tool for AskUserTool {
                 Some(s) => s,
                 None => {
                     return Ok(format!(
-                        "User reply (not among listed choices): {}\n\nListed options were: {:?}",
-                        reply, choices
+                        "User reply (not among listed choices): {reply}\n\nListed options were: {choices:?}"
                     ));
                 }
             }
         };
 
-        Ok(format!("User reply:\n{}", canonical_reply))
+        Ok(format!("User reply:\n{canonical_reply}"))
     }
 }
 

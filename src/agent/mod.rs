@@ -87,7 +87,7 @@ async fn persist_terminal_assistant_message(
         let _ = logger_tx.send(BusMessage::Log(
             LogEvent::warn(
                 name,
-                &format!("Failed to persist terminal assistant message: {}", e),
+                &format!("Failed to persist terminal assistant message: {e}"),
             )
             .with_chat_id(chat_id),
         ));
@@ -440,7 +440,7 @@ fn should_require_shell_approval(command: &str, patterns: &[String]) -> bool {
         if np.is_empty() {
             return false;
         }
-        normalized.contains(&format!(" {} ", np))
+        normalized.contains(&format!(" {np} "))
     })
 }
 
@@ -956,7 +956,7 @@ async fn log_tool_invocation_start(
     let tool_name = &tc.function.name;
     let args_str = &tc.function.arguments;
     let _ = logger_tx.send(BusMessage::Log(
-        LogEvent::info(agent_name, &format!("Invoking tool: {}", tool_name))
+        LogEvent::info(agent_name, &format!("Invoking tool: {tool_name}"))
             .with_chat_id(&inbound.chat_id),
     ));
     let _ = outbound_tx
@@ -1104,8 +1104,7 @@ async fn execute_tool_call_with_activity(
                             return ToolExecutionFinished::error(
                                 ToolErrorCode::PolicyDenied,
                                 format!(
-                                    "Command blocked by shell policy (mode=deny): {}",
-                                    command
+                                    "Command blocked by shell policy (mode=deny): {command}"
                                 ),
                             );
                         }
@@ -1212,7 +1211,7 @@ async fn execute_tool_call_with_activity(
                                 Err(e) => {
                                     return ToolExecutionFinished::error(
                                         ToolErrorCode::ExecutionFailed,
-                                        format!("Shell policy approval failed: {}", e),
+                                        format!("Shell policy approval failed: {e}"),
                                     );
                                 }
                             }
@@ -1747,7 +1746,7 @@ fn spawn_main_chat_reasoning_turn(
         let _ = logger_tx.send(BusMessage::Log(
             LogEvent::debug(
                 &agent_name,
-                &format!("Spawning reasoning task for chat_id: {}", task_chat_id),
+                &format!("Spawning reasoning task for chat_id: {task_chat_id}"),
             )
             .with_chat_id(&task_chat_id),
         ));
@@ -1839,8 +1838,7 @@ fn spawn_main_chat_reasoning_turn(
                     LogEvent::info(
                         &agent_name,
                         &format!(
-                            "Reasoning task for chat_id {} finished via cancellation.",
-                            task_chat_id
+                            "Reasoning task for chat_id {task_chat_id} finished via cancellation."
                         ),
                     )
                     .with_chat_id(&task_chat_id),
@@ -1851,8 +1849,7 @@ fn spawn_main_chat_reasoning_turn(
                     LogEvent::debug(
                         &agent_name,
                         &format!(
-                            "Reasoning task for chat_id {} finished successfully.",
-                            task_chat_id
+                            "Reasoning task for chat_id {task_chat_id} finished successfully."
                         ),
                     )
                     .with_chat_id(&task_chat_id),
@@ -1863,7 +1860,7 @@ fn spawn_main_chat_reasoning_turn(
                 let _ = logger_tx.send(BusMessage::Log(
                     LogEvent::error(
                         "AgentLogic",
-                        &format!("Reasoning loop panicked for chat_id {}", task_chat_id),
+                        &format!("Reasoning loop panicked for chat_id {task_chat_id}"),
                     )
                     .with_chat_id(&task_chat_id),
                 ));
@@ -2008,7 +2005,7 @@ fn spawn_main_chat_reasoning_turn(
                     let _ = logger_tx.send(BusMessage::Log(
                         LogEvent::error(
                             "AgentLogic",
-                            &format!("Dropping queued inbound without valid run ID: {}", error),
+                            &format!("Dropping queued inbound without valid run ID: {error}"),
                         )
                         .with_chat_id(&task_chat_id),
                     ));
@@ -2409,8 +2406,7 @@ impl AgentLogic {
                 LogEvent::warn(
                     &self.name,
                     &format!(
-                        "Ignored cancellation for chat_id {} because run_id did not match the active run.",
-                        chat_id
+                        "Ignored cancellation for chat_id {chat_id} because run_id did not match the active run."
                     ),
                 )
                 .with_chat_id(chat_id),
@@ -2427,7 +2423,7 @@ impl AgentLogic {
         let _ = self.logger_tx.send(BusMessage::Log(
             LogEvent::info(
                 &self.name,
-                &format!("Cancelled reasoning loop for chat_id: {}", chat_id),
+                &format!("Cancelled reasoning loop for chat_id: {chat_id}"),
             )
             .with_chat_id(chat_id),
         ));
@@ -2500,8 +2496,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 let _ = self.logger_tx.send(BusMessage::Log(LogEvent::info(
                     &self.name,
                     &format!(
-                        "Switched to provider={} model={}",
-                        provider_name, model_name
+                        "Switched to provider={provider_name} model={model_name}"
                     ),
                 )));
                 return Ok(None);
@@ -2531,7 +2526,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                         Err(e) => {
                             let _ = logger_tx.send(BusMessage::Log(LogEvent::error(
                                 &name,
-                                &format!("Failed to install skills from {}: {}", repo_url, e),
+                                &format!("Failed to install skills from {repo_url}: {e}"),
                             )));
                         }
                     }
@@ -2545,7 +2540,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                         let _ = self.logger_tx.send(BusMessage::Log(
                             LogEvent::error(
                                 &self.name,
-                                &format!("Rejecting inbound message: {}", error),
+                                &format!("Rejecting inbound message: {error}"),
                             )
                             .with_chat_id(&inbound.chat_id),
                         ));
@@ -2637,8 +2632,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                         LogEvent::debug(
                             &self.name,
                             &format!(
-                                "Queued inbound for chat_id {} (FIFO) — reasoning already active.",
-                                chat_id
+                                "Queued inbound for chat_id {chat_id} (FIFO) — reasoning already active."
                             ),
                         )
                         .with_chat_id(&chat_id),
@@ -2681,8 +2675,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                     let _ = self.logger_tx.send(BusMessage::Log(LogEvent::warn(
                         &self.name,
                         &format!(
-                            "TriggerCompaction dropped for session_key={}: {}",
-                            session_key, e
+                            "TriggerCompaction dropped for session_key={session_key}: {e}"
                         ),
                     )));
                 }
@@ -2744,16 +2737,14 @@ impl AgentLogic {
             .nth(1)
             .ok_or_else(|| {
                 format!(
-                    "Malformed session_key (expected `channel:chat_id:thread`): {}",
-                    session_key
+                    "Malformed session_key (expected `channel:chat_id:thread`): {session_key}"
                 )
             })?
             .to_string();
 
         if self.cancellation_tokens.contains_key(&chat_id) {
             return Err(format!(
-                "Refusing manual compaction: reasoning turn in flight for chat_id={}",
-                chat_id
+                "Refusing manual compaction: reasoning turn in flight for chat_id={chat_id}"
             ));
         }
 
@@ -2761,11 +2752,11 @@ impl AgentLogic {
             .session_manager
             .get_session(&session_key)
             .await
-            .map_err(|e| format!("get_session({}): {}", session_key, e))?;
+            .map_err(|e| format!("get_session({session_key}): {e}"))?;
         let current_context = mem
             .get_context_since_reflection()
             .await
-            .map_err(|e| format!("get_context_since_reflection({}): {}", session_key, e))?;
+            .map_err(|e| format!("get_context_since_reflection({session_key}): {e}"))?;
         let user_turns = current_context.iter().filter(|m| m.role == "user").count();
         let approx_tokens: usize = estimate_context_tokens(&current_context);
 
@@ -2774,7 +2765,7 @@ impl AgentLogic {
         let prefix = {
             let mut parts = session_key.splitn(3, ':');
             let channel = parts.next().unwrap_or("");
-            format!("{}:{}", channel, chat_id)
+            format!("{channel}:{chat_id}")
         };
         let recent = self
             .session_manager
@@ -2986,11 +2977,11 @@ impl AgentLogic {
                 reply: SharedReply::new(tx),
             })
             .await
-            .map_err(|e| format!("Memory actor error: {}", e))?;
+            .map_err(|e| format!("Memory actor error: {e}"))?;
 
         rx.await
             .map_err(|_| "Memory actor channel closed".to_string())?
-            .map_err(|e| format!("Memory node failed to resolve ticket fully: {}", e))?;
+            .map_err(|e| format!("Memory node failed to resolve ticket fully: {e}"))?;
 
         // 2. Inject tool response into memory
         if let Some(id) = tool_call_id {
@@ -3016,9 +3007,9 @@ impl AgentLogic {
                     tool_name_for_resume.as_deref(),
                 ))
                 .await
-                .map_err(|e| format!("Failed to inject tool response into memory: {}", e))?;
+                .map_err(|e| format!("Failed to inject tool response into memory: {e}"))?;
             } else {
-                return Err(format!("Failed to get session {}", session_key));
+                return Err(format!("Failed to get session {session_key}"));
             }
         }
 
@@ -3628,7 +3619,7 @@ impl AgentLogic {
         let thread_info = inbound
             .thread_id
             .as_deref()
-            .map(|t| format!(", thread: '{}'", t))
+            .map(|t| format!(", thread: '{t}'"))
             .unwrap_or_default();
         let now = chrono::Local::now().to_rfc3339();
         let os_family = std::env::consts::OS;
@@ -3670,7 +3661,7 @@ impl AgentLogic {
         if let Some(v) = inbound.metadata.get("isanagent_autonomous_until") {
             if let Some(s) = v.as_str() {
                 runtime_context
-                    .push_str(&format!(" Autonomous session deadline (RFC3339): '{}'.", s));
+                    .push_str(&format!(" Autonomous session deadline (RFC3339): '{s}'."));
             }
         }
         if forbid_final_effective {
@@ -3701,7 +3692,7 @@ impl AgentLogic {
                         return Err(ReasoningLoopError::protocol(msg));
                     }
                     UserPromptHookOutcome::InjectPrefix(prefix) => {
-                        contextualized_content = format!("{}\n{}", prefix, contextualized_content);
+                        contextualized_content = format!("{prefix}\n{contextualized_content}");
                     }
                     UserPromptHookOutcome::Proceed => {}
                 }
@@ -3787,7 +3778,7 @@ impl AgentLogic {
             let _ = logger_tx.send(BusMessage::Log(
                 LogEvent::debug(
                     &name,
-                    &format!("Iteration {}/{}", iterations, max_iterations),
+                    &format!("Iteration {iterations}/{max_iterations}"),
                 )
                 .with_chat_id(&inbound.chat_id),
             ));
@@ -3921,8 +3912,7 @@ impl AgentLogic {
                 String::new()
             };
             let iteration_line = format!(
-                "\n--- Reasoning budget ---\nYou are on tool/LLM step {} of {} for this user turn.\n",
-                iterations, max_iterations
+                "\n--- Reasoning budget ---\nYou are on tool/LLM step {iterations} of {max_iterations} for this user turn.\n"
             );
             let autonomy_line = if forbid_final_effective {
                 "\n--- Autonomy ---\nDo not finish this step with assistant text only — call tools (or `ask_user` if blocked). If you believe you are done, still run a verification tool (e.g. read_file or execution_env_info) when appropriate.\n"
@@ -3959,8 +3949,7 @@ impl AgentLogic {
                                 LogEvent::warn(
                                     &name,
                                     &format!(
-                                        "Doom loop still active after {} consecutive detections — stopping the run.",
-                                        consecutive_doom_detections
+                                        "Doom loop still active after {consecutive_doom_detections} consecutive detections — stopping the run."
                                     ),
                                 )
                                 .with_chat_id(&inbound.chat_id),

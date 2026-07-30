@@ -47,7 +47,7 @@ pub fn resolve_path(path: &str, workspace_dir: &Path, restrict: bool) -> Result<
     // If it doesn't exist yet (e.g., writing a new file), we canonicalize the nearest existing parent
     // and append the remainder.
     let canonical = if resolved.exists() {
-        std::fs::canonicalize(&resolved).map_err(|e| format!("Path normalization error: {}", e))?
+        std::fs::canonicalize(&resolved).map_err(|e| format!("Path normalization error: {e}"))?
     } else {
         // Find nearest existing parent
         let mut parent = resolved.parent();
@@ -61,7 +61,7 @@ pub fn resolve_path(path: &str, workspace_dir: &Path, restrict: bool) -> Result<
         }
 
         let mut safe_base = std::fs::canonicalize(parent.unwrap_or_else(|| Path::new(".")))
-            .map_err(|e| format!("Base path normalization error: {}", e))?;
+            .map_err(|e| format!("Base path normalization error: {e}"))?;
 
         for comp in missing_components.into_iter().rev() {
             safe_base.push(comp);
@@ -75,7 +75,7 @@ pub fn resolve_path(path: &str, workspace_dir: &Path, restrict: bool) -> Result<
     // 3. Enforce sandbox boundary if restricted.
     if restrict {
         let canonical_workspace = std::fs::canonicalize(workspace_dir)
-            .map_err(|e| format!("Workspace normalization error: {}", e))?;
+            .map_err(|e| format!("Workspace normalization error: {e}"))?;
 
         if !canonical.starts_with(&canonical_workspace) {
             return Err(format!(
@@ -345,7 +345,7 @@ impl Tool for WriteFileTool {
 
         if let Some(parent) = actual_path.parent() {
             fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create parent directories: {}", e))?;
+                .map_err(|e| format!("Failed to create parent directories: {e}"))?;
         }
 
         crate::checkpoint::snapshot_before(&actual_path, "write_file");
@@ -475,7 +475,7 @@ impl Tool for EditFileTool {
         let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
 
         let content =
-            fs::read_to_string(&actual_path).map_err(|e| format!("Error reading file: {}", e))?;
+            fs::read_to_string(&actual_path).map_err(|e| format!("Error reading file: {e}"))?;
 
         if !content.contains(old_text) {
             return Ok("Error: old_text not found in file.".to_string());
@@ -484,8 +484,7 @@ impl Tool for EditFileTool {
         let count = content.matches(old_text).count();
         if count > 1 && !replace_all {
             return Ok(format!(
-                "Error: old_text appears {} times. Provide more surrounding context to make it unique, or set replace_all to true.",
-                count
+                "Error: old_text appears {count} times. Provide more surrounding context to make it unique, or set replace_all to true."
             ));
         }
 
@@ -497,7 +496,7 @@ impl Tool for EditFileTool {
         };
 
         crate::checkpoint::snapshot_before(&actual_path, "edit_file");
-        fs::write(&actual_path, &new_content).map_err(|e| format!("Error saving edits: {}", e))?;
+        fs::write(&actual_path, &new_content).map_err(|e| format!("Error saving edits: {e}"))?;
 
         let diff = unified_diff_snippet(&old_content, &new_content);
         let replacements = if replace_all { count } else { 1 };
@@ -620,7 +619,7 @@ impl Tool for ListDirTool {
 
         let mut entries = match fs::read_dir(&actual_path) {
             Ok(iter) => iter,
-            Err(e) => return Ok(format!("Error reading dir: {}", e)),
+            Err(e) => return Ok(format!("Error reading dir: {e}")),
         };
 
         let mut items = Vec::new();
@@ -657,12 +656,12 @@ fn compile_glob_single(pattern: &str) -> Result<GlobSet, String> {
     let glob = GlobBuilder::new(pattern)
         .literal_separator(true)
         .build()
-        .map_err(|e| format!("Invalid glob pattern: {}", e))?;
+        .map_err(|e| format!("Invalid glob pattern: {e}"))?;
     let mut builder = GlobSetBuilder::new();
     builder.add(glob);
     builder
         .build()
-        .map_err(|e| format!("Invalid glob pattern: {}", e))
+        .map_err(|e| format!("Invalid glob pattern: {e}"))
 }
 
 #[async_trait]
@@ -764,8 +763,7 @@ impl Tool for GlobFilesTool {
 
         if truncated {
             out.push_str(&format!(
-                "\n... (glob results capped at {} paths; refine the pattern or base path)",
-                MAX_GLOB_RESULTS
+                "\n... (glob results capped at {MAX_GLOB_RESULTS} paths; refine the pattern or base path)"
             ));
         }
 
@@ -825,8 +823,8 @@ async fn search_text_ripgrep(
     let fut = cmd.output();
     let output = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut)
         .await
-        .map_err(|_| format!("Search timed out after {} seconds.", timeout_secs))?
-        .map_err(|e| format!("Failed to run ripgrep: {}", e))?;
+        .map_err(|_| format!("Search timed out after {timeout_secs} seconds."))?
+        .map_err(|e| format!("Failed to run ripgrep: {e}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let code = output.status.code();
@@ -840,7 +838,7 @@ async fn search_text_ripgrep(
         if stderr.is_empty() {
             return Ok("No matches found.".to_string());
         }
-        return Err(format!("ripgrep error: {}", stderr));
+        return Err(format!("ripgrep error: {stderr}"));
     }
 
     if stdout.is_empty() {
@@ -860,8 +858,7 @@ fn truncate_search_output(mut s: String) -> String {
     }
     s.truncate(end);
     s.push_str(&format!(
-        "\n... (truncated, output exceeded {} characters)",
-        MAX_SEARCH_TEXT_CHARS
+        "\n... (truncated, output exceeded {MAX_SEARCH_TEXT_CHARS} characters)"
     ));
     s
 }
@@ -1081,7 +1078,7 @@ impl Tool for SearchTextTool {
         let regex = regex::RegexBuilder::new(pattern)
             .case_insensitive(case_insensitive)
             .build()
-            .map_err(|e| format!("Invalid regex: {}", e))?;
+            .map_err(|e| format!("Invalid regex: {e}"))?;
 
         let search_root = search_target;
         let mode = output_mode.to_string();
@@ -1091,7 +1088,7 @@ impl Tool for SearchTextTool {
             search_text_native(&regex_owned, &search_root, glob_set.as_ref(), &mode)
         })
         .await
-        .map_err(|e| format!("search task failed: {}", e))?
+        .map_err(|e| format!("search task failed: {e}"))?
     }
 }
 
@@ -1125,8 +1122,7 @@ impl ShellExecTool {
         for pattern in blocked_patterns.iter() {
             if lower_cmd.contains(pattern) {
                 return Err(format!(
-                    "Command blocked by safety guard (detected dangerous pattern: {})",
-                    pattern
+                    "Command blocked by safety guard (detected dangerous pattern: {pattern})"
                 ));
             }
         }
@@ -1293,11 +1289,11 @@ fn web_http_client(timeout_secs: u64) -> Result<reqwest::Client, String> {
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0")
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))
+        .map_err(|e| format!("Failed to build HTTP client: {e}"))
 }
 
 fn parse_scraper_selector(sel: &str) -> Result<scraper::Selector, String> {
-    scraper::Selector::parse(sel).map_err(|e| format!("Invalid CSS selector {:?}: {}", sel, e))
+    scraper::Selector::parse(sel).map_err(|e| format!("Invalid CSS selector {sel:?}: {e}"))
 }
 
 fn truncate_web_output(text: String, max_chars: usize) -> String {
@@ -1321,7 +1317,7 @@ fn apply_jina_bearer(
 ) -> reqwest::RequestBuilder {
     if let Some(j) = jina {
         if let Some(key) = j.api_key.as_deref() {
-            return req.header("Authorization", format!("Bearer {}", key));
+            return req.header("Authorization", format!("Bearer {key}"));
         }
     }
     req
@@ -1404,7 +1400,7 @@ async fn web_fetch_direct(url: &str, max_output_chars: usize) -> Result<String, 
         .get(url)
         .send()
         .await
-        .map_err(|e| format!("Failed to fetch URL: {}", e))?;
+        .map_err(|e| format!("Failed to fetch URL: {e}"))?;
 
     if !res.status().is_success() {
         return Err(format!("HTTP Error: {}", res.status()));
@@ -1420,7 +1416,7 @@ async fn web_fetch_direct(url: &str, max_output_chars: usize) -> Result<String, 
         let json_body: Value = res
             .json()
             .await
-            .map_err(|e| format!("Invalid JSON: {}", e))?;
+            .map_err(|e| format!("Invalid JSON: {e}"))?;
         let s = serde_json::to_string_pretty(&json_body).unwrap_or_default();
         return Ok(truncate_web_output(s, max_output_chars));
     }
@@ -1428,7 +1424,7 @@ async fn web_fetch_direct(url: &str, max_output_chars: usize) -> Result<String, 
     let body = res
         .text()
         .await
-        .map_err(|e| format!("Failed to decode text: {}", e))?;
+        .map_err(|e| format!("Failed to decode text: {e}"))?;
 
     let document = scraper::Html::parse_document(&body);
     let mut text_output = String::new();
@@ -1509,7 +1505,7 @@ async fn web_fetch_jina(
     let res = req
         .send()
         .await
-        .map_err(|e| format!("Failed to fetch URL via Jina: {}", e))?;
+        .map_err(|e| format!("Failed to fetch URL via Jina: {e}"))?;
     if !res.status().is_success() {
         return Err(format!("HTTP Error (Jina reader): {}", res.status()));
     }
@@ -1524,7 +1520,7 @@ async fn web_fetch_jina(
         let json_body: Value = res
             .json()
             .await
-            .map_err(|e| format!("Invalid JSON: {}", e))?;
+            .map_err(|e| format!("Invalid JSON: {e}"))?;
         let s = serde_json::to_string_pretty(&json_body).unwrap_or_default();
         return Ok(truncate_web_output(s, max_output_chars));
     }
@@ -1532,7 +1528,7 @@ async fn web_fetch_jina(
     let body = res
         .text()
         .await
-        .map_err(|e| format!("Failed to decode text: {}", e))?;
+        .map_err(|e| format!("Failed to decode text: {e}"))?;
     Ok(truncate_web_output(body, max_output_chars))
 }
 
@@ -1781,7 +1777,7 @@ impl Tool for CronTool {
                         format!("Every: {}s", every_ms / 1000)
                     }
                     crate::scheduler::ScheduleKind::Cron { cron_expr } => {
-                        format!("Cron: {}", cron_expr)
+                        format!("Cron: {cron_expr}")
                     }
                 };
                 out.push_str(&format!(
@@ -1811,9 +1807,9 @@ impl Tool for CronTool {
             if let Some(scheduler) = self.mte_cron_scheduler.as_ref() {
                 let removed = scheduler.remove_job(job_id, Utc::now()).await?;
                 return if removed {
-                    Ok(format!("Removed job {}", job_id))
+                    Ok(format!("Removed job {job_id}"))
                 } else {
-                    Ok(format!("Job {} was not found", job_id))
+                    Ok(format!("Job {job_id} was not found"))
                 };
             }
             let cmd = crate::scheduler::CronCommand::Remove {
@@ -1824,7 +1820,7 @@ impl Tool for CronTool {
                 .send_packet(json_str)
                 .await
                 .map_err(|e| e.to_string())?;
-            return Ok(format!("Requested removal of job {}", job_id));
+            return Ok(format!("Requested removal of job {job_id}"));
         }
 
         if action == "add" {
@@ -1892,8 +1888,7 @@ impl Tool for CronTool {
                     )
                     .await?;
                 return Ok(format!(
-                    "Successfully scheduled job {} with action '{}'",
-                    id, message
+                    "Successfully scheduled job {id} with action '{message}'"
                 ));
             }
 
@@ -1911,12 +1906,11 @@ impl Tool for CronTool {
                 .await
                 .map_err(|e| e.to_string())?;
             return Ok(format!(
-                "Successfully scheduled job {} with action '{}'",
-                id, message
+                "Successfully scheduled job {id} with action '{message}'"
             ));
         }
 
-        Err(format!("Unknown action '{}'", action))
+        Err(format!("Unknown action '{action}'"))
     }
 }
 
@@ -2065,8 +2059,8 @@ impl Tool for MessageTool {
         });
 
         match self.outbound_tx.send(msg).await {
-            Ok(_) => Ok(format!("Message sent to {}:{}", channel, chat_id)),
-            Err(e) => Err(format!("Failed to send message: {}", e)),
+            Ok(_) => Ok(format!("Message sent to {channel}:{chat_id}")),
+            Err(e) => Err(format!("Failed to send message: {e}")),
         }
     }
 }
@@ -2113,7 +2107,7 @@ fn truncate_git_worktree_output(mut s: String) -> String {
     }
     let rest = s.len() - end;
     s.truncate(end);
-    s.push_str(&format!("\n... (truncated, {} more chars)", rest));
+    s.push_str(&format!("\n... (truncated, {rest} more chars)"));
     s
 }
 
@@ -2130,8 +2124,8 @@ async fn run_git_output(
     let fut = cmd.output();
     match timeout(Duration::from_secs(timeout_secs), fut).await {
         Ok(Ok(output)) => Ok(output),
-        Ok(Err(e)) => Err(format!("failed to spawn git: {}", e)),
-        Err(_) => Err(format!("git command timed out after {}s", timeout_secs)),
+        Ok(Err(e)) => Err(format!("failed to spawn git: {e}")),
+        Err(_) => Err(format!("git command timed out after {timeout_secs}s")),
     }
 }
 
@@ -2175,7 +2169,7 @@ async fn git_rev_parse_show_toplevel(cwd: &Path) -> Result<PathBuf, String> {
         return Err("git rev-parse --show-toplevel returned empty output".to_string());
     }
     let p = PathBuf::from(line);
-    fs::canonicalize(&p).map_err(|e| format!("could not canonicalize git root: {}", e))
+    fs::canonicalize(&p).map_err(|e| format!("could not canonicalize git root: {e}"))
 }
 
 async fn git_common_dir_abs(wt_path: &Path) -> Result<PathBuf, String> {
@@ -2217,7 +2211,7 @@ async fn git_common_dir_abs(wt_path: &Path) -> Result<PathBuf, String> {
     } else {
         wt_path.join(line)
     };
-    fs::canonicalize(p).map_err(|e| format!("could not canonicalize git common dir: {}", e))
+    fs::canonicalize(p).map_err(|e| format!("could not canonicalize git common dir: {e}"))
 }
 
 fn main_repo_dir_from_common_git_dir(common_dir: &Path) -> PathBuf {
@@ -2325,7 +2319,7 @@ impl GitWorktreeTool {
         }
         if let Some(parent) = wt.parent() {
             fs::create_dir_all(parent)
-                .map_err(|e| format!("failed to create parent directories: {}", e))?;
+                .map_err(|e| format!("failed to create parent directories: {e}"))?;
         }
         let branch_name = if let Some(b) = branch.filter(|s| !s.is_empty()) {
             validate_optional_branch_name(b)?;
@@ -2442,8 +2436,7 @@ impl Tool for GitWorktreeTool {
                 self.action_remove(path, force).await
             }
             _ => Err(format!(
-                "Unknown action {:?}; expected list, add, or remove",
-                action
+                "Unknown action {action:?}; expected list, add, or remove"
             )),
         }
     }
@@ -2499,7 +2492,7 @@ impl Tool for SearchMemoryTool {
             .map_err(|_| "Memory Actor Channel Closed".to_string())??;
 
         if results.is_empty() {
-            Ok(format!("No memory results found for '{}'.", query))
+            Ok(format!("No memory results found for '{query}'."))
         } else {
             Ok(format!(
                 "Memory Search Results:\n\n{}",
@@ -2565,8 +2558,7 @@ impl Tool for FetchMemoryByDateTool {
 
         if results.is_empty() {
             Ok(format!(
-                "No memory results found in the last {} days.",
-                days_ago
+                "No memory results found in the last {days_ago} days."
             ))
         } else {
             Ok(format!(
@@ -2614,7 +2606,7 @@ impl Tool for GetEnvTool {
             } else {
                 v
             };
-            result.push_str(&format!("{}={}\n", k, masked));
+            result.push_str(&format!("{k}={masked}\n"));
         }
         Ok(result)
     }
@@ -2666,21 +2658,21 @@ impl Tool for PythonRunTool {
 
         let mut child = cmd
             .spawn()
-            .map_err(|e| format!("Failed to spawn python: {}", e))?;
+            .map_err(|e| format!("Failed to spawn python: {e}"))?;
 
         if let Some(mut stdin) = child.stdin.take() {
             use tokio::io::AsyncWriteExt;
             stdin
                 .write_all(code.as_bytes())
                 .await
-                .map_err(|e| format!("Failed to write to python stdin: {}", e))?;
+                .map_err(|e| format!("Failed to write to python stdin: {e}"))?;
         }
 
         let output =
             tokio::time::timeout(std::time::Duration::from_secs(60), child.wait_with_output())
                 .await
                 .map_err(|_| "Python execution timed out after 60 seconds")?
-                .map_err(|e| format!("Failed to wait for python: {}", e))?;
+                .map_err(|e| format!("Failed to wait for python: {e}"))?;
 
         let mut result = String::new();
         let stdout = String::from_utf8_lossy(&output.stdout);

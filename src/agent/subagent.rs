@@ -144,7 +144,7 @@ async fn persist_subagent_start(
             reply: SharedReply::new(tx),
         })
         .await
-        .map_err(|e| format!("memory: {}", e))?;
+        .map_err(|e| format!("memory: {e}"))?;
     rx.await.map_err(|_| "memory actor closed".to_string())?
 }
 
@@ -364,8 +364,7 @@ impl SubagentHarness {
                 let maybe = registry.get(agent).cloned();
                 if maybe.is_none() {
                     return Err(format!(
-                        "Named agent '{}' not found in registry. Use `agent_list` to see available agents.",
-                        agent
+                        "Named agent '{agent}' not found in registry. Use `agent_list` to see available agents."
                     ));
                 }
                 maybe
@@ -554,7 +553,7 @@ impl SubagentHarness {
             sender_id: parent_chat_id.clone(),
             chat_id: child_chat_id.clone(),
             thread_id: parent_thread_id.clone(),
-            content: format!("[Sub-agent: {}]\n\n{}", label, prompt),
+            content: format!("[Sub-agent: {label}]\n\n{prompt}"),
             attachments: vec![],
             metadata: HashMap::new(),
         };
@@ -799,7 +798,7 @@ impl SubagentHarness {
                 .await
                 .map_err(|_| {
                     record.cancel.cancel();
-                    format!("subagent_spawn timed out after {}s (wait=true)", max_wait)
+                    format!("subagent_spawn timed out after {max_wait}s (wait=true)")
                 })?;
         }
 
@@ -833,7 +832,7 @@ impl SubagentHarness {
             .inner
             .tasks
             .get(task_id)
-            .ok_or_else(|| format!("Task '{}' not found", task_id))?;
+            .ok_or_else(|| format!("Task '{task_id}' not found"))?;
         if t.parent_chat_id != parent_chat_id {
             return Err("Task is not owned by the current chat".to_string());
         }
@@ -848,7 +847,7 @@ impl SubagentHarness {
     pub fn cancel_task(&self, task_id: &str, parent_chat_id: &str) -> Result<String, String> {
         let t = self.find_task(task_id, parent_chat_id)?;
         t.cancel.cancel();
-        Ok(format!("Cancellation requested for task {}", task_id))
+        Ok(format!("Cancellation requested for task {task_id}"))
     }
 }
 
@@ -1078,7 +1077,7 @@ impl Tool for SubagentPlanTool {
             .and_then(|v| v.as_str())
             .ok_or("Missing plan (JSON string)")?;
         let plan: PlanInput =
-            serde_json::from_str(plan_str).map_err(|e| format!("Invalid plan JSON: {}", e))?;
+            serde_json::from_str(plan_str).map_err(|e| format!("Invalid plan JSON: {e}"))?;
         if plan.steps.is_empty() {
             return Err("plan.steps is empty".to_string());
         }
@@ -1118,12 +1117,12 @@ impl Tool for SubagentPlanTool {
                 let mut body = String::new();
                 for d in &deps[&step_id] {
                     if let Some(r) = results.get(d) {
-                        body.push_str(&format!("## Prior step {} result:\n{}\n\n", d, r));
+                        body.push_str(&format!("## Prior step {d} result:\n{r}\n\n"));
                     }
                 }
                 body.push_str(&prompts[&step_id]);
                 let p = current_parent_ids()?;
-                let label = format!("plan-{}", step_id);
+                let label = format!("plan-{step_id}");
                 let spawn_json = self
                     .harness
                     .spawn(SubagentSpawnSpec {
@@ -1147,7 +1146,7 @@ impl Tool for SubagentPlanTool {
                     })
                     .unwrap_or(spawn_json.clone());
                 results.insert(step_id.clone(), step_output.clone());
-                out.push_str(&format!("## Step {}\n{}\n\n", step_id, step_output));
+                out.push_str(&format!("## Step {step_id}\n{step_output}\n\n"));
                 done.insert(step_id);
             }
         }
@@ -1194,7 +1193,7 @@ impl Tool for TaskHistoryListTool {
                 reply: SharedReply::new(tx),
             })
             .await
-            .map_err(|e| format!("memory: {}", e))?;
+            .map_err(|e| format!("memory: {e}"))?;
         let rows = rx.await.map_err(|_| "memory actor closed".to_string())??;
         if rows.is_empty() {
             return Ok("No persisted sub-agent tasks for this chat yet.".to_string());
@@ -1240,7 +1239,7 @@ impl Tool for AgentListTool {
             let model = m.model.as_deref().unwrap_or("(parent model)");
             let temp = m
                 .temperature
-                .map(|t| format!("{:.2}", t))
+                .map(|t| format!("{t:.2}"))
                 .unwrap_or_else(|| "default".to_string());
             let iter = m
                 .max_iterations
@@ -1304,7 +1303,7 @@ impl Tool for TaskDashboardTool {
                 reply: SharedReply::new(tx),
             })
             .await
-            .map_err(|e| format!("memory: {}", e))?;
+            .map_err(|e| format!("memory: {e}"))?;
         let rows = rx.await.map_err(|_| "memory actor closed".to_string())??;
         if rows.is_empty() {
             out.push_str("(no history)\n");

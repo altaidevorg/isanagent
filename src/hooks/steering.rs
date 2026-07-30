@@ -101,7 +101,7 @@ async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(
         let n = reader
             .read(&mut chunk)
             .await
-            .map_err(|e| format!("read hook output: {}", e))?;
+            .map_err(|e| format!("read hook output: {e}"))?;
         if n == 0 {
             break;
         }
@@ -147,13 +147,13 @@ async fn run_hook_command(
         })
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| format!("spawn hook: {}", e))?;
+        .map_err(|e| format!("spawn hook: {e}"))?;
 
     let mut stdin = child
         .stdin
         .take()
         .ok_or_else(|| "hook stdin missing".to_string())?;
-    let body = serde_json::to_vec(stdin_json).map_err(|e| format!("hook stdin encode: {}", e))?;
+    let body = serde_json::to_vec(stdin_json).map_err(|e| format!("hook stdin encode: {e}"))?;
     // A hook that ignores its stdin and exits (a bare `cargo build` / `pytest`, or any verify hook
     // that reads the event from argv/env instead) closes its stdin read end before — or while — we
     // write. On Linux that surfaces here as `BrokenPipe`; on macOS the small event JSON usually fits
@@ -163,7 +163,7 @@ async fn run_hook_command(
     // fine — swallow BrokenPipe and proceed to capture its output and exit status.
     if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut stdin, &body).await {
         if e.kind() != std::io::ErrorKind::BrokenPipe {
-            return Err(format!("hook stdin write: {}", e));
+            return Err(format!("hook stdin write: {e}"));
         }
     }
     drop(stdin);
@@ -192,7 +192,7 @@ async fn run_hook_command(
     .await
     .map_err(|_| "hook timed out".to_string())?;
 
-    let status = status.map_err(|e| format!("hook wait: {}", e))?;
+    let status = status.map_err(|e| format!("hook wait: {e}"))?;
     let out = out?;
 
     // Join stdout + stderr (stderr is empty unless `capture_failure` piped it).
@@ -232,7 +232,7 @@ async fn run_hook_command(
 
 fn parse_pre_tool_stdout(text: &str) -> Result<PreToolOutcome, String> {
     let v: HookStdoutEnvelope =
-        serde_json::from_str(text).map_err(|e| format!("hook json: {}", e))?;
+        serde_json::from_str(text).map_err(|e| format!("hook json: {e}"))?;
     match v
         .decision
         .as_deref()
@@ -256,13 +256,13 @@ fn parse_pre_tool_stdout(text: &str) -> Result<PreToolOutcome, String> {
                 Ok(PreToolOutcome::Proceed(Value::Null))
             }
         }
-        Some(other) => Err(format!("unknown decision {:?}", other)),
+        Some(other) => Err(format!("unknown decision {other:?}")),
     }
 }
 
 fn parse_user_prompt_stdout(text: &str) -> Result<UserPromptHookOutcome, String> {
     let v: HookStdoutEnvelope =
-        serde_json::from_str(text).map_err(|e| format!("hook json: {}", e))?;
+        serde_json::from_str(text).map_err(|e| format!("hook json: {e}"))?;
     match v
         .decision
         .as_deref()
@@ -280,7 +280,7 @@ fn parse_user_prompt_stdout(text: &str) -> Result<UserPromptHookOutcome, String>
             Ok(UserPromptHookOutcome::InjectPrefix(msg))
         }
         Some("proceed") | Some("allow") | None => Ok(UserPromptHookOutcome::Proceed),
-        Some(other) => Err(format!("unknown decision {:?}", other)),
+        Some(other) => Err(format!("unknown decision {other:?}")),
     }
 }
 
@@ -313,7 +313,7 @@ pub async fn run_pre_tool_hooks(
         let cwd = match hook_cwd(&engine.sandbox_dir, h.cwd_relative.as_deref()) {
             Ok(p) => p,
             Err(e) => {
-                log::warn!("pre_tool hook cwd: {}", e);
+                log::warn!("pre_tool hook cwd: {e}");
                 continue;
             }
         };
@@ -344,7 +344,7 @@ pub async fn run_pre_tool_hooks(
         {
             Ok(o) => o,
             Err(e) => {
-                log::warn!("pre_tool hook failed (proceeding): {}", e);
+                log::warn!("pre_tool hook failed (proceeding): {e}");
                 continue;
             }
         };
@@ -356,7 +356,7 @@ pub async fn run_pre_tool_hooks(
                     args = new_args;
                 }
             }
-            Err(e) => log::warn!("pre_tool hook stdout parse (ignored): {}", e),
+            Err(e) => log::warn!("pre_tool hook stdout parse (ignored): {e}"),
         }
     }
     PreToolOutcome::Proceed(args)
@@ -382,7 +382,7 @@ pub async fn run_post_tool_hooks(
         let cwd = match hook_cwd(&engine.sandbox_dir, h.cwd_relative.as_deref()) {
             Ok(p) => p,
             Err(e) => {
-                log::warn!("post_tool hook cwd: {}", e);
+                log::warn!("post_tool hook cwd: {e}");
                 continue;
             }
         };
@@ -416,7 +416,7 @@ pub async fn run_post_tool_hooks(
         {
             Ok(Some(out)) => outputs.push(out),
             Ok(None) => {}
-            Err(e) => log::warn!("post_tool hook failed: {}", e),
+            Err(e) => log::warn!("post_tool hook failed: {e}"),
         }
     }
     if outputs.is_empty() {
@@ -436,7 +436,7 @@ pub async fn run_user_prompt_hooks(
         let cwd = match hook_cwd(&engine.sandbox_dir, h.cwd_relative.as_deref()) {
             Ok(p) => p,
             Err(e) => {
-                log::warn!("user_prompt hook cwd: {}", e);
+                log::warn!("user_prompt hook cwd: {e}");
                 continue;
             }
         };
@@ -465,7 +465,7 @@ pub async fn run_user_prompt_hooks(
         {
             Ok(o) => o,
             Err(e) => {
-                log::warn!("user_prompt hook failed (proceeding): {}", e);
+                log::warn!("user_prompt hook failed (proceeding): {e}");
                 continue;
             }
         };
@@ -474,12 +474,12 @@ pub async fn run_user_prompt_hooks(
             Ok(UserPromptHookOutcome::Block(m)) => return UserPromptHookOutcome::Block(m),
             Ok(UserPromptHookOutcome::InjectPrefix(prefix)) => {
                 inject = Some(match inject.take() {
-                    Some(prev) => format!("{}\n{}", prev, prefix),
+                    Some(prev) => format!("{prev}\n{prefix}"),
                     None => prefix,
                 });
             }
             Ok(UserPromptHookOutcome::Proceed) => {}
-            Err(e) => log::warn!("user_prompt hook stdout parse (ignored): {}", e),
+            Err(e) => log::warn!("user_prompt hook stdout parse (ignored): {e}"),
         }
     }
     match inject {
@@ -505,7 +505,7 @@ fn compile_hook_handlers(
                 Some(pat) => match Regex::new(pat) {
                     Ok(re) => Some(re),
                     Err(e) => {
-                        log::warn!("hooks: skip invalid matcher {:?}: {}", pat, e);
+                        log::warn!("hooks: skip invalid matcher {pat:?}: {e}");
                         None
                     }
                 },

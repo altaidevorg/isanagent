@@ -169,7 +169,7 @@ fn truncate_thread_preview_line(text: &str) -> String {
     let mut iter = line.chars();
     let chunk: String = iter.by_ref().take(THREAD_PREVIEW_MAX_CHARS).collect();
     if iter.next().is_some() {
-        format!("{}…", chunk)
+        format!("{chunk}…")
     } else {
         chunk
     }
@@ -399,7 +399,7 @@ fn todo_replace_sqlite_conn(
     chat_id: &str,
     items: &[TodoRow],
 ) -> Result<(), String> {
-    let json = serde_json::to_string(items).map_err(|e| format!("serialize todo items: {}", e))?;
+    let json = serde_json::to_string(items).map_err(|e| format!("serialize todo items: {e}"))?;
     let now = Utc::now().timestamp_millis();
     conn.execute(
         "INSERT INTO harness_todos (chat_id, items_json, updated_at_ms) VALUES (?1, ?2, ?3)
@@ -408,7 +408,7 @@ fn todo_replace_sqlite_conn(
            updated_at_ms = excluded.updated_at_ms",
         params![chat_id, json, now],
     )
-    .map_err(|e| format!("upsert harness_todos: {}", e))?;
+    .map_err(|e| format!("upsert harness_todos: {e}"))?;
     Ok(())
 }
 
@@ -420,12 +420,12 @@ fn todo_load_sqlite_conn(conn: &Connection, chat_id: &str) -> Result<Option<Vec<
             |row| row.get(0),
         )
         .optional()
-        .map_err(|e| format!("select harness_todos: {}", e))?;
+        .map_err(|e| format!("select harness_todos: {e}"))?;
     match out {
         None => Ok(None),
         Some(s) => {
             let items: Vec<TodoRow> =
-                serde_json::from_str(&s).map_err(|e| format!("parse todo items: {}", e))?;
+                serde_json::from_str(&s).map_err(|e| format!("parse todo items: {e}"))?;
             Ok(Some(items))
         }
     }
@@ -871,7 +871,7 @@ impl SqliteMemoryActor {
 
             Ok(conn)
         })()
-        .map_err(|e| format!("SQLite init ({}): {}", db_path, e))?;
+        .map_err(|e| format!("SQLite init ({db_path}): {e}"))?;
 
         Ok(Self { conn })
     }
@@ -1269,7 +1269,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                          WHERE thread_id LIKE ?1 ORDER BY created_at DESC LIMIT ?2"
                     ).map_err(|e| e.to_string())?;
 
-                    let pattern = format!("{}%", thread_id);
+                    let pattern = format!("{thread_id}%");
                     let limit_i64 = limit as i64;
                     let rows = stmt
                         .query_map(params![pattern, limit_i64], |row| {
@@ -1278,8 +1278,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                             let knowledge_gaps: String = row.get(2)?;
                             let created_at: String = row.get(3)?;
                             Ok(format!(
-                                "[{}] Summary: {}\nKey Info: {}\nGaps: {}",
-                                created_at, summary, key_info, knowledge_gaps
+                                "[{created_at}] Summary: {summary}\nKey Info: {key_info}\nGaps: {knowledge_gaps}"
                             ))
                         })
                         .map_err(|e| e.to_string())?;
@@ -1333,7 +1332,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                         rows.collect::<Result<Vec<_>, _>>()
                             .map_err(|e| e.to_string())?
                     } else {
-                        let pattern = format!("{}%", thread_id);
+                        let pattern = format!("{thread_id}%");
                         let rows = stmt
                             .query_map(params![pattern, limit_i64], summary_mapper)
                             .map_err(|e| e.to_string())?;
@@ -1408,7 +1407,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                             let sid: String = row.get(0)?;
                             let sum: String = row.get(1)?;
                             let key: String = row.get(2)?;
-                            Ok(format!("Thread [{}]: {}\nKey Info: {}", sid, sum, key))
+                            Ok(format!("Thread [{sid}]: {sum}\nKey Info: {key}"))
                         })
                         .map_err(|e| e.to_string())?;
 
@@ -1441,8 +1440,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                             let key: String = row.get(2)?;
                             let created_at: String = row.get(3)?;
                             Ok(format!(
-                                "[{}] Thread: {}\nSummary: {}\nKey Info: {}",
-                                created_at, sid, sum, key
+                                "[{created_at}] Thread: {sid}\nSummary: {sum}\nKey Info: {key}"
                             ))
                         })
                         .map_err(|e| e.to_string())?;
@@ -1582,7 +1580,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     let mut max_id = last_id;
                     for (id, sum, key) in rows.filter_map(Result::ok) {
                         summaries_content
-                            .push_str(&format!("Summary:\n{}\nKey Info:\n{}\n\n", sum, key));
+                            .push_str(&format!("Summary:\n{sum}\nKey Info:\n{key}\n\n"));
                         max_id = id;
                     }
                     Ok((should_run, summaries_content, max_id))
@@ -1636,7 +1634,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                                 now
                             ],
                         )
-                        .map_err(|e| format!("insert subagent_tasks: {}", e))?;
+                        .map_err(|e| format!("insert subagent_tasks: {e}"))?;
                     Ok(())
                 })();
                 let _ = reply.send(res);
@@ -1672,7 +1670,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                                 parent_chat_id
                             ],
                         )
-                        .map_err(|e| format!("finalize subagent_tasks: {}", e))?;
+                        .map_err(|e| format!("finalize subagent_tasks: {e}"))?;
                     if n == 0 {
                         return Err("subagent_tasks update: no matching row".to_string());
                     }
@@ -1870,7 +1868,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                             record.created_at_ms,
                             record.updated_at_ms
                         ],
-                    ).map_err(|e| format!("upsert background_jobs: {}", e))?;
+                    ).map_err(|e| format!("upsert background_jobs: {e}"))?;
                     Ok(())
                 })();
                 let _ = reply.send(res);
@@ -1947,7 +1945,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     self.conn.execute(
                         "UPDATE background_jobs SET state = ?1, last_error = ?2, updated_at_ms = ?3 WHERE job_id = ?4",
                         params![state, last_error, now, job_id],
-                    ).map_err(|e| format!("update background_jobs: {}", e))?;
+                    ).map_err(|e| format!("update background_jobs: {e}"))?;
                     Ok(())
                 })();
                 let _ = reply.send(res);
@@ -1963,7 +1961,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                         record.kind, record.title, record.body, record.action_kind, record.action_payload,
                         record.seen_at_ms, record.resolved_at_ms, record.created_at_ms
                     ],
-                ).map_err(|e| format!("insert notifications: {}", e)).map(|_| ());
+                ).map_err(|e| format!("insert notifications: {e}")).map(|_| ());
                 let _ = reply.send(res);
             }
             MemoryMessage::ListNotifications {
@@ -2035,7 +2033,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 let res = self.conn.execute(
                     "UPDATE notifications SET seen_at_ms = COALESCE(seen_at_ms, ?1) WHERE notification_id = ?2",
                     params![now, notification_id],
-                ).map_err(|e| format!("mark notification seen: {}", e)).map(|_| ());
+                ).map_err(|e| format!("mark notification seen: {e}")).map(|_| ());
                 let _ = reply.send(res);
             }
             MemoryMessage::ResolveNotification {
@@ -2046,7 +2044,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 let res = self.conn.execute(
                     "UPDATE notifications SET resolved_at_ms = COALESCE(resolved_at_ms, ?1) WHERE notification_id = ?2",
                     params![now, notification_id],
-                ).map_err(|e| format!("resolve notification: {}", e)).map(|_| ());
+                ).map_err(|e| format!("resolve notification: {e}")).map(|_| ());
                 let _ = reply.send(res);
             }
             MemoryMessage::UpsertClarificationTicket { record, reply } => {
@@ -2062,7 +2060,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                         record.tool_call_id, record.prompt, record.choices_json, record.response, record.status,
                         record.created_at_ms, record.updated_at_ms
                     ],
-                ).map_err(|e| format!("upsert clarification_tickets: {}", e)).map(|_| ());
+                ).map_err(|e| format!("upsert clarification_tickets: {e}")).map(|_| ());
                 let _ = reply.send(res);
             }
             MemoryMessage::ResolveClarificationTicket {
@@ -2074,7 +2072,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 let res = self.conn.execute(
                     "UPDATE clarification_tickets SET response = ?1, status = 'answered', updated_at_ms = ?2 WHERE ticket_id = ?3",
                     params![response, now, ticket_id],
-                ).map_err(|e| format!("resolve clarification ticket: {}", e)).map(|_| ());
+                ).map_err(|e| format!("resolve clarification ticket: {e}")).map(|_| ());
                 let _ = reply.send(res);
             }
             MemoryMessage::GetClarificationTicket { ticket_id, reply } => {
@@ -2123,7 +2121,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                             |row| row.get(0),
                         )
                         .optional()
-                        .map_err(|e| format!("load clarification ticket: {}", e))?;
+                        .map_err(|e| format!("load clarification ticket: {e}"))?;
                     let stored_job_id = stored_job_id.ok_or_else(|| {
                         "clarification ticket was not found or is no longer waiting".to_string()
                     })?;
@@ -2143,7 +2141,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                              WHERE ticket_id = ?3 AND status = 'waiting'",
                             params![response, now, ticket_id],
                         )
-                        .map_err(|e| format!("resolve clarification ticket: {}", e))?;
+                        .map_err(|e| format!("resolve clarification ticket: {e}"))?;
                     if ticket_rows != 1 {
                         return Err("clarification ticket could not be claimed".to_string());
                     }
@@ -2152,7 +2150,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     tx.execute(
                         "UPDATE notifications SET resolved_at_ms = ?1 WHERE action_payload = ?2 AND resolved_at_ms IS NULL",
                         params![now, ticket_id],
-                    ).map_err(|e| format!("resolve related notifications: {}", e))?;
+                    ).map_err(|e| format!("resolve related notifications: {e}"))?;
 
                     // 3. Update job state to running
                     let job_rows = tx
@@ -2160,7 +2158,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                             "UPDATE background_jobs SET state = 'running', updated_at_ms = ?1 WHERE job_id = ?2",
                             params![now, job_id],
                         )
-                        .map_err(|e| format!("update job state to running: {}", e))?;
+                        .map_err(|e| format!("update job state to running: {e}"))?;
                     if job_rows != 1 {
                         return Err("background job was not found".to_string());
                     }
@@ -2204,7 +2202,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     self.conn.execute(
                         "UPDATE background_jobs SET state = 'completed', updated_at_ms = ?1 WHERE job_id = ?2",
                         params![now, jid],
-                    ).map_err(|e| format!("dismiss background_job: {}", e))?;
+                    ).map_err(|e| format!("dismiss background_job: {e}"))?;
 
                     // 2. Resolve any associated clarification tickets
                     let mut stmt = self.conn.prepare(
@@ -2220,13 +2218,13 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                         self.conn.execute(
                             "UPDATE clarification_tickets SET response = 'Dismissed', status = 'answered', updated_at_ms = ?1 WHERE ticket_id = ?2",
                             params![now, tid],
-                        ).map_err(|e| format!("dismiss ticket: {}", e))?;
+                        ).map_err(|e| format!("dismiss ticket: {e}"))?;
 
                         // Resolve notifications for this ticket
                         self.conn.execute(
                             "UPDATE notifications SET resolved_at_ms = COALESCE(resolved_at_ms, ?1) WHERE action_payload = ?2 AND kind = 'clarification_ticket'",
                             params![now, tid],
-                        ).map_err(|e| format!("resolve notifications for ticket: {}", e))?;
+                        ).map_err(|e| format!("resolve notifications for ticket: {e}"))?;
                     }
 
                     Ok(())

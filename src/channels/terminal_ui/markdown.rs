@@ -108,11 +108,11 @@ pub fn assistant_markdown_lines(markdown: &str, width: usize) -> Vec<Line<'stati
             }
             Event::End(TagEnd::Link) => {
                 if let Some(url) = link_dest.take() {
-                    push_run(&mut runs, Theme::dim(), &format!(" ({})", url));
+                    push_run(&mut runs, Theme::dim(), &format!(" ({url})"));
                 }
             }
             Event::Start(Tag::Image { dest_url, .. }) => {
-                push_run(&mut runs, Theme::dim(), &format!(" [image: {}] ", dest_url));
+                push_run(&mut runs, Theme::dim(), &format!(" [image: {dest_url}] "));
             }
             Event::End(TagEnd::Image) => {}
             Event::Text(t) => {
@@ -174,7 +174,7 @@ pub fn assistant_markdown_lines(markdown: &str, width: usize) -> Vec<Line<'stati
                 push_run(&mut runs, Theme::assistant_bullet(), mark);
             }
             Event::FootnoteReference(l) => {
-                push_run(&mut runs, Theme::dim(), &format!(" [^{}] ", l));
+                push_run(&mut runs, Theme::dim(), &format!(" [^{l}] "));
             }
             Event::Start(Tag::Table(_) | Tag::TableHead | Tag::TableRow | Tag::TableCell) => {}
             Event::End(TagEnd::TableCell) => {
@@ -260,7 +260,7 @@ fn wrap_runs_to_lines(
                     first_word = false;
                     word.to_string()
                 } else {
-                    format!(" {}", word)
+                    format!(" {word}")
                 };
                 let tw = token.as_str().width();
                 if col + tw > width {

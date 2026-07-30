@@ -299,12 +299,11 @@ fn apply_onboard_options(cfg: &mut AppConfig, opts: &OnboardOptions) {
 fn build_config_toml(options: &OnboardOptions) -> Result<String, String> {
     let mut cfg: AppConfig = toml::from_str(CONFIG_TEMPLATE).map_err(|e| {
         format!(
-            "Internal error: embedded config template is invalid TOML: {}",
-            e
+            "Internal error: embedded config template is invalid TOML: {e}"
         )
     })?;
     apply_onboard_options(&mut cfg, options);
-    toml::to_string_pretty(&cfg).map_err(|e| format!("Failed to serialize config.toml: {}", e))
+    toml::to_string_pretty(&cfg).map_err(|e| format!("Failed to serialize config.toml: {e}"))
 }
 
 /// Same overrides as [`apply_onboard_options`], applied in-place on the embedded template with
@@ -312,7 +311,7 @@ fn build_config_toml(options: &OnboardOptions) -> Result<String, String> {
 pub fn build_interactive_config_toml(options: &OnboardOptions) -> Result<String, String> {
     let mut doc: DocumentMut = CONFIG_TEMPLATE
         .parse()
-        .map_err(|e| format!("interactive config template parse (toml_edit): {}", e))?;
+        .map_err(|e| format!("interactive config template parse (toml_edit): {e}"))?;
 
     if let Some(v) = options.restrict_to_workspace {
         doc["restrict_to_workspace"] = value(v);
@@ -437,8 +436,7 @@ pub fn build_interactive_config_toml(options: &OnboardOptions) -> Result<String,
     let out = doc.to_string();
     let _: AppConfig = toml::from_str(&out).map_err(|e| {
         format!(
-            "interactive merged config.toml failed AppConfig validation: {}",
-            e
+            "interactive merged config.toml failed AppConfig validation: {e}"
         )
     })?;
     Ok(out)
@@ -590,8 +588,7 @@ This file is created by **`isanagent onboard`**. It mirrors the policy text that
 appends to the system prompt when **`[harness.ml_engineer] enabled = true`** in `config.toml`. \
 Editing this file does **not** change runtime behavior (the live text is embedded in the \
 `isanagent` build). For workspace-specific ML rules, add or edit **`ML_POLICY.md`** in this \
-directory (merged by `compile_system_prompt`).\n\n---\n\n{}",
-        HARNESS_OVERLAY
+directory (merged by `compile_system_prompt`).\n\n---\n\n{HARNESS_OVERLAY}"
     )
 }
 
@@ -649,8 +646,7 @@ fn write_embedded_kernel_porting_tree(
     )?;
     // Symlink-style copy: gpu_to_jax plan accessible at .agents/kernel-porting/
     let plan_src = root.join(format!(
-        "{}/gpu_to_jax_plan.json",
-        KERNEL_PORTING_SKILL_REL_PREFIX
+        "{KERNEL_PORTING_SKILL_REL_PREFIX}/gpu_to_jax_plan.json"
     ));
     let plan_dest = root.join("workspace/.agents/kernel-porting/gpu_to_jax_plan.json");
     if plan_src.exists() {
@@ -664,8 +660,7 @@ fn write_embedded_kernel_porting_tree(
         }
     }
     let schema_src = root.join(format!(
-        "{}/map_elites.schema.json",
-        KERNEL_PORTING_SKILL_REL_PREFIX
+        "{KERNEL_PORTING_SKILL_REL_PREFIX}/map_elites.schema.json"
     ));
     let schema_dest = root.join("workspace/.agents/kernel-porting/map_elites.schema.json");
     if schema_src.exists() {
@@ -694,8 +689,7 @@ fn write_embedded_autotrainess_tree(
     )?;
     // Convenience copy: iteration plan accessible at .agents/autotrainess/
     let plan_src = root.join(format!(
-        "{}/iteration_plan.json",
-        AUTOTRAINESS_SKILL_REL_PREFIX
+        "{AUTOTRAINESS_SKILL_REL_PREFIX}/iteration_plan.json"
     ));
     let plan_dest = root.join("workspace/.agents/autotrainess/iteration_plan.json");
     if plan_src.exists() {
@@ -780,9 +774,9 @@ fn write_if_missing_string(
 fn validate_generated_files(layout: &WorkspaceLayout) -> Result<(), String> {
     let config_path = layout.root.join("config.toml");
     let config_str = fs::read_to_string(&config_path)
-        .map_err(|e| format!("Failed to read generated config.toml: {}", e))?;
+        .map_err(|e| format!("Failed to read generated config.toml: {e}"))?;
     toml::from_str::<AppConfig>(&config_str)
-        .map_err(|e| format!("Generated config.toml is invalid: {}", e))?;
+        .map_err(|e| format!("Generated config.toml is invalid: {e}"))?;
 
     for relative_path in [
         "workspace/AGENTS.md",

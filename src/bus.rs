@@ -57,7 +57,7 @@ pub fn get_background_job_id(
 /// using an empty thread segment when `thread_id` is missing.
 pub fn clarification_session_key(channel: &str, chat_id: &str, thread_id: Option<&str>) -> String {
     let thread_part = thread_id.unwrap_or("");
-    format!("{}:{}:{}", channel, chat_id, thread_part)
+    format!("{channel}:{chat_id}:{thread_part}")
 }
 
 impl InboundMessage {
@@ -508,17 +508,17 @@ impl LogEvent {
         let target_part = self
             .target
             .as_deref()
-            .map(|target| format!(" [target:{}]", target))
+            .map(|target| format!(" [target:{target}]"))
             .unwrap_or_default();
         let location_part = match (self.file.as_deref(), self.line) {
-            (Some(file), Some(line)) => format!(" [{}:{}]", file, line),
-            (Some(file), None) => format!(" [{}]", file),
+            (Some(file), Some(line)) => format!(" [{file}:{line}]"),
+            (Some(file), None) => format!(" [{file}]"),
             _ => String::new(),
         };
         let meta_part = self
             .metadata
             .as_ref()
-            .map(|m| format!(" {}", m))
+            .map(|m| format!(" {m}"))
             .unwrap_or_default();
         format!(
             "{} [{}] [{}]{}{}{} {}",
@@ -536,7 +536,7 @@ impl LogEvent {
 fn redact_chat_id(chat_id: &str) -> String {
     if let Some((local, domain)) = chat_id.split_once('@') {
         let first = local.chars().next().unwrap_or('*');
-        return format!("{}***@{}", first, domain);
+        return format!("{first}***@{domain}");
     }
     chat_id.to_string()
 }

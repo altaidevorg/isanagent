@@ -279,15 +279,14 @@ fn try_switch_model(
             }
             Err(e) => {
                 let err_msg = format!(
-                    "No API key for '{}': {}\n\
-                     Run /key {} <api_key> to set one now, or add api_key = \"...\" under \
-                     [providers.{}] in config.toml (or set the env var).",
-                    config_key, e, config_key, config_key
+                    "No API key for '{config_key}': {e}\n\
+                     Run /key {config_key} <api_key> to set one now, or add api_key = \"...\" under \
+                     [providers.{config_key}] in config.toml (or set the env var)."
                 );
                 app.cells.push(Cell::Error { message: err_msg });
                 app.set_toast(
                     ToastKind::Err,
-                    format!("No API key for {}", config_key),
+                    format!("No API key for {config_key}"),
                     Duration::from_secs(5),
                 );
             }
@@ -2384,7 +2383,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             };
             let t = truncate_chars_display(active_text, active_w.max(8).saturating_sub(6));
             let active_row = Line::from(vec![
-                Span::styled(format!(" {} ", icon), Theme::tool_call()),
+                Span::styled(format!(" {icon} "), Theme::tool_call()),
                 Span::styled(t, Theme::dim()),
             ]);
             f.render_widget(Paragraph::new(active_row), ch[4]);
@@ -2540,7 +2539,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     let mut lines: Vec<Line> = Vec::new();
                     for (cmd, desc) in matching.iter().take(hint_inner.height as usize) {
                         lines.push(Line::from(vec![
-                            Span::styled(format!("{:<16}", cmd), Style::default().fg(Color::Cyan)),
+                            Span::styled(format!("{cmd:<16}"), Style::default().fg(Color::Cyan)),
                             Span::styled(*desc, Style::default().fg(Color::Gray)),
                         ]));
                     }
@@ -2784,7 +2783,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 sync_terminal_session_chat(&bus_tx, &chat_id);
                                 app.thinking = false;
                                 app.cells.push(Cell::System {
-                                    message: format!("New thread: {}", chat_id),
+                                    message: format!("New thread: {chat_id}"),
                                 });
                                 rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
                                 last_exec_poll = Instant::now();
@@ -3009,8 +3008,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                         "Compaction requested. It will run between turns; next inbound will see a smaller context.".to_string()
                                     } else {
                                         format!(
-                                            "Compaction requested with focus: \"{}\". Next inbound will see a smaller context.",
-                                            focus
+                                            "Compaction requested with focus: \"{focus}\". Next inbound will see a smaller context."
                                         )
                                     };
                                     app.cells.push(Cell::System { message: note });
@@ -3137,7 +3135,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                             });
                                         } else {
                                             app.cells.push(Cell::System {
-                                                message: format!("Skill installation requested for repository: {}. Check logs for progress.", repo_url),
+                                                message: format!("Skill installation requested for repository: {repo_url}. Check logs for progress."),
                                             });
                                         }
                                     }

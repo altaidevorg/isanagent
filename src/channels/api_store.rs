@@ -56,13 +56,13 @@ struct SqliteApiResponseStoreActor {
 impl SqliteApiResponseStoreActor {
     fn new(db_path: impl AsRef<Path>) -> Result<Self, String> {
         let conn = Connection::open(db_path)
-            .map_err(|e| format!("Failed to open API response store: {}", e))?;
+            .map_err(|e| format!("Failed to open API response store: {e}"))?;
         conn.busy_timeout(Duration::from_secs(5))
-            .map_err(|e| format!("Failed to configure API response store busy timeout: {}", e))?;
+            .map_err(|e| format!("Failed to configure API response store busy timeout: {e}"))?;
         conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| format!("Failed to enable WAL mode for API response store: {}", e))?;
+            .map_err(|e| format!("Failed to enable WAL mode for API response store: {e}"))?;
         conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(|e| format!("Failed to tune API response store synchronous mode: {}", e))?;
+            .map_err(|e| format!("Failed to tune API response store synchronous mode: {e}"))?;
         conn.execute(
             "CREATE TABLE IF NOT EXISTS api_responses (
                 response_id TEXT PRIMARY KEY,
@@ -74,7 +74,7 @@ impl SqliteApiResponseStoreActor {
             )",
             [],
         )
-        .map_err(|e| format!("Failed to initialize api_responses table: {}", e))?;
+        .map_err(|e| format!("Failed to initialize api_responses table: {e}"))?;
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_api_responses_previous_response_id
@@ -83,8 +83,7 @@ impl SqliteApiResponseStoreActor {
         )
         .map_err(|e| {
             format!(
-                "Failed to initialize api_responses previous_response_id index: {}",
-                e
+                "Failed to initialize api_responses previous_response_id index: {e}"
             )
         })?;
         conn.execute(
@@ -92,7 +91,7 @@ impl SqliteApiResponseStoreActor {
              ON api_responses(created_at)",
             [],
         )
-        .map_err(|e| format!("Failed to initialize api_responses created_at index: {}", e))?;
+        .map_err(|e| format!("Failed to initialize api_responses created_at index: {e}"))?;
 
         Ok(Self { conn })
     }
@@ -131,7 +130,7 @@ impl ActorLogic<ApiStoreMessage> for SqliteApiResponseStoreActor {
                             created_at
                         ],
                     )
-                    .map_err(|e| format!("Failed to persist response state: {}", e))
+                    .map_err(|e| format!("Failed to persist response state: {e}"))
                     .map(|_| ());
                 let _ = reply.send(result);
             }
@@ -152,7 +151,7 @@ impl ActorLogic<ApiStoreMessage> for SqliteApiResponseStoreActor {
                         },
                     )
                     .optional()
-                    .map_err(|e| format!("Failed to load response state: {}", e));
+                    .map_err(|e| format!("Failed to load response state: {e}"));
                 let _ = reply.send(result);
             }
             ApiStoreMessage::ListThreadsBySender {
@@ -185,7 +184,7 @@ impl ActorLogic<ApiStoreMessage> for SqliteApiResponseStoreActor {
                             ORDER BY updated_at DESC
                             LIMIT ?2",
                         )
-                        .map_err(|e| format!("Failed to list threads: {}", e))?;
+                        .map_err(|e| format!("Failed to list threads: {e}"))?;
                     let rows = stmt
                         .query_map(params![sender_id, limit_i64], |row| {
                             Ok(ThreadListRow {
@@ -194,10 +193,10 @@ impl ActorLogic<ApiStoreMessage> for SqliteApiResponseStoreActor {
                                 latest_response_id: row.get(2)?,
                             })
                         })
-                        .map_err(|e| format!("Failed to list threads: {}", e))?;
+                        .map_err(|e| format!("Failed to list threads: {e}"))?;
                     let mut out = Vec::new();
                     for r in rows {
-                        out.push(r.map_err(|e| format!("Failed to read thread row: {}", e))?);
+                        out.push(r.map_err(|e| format!("Failed to read thread row: {e}"))?);
                     }
                     Ok(out)
                 })();
@@ -215,7 +214,7 @@ impl ActorLogic<ApiStoreMessage> for SqliteApiResponseStoreActor {
                          WHERE thread_id = ?1 AND sender_id = ?2",
                         params![thread_id, sender_id],
                     )
-                    .map_err(|e| format!("Failed to delete thread responses: {}", e));
+                    .map_err(|e| format!("Failed to delete thread responses: {e}"));
                 let _ = reply.send(result);
             }
         }
@@ -253,7 +252,7 @@ impl ResponseStore {
         self.node
             .send_packet(msg)
             .await
-            .map_err(|e| format!("Failed to send response store insert request: {}", e))?;
+            .map_err(|e| format!("Failed to send response store insert request: {e}"))?;
         rx.await
             .map_err(|_| "API response store actor channel closed".to_string())?
     }
@@ -267,7 +266,7 @@ impl ResponseStore {
         self.node
             .send_packet(msg)
             .await
-            .map_err(|e| format!("Failed to send response store get request: {}", e))?;
+            .map_err(|e| format!("Failed to send response store get request: {e}"))?;
         rx.await
             .map_err(|_| "API response store actor channel closed".to_string())?
     }
@@ -286,7 +285,7 @@ impl ResponseStore {
         self.node
             .send_packet(msg)
             .await
-            .map_err(|e| format!("Failed to send list threads request: {}", e))?;
+            .map_err(|e| format!("Failed to send list threads request: {e}"))?;
         rx.await
             .map_err(|_| "API response store actor channel closed".to_string())?
     }
@@ -306,7 +305,7 @@ impl ResponseStore {
         self.node
             .send_packet(msg)
             .await
-            .map_err(|e| format!("Failed to send delete thread request: {}", e))?;
+            .map_err(|e| format!("Failed to send delete thread request: {e}"))?;
         rx.await
             .map_err(|_| "API response store actor channel closed".to_string())?
     }

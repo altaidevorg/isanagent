@@ -31,7 +31,7 @@ impl LoggerHandle {
         // For system logs, it's better to drop a log than to dead-lock the entire agent.
         self.sender
             .try_send(msg)
-            .map_err(|e| format!("logger error: {}", e))
+            .map_err(|e| format!("logger error: {e}"))
     }
 }
 
@@ -199,7 +199,7 @@ impl LoggingActor {
     ) -> Result<Self, String> {
         let logs_dir = workspace_dir.join(".system_generated").join("logs");
         fs::create_dir_all(&logs_dir)
-            .map_err(|e| format!("Failed to create logs directory: {}", e))?;
+            .map_err(|e| format!("Failed to create logs directory: {e}"))?;
 
         let mut actor = Self {
             conversation_writer: None,
@@ -218,7 +218,7 @@ impl LoggingActor {
                 logging_config.conversation_max_bytes,
                 logging_config.retained_generations,
             )
-            .map_err(|e| format!("Failed to open conversation log: {}", e))?,
+            .map_err(|e| format!("Failed to open conversation log: {e}"))?,
         );
         actor.runtime_writer = Some(
             RotatingLineWriter::new(
@@ -226,11 +226,11 @@ impl LoggingActor {
                 logging_config.runtime_max_bytes,
                 logging_config.retained_generations,
             )
-            .map_err(|e| format!("Failed to open runtime log: {}", e))?,
+            .map_err(|e| format!("Failed to open runtime log: {e}"))?,
         );
         actor
             .enforce_total_log_cap()
-            .map_err(|e| format!("Failed to enforce diagnostic log cap: {}", e))?;
+            .map_err(|e| format!("Failed to enforce diagnostic log cap: {e}"))?;
         Ok(actor)
     }
 
@@ -337,14 +337,13 @@ impl LoggingActor {
             BusMessage::LoggerControl(_) => return,
             BusMessage::Cancel(chat_id) => LogEvent::info(
                 "BusMessage",
-                &format!("Cancel reasoning loop for chat_id={}", chat_id),
+                &format!("Cancel reasoning loop for chat_id={chat_id}"),
             )
             .with_chat_id(chat_id),
             BusMessage::CancelRun { chat_id, run_id } => LogEvent::info(
                 "BusMessage",
                 &format!(
-                    "Cancel reasoning loop for chat_id={} run_id={}",
-                    chat_id, run_id
+                    "Cancel reasoning loop for chat_id={chat_id} run_id={run_id}"
                 ),
             )
             .with_chat_id(chat_id),
@@ -352,17 +351,17 @@ impl LoggingActor {
                 chat_id, run_id, ..
             } => LogEvent::info(
                 "BusMessage",
-                &format!("Steer active run for chat_id={} run_id={}", chat_id, run_id),
+                &format!("Steer active run for chat_id={chat_id} run_id={run_id}"),
             )
             .with_chat_id(chat_id),
             BusMessage::PromoteSyncToBackground(chat_id) => LogEvent::info(
                 "BusMessage",
-                &format!("PromoteSyncToBackground requested for chat_id={}", chat_id),
+                &format!("PromoteSyncToBackground requested for chat_id={chat_id}"),
             )
             .with_chat_id(chat_id),
             BusMessage::SetTerminalSessionChat { chat_id } => LogEvent::info(
                 "BusMessage",
-                &format!("SetTerminalSessionChat chat_id={}", chat_id),
+                &format!("SetTerminalSessionChat chat_id={chat_id}"),
             )
             .with_chat_id(chat_id),
             BusMessage::SwitchModel {
@@ -372,8 +371,7 @@ impl LoggingActor {
             } => LogEvent::info(
                 "BusMessage",
                 &format!(
-                    "SwitchModel provider={} model={}",
-                    provider_name, model_name
+                    "SwitchModel provider={provider_name} model={model_name}"
                 ),
             ),
             BusMessage::TriggerCompaction {
@@ -848,8 +846,7 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
         } => LogEvent::info(
             "Telemetry",
             &format!(
-                "SubagentFinished parent={} child={} task={} status={}",
-                parent_chat_id, child_chat_id, task_id, status
+                "SubagentFinished parent={parent_chat_id} child={child_chat_id} task={task_id} status={status}"
             ),
         )
         .with_chat_id(parent_chat_id.as_str()),
@@ -863,8 +860,7 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
         } => LogEvent::info(
             "Telemetry",
             &format!(
-                "ShellPolicyDecision channel={} mode={} decision={} command={}",
-                channel, mode, decision, command_preview
+                "ShellPolicyDecision channel={channel} mode={mode} decision={decision} command={command_preview}"
             ),
         )
         .with_chat_id(chat_id),
@@ -876,8 +872,7 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
         } => LogEvent::warn(
             "Telemetry",
             &format!(
-                "ShellGrepLikeDetected channel={} command={}",
-                channel, command_preview
+                "ShellGrepLikeDetected channel={channel} command={command_preview}"
             ),
         )
         .with_chat_id(chat_id),
@@ -888,7 +883,7 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             ..
         } => LogEvent::info(
             "Telemetry",
-            &format!("ResearchDepthNudge channel={} reason={}", channel, reason),
+            &format!("ResearchDepthNudge channel={channel} reason={reason}"),
         )
         .with_chat_id(chat_id),
         TelemetryEvent::BackgroundJobUpdated {
@@ -921,8 +916,7 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
         } => LogEvent::info(
             "Telemetry",
             &format!(
-                "NotificationCreated channel={} id={} kind={} title={}",
-                channel, notification_id, kind, title
+                "NotificationCreated channel={channel} id={notification_id} kind={kind} title={title}"
             ),
         )
         .with_chat_id(chat_id),
@@ -935,8 +929,7 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
         } => LogEvent::info(
             "Telemetry",
             &format!(
-                "NotificationUpdated channel={} id={} state={}",
-                channel, notification_id, state
+                "NotificationUpdated channel={channel} id={notification_id} state={state}"
             ),
         )
         .with_chat_id(chat_id),
@@ -950,8 +943,7 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
         } => LogEvent::info(
             "Telemetry",
             &format!(
-                "CompactionTriggered reason={:?} tokens_before={} turns_before={} tokens_after_preprocess={}",
-                reason, tokens_before, turns_before, tokens_after_preprocess
+                "CompactionTriggered reason={reason:?} tokens_before={tokens_before} turns_before={turns_before} tokens_after_preprocess={tokens_after_preprocess}"
             ),
         )
         .with_chat_id(chat_id),
@@ -965,8 +957,7 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
         } => LogEvent::info(
             "Telemetry",
             &format!(
-                "CompactionCompleted tokens={}→{} wall_ms={} summary_bytes={} completeness={:.2}",
-                tokens_before, tokens_after, wall_ms, summary_bytes, section_completeness
+                "CompactionCompleted tokens={tokens_before}→{tokens_after} wall_ms={wall_ms} summary_bytes={summary_bytes} completeness={section_completeness:.2}"
             ),
         )
         .with_chat_id(chat_id),
@@ -977,8 +968,7 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
         } => LogEvent::warn(
             "Telemetry",
             &format!(
-                "CompactionFailed reason={} tokens_at_failure={}",
-                reason, tokens_at_failure
+                "CompactionFailed reason={reason} tokens_at_failure={tokens_at_failure}"
             ),
         )
         .with_chat_id(chat_id),
@@ -990,8 +980,7 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             let ev = LogEvent::info(
                 "Telemetry",
                 &format!(
-                    "ReflectionStarted kind={:?} inputs_consumed={}",
-                    kind, inputs_consumed
+                    "ReflectionStarted kind={kind:?} inputs_consumed={inputs_consumed}"
                 ),
             );
             match chat_id {
@@ -1008,8 +997,7 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             let ev = LogEvent::info(
                 "Telemetry",
                 &format!(
-                    "ReflectionCompleted kind={:?} output_bytes={} wall_ms={}",
-                    kind, output_bytes, wall_ms
+                    "ReflectionCompleted kind={kind:?} output_bytes={output_bytes} wall_ms={wall_ms}"
                 ),
             );
             match chat_id {
@@ -1022,7 +1010,7 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             tool_call_id,
         } => LogEvent::info(
             "Telemetry",
-            &format!("ToolResultRefetch tool_call_id={}", tool_call_id),
+            &format!("ToolResultRefetch tool_call_id={tool_call_id}"),
         )
         .with_chat_id(chat_id),
     }
