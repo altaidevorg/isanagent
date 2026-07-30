@@ -679,16 +679,23 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
                 }
             });
             let sandbox_dir = self.sandbox_dir.clone();
+            let workspace_dir = self.workspace_dir.clone();
+            let mut providers = self.providers.clone();
             let memory_node = self.memory_node.clone();
             let channel_name_for_line = channel_name.clone();
             let mut pending_host_files = self.initial_files.clone();
             std::thread::spawn(move || {
                 use std::io::BufRead;
+                let mut active_provider_key =
+                    crate::channels::terminal_ui::resolve_initial_active_provider_key(
+                        &workspace_dir,
+                        &providers,
+                    );
                 println!(
                     "ALTAI line mode · {sandbox_label} · {status_model} · {status_permission} · session {session_short}"
                 );
                 println!(
-                    "Commands: /exit · /context · /compact [focus] · @file attachments. Color: {}",
+                    "Commands: /exit · /context · /compact [focus] · /key <api_key> · @file attachments. Color: {}",
                     if crate::channels::terminal_ui::uses_ansi_color() {
                         "on"
                     } else {
@@ -790,9 +797,118 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
                         if focus.is_empty() {
                             println!("[system] Compaction requested. It will run between turns.");
                         } else {
+                            println!("[system] Compaction requested with focus: \"{focus}\".");
+                        }
+                        print!("> ");
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                        continue;
+                    }
+                    if trimmed.eq_ignore_ascii_case("/key")
+                        || trimmed.to_ascii_lowercase().starts_with("/key ")
+                    {
+                        let arg = trimmed.strip_prefix("/key").unwrap_or("").trim();
+                        if arg.is_empty() {
                             println!(
-                                "[system] Compaction requested with focus: \"{focus}\"."
+                                "[system] Usage: /key <api_key>  (or /key <provider_config_key> <api_key>)"
                             );
+                            print!("> ");
+                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                            continue;
+                        }
+                        let mut parts = arg.splitn(2, char::is_whitespace);
+                        let first = parts.next().unwrap_or("").trim();
+                        let rest = parts.next().unwrap_or("").trim();
+                        let (config_key_arg, secret): (Option<&str>, &str) =
+                            if !rest.is_empty() && providers.contains_key(first) {
+                                (Some(first), rest)
+                            } else {
+                                (None, arg)
+                            };
+                        let resolved_config_key = config_key_arg
+                            .map(|s| s.to_string())
+                            .or_else(|| active_provider_key.clone())
+                            .or_else(|| {
+                                if providers.len() == 1 {
+                                    providers.keys().next().cloned()
+                                } else {
+                                    None
+                                }
+                            });
+                        let Some(resolved_config_key) = resolved_config_key else {
+                            let mut available: Vec<&str> =
+                                providers.keys().map(|s| s.as_str()).collect();
+                            available.sort_unstable();
+                            println!(
+                                "[system] Multiple providers configured; specify one: /key <provider_config_key> <api_key>. Available: {}. Or run /model first, then /key.",
+                                available.join(", ")
+                            );
+                            print!("> ");
+                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                            continue;
+                        };
+                        if crate::channels::terminal_ui::key_looks_like_placeholder(secret) {
+                            println!(
+                                "[system] That doesn't look like a real API key. Usage: /key <api_key>"
+                            );
+                            print!("> ");
+                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                            continue;
+                        }
+                        match providers.get_mut(&resolved_config_key) {
+                            None => {
+                                let mut available: Vec<&str> =
+                                    providers.keys().map(|s| s.as_str()).collect();
+                                available.sort_unstable();
+                                println!(
+                                    "[system] Unknown provider '{resolved_config_key}'. Available: {}.",
+                                    available.join(", ")
+                                );
+                            }
+                            Some(cfg) => {
+                                cfg.api_key = Some(secret.to_string());
+                                let provider_name = cfg.provider_name.clone();
+                                let model_name = cfg.model_name.clone();
+                                let resolved_url = cfg.resolved_base_url().unwrap_or_default();
+                                match cfg.resolve_api_key() {
+                                    Ok(resolved_key) => {
+                                        let masked =
+                                            crate::channels::terminal_ui::mask_api_key_suffix(
+                                                &resolved_key,
+                                            );
+                                        match crate::channels::terminal_ui::persist_provider_api_key(
+                                            &workspace_dir,
+                                            &resolved_config_key,
+                                            secret,
+                                        ) {
+                                            Ok(()) => println!(
+                                                "[system] API key updated for '{resolved_config_key}' (ends in {masked}) and saved to config.toml."
+                                            ),
+                                            Err(e) => println!(
+                                                "[system] API key updated for '{resolved_config_key}' (ends in {masked}) for this session, but could not persist to config.toml: {e}"
+                                            ),
+                                        }
+                                        if bus_tx
+                                            .blocking_send(BusMessage::SwitchModel {
+                                                provider_name,
+                                                model_name,
+                                                base_url: resolved_url,
+                                                api_key: resolved_key,
+                                            })
+                                            .is_err()
+                                        {
+                                            println!("[system] Bus closed; exiting.");
+                                            let _ = shutdown.send(());
+                                            break;
+                                        }
+                                        active_provider_key = Some(resolved_config_key);
+                                    }
+                                    Err(e) => {
+                                        println!(
+                                            "[system] Key was set, but could not resolve it for switching: {e}"
+                                        );
+                                    }
+                                }
+                            }
                         }
                         print!("> ");
                         let _ = std::io::Write::flush(&mut std::io::stdout());

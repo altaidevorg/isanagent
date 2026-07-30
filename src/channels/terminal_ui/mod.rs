@@ -30,7 +30,10 @@ pub use theme::{
     resolve_host_appearance, uses_ansi_color, HostThemeMode, Theme, ThemeAppearance,
 };
 
-pub(crate) use run::{run_ratatui_main, RatatuiMainConfig};
+pub(crate) use run::{
+    key_looks_like_placeholder, mask_api_key_suffix, persist_provider_api_key,
+    resolve_initial_active_provider_key, run_ratatui_main, RatatuiMainConfig,
+};
 
 use unicode_width::UnicodeWidthStr;
 

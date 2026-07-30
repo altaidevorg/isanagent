@@ -93,7 +93,8 @@ impl Provider for NoKeyProvider {
         _tools: Option<Value>,
     ) -> Result<LLMResponse, LLMError> {
         Err(LLMError::ApiError(
-            "No API key configured. Use /model to select a provider, or add api_key to config.toml."
+            "No API key configured. Use /key <api_key> to set one now, /model to switch \
+             providers, or add api_key to config.toml."
                 .to_string(),
         ))
     }
