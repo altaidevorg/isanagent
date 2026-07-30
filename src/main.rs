@@ -136,16 +136,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Acp) => {
-            isanagent::host::start_host(isanagent::host::HostConfig {
-                workspace: cli.workspace.map(std::path::PathBuf::from),
-                config: cli.config.map(std::path::PathBuf::from),
-                acp_mode: true,
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| e as Box<dyn std::error::Error>)
-        }
+        Some(Commands::Acp) => isanagent::host::start_host(isanagent::host::HostConfig {
+            workspace: cli.workspace.map(std::path::PathBuf::from),
+            config: cli.config.map(std::path::PathBuf::from),
+            acp_mode: true,
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| e as Box<dyn std::error::Error>),
         Some(Commands::Onboard(args)) => run_onboard(cli.workspace, args).await,
         Some(Commands::Skills(args)) => run_skills(cli.workspace, args).await,
         None => {
