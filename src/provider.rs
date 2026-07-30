@@ -77,7 +77,6 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use log::debug;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 /// Placeholder provider used when no API key is configured at startup.
@@ -96,55 +95,6 @@ impl Provider for NoKeyProvider {
             "No API key configured. Use /model to select a provider, or add api_key to config.toml."
                 .to_string(),
         ))
-    }
-}
-
-/// Deterministic in-process provider for host/CLI smoke tests.
-#[derive(Clone)]
-pub struct ScriptedProvider {
-    responses: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
-    fallback: String,
-}
-
-impl ScriptedProvider {
-    pub fn new(responses: Vec<String>) -> Self {
-        let fallback = responses
-            .last()
-            .cloned()
-            .unwrap_or_else(|| "scripted-ok".to_string());
-        Self {
-            responses: Arc::new(std::sync::Mutex::new(responses.into())),
-            fallback,
-        }
-    }
-}
-
-#[async_trait]
-impl Provider for ScriptedProvider {
-    async fn chat(
-        &self,
-        _messages: &[ChatMessage],
-        _tools: Option<Value>,
-    ) -> Result<LLMResponse, LLMError> {
-        let content = {
-            let mut queue = self
-                .responses
-                .lock()
-                .map_err(|_| LLMError::ApiError("scripted provider lock poisoned".into()))?;
-            queue.pop_front().unwrap_or_else(|| self.fallback.clone())
-        };
-        Ok(LLMResponse {
-            content,
-            tool_calls: None,
-            reasoning_content: None,
-            usage: Some(crate::utils::TokenUsage {
-                prompt_tokens: 1,
-                completion_tokens: 1,
-                total_tokens: 2,
-                cache_read_tokens: 0,
-                cache_creation_tokens: 0,
-            }),
-        })
     }
 }
 

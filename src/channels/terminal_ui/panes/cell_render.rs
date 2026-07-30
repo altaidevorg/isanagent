@@ -111,55 +111,22 @@ pub(crate) fn cell_block_lines(cell: &Cell, inner_width: usize) -> Vec<Line<'sta
             v.push(Line::from(""));
             v
         }
-        Cell::Clarification {
-            text,
-            choices,
-            edit_diff,
-        } => {
+        Cell::Clarification { text, choices } => {
             let inner = w.saturating_sub(2).max(8);
-            let title = if edit_diff.is_some() {
-                "edit approval"
-            } else {
-                "approval"
-            };
             let mut v = vec![Line::from(vec![
                 Span::styled(" ? ", Theme::clarification()),
-                Span::styled(title, Theme::clarification().add_modifier(Modifier::BOLD)),
+                Span::styled("question", Theme::clarification()),
             ])];
-            if let Some(diff) = edit_diff {
-                v.push(Line::from(vec![
-                    Span::styled(" file ", Theme::dim()),
-                    Span::styled(diff.file.clone(), Theme::active()),
-                ]));
-                if diff.truncated {
-                    v.push(Line::from(Span::styled(
-                        " [truncated]",
-                        Theme::tool_call(),
-                    )));
-                }
-                v.extend(crate::channels::terminal_ui::approval::diff_lines_to_spans(
-                    &diff.diff,
-                    40,
-                ));
-            }
             for ln in wrap_text(text, inner) {
                 v.push(Line::from(Span::styled(ln, Theme::clarification())));
             }
-            let shown_choices = if choices.is_empty() {
-                crate::channels::terminal_ui::APPROVAL_CHOICES
-                    .iter()
-                    .map(|s| (*s).to_string())
-                    .collect::<Vec<_>>()
-            } else {
-                choices.clone()
-            };
-            if !shown_choices.is_empty() {
+            if !choices.is_empty() {
                 v.push(Line::from(Span::styled(
-                    "1 approve · 2 deny · 3 always · 4 abort  (or type the option)",
+                    "Reply with a number (1–n) or the exact option text.",
                     Theme::dim(),
                 )));
                 let indent = "   ";
-                for (i, choice) in shown_choices.iter().enumerate() {
+                for (i, choice) in choices.iter().enumerate() {
                     let n = i + 1;
                     let head = format!("{n}. ");
                     let first = format!("{head}{choice}");
