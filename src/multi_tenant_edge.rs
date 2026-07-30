@@ -92,7 +92,7 @@ impl HeartbeatTransport for ReqwestHeartbeatTransport {
     async fn post_activity(&self, url: &str, token: &str) -> Result<StatusCode, String> {
         self.client
             .post(url)
-            .header("Authorization", format!("Bearer {}", token))
+            .header("Authorization", format!("Bearer {token}"))
             .send()
             .await
             .map(|response| response.status())
@@ -110,7 +110,7 @@ impl CronTransport for ReqwestCronTransport {
     ) -> Result<StatusCode, String> {
         self.client
             .put(url)
-            .header("Authorization", format!("Bearer {}", token))
+            .header("Authorization", format!("Bearer {token}"))
             .json(&PutCronsBody {
                 cron_rules: cron_rules.to_vec(),
             })
@@ -417,8 +417,7 @@ fn build_reqwest_client() -> Result<reqwest::Client, String> {
         .build()
         .map_err(|error| {
             format!(
-                "failed to build multi-tenant-edge reqwest client: {}",
-                error
+                "failed to build multi-tenant-edge reqwest client: {error}"
             )
         })
 }
@@ -472,12 +471,11 @@ fn normalize_internal_url(
     let url = if trimmed.ends_with(path) {
         trimmed.to_string()
     } else {
-        format!("{}{}", trimmed, path)
+        format!("{trimmed}{path}")
     };
     Url::parse(&url).map_err(|error| {
         format!(
-            "multi-tenant-edge {} enabled but MTE_PROXY_BASE_URL '{}' is invalid: {}",
-            feature_name, base_url, error
+            "multi-tenant-edge {feature_name} enabled but MTE_PROXY_BASE_URL '{base_url}' is invalid: {error}"
         )
     })?;
     Ok(url)

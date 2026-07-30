@@ -80,7 +80,7 @@ impl Tool for CompactContextTool {
                 trigger: Some(CompactionTrigger::AgentSelf),
             })
             .await
-            .map_err(|e| format!("Failed to enqueue compaction request: {}", e))?;
+            .map_err(|e| format!("Failed to enqueue compaction request: {e}"))?;
 
         Ok(
             "Compaction scheduled. It will run between this turn and the next user message, \

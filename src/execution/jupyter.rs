@@ -310,9 +310,7 @@ async fn connect_kernel_channels_ws(url: &str) -> Result<ExecWsStream, Execution
         }
         Err(e1) => {
             log::debug!(
-                "jupyter kernel ws connect with {} failed: {}; retrying without subprotocol",
-                JUPYTER_KERNEL_WS_SUBPROTOCOL,
-                e1
+                "jupyter kernel ws connect with {JUPYTER_KERNEL_WS_SUBPROTOCOL} failed: {e1}; retrying without subprotocol"
             );
             let (ws, _) = connect_async(url).await.map_err(|e2| {
                 ExecutionError::Provider(format!(
@@ -535,7 +533,7 @@ impl ExecutionProvider for JupyterExecutionProvider {
             )
             .await;
             if let Err(e) = r {
-                log::warn!("jupyter notebook sync {}: {}", path, e);
+                log::warn!("jupyter notebook sync {path}: {e}");
             }
         }
 

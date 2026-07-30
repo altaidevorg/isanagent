@@ -199,14 +199,7 @@ async fn start_embedded_host(
     isanagent::host::start_host(isanagent::host::HostConfig {
         workspace: workspace_arg.map(std::path::PathBuf::from),
         config: config_arg.map(std::path::PathBuf::from),
-        sandbox: None,
-        model: None,
-        fallback_model: None,
-        permission: None,
-        no_color: false,
-        resume: None,
-        files: Vec::new(),
-        line_mode: false,
+        ..Default::default()
     })
     .await
     .map_err(std::io::Error::other)?;
@@ -224,7 +217,7 @@ async fn run_isanagent_legacy(
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
     let (app_shutdown_tx, app_shutdown_rx) = watch::channel(false);
     init_runtime_logger(logger_bus_tx.clone()).map_err(|e| {
-        std::io::Error::other(format!("failed to initialize runtime logger: {:?}", e))
+        std::io::Error::other(format!("failed to initialize runtime logger: {e:?}"))
     })?;
 
     let logger_factory = {
@@ -284,7 +277,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         .to_str()
         .ok_or_else(|| std::io::Error::other("workspace DB path is not valid UTF-8"))?;
     let memory_actor = isanagent::memory::SqliteMemoryActor::new(db_path_str).map_err(|e| {
-        std::io::Error::other(format!("Failed to initialize SqliteMemoryActor: {}", e))
+        std::io::Error::other(format!("Failed to initialize SqliteMemoryActor: {e}"))
     })?;
     let memory_node = NodeHandle::<isanagent::memory::MemoryMessage>::new(
         memory_actor,
@@ -332,8 +325,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             .await
             .map_err(|error| {
                 std::io::Error::other(format!(
-                    "Failed to sync cron jobs to multi-tenant-edge on startup: {}",
-                    error
+                    "Failed to sync cron jobs to multi-tenant-edge on startup: {error}"
                 ))
             })?;
         Some(scheduler)
@@ -876,6 +868,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             workspace_dir: workspace.dir.clone(),
             sandbox_dir: workspace.sandbox_dir.clone(),
             status_model: model_name.clone(),
+            status_permission: "default".into(),
             memory_node: memory_node.clone(),
             providers: {
                 // Merge default [provider] + expanded [providers.*] into one map for /model selector
@@ -887,6 +880,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                 all_providers
             },
             color_enabled: !matches!(std::env::var_os("NO_COLOR"), Some(value) if !value.is_empty()),
+            theme: isanagent::host::HostThemeMode::Auto,
             resume_session: false,
             initial_files: Vec::new(),
             mode: TerminalMode::Tui,
@@ -1100,7 +1094,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                         );
                         if let Some(chan) = delivery_channels.get("terminal") {
                             if let Err(e) = chan.send(notice).await {
-                                log::error!("Failed to deliver AgentThought to terminal: {}", e);
+                                log::error!("Failed to deliver AgentThought to terminal: {e}");
                             }
                         }
                     }
@@ -1137,8 +1131,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                         if let Some(chan) = delivery_channels.get("terminal") {
                             if let Err(e) = chan.send(notice).await {
                                 log::error!(
-                                    "Failed to deliver tool-progress notice to terminal: {}",
-                                    e
+                                    "Failed to deliver tool-progress notice to terminal: {e}"
                                 );
                             }
                         }
@@ -1182,8 +1175,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                         if let Some(chan) = delivery_channels.get("terminal") {
                             if let Err(e) = chan.send(notice).await {
                                 log::error!(
-                                    "Failed to deliver tool-call notice to terminal: {}",
-                                    e
+                                    "Failed to deliver tool-call notice to terminal: {e}"
                                 );
                             }
                         }
@@ -1215,8 +1207,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                         if let Some(chan) = delivery_channels.get("terminal") {
                             if let Err(e) = chan.send(notice).await {
                                 log::error!(
-                                    "Failed to deliver tool-result notice to terminal: {}",
-                                    e
+                                    "Failed to deliver tool-result notice to terminal: {e}"
                                 );
                             }
                         }
@@ -1319,9 +1310,8 @@ provider's environment, or set default_provider=\"local\" and local_python_runti
             && io::stdout().is_terminal();
         if !interactive {
             log::warn!(
-                "Execution local runtime is uv-managed but '{}' was not found on PATH. \
-Install uv manually or run /install-python from terminal mode.",
-                uv_bin
+                "Execution local runtime is uv-managed but '{uv_bin}' was not found on PATH. \
+Install uv manually or run /install-python from terminal mode."
             );
             return;
         }
@@ -1329,8 +1319,7 @@ Install uv manually or run /install-python from terminal mode.",
         let uv_bin_owned = uv_bin.to_string();
         let prompt_result = tokio::task::spawn_blocking(move || {
             println!(
-                "\nExecution runtime is set to uv-managed, but '{}' was not found on PATH.",
-                uv_bin_owned
+                "\nExecution runtime is set to uv-managed, but '{uv_bin_owned}' was not found on PATH."
             );
             println!("Install uv now? (yes/no)");
             let _ = io::stdout().flush();
@@ -1394,7 +1383,7 @@ async fn recover_background_jobs_on_startup(
     let rows = match rx.await {
         Ok(Ok(rows)) => rows,
         Ok(Err(e)) => {
-            log::error!("Failed to list background jobs for recovery: {}", e);
+            log::error!("Failed to list background jobs for recovery: {e}");
             return;
         }
         Err(_) => {
@@ -1440,8 +1429,7 @@ async fn recover_background_jobs_on_startup(
     }
     if count > 0 {
         log::info!(
-            "Successfully resumed {} background job(s) on startup.",
-            count
+            "Successfully resumed {count} background job(s) on startup."
         );
     }
 }
@@ -1597,9 +1585,9 @@ async fn run_skills(
     match args.command {
         SkillCommands::Add { repo_url, skill } => {
             if let Some(ref name) = skill {
-                println!("Adding skill '{}' from {}...", name, repo_url);
+                println!("Adding skill '{name}' from {repo_url}...");
             } else {
-                println!("Adding all skills from {}...", repo_url);
+                println!("Adding all skills from {repo_url}...");
             }
             match skills
                 .install_skills_from_repo(&repo_url, skill.as_deref())
@@ -1611,12 +1599,12 @@ async fn run_skills(
                     } else {
                         println!("Successfully installed {} skills:", installed.len());
                         for name in installed {
-                            println!("  - {}", name);
+                            println!("  - {name}");
                         }
                     }
                 }
                 Err(e) => {
-                    return Err(format!("Error installing skills: {}", e).into());
+                    return Err(format!("Error installing skills: {e}").into());
                 }
             }
         }
@@ -1732,8 +1720,7 @@ fn print_onboarding_report(
     match api_key_env {
         Some(env) => {
             println!(
-                "1. Ensure {} is set in your environment (see config.toml provider.api_key_env)",
-                env
+                "1. Ensure {env} is set in your environment (see config.toml provider.api_key_env)"
             );
         }
         None => {

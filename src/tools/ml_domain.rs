@@ -61,8 +61,7 @@ impl Tool for ArxivSearchTool {
 
         let q = urlencoding::encode(query);
         let url = format!(
-            "https://export.arxiv.org/api/query?search_query=all:{}&start=0&max_results={}",
-            q, max_results
+            "https://export.arxiv.org/api/query?search_query=all:{q}&start=0&max_results={max_results}"
         );
 
         let client = reqwest::Client::builder()
@@ -74,7 +73,7 @@ impl Tool for ArxivSearchTool {
             .get(&url)
             .send()
             .await
-            .map_err(|e| format!("arxiv_search request: {}", e))?;
+            .map_err(|e| format!("arxiv_search request: {e}"))?;
 
         if !resp.status().is_success() {
             return Err(format!("arxiv_search HTTP {}", resp.status()));
@@ -83,7 +82,7 @@ impl Tool for ArxivSearchTool {
         let body = resp
             .text()
             .await
-            .map_err(|e| format!("arxiv_search body: {}", e))?;
+            .map_err(|e| format!("arxiv_search body: {e}"))?;
 
         let mut out = String::new();
         let entry_re = regex::Regex::new(r"(?s)<entry>.*?</entry>").map_err(|e| e.to_string())?;
@@ -115,8 +114,7 @@ impl Tool for ArxivSearchTool {
             let id_clean = id.split('/').next_back().unwrap_or(id);
 
             out.push_str(&format!(
-                "ID: {}\nTitle: {}\nSummary: {}\n\n---\n",
-                id_clean, title, summary
+                "ID: {id_clean}\nTitle: {title}\nSummary: {summary}\n\n---\n"
             ));
         }
 
@@ -165,7 +163,7 @@ impl Tool for ArxivFetchTool {
             return Err("invalid arxiv_id".to_string());
         }
 
-        let arxiv2md_url = format!("https://arxiv2md.org/api/markdown?url={}", id);
+        let arxiv2md_url = format!("https://arxiv2md.org/api/markdown?url={id}");
 
         let client = reqwest::Client::builder()
             .user_agent(HF_USER_AGENT)
@@ -186,12 +184,12 @@ impl Tool for ArxivFetchTool {
         }
 
         let full_content = if html_markdown_content.is_empty() {
-            let pdf_url = format!("https://arxiv.org/pdf/{}.pdf", id);
+            let pdf_url = format!("https://arxiv.org/pdf/{id}.pdf");
             let pdf_resp = client
                 .get(&pdf_url)
                 .send()
                 .await
-                .map_err(|e| format!("arxiv_fetch pdf request: {}", e))?;
+                .map_err(|e| format!("arxiv_fetch pdf request: {e}"))?;
 
             if !pdf_resp.status().is_success() {
                 return Err(format!(
@@ -204,7 +202,7 @@ impl Tool for ArxivFetchTool {
             let pdf_bytes = pdf_resp
                 .bytes()
                 .await
-                .map_err(|e| format!("arxiv_fetch pdf body: {}", e))?
+                .map_err(|e| format!("arxiv_fetch pdf body: {e}"))?
                 .to_vec();
 
             crate::utils::extract_markdown_from_pdf_bytes(&pdf_bytes)?
@@ -305,8 +303,7 @@ impl Tool for HfHubFileFetchTool {
             .collect::<Vec<_>>()
             .join("/");
         let url = format!(
-            "https://huggingface.co/{}/resolve/{}/{}",
-            repo, revision, enc_path
+            "https://huggingface.co/{repo}/resolve/{revision}/{enc_path}"
         );
 
         let client = reqwest::Client::builder()
@@ -318,14 +315,14 @@ impl Tool for HfHubFileFetchTool {
         if let Ok(token) = std::env::var("HF_TOKEN") {
             let t = token.trim();
             if !t.is_empty() {
-                req = req.header(AUTHORIZATION, format!("Bearer {}", t));
+                req = req.header(AUTHORIZATION, format!("Bearer {t}"));
             }
         }
 
         let resp = req
             .send()
             .await
-            .map_err(|e| format!("hf_hub_file_fetch request: {}", e))?;
+            .map_err(|e| format!("hf_hub_file_fetch request: {e}"))?;
 
         if !resp.status().is_success() {
             return Err(format!(
@@ -359,7 +356,7 @@ impl Tool for HfHubFileFetchTool {
         let mut body = resp
             .text()
             .await
-            .map_err(|e| format!("hf_hub_file_fetch body: {}", e))?;
+            .map_err(|e| format!("hf_hub_file_fetch body: {e}"))?;
         crate::utils::truncate_utf8_safe(&mut body, self.max_output_chars, "\n... [TRUNCATED]");
         Ok(body)
     }

@@ -42,9 +42,8 @@ use crate::channels::terminal_ui::protocol::{
 };
 use crate::channels::terminal_ui::text_format::truncate_chars_display;
 use crate::channels::terminal_ui::{
-    execution_browser, init, uses_ansi_color, AgentTaskStatus, App, Cell, JobStripStatus,
-    ModelSelector, TerminalUiFocus, Theme, ToastKind, ToolNoticePhase, ToolRailEntry,
-    TranscriptSelection,
+    execution_browser, uses_ansi_color, AgentTaskStatus, App, Cell, JobStripStatus, ModelSelector,
+    TerminalUiFocus, Theme, ToastKind, ToolNoticePhase, ToolRailEntry, TranscriptSelection,
 };
 use crate::clarification::{METADATA_CLARIFICATION, METADATA_CLARIFICATION_CHOICES};
 use crate::memory::{chat_id_from_root_thread_id, MemoryMessage, SharedReply};
@@ -93,14 +92,164 @@ fn persist_last_model(workspace_dir: &Path, config_key: &str) {
     let _ = std::fs::write(&path, config_key);
 }
 
+/// Resolve the initially "active" provider config key for `/key` when no explicit key is
+/// given: prefer the last model persisted to `.system_generated/last_model` (if it still names
+/// a known provider), else fall back to the sole configured provider when there is exactly one.
+/// Otherwise the caller must ask the user to `/key <provider_config_key> <secret>` or `/model`
+/// first.
+pub(crate) fn resolve_initial_active_provider_key(
+    workspace_dir: &Path,
+    providers: &std::collections::HashMap<String, crate::config::ProviderConfig>,
+) -> Option<String> {
+    let last_model_path = workspace_dir.join(LAST_MODEL_FILE);
+    if let Ok(saved) = std::fs::read_to_string(&last_model_path) {
+        let saved = saved.trim();
+        if !saved.is_empty() && providers.contains_key(saved) {
+            return Some(saved.to_string());
+        }
+    }
+    if providers.len() == 1 {
+        return providers.keys().next().cloned();
+    }
+    None
+}
+
+/// Lightweight placeholder check for interactively entered API keys. Mirrors
+/// `config::api_key_looks_like_placeholder` (kept private there) without depending on config
+/// internals: rejects empty values, angle-bracket templates (`<changethis>`), and common
+/// placeholder tokens.
+pub(crate) fn key_looks_like_placeholder(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() || t.starts_with('<') {
+        return true;
+    }
+    if !t.is_ascii() {
+        return true;
+    }
+    let lower = t.to_ascii_lowercase();
+    if lower == "changethis" {
+        return true;
+    }
+    [
+        "optional",
+        "placeholder",
+        "replace_me",
+        "replaceme",
+        "your_api_key",
+        "changeme",
+    ]
+    .iter()
+    .any(|pat| lower.contains(pat))
+}
+
+/// Never echo a full API key in toasts/cells: show only the trailing 4 characters, e.g. `…cd34`.
+pub(crate) fn mask_api_key_suffix(key: &str) -> String {
+    let trimmed = key.trim();
+    let n = trimmed.chars().count();
+    if n == 0 {
+        return "****".to_string();
+    }
+    let take = n.min(4);
+    let tail: String = trimmed.chars().skip(n - take).collect();
+    format!("…{tail}")
+}
+
+/// Best-effort merge of a live API key into workspace `config.toml`, preserving comments via
+/// `toml_edit::DocumentMut`. Tries, in order: an exact `[providers.<config_key>]` section
+/// (legacy per-model format), a family table whose `models = [...]` array contains
+/// `config_key` (the common family format, where `config_key` is a model name), the legacy
+/// singular `[provider]` block, and finally creates a fresh `[providers.<config_key>]` section.
+pub(crate) fn persist_provider_api_key(
+    workspace_dir: &Path,
+    config_key: &str,
+    api_key: &str,
+) -> Result<(), String> {
+    let config_path = workspace_dir.join("config.toml");
+    let raw = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("Could not read {}: {}", config_path.display(), e))?;
+    let mut doc: toml_edit::DocumentMut = raw
+        .parse()
+        .map_err(|e| format!("Could not parse config.toml: {e}"))?;
+
+    let providers_table_ref = doc.get("providers").and_then(toml_edit::Item::as_table);
+    let exact_match = providers_table_ref.is_some_and(|t| t.contains_key(config_key));
+    let family_match = if exact_match {
+        None
+    } else {
+        providers_table_ref.and_then(|providers| {
+            providers.iter().find_map(|(key, item)| {
+                let models = item.as_table()?.get("models")?.as_array()?;
+                models
+                    .iter()
+                    .any(|v| v.as_str() == Some(config_key))
+                    .then(|| key.to_string())
+            })
+        })
+    };
+    let has_legacy_provider = doc
+        .get("provider")
+        .and_then(toml_edit::Item::as_table)
+        .is_some();
+
+    let target_section: Option<String> = if exact_match {
+        Some(config_key.to_string())
+    } else {
+        family_match
+    };
+
+    if let Some(section_key) = target_section {
+        let providers_table = doc["providers"]
+            .as_table_mut()
+            .ok_or_else(|| "config.toml `providers` is not a table".to_string())?;
+        let entry = providers_table
+            .entry(&section_key)
+            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+        let entry_table = entry
+            .as_table_mut()
+            .ok_or_else(|| format!("[providers.{section_key}] is not a table in config.toml"))?;
+        entry_table["api_key"] = toml_edit::value(api_key);
+    } else if has_legacy_provider {
+        let provider_table = doc["provider"]
+            .as_table_mut()
+            .ok_or_else(|| "config.toml `provider` is not a table".to_string())?;
+        provider_table["api_key"] = toml_edit::value(api_key);
+    } else {
+        if doc
+            .get("providers")
+            .and_then(toml_edit::Item::as_table)
+            .is_none()
+        {
+            let mut fresh = toml_edit::Table::new();
+            fresh.set_implicit(true);
+            doc["providers"] = toml_edit::Item::Table(fresh);
+        }
+        let providers_table = doc["providers"]
+            .as_table_mut()
+            .ok_or_else(|| "config.toml `providers` is not a table".to_string())?;
+        let entry = providers_table
+            .entry(config_key)
+            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+        let entry_table = entry
+            .as_table_mut()
+            .ok_or_else(|| format!("[providers.{config_key}] is not a table in config.toml"))?;
+        entry_table["api_key"] = toml_edit::value(api_key);
+    }
+
+    std::fs::write(&config_path, doc.to_string())
+        .map_err(|e| format!("Could not write {}: {}", config_path.display(), e))
+}
+
 /// Shared helper: resolve a provider config by key, send SwitchModel, and update UI.
 /// Used by both the interactive model selector (Enter key) and the `/model <name>` command.
+/// On success, records `config_key` as the active provider so a later bare `/key <secret>`
+/// knows which `[providers.*]` entry to update.
 fn try_switch_model(
     app: &mut App,
     bus_tx: &Sender<BusMessage>,
     providers: &std::collections::HashMap<String, crate::config::ProviderConfig>,
     workspace_dir: &Path,
     config_key: &str,
+    active_provider_key: &mut Option<String>,
 ) {
     if let Some(cfg) = providers.get(config_key) {
         let resolved_url = cfg.resolved_base_url().unwrap_or_default();
@@ -120,6 +269,7 @@ fn try_switch_model(
                 } else {
                     app.status_model = cfg.model_name.clone();
                     persist_last_model(workspace_dir, config_key);
+                    *active_provider_key = Some(config_key.to_string());
                     app.set_toast(
                         ToastKind::Ok,
                         format!("Model: {}", app.status_model),
@@ -129,14 +279,14 @@ fn try_switch_model(
             }
             Err(e) => {
                 let err_msg = format!(
-                    "No API key for '{}': {}\n\
-                     Set the env var or add api_key = \"...\" under [providers.{}] in config.toml.",
-                    config_key, e, config_key
+                    "No API key for '{config_key}': {e}\n\
+                     Run /key {config_key} <api_key> to set one now, or add api_key = \"...\" under \
+                     [providers.{config_key}] in config.toml (or set the env var)."
                 );
                 app.cells.push(Cell::Error { message: err_msg });
                 app.set_toast(
                     ToastKind::Err,
-                    format!("No API key for {}", config_key),
+                    format!("No API key for {config_key}"),
                     Duration::from_secs(5),
                 );
             }
@@ -144,9 +294,97 @@ fn try_switch_model(
     }
 }
 
+/// `/key` command handler: sets (or updates) an API key at runtime, hot-swaps the live
+/// connection via `BusMessage::SwitchModel`, persists it to `config.toml`, and updates the
+/// in-memory `providers` map so a later `/model` picks up the new key. Never echoes the full
+/// key — only the trailing 4 characters are ever shown.
+#[allow(clippy::too_many_arguments)]
+fn try_set_api_key(
+    app: &mut App,
+    bus_tx: &Sender<BusMessage>,
+    providers: &mut std::collections::HashMap<String, crate::config::ProviderConfig>,
+    workspace_dir: &Path,
+    config_key: &str,
+    api_key: &str,
+    active_provider_key: &mut Option<String>,
+) {
+    if key_looks_like_placeholder(api_key) {
+        app.cells.push(Cell::Error {
+            message: "That doesn't look like a real API key. Usage: /key <api_key>  (or /key <provider_config_key> <api_key>)".into(),
+        });
+        return;
+    }
+    let Some(cfg) = providers.get_mut(config_key) else {
+        let mut available: Vec<&str> = providers.keys().map(|s| s.as_str()).collect();
+        available.sort_unstable();
+        app.cells.push(Cell::Error {
+            message: format!(
+                "Unknown provider '{}'. Available: {}. Run /model first to pick one, then /key.",
+                config_key,
+                available.join(", ")
+            ),
+        });
+        return;
+    };
+    cfg.api_key = Some(api_key.to_string());
+    let provider_name = cfg.provider_name.clone();
+    let model_name = cfg.model_name.clone();
+    let resolved_url = cfg.resolved_base_url().unwrap_or_default();
+    let resolved_key = match cfg.resolve_api_key() {
+        Ok(k) => k,
+        Err(e) => {
+            app.cells.push(Cell::Error {
+                message: format!("Key was set, but could not resolve it for switching: {e}"),
+            });
+            return;
+        }
+    };
+    let masked = mask_api_key_suffix(&resolved_key);
+
+    match persist_provider_api_key(workspace_dir, config_key, api_key) {
+        Ok(()) => app.cells.push(Cell::System {
+            message: format!(
+                "API key updated for '{config_key}' (ends in {masked}) and saved to config.toml."
+            ),
+        }),
+        Err(e) => app.cells.push(Cell::System {
+            message: format!(
+                "API key updated for '{config_key}' (ends in {masked}) for this session, but \
+                 could not persist to config.toml: {e}"
+            ),
+        }),
+    }
+
+    let msg = BusMessage::SwitchModel {
+        provider_name,
+        model_name: model_name.clone(),
+        base_url: resolved_url,
+        api_key: resolved_key,
+    };
+    if bus_tx.blocking_send(msg).is_err() {
+        app.cells.push(Cell::System {
+            message: "Bus closed; exiting.".into(),
+        });
+        app.request_quit();
+    } else {
+        app.status_model = model_name;
+        persist_last_model(workspace_dir, config_key);
+        *active_provider_key = Some(config_key.to_string());
+        app.set_toast(
+            ToastKind::Ok,
+            format!("API key set for {config_key} ({masked})"),
+            Duration::from_secs(3),
+        );
+    }
+}
+
 const TERMINAL_HELP: &str = r#"Commands (leading slash):
   /exit, /quit   Quit and restore the terminal
   /new           Start a new thread (new chat id)
+  /model [name]  Switch LLM model (interactive picker, or /model <config_key>)
+  /key [key]     Set/update an API key at runtime; hot-swaps the live model, saves to
+                 config.toml. Usage: /key <api_key>  or  /key <provider_config_key> <api_key>
+                 (only the last 4 characters are ever shown back to you)
   /copy          Copy the last assistant reply to the clipboard
   /install-python Install uv (best effort) in the background; UI stays responsive
   /cancel, /stop Stop the in-flight reply for this chat (drops queued prompts)
@@ -200,6 +438,7 @@ fn env_falsy(var: &str) -> bool {
 /// Slash commands with descriptions for the autocomplete popup.
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/model", "Switch LLM model"),
+    ("/key", "Set/update an API key"),
     ("/new", "Start a new thread"),
     ("/exit", "Quit the terminal"),
     ("/copy", "Copy last reply to clipboard"),
@@ -391,9 +630,23 @@ fn outbound_to_cell(msg: &OutboundMessage) -> Cell {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let edit_diff = msg.metadata.get("edit_diff").and_then(|v| {
+            let file = v.get("file")?.as_str()?.to_string();
+            let diff = v.get("diff")?.as_str()?.to_string();
+            let truncated = v
+                .get("truncated")
+                .and_then(|t| t.as_bool())
+                .unwrap_or(false);
+            Some(crate::channels::terminal_ui::EditDiffPayload {
+                file,
+                diff,
+                truncated,
+            })
+        });
         Cell::Clarification {
             text: msg.content.clone(),
             choices,
+            edit_diff,
         }
     } else {
         Cell::Assistant {
@@ -423,6 +676,44 @@ fn layout_chunks(area: Rect, exec_panel_h: u16, active_tool_h: u16, input_h: u16
     [
         chunks[0], chunks[1], chunks[2], chunks[3], chunks[4], chunks[5],
     ]
+}
+
+/// ALTAI Task Session density breakpoints (cols).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LayoutDensity {
+    Narrow,
+    Medium,
+    Wide,
+}
+
+impl LayoutDensity {
+    pub(crate) fn from_cols(cols: u16) -> Self {
+        if cols < 80 {
+            Self::Narrow
+        } else if cols < 120 {
+            Self::Medium
+        } else {
+            Self::Wide
+        }
+    }
+}
+
+/// Split the main content region for wide terminals when a secondary pane is focused.
+fn split_main_content(
+    area: Rect,
+    density: LayoutDensity,
+    focus: TerminalUiFocus,
+) -> (Rect, Option<Rect>) {
+    if density == LayoutDensity::Wide && focus != TerminalUiFocus::Transcript {
+        let side = (area.width / 3).clamp(28, 56);
+        let parts = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(24), Constraint::Length(side)])
+            .split(area);
+        (parts[0], Some(parts[1]))
+    } else {
+        (area, None)
+    }
 }
 
 fn chunks_line_width(spans: &[Span<'static>]) -> usize {
@@ -677,11 +968,47 @@ fn line_from_chunk_groups(groups: Vec<Vec<Span<'static>>>, max_width: usize) -> 
     }
 }
 
-fn build_title_line(max_width: usize) -> Line<'static> {
-    let groups = vec![vec![Span::styled(
-        " ALTAI isanagent ",
-        Theme::input_prompt(),
-    )]];
+fn build_title_line(max_width: usize, app: &App) -> Line<'static> {
+    let dim = Theme::dim();
+    let workspace = if app.status_workspace.is_empty() {
+        "workspace".to_string()
+    } else {
+        app.status_workspace.clone()
+    };
+    let model = if app.status_model.is_empty() {
+        "model?".to_string()
+    } else {
+        app.status_model.clone()
+    };
+    let permission = if app.status_permission.is_empty() {
+        "default".to_string()
+    } else {
+        app.status_permission.clone()
+    };
+    let session = if app.status_session.is_empty() {
+        "—".to_string()
+    } else {
+        app.status_session.clone()
+    };
+    let mut groups: Vec<Vec<Span<'static>>> = vec![
+        vec![Span::styled(" ALTAI ", Theme::active())],
+        vec![
+            Span::styled("· ", dim),
+            Span::styled(workspace, Theme::text()),
+        ],
+        vec![
+            Span::styled(" · ", dim),
+            Span::styled(model, Theme::active()),
+        ],
+        vec![Span::styled(" · ", dim), Span::styled(permission, dim)],
+        vec![
+            Span::styled(" · ", dim),
+            Span::styled(format!("session {session}"), dim),
+        ],
+    ];
+    if !uses_ansi_color() {
+        groups.push(vec![Span::styled(" · ", dim), Span::styled("[plain]", dim)]);
+    }
     line_from_chunk_groups(groups, max_width)
 }
 
@@ -694,12 +1021,12 @@ fn build_status_line(
 ) -> Line<'static> {
     let dim = Theme::dim();
     let activity_label = if thinking {
-        format!("🦾 {} thinking", app.get_spinner_frame())
+        format!("running {} thinking", app.get_spinner_frame())
     } else {
-        "🦾 idle".to_string()
+        "idle".to_string()
     };
     let activity_style = if thinking {
-        Theme::tool_call()
+        Theme::active()
     } else {
         Theme::dim()
     };
@@ -711,22 +1038,25 @@ fn build_status_line(
         first_row,
         vec![
             Span::styled(" · ", dim),
-            Span::styled(format!("[ 📋 {} Todos ]", app.todos_count), dim),
+            Span::styled(format!("todos {}", app.todos_count), dim),
         ],
         vec![
             Span::styled(" · ", dim),
-            Span::styled(format!("[ 🕒 {} Crons ]", app.crons_count), dim),
+            Span::styled(format!("crons {}", app.crons_count), dim),
         ],
         vec![
             Span::styled(" · ", dim),
-            Span::styled(format!("[ 🛠 {} Jobs ]", app.jobs_strip.len()), dim),
+            Span::styled(format!("jobs {}", app.jobs_strip.len()), dim),
         ],
         vec![
             Span::styled(" · ", dim),
             Span::styled(
                 format!(
-                    "[ 🤖 {} Agents ]",
-                    app.agent_tasks.iter().filter(|e| !e.status.is_terminal()).count()
+                    "agents {}",
+                    app.agent_tasks
+                        .iter()
+                        .filter(|e| !e.status.is_terminal())
+                        .count()
                 ),
                 dim,
             ),
@@ -738,7 +1068,7 @@ fn build_status_line(
         vec![
             Span::styled(" · ", dim),
             Span::styled(
-                "Enter send · ^G background · ^Shift+Y copy last · ^Shift+M wheel · ^W word · ^U clear · ^C cancel · ^D exit",
+                "Enter send · ^G jobs · Tab panes · ^C cancel · ^D exit",
                 Theme::status_bar(),
             ),
         ],
@@ -1291,12 +1621,15 @@ pub(crate) struct RatatuiMainConfig {
     pub channel_name: String,
     pub opening_banner: String,
     pub status_model: String,
+    pub status_permission: String,
     /// Workspace memory (same as agent) for past-session list and transcript load.
     pub memory_node: NodeHandle<MemoryMessage>,
     /// Named alternative providers for `/model` switching.
     pub providers: std::collections::HashMap<String, crate::config::ProviderConfig>,
     /// Whether the host permits ANSI foreground colors for this session.
     pub color_enabled: bool,
+    /// Host-selected ALTAI theme mode.
+    pub theme: super::HostThemeMode,
     /// Whether `chat_id` names a persisted chat that should be loaded.
     pub resume_session: bool,
     /// File references composed into the first user message.
@@ -1315,19 +1648,26 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         channel_name,
         opening_banner,
         status_model,
+        status_permission,
         memory_node,
-        providers,
+        mut providers,
         color_enabled,
+        theme,
         resume_session,
         initial_files,
     } = config;
+
+    // Which `[providers.*]` entry `/key` (with no explicit target) should update; refreshed by
+    // `try_switch_model` and by `/key` itself whenever a provider is selected.
+    let mut active_provider_key: Option<String> =
+        resolve_initial_active_provider_key(&workspace_dir, &providers);
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(io::Error::other)?;
 
-    init(color_enabled);
+    super::init_from_host(theme, !color_enabled);
 
     let mut stdout = stdout();
     enable_raw_mode()?;
@@ -1352,6 +1692,21 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 
     let mut app = App::new();
     app.status_model = status_model;
+    app.status_permission = status_permission;
+    app.status_workspace = sandbox_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("workspace")
+        .to_string();
+    app.status_session = {
+        let n = chat_id.chars().count();
+        if n <= 13 {
+            chat_id.clone()
+        } else {
+            let tail: String = chat_id.chars().skip(n - 12).collect();
+            format!("…{tail}")
+        }
+    };
     app.cells.push(Cell::System {
         message: opening_banner,
     });
@@ -1690,6 +2045,9 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     app.upsert_tool_notice(tool_call_id, phase, content);
                 }
                 other => {
+                    if matches!(other, Cell::Clarification { .. }) {
+                        app.pending_approval = true;
+                    }
                     append_cell_merging_thought(&mut app.cells, other);
                 }
             }
@@ -1738,143 +2096,253 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             }
             let input_h = (visual_lines + 2).clamp(3, 12);
             let ch = layout_chunks(area, exec_h, active_strip_h, input_h);
+            let density = LayoutDensity::from_cols(area.width);
 
             let title_w = ch[0].width as usize;
-            let title = Paragraph::new(build_title_line(title_w.max(1)));
+            let title = Paragraph::new(build_title_line(title_w.max(1), &app));
             f.render_widget(title, ch[0]);
 
-            match app.ui_focus {
-                TerminalUiFocus::Transcript => {
-                    let (w, max_s, vis_start) = transcript_paragraph(
-                        &app.cells,
-                        ch[1],
-                        app.scroll_offset,
-                        app.transcript_selection.as_ref(),
-                    );
-                    max_transcript_scroll_holder.set(max_s);
-                    app.last_transcript_visible_start = vis_start;
-                    f.render_widget(w, ch[1]);
-                    app.last_transcript_rect = Some(ch[1]);
-                    app.last_tool_history_rect = None;
-                    app.last_executions_list_rect = None;
-                    app.last_executions_code_rect = None;
-                    app.last_executions_output_rect = None;
-                    app.last_conversations_list_rect = None;
-                    app.last_agent_tasks_rect = None;
-                }
-                TerminalUiFocus::Conversations => {
-                    let (w, max_s) = conversations_list_paragraph(&app, ch[1]);
-                    max_conversations_list_scroll_holder.set(max_s);
-                    f.render_widget(w, ch[1]);
-                    app.last_conversations_list_rect = Some(ch[1]);
-                    app.last_transcript_rect = None;
-                    app.last_tool_history_rect = None;
-                    app.last_executions_list_rect = None;
-                    app.last_executions_code_rect = None;
-                    app.last_executions_output_rect = None;
-                    app.last_agent_tasks_rect = None;
-                }
-                TerminalUiFocus::Executions => {
-                    let list_w = (ch[1].width / 3).clamp(26, 46);
-                    let hareas = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([Constraint::Length(list_w), Constraint::Min(8)])
-                        .split(ch[1]);
-                    let list_r = hareas[0];
-                    let detail_area = hareas[1];
-                    let vareas = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
-                        .split(detail_area);
-                    let code_r = vareas[0];
-                    let out_r = vareas[1];
-
-                    let (pl, max_l) = executions_list_paragraph(&app, list_r);
-                    max_exec_list_scroll_holder.set(max_l);
-                    f.render_widget(pl, list_r);
-
-                    match &app.executions_detail {
-                        Some(d) => {
-                            let (pc, max_c) = executions_code_paragraph(
-                                d,
-                                code_r,
-                                app.executions_code_scroll_top,
-                            );
-                            max_exec_code_scroll_holder.set(max_c);
-                            f.render_widget(pc, code_r);
-                            let (po, max_o) = executions_output_paragraph(
-                                &d.journal,
-                                out_r,
-                                app.executions_output_scroll_top,
-                            );
-                            max_exec_out_scroll_holder.set(max_o);
-                            f.render_widget(po, out_r);
-                            app.last_executions_code_rect = Some(code_r);
-                            app.last_executions_output_rect = Some(out_r);
-                        }
-                        None => {
-                            max_exec_code_scroll_holder.set(0);
-                            max_exec_out_scroll_holder.set(0);
-                            app.last_executions_code_rect = None;
-                            app.last_executions_output_rect = None;
-                            let msg = app
-                                .executions_detail_error
-                                .as_deref()
-                                .unwrap_or("Pick a run from the list (↑↓).");
-                            let empty = Paragraph::new(Line::from(Span::styled(msg, Theme::dim())))
-                                .block(
-                                    Block::default()
-                                        .borders(Borders::ALL)
-                                        .title(Span::styled(" detail ", Theme::dim()))
-                                        .border_style(Theme::dim()),
+            let (main_left, side_opt) = split_main_content(ch[1], density, app.ui_focus);
+            if let Some(side) = side_opt {
+                let (w, max_s, vis_start) = transcript_paragraph(
+                    &app.cells,
+                    main_left,
+                    app.scroll_offset,
+                    app.transcript_selection.as_ref(),
+                );
+                max_transcript_scroll_holder.set(max_s);
+                app.last_transcript_visible_start = vis_start;
+                f.render_widget(w, main_left);
+                app.last_transcript_rect = Some(main_left);
+                // Focused secondary pane occupies the right column.
+                let pane = side;
+                match app.ui_focus {
+                    TerminalUiFocus::Transcript => {}
+                    TerminalUiFocus::Conversations => {
+                        let (w, max_s) = conversations_list_paragraph(&app, pane);
+                        max_conversations_list_scroll_holder.set(max_s);
+                        f.render_widget(w, pane);
+                        app.last_conversations_list_rect = Some(pane);
+                        app.last_tool_history_rect = None;
+                        app.last_executions_list_rect = None;
+                        app.last_executions_code_rect = None;
+                        app.last_executions_output_rect = None;
+                        app.last_agent_tasks_rect = None;
+                    }
+                    TerminalUiFocus::Executions => {
+                        let list_w = (pane.width / 3).clamp(18, 36);
+                        let hareas = Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([Constraint::Length(list_w), Constraint::Min(6)])
+                            .split(pane);
+                        let (pl, max_l) = executions_list_paragraph(&app, hareas[0]);
+                        max_exec_list_scroll_holder.set(max_l);
+                        f.render_widget(pl, hareas[0]);
+                        app.last_executions_list_rect = Some(hareas[0]);
+                        app.last_conversations_list_rect = None;
+                        app.last_tool_history_rect = None;
+                        app.last_agent_tasks_rect = None;
+                        match &app.executions_detail {
+                            Some(d) => {
+                                let vareas = Layout::default()
+                                    .direction(Direction::Vertical)
+                                    .constraints([
+                                        Constraint::Percentage(52),
+                                        Constraint::Percentage(48),
+                                    ])
+                                    .split(hareas[1]);
+                                let (pc, max_c) = executions_code_paragraph(
+                                    d,
+                                    vareas[0],
+                                    app.executions_code_scroll_top,
                                 );
-                            f.render_widget(empty, detail_area);
+                                max_exec_code_scroll_holder.set(max_c);
+                                f.render_widget(pc, vareas[0]);
+                                let (po, max_o) = executions_output_paragraph(
+                                    &d.journal,
+                                    vareas[1],
+                                    app.executions_output_scroll_top,
+                                );
+                                max_exec_out_scroll_holder.set(max_o);
+                                f.render_widget(po, vareas[1]);
+                                app.last_executions_code_rect = Some(vareas[0]);
+                                app.last_executions_output_rect = Some(vareas[1]);
+                            }
+                            None => {
+                                max_exec_code_scroll_holder.set(0);
+                                max_exec_out_scroll_holder.set(0);
+                                app.last_executions_code_rect = None;
+                                app.last_executions_output_rect = None;
+                            }
                         }
                     }
-                    app.last_transcript_rect = None;
-                    app.last_tool_history_rect = None;
-                    app.last_executions_list_rect = Some(list_r);
-                    app.last_conversations_list_rect = None;
-                    app.last_agent_tasks_rect = None;
+                    TerminalUiFocus::ToolHistory => {
+                        let (w, max_s) =
+                            tool_history_paragraph(&app.tool_rail, pane, app.tool_history_scroll);
+                        max_tool_history_scroll_holder.set(max_s);
+                        f.render_widget(w, pane);
+                        app.last_tool_history_rect = Some(pane);
+                        app.last_conversations_list_rect = None;
+                        app.last_executions_list_rect = None;
+                        app.last_agent_tasks_rect = None;
+                    }
+                    TerminalUiFocus::AgentTasks | TerminalUiFocus::BackgroundJobs => {
+                        let list = background_pane_paragraph(&app);
+                        let title = if app.ui_focus == TerminalUiFocus::BackgroundJobs {
+                            " background "
+                        } else {
+                            " sub-agents "
+                        };
+                        let w = Paragraph::new(Text::from(list))
+                            .block(
+                                Block::default()
+                                    .borders(Borders::ALL)
+                                    .title(Span::styled(title, Theme::tool_call()))
+                                    .border_style(Theme::dim()),
+                            )
+                            .scroll((app.agent_tasks_scroll_top as u16, 0));
+                        f.render_widget(w, pane);
+                        app.last_agent_tasks_rect = Some(pane);
+                        app.last_conversations_list_rect = None;
+                        app.last_tool_history_rect = None;
+                        app.last_executions_list_rect = None;
+                    }
                 }
-                TerminalUiFocus::ToolHistory => {
-                    let (w, max_s) =
-                        tool_history_paragraph(&app.tool_rail, ch[1], app.tool_history_scroll);
-                    max_tool_history_scroll_holder.set(max_s);
-                    f.render_widget(w, ch[1]);
-                    app.last_tool_history_rect = Some(ch[1]);
-                    app.last_transcript_rect = None;
-                    app.last_executions_list_rect = None;
-                    app.last_executions_code_rect = None;
-                    app.last_executions_output_rect = None;
-                    app.last_conversations_list_rect = None;
-                    app.last_agent_tasks_rect = None;
+            } else {
+                match app.ui_focus {
+                    TerminalUiFocus::Transcript => {
+                        let (w, max_s, vis_start) = transcript_paragraph(
+                            &app.cells,
+                            ch[1],
+                            app.scroll_offset,
+                            app.transcript_selection.as_ref(),
+                        );
+                        max_transcript_scroll_holder.set(max_s);
+                        app.last_transcript_visible_start = vis_start;
+                        f.render_widget(w, ch[1]);
+                        app.last_transcript_rect = Some(ch[1]);
+                        app.last_tool_history_rect = None;
+                        app.last_executions_list_rect = None;
+                        app.last_executions_code_rect = None;
+                        app.last_executions_output_rect = None;
+                        app.last_conversations_list_rect = None;
+                        app.last_agent_tasks_rect = None;
+                    }
+                    TerminalUiFocus::Conversations => {
+                        let (w, max_s) = conversations_list_paragraph(&app, ch[1]);
+                        max_conversations_list_scroll_holder.set(max_s);
+                        f.render_widget(w, ch[1]);
+                        app.last_conversations_list_rect = Some(ch[1]);
+                        app.last_transcript_rect = None;
+                        app.last_tool_history_rect = None;
+                        app.last_executions_list_rect = None;
+                        app.last_executions_code_rect = None;
+                        app.last_executions_output_rect = None;
+                        app.last_agent_tasks_rect = None;
+                    }
+                    TerminalUiFocus::Executions => {
+                        let list_w = (ch[1].width / 3).clamp(26, 46);
+                        let hareas = Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([Constraint::Length(list_w), Constraint::Min(8)])
+                            .split(ch[1]);
+                        let list_r = hareas[0];
+                        let detail_area = hareas[1];
+                        let vareas = Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
+                            .split(detail_area);
+                        let code_r = vareas[0];
+                        let out_r = vareas[1];
+
+                        let (pl, max_l) = executions_list_paragraph(&app, list_r);
+                        max_exec_list_scroll_holder.set(max_l);
+                        f.render_widget(pl, list_r);
+
+                        match &app.executions_detail {
+                            Some(d) => {
+                                let (pc, max_c) = executions_code_paragraph(
+                                    d,
+                                    code_r,
+                                    app.executions_code_scroll_top,
+                                );
+                                max_exec_code_scroll_holder.set(max_c);
+                                f.render_widget(pc, code_r);
+                                let (po, max_o) = executions_output_paragraph(
+                                    &d.journal,
+                                    out_r,
+                                    app.executions_output_scroll_top,
+                                );
+                                max_exec_out_scroll_holder.set(max_o);
+                                f.render_widget(po, out_r);
+                                app.last_executions_code_rect = Some(code_r);
+                                app.last_executions_output_rect = Some(out_r);
+                            }
+                            None => {
+                                max_exec_code_scroll_holder.set(0);
+                                max_exec_out_scroll_holder.set(0);
+                                app.last_executions_code_rect = None;
+                                app.last_executions_output_rect = None;
+                                let msg = app
+                                    .executions_detail_error
+                                    .as_deref()
+                                    .unwrap_or("Pick a run from the list (↑↓).");
+                                let empty =
+                                    Paragraph::new(Line::from(Span::styled(msg, Theme::dim())))
+                                        .block(
+                                            Block::default()
+                                                .borders(Borders::ALL)
+                                                .title(Span::styled(" detail ", Theme::dim()))
+                                                .border_style(Theme::dim()),
+                                        );
+                                f.render_widget(empty, detail_area);
+                            }
+                        }
+                        app.last_transcript_rect = None;
+                        app.last_tool_history_rect = None;
+                        app.last_executions_list_rect = Some(list_r);
+                        app.last_conversations_list_rect = None;
+                        app.last_agent_tasks_rect = None;
+                    }
+                    TerminalUiFocus::ToolHistory => {
+                        let (w, max_s) =
+                            tool_history_paragraph(&app.tool_rail, ch[1], app.tool_history_scroll);
+                        max_tool_history_scroll_holder.set(max_s);
+                        f.render_widget(w, ch[1]);
+                        app.last_tool_history_rect = Some(ch[1]);
+                        app.last_transcript_rect = None;
+                        app.last_executions_list_rect = None;
+                        app.last_executions_code_rect = None;
+                        app.last_executions_output_rect = None;
+                        app.last_conversations_list_rect = None;
+                        app.last_agent_tasks_rect = None;
+                    }
+                    TerminalUiFocus::AgentTasks | TerminalUiFocus::BackgroundJobs => {
+                        let list = background_pane_paragraph(&app);
+                        let title = if app.ui_focus == TerminalUiFocus::BackgroundJobs {
+                            " background "
+                        } else {
+                            " sub-agents "
+                        };
+                        let w = Paragraph::new(Text::from(list))
+                            .block(
+                                Block::default()
+                                    .borders(Borders::ALL)
+                                    .title(Span::styled(title, Theme::tool_call()))
+                                    .border_style(Theme::dim()),
+                            )
+                            .scroll((app.agent_tasks_scroll_top as u16, 0));
+                        f.render_widget(w, ch[1]);
+                        app.last_agent_tasks_rect = Some(ch[1]);
+                        app.last_transcript_rect = None;
+                        app.last_tool_history_rect = None;
+                        app.last_executions_list_rect = None;
+                        app.last_executions_code_rect = None;
+                        app.last_executions_output_rect = None;
+                        app.last_conversations_list_rect = None;
+                    }
                 }
-                TerminalUiFocus::AgentTasks | TerminalUiFocus::BackgroundJobs => {
-                    let list = background_pane_paragraph(&app);
-                    let title = if app.ui_focus == TerminalUiFocus::BackgroundJobs {
-                        " background "
-                    } else {
-                        " sub-agents "
-                    };
-                    let w = Paragraph::new(Text::from(list))
-                        .block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .title(Span::styled(title, Theme::tool_call()))
-                                .border_style(Theme::dim()),
-                        )
-                        .scroll((app.agent_tasks_scroll_top as u16, 0));
-                    f.render_widget(w, ch[1]);
-                    app.last_agent_tasks_rect = Some(ch[1]);
-                    app.last_transcript_rect = None;
-                    app.last_tool_history_rect = None;
-                    app.last_executions_list_rect = None;
-                    app.last_executions_code_rect = None;
-                    app.last_executions_output_rect = None;
-                    app.last_conversations_list_rect = None;
-                }
-            }
+            } // end single-pane (non-wide) branch
 
             if exec_h > 0 {
                 let exec_block = Block::default()
@@ -1915,7 +2383,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             };
             let t = truncate_chars_display(active_text, active_w.max(8).saturating_sub(6));
             let active_row = Line::from(vec![
-                Span::styled(format!(" {} ", icon), Theme::tool_call()),
+                Span::styled(format!(" {icon} "), Theme::tool_call()),
                 Span::styled(t, Theme::dim()),
             ]);
             f.render_widget(Paragraph::new(active_row), ch[4]);
@@ -2071,7 +2539,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     let mut lines: Vec<Line> = Vec::new();
                     for (cmd, desc) in matching.iter().take(hint_inner.height as usize) {
                         lines.push(Line::from(vec![
-                            Span::styled(format!("{:<16}", cmd), Style::default().fg(Color::Cyan)),
+                            Span::styled(format!("{cmd:<16}"), Style::default().fg(Color::Cyan)),
                             Span::styled(*desc, Style::default().fg(Color::Gray)),
                         ]));
                     }
@@ -2133,46 +2601,14 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 .and_then(|s| s.selected_entry().map(|e| e.config_key.clone()));
                             app.model_selector = None;
                             if let Some(config_key) = selection {
-                                if let Some(cfg) = providers.get(&config_key) {
-                                    let resolved_url = cfg.resolved_base_url().unwrap_or_default();
-                                    match cfg.resolve_api_key() {
-                                        Ok(api_key) => {
-                                            let msg = BusMessage::SwitchModel {
-                                                provider_name: cfg.provider_name.clone(),
-                                                model_name: cfg.model_name.clone(),
-                                                base_url: resolved_url,
-                                                api_key,
-                                            };
-                                            if bus_tx.blocking_send(msg).is_err() {
-                                                app.cells.push(Cell::System {
-                                                    message: "Bus closed; exiting.".into(),
-                                                });
-                                                app.request_quit();
-                                            } else {
-                                                app.status_model = cfg.model_name.clone();
-                                                persist_last_model(&workspace_dir, &config_key);
-                                                app.set_toast(
-                                                    ToastKind::Ok,
-                                                    format!("Model: {}", app.status_model),
-                                                    Duration::from_secs(3),
-                                                );
-                                            }
-                                        }
-                                        Err(e) => {
-                                            let err_msg = format!(
-                                                "No API key for '{}': {}\n\
-                                                Set the env var or add api_key = \"...\" under [providers.{}] in config.toml.",
-                                                config_key, e, config_key
-                                            );
-                                            app.cells.push(Cell::Error { message: err_msg });
-                                            app.set_toast(
-                                                ToastKind::Err,
-                                                format!("No API key for {}", config_key),
-                                                Duration::from_secs(5),
-                                            );
-                                        }
-                                    }
-                                }
+                                try_switch_model(
+                                    &mut app,
+                                    &bus_tx,
+                                    &providers,
+                                    &workspace_dir,
+                                    &config_key,
+                                    &mut active_provider_key,
+                                );
                             }
                         }
                         KeyCode::Esc | KeyCode::Char('q') => {
@@ -2347,7 +2783,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 sync_terminal_session_chat(&bus_tx, &chat_id);
                                 app.thinking = false;
                                 app.cells.push(Cell::System {
-                                    message: format!("New thread: {}", chat_id),
+                                    message: format!("New thread: {chat_id}"),
                                 });
                                 rescan_executions_manifest(&workspace_dir, &chat_id, &mut app);
                                 last_exec_poll = Instant::now();
@@ -2572,8 +3008,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                         "Compaction requested. It will run between turns; next inbound will see a smaller context.".to_string()
                                     } else {
                                         format!(
-                                            "Compaction requested with focus: \"{}\". Next inbound will see a smaller context.",
-                                            focus
+                                            "Compaction requested with focus: \"{focus}\". Next inbound will see a smaller context."
                                         )
                                     };
                                     app.cells.push(Cell::System { message: note });
@@ -2601,6 +3036,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                         &providers,
                                         &workspace_dir,
                                         arg,
+                                        &mut active_provider_key,
                                     );
                                 } else {
                                     let available: Vec<&str> =
@@ -2612,6 +3048,66 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                             available.join(", ")
                                         ),
                                     });
+                                }
+                                continue;
+                            }
+                            if text.eq_ignore_ascii_case("/key")
+                                || text.to_ascii_lowercase().starts_with("/key ")
+                            {
+                                let arg = text.strip_prefix("/key").unwrap_or("").trim();
+                                if arg.is_empty() {
+                                    app.cells.push(Cell::System {
+                                        message: "Usage: /key <api_key>  (or /key <provider_config_key> <api_key>)".into(),
+                                    });
+                                    continue;
+                                }
+                                // Optional leading token names a provider config key explicitly;
+                                // otherwise the whole arg is the secret and we fall back to the
+                                // currently active provider (or the sole configured one).
+                                let mut parts = arg.splitn(2, char::is_whitespace);
+                                let first = parts.next().unwrap_or("").trim();
+                                let rest = parts.next().unwrap_or("").trim();
+                                let (config_key_arg, secret): (Option<&str>, &str) =
+                                    if !rest.is_empty() && providers.contains_key(first) {
+                                        (Some(first), rest)
+                                    } else {
+                                        (None, arg)
+                                    };
+                                let resolved_config_key = config_key_arg
+                                    .map(|s| s.to_string())
+                                    .or_else(|| active_provider_key.clone())
+                                    .or_else(|| {
+                                        if providers.len() == 1 {
+                                            providers.keys().next().cloned()
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                match resolved_config_key {
+                                    Some(config_key) => {
+                                        try_set_api_key(
+                                            &mut app,
+                                            &bus_tx,
+                                            &mut providers,
+                                            &workspace_dir,
+                                            &config_key,
+                                            secret,
+                                            &mut active_provider_key,
+                                        );
+                                    }
+                                    None => {
+                                        let mut available: Vec<&str> =
+                                            providers.keys().map(|s| s.as_str()).collect();
+                                        available.sort_unstable();
+                                        app.cells.push(Cell::Error {
+                                            message: format!(
+                                                "Multiple providers configured; specify which one: \
+                                                 /key <provider_config_key> <api_key>. Available: {}. \
+                                                 Or run /model first, then /key.",
+                                                available.join(", ")
+                                            ),
+                                        });
+                                    }
                                 }
                                 continue;
                             }
@@ -2639,7 +3135,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                             });
                                         } else {
                                             app.cells.push(Cell::System {
-                                                message: format!("Skill installation requested for repository: {}. Check logs for progress.", repo_url),
+                                                message: format!("Skill installation requested for repository: {repo_url}. Check logs for progress."),
                                             });
                                         }
                                     }
@@ -2652,7 +3148,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             }
                             app.cells.push(Cell::System {
                             message:
-                                "Unknown command. Try /help, /exit, /new, /chats, /copy, /install-python, /cancel, /background, /retry, /tools, /exec, /agents, /model, /compact, /context, /skills."
+                                "Unknown command. Try /help, /exit, /new, /chats, /copy, /install-python, /cancel, /background, /retry, /tools, /exec, /agents, /model, /key, /compact, /context, /skills."
                                     .into(),
                         });
                             continue;
@@ -2665,6 +3161,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 
                         app.cells.push(Cell::User { text: raw.clone() });
                         app.thinking = true;
+                        app.pending_approval = false;
                         app.last_inbound_text = Some(text.to_string());
                         app.llm_retry_available = false;
                         let (clean_text, attachments) =
@@ -2967,6 +3464,36 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             }
                         }
                     }
+                    KeyCode::Char(c) if app.pending_approval && app.input.is_empty() => {
+                        if let Some(reply) = crate::channels::terminal_ui::approval_hotkey_reply(c)
+                        {
+                            app.cells.push(Cell::User {
+                                text: reply.to_string(),
+                            });
+                            app.thinking = true;
+                            app.pending_approval = false;
+                            app.last_inbound_text = Some(reply.to_string());
+                            let msg = InboundMessage {
+                                channel: channel_name.clone(),
+                                sender_id: "local_user".to_string(),
+                                chat_id: chat_id.clone(),
+                                thread_id: None,
+                                content: reply.to_string(),
+                                attachments: Vec::new(),
+                                metadata: Default::default(),
+                            };
+                            if bus_tx.blocking_send(BusMessage::Inbound(msg)).is_err() {
+                                app.thinking = false;
+                                app.cells.push(Cell::System {
+                                    message: "Bus closed; exiting.".into(),
+                                });
+                                app.request_quit();
+                            }
+                            app.scroll_to_bottom();
+                        } else {
+                            app.insert_char(c);
+                        }
+                    }
                     KeyCode::Char(c) => app.insert_char(c),
                     _ => {}
                 }
@@ -3249,10 +3776,12 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 
 #[cfg(test)]
 mod width_fit_tests {
-    use super::{build_status_line, build_title_line};
+    use super::{build_status_line, build_title_line, split_main_content, LayoutDensity};
     use crate::channels::terminal_ui::app::App;
     use crate::channels::terminal_ui::display_width;
     use crate::channels::terminal_ui::text_format::truncate_chars_display;
+    use crate::channels::terminal_ui::TerminalUiFocus;
+    use ratatui::layout::Rect;
     use ratatui::text::Line;
 
     fn flat(line: &Line) -> String {
@@ -3261,6 +3790,15 @@ mod width_fit_tests {
             .map(|s| s.content.as_ref())
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    fn sample_app() -> App {
+        let mut app = App::new();
+        app.status_workspace = "altai-app".into();
+        app.status_model = "anthropic/claude-sonnet".into();
+        app.status_permission = "plan".into();
+        app.status_session = "…abc123".into();
+        app
     }
 
     #[test]
@@ -3276,12 +3814,10 @@ mod width_fit_tests {
 
     #[test]
     fn status_drops_low_priority_when_narrow() {
-        let app = App::new();
+        let app = sample_app();
         let line = build_status_line(26, false, 3, None, &app);
         let t = flat(&line);
-        assert!(t.contains("🦾"), "{t}");
-        assert!(t.contains("idle"));
-        assert!(!t.contains("thread"), "{t}");
+        assert!(t.contains("idle"), "{t}");
         assert!(
             !t.contains("Enter send"),
             "hints should drop first when tight: {t}"
@@ -3289,11 +3825,54 @@ mod width_fit_tests {
     }
 
     #[test]
-    fn title_shows_brand_only() {
-        let line = build_title_line(120);
+    fn title_shows_brand_workspace_model() {
+        let app = sample_app();
+        let line = build_title_line(160, &app);
         let t = flat(&line);
-        assert!(t.contains("ALTAI isanagent"), "{t}");
-        assert!(!t.contains("thread "), "{t}");
+        assert!(t.contains("ALTAI"), "{t}");
+        assert!(t.contains("altai-app"), "{t}");
+        assert!(t.contains("anthropic/claude-sonnet"), "{t}");
+        assert!(t.contains("plan"), "{t}");
+    }
+
+    #[test]
+    fn title_and_status_fit_snapshot_widths() {
+        let app = sample_app();
+        for width in [80usize, 100, 160] {
+            let title = flat(&build_title_line(width, &app));
+            let status = flat(&build_status_line(width, false, 3, None, &app));
+            assert!(
+                display_width(&title) <= width,
+                "title overflow at {width}: {title:?}"
+            );
+            assert!(
+                display_width(&status) <= width,
+                "status overflow at {width}: {status:?}"
+            );
+            assert!(title.contains("ALTAI"), "{title}");
+            assert!(status.contains("idle"), "{status}");
+        }
+    }
+
+    #[test]
+    fn layout_density_breakpoints() {
+        assert_eq!(LayoutDensity::from_cols(79), LayoutDensity::Narrow);
+        assert_eq!(LayoutDensity::from_cols(80), LayoutDensity::Medium);
+        assert_eq!(LayoutDensity::from_cols(119), LayoutDensity::Medium);
+        assert_eq!(LayoutDensity::from_cols(120), LayoutDensity::Wide);
+    }
+
+    #[test]
+    fn wide_layout_splits_secondary_pane() {
+        let area = Rect::new(0, 0, 160, 40);
+        let (left, right) =
+            split_main_content(area, LayoutDensity::Wide, TerminalUiFocus::ToolHistory);
+        assert!(right.is_some());
+        assert!(left.width + right.unwrap().width <= area.width);
+        let (only, none) =
+            split_main_content(area, LayoutDensity::Medium, TerminalUiFocus::ToolHistory);
+        assert!(none.is_none());
+        assert_eq!(only, area);
     }
 }
 
@@ -3322,5 +3901,195 @@ mod execution_strip_tests {
         let out = execution_strip_subtitle(None, "683c0fdc-a2bd");
         assert!(out.starts_with('…'));
         assert!(out.contains("683c0fdc"));
+    }
+}
+
+#[cfg(test)]
+mod api_key_persist_tests {
+    use super::{
+        key_looks_like_placeholder, mask_api_key_suffix, persist_provider_api_key,
+        resolve_initial_active_provider_key,
+    };
+    use std::collections::HashMap;
+
+    fn write_config(dir: &std::path::Path, contents: &str) {
+        std::fs::write(dir.join("config.toml"), contents).expect("write config.toml");
+    }
+
+    fn read_config(dir: &std::path::Path) -> String {
+        std::fs::read_to_string(dir.join("config.toml")).expect("read config.toml")
+    }
+
+    #[test]
+    fn sets_api_key_under_exact_providers_section() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_config(
+            tmp.path(),
+            "# top-of-file comment\n\
+             [providers.anthropic]\n\
+             # a comment on the model list\n\
+             models = [\"claude-opus-4-7\"]\n\
+             api_key = \"<changethis>\"\n",
+        );
+
+        persist_provider_api_key(tmp.path(), "anthropic", "sk-ant-real-secret-1234")
+            .expect("persist should succeed");
+
+        let out = read_config(tmp.path());
+        assert!(
+            out.contains("api_key = \"sk-ant-real-secret-1234\""),
+            "expected new key written: {out}"
+        );
+        assert!(
+            out.contains("# top-of-file comment"),
+            "top-level comment should be preserved: {out}"
+        );
+        assert!(
+            out.contains("# a comment on the model list"),
+            "in-table comment should be preserved: {out}"
+        );
+        assert!(
+            !out.contains("<changethis>"),
+            "placeholder should be replaced: {out}"
+        );
+    }
+
+    #[test]
+    fn sets_api_key_via_family_model_name_lookup() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_config(
+            tmp.path(),
+            "[providers.gemini]\n\
+             models = [\"gemini-2.5-flash\", \"gemini-2.5-pro\"]\n\
+             api_key = \"<changethis>\"\n",
+        );
+
+        // Family-expanded config keys are model names, not the section key.
+        persist_provider_api_key(tmp.path(), "gemini-2.5-pro", "sk-gem-secret")
+            .expect("persist should succeed");
+
+        let doc: toml_edit::DocumentMut = read_config(tmp.path()).parse().expect("parse");
+        assert_eq!(
+            doc["providers"]["gemini"]["api_key"].as_str(),
+            Some("sk-gem-secret")
+        );
+    }
+
+    #[test]
+    fn sets_api_key_under_legacy_singular_provider_block() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_config(
+            tmp.path(),
+            "[provider]\n\
+             provider_name = \"openai\"\n\
+             model_name = \"gpt-5.5\"\n\
+             api_key = \"<changethis>\"\n",
+        );
+
+        persist_provider_api_key(tmp.path(), "openai/gpt-5.5", "sk-legacy-secret")
+            .expect("persist should succeed");
+
+        let doc: toml_edit::DocumentMut = read_config(tmp.path()).parse().expect("parse");
+        assert_eq!(
+            doc["provider"]["api_key"].as_str(),
+            Some("sk-legacy-secret")
+        );
+    }
+
+    #[test]
+    fn creates_fresh_section_when_nothing_matches() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_config(tmp.path(), "restrict_to_workspace = true\n");
+
+        persist_provider_api_key(tmp.path(), "brand-new", "sk-fresh-secret")
+            .expect("persist should succeed");
+
+        let doc: toml_edit::DocumentMut = read_config(tmp.path()).parse().expect("parse");
+        assert_eq!(
+            doc["providers"]["brand-new"]["api_key"].as_str(),
+            Some("sk-fresh-secret")
+        );
+    }
+
+    #[test]
+    fn missing_config_file_returns_err() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let err = persist_provider_api_key(tmp.path(), "anthropic", "sk-x").unwrap_err();
+        assert!(err.contains("Could not read"), "{err}");
+    }
+
+    #[test]
+    fn placeholder_detection_rejects_common_templates() {
+        for bad in [
+            "",
+            "  ",
+            "<changethis>",
+            "changethis",
+            "YOUR_API_KEY",
+            "replace_me",
+        ] {
+            assert!(
+                key_looks_like_placeholder(bad),
+                "expected placeholder rejection for {bad:?}"
+            );
+        }
+        assert!(!key_looks_like_placeholder("sk-ant-real-secret-1234"));
+    }
+
+    #[test]
+    fn masking_only_reveals_last_four_chars() {
+        assert_eq!(mask_api_key_suffix("sk-ant-real-secret-1234"), "…1234");
+        assert_eq!(mask_api_key_suffix("ab"), "…ab");
+        assert_eq!(mask_api_key_suffix(""), "****");
+    }
+
+    #[test]
+    fn resolves_sole_provider_when_last_model_file_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut providers = HashMap::new();
+        providers.insert(
+            "only-one".to_string(),
+            crate::config::ProviderConfig::default(),
+        );
+        assert_eq!(
+            resolve_initial_active_provider_key(tmp.path(), &providers),
+            Some("only-one".to_string())
+        );
+    }
+
+    #[test]
+    fn resolves_last_model_file_when_valid() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".system_generated")).expect("mkdir");
+        std::fs::write(
+            tmp.path().join(".system_generated/last_model"),
+            "claude-opus-4-7",
+        )
+        .expect("write last_model");
+        let mut providers = HashMap::new();
+        providers.insert(
+            "claude-opus-4-7".to_string(),
+            crate::config::ProviderConfig::default(),
+        );
+        providers.insert(
+            "gpt-5.5".to_string(),
+            crate::config::ProviderConfig::default(),
+        );
+        assert_eq!(
+            resolve_initial_active_provider_key(tmp.path(), &providers),
+            Some("claude-opus-4-7".to_string())
+        );
+    }
+
+    #[test]
+    fn no_signal_with_multiple_unknown_providers() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut providers = HashMap::new();
+        providers.insert("a".to_string(), crate::config::ProviderConfig::default());
+        providers.insert("b".to_string(), crate::config::ProviderConfig::default());
+        assert_eq!(
+            resolve_initial_active_provider_key(tmp.path(), &providers),
+            None
+        );
     }
 }

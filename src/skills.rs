@@ -91,8 +91,7 @@ impl SkillRegistry {
         // Extremely basic frontmatter parsing: looks for --- ... ---
         if lines[0] != "---" {
             warn!(
-                "Skipping {:?}: No YAML frontmatter found (must start with '---')",
-                path
+                "Skipping {path:?}: No YAML frontmatter found (must start with '---')"
             );
             return None;
         }
@@ -106,7 +105,7 @@ impl SkillRegistry {
         }
 
         if end_idx == 0 {
-            warn!("Skipping {:?}: Unclosed YAML frontmatter", path);
+            warn!("Skipping {path:?}: Unclosed YAML frontmatter");
             return None;
         }
 
@@ -123,7 +122,7 @@ impl SkillRegistry {
                         for bin in bins {
                             if which::which(bin).is_err() {
                                 available = false;
-                                missing_reasons.push(format!("missing bin: {}", bin));
+                                missing_reasons.push(format!("missing bin: {bin}"));
                             }
                         }
                     }
@@ -131,7 +130,7 @@ impl SkillRegistry {
                         for env in envs {
                             if std::env::var(env).is_err() {
                                 available = false;
-                                missing_reasons.push(format!("missing env var: {}", env));
+                                missing_reasons.push(format!("missing env var: {env}"));
                             }
                         }
                     }
@@ -157,7 +156,7 @@ impl SkillRegistry {
                 })
             }
             Err(e) => {
-                warn!("Failed to parse YAML frontmatter for {:?}: {}", path, e);
+                warn!("Failed to parse YAML frontmatter for {path:?}: {e}");
                 None
             }
         }
@@ -184,7 +183,7 @@ impl SkillRegistry {
         }
         summary.push_str("\nTo execute a skill, use the 'load_skill_instructions' tool with the skill's name to learn how to use it contextually.\n");
 
-        format!("{}{}", summary, always_blocks)
+        format!("{summary}{always_blocks}")
     }
 
     pub fn get_skill_instructions(&self, name: &str) -> Result<String, String> {
@@ -198,7 +197,7 @@ impl SkillRegistry {
                 }
                 Ok(skill.instructions.clone())
             }
-            None => Err(format!("Skill '{}' not found", name)),
+            None => Err(format!("Skill '{name}' not found")),
         }
     }
 
@@ -227,7 +226,7 @@ impl SkillRegistry {
         let skill = self
             .skills
             .get(name)
-            .ok_or_else(|| format!("Skill '{}' not found", name))?;
+            .ok_or_else(|| format!("Skill '{name}' not found"))?;
         Ok(format!(
             "Skill: {}\nAvailable: {}\nDescription: {}\nInstruction length: {} characters\nPath: {}",
             skill.name,
@@ -253,21 +252,20 @@ impl SkillRegistry {
 
         // Support shorthand owner/repo format
         let full_repo_url = if !repo_url.contains("://") && repo_url.contains('/') {
-            format!("https://github.com/{}", repo_url)
+            format!("https://github.com/{repo_url}")
         } else {
             repo_url.to_string()
         };
 
         info!(
-            "Installing skills from repository: {} (specific: {:?})",
-            full_repo_url, specific_skill
+            "Installing skills from repository: {full_repo_url} (specific: {specific_skill:?})"
         );
 
         // 1. Create a temporary directory with a cleanup guard
         let temp_dir_path =
             std::env::temp_dir().join(format!("isanagent-skills-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&temp_dir_path)
-            .map_err(|e| format!("Failed to create temp dir: {}", e))?;
+            .map_err(|e| format!("Failed to create temp dir: {e}"))?;
         let _guard = TempDirGuard::new(temp_dir_path.clone());
 
         // 2. Clone the repository (using git command)
@@ -280,8 +278,7 @@ impl SkillRegistry {
             .status()
             .map_err(|e| {
                 format!(
-                    "Failed to execute git clone: {}. Make sure 'git' is installed and in your PATH.",
-                    e
+                    "Failed to execute git clone: {e}. Make sure 'git' is installed and in your PATH."
                 )
             })?;
 
@@ -319,7 +316,7 @@ impl SkillRegistry {
                     }
 
                     fs::create_dir_all(&tmp_dest_dir)
-                        .map_err(|e| format!("Failed to create skill dir: {}", e))?;
+                        .map_err(|e| format!("Failed to create skill dir: {e}"))?;
 
                     // Copy everything from skill_dir to tmp_dest_dir
                     copy_dir_recursive(skill_dir, &tmp_dest_dir)?;
@@ -327,10 +324,10 @@ impl SkillRegistry {
                     // Swap: remove old and rename tmp to dest
                     if dest_dir.exists() {
                         fs::remove_dir_all(&dest_dir)
-                            .map_err(|e| format!("Failed to remove existing skill dir: {}", e))?;
+                            .map_err(|e| format!("Failed to remove existing skill dir: {e}"))?;
                     }
                     fs::rename(&tmp_dest_dir, &dest_dir)
-                        .map_err(|e| format!("Failed to finalize skill installation: {}", e))?;
+                        .map_err(|e| format!("Failed to finalize skill installation: {e}"))?;
 
                     installed_skills.push(def.name);
 
@@ -344,8 +341,7 @@ impl SkillRegistry {
 
         if let Some(skill) = specific_skill.filter(|_| installed_skills.is_empty()) {
             return Err(format!(
-                "Skill '{}' not found in repository {}",
-                skill, full_repo_url
+                "Skill '{skill}' not found in repository {full_repo_url}"
             ));
         }
 
@@ -378,16 +374,16 @@ impl Drop for TempDirGuard {
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     if !dst.exists() {
         fs::create_dir_all(dst)
-            .map_err(|e| format!("Failed to create directory {:?}: {}", dst, e))?;
+            .map_err(|e| format!("Failed to create directory {dst:?}: {e}"))?;
     }
 
     for entry in
-        fs::read_dir(src).map_err(|e| format!("Failed to read directory {:?}: {}", src, e))?
+        fs::read_dir(src).map_err(|e| format!("Failed to read directory {src:?}: {e}"))?
     {
-        let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
+        let entry = entry.map_err(|e| format!("Failed to read entry: {e}"))?;
         let file_type = entry
             .file_type()
-            .map_err(|e| format!("Failed to get file type: {}", e))?;
+            .map_err(|e| format!("Failed to get file type: {e}"))?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
 
@@ -396,8 +392,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
         } else {
             fs::copy(&src_path, &dst_path).map_err(|e| {
                 format!(
-                    "Failed to copy file {:?} to {:?}: {}",
-                    src_path, dst_path, e
+                    "Failed to copy file {src_path:?} to {dst_path:?}: {e}"
                 )
             })?;
         }

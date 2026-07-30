@@ -19,19 +19,19 @@ pub fn resolve_workspace_root(path_override: Option<&str>) -> PathBuf {
 
 pub fn ensure_workspace_layout(root: &Path) -> Result<WorkspaceLayout, String> {
     if !root.exists() {
-        info!("Creating workspace directory at {:?}", root);
+        info!("Creating workspace directory at {root:?}");
     }
-    fs::create_dir_all(root).map_err(|e| format!("Failed to create workspace dir: {}", e))?;
+    fs::create_dir_all(root).map_err(|e| format!("Failed to create workspace dir: {e}"))?;
 
     let system_dir = root.join(".system_generated");
     fs::create_dir_all(&system_dir)
-        .map_err(|e| format!("Failed to create .system_generated dir: {}", e))?;
+        .map_err(|e| format!("Failed to create .system_generated dir: {e}"))?;
 
     let sandbox_dir = root.join("workspace");
-    fs::create_dir_all(&sandbox_dir).map_err(|e| format!("Failed to create sandbox dir: {}", e))?;
+    fs::create_dir_all(&sandbox_dir).map_err(|e| format!("Failed to create sandbox dir: {e}"))?;
 
     let skills_dir = sandbox_dir.join("skills");
-    fs::create_dir_all(&skills_dir).map_err(|e| format!("Failed to create skills dir: {}", e))?;
+    fs::create_dir_all(&skills_dir).map_err(|e| format!("Failed to create skills dir: {e}"))?;
 
     Ok(WorkspaceLayout {
         root: root.to_path_buf(),
@@ -88,8 +88,8 @@ impl IsanagentWorkspace {
 
         let config = if config_path.exists() {
             let toml_str = fs::read_to_string(&config_path)
-                .map_err(|e| format!("Failed to read config.toml: {}", e))?;
-            toml::from_str(&toml_str).map_err(|e| format!("Failed to parse config.toml: {}", e))?
+                .map_err(|e| format!("Failed to read config.toml: {e}"))?;
+            toml::from_str(&toml_str).map_err(|e| format!("Failed to parse config.toml: {e}"))?
         } else {
             AppConfig::default()
         };
@@ -116,11 +116,11 @@ impl IsanagentWorkspace {
         if file_path.exists() {
             match fs::read_to_string(&file_path) {
                 Ok(content) => {
-                    info!("Loaded {}", filename);
+                    info!("Loaded {filename}");
                     Some(content)
                 }
                 Err(e) => {
-                    warn!("Failed to read {}: {}", filename, e);
+                    warn!("Failed to read {filename}: {e}");
                     None
                 }
             }
@@ -134,21 +134,20 @@ impl IsanagentWorkspace {
         let mut prompt_parts = Vec::new();
 
         if let Some(agent) = self.read_md_file("AGENTS.md") {
-            prompt_parts.push(format!("--- AGENT INSTRUCTIONS ---\n{}\n", agent));
+            prompt_parts.push(format!("--- AGENT INSTRUCTIONS ---\n{agent}\n"));
         }
         if let Some(soul) = self.read_md_file("SOUL.md") {
-            prompt_parts.push(format!("--- AGENT PERSONA (SOUL) ---\n{}\n", soul));
+            prompt_parts.push(format!("--- AGENT PERSONA (SOUL) ---\n{soul}\n"));
         }
         if let Some(user) = self.read_md_file("USER.md") {
-            prompt_parts.push(format!("--- USER PROFILE ---\n{}\n", user));
+            prompt_parts.push(format!("--- USER PROFILE ---\n{user}\n"));
         }
         if let Some(memory) = self.read_md_file("MEMORY.md") {
-            prompt_parts.push(format!("--- LONG TERM MEMORY ---\n{}\n", memory));
+            prompt_parts.push(format!("--- LONG TERM MEMORY ---\n{memory}\n"));
         }
         if let Some(ml) = self.read_md_file("ML_POLICY.md") {
             prompt_parts.push(format!(
-                "--- ML / TRAINING POLICY (ML_POLICY.md) ---\n{}\n",
-                ml
+                "--- ML / TRAINING POLICY (ML_POLICY.md) ---\n{ml}\n"
             ));
         }
 

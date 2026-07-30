@@ -492,11 +492,10 @@ impl AppConfig {
                     };
                     if result.contains_key(model) {
                         warn!(
-                            "Duplicate model name \"{}\" in [providers.{}] -- \
+                            "Duplicate model name \"{model}\" in [providers.{key}] -- \
                              overwriting previous entry. Use the legacy per-model \
                              format with unique map keys to distinguish the same \
-                             model from different providers.",
-                            model, key
+                             model from different providers."
                         );
                     }
                     result.insert(model.clone(), expanded);
@@ -509,18 +508,16 @@ impl AppConfig {
                 single.models = None;
                 if result.contains_key(key) {
                     warn!(
-                        "Duplicate provider key \"{}\" in [providers] -- \
-                         overwriting previous entry.",
-                        key
+                        "Duplicate provider key \"{key}\" in [providers] -- \
+                         overwriting previous entry."
                     );
                 }
                 result.insert(key.clone(), single);
             } else {
                 warn!(
-                    "[providers.{}] has neither \"models\" nor \
+                    "[providers.{key}] has neither \"models\" nor \
                      \"model_name\" -- entry is ignored. Add one to \
-                     register a provider.",
-                    key
+                     register a provider."
                 );
             }
         }
@@ -995,7 +992,7 @@ impl AppConfig {
                 allow.map(|s| s.len()).unwrap_or(0)
             ));
             let agent_count = self.agent_definitions().len();
-            lines.push(format!("named_agents={}", agent_count));
+            lines.push(format!("named_agents={agent_count}"));
         }
         lines.push(format!(
             "ml_engineer_harness_enabled={}",
@@ -1024,8 +1021,7 @@ impl AppConfig {
             .and_then(|x| x.steering.as_ref())
             .is_some_and(|s| s.enabled.unwrap_or(false));
         lines.push(format!(
-            "hooks_observation_enabled={} hooks_steering_enabled={}",
-            hooks_obs, hooks_steer
+            "hooks_observation_enabled={hooks_obs} hooks_steering_enabled={hooks_steer}"
         ));
         lines
     }
@@ -1515,8 +1511,7 @@ impl ProviderConfig {
             }
         }
         Err(format!(
-            "No API key found (checked env ${} and config api_key)",
-            env_var
+            "No API key found (checked env ${env_var} and config api_key)"
         ))
     }
 

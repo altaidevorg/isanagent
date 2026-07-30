@@ -330,8 +330,7 @@ pub fn build_compact_placeholder(
         head.push('…');
     }
     format!(
-        "[Tool result archived. Recall: recall_tool_result(tool_call_id=\"{}\"). Original: tool={} bytes={} head=\"{}\"]",
-        tool_call_id, tool_name, bytes, head
+        "[Tool result archived. Recall: recall_tool_result(tool_call_id=\"{tool_call_id}\"). Original: tool={tool_name} bytes={bytes} head=\"{head}\"]"
     )
 }
 
@@ -657,7 +656,7 @@ pub async fn do_compaction(args: DoCompactionArgs<'_>) -> CompactionOutcome {
                 .outbound_tx
                 .send(BusMessage::Telemetry(TelemetryEvent::CompactionFailed {
                     chat_id: args.chat_id.to_string(),
-                    reason: format!("provider error: {}", e),
+                    reason: format!("provider error: {e}"),
                     tokens_at_failure: args.tokens_before,
                 }))
                 .await;

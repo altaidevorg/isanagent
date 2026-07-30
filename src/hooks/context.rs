@@ -46,7 +46,7 @@ impl ToolCallHookContext {
             match build_steering_engine(s, workspace_dir.to_path_buf(), sandbox_dir.to_path_buf()) {
                 Ok(e) => Some(e),
                 Err(e) => {
-                    log::error!("hooks steering init failed: {}", e);
+                    log::error!("hooks steering init failed: {e}");
                     None
                 }
             }

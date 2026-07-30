@@ -75,13 +75,13 @@ pub fn start_observation_hooks(params: ObservationHooksParams) -> Option<Observa
             redactor.redact_json(&mut envelope);
             if let Some(ref path) = jsonl_path {
                 if let Err(e) = append_jsonl(path, &envelope).await {
-                    log::warn!("hooks observation jsonl: {}", e);
+                    log::warn!("hooks observation jsonl: {e}");
                 }
             }
             if let Some(ref url) = webhook_url {
                 if let Some(ref c) = client {
                     if let Err(e) = post_webhook(c, url, &hmac_secret, &envelope).await {
-                        log::warn!("hooks observation webhook: {}", e);
+                        log::warn!("hooks observation webhook: {e}");
                     }
                 }
             }
@@ -135,13 +135,13 @@ async fn append_jsonl(path: &Path, envelope: &Value) -> Result<(), String> {
         .open(path)
         .await
         .map_err(|e| format!("open {}: {}", path.display(), e))?;
-    let line = serde_json::to_string(envelope).map_err(|e| format!("encode: {}", e))?;
+    let line = serde_json::to_string(envelope).map_err(|e| format!("encode: {e}"))?;
     file.write_all(line.as_bytes())
         .await
-        .map_err(|e| format!("write: {}", e))?;
+        .map_err(|e| format!("write: {e}"))?;
     file.write_all(b"\n")
         .await
-        .map_err(|e| format!("write nl: {}", e))?;
+        .map_err(|e| format!("write nl: {e}"))?;
     Ok(())
 }
 
@@ -173,14 +173,14 @@ async fn post_webhook(
     envelope: &Value,
 ) -> Result<(), String> {
     const MAX_ATTEMPTS: usize = 3;
-    let body = serde_json::to_vec(envelope).map_err(|e| format!("encode body: {}", e))?;
+    let body = serde_json::to_vec(envelope).map_err(|e| format!("encode body: {e}"))?;
 
     for attempt in 0..MAX_ATTEMPTS {
         let mut req = client.post(url).body(body.clone());
         if let Some(secret) = hmac_secret {
             if !secret.is_empty() {
                 let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-                    .map_err(|e| format!("hmac key: {}", e))?;
+                    .map_err(|e| format!("hmac key: {e}"))?;
                 mac.update(&body);
                 let sig = hex::encode(mac.finalize().into_bytes());
                 req = req.header("X-Isanagent-Hook-Signature", format!("sha256={sig}"));
@@ -195,7 +195,7 @@ async fn post_webhook(
             }
             Err(err) => {
                 if attempt + 1 >= MAX_ATTEMPTS {
-                    return Err(format!("webhook request: {}", err));
+                    return Err(format!("webhook request: {err}"));
                 }
             }
         }

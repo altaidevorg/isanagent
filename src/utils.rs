@@ -369,7 +369,7 @@ pub fn format_api_error(status: u16, body: &str, base_url: &str, model: &str) ->
 
     let code_tag = error_code
         .as_deref()
-        .map(|c| format!(" [{}]", c))
+        .map(|c| format!(" [{c}]"))
         .unwrap_or_default();
 
     match status {
@@ -388,37 +388,31 @@ pub fn format_api_error(status: u16, body: &str, base_url: &str, model: &str) ->
                 "Check that the correct API key is set for this provider."
             };
             format!(
-                "({}{}) Authentication failed for model '{}'. {}",
-                status, code_tag, model, hint
+                "({status}{code_tag}) Authentication failed for model '{model}'. {hint}"
             )
         }
         403 => {
             let detail = msg
                 .as_deref()
-                .map(|m| format!(" {}", m))
+                .map(|m| format!(" {m}"))
                 .unwrap_or_default();
             format!(
-                "({}{}) Access denied for model '{}'.{} Your API key may not have permission to use this model.",
-                status, code_tag, model, detail
+                "({status}{code_tag}) Access denied for model '{model}'.{detail} Your API key may not have permission to use this model."
             )
         }
         404 => format!(
-            "({}{}) Model '{}' not found at {}. It may not exist or is not available on your plan.",
-            status, code_tag, model, base_url
+            "({status}{code_tag}) Model '{model}' not found at {base_url}. It may not exist or is not available on your plan."
         ),
         429 => format!(
-            "({}{}) Rate limit exceeded for model '{}'. Try again in a moment.",
-            status, code_tag, model
+            "({status}{code_tag}) Rate limit exceeded for model '{model}'. Try again in a moment."
         ),
         _ if status >= 500 => format!(
-            "({}{}) Server error from provider while using model '{}'. Try again later.",
-            status, code_tag, model
+            "({status}{code_tag}) Server error from provider while using model '{model}'. Try again later."
         ),
         _ => {
             let detail = msg.unwrap_or_else(|| body.chars().take(200).collect());
             format!(
-                "({}{}) API error for model '{}': {}",
-                status, code_tag, model, detail
+                "({status}{code_tag}) API error for model '{model}': {detail}"
             )
         }
     }
@@ -590,7 +584,7 @@ impl LLMClient {
             match serde_json::from_value::<Vec<ToolCallRequest>>(tc_json) {
                 Ok(calls) => Some(calls),
                 Err(e) => {
-                    warn!("Failed to parse tool_calls from provider response: {}", e);
+                    warn!("Failed to parse tool_calls from provider response: {e}");
                     None
                 }
             }
@@ -871,7 +865,7 @@ pub fn extract_json_from_llm_response(text: &str) -> Option<serde_json::Value> {
 /// Extracts text from a PDF file byte payload into Markdown format.
 pub fn extract_markdown_from_pdf_bytes(pdf_bytes: &[u8]) -> Result<String, String> {
     let doc = pdf_oxide::PdfDocument::from_bytes(pdf_bytes.to_vec())
-        .map_err(|e| format!("pdf_oxide error: {:?}", e))?;
+        .map_err(|e| format!("pdf_oxide error: {e:?}"))?;
 
     let mut extracted = String::new();
     let options = pdf_oxide::converters::ConversionOptions::default();

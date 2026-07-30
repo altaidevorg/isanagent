@@ -62,9 +62,9 @@ impl Channel for EmailChannel {
                 let res = tokio::task::spawn_blocking(move || poll_inbox_once(cfg, tx)).await;
 
                 if let Err(e) = res {
-                    error!("IMAP panic: {}", e);
+                    error!("IMAP panic: {e}");
                 } else if let Ok(Err(e)) = res {
-                    error!("IMAP Error: {}. Reconnecting in 15 seconds.", e);
+                    error!("IMAP Error: {e}. Reconnecting in 15 seconds.");
                 }
 
                 tokio::select! {
@@ -111,15 +111,15 @@ impl Channel for EmailChannel {
                     config
                         .email_address
                         .parse()
-                        .map_err(|e| format!("Invalid from address: {}", e))?,
+                        .map_err(|e| format!("Invalid from address: {e}"))?,
                 )
                 .to(to_address
                     .parse()
-                    .map_err(|e| format!("Invalid to address: {}", e))?)
+                    .map_err(|e| format!("Invalid to address: {e}"))?)
                 .subject(if subject.starts_with("Re:") {
                     subject.clone()
                 } else {
-                    format!("Re: {}", subject)
+                    format!("Re: {subject}")
                 })
                 .body(msg.content.clone())
                 .map_err(|e| e.to_string())?;
@@ -128,18 +128,18 @@ impl Channel for EmailChannel {
                 Credentials::new(config.imap_username.clone(), config.imap_password.clone());
 
             let mailer = SmtpTransport::relay(&config.smtp_host)
-                .map_err(|e| format!("Invalid SMTP host: {}", e))?
+                .map_err(|e| format!("Invalid SMTP host: {e}"))?
                 .port(config.smtp_port)
                 .credentials(creds)
                 .build();
 
             mailer.send(&email).map_err(|e| e.to_string())?;
 
-            info!("Successfully sent reply email to {}", to_address);
+            info!("Successfully sent reply email to {to_address}");
             Ok(())
         })
         .await
-        .map_err(|e| format!("SMTP task panicked: {}", e))?
+        .map_err(|e| format!("SMTP task panicked: {e}"))?
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -162,7 +162,7 @@ fn poll_inbox_once(config: EmailConfig, bus_tx: Sender<BusMessage>) -> Result<()
     info!("Found {} UNSEEN messages", messages.len());
 
     for seq in messages {
-        info!("Fetching message {}", seq);
+        info!("Fetching message {seq}");
         if let Ok(fetches) = session.fetch(seq.to_string(), "(ENVELOPE BODY[TEXT])") {
             for m in fetches.iter() {
                 let mut sender = String::from("unknown@example.com");
@@ -201,11 +201,11 @@ fn poll_inbox_once(config: EmailConfig, bus_tx: Sender<BusMessage>) -> Result<()
                 };
 
                 if let Err(e) = bus_tx.blocking_send(BusMessage::Inbound(inbound)) {
-                    error!("Failed to route email to agent bus: {}", e);
+                    error!("Failed to route email to agent bus: {e}");
                 }
             }
         }
-        let _ = session.store(format!("{}", seq), "+FLAGS (\\Seen)");
+        let _ = session.store(format!("{seq}"), "+FLAGS (\\Seen)");
     }
 
     let _ = session.logout();

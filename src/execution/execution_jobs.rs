@@ -640,11 +640,10 @@ impl ExecutionJobManager {
                         .filter(|s| !s.is_empty())
                     {
                         Some(d) => {
-                            format!("{} — completed (exit {}, {} ms)", d, exit_s, duration_ms)
+                            format!("{d} — completed (exit {exit_s}, {duration_ms} ms)")
                         }
                         None => format!(
-                            "Execution job {} completed (exit {}, {} ms)",
-                            job_id_for_task, exit_s, duration_ms
+                            "Execution job {job_id_for_task} completed (exit {exit_s}, {duration_ms} ms)"
                         ),
                     };
                     let notice = build_execution_job_notice(
@@ -686,8 +685,7 @@ impl ExecutionJobManager {
                         warn!("execution_jobs audit: {e}");
                     }
                     info!(
-                        "execution_job_done job={} session={} provider={} status=completed",
-                        job_id_for_task, sid_spawn, prov
+                        "execution_job_done job={job_id_for_task} session={sid_spawn} provider={prov} status=completed"
                     );
                 }
                 Err(e) => {
@@ -724,7 +722,7 @@ impl ExecutionJobManager {
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                     {
-                        Some(d) => format!("{} — {status_label} ({es})", d),
+                        Some(d) => format!("{d} — {status_label} ({es})"),
                         None => format!("Execution job {job_id_for_task}: {status_label} ({es})"),
                     };
                     let notice = build_execution_job_notice(
@@ -766,8 +764,7 @@ impl ExecutionJobManager {
                         warn!("execution_jobs audit: {log_e}");
                     }
                     info!(
-                        "execution_job_done job={} session={} provider={} status={}",
-                        job_id_for_task, sid_spawn, prov, status_label
+                        "execution_job_done job={job_id_for_task} session={sid_spawn} provider={prov} status={status_label}"
                     );
                 }
             }
@@ -1115,10 +1112,9 @@ async fn finalize_arbitrary_job(p: FinalizeArbitraryParams) {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
-                Some(d) => format!("{} - completed (exit {}, {} ms)", d, exit_s, duration_ms),
+                Some(d) => format!("{d} - completed (exit {exit_s}, {duration_ms} ms)"),
                 None => format!(
-                    "{} job {} completed (exit {}, {} ms)",
-                    tool_name, job_id, exit_s, duration_ms
+                    "{tool_name} job {job_id} completed (exit {exit_s}, {duration_ms} ms)"
                 ),
             };
             let notice = build_execution_job_notice(
@@ -1160,8 +1156,7 @@ async fn finalize_arbitrary_job(p: FinalizeArbitraryParams) {
                 warn!("execution_jobs audit: {e}");
             }
             info!(
-                "execution_job_done job={} session={} provider={} status=completed tool={}",
-                job_id, sid, provider_id, tool_name
+                "execution_job_done job={job_id} session={sid} provider={provider_id} status=completed tool={tool_name}"
             );
         }
         Err(e) => {
@@ -1198,7 +1193,7 @@ async fn finalize_arbitrary_job(p: FinalizeArbitraryParams) {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
-                Some(d) => format!("{} - {status_label} ({es})", d),
+                Some(d) => format!("{d} - {status_label} ({es})"),
                 None => format!("{tool_name} job {job_id}: {status_label} ({es})"),
             };
             let notice = build_execution_job_notice(
@@ -1240,8 +1235,7 @@ async fn finalize_arbitrary_job(p: FinalizeArbitraryParams) {
                 warn!("execution_jobs audit: {log_e}");
             }
             info!(
-                "execution_job_done job={} session={} provider={} status={} tool={}",
-                job_id, sid, provider_id, status_label, tool_name
+                "execution_job_done job={job_id} session={sid} provider={provider_id} status={status_label} tool={tool_name}"
             );
         }
     }

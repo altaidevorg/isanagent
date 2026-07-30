@@ -13,6 +13,7 @@ use tokio::sync::{mpsc, watch, RwLock};
 
 use crate::agent::{AgentLogic, AgentLogicParams};
 use crate::bus::{BusMessage, InboundMessage, LoggerControlMessage, TelemetryEvent};
+use crate::channels::oneshot::OneshotChannel;
 use crate::channels::terminal::{
     build_agent_thought_terminal_notice, build_tool_call_terminal_notice,
     build_tool_progress_terminal_notice, build_tool_result_terminal_notice,
@@ -87,12 +88,32 @@ pub struct HostConfig {
     pub permission: Option<HostPermissionMode>,
     /// Disable ANSI foreground colors while retaining terminal structure.
     pub no_color: bool,
+    /// ALTAI terminal appearance. `no_color` / `NO_COLOR` still win.
+    pub theme: HostThemeMode,
     /// Existing terminal chat identifier to load on startup.
     pub resume: Option<String>,
     /// Files preloaded into the terminal's next composed message.
     pub files: Vec<PathBuf>,
     pub line_mode: bool,
+    /// Optional override for between-turn auto-compaction (`None` = config default).
+    pub compact_auto: Option<bool>,
+    /// Optional override for the auto-compaction token threshold.
+    pub compact_threshold_tokens: Option<usize>,
+    /// Optional override for recent-summary / tail retention.
+    pub compact_tail_turns: Option<usize>,
+    /// When set, disable the interactive terminal, inject this prompt once through
+    /// the headless `altai-cli` channel, and shut down after the run terminates.
+    pub oneshot_prompt: Option<String>,
+    /// Optional observer for raw host bus messages during interactive or oneshot runs.
+    pub observe_tx: Option<mpsc::UnboundedSender<BusMessage>>,
+    /// Deterministic in-process assistant replies for tests and CI smokes.
+    /// When set, the host skips network providers and returns these responses
+    /// in order (the last response repeats).
+    pub scripted_responses: Option<Vec<String>>,
 }
+
+pub use crate::channels::oneshot::{OneshotOutcome, OneshotResult};
+pub use crate::channels::terminal_ui::HostThemeMode;
 
 /// Interactive permission modes exposed to embedding hosts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,7 +182,7 @@ pub fn spawn_host(config: HostConfig) -> HostHandle {
     let (events_tx, events) = mpsc::unbounded_channel();
     let task = tokio::spawn(async move {
         let _ = events_tx.send(HostEvent::Starting);
-        let result = run_host(config, Some(shutdown_rx)).await;
+        let result = run_host(config, Some(shutdown_rx), None).await;
         let outcome = match &result {
             Ok(()) => HostExit::Completed,
             Err(error) => HostExit::Failed(error.to_string()),
@@ -180,12 +201,38 @@ pub fn spawn_host(config: HostConfig) -> HostHandle {
 /// Start the complete IsanAgent runtime, including its terminal channel when
 /// enabled by the selected configuration.
 pub async fn start_host(config: HostConfig) -> HostResult<()> {
-    run_host(config, None).await
+    run_host(config, None, None).await?;
+    Ok(())
+}
+
+/// Run a single headless prompt through the shared host runtime and shut down
+/// after the matching reasoning run terminates.
+pub async fn run_oneshot(mut config: HostConfig) -> HostResult<OneshotResult> {
+    if config
+        .oneshot_prompt
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        return Err(std::io::Error::other("oneshot prompt must be non-empty").into());
+    }
+    // One-shot runs never own an interactive TTY channel.
+    config.line_mode = false;
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let host_result = run_host(config, None, Some(result_tx)).await;
+    match result_rx.await {
+        Ok(result) => Ok(result),
+        Err(_) => Err(host_result.err().unwrap_or_else(|| {
+            std::io::Error::other("oneshot host exited without a terminal result").into()
+        })),
+    }
 }
 
 async fn run_host(
     config: HostConfig,
     mut external_shutdown_rx: Option<mpsc::UnboundedReceiver<()>>,
+    oneshot_result_tx: Option<tokio::sync::oneshot::Sender<OneshotResult>>,
 ) -> HostResult<()> {
     let workspace_arg = config
         .workspace
@@ -202,7 +249,7 @@ async fn run_host(
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
     let (app_shutdown_tx, app_shutdown_rx) = watch::channel(false);
     init_runtime_logger(logger_bus_tx.clone()).map_err(|e| {
-        std::io::Error::other(format!("failed to initialize runtime logger: {:?}", e))
+        std::io::Error::other(format!("failed to initialize runtime logger: {e:?}"))
     })?;
 
     let logger_factory = {
@@ -232,7 +279,16 @@ async fn run_host(
             }
         })?;
 
-    println!("Starting Advanced isanagent System...");
+    let oneshot_mode = config
+        .oneshot_prompt
+        .as_ref()
+        .map(|prompt| prompt.trim())
+        .is_some_and(|prompt| !prompt.is_empty());
+    if oneshot_mode {
+        eprintln!("Starting Advanced isanagent System...");
+    } else {
+        println!("Starting Advanced isanagent System...");
+    }
     log::info!("Starting Advanced isanagent System.");
 
     let mut workspace = IsanagentWorkspace::new_with_sandbox(
@@ -241,10 +297,27 @@ async fn run_host(
         sandbox,
     )?;
     apply_host_overrides(&mut workspace.config, &config).map_err(std::io::Error::other)?;
-    println!("Loading isanagent workspace at: {:?}", workspace.dir);
+    let oneshot_prompt = config
+        .oneshot_prompt
+        .as_ref()
+        .map(|prompt| prompt.trim().to_string())
+        .filter(|prompt| !prompt.is_empty());
+    if oneshot_mode {
+        // One-shot hosts never attach the interactive terminal channel.
+        let terminal = workspace
+            .config
+            .terminal
+            .get_or_insert_with(Default::default);
+        terminal.enabled = Some(false);
+        eprintln!("Loading isanagent workspace at: {:?}", workspace.dir);
+    } else {
+        println!("Loading isanagent workspace at: {:?}", workspace.dir);
+    }
     log::info!("Loading isanagent workspace at {:?}", workspace.dir);
 
-    if !workspace.config.terminal_enabled() && !workspace.config.has_non_terminal_inbound_channel()
+    if oneshot_prompt.is_none()
+        && !workspace.config.terminal_enabled()
+        && !workspace.config.has_non_terminal_inbound_channel()
     {
         return Err(std::io::Error::other(
             "Invalid config: [terminal] enabled = false requires at least one other inbound channel. \
@@ -253,7 +326,9 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         .into());
     }
 
-    maybe_prompt_uv_install_on_launch(&workspace).await;
+    if !oneshot_mode {
+        maybe_prompt_uv_install_on_launch(&workspace).await;
+    }
 
     // 1. Setup SqliteMemoryActor and SessionManager
     let db_path = workspace
@@ -267,7 +342,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         .to_str()
         .ok_or_else(|| std::io::Error::other("workspace DB path is not valid UTF-8"))?;
     let memory_actor = crate::memory::SqliteMemoryActor::new(db_path_str).map_err(|e| {
-        std::io::Error::other(format!("Failed to initialize SqliteMemoryActor: {}", e))
+        std::io::Error::other(format!("Failed to initialize SqliteMemoryActor: {e}"))
     })?;
     let memory_node = NodeHandle::<crate::memory::MemoryMessage>::new(
         memory_actor,
@@ -315,8 +390,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             .await
             .map_err(|error| {
                 std::io::Error::other(format!(
-                    "Failed to sync cron jobs to multi-tenant-edge on startup: {}",
-                    error
+                    "Failed to sync cron jobs to multi-tenant-edge on startup: {error}"
                 ))
             })?;
         Some(scheduler)
@@ -602,7 +676,13 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         Box<dyn crate::traits::Provider>,
         Box<dyn crate::traits::Provider>,
         Vec<crate::agent::FallbackProviderSpec>,
-    ) = if let (Some(cfg), Some(key)) = (&provider_cfg, &api_key) {
+    ) = if let Some(responses) = config.scripted_responses.clone() {
+        (
+            Box::new(crate::provider::ScriptedProvider::new(responses.clone())),
+            Box::new(crate::provider::ScriptedProvider::new(responses)),
+            Vec::new(),
+        )
+    } else if let (Some(cfg), Some(key)) = (&provider_cfg, &api_key) {
         let base_url = cfg.resolved_base_url().map_err(std::io::Error::other)?;
         let p1 = crate::provider::create_provider(&cfg.provider_name, &base_url, key, &model_name);
         let p2 = crate::provider::create_provider(&cfg.provider_name, &base_url, key, &model_name);
@@ -727,7 +807,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
 
     // 7. Create Agent Logic
     let max_iterations = workspace.config.resolved_max_iterations().unwrap_or(50);
-    let max_recent_summaries = workspace
+    let mut max_recent_summaries = workspace
         .config
         .memory
         .as_ref()
@@ -739,12 +819,20 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         .as_ref()
         .and_then(|m| m.short_term_threshold_turns)
         .unwrap_or(20);
-    let short_term_threshold_tokens = workspace
+    let mut short_term_threshold_tokens = workspace
         .config
         .memory
         .as_ref()
         .and_then(|m| m.short_term_threshold_tokens)
         .unwrap_or(100000);
+    if config.compact_auto == Some(false) {
+        short_term_threshold_tokens = usize::MAX;
+    } else if let Some(tokens) = config.compact_threshold_tokens {
+        short_term_threshold_tokens = tokens.max(8_000);
+    }
+    if let Some(tail) = config.compact_tail_turns {
+        max_recent_summaries = tail.max(1);
+    }
     let tool_execution_activity = if multi_tenant_edge_cfg
         .activity_heartbeat_enabled
         .unwrap_or(false)
@@ -858,6 +946,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             workspace_dir: workspace.dir.clone(),
             sandbox_dir: workspace.sandbox_dir.clone(),
             status_model: model_name.clone(),
+            status_permission: host_permission_label(config.permission),
             memory_node: memory_node.clone(),
             providers: {
                 // Merge default [provider] + expanded [providers.*] into one map for /model selector
@@ -868,7 +957,8 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                 }
                 all_providers
             },
-            color_enabled: !config.no_color,
+            color_enabled: !config.no_color && config.theme != HostThemeMode::NoColor,
+            theme: config.theme,
             resume_session: config.resume.is_some(),
             initial_files: config.files.clone(),
             mode: if config.line_mode {
@@ -882,6 +972,52 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         Some(id)
     } else {
         log::info!("Terminal channel disabled via config; stdin will not be read.");
+        None
+    };
+
+    let oneshot_channel = if let Some(prompt) = oneshot_prompt.clone() {
+        let result_tx = oneshot_result_tx.ok_or_else(|| {
+            std::io::Error::other(
+                "oneshot prompt requires run_oneshot or an explicit result channel",
+            )
+        })?;
+        let id = config
+            .resume
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let (attachments, attach_warnings) =
+            crate::channels::terminal_ui::load_host_file_attachments(
+                &workspace.sandbox_dir,
+                &config.files,
+            );
+        for warning in attach_warnings {
+            log::warn!("oneshot attachment: {warning}");
+            let _ = logger_bus_tx.send(BusMessage::Log(crate::bus::LogEvent::warn(
+                "altai-cli",
+                &warning,
+            )));
+        }
+        let channel = Arc::new(OneshotChannel::new(
+            id,
+            prompt,
+            config.files.clone(),
+            attachments,
+            result_tx,
+            shutdown_tx.clone(),
+            config.observe_tx.clone(),
+        ));
+        channel.start(bus_tx.clone()).await?;
+        out_channels.insert(channel.name().to_string(), channel.clone());
+        Some(channel)
+    } else {
+        if oneshot_result_tx.is_some() {
+            return Err(std::io::Error::other(
+                "oneshot result channel provided without oneshot_prompt",
+            )
+            .into());
+        }
         None
     };
 
@@ -935,7 +1071,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     }
 
     // 14. Print clean startup banner (skipped when Ratatui owns the alternate screen)
-    if !terminal_startup_suppresses_plain_banner(&workspace.config) {
+    if !oneshot_mode && !terminal_startup_suppresses_plain_banner(&workspace.config) {
         println!(
             "\n{}",
             "=============================================".blue()
@@ -989,8 +1125,16 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     let logger_tx = logger_bus_tx.clone();
     let inflight_promote = inflight_sync_outer.clone();
     let active_terminal_session_for_bus = active_terminal_session_chat.clone();
+    let oneshot_for_bus = oneshot_channel.clone();
+    let observe_tx = config.observe_tx.clone();
     tokio::spawn(async move {
         while let Some(msg) = bus_rx.recv().await {
+            if let Some(tx) = observe_tx.as_ref() {
+                let _ = tx.send(msg.clone());
+            }
+            if let Some(oneshot) = oneshot_for_bus.as_ref() {
+                oneshot.observe_bus_message(&msg);
+            }
             let _ = logger_tx.send(msg.clone());
             // Intercept /background slash commands and fire the in-flight oneshot.
             if let BusMessage::PromoteSyncToBackground(chat_id) = &msg {
@@ -1035,6 +1179,9 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                     BusMessage::Telemetry(tel) => {
                         let _ = agent_outbound_tx.send(BusMessage::Telemetry(tel)).await;
                     }
+                    lifecycle @ BusMessage::RunLifecycle(_) => {
+                        let _ = agent_outbound_tx.send(lifecycle).await;
+                    }
                     _ => {}
                 }
             }
@@ -1044,8 +1191,18 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     let logger_tx_outbound = logger_bus_tx.clone();
     let delivery_channels = out_channels.clone();
     let active_terminal_for_outbound = active_terminal_session_chat.clone();
+    let oneshot_for_outbound = oneshot_channel.clone();
+    let observe_tx_outbound = config.observe_tx.clone();
     tokio::spawn(async move {
         while let Some(msg) = global_outbound_rx.recv().await {
+            if let Some(tx) = observe_tx_outbound.as_ref() {
+                let _ = tx.send(msg.clone());
+            }
+            if let Some(oneshot) = oneshot_for_outbound.as_ref() {
+                if !matches!(&msg, BusMessage::Outbound(_)) {
+                    oneshot.observe_bus_message(&msg);
+                }
+            }
             // Deliver user-visible terminal traffic first. `LoggerHandle::send` uses a blocking
             // `sync_channel::send`; doing it before channel delivery can stall this task and make
             // tool-call lines and agent replies appear only after the run finishes.
@@ -1073,6 +1230,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                         }
                     }
                 }
+                BusMessage::RunLifecycle(_) => {}
                 BusMessage::Telemetry(TelemetryEvent::AgentThought {
                     chat_id,
                     thought,
@@ -1086,7 +1244,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                         );
                         if let Some(chan) = delivery_channels.get("terminal") {
                             if let Err(e) = chan.send(notice).await {
-                                log::error!("Failed to deliver AgentThought to terminal: {}", e);
+                                log::error!("Failed to deliver AgentThought to terminal: {e}");
                             }
                         }
                     }
@@ -1123,8 +1281,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                         if let Some(chan) = delivery_channels.get("terminal") {
                             if let Err(e) = chan.send(notice).await {
                                 log::error!(
-                                    "Failed to deliver tool-progress notice to terminal: {}",
-                                    e
+                                    "Failed to deliver tool-progress notice to terminal: {e}"
                                 );
                             }
                         }
@@ -1168,8 +1325,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                         if let Some(chan) = delivery_channels.get("terminal") {
                             if let Err(e) = chan.send(notice).await {
                                 log::error!(
-                                    "Failed to deliver tool-call notice to terminal: {}",
-                                    e
+                                    "Failed to deliver tool-call notice to terminal: {e}"
                                 );
                             }
                         }
@@ -1201,8 +1357,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                         if let Some(chan) = delivery_channels.get("terminal") {
                             if let Err(e) = chan.send(notice).await {
                                 log::error!(
-                                    "Failed to deliver tool-result notice to terminal: {}",
-                                    e
+                                    "Failed to deliver tool-result notice to terminal: {e}"
                                 );
                             }
                         }
@@ -1331,7 +1486,9 @@ fn apply_host_overrides(config: &mut AppConfig, host: &HostConfig) -> Result<(),
         let (mode, edit_mode) = match permission {
             HostPermissionMode::Ask => ("ask", "ask"),
             HostPermissionMode::AutoEdit => ("ask", "allow"),
-            HostPermissionMode::Plan => ("deny", "deny"),
+            // Match desktop: plan keeps shell at ask (read-only inspection with
+            // approval for destructive commands) while denying file edits.
+            HostPermissionMode::Plan => ("ask", "deny"),
             HostPermissionMode::Bypass => ("allow", "allow"),
         };
         shell_policy.mode = Some(mode.to_string());
@@ -1339,6 +1496,16 @@ fn apply_host_overrides(config: &mut AppConfig, host: &HostConfig) -> Result<(),
     }
 
     Ok(())
+}
+
+fn host_permission_label(permission: Option<HostPermissionMode>) -> String {
+    match permission {
+        Some(HostPermissionMode::Ask) => "ask".into(),
+        Some(HostPermissionMode::AutoEdit) => "auto-edit".into(),
+        Some(HostPermissionMode::Plan) => "plan".into(),
+        Some(HostPermissionMode::Bypass) => "bypass".into(),
+        None => "default".into(),
+    }
 }
 
 async fn wait_for_external_shutdown(receiver: &mut Option<mpsc::UnboundedReceiver<()>>) {
@@ -1380,9 +1547,8 @@ provider's environment, or set default_provider=\"local\" and local_python_runti
             && io::stdout().is_terminal();
         if !interactive {
             log::warn!(
-                "Execution local runtime is uv-managed but '{}' was not found on PATH. \
-Install uv manually or run /install-python from terminal mode.",
-                uv_bin
+                "Execution local runtime is uv-managed but '{uv_bin}' was not found on PATH. \
+Install uv manually or run /install-python from terminal mode."
             );
             return;
         }
@@ -1390,8 +1556,7 @@ Install uv manually or run /install-python from terminal mode.",
         let uv_bin_owned = uv_bin.to_string();
         let prompt_result = tokio::task::spawn_blocking(move || {
             println!(
-                "\nExecution runtime is set to uv-managed, but '{}' was not found on PATH.",
-                uv_bin_owned
+                "\nExecution runtime is set to uv-managed, but '{uv_bin_owned}' was not found on PATH."
             );
             println!("Install uv now? (yes/no)");
             let _ = io::stdout().flush();
@@ -1455,7 +1620,7 @@ async fn recover_background_jobs_on_startup(
     let rows = match rx.await {
         Ok(Ok(rows)) => rows,
         Ok(Err(e)) => {
-            log::error!("Failed to list background jobs for recovery: {}", e);
+            log::error!("Failed to list background jobs for recovery: {e}");
             return;
         }
         Err(_) => {
@@ -1501,8 +1666,7 @@ async fn recover_background_jobs_on_startup(
     }
     if count > 0 {
         log::info!(
-            "Successfully resumed {} background job(s) on startup.",
-            count
+            "Successfully resumed {count} background job(s) on startup."
         );
     }
 }
@@ -1663,9 +1827,13 @@ mod tests {
         assert!(config.fallback_model.is_none());
         assert!(config.permission.is_none());
         assert!(!config.no_color);
+        assert_eq!(config.theme, HostThemeMode::Auto);
         assert!(config.resume.is_none());
         assert!(config.files.is_empty());
         assert!(!config.line_mode);
+        assert!(config.oneshot_prompt.is_none());
+        assert!(config.observe_tx.is_none());
+        assert!(config.scripted_responses.is_none());
     }
 
     #[test]
@@ -1691,7 +1859,7 @@ mod tests {
         for (permission, mode, edit_mode) in [
             (HostPermissionMode::Ask, "ask", "ask"),
             (HostPermissionMode::AutoEdit, "ask", "allow"),
-            (HostPermissionMode::Plan, "deny", "deny"),
+            (HostPermissionMode::Plan, "ask", "deny"),
             (HostPermissionMode::Bypass, "allow", "allow"),
         ] {
             let mut config = AppConfig::default();
@@ -1750,9 +1918,16 @@ mod tests {
             fallback_model: None,
             permission: None,
             no_color: false,
+            theme: HostThemeMode::Auto,
             resume: None,
             files: Vec::new(),
             line_mode: false,
+            compact_auto: None,
+            compact_threshold_tokens: None,
+            compact_tail_turns: None,
+            oneshot_prompt: None,
+            observe_tx: None,
+            scripted_responses: None,
         });
         assert_eq!(host.next_event().await, Some(HostEvent::Starting));
         assert!(host.shutdown());
@@ -1770,5 +1945,46 @@ mod tests {
             .await
             .expect("host task should join")
             .expect("host should complete cleanly");
+    }
+
+    #[tokio::test]
+    async fn run_oneshot_completes_with_scripted_provider() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let config_path = temp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            "[terminal]\nenabled = false\n\n[logging]\nenabled = false\n",
+        )
+        .expect("write config");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            run_oneshot(HostConfig {
+                workspace: Some(temp.path().to_path_buf()),
+                config: Some(config_path),
+                sandbox: Some(temp.path().to_path_buf()),
+                model: None,
+                fallback_model: None,
+                permission: Some(HostPermissionMode::Plan),
+                no_color: true,
+                theme: HostThemeMode::NoColor,
+                resume: None,
+                files: Vec::new(),
+                line_mode: false,
+                compact_auto: None,
+                compact_threshold_tokens: None,
+                compact_tail_turns: None,
+                oneshot_prompt: Some("reply with oneshot-ok".to_string()),
+                observe_tx: None,
+                scripted_responses: Some(vec!["oneshot-ok".to_string()]),
+            }),
+        )
+        .await
+        .expect("oneshot should finish promptly")
+        .expect("oneshot should succeed");
+
+        assert_eq!(result.outcome, OneshotOutcome::Completed);
+        assert_eq!(result.final_text.as_deref(), Some("oneshot-ok"));
+        assert!(!result.chat_id.is_empty());
     }
 }

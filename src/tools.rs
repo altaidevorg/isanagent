@@ -140,7 +140,7 @@ impl ToolRegistry {
         if let Some(tool) = self.get_tool(name) {
             tool.execute(args).await
         } else {
-            Err(format!("Tool '{}' not found", name))
+            Err(format!("Tool '{name}' not found"))
         }
     }
 
@@ -168,7 +168,7 @@ impl ToolRegistry {
         self.authorize_scoped(name, allowlist, is_subagent)?;
         match self.get_tool(name) {
             Some(tool) => tool.preview_mutation(args).await,
-            None => Err(format!("Tool '{}' not found", name)),
+            None => Err(format!("Tool '{name}' not found")),
         }
     }
 
@@ -187,7 +187,7 @@ impl ToolRegistry {
                 tool.execute_with_approved_mutation(args, approved_preview)
                     .await
             }
-            None => Err(format!("Tool '{}' not found", name)),
+            None => Err(format!("Tool '{name}' not found")),
         }
     }
 
@@ -221,15 +221,13 @@ impl ToolRegistry {
     ) -> Result<(), String> {
         if is_subagent && Self::is_subagent_restricted_tool(name) {
             return Err(format!(
-                "Tool '{}' is not available inside a sub-agent run",
-                name
+                "Tool '{name}' is not available inside a sub-agent run"
             ));
         }
         if let Some(set) = allowlist {
             if !set.is_empty() && !set.contains(name) {
                 return Err(format!(
-                    "Tool '{}' is not allowed for this sub-agent (allowlist)",
-                    name
+                    "Tool '{name}' is not allowed for this sub-agent (allowlist)"
                 ));
             }
         }

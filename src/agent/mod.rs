@@ -87,7 +87,7 @@ async fn persist_terminal_assistant_message(
         let _ = logger_tx.send(BusMessage::Log(
             LogEvent::warn(
                 name,
-                &format!("Failed to persist terminal assistant message: {}", e),
+                &format!("Failed to persist terminal assistant message: {e}"),
             )
             .with_chat_id(chat_id),
         ));
@@ -440,7 +440,7 @@ fn should_require_shell_approval(command: &str, patterns: &[String]) -> bool {
         if np.is_empty() {
             return false;
         }
-        normalized.contains(&format!(" {} ", np))
+        normalized.contains(&format!(" {np} "))
     })
 }
 
@@ -455,7 +455,24 @@ fn should_require_shell_approval(command: &str, patterns: &[String]) -> bool {
 /// negative sentence ("never approve", "i can't approve", "approve? actually nope"). The prompt
 /// constrains the choices to approve/deny with `allow_empty = false`, so the strictness is
 /// UX-compatible; an unrecognized reply simply skips execution and the user can re-confirm.
+#[cfg(test)]
 fn shell_approval_reply_is_grant(reply: &str) -> bool {
+    matches!(
+        classify_approval_reply(reply),
+        ApprovalReply::Grant | ApprovalReply::AlwaysThisRun
+    )
+}
+
+/// Four-way approval reply classification for ALTAI CLI / TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalReply {
+    Grant,
+    AlwaysThisRun,
+    Deny,
+    Abort,
+}
+
+fn classify_approval_reply(reply: &str) -> ApprovalReply {
     const AFFIRM: &[&str] = &[
         "approve",
         "approved",
@@ -477,25 +494,67 @@ fn shell_approval_reply_is_grant(reply: &str) -> bool {
         "go",
         "sure",
     ];
-    const FILLER: &[&str] = &["please", "it", "this", "that", "ahead", "now", "run", "do"];
+    const FILLER: &[&str] = &[
+        "please", "it", "this", "that", "ahead", "now", "run", "do", "for",
+    ];
+    const ALWAYS: &[&str] = &["always"];
+    const ABORT: &[&str] = &["abort", "cancel", "quit", "stop"];
 
     let r = reply.trim().to_ascii_lowercase();
     if r.is_empty() {
-        return false;
+        return ApprovalReply::Deny;
     }
-    let mut saw_affirmative = false;
-    for tok in r
+
+    let tokens: Vec<&str> = r
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())
+        .collect();
+
+    if tokens.iter().any(|t| ABORT.contains(t))
+        && !tokens
+            .iter()
+            .any(|t| AFFIRM.contains(t) || ALWAYS.contains(t))
     {
-        if AFFIRM.contains(&tok) {
+        return ApprovalReply::Abort;
+    }
+
+    // "always" / "always for this run" — allow only known filler around always.
+    if tokens.iter().any(|t| ALWAYS.contains(t)) {
+        let ok = tokens
+            .iter()
+            .all(|t| ALWAYS.contains(t) || FILLER.contains(t) || AFFIRM.contains(t));
+        if ok {
+            return ApprovalReply::AlwaysThisRun;
+        }
+        return ApprovalReply::Deny;
+    }
+
+    let mut saw_affirmative = false;
+    for tok in &tokens {
+        if AFFIRM.contains(tok) {
             saw_affirmative = true;
-        } else if !FILLER.contains(&tok) {
-            // Negation, caveat, or unmodeled prose -> deny.
-            return false;
+        } else if !FILLER.contains(tok) {
+            return ApprovalReply::Deny;
         }
     }
-    saw_affirmative
+    if saw_affirmative {
+        ApprovalReply::Grant
+    } else {
+        ApprovalReply::Deny
+    }
+}
+
+fn command_preview_with_flag(command: &str) -> (String, bool) {
+    const MAX_PREVIEW: usize = 160;
+    if command.len() <= MAX_PREVIEW {
+        (command.to_string(), false)
+    } else {
+        (format!("{}…", &command[..MAX_PREVIEW]), true)
+    }
+}
+
+fn command_preview(command: &str) -> String {
+    command_preview_with_flag(command).0
 }
 
 fn shell_policy_mode_for_session(
@@ -528,15 +587,6 @@ fn edit_policy_block_reason(unattended_session: bool) -> &'static str {
         "File edit blocked by policy: unattended edit mode is active."
     } else {
         "File edit blocked by policy: plan mode active — finalize or apply the plan first."
-    }
-}
-
-fn command_preview(command: &str) -> String {
-    const MAX_PREVIEW: usize = 160;
-    if command.len() <= MAX_PREVIEW {
-        command.to_string()
-    } else {
-        format!("{}...", &command[..MAX_PREVIEW])
     }
 }
 
@@ -741,6 +791,23 @@ mod code_exec_gate_tests {
     }
 
     #[test]
+    fn approval_reply_classifies_always_and_abort() {
+        assert_eq!(
+            classify_approval_reply("always"),
+            ApprovalReply::AlwaysThisRun
+        );
+        assert_eq!(
+            classify_approval_reply("always for this run"),
+            ApprovalReply::AlwaysThisRun
+        );
+        assert_eq!(classify_approval_reply("abort"), ApprovalReply::Abort);
+        assert_eq!(classify_approval_reply("cancel"), ApprovalReply::Abort);
+        assert_eq!(classify_approval_reply("deny"), ApprovalReply::Deny);
+        assert!(shell_approval_reply_is_grant("always"));
+        assert!(!shell_approval_reply_is_grant("abort"));
+    }
+
+    #[test]
     fn append_post_tool_output_preserves_polarity() {
         // Appends to a success, preserving its typed status.
         let ok = append_post_tool_output(ToolResult::success("applied"), "tests passed");
@@ -889,7 +956,7 @@ async fn log_tool_invocation_start(
     let tool_name = &tc.function.name;
     let args_str = &tc.function.arguments;
     let _ = logger_tx.send(BusMessage::Log(
-        LogEvent::info(agent_name, &format!("Invoking tool: {}", tool_name))
+        LogEvent::info(agent_name, &format!("Invoking tool: {tool_name}"))
             .with_chat_id(&inbound.chat_id),
     ));
     let _ = outbound_tx
@@ -949,6 +1016,21 @@ struct ToolCallRuntime {
     unattended_session: bool,
     hook_tool_ctx: Option<Arc<ToolCallHookContext>>,
     inbound_metadata: Arc<HashMap<String, serde_json::Value>>,
+}
+
+/// Process-scoped "always for this run" grants (`shell:…` / `edit:…`).
+fn process_approval_grants() -> &'static tokio::sync::Mutex<HashSet<String>> {
+    static GRANTS: std::sync::OnceLock<tokio::sync::Mutex<HashSet<String>>> =
+        std::sync::OnceLock::new();
+    GRANTS.get_or_init(|| tokio::sync::Mutex::new(HashSet::new()))
+}
+
+async fn approval_already_granted(key: &str) -> bool {
+    process_approval_grants().lock().await.contains(key)
+}
+
+async fn remember_approval_grant(key: String) {
+    process_approval_grants().lock().await.insert(key);
 }
 
 /// Runs a tool with optional per-call activity heartbeats and optional cooperative cancellation.
@@ -1022,29 +1104,37 @@ async fn execute_tool_call_with_activity(
                             return ToolExecutionFinished::error(
                                 ToolErrorCode::PolicyDenied,
                                 format!(
-                                    "Command blocked by shell policy (mode=deny): {}",
-                                    command
+                                    "Command blocked by shell policy (mode=deny): {command}"
                                 ),
                             );
                         }
                     }
                     ShellPolicyMode::Ask => {
                         if requires_approval {
+                            let grant_key = format!("shell:{tool_name}:{command}");
+                            if !approval_already_granted(&grant_key).await {
+                            let (preview, preview_truncated) = command_preview_with_flag(&command);
                             let _ = outbound_tx
                                 .send(BusMessage::Telemetry(TelemetryEvent::ShellPolicyDecision {
                                     chat_id: chat_id.clone(),
                                     channel: channel.clone(),
                                     mode: "ask".to_string(),
                                     decision: "approval_requested".to_string(),
-                                    command_preview: preview.clone(),
+                                    command_preview: if preview_truncated {
+                                        format!("{preview} [truncated]")
+                                    } else {
+                                        preview.clone()
+                                    },
                                 }))
                                 .await;
                             let ask_payload = serde_json::json!({
                                 "prompt": format!(
-                                    "Approve running `{}`?\n\n```\n{}\n```\n\nReply with approve or deny.",
-                                    tool_name, command
+                                    "Approve running `{}`?\n\n```\n{}\n```\n\nReply with approve, deny, always (this run), or abort.{}",
+                                    tool_name,
+                                    command,
+                                    if preview_truncated { "\n[command preview truncated in telemetry]" } else { "" }
                                 ),
-                                "choices": ["approve", "deny"],
+                                "choices": ["approve", "deny", "always", "abort"],
                                 "timeout_secs": 1800,
                                 "allow_empty": false
                             });
@@ -1061,45 +1151,71 @@ async fn execute_tool_call_with_activity(
                                 .await;
                             match ask_result {
                                 Ok(reply) => {
-                                    // Deny-default parse: an explicit grant runs; anything else
-                                    // (incl. "do not approve") skips execution.
-                                    let approved = shell_approval_reply_is_grant(&reply);
-                                    if !approved {
-                                        let _ = outbound_tx
-                                            .send(BusMessage::Telemetry(
-                                                TelemetryEvent::ShellPolicyDecision {
-                                                    chat_id: chat_id.clone(),
-                                                    channel: channel.clone(),
-                                                    mode: "ask".to_string(),
-                                                    decision: "approval_denied".to_string(),
-                                                    command_preview: preview,
-                                                },
-                                            ))
-                                            .await;
-                                        return ToolExecutionFinished::error(
-                                            ToolErrorCode::PolicyDenied,
-                                            "Command not approved by user; execution skipped.",
-                                        );
+                                    let classified = classify_approval_reply(&reply);
+                                    match classified {
+                                        ApprovalReply::Grant | ApprovalReply::AlwaysThisRun => {
+                                            if matches!(classified, ApprovalReply::AlwaysThisRun) {
+                                                remember_approval_grant(grant_key).await;
+                                            }
+                                            let _ = outbound_tx
+                                                .send(BusMessage::Telemetry(
+                                                    TelemetryEvent::ShellPolicyDecision {
+                                                        chat_id: chat_id.clone(),
+                                                        channel: channel.clone(),
+                                                        mode: "ask".to_string(),
+                                                        decision: "approval_granted".to_string(),
+                                                        command_preview: preview,
+                                                    },
+                                                ))
+                                                .await;
+                                        }
+                                        ApprovalReply::Abort => {
+                                            let _ = outbound_tx
+                                                .send(BusMessage::Telemetry(
+                                                    TelemetryEvent::ShellPolicyDecision {
+                                                        chat_id: chat_id.clone(),
+                                                        channel: channel.clone(),
+                                                        mode: "ask".to_string(),
+                                                        decision: "approval_denied".to_string(),
+                                                        command_preview: preview,
+                                                    },
+                                                ))
+                                                .await;
+                                            if let Some(token) = cancel_owned.as_ref() {
+                                                token.cancel();
+                                            }
+                                            return ToolExecutionFinished::error(
+                                                ToolErrorCode::PolicyDenied,
+                                                "Command approval aborted by user; execution skipped.",
+                                            );
+                                        }
+                                        ApprovalReply::Deny => {
+                                            let _ = outbound_tx
+                                                .send(BusMessage::Telemetry(
+                                                    TelemetryEvent::ShellPolicyDecision {
+                                                        chat_id: chat_id.clone(),
+                                                        channel: channel.clone(),
+                                                        mode: "ask".to_string(),
+                                                        decision: "approval_denied".to_string(),
+                                                        command_preview: preview,
+                                                    },
+                                                ))
+                                                .await;
+                                            return ToolExecutionFinished::error(
+                                                ToolErrorCode::PolicyDenied,
+                                                "Command not approved by user; execution skipped.",
+                                            );
+                                        }
                                     }
-                                    let _ = outbound_tx
-                                        .send(BusMessage::Telemetry(
-                                            TelemetryEvent::ShellPolicyDecision {
-                                                chat_id: chat_id.clone(),
-                                                channel: channel.clone(),
-                                                mode: "ask".to_string(),
-                                                decision: "approval_granted".to_string(),
-                                                command_preview: preview,
-                                            },
-                                        ))
-                                        .await;
                                 }
                                 Err(e) => {
                                     return ToolExecutionFinished::error(
                                         ToolErrorCode::ExecutionFailed,
-                                        format!("Shell policy approval failed: {}", e),
+                                        format!("Shell policy approval failed: {e}"),
                                     );
                                 }
                             }
+                            } // end if !already_granted
                         }
                     }
                 }
@@ -1161,12 +1277,14 @@ async fn execute_tool_call_with_activity(
                         }
                     };
                     if let Some(preview) = preview {
+                        let grant_key = format!("edit:{}", preview.path);
+                        if !approval_already_granted(&grant_key).await {
                         let ask_payload = serde_json::json!({
                             "prompt": format!(
-                                "Approve edit to `{}`? Review the attached diff, then reply with approve or deny.",
+                                "Approve edit to `{}`? Review the attached diff, then reply with approve, deny, always (this run), or abort.",
                                 preview.path
                             ),
-                            "choices": ["approve", "deny"],
+                            "choices": ["approve", "deny", "always", "abort"],
                             "timeout_secs": 1800,
                             "allow_empty": false,
                             "metadata": {
@@ -1197,12 +1315,28 @@ async fn execute_tool_call_with_activity(
                                 );
                             }
                         };
-                        if !shell_approval_reply_is_grant(&reply) {
-                            return ToolExecutionFinished::error(
-                                ToolErrorCode::PolicyDenied,
-                                "Edit not approved by user; mutation skipped.",
-                            );
+                        match classify_approval_reply(&reply) {
+                            ApprovalReply::Grant => {}
+                            ApprovalReply::AlwaysThisRun => {
+                                remember_approval_grant(grant_key).await;
+                            }
+                            ApprovalReply::Abort => {
+                                if let Some(token) = cancel_owned.as_ref() {
+                                    token.cancel();
+                                }
+                                return ToolExecutionFinished::error(
+                                    ToolErrorCode::PolicyDenied,
+                                    "Edit approval aborted by user; mutation skipped.",
+                                );
+                            }
+                            ApprovalReply::Deny => {
+                                return ToolExecutionFinished::error(
+                                    ToolErrorCode::PolicyDenied,
+                                    "Edit not approved by user; mutation skipped.",
+                                );
+                            }
                         }
+                        } // end if !already_granted
                         approved_mutation_preview = Some(preview);
                     }
                 }
@@ -1612,7 +1746,7 @@ fn spawn_main_chat_reasoning_turn(
         let _ = logger_tx.send(BusMessage::Log(
             LogEvent::debug(
                 &agent_name,
-                &format!("Spawning reasoning task for chat_id: {}", task_chat_id),
+                &format!("Spawning reasoning task for chat_id: {task_chat_id}"),
             )
             .with_chat_id(&task_chat_id),
         ));
@@ -1704,8 +1838,7 @@ fn spawn_main_chat_reasoning_turn(
                     LogEvent::info(
                         &agent_name,
                         &format!(
-                            "Reasoning task for chat_id {} finished via cancellation.",
-                            task_chat_id
+                            "Reasoning task for chat_id {task_chat_id} finished via cancellation."
                         ),
                     )
                     .with_chat_id(&task_chat_id),
@@ -1716,8 +1849,7 @@ fn spawn_main_chat_reasoning_turn(
                     LogEvent::debug(
                         &agent_name,
                         &format!(
-                            "Reasoning task for chat_id {} finished successfully.",
-                            task_chat_id
+                            "Reasoning task for chat_id {task_chat_id} finished successfully."
                         ),
                     )
                     .with_chat_id(&task_chat_id),
@@ -1728,7 +1860,7 @@ fn spawn_main_chat_reasoning_turn(
                 let _ = logger_tx.send(BusMessage::Log(
                     LogEvent::error(
                         "AgentLogic",
-                        &format!("Reasoning loop panicked for chat_id {}", task_chat_id),
+                        &format!("Reasoning loop panicked for chat_id {task_chat_id}"),
                     )
                     .with_chat_id(&task_chat_id),
                 ));
@@ -1873,7 +2005,7 @@ fn spawn_main_chat_reasoning_turn(
                     let _ = logger_tx.send(BusMessage::Log(
                         LogEvent::error(
                             "AgentLogic",
-                            &format!("Dropping queued inbound without valid run ID: {}", error),
+                            &format!("Dropping queued inbound without valid run ID: {error}"),
                         )
                         .with_chat_id(&task_chat_id),
                     ));
@@ -2274,8 +2406,7 @@ impl AgentLogic {
                 LogEvent::warn(
                     &self.name,
                     &format!(
-                        "Ignored cancellation for chat_id {} because run_id did not match the active run.",
-                        chat_id
+                        "Ignored cancellation for chat_id {chat_id} because run_id did not match the active run."
                     ),
                 )
                 .with_chat_id(chat_id),
@@ -2292,7 +2423,7 @@ impl AgentLogic {
         let _ = self.logger_tx.send(BusMessage::Log(
             LogEvent::info(
                 &self.name,
-                &format!("Cancelled reasoning loop for chat_id: {}", chat_id),
+                &format!("Cancelled reasoning loop for chat_id: {chat_id}"),
             )
             .with_chat_id(chat_id),
         ));
@@ -2365,8 +2496,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                 let _ = self.logger_tx.send(BusMessage::Log(LogEvent::info(
                     &self.name,
                     &format!(
-                        "Switched to provider={} model={}",
-                        provider_name, model_name
+                        "Switched to provider={provider_name} model={model_name}"
                     ),
                 )));
                 return Ok(None);
@@ -2396,7 +2526,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                         Err(e) => {
                             let _ = logger_tx.send(BusMessage::Log(LogEvent::error(
                                 &name,
-                                &format!("Failed to install skills from {}: {}", repo_url, e),
+                                &format!("Failed to install skills from {repo_url}: {e}"),
                             )));
                         }
                     }
@@ -2410,7 +2540,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                         let _ = self.logger_tx.send(BusMessage::Log(
                             LogEvent::error(
                                 &self.name,
-                                &format!("Rejecting inbound message: {}", error),
+                                &format!("Rejecting inbound message: {error}"),
                             )
                             .with_chat_id(&inbound.chat_id),
                         ));
@@ -2502,8 +2632,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                         LogEvent::debug(
                             &self.name,
                             &format!(
-                                "Queued inbound for chat_id {} (FIFO) — reasoning already active.",
-                                chat_id
+                                "Queued inbound for chat_id {chat_id} (FIFO) — reasoning already active."
                             ),
                         )
                         .with_chat_id(&chat_id),
@@ -2546,8 +2675,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                     let _ = self.logger_tx.send(BusMessage::Log(LogEvent::warn(
                         &self.name,
                         &format!(
-                            "TriggerCompaction dropped for session_key={}: {}",
-                            session_key, e
+                            "TriggerCompaction dropped for session_key={session_key}: {e}"
                         ),
                     )));
                 }
@@ -2609,16 +2737,14 @@ impl AgentLogic {
             .nth(1)
             .ok_or_else(|| {
                 format!(
-                    "Malformed session_key (expected `channel:chat_id:thread`): {}",
-                    session_key
+                    "Malformed session_key (expected `channel:chat_id:thread`): {session_key}"
                 )
             })?
             .to_string();
 
         if self.cancellation_tokens.contains_key(&chat_id) {
             return Err(format!(
-                "Refusing manual compaction: reasoning turn in flight for chat_id={}",
-                chat_id
+                "Refusing manual compaction: reasoning turn in flight for chat_id={chat_id}"
             ));
         }
 
@@ -2626,11 +2752,11 @@ impl AgentLogic {
             .session_manager
             .get_session(&session_key)
             .await
-            .map_err(|e| format!("get_session({}): {}", session_key, e))?;
+            .map_err(|e| format!("get_session({session_key}): {e}"))?;
         let current_context = mem
             .get_context_since_reflection()
             .await
-            .map_err(|e| format!("get_context_since_reflection({}): {}", session_key, e))?;
+            .map_err(|e| format!("get_context_since_reflection({session_key}): {e}"))?;
         let user_turns = current_context.iter().filter(|m| m.role == "user").count();
         let approx_tokens: usize = estimate_context_tokens(&current_context);
 
@@ -2639,7 +2765,7 @@ impl AgentLogic {
         let prefix = {
             let mut parts = session_key.splitn(3, ':');
             let channel = parts.next().unwrap_or("");
-            format!("{}:{}", channel, chat_id)
+            format!("{channel}:{chat_id}")
         };
         let recent = self
             .session_manager
@@ -2851,11 +2977,11 @@ impl AgentLogic {
                 reply: SharedReply::new(tx),
             })
             .await
-            .map_err(|e| format!("Memory actor error: {}", e))?;
+            .map_err(|e| format!("Memory actor error: {e}"))?;
 
         rx.await
             .map_err(|_| "Memory actor channel closed".to_string())?
-            .map_err(|e| format!("Memory node failed to resolve ticket fully: {}", e))?;
+            .map_err(|e| format!("Memory node failed to resolve ticket fully: {e}"))?;
 
         // 2. Inject tool response into memory
         if let Some(id) = tool_call_id {
@@ -2881,9 +3007,9 @@ impl AgentLogic {
                     tool_name_for_resume.as_deref(),
                 ))
                 .await
-                .map_err(|e| format!("Failed to inject tool response into memory: {}", e))?;
+                .map_err(|e| format!("Failed to inject tool response into memory: {e}"))?;
             } else {
-                return Err(format!("Failed to get session {}", session_key));
+                return Err(format!("Failed to get session {session_key}"));
             }
         }
 
@@ -3493,7 +3619,7 @@ impl AgentLogic {
         let thread_info = inbound
             .thread_id
             .as_deref()
-            .map(|t| format!(", thread: '{}'", t))
+            .map(|t| format!(", thread: '{t}'"))
             .unwrap_or_default();
         let now = chrono::Local::now().to_rfc3339();
         let os_family = std::env::consts::OS;
@@ -3535,7 +3661,7 @@ impl AgentLogic {
         if let Some(v) = inbound.metadata.get("isanagent_autonomous_until") {
             if let Some(s) = v.as_str() {
                 runtime_context
-                    .push_str(&format!(" Autonomous session deadline (RFC3339): '{}'.", s));
+                    .push_str(&format!(" Autonomous session deadline (RFC3339): '{s}'."));
             }
         }
         if forbid_final_effective {
@@ -3566,7 +3692,7 @@ impl AgentLogic {
                         return Err(ReasoningLoopError::protocol(msg));
                     }
                     UserPromptHookOutcome::InjectPrefix(prefix) => {
-                        contextualized_content = format!("{}\n{}", prefix, contextualized_content);
+                        contextualized_content = format!("{prefix}\n{contextualized_content}");
                     }
                     UserPromptHookOutcome::Proceed => {}
                 }
@@ -3652,7 +3778,7 @@ impl AgentLogic {
             let _ = logger_tx.send(BusMessage::Log(
                 LogEvent::debug(
                     &name,
-                    &format!("Iteration {}/{}", iterations, max_iterations),
+                    &format!("Iteration {iterations}/{max_iterations}"),
                 )
                 .with_chat_id(&inbound.chat_id),
             ));
@@ -3786,8 +3912,7 @@ impl AgentLogic {
                 String::new()
             };
             let iteration_line = format!(
-                "\n--- Reasoning budget ---\nYou are on tool/LLM step {} of {} for this user turn.\n",
-                iterations, max_iterations
+                "\n--- Reasoning budget ---\nYou are on tool/LLM step {iterations} of {max_iterations} for this user turn.\n"
             );
             let autonomy_line = if forbid_final_effective {
                 "\n--- Autonomy ---\nDo not finish this step with assistant text only — call tools (or `ask_user` if blocked). If you believe you are done, still run a verification tool (e.g. read_file or execution_env_info) when appropriate.\n"
@@ -3824,8 +3949,7 @@ impl AgentLogic {
                                 LogEvent::warn(
                                     &name,
                                     &format!(
-                                        "Doom loop still active after {} consecutive detections — stopping the run.",
-                                        consecutive_doom_detections
+                                        "Doom loop still active after {consecutive_doom_detections} consecutive detections — stopping the run."
                                     ),
                                 )
                                 .with_chat_id(&inbound.chat_id),
@@ -4271,9 +4395,7 @@ impl AgentLogic {
                             let code = tool_result
                                 .error_code()
                                 .unwrap_or(ToolErrorCode::ExecutionFailed);
-                            budget.record_tool_failure(typed_failure_key(
-                                &tool_name, code, &intent,
-                            ))
+                            budget.record_tool_failure(typed_failure_key(&tool_name, code, &intent))
                         } else {
                             budget.record_tool_success(intent)
                         };
@@ -4394,15 +4516,12 @@ impl AgentLogic {
                         };
 
                         let is_error = tool_result.is_error();
-                        let intent =
-                            tool_intent_signature(tool_name, &tc.function.arguments);
+                        let intent = tool_intent_signature(tool_name, &tc.function.arguments);
                         let budget_decision = if is_error {
                             let code = tool_result
                                 .error_code()
                                 .unwrap_or(ToolErrorCode::ExecutionFailed);
-                            budget.record_tool_failure(typed_failure_key(
-                                tool_name, code, &intent,
-                            ))
+                            budget.record_tool_failure(typed_failure_key(tool_name, code, &intent))
                         } else {
                             budget.record_tool_success(intent)
                         };

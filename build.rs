@@ -42,7 +42,7 @@ fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) {
     });
 
     for entry in entries {
-        let entry = entry.unwrap_or_else(|error| panic!("Failed to read UI dist entry: {}", error));
+        let entry = entry.unwrap_or_else(|error| panic!("Failed to read UI dist entry: {error}"));
         let path = entry.path();
         if path.is_dir() {
             collect_files(&path, files);
@@ -60,7 +60,7 @@ fn build_embedded_assets_module(ui_dist_dir: &Path, files: &[PathBuf]) -> String
     for file in files {
         let relative = file
             .strip_prefix(ui_dist_dir)
-            .unwrap_or_else(|error| panic!("Failed to strip UI dist prefix: {}", error))
+            .unwrap_or_else(|error| panic!("Failed to strip UI dist prefix: {error}"))
             .to_string_lossy()
             .replace('\\', "/");
         let absolute = escape_rust_string(&file.to_string_lossy());
@@ -68,8 +68,7 @@ fn build_embedded_assets_module(ui_dist_dir: &Path, files: &[PathBuf]) -> String
         let content_type = mime_type_for_path(file);
 
         generated.push_str(&format!(
-            "    EmbeddedUiAsset {{ path: \"{}\", bytes: include_bytes!(\"{}\"), content_type: \"{}\" }},\n",
-            path, absolute, content_type
+            "    EmbeddedUiAsset {{ path: \"{path}\", bytes: include_bytes!(\"{absolute}\"), content_type: \"{content_type}\" }},\n"
         ));
     }
 

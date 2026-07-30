@@ -186,7 +186,7 @@ fn normalize_custom_base_url(input: &str) -> Result<String, String> {
     if base.ends_with("/chat/completions") {
         return Ok(base.to_string());
     }
-    Ok(format!("{}/chat/completions", base))
+    Ok(format!("{base}/chat/completions"))
 }
 
 async fn fetch_model_ids(
@@ -197,26 +197,26 @@ async fn fetch_model_ids(
     let url = models_endpoint_url(chat_url);
     let res = client
         .get(&url)
-        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Authorization", format!("Bearer {api_key}"))
         .timeout(Duration::from_secs(60))
         .send()
         .await
-        .map_err(|e| format!("HTTP error: {}", e))?;
+        .map_err(|e| format!("HTTP error: {e}"))?;
     let status = res.status();
     if !status.is_success() {
         let body = res
             .text()
             .await
-            .map_err(|e| format!("Failed to read response body: {}", e))?;
+            .map_err(|e| format!("Failed to read response body: {e}"))?;
         return Err(format!(
             "List models failed ({}): {}",
             status,
             body.chars().take(500).collect::<String>()
         ));
     }
-    let text = res.text().await.map_err(|e| format!("Read body: {}", e))?;
+    let text = res.text().await.map_err(|e| format!("Read body: {e}"))?;
     let parsed: ModelsListResponse =
-        serde_json::from_str(&text).map_err(|e| format!("Invalid JSON from /models: {}", e))?;
+        serde_json::from_str(&text).map_err(|e| format!("Invalid JSON from /models: {e}"))?;
     let mut ids: Vec<String> = if !parsed.data.is_empty() {
         parsed.data.into_iter().map(|m| m.id).collect()
     } else {
@@ -318,11 +318,11 @@ struct TerminalUiGuard;
 
 impl TerminalUiGuard {
     fn enter() -> Result<Self, String> {
-        enable_raw_mode().map_err(|e| format!("enable_raw_mode: {}", e))?;
+        enable_raw_mode().map_err(|e| format!("enable_raw_mode: {e}"))?;
         let mut stdout = stdout();
         if let Err(e) = execute!(stdout, EnterAlternateScreen) {
             let _ = disable_raw_mode();
-            return Err(format!("EnterAlternateScreen: {}", e));
+            return Err(format!("EnterAlternateScreen: {e}"));
         }
         Ok(Self)
     }
@@ -343,7 +343,7 @@ pub fn run_interactive_collect(handle: &Handle) -> Result<InteractiveOnboardOutc
 
 fn run_ui_loop(handle: &Handle) -> Result<InteractiveOnboardOutcome, String> {
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))
-        .map_err(|e| format!("terminal: {}", e))?;
+        .map_err(|e| format!("terminal: {e}"))?;
 
     let client = crate::utils::build_reqwest_client();
     let mut state = UiState::new();
@@ -351,7 +351,7 @@ fn run_ui_loop(handle: &Handle) -> Result<InteractiveOnboardOutcome, String> {
     loop {
         terminal
             .draw(|f| render(f, &state))
-            .map_err(|e| format!("draw: {}", e))?;
+            .map_err(|e| format!("draw: {e}"))?;
 
         if matches!(state.step, Step::FetchingModels) {
             let rx = match state.fetch_rx.take() {
@@ -367,7 +367,7 @@ fn run_ui_loop(handle: &Handle) -> Result<InteractiveOnboardOutcome, String> {
             loop {
                 terminal
                     .draw(|f| render(f, &state))
-                    .map_err(|e| format!("draw: {}", e))?;
+                    .map_err(|e| format!("draw: {e}"))?;
                 match rx.try_recv() {
                     Ok(Ok(models)) => {
                         state.step = Step::PickModel {
@@ -390,9 +390,9 @@ fn run_ui_loop(handle: &Handle) -> Result<InteractiveOnboardOutcome, String> {
                     Err(mpsc::TryRecvError::Empty) => {}
                 }
                 if event::poll(Duration::from_millis(50))
-                    .map_err(|e| format!("event poll: {}", e))?
+                    .map_err(|e| format!("event poll: {e}"))?
                 {
-                    let evt = event::read().map_err(|e| format!("event: {}", e))?;
+                    let evt = event::read().map_err(|e| format!("event: {e}"))?;
                     if let Event::Key(key) = evt {
                         if key.kind == KeyEventKind::Release {
                             continue;
@@ -410,7 +410,7 @@ fn run_ui_loop(handle: &Handle) -> Result<InteractiveOnboardOutcome, String> {
             continue;
         }
 
-        let evt = event::read().map_err(|e| format!("event: {}", e))?;
+        let evt = event::read().map_err(|e| format!("event: {e}"))?;
         let Event::Key(key) = evt else {
             continue;
         };
@@ -532,8 +532,7 @@ fn run_ui_loop(handle: &Handle) -> Result<InteractiveOnboardOutcome, String> {
                                     Ok(k) => k,
                                     Err(_) => {
                                         let _ = tx.send(Err(format!(
-                                            "Environment variable `{}` is not set.",
-                                            env_name
+                                            "Environment variable `{env_name}` is not set."
                                         )));
                                         return;
                                     }
@@ -547,8 +546,7 @@ fn run_ui_loop(handle: &Handle) -> Result<InteractiveOnboardOutcome, String> {
                         }
                         Err(_) => {
                             state.api_key_env_error = Some(format!(
-                                "`{}` is not set in this process. Export it first, then press Enter.",
-                                trimmed
+                                "`{trimmed}` is not set in this process. Export it first, then press Enter."
                             ));
                         }
                     }
@@ -583,7 +581,7 @@ fn run_ui_loop(handle: &Handle) -> Result<InteractiveOnboardOutcome, String> {
                 selected,
                 page,
             } => {
-                let size = terminal.size().map_err(|e| format!("size: {}", e))?;
+                let size = terminal.size().map_err(|e| format!("size: {e}"))?;
                 let area = Rect::new(0, 0, size.width, size.height);
                 let block = centered_rect(area, 85, 80);
                 let inner_h = block.height.saturating_sub(4) as usize;
@@ -653,7 +651,7 @@ fn run_ui_loop(handle: &Handle) -> Result<InteractiveOnboardOutcome, String> {
                 page,
                 values,
             } => {
-                let size = terminal.size().map_err(|e| format!("size: {}", e))?;
+                let size = terminal.size().map_err(|e| format!("size: {e}"))?;
                 let area = Rect::new(0, 0, size.width, size.height);
                 let block = centered_rect(area, 85, 80);
                 let inner_h = block.height.saturating_sub(4) as usize;
@@ -768,7 +766,7 @@ fn render(frame: &mut Frame, state: &UiState) {
             let err_line = state
                 .custom_url_error
                 .as_ref()
-                .map(|e| Line::from(format!("Error: {}", e)).style(Style::default().fg(Color::Red)))
+                .map(|e| Line::from(format!("Error: {e}")).style(Style::default().fg(Color::Red)))
                 .unwrap_or_else(|| Line::from(""));
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
@@ -796,7 +794,7 @@ fn render(frame: &mut Frame, state: &UiState) {
             let err_line = state
                 .api_key_env_error
                 .as_ref()
-                .map(|e| Line::from(format!("Error: {}", e)).style(Style::default().fg(Color::Red)))
+                .map(|e| Line::from(format!("Error: {e}")).style(Style::default().fg(Color::Red)))
                 .unwrap_or_else(|| Line::from(""));
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
@@ -834,8 +832,7 @@ fn render(frame: &mut Frame, state: &UiState) {
         }
         Step::FetchError { message } => {
             let p = Paragraph::new(format!(
-                "{}\n\nPress Enter, r, or ← to edit the env var name again. Esc quit.",
-                message
+                "{message}\n\nPress Enter, r, or ← to edit the env var name again. Esc quit."
             ))
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: true })

@@ -157,7 +157,7 @@ impl SlackRuntimeState {
         let auth_res = self
             .client
             .post(self.api_url("auth.test"))
-            .header("Authorization", format!("Bearer {}", bot_token))
+            .header("Authorization", format!("Bearer {bot_token}"))
             .send()
             .await;
 
@@ -171,7 +171,7 @@ impl SlackRuntimeState {
                             &self.logger_tx,
                             LogEvent::info(
                                 "SlackChannel",
-                                &format!("Slack bot connected as {}", uid),
+                                &format!("Slack bot connected as {uid}"),
                             ),
                         );
                         return Some(uid);
@@ -182,7 +182,7 @@ impl SlackRuntimeState {
                         &self.logger_tx,
                         LogEvent::warn(
                             "SlackChannel",
-                            &format!("Slack auth.test failed: {:?}", json),
+                            &format!("Slack auth.test failed: {json:?}"),
                         ),
                     );
                 }
@@ -191,7 +191,7 @@ impl SlackRuntimeState {
                         &self.logger_tx,
                         LogEvent::warn(
                             "SlackChannel",
-                            &format!("Failed to decode Slack auth.test response: {}", e),
+                            &format!("Failed to decode Slack auth.test response: {e}"),
                         ),
                     );
                 }
@@ -201,7 +201,7 @@ impl SlackRuntimeState {
                     &self.logger_tx,
                     LogEvent::warn(
                         "SlackChannel",
-                        &format!("Failed to request Slack auth.test: {}", e),
+                        &format!("Failed to request Slack auth.test: {e}"),
                     ),
                 );
             }
@@ -269,8 +269,7 @@ impl SlackRuntimeState {
             }
             Ok(None) => {}
             Err(e) => warn!(
-                "Failed to load cached Slack user profile for {}: {}",
-                user, e
+                "Failed to load cached Slack user profile for {user}: {e}"
             ),
         }
 
@@ -288,11 +287,11 @@ impl SlackRuntimeState {
     }
 
     async fn fetch_display_name_from_slack(&self, user: &str, bot_token: &str) -> Option<String> {
-        let info_url = self.api_url(&format!("users.info?user={}", user));
+        let info_url = self.api_url(&format!("users.info?user={user}"));
         let info_res = self
             .client
             .get(info_url)
-            .header("Authorization", format!("Bearer {}", bot_token))
+            .header("Authorization", format!("Bearer {bot_token}"))
             .send()
             .await;
 
@@ -302,9 +301,9 @@ impl SlackRuntimeState {
                     return slack_profile_display_name(&json);
                 }
                 Ok(_) => {}
-                Err(e) => warn!("Failed to decode Slack users.info response: {}", e),
+                Err(e) => warn!("Failed to decode Slack users.info response: {e}"),
             },
-            Err(e) => warn!("Failed to fetch Slack user profile for {}: {}", user, e),
+            Err(e) => warn!("Failed to fetch Slack user profile for {user}: {e}"),
         }
 
         None
@@ -325,7 +324,7 @@ impl SlackRuntimeState {
             )
             .await
         {
-            warn!("Failed to persist Slack user profile for {}: {}", user, e);
+            warn!("Failed to persist Slack user profile for {user}: {e}");
         }
     }
 
@@ -348,12 +347,12 @@ impl SlackRuntimeState {
         match self
             .client
             .get(url)
-            .header("Authorization", format!("Bearer {}", bot_token))
+            .header("Authorization", format!("Bearer {bot_token}"))
             .send()
             .await
         {
             Err(e) => {
-                warn!("Failed to download Slack file {}: {}", url, e);
+                warn!("Failed to download Slack file {url}: {e}");
                 None
             }
             Ok(response) => {
@@ -367,12 +366,12 @@ impl SlackRuntimeState {
                 }
                 match response.bytes().await {
                     Err(e) => {
-                        warn!("Failed to read Slack file bytes from {}: {}", url, e);
+                        warn!("Failed to read Slack file bytes from {url}: {e}");
                         None
                     }
                     Ok(bytes) => {
                         let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                        let data_uri = format!("data:{};base64,{}", mime, encoded);
+                        let data_uri = format!("data:{mime};base64,{encoded}");
                         Some(ContentPart::ImageUrl {
                             image_url: ImageUrl {
                                 url: data_uri,
@@ -431,7 +430,7 @@ impl SlackRuntimeState {
         let reaction = dispatch.reaction.clone();
         let chat_id = dispatch.inbound.chat_id.clone();
         if let Err(e) = bus_tx.send(BusMessage::Inbound(dispatch.inbound)).await {
-            warn!("Failed to route InboundMessage from Slack: {}", e);
+            warn!("Failed to route InboundMessage from Slack: {e}");
             return;
         }
 
@@ -458,7 +457,7 @@ impl SlackRuntimeState {
 
             match client
                 .post(api_url)
-                .header("Authorization", format!("Bearer {}", bot_token))
+                .header("Authorization", format!("Bearer {bot_token}"))
                 .json(&body)
                 .send()
                 .await
@@ -469,10 +468,10 @@ impl SlackRuntimeState {
                     if let Err(err) =
                         validate_simple_slack_api_response("Slack reaction", status, &body)
                     {
-                        warn!("{}", err);
+                        warn!("{err}");
                     }
                 }
-                Err(e) => warn!("Network error adding Slack emoji reaction: {}", e),
+                Err(e) => warn!("Network error adding Slack emoji reaction: {e}"),
             }
         });
     }
@@ -594,15 +593,15 @@ impl Channel for SlackChannel {
                 port,
                 path,
             } => {
-                let addr = format!("0.0.0.0:{}", port);
+                let addr = format!("0.0.0.0:{port}");
                 let listener = tokio::net::TcpListener::bind(&addr)
                     .await
-                    .map_err(|e| format!("Failed to bind Slack webhook port on {}: {}", addr, e))?;
+                    .map_err(|e| format!("Failed to bind Slack webhook port on {addr}: {e}"))?;
                 log_slack(
                     &self.shared.logger_tx,
                     LogEvent::info(
                         "SlackChannel",
-                        &format!("Slack webhook listening on http://{}{}", addr, path),
+                        &format!("Slack webhook listening on http://{addr}{path}"),
                     ),
                 );
 
@@ -624,7 +623,7 @@ impl Channel for SlackChannel {
                         }
                     });
                     if let Err(e) = server.await {
-                        error!("Slack webhook server crashed: {}", e);
+                        error!("Slack webhook server crashed: {e}");
                     }
                 });
                 self.store_task_handle(handle).await?;
@@ -662,7 +661,7 @@ impl Channel for SlackChannel {
             async move {
                 let response = client
                     .post(api_url)
-                    .header("Authorization", format!("Bearer {}", bot_token))
+                    .header("Authorization", format!("Bearer {bot_token}"))
                     .json(&body)
                     .send()
                     .await
@@ -735,8 +734,7 @@ where
             },
             Err(e) => {
                 error!(
-                    "Slack postMessage network error (attempt {}): {}",
-                    attempt, e
+                    "Slack postMessage network error (attempt {attempt}): {e}"
                 );
                 if attempt < max_retries {
                     tokio::time::sleep(backoff).await;
@@ -747,7 +745,7 @@ where
         }
     }
 
-    error!("Slack send failed after {} attempts.", max_retries);
+    error!("Slack send failed after {max_retries} attempts.");
     Err("Slack send max retries exceeded".to_string())
 }
 
@@ -783,12 +781,11 @@ fn classify_post_message_response(response: SlackHttpResponse) -> SlackSendDecis
             let err = api_response
                 .error
                 .unwrap_or_else(|| "unknown_error".to_string());
-            error!("Slack postMessage failed with ok=false: {}", err);
-            SlackSendDecision::Fatal(format!("Slack API returned ok=false: {}", err))
+            error!("Slack postMessage failed with ok=false: {err}");
+            SlackSendDecision::Fatal(format!("Slack API returned ok=false: {err}"))
         }
         Err(e) => SlackSendDecision::Fatal(format!(
-            "Failed to decode Slack postMessage response: {}",
-            e
+            "Failed to decode Slack postMessage response: {e}"
         )),
     }
 }
@@ -800,13 +797,12 @@ fn validate_simple_slack_api_response(
 ) -> Result<(), String> {
     if !status.is_success() {
         return Err(format!(
-            "{} failed with status {}: {}",
-            action, status, body
+            "{action} failed with status {status}: {body}"
         ));
     }
 
     let api_response = serde_json::from_str::<SlackApiResponse>(body)
-        .map_err(|e| format!("Failed to decode {} response: {}", action, e))?;
+        .map_err(|e| format!("Failed to decode {action} response: {e}"))?;
     if api_response.ok {
         return Ok(());
     }
@@ -839,14 +835,14 @@ async fn handle_slack_webhook(
         now,
         state.timestamp_tolerance_secs,
     ) {
-        warn!("Slack webhook signature verification failed: {}", err);
+        warn!("Slack webhook signature verification failed: {err}");
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
     let payload: Value = match serde_json::from_slice(body.as_ref()) {
         Ok(payload) => payload,
         Err(e) => {
-            warn!("Failed to parse Slack webhook payload: {}", e);
+            warn!("Failed to parse Slack webhook payload: {e}");
             return StatusCode::BAD_REQUEST.into_response();
         }
     };
@@ -908,7 +904,7 @@ async fn run_socket_mode(
         let res = shared
             .client
             .post(shared.api_url("apps.connections.open"))
-            .header("Authorization", format!("Bearer {}", app_token))
+            .header("Authorization", format!("Bearer {app_token}"))
             .header("Content-type", "application/x-www-form-urlencoded")
             .send()
             .await;
@@ -923,7 +919,7 @@ async fn run_socket_mode(
                         &shared.logger_tx,
                         LogEvent::error(
                             "SlackChannel",
-                            &format!("Slack apps.connections.open failed: {:?}", json),
+                            &format!("Slack apps.connections.open failed: {json:?}"),
                         ),
                     );
                     if wait_for_shutdown_or_timeout(shutdown_rx, Duration::from_secs(backoff_secs))
@@ -939,7 +935,7 @@ async fn run_socket_mode(
                         &shared.logger_tx,
                         LogEvent::error(
                             "SlackChannel",
-                            &format!("Failed to parse Slack response: {}", e),
+                            &format!("Failed to parse Slack response: {e}"),
                         ),
                     );
                     if wait_for_shutdown_or_timeout(shutdown_rx, Duration::from_secs(backoff_secs))
@@ -956,7 +952,7 @@ async fn run_socket_mode(
                     &shared.logger_tx,
                     LogEvent::error(
                         "SlackChannel",
-                        &format!("Failed to request Slack websockets URL: {}", e),
+                        &format!("Failed to request Slack websockets URL: {e}"),
                     ),
                 );
                 if wait_for_shutdown_or_timeout(shutdown_rx, Duration::from_secs(backoff_secs))
@@ -983,7 +979,7 @@ async fn run_socket_mode(
                     &shared.logger_tx,
                     LogEvent::error(
                         "SlackChannel",
-                        &format!("WebSocket connection failed: {}", e),
+                        &format!("WebSocket connection failed: {e}"),
                     ),
                 );
                 if wait_for_shutdown_or_timeout(shutdown_rx, Duration::from_secs(backoff_secs))
@@ -1020,7 +1016,7 @@ async fn run_socket_mode(
             let msg = match msg {
                 Ok(m) => m,
                 Err(e) => {
-                    error!("Slack websocket read error: {}", e);
+                    error!("Slack websocket read error: {e}");
                     break;
                 }
             };
@@ -1033,7 +1029,7 @@ async fn run_socket_mode(
                 if let Some(envelope_id) = payload.get("envelope_id").and_then(Value::as_str) {
                     let ack = json!({ "envelope_id": envelope_id });
                     if let Err(e) = write.send(Message::Text(ack.to_string().into())).await {
-                        error!("Failed to ack Slack envelope: {}", e);
+                        error!("Failed to ack Slack envelope: {e}");
                     }
                 }
 
@@ -1054,8 +1050,7 @@ async fn run_socket_mode(
         }
 
         warn!(
-            "Slack Socket Mode disconnected. Reconnecting in {} seconds...",
-            backoff_secs
+            "Slack Socket Mode disconnected. Reconnecting in {backoff_secs} seconds..."
         );
         if wait_for_shutdown_or_timeout(shutdown_rx, Duration::from_secs(backoff_secs)).await {
             break;
@@ -1120,7 +1115,7 @@ fn normalize_slack_event(
     }
 
     let stripped_text = strip_bot_mention(&text, bot_user_id);
-    let payload_text = format!("(Slack User: {}) {}", display_name, stripped_text)
+    let payload_text = format!("(Slack User: {display_name}) {stripped_text}")
         .trim()
         .to_string();
 
@@ -1202,7 +1197,7 @@ fn strip_bot_mention(text: &str, bot_user_id: Option<&str>) -> String {
 fn normalize_webhook_path(path: Option<&str>) -> String {
     match path.map(str::trim).filter(|value| !value.is_empty()) {
         Some(path) if path.starts_with('/') => path.to_string(),
-        Some(path) => format!("/{}", path),
+        Some(path) => format!("/{path}"),
         None => DEFAULT_WEBHOOK_PATH.to_string(),
     }
 }
@@ -1244,7 +1239,7 @@ fn verify_slack_signature(
 
     let mut mac = HmacSha256::new_from_slice(signing_secret.as_bytes())
         .map_err(|_| "invalid_signing_secret")?;
-    mac.update(format!("v0:{}:", timestamp).as_bytes());
+    mac.update(format!("v0:{timestamp}:").as_bytes());
     mac.update(body);
     mac.verify_slice(&provided).map_err(|_| "invalid_signature")
 }

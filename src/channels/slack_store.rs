@@ -34,25 +34,22 @@ struct SqliteSlackUserProfileStoreActor {
 impl SqliteSlackUserProfileStoreActor {
     fn new(db_path: impl AsRef<Path>) -> Result<Self, String> {
         let conn = Connection::open(db_path)
-            .map_err(|e| format!("Failed to open Slack user profile store: {}", e))?;
+            .map_err(|e| format!("Failed to open Slack user profile store: {e}"))?;
         conn.busy_timeout(Duration::from_secs(5)).map_err(|e| {
             format!(
-                "Failed to configure Slack user profile store busy timeout: {}",
-                e
+                "Failed to configure Slack user profile store busy timeout: {e}"
             )
         })?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| {
                 format!(
-                    "Failed to enable WAL mode for Slack user profile store: {}",
-                    e
+                    "Failed to enable WAL mode for Slack user profile store: {e}"
                 )
             })?;
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(|e| {
                 format!(
-                    "Failed to tune Slack user profile store synchronous mode: {}",
-                    e
+                    "Failed to tune Slack user profile store synchronous mode: {e}"
                 )
             })?;
         conn.execute(
@@ -63,7 +60,7 @@ impl SqliteSlackUserProfileStoreActor {
             )",
             [],
         )
-        .map_err(|e| format!("Failed to initialize slack_user_profiles table: {}", e))?;
+        .map_err(|e| format!("Failed to initialize slack_user_profiles table: {e}"))?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_slack_user_profiles_fetched_at
              ON slack_user_profiles(fetched_at_unix_secs)",
@@ -71,8 +68,7 @@ impl SqliteSlackUserProfileStoreActor {
         )
         .map_err(|e| {
             format!(
-                "Failed to initialize slack_user_profiles fetched_at index: {}",
-                e
+                "Failed to initialize slack_user_profiles fetched_at index: {e}"
             )
         })?;
 
@@ -106,7 +102,7 @@ impl ActorLogic<SlackUserStoreMessage> for SqliteSlackUserProfileStoreActor {
                             fetched_at_unix_secs = excluded.fetched_at_unix_secs",
                         params![user_id, stored.display_name, stored.fetched_at_unix_secs],
                     )
-                    .map_err(|e| format!("Failed to persist Slack user profile: {}", e))
+                    .map_err(|e| format!("Failed to persist Slack user profile: {e}"))
                     .map(|_| ());
                 let _ = reply.send(result);
             }
@@ -126,7 +122,7 @@ impl ActorLogic<SlackUserStoreMessage> for SqliteSlackUserProfileStoreActor {
                         },
                     )
                     .optional()
-                    .map_err(|e| format!("Failed to load Slack user profile: {}", e));
+                    .map_err(|e| format!("Failed to load Slack user profile: {e}"));
                 let _ = reply.send(result);
             }
         }
@@ -160,7 +156,7 @@ impl SlackUserProfileStore {
         self.node
             .send_packet(msg)
             .await
-            .map_err(|e| format!("Failed to send Slack user profile upsert request: {}", e))?;
+            .map_err(|e| format!("Failed to send Slack user profile upsert request: {e}"))?;
         rx.await
             .map_err(|_| "Slack user profile store actor channel closed".to_string())?
     }
@@ -177,7 +173,7 @@ impl SlackUserProfileStore {
         self.node
             .send_packet(msg)
             .await
-            .map_err(|e| format!("Failed to send Slack user profile get request: {}", e))?;
+            .map_err(|e| format!("Failed to send Slack user profile get request: {e}"))?;
         rx.await
             .map_err(|_| "Slack user profile store actor channel closed".to_string())?
     }
