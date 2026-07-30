@@ -634,7 +634,10 @@ fn outbound_to_cell(msg: &OutboundMessage) -> Cell {
         let edit_diff = msg.metadata.get("edit_diff").and_then(|v| {
             let file = v.get("file")?.as_str()?.to_string();
             let diff = v.get("diff")?.as_str()?.to_string();
-            let truncated = v.get("truncated").and_then(|t| t.as_bool()).unwrap_or(false);
+            let truncated = v
+                .get("truncated")
+                .and_then(|t| t.as_bool())
+                .unwrap_or(false);
             Some(crate::channels::terminal_ui::EditDiffPayload {
                 file,
                 diff,
@@ -998,20 +1001,14 @@ fn build_title_line(max_width: usize, app: &App) -> Line<'static> {
             Span::styled(" · ", dim),
             Span::styled(model, Theme::active()),
         ],
-        vec![
-            Span::styled(" · ", dim),
-            Span::styled(permission, dim),
-        ],
+        vec![Span::styled(" · ", dim), Span::styled(permission, dim)],
         vec![
             Span::styled(" · ", dim),
             Span::styled(format!("session {session}"), dim),
         ],
     ];
     if !uses_ansi_color() {
-        groups.push(vec![
-            Span::styled(" · ", dim),
-            Span::styled("[plain]", dim),
-        ]);
+        groups.push(vec![Span::styled(" · ", dim), Span::styled("[plain]", dim)]);
     }
     line_from_chunk_groups(groups, max_width)
 }
@@ -1057,7 +1054,10 @@ fn build_status_line(
             Span::styled(
                 format!(
                     "agents {}",
-                    app.agent_tasks.iter().filter(|e| !e.status.is_terminal()).count()
+                    app.agent_tasks
+                        .iter()
+                        .filter(|e| !e.status.is_terminal())
+                        .count()
                 ),
                 dim,
             ),
@@ -2178,11 +2178,8 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         }
                     }
                     TerminalUiFocus::ToolHistory => {
-                        let (w, max_s) = tool_history_paragraph(
-                            &app.tool_rail,
-                            pane,
-                            app.tool_history_scroll,
-                        );
+                        let (w, max_s) =
+                            tool_history_paragraph(&app.tool_rail, pane, app.tool_history_scroll);
                         max_tool_history_scroll_holder.set(max_s);
                         f.render_widget(w, pane);
                         app.last_tool_history_rect = Some(pane);
@@ -2213,138 +2210,139 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     }
                 }
             } else {
-            match app.ui_focus {
-                TerminalUiFocus::Transcript => {
-                    let (w, max_s, vis_start) = transcript_paragraph(
-                        &app.cells,
-                        ch[1],
-                        app.scroll_offset,
-                        app.transcript_selection.as_ref(),
-                    );
-                    max_transcript_scroll_holder.set(max_s);
-                    app.last_transcript_visible_start = vis_start;
-                    f.render_widget(w, ch[1]);
-                    app.last_transcript_rect = Some(ch[1]);
-                    app.last_tool_history_rect = None;
-                    app.last_executions_list_rect = None;
-                    app.last_executions_code_rect = None;
-                    app.last_executions_output_rect = None;
-                    app.last_conversations_list_rect = None;
-                    app.last_agent_tasks_rect = None;
-                }
-                TerminalUiFocus::Conversations => {
-                    let (w, max_s) = conversations_list_paragraph(&app, ch[1]);
-                    max_conversations_list_scroll_holder.set(max_s);
-                    f.render_widget(w, ch[1]);
-                    app.last_conversations_list_rect = Some(ch[1]);
-                    app.last_transcript_rect = None;
-                    app.last_tool_history_rect = None;
-                    app.last_executions_list_rect = None;
-                    app.last_executions_code_rect = None;
-                    app.last_executions_output_rect = None;
-                    app.last_agent_tasks_rect = None;
-                }
-                TerminalUiFocus::Executions => {
-                    let list_w = (ch[1].width / 3).clamp(26, 46);
-                    let hareas = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([Constraint::Length(list_w), Constraint::Min(8)])
-                        .split(ch[1]);
-                    let list_r = hareas[0];
-                    let detail_area = hareas[1];
-                    let vareas = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
-                        .split(detail_area);
-                    let code_r = vareas[0];
-                    let out_r = vareas[1];
-
-                    let (pl, max_l) = executions_list_paragraph(&app, list_r);
-                    max_exec_list_scroll_holder.set(max_l);
-                    f.render_widget(pl, list_r);
-
-                    match &app.executions_detail {
-                        Some(d) => {
-                            let (pc, max_c) = executions_code_paragraph(
-                                d,
-                                code_r,
-                                app.executions_code_scroll_top,
-                            );
-                            max_exec_code_scroll_holder.set(max_c);
-                            f.render_widget(pc, code_r);
-                            let (po, max_o) = executions_output_paragraph(
-                                &d.journal,
-                                out_r,
-                                app.executions_output_scroll_top,
-                            );
-                            max_exec_out_scroll_holder.set(max_o);
-                            f.render_widget(po, out_r);
-                            app.last_executions_code_rect = Some(code_r);
-                            app.last_executions_output_rect = Some(out_r);
-                        }
-                        None => {
-                            max_exec_code_scroll_holder.set(0);
-                            max_exec_out_scroll_holder.set(0);
-                            app.last_executions_code_rect = None;
-                            app.last_executions_output_rect = None;
-                            let msg = app
-                                .executions_detail_error
-                                .as_deref()
-                                .unwrap_or("Pick a run from the list (↑↓).");
-                            let empty = Paragraph::new(Line::from(Span::styled(msg, Theme::dim())))
-                                .block(
-                                    Block::default()
-                                        .borders(Borders::ALL)
-                                        .title(Span::styled(" detail ", Theme::dim()))
-                                        .border_style(Theme::dim()),
-                                );
-                            f.render_widget(empty, detail_area);
-                        }
+                match app.ui_focus {
+                    TerminalUiFocus::Transcript => {
+                        let (w, max_s, vis_start) = transcript_paragraph(
+                            &app.cells,
+                            ch[1],
+                            app.scroll_offset,
+                            app.transcript_selection.as_ref(),
+                        );
+                        max_transcript_scroll_holder.set(max_s);
+                        app.last_transcript_visible_start = vis_start;
+                        f.render_widget(w, ch[1]);
+                        app.last_transcript_rect = Some(ch[1]);
+                        app.last_tool_history_rect = None;
+                        app.last_executions_list_rect = None;
+                        app.last_executions_code_rect = None;
+                        app.last_executions_output_rect = None;
+                        app.last_conversations_list_rect = None;
+                        app.last_agent_tasks_rect = None;
                     }
-                    app.last_transcript_rect = None;
-                    app.last_tool_history_rect = None;
-                    app.last_executions_list_rect = Some(list_r);
-                    app.last_conversations_list_rect = None;
-                    app.last_agent_tasks_rect = None;
+                    TerminalUiFocus::Conversations => {
+                        let (w, max_s) = conversations_list_paragraph(&app, ch[1]);
+                        max_conversations_list_scroll_holder.set(max_s);
+                        f.render_widget(w, ch[1]);
+                        app.last_conversations_list_rect = Some(ch[1]);
+                        app.last_transcript_rect = None;
+                        app.last_tool_history_rect = None;
+                        app.last_executions_list_rect = None;
+                        app.last_executions_code_rect = None;
+                        app.last_executions_output_rect = None;
+                        app.last_agent_tasks_rect = None;
+                    }
+                    TerminalUiFocus::Executions => {
+                        let list_w = (ch[1].width / 3).clamp(26, 46);
+                        let hareas = Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([Constraint::Length(list_w), Constraint::Min(8)])
+                            .split(ch[1]);
+                        let list_r = hareas[0];
+                        let detail_area = hareas[1];
+                        let vareas = Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
+                            .split(detail_area);
+                        let code_r = vareas[0];
+                        let out_r = vareas[1];
+
+                        let (pl, max_l) = executions_list_paragraph(&app, list_r);
+                        max_exec_list_scroll_holder.set(max_l);
+                        f.render_widget(pl, list_r);
+
+                        match &app.executions_detail {
+                            Some(d) => {
+                                let (pc, max_c) = executions_code_paragraph(
+                                    d,
+                                    code_r,
+                                    app.executions_code_scroll_top,
+                                );
+                                max_exec_code_scroll_holder.set(max_c);
+                                f.render_widget(pc, code_r);
+                                let (po, max_o) = executions_output_paragraph(
+                                    &d.journal,
+                                    out_r,
+                                    app.executions_output_scroll_top,
+                                );
+                                max_exec_out_scroll_holder.set(max_o);
+                                f.render_widget(po, out_r);
+                                app.last_executions_code_rect = Some(code_r);
+                                app.last_executions_output_rect = Some(out_r);
+                            }
+                            None => {
+                                max_exec_code_scroll_holder.set(0);
+                                max_exec_out_scroll_holder.set(0);
+                                app.last_executions_code_rect = None;
+                                app.last_executions_output_rect = None;
+                                let msg = app
+                                    .executions_detail_error
+                                    .as_deref()
+                                    .unwrap_or("Pick a run from the list (↑↓).");
+                                let empty =
+                                    Paragraph::new(Line::from(Span::styled(msg, Theme::dim())))
+                                        .block(
+                                            Block::default()
+                                                .borders(Borders::ALL)
+                                                .title(Span::styled(" detail ", Theme::dim()))
+                                                .border_style(Theme::dim()),
+                                        );
+                                f.render_widget(empty, detail_area);
+                            }
+                        }
+                        app.last_transcript_rect = None;
+                        app.last_tool_history_rect = None;
+                        app.last_executions_list_rect = Some(list_r);
+                        app.last_conversations_list_rect = None;
+                        app.last_agent_tasks_rect = None;
+                    }
+                    TerminalUiFocus::ToolHistory => {
+                        let (w, max_s) =
+                            tool_history_paragraph(&app.tool_rail, ch[1], app.tool_history_scroll);
+                        max_tool_history_scroll_holder.set(max_s);
+                        f.render_widget(w, ch[1]);
+                        app.last_tool_history_rect = Some(ch[1]);
+                        app.last_transcript_rect = None;
+                        app.last_executions_list_rect = None;
+                        app.last_executions_code_rect = None;
+                        app.last_executions_output_rect = None;
+                        app.last_conversations_list_rect = None;
+                        app.last_agent_tasks_rect = None;
+                    }
+                    TerminalUiFocus::AgentTasks | TerminalUiFocus::BackgroundJobs => {
+                        let list = background_pane_paragraph(&app);
+                        let title = if app.ui_focus == TerminalUiFocus::BackgroundJobs {
+                            " background "
+                        } else {
+                            " sub-agents "
+                        };
+                        let w = Paragraph::new(Text::from(list))
+                            .block(
+                                Block::default()
+                                    .borders(Borders::ALL)
+                                    .title(Span::styled(title, Theme::tool_call()))
+                                    .border_style(Theme::dim()),
+                            )
+                            .scroll((app.agent_tasks_scroll_top as u16, 0));
+                        f.render_widget(w, ch[1]);
+                        app.last_agent_tasks_rect = Some(ch[1]);
+                        app.last_transcript_rect = None;
+                        app.last_tool_history_rect = None;
+                        app.last_executions_list_rect = None;
+                        app.last_executions_code_rect = None;
+                        app.last_executions_output_rect = None;
+                        app.last_conversations_list_rect = None;
+                    }
                 }
-                TerminalUiFocus::ToolHistory => {
-                    let (w, max_s) =
-                        tool_history_paragraph(&app.tool_rail, ch[1], app.tool_history_scroll);
-                    max_tool_history_scroll_holder.set(max_s);
-                    f.render_widget(w, ch[1]);
-                    app.last_tool_history_rect = Some(ch[1]);
-                    app.last_transcript_rect = None;
-                    app.last_executions_list_rect = None;
-                    app.last_executions_code_rect = None;
-                    app.last_executions_output_rect = None;
-                    app.last_conversations_list_rect = None;
-                    app.last_agent_tasks_rect = None;
-                }
-                TerminalUiFocus::AgentTasks | TerminalUiFocus::BackgroundJobs => {
-                    let list = background_pane_paragraph(&app);
-                    let title = if app.ui_focus == TerminalUiFocus::BackgroundJobs {
-                        " background "
-                    } else {
-                        " sub-agents "
-                    };
-                    let w = Paragraph::new(Text::from(list))
-                        .block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .title(Span::styled(title, Theme::tool_call()))
-                                .border_style(Theme::dim()),
-                        )
-                        .scroll((app.agent_tasks_scroll_top as u16, 0));
-                    f.render_widget(w, ch[1]);
-                    app.last_agent_tasks_rect = Some(ch[1]);
-                    app.last_transcript_rect = None;
-                    app.last_tool_history_rect = None;
-                    app.last_executions_list_rect = None;
-                    app.last_executions_code_rect = None;
-                    app.last_executions_output_rect = None;
-                    app.last_conversations_list_rect = None;
-                }
-            }
             } // end single-pane (non-wide) branch
 
             if exec_h > 0 {
@@ -3469,8 +3467,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         }
                     }
                     KeyCode::Char(c) if app.pending_approval && app.input.is_empty() => {
-                        if let Some(reply) =
-                            crate::channels::terminal_ui::approval_hotkey_reply(c)
+                        if let Some(reply) = crate::channels::terminal_ui::approval_hotkey_reply(c)
                         {
                             app.cells.push(Cell::User {
                                 text: reply.to_string(),
@@ -3781,9 +3778,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 
 #[cfg(test)]
 mod width_fit_tests {
-    use super::{
-        build_status_line, build_title_line, split_main_content, LayoutDensity,
-    };
+    use super::{build_status_line, build_title_line, split_main_content, LayoutDensity};
     use crate::channels::terminal_ui::app::App;
     use crate::channels::terminal_ui::display_width;
     use crate::channels::terminal_ui::text_format::truncate_chars_display;

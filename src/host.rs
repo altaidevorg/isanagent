@@ -13,12 +13,12 @@ use tokio::sync::{mpsc, watch, RwLock};
 
 use crate::agent::{AgentLogic, AgentLogicParams};
 use crate::bus::{BusMessage, InboundMessage, LoggerControlMessage, TelemetryEvent};
+use crate::channels::oneshot::OneshotChannel;
 use crate::channels::terminal::{
     build_agent_thought_terminal_notice, build_tool_call_terminal_notice,
     build_tool_progress_terminal_notice, build_tool_result_terminal_notice,
     terminal_startup_suppresses_plain_banner, TerminalChannelConfig, TerminalMode,
 };
-use crate::channels::oneshot::OneshotChannel;
 use crate::channels::{
     api::ApiChannel, email::EmailChannel, slack::SlackChannel, terminal::TerminalChannel, Channel,
 };
@@ -304,7 +304,10 @@ async fn run_host(
         .filter(|prompt| !prompt.is_empty());
     if oneshot_mode {
         // One-shot hosts never attach the interactive terminal channel.
-        let terminal = workspace.config.terminal.get_or_insert_with(Default::default);
+        let terminal = workspace
+            .config
+            .terminal
+            .get_or_insert_with(Default::default);
         terminal.enabled = Some(false);
         eprintln!("Loading isanagent workspace at: {:?}", workspace.dir);
     } else {
@@ -975,7 +978,9 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
 
     let oneshot_channel = if let Some(prompt) = oneshot_prompt.clone() {
         let result_tx = oneshot_result_tx.ok_or_else(|| {
-            std::io::Error::other("oneshot prompt requires run_oneshot or an explicit result channel")
+            std::io::Error::other(
+                "oneshot prompt requires run_oneshot or an explicit result channel",
+            )
         })?;
         let id = config
             .resume

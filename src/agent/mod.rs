@@ -511,7 +511,9 @@ fn classify_approval_reply(reply: &str) -> ApprovalReply {
         .collect();
 
     if tokens.iter().any(|t| ABORT.contains(t))
-        && !tokens.iter().any(|t| AFFIRM.contains(t) || ALWAYS.contains(t))
+        && !tokens
+            .iter()
+            .any(|t| AFFIRM.contains(t) || ALWAYS.contains(t))
     {
         return ApprovalReply::Abort;
     }
@@ -4404,9 +4406,7 @@ impl AgentLogic {
                             let code = tool_result
                                 .error_code()
                                 .unwrap_or(ToolErrorCode::ExecutionFailed);
-                            budget.record_tool_failure(typed_failure_key(
-                                &tool_name, code, &intent,
-                            ))
+                            budget.record_tool_failure(typed_failure_key(&tool_name, code, &intent))
                         } else {
                             budget.record_tool_success(intent)
                         };
@@ -4527,15 +4527,12 @@ impl AgentLogic {
                         };
 
                         let is_error = tool_result.is_error();
-                        let intent =
-                            tool_intent_signature(tool_name, &tc.function.arguments);
+                        let intent = tool_intent_signature(tool_name, &tc.function.arguments);
                         let budget_decision = if is_error {
                             let code = tool_result
                                 .error_code()
                                 .unwrap_or(ToolErrorCode::ExecutionFailed);
-                            budget.record_tool_failure(typed_failure_key(
-                                tool_name, code, &intent,
-                            ))
+                            budget.record_tool_failure(typed_failure_key(tool_name, code, &intent))
                         } else {
                             budget.record_tool_success(intent)
                         };

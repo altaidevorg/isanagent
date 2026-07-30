@@ -97,9 +97,7 @@ mod tests {
 
     #[test]
     fn parses_unified_diff_kinds() {
-        let lines = parse_diff_lines(
-            "--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n context\n",
-        );
+        let lines = parse_diff_lines("--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n context\n");
         assert_eq!(lines[0].kind, DiffLineKind::Meta);
         assert_eq!(lines[2].kind, DiffLineKind::Hunk);
         assert_eq!(lines[3].kind, DiffLineKind::Del);

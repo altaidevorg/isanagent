@@ -132,14 +132,10 @@ pub(crate) fn cell_block_lines(cell: &Cell, inner_width: usize) -> Vec<Line<'sta
                     Span::styled(diff.file.clone(), Theme::active()),
                 ]));
                 if diff.truncated {
-                    v.push(Line::from(Span::styled(
-                        " [truncated]",
-                        Theme::tool_call(),
-                    )));
+                    v.push(Line::from(Span::styled(" [truncated]", Theme::tool_call())));
                 }
                 v.extend(crate::channels::terminal_ui::approval::diff_lines_to_spans(
-                    &diff.diff,
-                    40,
+                    &diff.diff, 40,
                 ));
             }
             for ln in wrap_text(text, inner) {

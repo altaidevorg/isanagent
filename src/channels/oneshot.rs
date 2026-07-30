@@ -195,8 +195,7 @@ impl OneshotChannel {
                 chat_id,
                 run_id,
                 outcome,
-            }) if chat_id == &self.chat_id =>
-            {
+            }) if chat_id == &self.chat_id => {
                 {
                     let mut state = self.state.lock().expect("oneshot state");
                     state.run_id = Some(run_id.clone());
@@ -208,8 +207,7 @@ impl OneshotChannel {
                 decision,
                 command_preview,
                 ..
-            }) if chat_id == &self.chat_id && decision == "approval_requested" =>
-            {
+            }) if chat_id == &self.chat_id && decision == "approval_requested" => {
                 // When a controlling TTY is available, wait for the clarification
                 // outbound (handled in `send`) so the user can approve interactively.
                 if tty_available() {

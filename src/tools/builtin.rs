@@ -263,20 +263,14 @@ ranges (e.g. 1–100, then 101–200). Prefer absolute or workspace-relative pat
             ));
         }
 
-        let start_line = args
-            .get("start_line")
-            .and_then(|v| v.as_u64())
-            .ok_or(
-                "Missing required 'start_line'. Every read_file call must pass start_line and \
+        let start_line = args.get("start_line").and_then(|v| v.as_u64()).ok_or(
+            "Missing required 'start_line'. Every read_file call must pass start_line and \
 end_line (1-indexed, inclusive); max 100 lines per call — e.g. start_line=1, end_line=100.",
-            )?;
-        let end_line = args
-            .get("end_line")
-            .and_then(|v| v.as_u64())
-            .ok_or(
-                "Missing required 'end_line'. Every read_file call must pass start_line and \
+        )?;
+        let end_line = args.get("end_line").and_then(|v| v.as_u64()).ok_or(
+            "Missing required 'end_line'. Every read_file call must pass start_line and \
 end_line (1-indexed, inclusive); max 100 lines per call — e.g. start_line=1, end_line=100.",
-            )?;
+        )?;
 
         let content = fs::read_to_string(&actual_path).map_err(|e| e.to_string())?;
 

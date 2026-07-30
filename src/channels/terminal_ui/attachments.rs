@@ -30,12 +30,48 @@ fn is_probably_text_extension(path: &Path) -> bool {
         None => true, // extensionless (Dockerfile, Makefile, LICENSE, …)
         Some(ext) => matches!(
             ext,
-            "rs" | "ts" | "tsx" | "js" | "jsx" | "json" | "toml" | "yaml" | "yml"
-                | "md" | "txt" | "css" | "html" | "py" | "go" | "java" | "kt"
-                | "swift" | "c" | "h" | "cpp" | "hpp" | "cs" | "rb" | "php"
-                | "sh" | "bash" | "zsh" | "sql" | "graphql" | "xml" | "svg"
-                | "env" | "ini" | "cfg" | "conf" | "lock" | "gitignore"
-                | "dockerfile" | "makefile" | "cmake" | "gradle" | "properties"
+            "rs" | "ts"
+                | "tsx"
+                | "js"
+                | "jsx"
+                | "json"
+                | "toml"
+                | "yaml"
+                | "yml"
+                | "md"
+                | "txt"
+                | "css"
+                | "html"
+                | "py"
+                | "go"
+                | "java"
+                | "kt"
+                | "swift"
+                | "c"
+                | "h"
+                | "cpp"
+                | "hpp"
+                | "cs"
+                | "rb"
+                | "php"
+                | "sh"
+                | "bash"
+                | "zsh"
+                | "sql"
+                | "graphql"
+                | "xml"
+                | "svg"
+                | "env"
+                | "ini"
+                | "cfg"
+                | "conf"
+                | "lock"
+                | "gitignore"
+                | "dockerfile"
+                | "makefile"
+                | "cmake"
+                | "gradle"
+                | "properties"
         ),
     }
 }
@@ -107,7 +143,8 @@ pub fn load_sandbox_file_attachment(
         text = text.chars().take(MAX_TEXT_ATTACH_CHARS).collect();
         text.push_str("\n… [truncated]");
     }
-    let sandbox_canon = std::fs::canonicalize(sandbox_dir).unwrap_or_else(|_| sandbox_dir.to_path_buf());
+    let sandbox_canon =
+        std::fs::canonicalize(sandbox_dir).unwrap_or_else(|_| sandbox_dir.to_path_buf());
     let resolved_canon = std::fs::canonicalize(&resolved).unwrap_or(resolved.clone());
     let rel = resolved_canon
         .strip_prefix(&sandbox_canon)

@@ -198,10 +198,7 @@ impl BudgetController {
         } else {
             // A different typed key means the previous repeated-root-cause warning is stale
             // (e.g. intent-scoped NonZeroExit for `pnpm test` then `pnpm lint`).
-            if self
-                .emitted_warnings
-                .remove(&WarningKey::RepeatedRootCause)
-            {
+            if self.emitted_warnings.remove(&WarningKey::RepeatedRootCause) {
                 self.warning_cleared = true;
             }
             self.last_root_cause = Some(root_cause);
@@ -221,10 +218,7 @@ impl BudgetController {
         if matches!(kind, ProgressKind::NewEvidence) {
             self.last_root_cause = None;
             self.repeated_root_cause_failures = 0;
-            if self
-                .emitted_warnings
-                .remove(&WarningKey::RepeatedRootCause)
-            {
+            if self.emitted_warnings.remove(&WarningKey::RepeatedRootCause) {
                 self.warning_cleared = true;
             }
         }
@@ -379,11 +373,7 @@ fn duration_millis(duration: Duration) -> u64 {
 ///
 /// Exit / not-found / execution failures are **intent-scoped** (`tool:code:intent`): a failing
 /// `pnpm test` then a failing `pnpm lint` must not count as the same repeated root cause.
-pub(crate) fn typed_failure_key(
-    tool_name: &str,
-    code: ToolErrorCode,
-    intent_sig: &str,
-) -> String {
+pub(crate) fn typed_failure_key(tool_name: &str, code: ToolErrorCode, intent_sig: &str) -> String {
     let tool = tool_name.to_ascii_lowercase();
     let code_label = match code {
         ToolErrorCode::InvalidToolArguments => "invalid_tool_arguments",
@@ -789,7 +779,8 @@ mod tests {
         let mut controller = BudgetController::new(test_limits(50));
         let _ = controller.start_turn(Duration::ZERO);
         for step in 0..3 {
-            let intent = tool_intent_signature("exec", &format!(r#"{{"command":"write artifact-{step}"}}"#));
+            let intent =
+                tool_intent_signature("exec", &format!(r#"{{"command":"write artifact-{step}"}}"#));
             let key = typed_failure_key("exec", ToolErrorCode::PolicyDenied, &intent);
             let decision = controller.record_tool_failure(key);
             if step < 1 {
