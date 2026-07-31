@@ -1081,7 +1081,10 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     }
 
     // 14. Print clean startup banner (skipped when Ratatui owns the alternate screen or ACP mode)
-    if !oneshot_mode && !config.acp_mode && !terminal_startup_suppresses_plain_banner(&workspace.config) {
+    if !oneshot_mode
+        && !config.acp_mode
+        && !terminal_startup_suppresses_plain_banner(&workspace.config)
+    {
         println!(
             "\n{}",
             "=============================================".blue()

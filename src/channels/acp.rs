@@ -141,7 +141,9 @@ impl AcpChannel {
                         let default_cfg = ws.config.provider.clone();
                         let active_resolution = default_cfg
                             .as_ref()
-                            .and_then(|cfg| cfg.resolve_api_key().ok().map(|key| (cfg.clone(), key)))
+                            .and_then(|cfg| {
+                                cfg.resolve_api_key().ok().map(|key| (cfg.clone(), key))
+                            })
                             .or_else(|| {
                                 expanded.values().find_map(|cfg| {
                                     cfg.resolve_api_key().ok().map(|key| (cfg.clone(), key))
