@@ -1095,8 +1095,7 @@ mod tests {
         let r = run.await.unwrap();
         assert!(
             matches!(r, Err(ExecutionError::Cancelled)),
-            "expected Cancelled, got {:?}",
-            r
+            "expected Cancelled, got {r:?}"
         );
         prov.close_session(&h.id).await.ok();
         let _ = fs::remove_dir_all(&dir);

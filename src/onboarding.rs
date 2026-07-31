@@ -861,8 +861,7 @@ mod tests {
         let s = build_config_toml(&o).expect("toml");
         assert!(
             s.contains("ml_engineer") && s.contains("enabled"),
-            "merged config should still carry harness.ml_engineer from template: {}",
-            s
+            "merged config should still carry harness.ml_engineer from template: {s}"
         );
     }
 

@@ -425,7 +425,7 @@ mod skill_metadata_tests {
                     .and_then(|n| n.parse().ok())
             })
             .expect("instruction length line");
-        assert!(n >= 500, "expected long body, got length {}", n);
+        assert!(n >= 500, "expected long body, got length {n}");
         assert!(meta.contains("Available: false"));
 
         let dir_txt = reg.format_skill_directory();

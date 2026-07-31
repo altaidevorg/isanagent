@@ -180,13 +180,11 @@ pub fn load_env_file_if_exists(path: &Path) {
             if let Some((key, val)) = line_to_parse.split_once('=') {
                 let key = key.trim();
                 let mut val = val.trim();
-                if (val.starts_with('"') && val.ends_with('"'))
-                    || (val.starts_with('\'') && val.ends_with('\''))
-                {
-                    if val.len() >= 2 {
+                if ((val.starts_with('"') && val.ends_with('"'))
+                    || (val.starts_with('\'') && val.ends_with('\'')))
+                    && val.len() >= 2 {
                         val = &val[1..val.len() - 1];
                     }
-                }
                 if !key.is_empty() && std::env::var(key).is_err() {
                     std::env::set_var(key, val);
                 }
