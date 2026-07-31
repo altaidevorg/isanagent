@@ -2915,7 +2915,7 @@ mod git_worktree_path_tests {
         fs::create_dir_all(&outside).unwrap();
         let abs = outside.join("wt").to_string_lossy().to_string();
         let res = resolve_git_worktree_agent_path(&abs, &sandbox, true, false);
-        assert!(res.is_err(), "expected err, got {:?}", res);
+        assert!(res.is_err(), "expected err, got {res:?}");
         let _ = fs::remove_dir_all(&sandbox);
         let _ = fs::remove_dir_all(&outside);
     }

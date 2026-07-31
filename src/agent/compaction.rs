@@ -845,8 +845,7 @@ mod tests {
         let body_len = out.len();
         assert!(
             body_len < 1_000,
-            "huge tool result must be truncated; got {} bytes",
-            body_len
+            "huge tool result must be truncated; got {body_len} bytes"
         );
     }
 
@@ -1147,8 +1146,7 @@ mod tests {
         let stale = identify_stale_tool_swaps(&messages, KEEP_RECENT_USER_TURNS_DEFAULT);
         assert!(
             stale.is_empty(),
-            "with 3 user turns and keep=3, nothing is stale; got {:?}",
-            stale
+            "with 3 user turns and keep=3, nothing is stale; got {stale:?}"
         );
     }
 
@@ -1306,10 +1304,7 @@ mod tests {
         let reduction = 1.0 - (stripped_tokens as f64 / baseline_tokens as f64);
         assert!(
             reduction >= 0.30,
-            "expected ≥30% token reduction; baseline={} stripped={} reduction={:.3}",
-            baseline_tokens,
-            stripped_tokens,
-            reduction
+            "expected ≥30% token reduction; baseline={baseline_tokens} stripped={stripped_tokens} reduction={reduction:.3}"
         );
     }
 }

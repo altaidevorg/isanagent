@@ -2986,7 +2986,7 @@ bind_address = "127.0.0.1"
         let (bus_tx, _bus_rx) = mpsc::channel(4);
         let state = build_state(&db_path, bus_tx, None);
         let chat_suffix = "list-me-123e4567-e89b-12d3-a456-426614174000";
-        let memory_key = format!("api:{}:", chat_suffix);
+        let memory_key = format!("api:{chat_suffix}:");
         let (tx, rx) = oneshot::channel();
         state
             .memory_node
@@ -3344,7 +3344,7 @@ bind_address = "127.0.0.1"
                 assert!(at_ms > before_request.timestamp_millis());
                 assert!(at_ms > original_at_ms);
             }
-            other => panic!("expected rescheduled one-shot job, got {:?}", other),
+            other => panic!("expected rescheduled one-shot job, got {other:?}"),
         }
         assert_eq!(sync_records.lock().unwrap().len(), 1);
     }

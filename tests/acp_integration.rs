@@ -135,13 +135,14 @@ async fn test_acp_channel_prompt_cancellation() {
     assert!(prompt_ret.is_none()); // Returns None because response is async via oneshot
 
     // Verify inbound message dispatched to bus
-    let bus_msg = bus_rx.recv().await.expect("bus message received");
-    if let BusMessage::Inbound(inbound) = bus_msg {
-        assert_eq!(inbound.chat_id, session_res.session_id);
-        assert_eq!(inbound.content, "Run long task");
-    } else {
-        panic!("expected BusMessage::Inbound");
-    }
+    let inbound = loop {
+        let bus_msg = bus_rx.recv().await.expect("bus message received");
+        if let BusMessage::Inbound(inbound) = bus_msg {
+            break inbound;
+        }
+    };
+    assert_eq!(inbound.chat_id, session_res.session_id);
+    assert_eq!(inbound.content, "Run long task");
 
     // 3. Send session/cancel
     let cancel_req = serde_json::json!({
@@ -169,4 +170,69 @@ async fn test_acp_channel_prompt_cancellation() {
     let prompt_res: SessionPromptResult =
         serde_json::from_value(async_prompt_resp.result.unwrap()).unwrap();
     assert_eq!(prompt_res.stop_reason, AcpStopReason::Cancelled);
+}
+
+#[tokio::test]
+async fn test_acp_channel_prompt_completion() {
+    use isanagent::bus::{RunLifecycleEvent, RunOutcome};
+
+    let channel = AcpChannel::new();
+    let (bus_tx, _bus_rx) = mpsc::channel::<BusMessage>(10);
+    let (raw_writer_tx, mut raw_writer_rx) = mpsc::channel::<String>(10);
+
+    // 1. Create Session
+    let session_new_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 20,
+        "method": "session/new",
+        "params": {
+            "cwd": "/tmp/test-completion",
+            "mcpServers": []
+        }
+    });
+
+    let session_resp_str = channel
+        .handle_incoming_rpc(&session_new_req.to_string(), &bus_tx, &raw_writer_tx)
+        .await
+        .expect("session/new response");
+
+    let session_resp: JsonRpcResponse = serde_json::from_str(&session_resp_str).unwrap();
+    let session_res: SessionNewResult =
+        serde_json::from_value(session_resp.result.unwrap()).unwrap();
+
+    // 2. Prompt request
+    let prompt_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 21,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": session_res.session_id,
+            "prompt": [
+                { "type": "text", "text": "Tell me a joke" }
+            ]
+        }
+    });
+
+    let prompt_ret = channel
+        .handle_incoming_rpc(&prompt_req.to_string(), &bus_tx, &raw_writer_tx)
+        .await;
+    assert!(prompt_ret.is_none());
+
+    // 3. Simulate RunLifecycleEvent::Terminated
+    channel
+        .handle_run_lifecycle(&RunLifecycleEvent::Terminated {
+            run_id: "run_123".to_string(),
+            chat_id: session_res.session_id,
+            outcome: RunOutcome::Completed,
+        })
+        .await;
+
+    // Check async prompt response sent via raw_writer_tx
+    let async_prompt_line = raw_writer_rx.recv().await.expect("async prompt response");
+    let async_prompt_resp: JsonRpcResponse = serde_json::from_str(&async_prompt_line).unwrap();
+    assert_eq!(async_prompt_resp.id, serde_json::json!(21));
+
+    let prompt_res: SessionPromptResult =
+        serde_json::from_value(async_prompt_resp.result.unwrap()).unwrap();
+    assert_eq!(prompt_res.stop_reason, AcpStopReason::EndTurn);
 }

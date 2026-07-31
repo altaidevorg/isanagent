@@ -1179,7 +1179,7 @@ mod tests {
         ActiveJob {
             id: id.to_string(),
             schedule,
-            message: format!("message for {}", id),
+            message: format!("message for {id}"),
             last_run_at_ms: None,
             chat_id: "chat-123".to_string(),
             channel: "terminal".to_string(),
@@ -1366,7 +1366,7 @@ mod tests {
         match first.complete().await.expect("complete") {
             PendingCronTriggerFinalize::Completed => {}
             PendingCronTriggerFinalize::CompletedWithWarning(error) => {
-                panic!("unexpected sync warning: {}", error)
+                panic!("unexpected sync warning: {error}")
             }
         }
 
