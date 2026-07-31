@@ -91,11 +91,22 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Run as an Agent Client Protocol (ACP) server over stdio
-    Acp,
+    Acp(AcpArgs),
     /// Create workspace layout and starter files; optional flags override generated config.toml
     Onboard(OnboardArgs),
     /// Manage skills (add, list, etc.)
     Skills(SkillsArgs),
+}
+
+#[derive(ClapArgs, Debug, Default)]
+struct AcpArgs {
+    /// Optional explicit path to the workspace directory. Defaults to ~/.isanagent
+    #[arg(short, long)]
+    workspace: Option<String>,
+
+    /// Optional path to a config.toml file. Defaults to <workspace>/config.toml
+    #[arg(short, long)]
+    config: Option<String>,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -136,9 +147,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Acp) => isanagent::host::start_host(isanagent::host::HostConfig {
-            workspace: cli.workspace.map(std::path::PathBuf::from),
-            config: cli.config.map(std::path::PathBuf::from),
+        Some(Commands::Acp(args)) => isanagent::host::start_host(isanagent::host::HostConfig {
+            workspace: cli
+                .workspace
+                .or(args.workspace)
+                .map(std::path::PathBuf::from),
+            config: cli.config.or(args.config).map(std::path::PathBuf::from),
             acp_mode: true,
             ..Default::default()
         })

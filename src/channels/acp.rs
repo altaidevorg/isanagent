@@ -45,6 +45,7 @@ impl AcpSessionState {
 }
 
 /// ACP Channel implementing the Agent Client Protocol over stdio or custom streams.
+#[derive(Clone)]
 pub struct AcpChannel {
     pub sessions: Arc<DashMap<String, Arc<AcpSessionState>>>,
     pub client_capabilities: Arc<Mutex<ClientCapabilities>>,
@@ -129,6 +130,37 @@ impl AcpChannel {
                         return serde_json::to_string(&err_resp).ok();
                     }
                 };
+
+                if !params.cwd.trim().is_empty() {
+                    let cwd_path = std::path::Path::new(&params.cwd);
+                    crate::workspace::load_env_file_if_exists(&cwd_path.join(".env"));
+                    crate::workspace::load_env_file_if_exists(&cwd_path.join(".env.local"));
+
+                    if let Ok(ws) = crate::workspace::IsanagentWorkspace::new(None, None) {
+                        let expanded = ws.config.expanded_providers();
+                        let default_cfg = ws.config.provider.clone();
+                        let active_resolution = default_cfg
+                            .as_ref()
+                            .and_then(|cfg| cfg.resolve_api_key().ok().map(|key| (cfg.clone(), key)))
+                            .or_else(|| {
+                                expanded.values().find_map(|cfg| {
+                                    cfg.resolve_api_key().ok().map(|key| (cfg.clone(), key))
+                                })
+                            });
+
+                        if let Some((cfg, key)) = active_resolution {
+                            let base_url = cfg.resolved_base_url().unwrap_or_default();
+                            let _ = bus_tx
+                                .send(BusMessage::SwitchModel {
+                                    provider_name: cfg.provider_name,
+                                    model_name: cfg.model_name,
+                                    base_url,
+                                    api_key: key,
+                                })
+                                .await;
+                        }
+                    }
+                }
 
                 let session_id = format!("acp_sess_{}", Uuid::new_v4());
                 let state = Arc::new(AcpSessionState::new(
@@ -569,33 +601,37 @@ impl Channel for AcpChannel {
             }
         });
 
-        let stdin = tokio::io::stdin();
-        let mut reader = BufReader::new(stdin).lines();
+        let this = self.clone();
+        tokio::spawn(async move {
+            let stdin = tokio::io::stdin();
+            let mut reader = BufReader::new(stdin).lines();
 
-        while self.is_running.load(Ordering::SeqCst) {
-            match reader.next_line().await {
-                Ok(Some(line)) => {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
+            while this.is_running.load(Ordering::SeqCst) {
+                match reader.next_line().await {
+                    Ok(Some(line)) => {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
 
-                    if let Some(resp_str) = self
-                        .handle_incoming_rpc(trimmed, &bus_tx, &raw_writer_tx)
-                        .await
-                    {
-                        let _ = raw_writer_tx.send(resp_str).await;
+                        if let Some(resp_str) = this
+                            .handle_incoming_rpc(trimmed, &bus_tx, &raw_writer_tx)
+                            .await
+                        {
+                            let _ = raw_writer_tx.send(resp_str).await;
+                        }
                     }
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    eprintln!("ACP Channel stdin error: {e}");
-                    break;
+                    Ok(None) => break,
+                    Err(e) => {
+                        eprintln!("ACP Channel stdin error: {e}");
+                        break;
+                    }
                 }
             }
-        }
 
-        self.is_running.store(false, Ordering::SeqCst);
+            this.is_running.store(false, Ordering::SeqCst);
+        });
+
         Ok(())
     }
 

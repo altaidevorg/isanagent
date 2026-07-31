@@ -81,6 +81,8 @@ impl IsanagentWorkspace {
             None => layout.sandbox_dir,
         };
 
+        auto_load_env_files(&target_dir, &sandbox_dir);
+
         // 3. Load config.toml if it exists
         let config_path = config_override
             .map(|s| PathBuf::from(shellexpand::tilde(s).to_string()))
@@ -157,6 +159,63 @@ impl IsanagentWorkspace {
             prompt_parts.join("\n")
         }
     }
+}
+
+/// Load non-empty environment variables from a `.env` file into `std::env` if not already set.
+pub fn load_env_file_if_exists(path: &Path) {
+    if !path.is_file() {
+        return;
+    }
+    if let Ok(content) = fs::read_to_string(path) {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let line_to_parse = if let Some(stripped) = trimmed.strip_prefix("export ") {
+                stripped.trim()
+            } else {
+                trimmed
+            };
+            if let Some((key, val)) = line_to_parse.split_once('=') {
+                let key = key.trim();
+                let mut val = val.trim();
+                if (val.starts_with('"') && val.ends_with('"'))
+                    || (val.starts_with('\'') && val.ends_with('\''))
+                {
+                    if val.len() >= 2 {
+                        val = &val[1..val.len() - 1];
+                    }
+                }
+                if !key.is_empty() && std::env::var(key).is_err() {
+                    std::env::set_var(key, val);
+                }
+            }
+        }
+    }
+}
+
+/// Automatically inspect current directory, workspace directory, sandbox directory, and user home
+/// directory for `.env` and `.env.local` files, loading any missing keys into process environment.
+pub fn auto_load_env_files(workspace_dir: &Path, sandbox_dir: &Path) {
+    if let Ok(cwd) = std::env::current_dir() {
+        load_env_file_if_exists(&cwd.join(".env"));
+        load_env_file_if_exists(&cwd.join(".env.local"));
+    }
+    load_env_file_if_exists(&sandbox_dir.join(".env"));
+    load_env_file_if_exists(&sandbox_dir.join(".env.local"));
+    load_env_file_if_exists(&workspace_dir.join(".env"));
+    load_env_file_if_exists(&workspace_dir.join(".env.local"));
+    if let Some(home) = dirs_home_dir() {
+        load_env_file_if_exists(&home.join(".env"));
+        load_env_file_if_exists(&home.join(".env.local"));
+    }
+}
+
+fn dirs_home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 #[cfg(test)]
