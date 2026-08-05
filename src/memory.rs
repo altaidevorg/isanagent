@@ -379,10 +379,23 @@ pub fn ensure_cron_jobs_schema(conn: &Connection) -> Result<(), rusqlite::Error>
             webhook_token TEXT NOT NULL DEFAULT '',
             trigger_claim_token TEXT NOT NULL DEFAULT '',
             trigger_claimed_at_ms INTEGER,
-            completed_at_ms INTEGER
+            completed_at_ms INTEGER,
+            enabled INTEGER NOT NULL DEFAULT 1
         )",
         [],
     )?;
+    let has_enabled = conn
+        .prepare("PRAGMA table_info(cron_jobs)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|column| column == "enabled");
+    if !has_enabled {
+        conn.execute(
+            "ALTER TABLE cron_jobs ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
     Ok(())
 }
 

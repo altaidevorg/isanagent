@@ -1877,6 +1877,7 @@ impl Tool for CronTool {
                             chat_id: chat_id.clone(),
                             channel: channel.clone(),
                             webhook_token: crate::scheduler::generate_webhook_token(),
+                            enabled: true,
                         },
                         Utc::now(),
                     )
@@ -1934,6 +1935,7 @@ mod cron_tool_tests {
                     chat_id: chat_id.to_string(),
                     channel: "tauri".to_string(),
                     webhook_token: "test-token".to_string(),
+                    enabled: true,
                 })
                 .expect("insert cron job");
         }

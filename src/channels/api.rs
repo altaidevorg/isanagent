@@ -2705,6 +2705,7 @@ mod tests {
             chat_id: "chat-123".to_string(),
             channel: "terminal".to_string(),
             webhook_token: token.to_string(),
+            enabled: true,
         }
     }
 
