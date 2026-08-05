@@ -37,6 +37,15 @@ pub enum CronCommand {
     Remove {
         id: String,
     },
+    Update {
+        id: String,
+        schedule: Option<ScheduleKind>,
+        message: Option<String>,
+        enabled: Option<bool>,
+    },
+    Trigger {
+        id: String,
+    },
     /// Reload durable jobs after a trusted embedding host has updated the
     /// store directly and needs this local scheduler to observe the change.
     Reload,
@@ -51,6 +60,7 @@ pub struct ActiveJob {
     pub chat_id: String,
     pub channel: String,
     pub webhook_token: String,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -136,7 +146,7 @@ impl CronStore {
         let conn = self.lock_conn()?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, schedule, message, last_run_at_ms, chat_id, channel, webhook_token
+                "SELECT id, schedule, message, last_run_at_ms, chat_id, channel, webhook_token, enabled
                  FROM cron_jobs
                  WHERE completed_at_ms IS NULL",
             )
@@ -154,6 +164,7 @@ impl CronStore {
                     chat_id: row.get(4)?,
                     channel: row.get(5)?,
                     webhook_token: row.get(6)?,
+                    enabled: row.get::<_, i64>(7)? != 0,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -180,8 +191,8 @@ impl CronStore {
         conn.execute(
             "INSERT INTO cron_jobs (
                 id, schedule, message, last_run_at_ms, chat_id, channel, webhook_token,
-                trigger_claim_token, trigger_claimed_at_ms, completed_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '', NULL, NULL)",
+                trigger_claim_token, trigger_claimed_at_ms, completed_at_ms, enabled
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '', NULL, NULL, ?8)",
             params![
                 job.id,
                 schedule_json,
@@ -189,7 +200,8 @@ impl CronStore {
                 job.last_run_at_ms,
                 job.chat_id,
                 job.channel,
-                job.webhook_token
+                job.webhook_token,
+                i64::from(job.enabled)
             ],
         )
         .map(|_| ())
@@ -206,7 +218,7 @@ impl CronStore {
     pub fn find_job(&self, id: &str) -> Result<Option<ActiveJob>, String> {
         let conn = self.lock_conn()?;
         conn.query_row(
-            "SELECT id, schedule, message, last_run_at_ms, chat_id, channel, webhook_token
+            "SELECT id, schedule, message, last_run_at_ms, chat_id, channel, webhook_token, enabled
              FROM cron_jobs WHERE id = ?1 AND completed_at_ms IS NULL",
             params![id],
             |row| {
@@ -220,6 +232,7 @@ impl CronStore {
                     chat_id: row.get(4)?,
                     channel: row.get(5)?,
                     webhook_token: row.get(6)?,
+                    enabled: row.get::<_, i64>(7)? != 0,
                 })
             },
         )
@@ -241,6 +254,19 @@ impl CronStore {
         .map_err(|e| e.to_string())
     }
 
+    pub fn update_job(&self, job: &ActiveJob) -> Result<bool, String> {
+        let schedule = serde_json::to_string(&job.schedule)
+            .map_err(|e| format!("Failed to serialize schedule: {e}"))?;
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE cron_jobs SET schedule = ?2, message = ?3, enabled = ?4
+             WHERE id = ?1 AND completed_at_ms IS NULL",
+            params![job.id, schedule, job.message, i64::from(job.enabled)],
+        )
+        .map(|updated| updated != 0)
+        .map_err(|e| e.to_string())
+    }
+
     fn begin_pending_trigger(
         &self,
         job_id: &str,
@@ -253,7 +279,7 @@ impl CronStore {
 
         let row = tx
             .query_row(
-                "SELECT id, schedule, message, last_run_at_ms, chat_id, channel, webhook_token,
+                "SELECT id, schedule, message, last_run_at_ms, chat_id, channel, webhook_token, enabled,
                         trigger_claim_token, trigger_claimed_at_ms
                  FROM cron_jobs
                  WHERE id = ?1 AND webhook_token = ?2 AND completed_at_ms IS NULL",
@@ -270,9 +296,10 @@ impl CronStore {
                             chat_id: row.get(4)?,
                             channel: row.get(5)?,
                             webhook_token: row.get(6)?,
+                            enabled: row.get::<_, i64>(7)? != 0,
                         },
-                        row.get::<_, String>(7)?,
-                        row.get::<_, Option<i64>>(8)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, Option<i64>>(9)?,
                     ))
                 },
             )
@@ -712,6 +739,7 @@ impl ActorLogic<String> for CronActor {
                     chat_id: chat_id.clone(),
                     channel: channel.clone(),
                     webhook_token: generate_webhook_token(),
+                    enabled: true,
                 };
                 self.store.insert_job(&job).map_err(ActorError::from)?;
                 if let ScheduleKind::Cron { ref cron_expr } = schedule {
@@ -750,6 +778,91 @@ impl ActorLogic<String> for CronActor {
                             &self.name,
                             &format!("Removed job '{}'", id),
                         )));
+            }
+            CronCommand::Update {
+                id,
+                schedule,
+                message,
+                enabled,
+            } => {
+                let Some(index) = self.jobs.iter().position(|job| job.id == id) else {
+                    return Err(ActorError::from(format!("Cron job '{id}' was not found")));
+                };
+                let job = &mut self.jobs[index];
+                if let Some(schedule) = schedule {
+                    if let ScheduleKind::Cron { ref cron_expr } = schedule {
+                        validate_cron_expression(cron_expr)
+                            .map_err(|error| ActorError::from(error.to_string()))?;
+                    }
+                    job.schedule = schedule;
+                }
+                if let Some(message) = message {
+                    if message.trim().is_empty() {
+                        return Err(ActorError::from("Cron job message cannot be empty"));
+                    }
+                    job.message = message;
+                }
+                if let Some(enabled) = enabled {
+                    job.enabled = enabled;
+                }
+                if !self.store.update_job(job).map_err(ActorError::from)? {
+                    return Err(ActorError::from(format!("Cron job '{id}' was not found")));
+                }
+                self.cron_schedule_cache.clear();
+            }
+            CronCommand::Trigger { id } => {
+                let Some(job) = self.jobs.iter().find(|job| job.id == id).cloned() else {
+                    return Err(ActorError::from(format!("Cron job '{id}' was not found")));
+                };
+                if !job.enabled {
+                    return Err(ActorError::from(format!("Cron job '{id}' is paused")));
+                }
+                let now_ms = Utc::now().timestamp_millis();
+                match self.store.record_cron_background_job(
+                    &job.id,
+                    &job.channel,
+                    &job.chat_id,
+                    &job.message,
+                    now_ms,
+                ) {
+                    Ok(true) => {
+                        let mut metadata = HashMap::new();
+                        metadata.insert(
+                            crate::bus::METADATA_BACKGROUND_JOB_ID.to_string(),
+                            serde_json::json!(format!("cron:{}", job.id)),
+                        );
+                        metadata.insert("cron_job_id".to_string(), serde_json::json!(job.id));
+                        metadata.insert(
+                            crate::bus::METADATA_SYNTHETIC_CRON_TRIGGER.to_string(),
+                            serde_json::json!(true),
+                        );
+                        metadata.insert(
+                            crate::bus::METADATA_AUTONOMOUS_FORBID_FINAL_WITHOUT_TOOLS.to_string(),
+                            serde_json::json!(true),
+                        );
+                        let inbound = crate::bus::InboundMessage {
+                            channel: job.channel,
+                            sender_id: "cron_scheduler".to_string(),
+                            chat_id: job.chat_id,
+                            thread_id: None,
+                            content: job.message.clone(),
+                            attachments: Vec::new(),
+                            metadata,
+                        };
+                        self.bus_tx
+                            .send(crate::bus::BusMessage::Inbound(inbound))
+                            .await
+                            .map_err(|error| ActorError::from(error.to_string()))?;
+                        let _ = self.logger_tx.send(crate::bus::BusMessage::Telemetry(
+                            crate::bus::TelemetryEvent::CronTrigger {
+                                job_id: job.id,
+                                message: job.message,
+                            },
+                        ));
+                    }
+                    Ok(false) => return Err(ActorError::from("Cron job is already running")),
+                    Err(error) => return Err(ActorError::from(error)),
+                }
             }
             CronCommand::Reload => {
                 self.jobs = self.store.load_jobs().map_err(ActorError::from)?;
@@ -794,6 +907,9 @@ impl ActorLogic<String> for CronActor {
             let cron_schedule_cache = &mut self.cron_schedule_cache;
 
             for job in jobs {
+                if !job.enabled {
+                    continue;
+                }
                 let mut should_trigger = false;
 
                 match &job.schedule {
@@ -1147,6 +1263,7 @@ mod tests {
                 chat_id: "chat-1".to_string(),
                 channel: "tauri".to_string(),
                 webhook_token: generate_webhook_token(),
+                enabled: true,
             })
             .expect("persist host job");
 
@@ -1156,6 +1273,92 @@ mod tests {
             .expect("reload command");
         assert_eq!(actor.jobs.len(), 1);
         assert_eq!(actor.jobs[0].id, "host-job");
+    }
+
+    #[tokio::test]
+    async fn update_pause_and_manual_trigger_are_durable() {
+        let temp = LocalTempDir::new();
+        let db_path = temp.db_path();
+        let db_path_str = db_path.to_string_lossy();
+        let connection = rusqlite::Connection::open(&db_path).expect("database");
+        crate::memory::ensure_background_runtime_schema(&connection).expect("background schema");
+        let (logger, _logger_rx) = create_logger_channel(8);
+        let (bus_tx, mut bus_rx) = tokio::sync::mpsc::channel(2);
+        let mut actor = CronActor::new(
+            "test-cron",
+            &db_path_str,
+            logger,
+            CronSchedulingMode::Local,
+            bus_tx,
+        )
+        .expect("cron actor");
+        actor
+            .process(
+                serde_json::to_string(&CronCommand::Add {
+                    id: "automation-1".to_string(),
+                    schedule: ScheduleKind::Every { every_ms: 60_000 },
+                    message: "first message".to_string(),
+                    chat_id: "chat-1".to_string(),
+                    channel: "tauri".to_string(),
+                })
+                .expect("serialize add"),
+            )
+            .await
+            .expect("add job");
+        actor
+            .process(
+                serde_json::to_string(&CronCommand::Update {
+                    id: "automation-1".to_string(),
+                    schedule: None,
+                    message: Some("updated message".to_string()),
+                    enabled: Some(false),
+                })
+                .expect("serialize update"),
+            )
+            .await
+            .expect("pause job");
+        let store = CronStore::new(&db_path_str).expect("cron store");
+        let paused = store
+            .find_job("automation-1")
+            .expect("read job")
+            .expect("job");
+        assert!(!paused.enabled);
+        assert_eq!(paused.message, "updated message");
+        assert!(actor
+            .process(
+                serde_json::to_string(&CronCommand::Trigger {
+                    id: "automation-1".to_string()
+                })
+                .expect("serialize trigger")
+            )
+            .await
+            .is_err());
+
+        actor
+            .process(
+                serde_json::to_string(&CronCommand::Update {
+                    id: "automation-1".to_string(),
+                    schedule: None,
+                    message: None,
+                    enabled: Some(true),
+                })
+                .expect("serialize resume"),
+            )
+            .await
+            .expect("resume job");
+        actor
+            .process(
+                serde_json::to_string(&CronCommand::Trigger {
+                    id: "automation-1".to_string(),
+                })
+                .expect("serialize trigger"),
+            )
+            .await
+            .expect("trigger job");
+        let inbound = bus_rx.recv().await.expect("triggered inbound");
+        assert!(
+            matches!(inbound, crate::bus::BusMessage::Inbound(message) if message.content == "updated message")
+        );
     }
 
     #[derive(Clone)]
@@ -1191,6 +1394,7 @@ mod tests {
             chat_id: "chat-123".to_string(),
             channel: "terminal".to_string(),
             webhook_token: generate_webhook_token(),
+            enabled: true,
         }
     }
 
