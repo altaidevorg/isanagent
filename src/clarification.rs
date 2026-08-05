@@ -40,7 +40,15 @@ impl ClarificationHub {
 
     /// Remove a pending wait without notifying the tool (e.g. cooperative cancellation).
     pub fn cancel_wait(&self, session_key: &str) {
-        self.pending.remove(session_key);
+        let _ = self.cancel_wait_if_pending(session_key);
+    }
+
+    /// Remove a pending wait and report whether this call claimed it.
+    ///
+    /// Interactive hosts use this to reject duplicate dismissals instead of
+    /// presenting a stale clarification as successfully dismissed.
+    pub fn cancel_wait_if_pending(&self, session_key: &str) -> bool {
+        self.pending.remove(session_key).is_some()
     }
 
     /// If a tool is waiting on `session_key`, deliver `text` and return `true`.
@@ -84,6 +92,15 @@ mod tests {
         let rx = hub.begin_wait("t:1:").expect("begin");
         hub.cancel_wait("t:1:");
         assert!(!hub.try_deliver_reply("t:1:", "late".into()));
+        assert!(rx.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cancel_wait_if_pending_claims_once() {
+        let hub = ClarificationHub::new();
+        let rx = hub.begin_wait("t:1:").expect("begin");
+        assert!(hub.cancel_wait_if_pending("t:1:"));
+        assert!(!hub.cancel_wait_if_pending("t:1:"));
         assert!(rx.await.is_err());
     }
 }
