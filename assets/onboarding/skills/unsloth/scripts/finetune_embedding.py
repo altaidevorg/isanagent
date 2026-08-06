@@ -1,9 +1,22 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "unsloth>=2025.2.1",
+#     "unsloth_zoo>=2025.2.1",
+#     "torch>=2.4.0",
+#     "transformers>=4.48.0",
+#     "peft>=0.14.0",
+#     "sentence-transformers>=3.0.0",
+#     "datasets>=3.2.0",
+#     "accelerate>=1.3.0",
+# ]
+# ///
 """
 🦥 Unsloth Sentence Transformer / Embedding Model Fine-Tuning Script
 
 Usage:
-    uv run python finetune_embedding.py \
+    python finetune_embedding.py \
         --model_name "BAAI/bge-base-en-v1.5" \
         --output_dir "outputs/embedding_lora"
 """
@@ -50,12 +63,12 @@ def main():
     print("🦥 Preparing sample contrastive dataset (anchor, positive)...")
     dataset = Dataset.from_dict({
         "anchor": [
-            "How to fine-tune LLMs fast?",
+            "How to fine-tune LLMs effectively?",
             "What is QLoRA?",
             "How to export GGUF models?",
         ] * 20,
         "positive": [
-            "Unsloth enables 2-5x faster LLM fine-tuning with 80% lower VRAM.",
+            "Unsloth provides memory-efficient LLM fine-tuning kernels.",
             "QLoRA quantizes base weights to 4-bit NormalFloat and adds LoRA adapters.",
             "Use model.save_pretrained_gguf to generate GGUF files for Ollama.",
         ] * 20,

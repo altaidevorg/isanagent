@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "unsloth>=2025.2.1",
+#     "unsloth_zoo>=2025.2.1",
+#     "torch>=2.4.0",
+#     "transformers>=4.48.0",
+#     "peft>=0.14.0",
+#     "huggingface-hub>=0.20.0",
+# ]
+# ///
 """
 🦥 Unsloth Model Export Utility (GGUF, Merged Adapters, Ollama, HF Hub)
 

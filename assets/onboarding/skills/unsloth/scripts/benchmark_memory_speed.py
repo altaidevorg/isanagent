@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "unsloth>=2025.2.1",
+#     "unsloth_zoo>=2025.2.1",
+#     "torch>=2.4.0",
+#     "transformers>=4.48.0",
+#     "peft>=0.14.0",
+#     "accelerate>=1.3.0",
+# ]
+# ///
 """
 🦥 Unsloth VRAM Memory & Speed Profiling Benchmark Tool
 
 Usage:
-    python benchmark_memory_speed.py --model_name "unsloth/Qwen2.5-7B-Instruct"
+    python benchmark_memory_speed.py --model_name "unsloth/Qwen3.5-9B-Instruct"
 """
 
 import argparse
@@ -16,7 +27,7 @@ from unsloth import FastLanguageModel, get_gpu_memory_stats
 
 def main():
     parser = argparse.ArgumentParser(description="Unsloth VRAM & Inference Speed Benchmark")
-    parser.add_argument("--model_name", type=str, default="unsloth/Qwen2.5-7B-Instruct")
+    parser.add_argument("--model_name", type=str, default="unsloth/Qwen3.5-9B-Instruct")
     parser.add_argument("--max_seq_length", type=int, default=4096)
     parser.add_argument("--prompt", type=str, default="Explain quantum computing in simple terms:")
     parser.add_argument("--max_new_tokens", type=int, default=256)

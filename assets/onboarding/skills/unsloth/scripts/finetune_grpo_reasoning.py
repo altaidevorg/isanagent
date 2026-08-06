@@ -1,15 +1,16 @@
+#!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#     "unsloth",
-#     "unsloth_zoo",
-#     "trl",
-#     "transformers",
-#     "peft",
-#     "datasets",
-#     "accelerate",
-#     "torch",
-#     "vllm",
+#     "unsloth>=2025.2.1",
+#     "unsloth_zoo>=2025.2.1",
+#     "torch>=2.4.0",
+#     "transformers>=4.48.0",
+#     "peft>=0.14.0",
+#     "trl>=0.14.0",
+#     "datasets>=3.2.0",
+#     "accelerate>=1.3.0",
+#     "vllm>=0.7.0",
 # ]
 # ///
 
@@ -26,7 +27,7 @@ if torch.cuda.is_available():
 
 import argparse
 import unsloth
-from unsloth import FastLanguageModel, PatchFastRL
+from unsloth import FastLanguageModel, PatchFastRL, is_bfloat16_supported
 from datasets import load_dataset
 from trl import GRPOTrainer, GRPOConfig
 
@@ -37,7 +38,7 @@ def xml_layout_reward_func(completions, **kwargs):
     pattern = r"^<think>.*?</think>\s*<answer>.*?</answer>$"
     rewards = []
     for completion in completions:
-        text = completion[0]["content"]
+        text = completion[0]["content"] if isinstance(completion, list) else str(completion)
         rewards.append(1.0 if re.match(pattern, text, re.DOTALL) else 0.0)
     return rewards
 
@@ -46,7 +47,7 @@ def correctness_reward_func(prompts, completions, answer, **kwargs):
     """Extracts answer inside <answer>...</answer> and compares to ground truth."""
     rewards = []
     for completion, target in zip(completions, answer):
-        text = completion[0]["content"]
+        text = completion[0]["content"] if isinstance(completion, list) else str(completion)
         extracted = text.split("<answer>")[-1].split("</answer>")[0].strip() if "<answer>" in text else ""
         rewards.append(2.0 if extracted == str(target).strip() else 0.0)
     return rewards
@@ -54,10 +55,22 @@ def correctness_reward_func(prompts, completions, answer, **kwargs):
 
 def main():
     parser = argparse.ArgumentParser(description="Unsloth GRPO Reasoning RL Pipeline")
-    parser.add_argument("--model_name", type=str, default="unsloth/Qwen2.5-Math-7B-Instruct")
+    parser.add_argument("--model_name", type=str, default="unsloth/Qwen3.5-Math-9B-Instruct")
     parser.add_argument("--max_seq_length", type=int, default=2048)
+    parser.add_argument("--load_in_4bit", action=argparse.BooleanOptionalAction, default=True, help="Enable 4-bit NF4 quantization")
+    parser.add_argument("--batch_size", type=int, default=1, help="Per device train batch size")
+    parser.add_argument("--grad_accum", type=int, default=8, help="Gradient accumulation steps (effective batch size = batch_size * grad_accum must be divisible by num_generations)")
+    parser.add_argument("--num_generations", type=int, default=8, help="Number of candidate generations per prompt")
     parser.add_argument("--output_dir", type=str, default="outputs/grpo_reasoning")
     args = parser.parse_args()
+
+    # Enforce TRL GRPO Divisibility Requirement
+    effective_batch_size = args.batch_size * args.grad_accum
+    if effective_batch_size % args.num_generations != 0:
+        raise ValueError(
+            f"Invalid GRPO config: effective batch size ({args.batch_size} * {args.grad_accum} = {effective_batch_size}) "
+            f"must be divisible by num_generations ({args.num_generations})."
+        )
 
     print("🦥 Enabling Unsloth Fast RL Kernels for GRPO...")
     PatchFastRL("GRPO", FastLanguageModel)
@@ -70,7 +83,7 @@ def main():
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=args.model_name,
         max_seq_length=args.max_seq_length,
-        load_in_4bit=True,
+        load_in_4bit=args.load_in_4bit,
         fast_inference=True,              # Boot vLLM sampling engine
         gpu_memory_utilization=vllm_mem_util, # Dynamic VRAM allocation
     )
@@ -94,30 +107,26 @@ def main():
 
     def format_dataset(example):
         question = example["question"]
-        # Extract ground truth answer from GSM8K format '#### 42'
         answer = example["answer"].split("####")[-1].strip()
         prompt = [
             {
                 "role": "system",
-                "content": "Respond in the following format:\n<think>\n...\n</think>\n<answer>\n...\n</answer>",
+                "content": "You are a helpful reasoning assistant. Provide your step-by-step reasoning inside <think>...</think> and final answer inside <answer>...</answer>.",
             },
             {"role": "user", "content": question},
         ]
-        return {
-            "prompt": prompt,
-            "answer": answer,
-        }
+        return {"prompt": prompt, "answer": answer}
 
     dataset = dataset.map(format_dataset)
 
-    print("🦥 Initializing GRPOTrainer...")
+    print("🦥 Initializing GRPOTrainer with vLLM acceleration...")
     trainer = GRPOTrainer(
         model=model,
         processing_class=tokenizer,
         reward_funcs=[xml_layout_reward_func, correctness_reward_func],
         args=GRPOConfig(
             use_vllm=True,
-            vllm_gpu_memory_utilization=vllm_mem_util,  # Dynamic VRAM allocation
+            vllm_gpu_memory_utilization=vllm_mem_util,
             learning_rate=5e-6,
             adam_beta1=0.9,
             adam_beta2=0.99,
@@ -126,24 +135,25 @@ def main():
             lr_scheduler_type="cosine",
             optim="paged_adamw_8bit",
             logging_steps=1,
-            bf16=True,
-            per_device_train_batch_size=1,
-            gradient_accumulation_steps=4,
-            num_generations=8,
-            max_prompt_length=512,
-            max_completion_length=1024,
+            bf16=is_bfloat16_supported(),
+            fp16=not is_bfloat16_supported(),
+            per_device_train_batch_size=args.batch_size,
+            gradient_accumulation_steps=args.grad_accum,
+            num_generations=args.num_generations,
+            max_prompt_length=256,
+            max_completion_length=512,
             output_dir=args.output_dir,
         ),
         train_dataset=dataset,
     )
 
-    print("🦥 Starting GRPO Reasoning Training...")
+    print("🦥 Starting GRPO Reasoning Fine-Tuning...")
     trainer.train()
 
-    print(f"🦥 Saving GRPO reasoning model to {args.output_dir}...")
+    print(f"🦥 Saving trained GRPO model adapters to {args.output_dir}...")
     model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
-    print("✅ GRPO reasoning training complete!")
+    print("✅ GRPO Fine-Tuning complete!")
 
 
 if __name__ == "__main__":

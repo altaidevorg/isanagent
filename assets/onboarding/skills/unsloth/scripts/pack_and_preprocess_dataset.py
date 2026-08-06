@@ -1,10 +1,29 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "unsloth>=2025.2.1",
+#     "unsloth_zoo>=2025.2.1",
+#     "torch>=2.4.0",
+#     "transformers>=4.48.0",
+#     "peft>=0.14.0",
+#     "datasets>=3.2.0",
+#     "accelerate>=1.3.0",
+# ]
+# ///
 """
 🦥 Unsloth Dataset Sequence Packing & Preprocessing Tool
 
+GOTCHA & ATTENTION MASK WARNING:
+- Sequence packing (`packing=True`) concatenates multiple short samples into single context length windows.
+- Flash Attention variable-length kernels (`flash_attn_varlen_func`) MUST be active to avoid cross-sample attention leakage.
+  Without Flash Attention varlen masking, attention across packed document boundaries is unmasked.
+- Trade-off: Packing increases throughput (~2-3x) but may slightly degrade loss in multi-epoch runs
+  due to static sequence boundaries and reduced sample randomization across epochs.
+
 Usage:
-    uv run python pack_and_preprocess_dataset.py \
-        --model_name "unsloth/Qwen2.5-7B-Instruct" \
+    python pack_and_preprocess_dataset.py \
+        --model_name "unsloth/Qwen3.5-9B-Instruct" \
         --max_seq_length 4096 \
         --output_path "outputs/packed_dataset"
 """
@@ -20,9 +39,9 @@ from datasets import load_dataset
 
 def main():
     parser = argparse.ArgumentParser(description="Unsloth Dataset Packing & Preprocessing")
-    parser.add_argument("--model_name", type=str, default="unsloth/Qwen2.5-7B-Instruct")
+    parser.add_argument("--model_name", type=str, default="unsloth/Qwen3.5-9B-Instruct")
     parser.add_argument("--max_seq_length", type=int, default=4096)
-    parser.add_argument("--chat_template", type=str, default="qwen-2.5")
+    parser.add_argument("--override_chat_template", type=str, default=None, help="Optional fallback template name if tokenizer lacks chat_template")
     parser.add_argument("--output_path", type=str, default="outputs/packed_dataset")
     args = parser.parse_args()
 
@@ -32,7 +51,12 @@ def main():
         max_seq_length=args.max_seq_length,
         load_in_4bit=True,
     )
-    tokenizer = get_chat_template(tokenizer, chat_template=args.chat_template)
+
+    if args.override_chat_template:
+        tokenizer = get_chat_template(tokenizer, chat_template=args.override_chat_template)
+    elif not getattr(tokenizer, "chat_template", None):
+        print("⚠️ Tokenizer lacks native chat_template, falling back to chatml...")
+        tokenizer = get_chat_template(tokenizer, chat_template="chatml")
 
     print("🦥 Loading sample dataset...")
     dataset = load_dataset("philschmid/dolly-15k-curated-en", split="train[:500]")
@@ -52,7 +76,7 @@ def main():
 
     formatted_dataset = dataset.map(format_prompts, batched=True)
 
-    print(f"🦥 Formatted {len(formatted_dataset)} samples into chat template format.")
+    print(f"🦥 Formatted {len(formatted_dataset)} samples using native chat template.")
     print(f"Sample formatted text:\n{formatted_dataset[0]['text'][:300]}...")
 
     print(f"🦥 Saving preprocessed dataset to {args.output_path}...")

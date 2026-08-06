@@ -1,10 +1,23 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "unsloth>=2025.2.1",
+#     "unsloth_zoo>=2025.2.1",
+#     "torch>=2.4.0",
+#     "transformers>=4.48.0",
+#     "peft>=0.14.0",
+#     "trl>=0.14.0",
+#     "datasets>=3.2.0",
+#     "accelerate>=1.3.0",
+# ]
+# ///
 """
 🦥 Unsloth Direct Preference Optimization (DPO) Fine-Tuning Script
 
 Usage:
-    uv run python finetune_dpo.py \
-        --model_name "unsloth/Qwen2.5-7B-Instruct" \
+    python finetune_dpo.py \
+        --model_name "unsloth/Qwen3.5-9B-Instruct" \
         --output_dir "outputs/dpo_model"
 """
 
@@ -20,9 +33,9 @@ from trl import DPOTrainer, DPOConfig
 
 def main():
     parser = argparse.ArgumentParser(description="Unsloth DPO Fine-Tuning Pipeline")
-    parser.add_argument("--model_name", type=str, default="unsloth/Qwen2.5-7B-Instruct")
+    parser.add_argument("--model_name", type=str, default="unsloth/Qwen3.5-9B-Instruct")
     parser.add_argument("--max_seq_length", type=int, default=2048)
-    parser.add_argument("--load_in_4bit", action="store_true", default=True)
+    parser.add_argument("--load_in_4bit", action=argparse.BooleanOptionalAction, default=True, help="Enable 4-bit NF4 QLoRA quantization")
     parser.add_argument("--r", type=int, default=16)
     parser.add_argument("--beta", type=float, default=0.1, help="DPO temperature scaling parameter")
     parser.add_argument("--batch_size", type=int, default=2)
@@ -62,7 +75,7 @@ def main():
     print("🦥 Initializing DPOTrainer...")
     trainer = DPOTrainer(
         model=model,
-        ref_model=None,  # Unsloth automatically handles reference model implicitly
+        ref_model=None,  # Unsloth computes reference logits on-the-fly, saving ~5.5GB VRAM
         processing_class=tokenizer,
         train_dataset=dataset,
         args=DPOConfig(

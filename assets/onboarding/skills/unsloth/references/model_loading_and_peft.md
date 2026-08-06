@@ -36,7 +36,7 @@ Unsloth provides optimized model wrappers that patch Hugging Face Transformers a
 from unsloth import FastLanguageModel
 
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name = "unsloth/Qwen2.5-7B-Instruct",
+    model_name = "unsloth/Qwen3.5-9B-Instruct",
     max_seq_length = 8192,
     dtype = None,           # Auto-select bf16 if supported, else fp16
     load_in_4bit = True,    # 4-bit NF4 QLoRA
@@ -61,7 +61,7 @@ Unsloth replaces default PEFT/LoRA modules with custom Triton fused kernels for 
 | `r` | `int` | `16` | LoRA rank dimension. Recommended values: 8, 16, 32, 64, 128. |
 | `target_modules` | `list[str]` | `["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]` | Modules to attach LoRA adapters to. Target all 7 linear layers for maximum capacity. |
 | `lora_alpha` | `int` | `16` | LoRA scaling factor. Usually set equal to `r` or `2 * r`. |
-| `lora_dropout` | `float` | `0.0` | Dropout probability. **Set to `0.0`** for optimal speed (enables Triton fused path). |
+| `lora_dropout` | `float` | `0.0` | Dropout probability. **`0.0`** is recommended for optimal speed and VRAM savings (enables Triton fused path). Non-zero dropout (e.g. `0.05`) is supported and recommended if overfitting occurs on small datasets. |
 | `bias` | `str` | `"none"` | Bias fine-tuning strategy (`"none"`, `"all"`, `"lora_only"`). Always use `"none"` unless necessary. |
 | `use_gradient_checkpointing` | `str` / `bool` | `"unsloth"` | Gradient checkpointing method (`"unsloth"`, `"unsloth_offload"`, `True`, `False`). `"unsloth"` recomputes activations using fused kernels, saving 80% VRAM. |
 | `use_rslora` | `bool` | `False` | Enables Rank-Stabilized LoRA (`lora_alpha / sqrt(r)` scaling). Prevents instability at high ranks. |

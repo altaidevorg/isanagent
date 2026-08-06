@@ -1,6 +1,6 @@
 # Unsloth Comprehensive Troubleshooting, Gotchas, and Best Practices Guide
 
-This guide documents common operational failure modes, NaN loss diagnosis, precision rules, CUDA linker fixes, vLLM memory conflicts, Tesla T4 FlashInfer gotchas, DDP multi-GPU traps, 16GB VRAM optimization recipes, and debugging strategies in **Unsloth**.
+This guide documents common operational failure modes, NaN loss diagnosis, precision rules, CUDA linker fixes, vLLM memory conflicts, Tesla T4 FlashInfer gotchas, DDP multi-GPU traps, 16GB VRAM optimization recipes, sequence packing gotchas, chat template selection, and debugging strategies in **Unsloth**.
 
 ---
 
@@ -89,7 +89,7 @@ Let Unsloth's `prepare_device_map()` assign local ranks automatically:
 # uv run torchrun --nproc_per_node=2 scripts/finetune_sft.py
 
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name = "unsloth/Qwen2.5-7B-Instruct",
+    model_name = "unsloth/Qwen3.5-9B-Instruct",
     device_map = "sequential", # Unsloth automatically remaps to local rank in DDP
     load_in_4bit = True,
 )
@@ -99,188 +99,44 @@ model, tokenizer = FastLanguageModel.from_pretrained(
 
 ## 5. Gradient Checkpointing & Input Require Grads Error
 
-### Symptom: `RuntimeError: Element 0 of tensors does not require grad and does not have a grad_fn`.
+### Symptom: `RuntimeError: element 0 of tensors does not require grad and does not have a grad_fn`.
 
 #### Cause:
-Quantized 4-bit base model parameters frozen without enabling input gradients before attaching LoRA adapters.
+Input token embeddings were not enabled for gradient computation prior to starting backward pass.
 
 #### Fix:
-Unsloth handles this automatically inside `get_peft_model`. If writing custom training loops outside `SFTTrainer`, call:
-
-```python
-model.enable_input_require_grads()
-```
+Use `FastLanguageModel.get_peft_model(..., use_gradient_checkpointing = "unsloth")`. Unsloth automatically calls `enable_input_require_grads()`.
 
 ---
 
-## 6. vLLM Engine VRAM Allocation Conflicts in GRPO / Inference
+## 6. Sequence Packing Cross-Sample Attention Leakage & Multi-Epoch Trade-off
 
-### Symptom: CUDA Out-Of-Memory (OOM) during vLLM initialization (`fast_inference=True` or `GRPOTrainer(use_vllm=True)`).
+### Symptom: Unexpected validation loss behavior or model outputting mixed content across conversation boundaries when `packing = True`.
 
 #### Cause:
-By default, vLLM pre-allocates 90% of free GPU VRAM for KV cache blocks, leaving insufficient VRAM for PyTorch model gradients and optimizer states.
+Sequence packing concatenates multiple text items into a single context length window.
+1. **Attention Leakage**: If Flash Attention variable-length kernels (`flash_attn_varlen_func`) are inactive, standard SDPA or eager attention applies a single causal mask across the entire concatenated sequence. Token 1 of Sample 2 attends to token 500 of Sample 1!
+2. **Multi-Epoch Degredation**: Concatenating samples statically reduces inter-sample randomization and RoPE position embedding diversity across epochs.
 
 #### Fix:
-Limit vLLM GPU memory utilization to 40-50% when co-locating training and generation on the same GPU:
-
-```python
-# For FastLanguageModel loading:
-model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name = "unsloth/Qwen2.5-Math-7B-Instruct",
-    fast_inference = True,
-    gpu_memory_utilization = 0.4, # Reserve VRAM for training gradients
-)
-
-# For GRPOConfig:
-args = GRPOConfig(
-    use_vllm = True,
-    vllm_gpu_memory_utilization = 0.4,
-)
-```
+1. Ensure Flash Attention varlen masking is enabled before using `packing = True`.
+2. For multi-epoch runs, prefer unpacked SFT training with dynamic sequence batching (`packing = False`).
 
 ---
 
-## 7. Tesla T4 GPU & FlashInfer Compatibility (GRPO / vLLM)
+## 7. `get_chat_template()` Overwriting Native Tokenizer Templates
 
-### Symptom: vLLM initialization fails or crashes with FlashInfer kernel errors on Tesla T4 GPUs (Colab / Kaggle).
+### Symptom: Tokenizer outputs wrong special tokens (e.g. missing `<|im_end|>` or broken `<|eot_id|>`).
 
 #### Cause:
-Tesla T4 GPUs (compute capability 7.5) do not support FlashInfer's optimized top-p/top-k sampling kernels, which vLLM attempts to load by default.
+Modern Hugging Face tokenizers (Qwen 3.5, Llama 3.3, Gemma 4) ship with native `tokenizer.chat_template`. Applying `get_chat_template(tokenizer, chat_template="...")` unnecessarily can overwrite official chat templates.
 
 #### Fix:
-Disable FlashInfer by setting `UNSLOTH_VLLM_NO_FLASHINFER="1"` before importing `unsloth`:
-
-```python
-import os
-os.environ["UNSLOTH_VLLM_NO_FLASHINFER"] = "1"
-
-import unsloth
-from unsloth import FastLanguageModel
-```
+Use native `tokenizer.apply_chat_template` directly out of the box. Use `get_chat_template()` **only** as a fallback when `tokenizer.chat_template` is missing or when explicitly converting a custom dataset format.
 
 ---
 
-## 8. CUDA Runtime Shared Library Path Resolution (Colab VM)
-
-### Symptom: PyTorch / vLLM fails to locate `libcudart.so` or `nvidia/cuXX/lib` runtime libraries on Colab or Linux VMs.
-
-#### Cause:
-CUDA shared libraries installed inside Python site-packages are missing from system `LD_LIBRARY_PATH`.
-
-#### Fix:
-Append `nvidia/cuXX/lib` to `LD_LIBRARY_PATH` at the top of your Python script:
-
-```python
-import os
-import sys
-# Automatically locate nvidia CUDA lib directory inside python site-packages
-for p in sys.path:
-    nvidia_path = os.path.join(p, "nvidia")
-    if os.path.isdir(nvidia_path):
-        for sub in os.listdir(nvidia_path):
-            lib_dir = os.path.join(nvidia_path, sub, "lib")
-            if os.path.isdir(lib_dir):
-                os.environ["LD_LIBRARY_PATH"] = os.environ.get("LD_LIBRARY_PATH", "") + ":" + lib_dir
-```
-
----
-
-## 9. `colab-cli` AttributeError with `jupyter_kernel_client`
-
-### Symptom: `colab-cli` fails with `AttributeError: module 'jupyter_kernel_client' has no attribute 'KernelClient'`.
-
-#### Cause:
-`jupyter_kernel_client` 1.0.0+ renamed `KernelClient` to `JupyterKernelClient`.
-
-#### Fix:
-Downgrade `jupyter_kernel_client` or alias `KernelClient = JupyterKernelClient` before importing `colab_cli`.
-
----
-
-## 10. 16GB VRAM (Tesla T4 / RTX 4060Ti) Guarantee Recipe
-
-To guarantee zero OOM errors when fine-tuning 7B models on 16GB VRAM GPUs:
-
-1. **Gradient Accumulation**: Set `per_device_train_batch_size = 1` and increase `gradient_accumulation_steps = 8` or `16`.
-2. **Zero Dropout (`lora_dropout = 0.0`)**: Crucial because Unsloth's Triton custom fused kernels (which eliminate intermediate activation caching and save ~80% VRAM) require `lora_dropout = 0.0`.
-3. **Sequence Length**: Keep `max_seq_length = 1024` or `2048`.
-4. **Implicit Reference Model in DPO**: Always set `ref_model = None` in `DPOTrainer`. Unsloth computes reference logits on-the-fly, saving ~5.5 GB of VRAM.
-
----
-
-## 11. Broken Compiled Extensions (`causal_conv1d`, `vllm`, `fbgemm_gpu`)
-
-### Symptom: `ImportError: undefined symbol` or C++ extension segfaults on startup.
-
-#### Cause:
-Mismatched PyTorch, CUDA, or C++ ABI versions in pre-built binary wheels.
-
-#### Fix:
-Unsloth detects and disables broken C++ extensions automatically (`disable_broken_vllm()`). Re-install clean builds with `uv`:
-
-```bash
-uv pip install --upgrade --force-reinstall --no-cache-dir unsloth unsloth_zoo
-```
-
----
-
-## 12. RNG Checkpoint Resume Crashes in TRL
-
-### Symptom: `RuntimeError: Expected all tensors to be on the same device` or unpickling failure when resuming training from a checkpoint (`resume_from_checkpoint=True`).
-
-#### Cause:
-TRL's default RNG state saver attempts to reload CUDA RNG states for quantized model buffers across mismatched device IDs.
-
-#### Fix:
-Unsloth applies `patch_unsafe_trainer_rng_load()` automatically. If using custom Trainer callbacks, set `ignore_data_skip=True` in `SFTConfig`.
-
----
-
-## 13. Apple Silicon MLX Metal Context Timeout & MPS Errors
-
-### Symptom: Metal command buffer timeout or crash on M1/M2/M3/M4 Macs.
-
-#### Cause:
-AGX Metal CDM context store timeout during long generation loops.
-
-#### Fix:
-Unsloth sets `AGX_RELAX_CDM_CTXSTORE_TIMEOUT=1` automatically at import time. On macOS, ensure you do not pass `device_map="cuda"` or `.to("cuda")` in user code.
-
----
-
-## 14. WandB / TensorBoard Logging Deadlocks in Multi-GPU Jobs
-
-### Symptom: Training process hangs indefinitely at step 0 during logger initialization under `torchrun`.
-
-#### Cause:
-WandB service child process deadlocking when spawned under PyTorch DDP multiprocessing.
-
-#### Fix:
-Use `report_to="tensorboard"` or set `WANDB_START_METHOD="thread"` in your shell environment:
-
-```bash
-export WANDB_START_METHOD="thread"
-```
-
----
-
-## 15. GGUF Export Missing Tokenizer / Special Tokens
-
-### Symptom: `llama.cpp` error: `invalid token id` or missing chat template in exported GGUF file.
-
-#### Cause:
-Calling `save_pretrained_gguf` on a model without passing the associated `tokenizer` object.
-
-#### Fix:
-Always pass `tokenizer` as the second argument:
-
-```python
-model.save_pretrained_gguf("model_gguf", tokenizer, quantization_method = "q4_k_m")
-```
-
----
-
-## 16. Out-Of-Memory (OOM) Recovery Checklist
+## 8. Out-Of-Memory (OOM) Recovery Checklist
 
 If training crashes with `torch.cuda.OutOfMemoryError`:
 
