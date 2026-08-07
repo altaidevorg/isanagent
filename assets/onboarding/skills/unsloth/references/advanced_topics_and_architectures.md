@@ -55,13 +55,13 @@ trainer.train()
 ## 2. Advanced Memory Optimizations
 
 ### Tiled MLP (`unsloth_tiled_mlp=True`)
-For models with very large intermediate MLP dimensions (e.g. Llama 3 70B, Qwen 2.5 72B), intermediate activation memory during SwiGLU / GeGLU forward passes can dominate VRAM.
+For models with very large intermediate MLP dimensions, intermediate activation memory during SwiGLU / GeGLU forward passes can dominate VRAM.
 
 Unsloth tiles MLP projections across chunked sequence dimensions:
 
 ```python
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name = "unsloth/Qwen2.5-72B-Instruct-bnb-4bit",
+    model_name = "unsloth/Qwen3-32B-bnb-4bit",
     max_seq_length = 8192,
     load_in_4bit = True,
     unsloth_tiled_mlp = True, # Tiles MLP activations to save 30-40% peak VRAM
@@ -96,7 +96,7 @@ QAT simulates 4-bit / 8-bit quantization noise during training forward passes wh
 
 ```python
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name = "unsloth/Qwen2.5-7B-Instruct",
+    model_name = "unsloth/Qwen3-8B",
     load_in_4bit = False,
     qat_scheme = "int4", # Enables QAT simulation
 )

@@ -19,32 +19,32 @@ Agents executing fine-tuning tasks MUST follow this step-by-step operational wor
 ```
 
 ### Step 1: Preflight Environment Inspection
-Run `python3 scripts/doctor.py` to inspect OS, accelerator hardware, VRAM, package versions, and bfloat16 support before configuring fine-tuning.
+Run `scripts/doctor.py` to inspect OS, accelerator hardware, VRAM, package versions, and bfloat16 support before configuring fine-tuning.
 
 ### Step 2: Dataset Audit
-Run `python3 scripts/audit_dataset.py --max_seq_length 4096` to check dataset schema compliance, turn integrity, token length percentiles, and truncation rate.
+Run `scripts/audit_dataset.py --max_seq_length 4096` to check dataset schema compliance, turn integrity, token length percentiles, and truncation rate.
 
 ### Step 3: Run Planning & Calibration
-Run `python3 scripts/plan_run.py --workflow <sft|dpo|grpo> --vram_gb <16|24|80>` to calculate batch sizes, gradient accumulation steps, and verify GRPO divisibility (`effective_batch_size % num_generations == 0`).
+Run `scripts/plan_run.py --workflow <sft|dpo|grpo> --vram_gb <16|24|80>` to calculate batch sizes, gradient accumulation steps, and verify GRPO divisibility (`effective_batch_size % num_generations == 0`).
 
 ### Step 4: Execute Fine-Tuning Script
 Copy and run the appropriate workflow script with `--help` flag check first:
-- **Supervised Fine-Tuning**: `python3 scripts/finetune_sft.py --help`
-- **Tool-Calling Agent Tuning**: `python3 scripts/finetune_tool_calling.py --help`
-- **GRPO Reasoning RL**: `python3 scripts/finetune_grpo_reasoning.py --help`
-- **DPO Preference Fine-Tuning**: `python3 scripts/finetune_dpo.py --help`
-- **Vision-Language Model**: `python3 scripts/finetune_vision.py --help`
-- **Sentence Transformer**: `python3 scripts/finetune_embedding.py --help`
+- **Supervised Fine-Tuning**: Run `scripts/finetune_sft.py --help`
+- **Tool-Calling Agent Tuning**: Run `scripts/finetune_tool_calling.py --help`
+- **GRPO Reasoning RL**: Run `scripts/finetune_grpo_reasoning.py --help`
+- **DPO Preference Fine-Tuning**: Run `scripts/finetune_dpo.py --help`
+- **Vision-Language Model**: Run `scripts/finetune_vision.py --help`
+- **Sentence Transformer**: Run `scripts/finetune_embedding.py --help`
 
 ### Step 5: Verification & Export
-Evaluate model outputs, test reward functions (`python3 scripts/test_rewards.py`), profile performance (`python3 scripts/benchmark_memory_speed.py`), and export GGUF / merged weights (`python3 scripts/export_gguf_ollama.py`).
+Evaluate model outputs, test reward functions with `scripts/test_rewards.py`, profile performance with `scripts/benchmark_memory_speed.py`, and export GGUF / merged weights with `scripts/export_gguf_ollama.py`.
 
 ---
 
 ## Core Operational Rules
 
-1. **Inline Script Metadata (PEP 723)**: Standalone scripts contain PEP 723 metadata (`# /// script ... # ///`). Execute with `uv run python <script.py>` for automatic dependency resolution.
-2. **Model Freshness**: Use up-to-date defaults (`Qwen3.5-9B-Instruct`, `gemma-4-9b-it`, `Qwen3.6-35B-Instruct` for 27B+ models). Check Hugging Face Hub for fresh versions unless a specific model is explicitly requested.
+1. **Inline Script Metadata (PEP 723)**: Standalone scripts contain PEP 723 metadata (`# /// script ... # ///`). Use your environment's appropriate script runner (`uv`, `python`, `cinderflow exec`, etc.) for automatic dependency resolution.
+2. **Model Freshness**: Use up-to-date defaults (`Qwen3-8B` for text LLMs, `gemma-4-12b-it`, `Qwen3.6-27B` for 27B+ models). Check Hugging Face Hub for fresh versions unless a specific model is explicitly requested.
 3. **Native Chat Templates**: Prioritize `tokenizer.apply_chat_template(...)` directly out of the box. Use `get_chat_template()` only as a fallback when native chat templates are missing.
 4. **LoRA Dropout**: `lora_dropout=0.0` is recommended for Triton fused kernel acceleration and VRAM savings, but non-zero dropout (e.g. `0.05`) is supported and recommended when overfitting occurs.
 5. **Sequence Packing Gotchas**: Enable `packing=True` only when Flash Attention variable-length kernels (`flash_attn_varlen_func`) are active to prevent cross-sample attention leakage.

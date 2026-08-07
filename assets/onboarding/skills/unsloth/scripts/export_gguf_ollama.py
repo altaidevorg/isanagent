@@ -2,12 +2,12 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#     "unsloth>=2025.2.1",
-#     "unsloth_zoo>=2025.2.1",
-#     "torch>=2.4.0",
-#     "transformers>=4.48.0",
-#     "peft>=0.14.0",
-#     "huggingface-hub>=0.20.0",
+#     "unsloth>=2026.8.0",
+#     "unsloth_zoo>=2026.8.0",
+#     "torch>=2.13.0",
+#     "transformers>=5.14.1",
+#     "peft>=0.20.0",
+#     "huggingface-hub>=1.26.1",
 # ]
 # ///
 """

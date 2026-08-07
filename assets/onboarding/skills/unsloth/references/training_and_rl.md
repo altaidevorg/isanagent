@@ -19,6 +19,36 @@ Unsloth patches TRL's `SFTTrainer` and Hugging Face's `TrainingArguments` into `
 | `learning_rate` | `2e-4` (LoRA) / `2e-5` (Full) | Recommended default learning rate for 4-bit QLoRA. |
 | `fp16` / `bf16` | `bf16=True` on Ampere+ | Use `bf16` whenever supported for stable gradient norms. |
 
+### Code Example: Standard SFT Setup (TRL Standard Signature)
+```python
+from trl import SFTTrainer, SFTConfig
+from unsloth import FastLanguageModel, is_bfloat16_supported
+
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name = "unsloth/Qwen3-8B",
+    max_seq_length = 4096,
+    load_in_4bit = True,
+)
+
+trainer = SFTTrainer(
+    model = model,
+    processing_class = tokenizer,  # TRL standard parameter name
+    train_dataset = dataset,
+    args = SFTConfig(
+        dataset_text_field = "text",
+        max_length = 4096,
+        packing = False,
+        per_device_train_batch_size = 2,
+        gradient_accumulation_steps = 4,
+        learning_rate = 2e-4,
+        fp16 = not is_bfloat16_supported(),
+        bf16 = is_bfloat16_supported(),
+        output_dir = "outputs/sft_model",
+    ),
+)
+trainer.train()
+```
+
 ---
 
 ## 2. Reinforcement Learning via GRPO (DeepSeek R1 Reasoning)
@@ -34,8 +64,8 @@ Unsloth patches TRL's `GRPOTrainer` with `PatchFastRL("GRPO", FastLanguageModel)
 > [!IMPORTANT]
 > **Tesla T4 / Turing GPU Compatibility**: On Tesla T4 GPUs (compute capability 7.5), FlashInfer sampling kernels cause vLLM initialization failures. Disable FlashInfer by setting `os.environ["UNSLOTH_VLLM_NO_FLASHINFER"] = "1"` before importing `unsloth`.
 
-> [!NOTE]
-> **TRL Parameter Compatibility**: In TRL v0.15+, `GRPOTrainer` uses `processing_class=tokenizer` instead of `tokenizer=tokenizer`.
+> [!IMPORTANT]
+> **TRL GRPO Divisibility Rule**: Effective batch size (`per_device_train_batch_size * gradient_accumulation_steps`) MUST be divisible by `num_generations` (e.g. $1 \times 8 = 8 \pmod 8 == 0$).
 
 ### Step-by-Step GRPO Workflow
 
@@ -43,25 +73,22 @@ Unsloth patches TRL's `GRPOTrainer` with `PatchFastRL("GRPO", FastLanguageModel)
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#     "unsloth",
-#     "unsloth_zoo",
-#     "trl",
-#     "transformers",
-#     "peft",
-#     "datasets",
-#     "accelerate",
-#     "torch",
-#     "vllm",
+#     "unsloth>=2026.8.0",
+#     "unsloth_zoo>=2026.8.0",
+#     "trl>=1.9.2",
+#     "transformers>=5.14.1",
+#     "peft>=0.20.0",
+#     "datasets>=5.0.1",
+#     "accelerate>=1.14.0",
+#     "torch>=2.13.0",
+#     "vllm>=0.26.0",
 # ]
 # ///
 
 import os
-# Disable FlashInfer on Tesla T4 / Turing GPUs (compute capability 7.5)
-os.environ["UNSLOTH_VLLM_NO_FLASHINFER"] = "1"
-
 import re
 import torch
-from unsloth import FastLanguageModel, PatchFastRL
+from unsloth import FastLanguageModel, PatchFastRL, is_bfloat16_supported
 from trl import GRPOTrainer, GRPOConfig
 
 # 1. Patch TRL GRPOTrainer with Unsloth Fused Kernels
@@ -69,8 +96,8 @@ PatchFastRL("GRPO", FastLanguageModel)
 
 # 2. Load Model & Tokenizer with Fast vLLM Inference & VRAM Allocation Limit
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name = "unsloth/Qwen2.5-Math-7B-Instruct",
-    max_seq_length = 1024,
+    model_name = "unsloth/Qwen3-8B",
+    max_seq_length = 2048,
     load_in_4bit = True,
     fast_inference = True,       # Boot vLLM sampling engine
     gpu_memory_utilization = 0.4, # Reserve VRAM for training gradients
@@ -81,36 +108,36 @@ model = FastLanguageModel.get_peft_model(
     r = 16,
     target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     lora_alpha = 16,
+    lora_dropout = 0.0,
+    bias = "none",
     use_gradient_checkpointing = "unsloth",
 )
 
 # 3. Define Group Reward Functions
 def xml_layout_reward_func(completions, **kwargs):
-    """Reward completion if it follows <think>...</think><answer>...</answer> structure."""
     pattern = r"^<think>.*?</think>\s*<answer>.*?</answer>$"
     rewards = []
     for completion in completions:
-        text = completion[0]["content"]
+        text = completion[0]["content"] if isinstance(completion, list) else str(completion)
         rewards.append(1.0 if re.match(pattern, text, re.DOTALL) else 0.0)
     return rewards
 
 def math_answer_reward_func(prompts, completions, answer, **kwargs):
-    """Reward completion if extracted answer matches ground truth."""
     rewards = []
     for completion, target in zip(completions, answer):
-        text = completion[0]["content"]
+        text = completion[0]["content"] if isinstance(completion, list) else str(completion)
         extracted = text.split("<answer>")[-1].split("</answer>")[0].strip() if "<answer>" in text else ""
         rewards.append(2.0 if extracted == str(target).strip() else 0.0)
     return rewards
 
-# 4. Configure GRPO Trainer
+# 4. Configure GRPO Trainer (Effective batch 1 * 8 = 8 is divisible by num_generations = 8)
 trainer = GRPOTrainer(
     model = model,
-    processing_class = tokenizer, # TRL v0.15+ parameter name
+    processing_class = tokenizer,
     reward_funcs = [xml_layout_reward_func, math_answer_reward_func],
     args = GRPOConfig(
         use_vllm = True,
-        vllm_gpu_memory_utilization = 0.4, # Limit vLLM VRAM usage to prevent OOM
+        vllm_gpu_memory_utilization = 0.4,
         learning_rate = 5e-6,
         adam_beta1 = 0.9,
         adam_beta2 = 0.99,
@@ -119,10 +146,11 @@ trainer = GRPOTrainer(
         lr_scheduler_type = "cosine",
         optim = "paged_adamw_8bit",
         logging_steps = 1,
-        bf16 = True,
+        bf16 = is_bfloat16_supported(),
+        fp16 = not is_bfloat16_supported(),
         per_device_train_batch_size = 1,
-        gradient_accumulation_steps = 4,
-        num_generations = 8,          # Number of completion samples per prompt
+        gradient_accumulation_steps = 8,  # 1 * 8 = 8 % 8 == 0
+        num_generations = 8,
         max_prompt_length = 256,
         max_completion_length = 512,
         output_dir = "outputs/GRPO",
@@ -140,38 +168,30 @@ trainer.train()
 DPO optimizes preferences directly on prompt-chosen-rejected pairs without needing a reward model.
 
 ```python
-from unsloth import FastLanguageModel, PatchFastRL
+from unsloth import FastLanguageModel, PatchFastRL, is_bfloat16_supported
 from trl import DPOTrainer, DPOConfig
 
 PatchFastRL("DPO", FastLanguageModel)
 
 trainer = DPOTrainer(
     model = model,
-    ref_model = None, # Unsloth automatically handles reference model implicitly
-    tokenizer = tokenizer,
+    ref_model = None, # Unsloth automatically handles reference model implicitly (~5.5GB VRAM saved)
+    processing_class = tokenizer,
     train_dataset = dataset,
     args = DPOConfig(
         per_device_train_batch_size = 2,
         gradient_accumulation_steps = 4,
         warmup_ratio = 0.1,
-        beta = 0.1, # DPO temperature scaling
+        beta = 0.1,
+        max_prompt_length = 512,
+        max_length = 2048,
+        learning_rate = 5e-6,
         logging_steps = 1,
         optim = "adamw_8bit",
-        output_dir = "outputs/DPO",
+        fp16 = not is_bfloat16_supported(),
+        bf16 = is_bfloat16_supported(),
+        output_dir = "outputs/dpo_model",
     ),
 )
 trainer.train()
 ```
-
----
-
-## 4. VRAM Reduction Checklist
-
-If encountering CUDA Out-Of-Memory (OOM) errors during training:
-1. Ensure `load_in_4bit = True` is set.
-2. Set `use_gradient_checkpointing = "unsloth"` in `get_peft_model`.
-3. Set `optim = "adamw_8bit"` or `"paged_adamw_8bit"`.
-4. Set `per_device_train_batch_size = 1` and increase `gradient_accumulation_steps`.
-5. Set `lora_dropout = 0.0` to enable Triton fused path.
-6. Enable `packing = True` in `SFTTrainer` to reduce padding token overhead.
-7. Limit vLLM memory: `gpu_memory_utilization = 0.4` and `vllm_gpu_memory_utilization = 0.4`.

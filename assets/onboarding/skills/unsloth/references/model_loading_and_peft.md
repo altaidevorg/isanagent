@@ -10,7 +10,7 @@ Unsloth provides optimized model wrappers that patch Hugging Face Transformers a
 
 ### Key Entrypoint APIs
 - `FastLanguageModel.from_pretrained(...)`: For Causal Language Models (Llama 3, Qwen 2.5, DeepSeek, Gemma 2/3, Mistral, Granite, Cohere, etc.).
-- `FastVisionModel.from_pretrained(...)`: For Vision-Language Models (Qwen2-VL, Llama-3.2-Vision, Pixtral, etc.).
+- `FastVisionModel.from_pretrained(...)`: For Vision-Language Models (Qwen2.5-VL, Llama-3.2-Vision, Pixtral, etc.).
 - `FastModel.from_pretrained(...)`: Base polymorphic entrypoint.
 
 ### Parameters of `from_pretrained`
@@ -36,7 +36,7 @@ Unsloth provides optimized model wrappers that patch Hugging Face Transformers a
 from unsloth import FastLanguageModel
 
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name = "unsloth/Qwen3.5-9B-Instruct",
+    model_name = "unsloth/Qwen3-8B",
     max_seq_length = 8192,
     dtype = None,           # Auto-select bf16 if supported, else fp16
     load_in_4bit = True,    # 4-bit NF4 QLoRA

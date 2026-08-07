@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#     "datasets>=3.2.0",
+#     "datasets>=5.0.1",
 # ]
 # ///
 """

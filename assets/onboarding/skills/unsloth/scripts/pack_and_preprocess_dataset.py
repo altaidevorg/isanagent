@@ -2,13 +2,13 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#     "unsloth>=2025.2.1",
-#     "unsloth_zoo>=2025.2.1",
-#     "torch>=2.4.0",
-#     "transformers>=4.48.0",
-#     "peft>=0.14.0",
-#     "datasets>=3.2.0",
-#     "accelerate>=1.3.0",
+#     "unsloth>=2026.8.0",
+#     "unsloth_zoo>=2026.8.0",
+#     "torch>=2.13.0",
+#     "transformers>=5.14.1",
+#     "peft>=0.20.0",
+#     "datasets>=5.0.1",
+#     "accelerate>=1.14.0",
 # ]
 # ///
 """
@@ -23,7 +23,7 @@ GOTCHA & ATTENTION MASK WARNING:
 
 Usage:
     python pack_and_preprocess_dataset.py \
-        --model_name "unsloth/Qwen3.5-9B-Instruct" \
+        --model_name "unsloth/Qwen3-8B" \
         --max_seq_length 4096 \
         --output_path "outputs/packed_dataset"
 """
@@ -39,7 +39,7 @@ from datasets import load_dataset
 
 def main():
     parser = argparse.ArgumentParser(description="Unsloth Dataset Packing & Preprocessing")
-    parser.add_argument("--model_name", type=str, default="unsloth/Qwen3.5-9B-Instruct")
+    parser.add_argument("--model_name", type=str, default="unsloth/Qwen3-8B")
     parser.add_argument("--max_seq_length", type=int, default=4096)
     parser.add_argument("--override_chat_template", type=str, default=None, help="Optional fallback template name if tokenizer lacks chat_template")
     parser.add_argument("--output_path", type=str, default="outputs/packed_dataset")

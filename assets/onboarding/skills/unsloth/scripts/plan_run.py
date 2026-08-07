@@ -61,7 +61,7 @@ def plan_training_run(model_name, workflow, vram_gb, max_seq_length, num_generat
 
 def main():
     parser = argparse.ArgumentParser(description="Unsloth Training Run Planner")
-    parser.add_argument("--model_name", type=str, default="unsloth/Qwen3.5-9B-Instruct")
+    parser.add_argument("--model_name", type=str, default="unsloth/Qwen3-8B")
     parser.add_argument("--workflow", choices=["sft", "dpo", "grpo"], default="sft")
     parser.add_argument("--vram_gb", type=float, default=16.0)
     parser.add_argument("--max_seq_length", type=int, default=4096)

@@ -2,15 +2,15 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#     "unsloth>=2025.2.1",
-#     "unsloth_zoo>=2025.2.1",
-#     "torch>=2.4.0",
-#     "transformers>=4.48.0",
-#     "peft>=0.14.0",
-#     "trl>=0.14.0",
-#     "datasets>=3.2.0",
-#     "accelerate>=1.3.0",
-#     "vllm>=0.7.0",
+#     "unsloth>=2026.8.0",
+#     "unsloth_zoo>=2026.8.0",
+#     "torch>=2.13.0",
+#     "transformers>=5.14.1",
+#     "peft>=0.20.0",
+#     "trl>=1.9.2",
+#     "datasets>=5.0.1",
+#     "accelerate>=1.14.0",
+#     "vllm>=0.26.0",
 # ]
 # ///
 
@@ -55,7 +55,7 @@ def correctness_reward_func(prompts, completions, answer, **kwargs):
 
 def main():
     parser = argparse.ArgumentParser(description="Unsloth GRPO Reasoning RL Pipeline")
-    parser.add_argument("--model_name", type=str, default="unsloth/Qwen3.5-Math-9B-Instruct")
+    parser.add_argument("--model_name", type=str, default="unsloth/Qwen3-8B")
     parser.add_argument("--max_seq_length", type=int, default=2048)
     parser.add_argument("--load_in_4bit", action=argparse.BooleanOptionalAction, default=True, help="Enable 4-bit NF4 quantization")
     parser.add_argument("--batch_size", type=int, default=1, help="Per device train batch size")

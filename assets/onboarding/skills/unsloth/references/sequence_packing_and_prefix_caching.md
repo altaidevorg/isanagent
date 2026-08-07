@@ -37,12 +37,12 @@ from trl import SFTTrainer, SFTConfig
 # Use packing ONLY when Flash Attention varlen kernels are available
 trainer = SFTTrainer(
     model = model,
-    tokenizer = tokenizer,
+    processing_class = tokenizer,
     train_dataset = dataset,
-    dataset_text_field = "text",
-    max_seq_length = 4096,
-    packing = True, # Set True for fast text packing (Flash Attention required)
     args = SFTConfig(
+        dataset_text_field = "text",
+        max_length = 4096,
+        packing = True, # Set True for fast text packing (Flash Attention required)
         per_device_train_batch_size = 2,
         gradient_accumulation_steps = 4,
         output_dir = "outputs/packed_sft",

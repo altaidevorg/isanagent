@@ -89,7 +89,7 @@ Let Unsloth's `prepare_device_map()` assign local ranks automatically:
 # uv run torchrun --nproc_per_node=2 scripts/finetune_sft.py
 
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name = "unsloth/Qwen3.5-9B-Instruct",
+    model_name = "unsloth/Qwen3-8B",
     device_map = "sequential", # Unsloth automatically remaps to local rank in DDP
     load_in_4bit = True,
 )

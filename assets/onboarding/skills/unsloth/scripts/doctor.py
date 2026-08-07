@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#     "torch>=2.4.0",
+#     "torch>=2.13.0",
 # ]
 # ///
 """

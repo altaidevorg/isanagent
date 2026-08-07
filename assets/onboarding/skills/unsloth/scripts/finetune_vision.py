@@ -2,15 +2,15 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#     "unsloth>=2025.2.1",
-#     "unsloth_zoo>=2025.2.1",
-#     "torch>=2.4.0",
-#     "transformers>=4.48.0",
-#     "peft>=0.14.0",
-#     "trl>=0.14.0",
-#     "datasets>=3.2.0",
-#     "accelerate>=1.3.0",
-#     "pillow>=10.0.0",
+#     "unsloth>=2026.8.0",
+#     "unsloth_zoo>=2026.8.0",
+#     "torch>=2.13.0",
+#     "transformers>=5.14.1",
+#     "peft>=0.20.0",
+#     "trl>=1.9.2",
+#     "datasets>=5.0.1",
+#     "accelerate>=1.14.0",
+#     "pillow>=12.3.0",
 # ]
 # ///
 """
