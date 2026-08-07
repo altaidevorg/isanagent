@@ -549,7 +549,7 @@ fn apply_terminal_tool_aux(app: &mut App, msg: &OutboundMessage) {
 
 fn append_cell_merging_thought(cells: &mut Vec<Cell>, cell: Cell) {
     match (&cell, cells.last_mut()) {
-        (Cell::Thinking { text: new_t }, Some(Cell::Thinking { text: acc })) => {
+        (Cell::Thinking { text: new_t, .. }, Some(Cell::Thinking { text: acc, .. })) => {
             if !acc.is_empty() {
                 acc.push('\n');
             }
@@ -595,6 +595,7 @@ fn outbound_to_cell(msg: &OutboundMessage) -> Cell {
     if thought {
         Cell::Thinking {
             text: msg.content.clone(),
+            collapsed: true,
         }
     } else if tool_notify {
         let tool_call_id = msg
@@ -614,10 +615,12 @@ fn outbound_to_cell(msg: &OutboundMessage) -> Cell {
             _ => ToolNoticePhase::Other,
         };
         let content = tool_notice_display_content(msg, phase);
+        let is_finished = matches!(ph, ToolNoticePhase::Result | ToolNoticePhase::Failed);
         Cell::ToolNotice {
             phase: ph,
             content,
             tool_call_id,
+            collapsed: is_finished,
         }
     } else if clarification {
         let choices = msg
@@ -655,7 +658,7 @@ fn outbound_to_cell(msg: &OutboundMessage) -> Cell {
     }
 }
 
-fn layout_chunks(area: Rect, exec_panel_h: u16, active_tool_h: u16, input_h: u16) -> [Rect; 6] {
+fn layout_chunks(area: Rect, exec_panel_h: u16, input_h: u16) -> [Rect; 5] {
     let exec_constraint = if exec_panel_h > 0 {
         Constraint::Length(exec_panel_h)
     } else {
@@ -669,13 +672,10 @@ fn layout_chunks(area: Rect, exec_panel_h: u16, active_tool_h: u16, input_h: u16
             Constraint::Min(4),
             exec_constraint,
             Constraint::Length(1),
-            Constraint::Length(active_tool_h),
             Constraint::Length(input_h),
         ])
         .split(area);
-    [
-        chunks[0], chunks[1], chunks[2], chunks[3], chunks[4], chunks[5],
-    ]
+    [chunks[0], chunks[1], chunks[2], chunks[3], chunks[4]]
 }
 
 /// ALTAI Task Session density breakpoints (cols).
@@ -688,9 +688,9 @@ pub(crate) enum LayoutDensity {
 
 impl LayoutDensity {
     pub(crate) fn from_cols(cols: u16) -> Self {
-        if cols < 80 {
+        if cols < 70 {
             Self::Narrow
-        } else if cols < 120 {
+        } else if cols < 100 {
             Self::Medium
         } else {
             Self::Wide
@@ -1020,16 +1020,21 @@ fn build_status_line(
     app: &App,
 ) -> Line<'static> {
     let dim = Theme::dim();
-    let activity_label = if thinking {
-        format!("running {} thinking", app.get_spinner_frame())
+    let (activity_label, activity_style) = if let Some(active) = &app.active_tool_line {
+        let truncated = truncate_chars_display(active, 36);
+        (
+            format!("{} {}", app.get_spinner_frame(), truncated),
+            Theme::tool_call(),
+        )
+    } else if thinking {
+        (
+            format!("{} thinking", app.get_spinner_frame()),
+            Theme::active(),
+        )
     } else {
-        "idle".to_string()
+        ("idle".to_string(), Theme::dim())
     };
-    let activity_style = if thinking {
-        Theme::active()
-    } else {
-        Theme::dim()
-    };
+
     let mut first_row = vec![Span::styled(activity_label, activity_style)];
     if !uses_ansi_color() {
         first_row.push(Span::styled(" [plain]", Theme::dim()));
@@ -1339,6 +1344,16 @@ fn char_wrap_compose(
     let w = width.max(1);
     let mut out: Vec<Line<'static>> = Vec::new();
 
+    if input.is_empty() {
+        let placeholder = "Ask anything, or type / for commands...";
+        let text_budget = w.saturating_sub(2);
+        let truncated: String = placeholder.chars().take(text_budget).collect();
+        return vec![Line::from(vec![
+            Span::styled("> ".to_string(), prompt_style),
+            Span::styled(truncated, Theme::dim()),
+        ])];
+    }
+
     for (li, logical) in input.split('\n').enumerate() {
         let prefix: &str = if li == 0 { "> " } else { "  " };
         let prefix_w: usize = 2; // both "> " and "  " are 2 display-columns
@@ -1518,7 +1533,7 @@ fn last_copyable_text(cells: &[Cell], streaming_assistant: &str) -> Option<Strin
     // 2. Search cells in reverse for the last copyable cell.
     cells.iter().rev().find_map(|c| match c {
         Cell::Assistant { markdown } => Some(markdown.clone()),
-        Cell::Thinking { text } => Some(text.clone()),
+        Cell::Thinking { text, .. } => Some(text.clone()),
         Cell::Error { message } => Some(message.clone()),
         Cell::System { message } => Some(message.clone()),
         _ => None,
@@ -1677,6 +1692,20 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         EnableBracketedPaste,
         crossterm::cursor::Hide
     )?;
+
+    let default_panic_hook = std::sync::Arc::new(std::panic::take_hook());
+    let hook_clone = default_panic_hook.clone();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            std::io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            LeaveAlternateScreen,
+            crossterm::cursor::Show
+        );
+        hook_clone(info);
+    }));
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -2041,6 +2070,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     phase,
                     content,
                     tool_call_id,
+                    ..
                 } => {
                     app.upsert_tool_notice(tool_call_id, phase, content);
                 }
@@ -2078,8 +2108,6 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     base
                 }
             };
-            let active_strip_h: u16 = 1;
-            // Calculate visual line count accounting for wrapping at inner width.
             let compose_inner_w = area.width.saturating_sub(2).max(1) as usize; // borders
             let mut visual_lines: u16 = 0;
             for line in app.input.split('\n') {
@@ -2095,7 +2123,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 visual_lines = 1;
             }
             let input_h = (visual_lines + 2).clamp(3, 12);
-            let ch = layout_chunks(area, exec_h, active_strip_h, input_h);
+            let ch = layout_chunks(area, exec_h, input_h);
             let density = LayoutDensity::from_cols(area.width);
 
             let title_w = ch[0].width as usize;
@@ -2373,33 +2401,14 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             let status_w = Paragraph::new(status_line);
             f.render_widget(status_w, ch[3]);
 
-            let active_w = ch[4].width as usize;
-            let idle = "Idle (no running tool)";
-            let active_text = app.active_tool_line.as_deref().unwrap_or(idle);
-            let icon = if app.active_tool_line.is_some() {
-                app.get_spinner_frame().to_string()
-            } else {
-                "·".to_string()
-            };
-            let t = truncate_chars_display(active_text, active_w.max(8).saturating_sub(6));
-            let active_row = Line::from(vec![
-                Span::styled(format!(" {icon} "), Theme::tool_call()),
-                Span::styled(t, Theme::dim()),
-            ]);
-            f.render_widget(Paragraph::new(active_row), ch[4]);
-
             let input_block = Block::default()
                 .borders(Borders::ALL)
                 .title(Span::styled(" compose ", Theme::dim()))
-                .border_style(Theme::dim());
+                .border_style(Theme::border_focus());
 
-            let inner_area = ch[5].inner(Margin::new(1, 1));
+            let inner_area = ch[4].inner(Margin::new(1, 1));
             let inner_w = inner_area.width.max(1); // guard against zero-width after margin
 
-            // Build visual lines with character-level wrapping so that the cursor
-            // calculation (`total_cols / inner_w`) matches the rendered layout
-            // exactly.  Previously the code relied on ratatui's Wrap which uses
-            // word-level breaking, causing a mismatch.
             let text_lines = char_wrap_compose(
                 &app.input,
                 inner_w as usize,
@@ -2407,9 +2416,6 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 Theme::text(),
             );
 
-            // Calculate visual line of cursor for wrapping.
-            // Uses display_width (Unicode column width) instead of char count so that
-            // CJK characters and emoji that occupy two cells are measured correctly.
             let text_before_cursor = &app.input[..app.cursor];
             let mut cursor_visual_line: u16 = 0;
             let mut cursor_col_visual: u16 = 0;
@@ -2442,7 +2448,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             let input_para = Paragraph::new(Text::from(text_lines))
                 .block(input_block)
                 .scroll((input_v_scroll, 0));
-            f.render_widget(input_para, ch[5]);
+            f.render_widget(input_para, ch[4]);
 
             let cx = inner_area.x.saturating_add(cursor_col_visual);
             let cy = inner_area
@@ -2476,7 +2482,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         " Select Model (↑↓ Enter Esc) ",
                         Theme::tool_call(),
                     ))
-                    .border_style(Style::default().fg(Color::Cyan));
+                    .border_style(Theme::border_focus());
                 let inner = inner_block.inner(popup_area);
                 f.render_widget(inner_block, popup_area);
 
@@ -2497,11 +2503,9 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 {
                     let marker = if i == selector.selected { "▶ " } else { "  " };
                     let style = if i == selector.selected {
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD)
+                        Theme::active()
                     } else {
-                        Style::default().fg(Color::White)
+                        Theme::text()
                     };
                     let line_text = format!("{}{}", marker, entry.label);
                     lines.push(Line::from(Span::styled(line_text, style)));
@@ -2523,24 +2527,25 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     .collect();
                 if !matching.is_empty() {
                     let popup_h = (matching.len() as u16 + 2).min(16);
-                    let popup_w = 40u16.min(area.width.saturating_sub(4));
+                    let popup_w = 46u16.min(area.width.saturating_sub(4));
                     // Position above the compose box
-                    let popup_y = ch[5].y.saturating_sub(popup_h);
-                    let popup_x = ch[5].x + 1;
+                    let popup_y = ch[4].y.saturating_sub(popup_h);
+                    let popup_x = ch[4].x + 1;
                     let popup_area = Rect::new(popup_x, popup_y, popup_w, popup_h);
 
                     f.render_widget(Clear, popup_area);
                     let hint_block = Block::default()
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::DarkGray));
+                        .title(Span::styled(" commands ", Theme::dim()))
+                        .border_style(Theme::border());
                     let hint_inner = hint_block.inner(popup_area);
                     f.render_widget(hint_block, popup_area);
 
                     let mut lines: Vec<Line> = Vec::new();
                     for (cmd, desc) in matching.iter().take(hint_inner.height as usize) {
                         lines.push(Line::from(vec![
-                            Span::styled(format!("{cmd:<16}"), Style::default().fg(Color::Cyan)),
-                            Span::styled(*desc, Style::default().fg(Color::Gray)),
+                            Span::styled(format!("{cmd:<16}"), Theme::active()),
+                            Span::styled(*desc, Theme::dim()),
                         ]));
                     }
                     f.render_widget(Paragraph::new(Text::from(lines)), hint_inner);
@@ -3558,6 +3563,22 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                         }
                                     }
                                 } else {
+                                    if let Some(rect) = app.last_transcript_rect {
+                                        let inner_w = rect.width.saturating_sub(2) as usize;
+                                        if let Some(cell_idx) =
+                                            crate::channels::terminal_ui::panes::cell_index_at_line(
+                                                &app.cells,
+                                                sel.anchor_line,
+                                                inner_w,
+                                            )
+                                        {
+                                            if let Some(cell) = app.cells.get_mut(cell_idx) {
+                                                if cell.is_collapsible() {
+                                                    cell.toggle_collapsed();
+                                                }
+                                            }
+                                        }
+                                    }
                                     app.transcript_selection = None;
                                 }
                             }
@@ -3771,6 +3792,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         LeaveAlternateScreen,
         crossterm::cursor::Show
     )?;
+    std::panic::set_hook(Box::new(move |info| default_panic_hook(info)));
     Ok(())
 }
 
@@ -3856,10 +3878,10 @@ mod width_fit_tests {
 
     #[test]
     fn layout_density_breakpoints() {
-        assert_eq!(LayoutDensity::from_cols(79), LayoutDensity::Narrow);
-        assert_eq!(LayoutDensity::from_cols(80), LayoutDensity::Medium);
-        assert_eq!(LayoutDensity::from_cols(119), LayoutDensity::Medium);
-        assert_eq!(LayoutDensity::from_cols(120), LayoutDensity::Wide);
+        assert_eq!(LayoutDensity::from_cols(69), LayoutDensity::Narrow);
+        assert_eq!(LayoutDensity::from_cols(70), LayoutDensity::Medium);
+        assert_eq!(LayoutDensity::from_cols(99), LayoutDensity::Medium);
+        assert_eq!(LayoutDensity::from_cols(100), LayoutDensity::Wide);
     }
 
     #[test]

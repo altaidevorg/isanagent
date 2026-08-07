@@ -223,6 +223,7 @@ pub enum Cell {
     },
     Thinking {
         text: String,
+        collapsed: bool,
     },
     ToolNotice {
         phase: ToolNoticePhase,
@@ -233,6 +234,7 @@ pub enum Cell {
         /// instead of pushing two cells per call. Optional for backwards compatibility with
         /// older bus messages and synthetic notices that have no upstream id.
         tool_call_id: Option<String>,
+        collapsed: bool,
     },
     Clarification {
         text: String,
@@ -248,6 +250,28 @@ pub enum Cell {
     Error {
         message: String,
     },
+}
+
+impl Cell {
+    pub fn is_collapsible(&self) -> bool {
+        matches!(self, Cell::Thinking { .. } | Cell::ToolNotice { .. })
+    }
+
+    pub fn is_collapsed(&self) -> bool {
+        match self {
+            Cell::Thinking { collapsed, .. } => *collapsed,
+            Cell::ToolNotice { collapsed, .. } => *collapsed,
+            _ => false,
+        }
+    }
+
+    pub fn toggle_collapsed(&mut self) {
+        match self {
+            Cell::Thinking { collapsed, .. } => *collapsed = !*collapsed,
+            Cell::ToolNotice { collapsed, .. } => *collapsed = !*collapsed,
+            _ => {}
+        }
+    }
 }
 
 /// Mouse text selection state within the transcript pane.
@@ -813,6 +837,7 @@ impl App {
         if !self.streaming_thinking.is_empty() {
             self.cells.push(Cell::Thinking {
                 text: std::mem::take(&mut self.streaming_thinking),
+                collapsed: true,
             });
         }
         if !self.streaming_assistant.is_empty() {
@@ -1003,6 +1028,7 @@ impl App {
         phase: ToolNoticePhase,
         content: String,
     ) {
+        let is_finished = matches!(phase, ToolNoticePhase::Result | ToolNoticePhase::Failed);
         let id = match (tool_call_id.as_deref(), phase) {
             (Some(id), ToolNoticePhase::Result | ToolNoticePhase::Failed) if !id.is_empty() => id,
             _ => {
@@ -1010,6 +1036,7 @@ impl App {
                     phase,
                     content,
                     tool_call_id,
+                    collapsed: is_finished,
                 });
                 return;
             }
@@ -1020,6 +1047,7 @@ impl App {
                 phase: existing_phase,
                 content: existing_content,
                 tool_call_id: existing_id,
+                collapsed: existing_collapsed,
             } = cell
             {
                 if existing_id.as_deref() == Some(id) {
@@ -1045,6 +1073,9 @@ impl App {
                         };
                     *existing_phase = phase;
                     *existing_content = merged_content;
+                    if is_finished {
+                        *existing_collapsed = true;
+                    }
                     return;
                 }
             }
@@ -1054,6 +1085,7 @@ impl App {
             phase,
             content,
             tool_call_id,
+            collapsed: is_finished,
         });
     }
 }
@@ -1105,7 +1137,8 @@ mod tests {
             app.cells,
             vec![
                 Cell::Thinking {
-                    text: "plan".into()
+                    text: "plan".into(),
+                    collapsed: true,
                 },
                 Cell::Assistant {
                     markdown: "hello".into()

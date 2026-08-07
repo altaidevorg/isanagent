@@ -274,6 +274,46 @@ impl Theme {
     pub fn selection() -> Style {
         Style::default().add_modifier(Modifier::REVERSED)
     }
+
+    /// Subtle border style for unfocused blocks.
+    pub fn border() -> Style {
+        match palette() {
+            Some(p) => fg(p.muted),
+            None => Style::default().add_modifier(Modifier::DIM),
+        }
+    }
+
+    /// Highlighted border style for focused blocks.
+    pub fn border_focus() -> Style {
+        match palette() {
+            Some(p) => fg_mod(p.focus, Modifier::BOLD),
+            None => Style::default().add_modifier(Modifier::BOLD),
+        }
+    }
+
+    /// Fenced code block style.
+    pub fn code_block() -> Style {
+        match palette() {
+            Some(p) => fg(p.text),
+            None => Style::default(),
+        }
+    }
+
+    /// Header style for top status line.
+    pub fn header() -> Style {
+        match palette() {
+            Some(p) => fg_mod(p.text, Modifier::BOLD),
+            None => Style::default().add_modifier(Modifier::BOLD),
+        }
+    }
+
+    /// Badge style for active status pill / tags.
+    pub fn badge() -> Style {
+        match palette() {
+            Some(p) => fg_mod(p.active, Modifier::REVERSED),
+            None => Style::default().add_modifier(Modifier::REVERSED),
+        }
+    }
 }
 
 #[cfg(test)]

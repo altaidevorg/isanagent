@@ -49,8 +49,39 @@ fn push_run(
     runs.push((style, s.to_string()));
 }
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::OnceLock;
+
+use moka::sync::Cache;
+
+static MARKDOWN_CACHE: OnceLock<Cache<(u64, usize), Vec<Line<'static>>>> = OnceLock::new();
+
+fn get_markdown_cache() -> &'static Cache<(u64, usize), Vec<Line<'static>>> {
+    MARKDOWN_CACHE.get_or_init(|| Cache::builder().max_capacity(2000).build())
+}
+
+fn hash_str(s: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    s.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Convert assistant markdown to styled, width-wrapped lines for Ratatui.
 pub fn assistant_markdown_lines(markdown: &str, width: usize) -> Vec<Line<'static>> {
+    let w = width.max(12);
+    let key = (hash_str(markdown), w);
+    let cache = get_markdown_cache();
+    if let Some(cached) = cache.get(&key) {
+        return cached;
+    }
+
+    let lines = assistant_markdown_lines_uncached(markdown, w);
+    cache.insert(key, lines.clone());
+    lines
+}
+
+fn assistant_markdown_lines_uncached(markdown: &str, width: usize) -> Vec<Line<'static>> {
     let w = width.max(12);
     let md = truncate_chars(markdown, MAX_MARKDOWN_CHARS);
     let opts = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
@@ -59,6 +90,8 @@ pub fn assistant_markdown_lines(markdown: &str, width: usize) -> Vec<Line<'stati
     let mut runs: Vec<(ratatui::style::Style, String)> = Vec::new();
     let mut inline_stack: Vec<Inline> = Vec::new();
     let mut in_code_block = false;
+    let mut code_block_lang: Option<String> = None;
+    let mut code_block_buf: Option<String> = None;
     let mut in_blockquote = false;
     // Some(level) from Start(Heading) until End(Heading); body text is bold (no `#` in output).
     let mut heading: Option<pulldown_cmark::HeadingLevel> = None;
@@ -83,9 +116,24 @@ pub fn assistant_markdown_lines(markdown: &str, width: usize) -> Vec<Line<'stati
                 in_blockquote = false;
                 push_run(&mut runs, Theme::dim(), "\n");
             }
-            Event::Start(Tag::CodeBlock(_)) => in_code_block = true,
+            Event::Start(Tag::CodeBlock(kind)) => {
+                in_code_block = true;
+                let lang = match kind {
+                    pulldown_cmark::CodeBlockKind::Fenced(l) => l.to_string(),
+                    pulldown_cmark::CodeBlockKind::Indented => String::new(),
+                };
+                code_block_lang = Some(lang);
+                code_block_buf = Some(String::new());
+            }
             Event::End(TagEnd::CodeBlock) => {
                 in_code_block = false;
+                if let Some(buf) = code_block_buf.take() {
+                    let lang = code_block_lang.take().unwrap_or_default();
+                    let highlighted = super::syntect_highlight::highlight_code_block(&buf, &lang);
+                    for (sty, text) in highlighted {
+                        push_run(&mut runs, sty, &text);
+                    }
+                }
                 push_run(&mut runs, Theme::dim(), "\n");
             }
             Event::Start(Tag::Item) => list_item_first_text = true,
@@ -116,9 +164,14 @@ pub fn assistant_markdown_lines(markdown: &str, width: usize) -> Vec<Line<'stati
             }
             Event::End(TagEnd::Image) => {}
             Event::Text(t) => {
-                let mut sty = if in_code_block {
-                    Theme::dim()
-                } else if in_blockquote {
+                if in_code_block {
+                    if let Some(buf) = &mut code_block_buf {
+                        buf.push_str(&t);
+                    }
+                    continue;
+                }
+
+                let mut sty = if in_blockquote {
                     Theme::dim().add_modifier(Modifier::ITALIC)
                 } else {
                     style_from_inline(&inline_stack)
@@ -135,6 +188,10 @@ pub fn assistant_markdown_lines(markdown: &str, width: usize) -> Vec<Line<'stati
                 if list_item_first_text {
                     push_run(&mut runs, Theme::assistant_bullet(), "• ");
                     list_item_first_text = false;
+                }
+
+                if in_blockquote {
+                    push_run(&mut runs, Theme::clarification(), "│ ");
                 }
 
                 push_run(&mut runs, sty, &t);

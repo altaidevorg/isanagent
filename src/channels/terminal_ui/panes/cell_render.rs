@@ -69,47 +69,96 @@ pub(crate) fn cell_block_lines(cell: &Cell, inner_width: usize) -> Vec<Line<'sta
             v.push(Line::from(""));
             v
         }
-        Cell::Thinking { text } => {
-            let mut v = vec![Line::from(Span::styled(" … thought", Theme::thinking()))];
-            for ln in wrap_text(text, w) {
-                v.push(Line::from(Span::styled(ln, Theme::thinking())));
+        Cell::Thinking { text, collapsed } => {
+            if *collapsed {
+                let line_count = text.lines().count();
+                let char_count = text.chars().count();
+                let summary = format!(" ▶ thought ({line_count} lines, {char_count} chars)");
+                vec![
+                    Line::from(Span::styled(summary, Theme::thinking())),
+                    Line::from(""),
+                ]
+            } else {
+                let mut v = vec![Line::from(Span::styled(" ▼ thought", Theme::thinking()))];
+                for ln in wrap_text(text, w) {
+                    v.push(Line::from(Span::styled(ln, Theme::thinking())));
+                }
+                v.push(Line::from(""));
+                v
             }
-            v.push(Line::from(""));
-            v
         }
         Cell::ToolNotice {
             phase,
             content,
             tool_call_id: _,
+            collapsed,
         } => {
+            let is_policy_denied = matches!(phase, ToolNoticePhase::Failed)
+                && (content.contains("not approved")
+                    || content.contains("skipped")
+                    || content.contains("denied")
+                    || content.contains("aborted"));
+
             let label_style = match phase {
                 ToolNoticePhase::Pending => Theme::tool_pending().add_modifier(Modifier::BOLD),
                 ToolNoticePhase::Call => Theme::tool_call().add_modifier(Modifier::BOLD),
                 ToolNoticePhase::Result => Theme::tool_done().add_modifier(Modifier::BOLD),
+                ToolNoticePhase::Failed if is_policy_denied => {
+                    Theme::tool_pending().add_modifier(Modifier::BOLD)
+                }
                 ToolNoticePhase::Failed => Theme::error().add_modifier(Modifier::BOLD),
                 ToolNoticePhase::Other => Theme::tool_call().add_modifier(Modifier::BOLD),
             };
             let label = match phase {
-                ToolNoticePhase::Pending => "tool",
-                ToolNoticePhase::Call => "tool",
+                ToolNoticePhase::Pending => "pending",
+                ToolNoticePhase::Call => "running",
                 ToolNoticePhase::Result => "done",
+                ToolNoticePhase::Failed if is_policy_denied => "skipped",
                 ToolNoticePhase::Failed => "fail",
                 ToolNoticePhase::Other => "tool",
             };
-            let mut v = vec![Line::from(vec![
-                Span::styled(" ⚡ ", label_style),
-                Span::styled(label, label_style),
-            ])];
+            let arrow = if *collapsed { "▶" } else { "▼" };
             let body_style = match phase {
                 ToolNoticePhase::Pending => Theme::tool_pending(),
+                ToolNoticePhase::Failed if is_policy_denied => Theme::tool_pending(),
                 ToolNoticePhase::Failed => Theme::error(),
                 _ => Theme::text(),
             };
-            for ln in wrap_text(content, w.saturating_sub(2)) {
-                v.push(Line::from(Span::styled(ln, body_style)));
+
+            if *collapsed {
+                let summary_max = w.saturating_sub(14).max(8);
+                let first_line = content.lines().next().unwrap_or("").trim();
+                let truncated = if first_line.chars().count() > summary_max {
+                    let mut s: String = first_line
+                        .chars()
+                        .take(summary_max.saturating_sub(1))
+                        .collect();
+                    s.push('…');
+                    s
+                } else {
+                    first_line.to_string()
+                };
+                vec![
+                    Line::from(vec![
+                        Span::styled(" ⚡ ", label_style),
+                        Span::styled(format!("{label} "), label_style),
+                        Span::styled(truncated, body_style),
+                        Span::styled(format!("  [{arrow}]"), Theme::dim()),
+                    ]),
+                    Line::from(""),
+                ]
+            } else {
+                let mut v = vec![Line::from(vec![
+                    Span::styled(" ⚡ ", label_style),
+                    Span::styled(format!("{label} "), label_style),
+                    Span::styled(format!("  [{arrow}]"), Theme::dim()),
+                ])];
+                for ln in wrap_text(content, w.saturating_sub(2)) {
+                    v.push(Line::from(Span::styled(ln, body_style)));
+                }
+                v.push(Line::from(""));
+                v
             }
-            v.push(Line::from(""));
-            v
         }
         Cell::Clarification {
             text,
@@ -201,4 +250,16 @@ pub(crate) fn flatten_cells_to_lines(cells: &[Cell], inner_width: usize) -> Vec<
         lines.extend(cell_block_lines(cell, inner_width));
     }
     lines
+}
+
+pub fn cell_index_at_line(cells: &[Cell], target_line: usize, inner_width: usize) -> Option<usize> {
+    let mut current_line = 0usize;
+    for (idx, cell) in cells.iter().enumerate() {
+        let count = cell_block_lines(cell, inner_width).len();
+        if target_line >= current_line && target_line < current_line + count {
+            return Some(idx);
+        }
+        current_line += count;
+    }
+    None
 }

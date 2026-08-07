@@ -219,3 +219,40 @@ fn fallback_dim_lines(source: &str, width: usize, truncated: bool) -> Vec<Line<'
     }
     lines
 }
+
+/// Highlight a snippet of code with language hint into styled (Style, String) runs.
+pub fn highlight_code_block(source: &str, hint: &str) -> Vec<(Style, String)> {
+    let ps = syntax_set();
+    let theme = pick_theme();
+    let syntax = syntax_for_hint(ps, if hint.is_empty() { "py" } else { hint });
+    let mut highlighter = HighlightLines::new(syntax, theme);
+    let mut out: Vec<(Style, String)> = Vec::new();
+
+    for line in LinesWithEndings::from(source) {
+        if let Ok(regions) = highlighter.highlight_line(line, ps) {
+            for (st, text) in regions {
+                let rs = syntect_style_to_ratatui(st);
+                if let Some((last_st, last_s)) = out.last_mut() {
+                    if *last_st == rs {
+                        last_s.push_str(text);
+                    } else {
+                        out.push((rs, text.to_string()));
+                    }
+                } else {
+                    out.push((rs, text.to_string()));
+                }
+            }
+        } else {
+            if let Some((last_st, last_s)) = out.last_mut() {
+                if *last_st == Theme::dim() {
+                    last_s.push_str(line);
+                } else {
+                    out.push((Theme::dim(), line.to_string()));
+                }
+            } else {
+                out.push((Theme::dim(), line.to_string()));
+            }
+        }
+    }
+    out
+}
