@@ -28,7 +28,7 @@ fn normalize_legacy_tool_result(tool_name: &str, mut result: ToolResult) -> Tool
         return result;
     }
 
-    let code = if matches!(tool_name, "exec" | "python_run") {
+    let code = if tool_name == "exec" {
         ToolErrorCode::NonZeroExit
     } else {
         ToolErrorCode::LegacyReportedFailure

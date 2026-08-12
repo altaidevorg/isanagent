@@ -777,7 +777,7 @@ pub fn truncate_utf8_safe(s: &mut String, max_bytes: usize, suffix: &str) {
 /// `channels/terminal.rs` still uses for result tinting). That helper does a text-only prefix
 /// check on *every* tool's *finalized* output, which has two failure modes this function closes:
 ///
-/// 1. **Non-zero exit codes are missed.** `exec`/`python_run` report failure by appending a
+/// 1. **Non-zero exit codes are missed.** `exec` reports failure by appending a
 ///    trailing `Exit code: <N>` line — not by starting with `"Error:"`. A failed `cargo build`
 ///    (exit 1 with output that does not begin `"Error:"`) would be recorded as a *success*. Here
 ///    we tail-anchor on the runner's `Exit code:` marker instead.
@@ -801,7 +801,7 @@ pub fn truncate_utf8_safe(s: &mut String, max_bytes: usize, suffix: &str) {
 /// `is_error` (a possible wasted retry, never a masked real failure), so it is tolerated rather
 /// than papered over with brittle text gymnastics.
 pub fn tool_output_signals_failure(tool_name: &str, raw_output: &str) -> bool {
-    if matches!(tool_name, "exec" | "python_run") {
+    if tool_name == "exec" {
         if let Some(last) = raw_output.lines().rev().find(|l| !l.trim().is_empty()) {
             if let Some(code) = last.trim().strip_prefix("Exit code:") {
                 if code.trim().parse::<i64>().is_ok_and(|c| c != 0) {
@@ -987,14 +987,10 @@ mod tests {
 
     #[test]
     fn inband_failure_detects_nonzero_exit_for_runners() {
-        // exec / python_run append a trailing "Exit code: <N>" only on non-zero exit.
+        // exec appends a trailing "Exit code: <N>" only on non-zero exit.
         assert!(tool_output_signals_failure(
             "exec",
             "some stdout\nSTDERR:\nboom\nExit code: 1"
-        ));
-        assert!(tool_output_signals_failure(
-            "python_run",
-            "Traceback ...\nExit code: 2"
         ));
         // Negative exit (signal / unknown) still counts as failure.
         assert!(tool_output_signals_failure("exec", "killed\nExit code: -1"));
@@ -1007,7 +1003,6 @@ mod tests {
             "exec",
             "build succeeded\nall good"
         ));
-        assert!(!tool_output_signals_failure("python_run", "42\n"));
         // "(no output)" sentinel must not be treated as failure.
         assert!(!tool_output_signals_failure("exec", "(no output)"));
     }
@@ -1075,7 +1070,6 @@ mod tests {
         assert!(!tool_output_signals_failure("exec", "huh\nExit code: abc"));
         // Empty / whitespace-only output -> no signal.
         assert!(!tool_output_signals_failure("exec", "   \n  "));
-        assert!(!tool_output_signals_failure("python_run", ""));
     }
 
     #[test]
@@ -1104,10 +1098,6 @@ mod tests {
         assert!(tool_call_is_error(
             "edit_file",
             &Ok("Error: old_text not found in file.".to_string())
-        ));
-        assert!(tool_call_is_error(
-            "python_run",
-            &Ok("Traceback ...\nExit code: 1".to_string())
         ));
         // Genuine successes.
         assert!(!tool_call_is_error(

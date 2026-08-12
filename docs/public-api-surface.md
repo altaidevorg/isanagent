@@ -421,11 +421,11 @@ Public methods:
 
 `pub fn search_tool_index(entries: &[(String, String)], query: &str, limit: usize) -> Vec<(String, usize)>`. Lexical scoring for the `search_tools` tool.
 
-### 8.3 Built-in tool names (35 total)
+### 8.3 Built-in tool names (34 total)
 
 Discovered via `grep "fn name(&self) -> &str"` across [src/tools/](../src/tools/). Tool *names* are part of the contract — they are the strings the LLM emits in function calls, and they appear in saved chat transcripts.
 
-**[src/tools/builtin.rs](../src/tools/builtin.rs) — 16 tools.** `read_file`, `write_file`, `edit_file`, `list_dir`, `glob_files`, `search_text`, `exec`, `web_search`, `web_fetch`, `cron`, `message`, `git_worktree`, `search_memory`, `fetch_memory_by_date`, `get_env`, `python_run`.
+**[src/tools/builtin.rs](../src/tools/builtin.rs) — 15 tools.** `read_file`, `write_file`, `edit_file`, `list_dir`, `glob_files`, `search_text`, `exec`, `web_search`, `web_fetch`, `cron`, `message`, `git_worktree`, `search_memory`, `fetch_memory_by_date`, `get_env`.
 
 **[src/tools/execution.rs](../src/tools/execution.rs) — 11 tools.** `execution_session_create`, `execution_run`, `execution_run_background`, `execution_job_status`, `execution_job_result`, `execution_read_log`, `execution_job_list`, `execution_job_cancel`, `execution_artifact_list`, `execution_cancel`, `execution_session_close`, `execution_env_info`.
 
@@ -885,7 +885,7 @@ Phase 0 of the actual compaction/memory overhaul (distinct from the Phase 0.0 co
 - **0.0b.2 — config sweep.** Apply `#[non_exhaustive]` + `#[serde(default)]` to the ~30 pub structs and 3 enums in [src/config.rs](../src/config.rs). Out of scope for the initial 0.0b sweep to keep the breaking-change moment focused on runtime-message types.
 - **0.0b.3 — builder API.** Provide `AgentLogicParamsBuilder`, `SubagentHarnessParamsBuilder`, and `InboundMessage::new(...)` so the three deferred structs in [§9.1](#91-deferred--needs-builderconstructor-first) can adopt `#[non_exhaustive]`. Refactor [src/main.rs:719](../src/main.rs#L719), [src/main.rs:738](../src/main.rs#L738), [src/main.rs:1315](../src/main.rs#L1315), and the two test fixtures in `src/agent/mod.rs`.
 - **0.0c.1 — clippy cleanup.** Clear the 8 pre-existing warnings in `src/channels/terminal_ui/run.rs`, `src/execution/jupyter.rs`, `src/execution/ssh.rs`, `src/tools/builtin.rs`. Then add `-- -D warnings` to the clippy step in [.github/workflows/ci.yml](../.github/workflows/ci.yml).
-- **0.0c.2 — port `tools::execution::tests` away from `language = "python"`.** 6 tests are `#[ignore]`'d. Either port to `python_run` / `language = "shell"` or rewrite to validate the new local-provider contract directly. Remove `#[ignore]` once green.
+- **0.0c.2 — port `tools::execution::tests` away from `language = "python"`.** 6 tests are `#[ignore]`'d. Either port to `exec` / `language = "shell"` or rewrite to validate the new local-provider contract directly. Remove `#[ignore]` once green.
 - **0.0c.3 — broaden CI to macOS/Windows.** Currently ubuntu-only; the release-artifacts workflow already covers cross-platform on merge, but PR feedback for OS-specific code (russh, ratatui, lettre, imap) is delayed.
 - **0.0d — cross-repo smoke test.** Gated on producing concrete evidence of a downstream consumer (see [§2](#2-consumer-evidence)). When that exists, add a CI job that builds the consumer against this revision.
 - **Phase 0.1 — behavioral verification.** Run a real 30-turn session, verify `compaction_stats.py` reports the expected count of pairs, and add a smoke test that parses a recorded `conversation.jsonl` so the metric pipeline regresses loudly.

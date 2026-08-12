@@ -35,8 +35,7 @@ use isanagent::session::SessionManager;
 use isanagent::skills::SkillRegistry;
 use isanagent::tools::builtin::{
     CronTool, EditFileTool, GetEnvTool, GitWorktreeTool, GlobFilesTool, ListDirTool, MessageTool,
-    PythonRunTool, ReadFileTool, SearchTextTool, ShellExecTool, WebFetchTool, WebSearchTool,
-    WriteFileTool,
+    ReadFileTool, SearchTextTool, ShellExecTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use isanagent::tools::execution::{
     ExecutionArtifactListTool, ExecutionCancelTool, ExecutionEnvInfoTool, ExecutionJobCancelTool,
@@ -408,9 +407,6 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         restrict_to_workspace: restrict,
     }));
     tools.register(Box::new(GetEnvTool));
-    tools.register(Box::new(PythonRunTool {
-        workspace_dir: workspace.sandbox_dir.clone(),
-    }));
     if workspace.config.git_worktree_tool_enabled() {
         tools.register(Box::new(GitWorktreeTool {
             workspace_dir: workspace.sandbox_dir.clone(),
