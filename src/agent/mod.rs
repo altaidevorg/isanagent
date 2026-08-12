@@ -3630,10 +3630,12 @@ impl AgentLogic {
             inbound.chat_id,
             thread_info
         );
+        let exec_runner = if cfg!(windows) { "cmd /C" } else { "sh -c" };
         runtime_context.push_str(&format!(
-            " Host hints: os_family='{}', shell_family='{}', path_separator='{}', windows={}.",
+            " Host hints: os_family='{}', shell_family='{}', exec_runner='{}', path_separator='{}', windows={}.",
             os_family,
             shell_family,
+            exec_runner,
             path_sep,
             cfg!(windows)
         ));
