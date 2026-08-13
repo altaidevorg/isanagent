@@ -5,7 +5,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
-use tokio::time::{timeout, Duration};
+use std::time::{Duration, Instant};
+use tokio::time::timeout;
 use walkdir::WalkDir;
 
 use crate::config::JinaWebBackend;
@@ -1105,6 +1106,7 @@ pub struct ShellExecTool {
     pub workspace_dir: PathBuf,
     pub restrict_to_workspace: bool,
     pub exec_jobs: Option<ExecJobRegistry>,
+    pub windows_runner: crate::config::WindowsShellRunner,
 }
 
 struct ShellExecOutcome {
@@ -1180,9 +1182,7 @@ impl ShellExecTool {
         let started_rfc3339 = Utc::now().to_rfc3339();
 
         let mut cmd = if cfg!(target_os = "windows") {
-            let mut c = tokio::process::Command::new("cmd");
-            c.arg("/C").arg(command);
-            c
+            self.windows_runner.build_command(command)
         } else {
             let mut c = tokio::process::Command::new("sh");
             c.arg("-c").arg(command);
@@ -1260,24 +1260,27 @@ impl ShellExecTool {
                 }));
             }
 
-            let status_code = match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
-                Ok(Ok(s)) => {
-                    let code = s.code().unwrap_or(-1);
-                    *record_bg.exit_code.write().await = Some(code);
-                    if s.success() {
-                        record_bg.status.store(EXEC_JOB_COMPLETED, Ordering::Release);
-                        EXEC_JOB_COMPLETED
-                    } else {
+            let status_code =
+                match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
+                    Ok(Ok(s)) => {
+                        let code = s.code().unwrap_or(-1);
+                        *record_bg.exit_code.write().await = Some(code);
+                        if s.success() {
+                            record_bg
+                                .status
+                                .store(EXEC_JOB_COMPLETED, Ordering::Release);
+                            EXEC_JOB_COMPLETED
+                        } else {
+                            record_bg.status.store(EXEC_JOB_FAILED, Ordering::Release);
+                            EXEC_JOB_FAILED
+                        }
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        let _ = child.kill().await;
                         record_bg.status.store(EXEC_JOB_FAILED, Ordering::Release);
                         EXEC_JOB_FAILED
                     }
-                }
-                Ok(Err(_)) | Err(_) => {
-                    let _ = child.kill().await;
-                    record_bg.status.store(EXEC_JOB_FAILED, Ordering::Release);
-                    EXEC_JOB_FAILED
-                }
-            };
+                };
 
             for t in stream_tasks {
                 let _ = t.await;
@@ -1385,8 +1388,25 @@ impl Tool for ShellExecTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command on the host. By default waits up to 10000ms synchronously; if the command takes longer, it auto-promotes to a background job and returns a `command_id`. When backgrounded, a synthetic notification wakes you up when finished. Use `exec_status` to inspect output and `exec_send` to send stdin or terminate. \
-         On **Windows**, commands execute under **cmd.exe /C**. Prefer first-class tools (`search_text`, `read_file`, `glob_files`, `web_fetch`) over shell grep/cat pipelines."
+        if cfg!(target_os = "windows") {
+            match self.windows_runner {
+                crate::config::WindowsShellRunner::Cmd => {
+                    "Execute a shell command on the host. By default waits up to 10000ms synchronously; if the command takes longer, it auto-promotes to a background job and returns a `command_id`. When backgrounded, a synthetic notification wakes you up when finished. Use `exec_status` to inspect output and `exec_send` to send stdin or terminate. \
+                     On **Windows**, commands execute under **cmd.exe /C**. Write commands using standard cmd syntax. Prefer first-class tools (`search_text`, `read_file`, `glob_files`, `web_fetch`) over shell grep/cat pipelines."
+                }
+                crate::config::WindowsShellRunner::PowerShell => {
+                    "Execute a shell command on the host. By default waits up to 10000ms synchronously; if the command takes longer, it auto-promotes to a background job and returns a `command_id`. When backgrounded, a synthetic notification wakes you up when finished. Use `exec_status` to inspect output and `exec_send` to send stdin or terminate. \
+                     On **Windows**, commands execute under **powershell.exe -Command**. Write commands using PowerShell syntax. Prefer first-class tools (`search_text`, `read_file`, `glob_files`, `web_fetch`) over shell grep/cat pipelines."
+                }
+                crate::config::WindowsShellRunner::Pwsh => {
+                    "Execute a shell command on the host. By default waits up to 10000ms synchronously; if the command takes longer, it auto-promotes to a background job and returns a `command_id`. When backgrounded, a synthetic notification wakes you up when finished. Use `exec_status` to inspect output and `exec_send` to send stdin or terminate. \
+                     On **Windows**, commands execute under **pwsh.exe -Command**. Write commands using PowerShell Core syntax. Prefer first-class tools (`search_text`, `read_file`, `glob_files`, `web_fetch`) over shell grep/cat pipelines."
+                }
+            }
+        } else {
+            "Execute a shell command on the host. By default waits up to 10000ms synchronously; if the command takes longer, it auto-promotes to a background job and returns a `command_id`. When backgrounded, a synthetic notification wakes you up when finished. Use `exec_status` to inspect output and `exec_send` to send stdin or terminate. \
+             On **Unix**, commands execute under **sh -c**. Prefer first-class tools (`search_text`, `read_file`, `glob_files`, `web_fetch`) over shell grep/cat pipelines."
+        }
     }
 
     fn parameters(&self) -> Value {
@@ -1496,7 +1516,13 @@ impl Tool for ExecStatusTool {
         let job = self
             .exec_jobs
             .get_job(command_id)
-            .ok_or_else(|| format!("Command ID '{command_id}' not found"))?;
+            .ok_or_else(|| {
+                if command_id.starts_with("exec-job-") || command_id.starts_with("run-") {
+                    format!("Command ID '{command_id}' not found in host exec jobs. It appears to be an execution harness job — use `execution_job_status` instead.")
+                } else {
+                    format!("Command ID '{command_id}' not found")
+                }
+            })?;
 
         if wait_secs > 0 && !job.is_terminal() {
             let started = Instant::now();
@@ -1613,13 +1639,21 @@ impl Tool for ExecSendTool {
                     .flush()
                     .await
                     .map_err(|e| format!("Failed flushing stdin: {e}"))?;
-                return Ok(format!("Sent {} bytes to command '{command_id}' stdin.", text.len()));
+                return Ok(format!(
+                    "Sent {} bytes to command '{command_id}' stdin.",
+                    text.len()
+                ));
             } else {
-                return Err(format!("Command '{command_id}' stdin is closed or process finished."));
+                return Err(format!(
+                    "Command '{command_id}' stdin is closed or process finished."
+                ));
             }
         }
 
-        Err("Specify either 'input' to write to stdin or 'terminate: true' to kill the command.".to_string())
+        Err(
+            "Specify either 'input' to write to stdin or 'terminate: true' to kill the command."
+                .to_string(),
+        )
     }
 }
 
@@ -3279,6 +3313,7 @@ mod exec_failure_tests {
             workspace_dir: root,
             restrict_to_workspace: false,
             exec_jobs: None,
+            windows_runner: crate::config::WindowsShellRunner::default(),
         }
     }
 
@@ -3392,12 +3427,17 @@ mod exec_background_tests {
             workspace_dir: root.clone(),
             restrict_to_workspace: false,
             exec_jobs: Some(registry.clone()),
+            windows_runner: crate::config::WindowsShellRunner::default(),
         };
         let status_tool = ExecStatusTool {
             exec_jobs: registry.clone(),
         };
 
-        let cmd = if cfg!(windows) { "ping 127.0.0.1 -n 3 > nul" } else { "sleep 2" };
+        let cmd = if cfg!(windows) {
+            "ping 127.0.0.1 -n 3 > nul"
+        } else {
+            "sleep 2"
+        };
         let res = exec_tool
             .execute(json!({
                 "command": cmd,
@@ -3424,7 +3464,8 @@ mod exec_background_tests {
 
     #[tokio::test]
     async fn test_exec_send_terminates_job() {
-        let root = std::env::temp_dir().join(format!("isanagent_exec_term_{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("isanagent_exec_term_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
 
         let registry = ExecJobRegistry::new(None);
@@ -3432,12 +3473,17 @@ mod exec_background_tests {
             workspace_dir: root.clone(),
             restrict_to_workspace: false,
             exec_jobs: Some(registry.clone()),
+            windows_runner: crate::config::WindowsShellRunner::default(),
         };
         let send_tool = ExecSendTool {
             exec_jobs: registry.clone(),
         };
 
-        let cmd = if cfg!(windows) { "ping 127.0.0.1 -n 60 > nul" } else { "sleep 60" };
+        let cmd = if cfg!(windows) {
+            "ping 127.0.0.1 -n 60 > nul"
+        } else {
+            "sleep 60"
+        };
         let res = exec_tool
             .execute(json!({
                 "command": cmd,

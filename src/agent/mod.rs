@@ -597,7 +597,7 @@ fn edit_policy_block_reason(unattended_session: bool) -> &'static str {
 fn is_code_exec_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "exec" | "execution_run" | "execution_run_background"
+        "exec" | "exec_send" | "execution_run" | "execution_run_background"
     )
 }
 
@@ -613,13 +613,13 @@ fn is_arbitrary_code_tool(tool_name: &str) -> bool {
     matches!(tool_name, "execution_run" | "execution_run_background")
 }
 
-/// Extract the command/code a code-exec tool will run. `exec` carries it in `command`; the
-/// execution tools carry it in `code`.
+/// Extract the command/code a code-exec tool will run. `exec` carries it in `command`; `exec_send`
+/// carries it in `input`; execution tools carry it in `code`.
 fn extract_code_exec_command(tool_name: &str, args: &Value) -> Option<String> {
-    let key = if tool_name == "exec" {
-        "command"
-    } else {
-        "code"
+    let key = match tool_name {
+        "exec" => "command",
+        "exec_send" => "input",
+        _ => "code",
     };
     args.get(key)
         .and_then(|v| v.as_str())
@@ -3608,20 +3608,22 @@ impl AgentLogic {
         let now = chrono::Local::now().to_rfc3339();
         let os_family = std::env::consts::OS;
         let path_sep = std::path::MAIN_SEPARATOR;
-        let shell_family = if cfg!(windows) {
-            if std::env::var("PSModulePath").is_ok() {
-                "powershell"
-            } else {
-                "cmd"
+        let (shell_family, exec_runner) = if cfg!(windows) {
+            match shell_policy.windows_runner {
+                crate::config::WindowsShellRunner::Cmd => ("cmd", "cmd.exe /C"),
+                crate::config::WindowsShellRunner::PowerShell => {
+                    ("powershell", "powershell.exe -Command")
+                }
+                crate::config::WindowsShellRunner::Pwsh => ("pwsh", "pwsh.exe -Command"),
             }
         } else if std::env::var("SHELL")
             .ok()
             .map(|s| s.contains("bash"))
             .unwrap_or(false)
         {
-            "bash"
+            ("bash", "sh -c")
         } else {
-            "sh"
+            ("sh", "sh -c")
         };
         let mut runtime_context = format!(
             "[RUNTIME CONTEXT] Current time is {}. You are navigating and responding in channel: '{}', with chat ID: '{}'{}.",
@@ -3630,7 +3632,6 @@ impl AgentLogic {
             inbound.chat_id,
             thread_info
         );
-        let exec_runner = if cfg!(windows) { "cmd /C" } else { "sh -c" };
         runtime_context.push_str(&format!(
             " Host hints: os_family='{}', shell_family='{}', exec_runner='{}', path_separator='{}', windows={}.",
             os_family,
@@ -5626,6 +5627,7 @@ mod tests {
                 interactive_edit_mode: crate::config::ShellPolicyMode::Ask,
                 unattended_edit_mode: crate::config::ShellPolicyMode::Deny,
                 approval_patterns: Vec::new(),
+                windows_runner: crate::config::WindowsShellRunner::default(),
             }),
             hook_tool_ctx: None,
             inbound_metadata,
@@ -5730,6 +5732,7 @@ mod tests {
                     interactive_edit_mode: crate::config::ShellPolicyMode::Ask,
                     unattended_edit_mode: crate::config::ShellPolicyMode::Deny,
                     approval_patterns: Vec::new(),
+                    windows_runner: crate::config::WindowsShellRunner::default(),
                 },
                 hook_tool_ctx: None,
             },
@@ -5806,6 +5809,7 @@ mod tests {
                 interactive_edit_mode: crate::config::ShellPolicyMode::Ask,
                 unattended_edit_mode: crate::config::ShellPolicyMode::Deny,
                 approval_patterns: Vec::new(),
+                windows_runner: crate::config::WindowsShellRunner::default(),
             },
             hook_tool_ctx: None,
         });

@@ -444,6 +444,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         workspace_dir: workspace.sandbox_dir.clone(),
         restrict_to_workspace: restrict,
         exec_jobs: Some(exec_jobs.clone()),
+        windows_runner: workspace.config.windows_shell_runner(),
     }));
     tools.register(Box::new(crate::tools::builtin::ExecStatusTool {
         exec_jobs: exec_jobs.clone(),

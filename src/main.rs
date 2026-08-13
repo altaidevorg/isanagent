@@ -402,11 +402,13 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             .config
             .effective_search_text_ripgrep_timeout_secs(),
     }));
-    let exec_jobs = isanagent::tools::exec_jobs::ExecJobRegistry::new(Some(global_outbound_tx.clone()));
+    let exec_jobs =
+        isanagent::tools::exec_jobs::ExecJobRegistry::new(Some(global_outbound_tx.clone()));
     tools.register(Box::new(ShellExecTool {
         workspace_dir: workspace.sandbox_dir.clone(),
         restrict_to_workspace: restrict,
         exec_jobs: Some(exec_jobs.clone()),
+        windows_runner: workspace.config.windows_shell_runner(),
     }));
     tools.register(Box::new(isanagent::tools::builtin::ExecStatusTool {
         exec_jobs: exec_jobs.clone(),

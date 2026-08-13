@@ -191,6 +191,55 @@ pub struct ShellPolicyConfig {
     pub edit_mode: Option<String>,
     /// File edit mode for unattended/autonomous sessions (default `deny`).
     pub edit_unattended_default: Option<String>,
+    /// Shell runner on Windows for `exec` tool: `cmd` (default `cmd.exe /C`), `powershell` (`powershell.exe -Command`), or `pwsh` (`pwsh.exe -Command`).
+    pub windows_runner: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WindowsShellRunner {
+    #[default]
+    Cmd,
+    PowerShell,
+    Pwsh,
+}
+
+impl WindowsShellRunner {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Cmd => "cmd",
+            Self::PowerShell => "powershell",
+            Self::Pwsh => "pwsh",
+        }
+    }
+
+    pub fn display_runner(&self) -> &'static str {
+        match self {
+            Self::Cmd => "cmd.exe /C",
+            Self::PowerShell => "powershell.exe -Command",
+            Self::Pwsh => "pwsh.exe -Command",
+        }
+    }
+
+    pub fn build_command(&self, command: &str) -> tokio::process::Command {
+        match self {
+            Self::Cmd => {
+                let mut c = tokio::process::Command::new("cmd");
+                c.arg("/C").arg(command);
+                c
+            }
+            Self::PowerShell => {
+                let mut c = tokio::process::Command::new("powershell");
+                c.arg("-NoProfile").arg("-Command").arg(command);
+                c
+            }
+            Self::Pwsh => {
+                let mut c = tokio::process::Command::new("pwsh");
+                c.arg("-NoProfile").arg("-Command").arg(command);
+                c
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +257,7 @@ pub struct ResolvedShellPolicy {
     pub interactive_edit_mode: ShellPolicyMode,
     pub unattended_edit_mode: ShellPolicyMode,
     pub approval_patterns: Vec<String>,
+    pub windows_runner: WindowsShellRunner,
 }
 
 /// Async JSONL / webhook observation (`[harness.hooks.observation]`).
@@ -919,12 +969,29 @@ impl AppConfig {
         }
         approval_patterns.sort();
         approval_patterns.dedup();
+        let windows_runner = self.windows_shell_runner();
         ResolvedShellPolicy {
             interactive_mode,
             unattended_mode,
             interactive_edit_mode,
             unattended_edit_mode,
             approval_patterns,
+            windows_runner,
+        }
+    }
+
+    pub fn windows_shell_runner(&self) -> WindowsShellRunner {
+        let raw = self
+            .harness
+            .as_ref()
+            .and_then(|h| h.shell_policy.as_ref())
+            .and_then(|s| s.windows_runner.as_deref());
+        match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("powershell") | Some("ps") | Some("powershell.exe") => {
+                WindowsShellRunner::PowerShell
+            }
+            Some("pwsh") | Some("pwsh.exe") => WindowsShellRunner::Pwsh,
+            _ => WindowsShellRunner::Cmd,
         }
     }
 

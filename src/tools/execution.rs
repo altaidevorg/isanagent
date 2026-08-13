@@ -520,7 +520,15 @@ impl Tool for ExecutionJobStatusTool {
             .get("job_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing 'job_id'".to_string())?;
-        let v = self.jobs.job_status_json(job_id).await?;
+        let v = match self.jobs.job_status_json(job_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                if job_id.starts_with("exec-") && !job_id.starts_with("exec-job-") {
+                    return Err(format!("Job ID '{job_id}' not found in ExecutionJobManager. It appears to be a host shell exec job — use `exec_status` instead."));
+                }
+                return Err(e);
+            }
+        };
         serde_json::to_string_pretty(&v).map_err(|e| e.to_string())
     }
 }
