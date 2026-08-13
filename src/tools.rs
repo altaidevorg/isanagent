@@ -6,6 +6,7 @@ use std::sync::{Arc, RwLock};
 pub mod autotrainess;
 pub mod builtin;
 pub mod compact;
+pub mod exec_jobs;
 pub mod execution;
 pub mod isanagent_ignore;
 pub mod kernel_porting;
@@ -28,7 +29,7 @@ fn normalize_legacy_tool_result(tool_name: &str, mut result: ToolResult) -> Tool
         return result;
     }
 
-    let code = if matches!(tool_name, "exec" | "python_run") {
+    let code = if tool_name == "exec" {
         ToolErrorCode::NonZeroExit
     } else {
         ToolErrorCode::LegacyReportedFailure

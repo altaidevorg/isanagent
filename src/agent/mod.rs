@@ -593,11 +593,11 @@ fn edit_policy_block_reason(unattended_session: bool) -> &'static str {
 /// Tools that execute model-authored code/commands on the host or a session. All of these run
 /// arbitrary code, so they share the shell-policy approval gate — not just `exec`. Keying the
 /// gate on this category (rather than the literal name `"exec"`) is what stops `execution_run`
-/// / `execution_run_background` / `python_run` from bypassing approval entirely.
+/// / `execution_run_background` from bypassing approval entirely.
 fn is_code_exec_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "exec" | "python_run" | "execution_run" | "execution_run_background"
+        "exec" | "exec_send" | "execution_run" | "execution_run_background"
     )
 }
 
@@ -610,19 +610,16 @@ fn is_file_mutate_tool(tool_name: &str) -> bool {
 /// destructive-shell-pattern heuristic does not meaningfully apply, so any such call is
 /// treated as approval-worthy in ask/deny mode.
 fn is_arbitrary_code_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "python_run" | "execution_run" | "execution_run_background"
-    )
+    matches!(tool_name, "execution_run" | "execution_run_background")
 }
 
-/// Extract the command/code a code-exec tool will run. `exec` carries it in `command`; the
-/// execution / python tools carry it in `code`.
+/// Extract the command/code a code-exec tool will run. `exec` carries it in `command`; `exec_send`
+/// carries it in `input`; execution tools carry it in `code`.
 fn extract_code_exec_command(tool_name: &str, args: &Value) -> Option<String> {
-    let key = if tool_name == "exec" {
-        "command"
-    } else {
-        "code"
+    let key = match tool_name {
+        "exec" => "command",
+        "exec_send" => "input",
+        _ => "code",
     };
     args.get(key)
         .and_then(|v| v.as_str())
@@ -644,7 +641,6 @@ mod code_exec_gate_tests {
     #[test]
     fn category_covers_all_code_exec_tools() {
         assert!(is_code_exec_tool("exec"));
-        assert!(is_code_exec_tool("python_run"));
         assert!(is_code_exec_tool("execution_run"));
         assert!(is_code_exec_tool("execution_run_background"));
         assert!(!is_code_exec_tool("read_file"));
@@ -681,10 +677,6 @@ mod code_exec_gate_tests {
             extract_code_exec_command("execution_run", &json!({"code": "print(1)"})).as_deref(),
             Some("print(1)")
         );
-        assert_eq!(
-            extract_code_exec_command("python_run", &json!({"code": "import os"})).as_deref(),
-            Some("import os")
-        );
         // wrong key / empty -> None
         assert!(extract_code_exec_command("execution_run", &json!({"command": "x"})).is_none());
         assert!(extract_code_exec_command("exec", &json!({"command": "  "})).is_none());
@@ -699,7 +691,6 @@ mod code_exec_gate_tests {
             "print('hi')",
             &patterns
         ));
-        assert!(code_exec_requires_approval("python_run", "1+1", &patterns));
         // Shell `exec`: benign command does NOT require approval (preserves existing UX)...
         assert!(!code_exec_requires_approval("exec", "ls -la", &patterns));
         // ...but a destructive one does.
@@ -3617,20 +3608,22 @@ impl AgentLogic {
         let now = chrono::Local::now().to_rfc3339();
         let os_family = std::env::consts::OS;
         let path_sep = std::path::MAIN_SEPARATOR;
-        let shell_family = if cfg!(windows) {
-            if std::env::var("PSModulePath").is_ok() {
-                "powershell"
-            } else {
-                "cmd"
+        let (shell_family, exec_runner) = if cfg!(windows) {
+            match shell_policy.windows_runner {
+                crate::config::WindowsShellRunner::Cmd => ("cmd", "cmd.exe /C"),
+                crate::config::WindowsShellRunner::PowerShell => {
+                    ("powershell", "powershell.exe -Command")
+                }
+                crate::config::WindowsShellRunner::Pwsh => ("pwsh", "pwsh.exe -Command"),
             }
         } else if std::env::var("SHELL")
             .ok()
             .map(|s| s.contains("bash"))
             .unwrap_or(false)
         {
-            "bash"
+            ("bash", "sh -c")
         } else {
-            "sh"
+            ("sh", "sh -c")
         };
         let mut runtime_context = format!(
             "[RUNTIME CONTEXT] Current time is {}. You are navigating and responding in channel: '{}', with chat ID: '{}'{}.",
@@ -3640,9 +3633,10 @@ impl AgentLogic {
             thread_info
         );
         runtime_context.push_str(&format!(
-            " Host hints: os_family='{}', shell_family='{}', path_separator='{}', windows={}.",
+            " Host hints: os_family='{}', shell_family='{}', exec_runner='{}', path_separator='{}', windows={}.",
             os_family,
             shell_family,
+            exec_runner,
             path_sep,
             cfg!(windows)
         ));
@@ -5633,6 +5627,7 @@ mod tests {
                 interactive_edit_mode: crate::config::ShellPolicyMode::Ask,
                 unattended_edit_mode: crate::config::ShellPolicyMode::Deny,
                 approval_patterns: Vec::new(),
+                windows_runner: crate::config::WindowsShellRunner::default(),
             }),
             hook_tool_ctx: None,
             inbound_metadata,
@@ -5737,6 +5732,7 @@ mod tests {
                     interactive_edit_mode: crate::config::ShellPolicyMode::Ask,
                     unattended_edit_mode: crate::config::ShellPolicyMode::Deny,
                     approval_patterns: Vec::new(),
+                    windows_runner: crate::config::WindowsShellRunner::default(),
                 },
                 hook_tool_ctx: None,
             },
@@ -5813,6 +5809,7 @@ mod tests {
                 interactive_edit_mode: crate::config::ShellPolicyMode::Ask,
                 unattended_edit_mode: crate::config::ShellPolicyMode::Deny,
                 approval_patterns: Vec::new(),
+                windows_runner: crate::config::WindowsShellRunner::default(),
             },
             hook_tool_ctx: None,
         });

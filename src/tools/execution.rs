@@ -115,7 +115,7 @@ impl Tool for ExecutionSessionCreateTool {
                 "label": { "type": "string", "description": "Optional label for logs" },
                 "language": {
                     "type": "string",
-                    "description": "Optional language hint. Local: shell, sh, bash, cmd, powershell (all map to the host shell — use python_run or exec+uv for Python). Jupyter: python, py, r, R (ir kernel). SSH: python, py, shell, sh, bash (remote exec with code on stdin)."
+                    "description": "Optional language hint. Local: shell, sh, bash, cmd, powershell (all map to the host shell — use exec+uv for Python). Jupyter: python, py, r, R (ir kernel). SSH: python, py, shell, sh, bash (remote exec with code on stdin)."
                 },
                 "resume_jupyter_kernel_id": {
                     "type": "string",
@@ -520,7 +520,15 @@ impl Tool for ExecutionJobStatusTool {
             .get("job_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing 'job_id'".to_string())?;
-        let v = self.jobs.job_status_json(job_id).await?;
+        let v = match self.jobs.job_status_json(job_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                if job_id.starts_with("exec-") && !job_id.starts_with("exec-job-") {
+                    return Err(format!("Job ID '{job_id}' not found in ExecutionJobManager. It appears to be a host shell exec job — use `exec_status` instead."));
+                }
+                return Err(e);
+            }
+        };
         serde_json::to_string_pretty(&v).map_err(|e| e.to_string())
     }
 }
@@ -1062,7 +1070,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Local provider rejects language=python; port to python_run or language=shell (Phase 0.0c follow-up)"]
+    #[ignore = "Local provider rejects language=python; port to exec or language=shell (Phase 0.0c follow-up)"]
     async fn execution_session_create_accepts_explicit_provider() {
         // With a single-provider harness, an explicit `provider: "local"` should resolve cleanly
         // and the response should echo the provider id back so the model can audit its choice.
@@ -1125,7 +1133,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Local provider rejects language=python; port to python_run or language=shell (Phase 0.0c follow-up)"]
+    #[ignore = "Local provider rejects language=python; port to exec or language=shell (Phase 0.0c follow-up)"]
     async fn create_run_close_roundtrip() {
         let (ws, dir) = temp_dirs();
         let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
@@ -1179,7 +1187,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Local provider rejects language=python; port to python_run or language=shell (Phase 0.0c follow-up)"]
+    #[ignore = "Local provider rejects language=python; port to exec or language=shell (Phase 0.0c follow-up)"]
     async fn background_job_poll_and_result() {
         let (ws, dir) = temp_dirs();
         let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
@@ -1258,7 +1266,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Local provider rejects language=python; port to python_run or language=shell (Phase 0.0c follow-up)"]
+    #[ignore = "Local provider rejects language=python; port to exec or language=shell (Phase 0.0c follow-up)"]
     async fn execution_run_auto_promotes_when_bound_smaller_than_runtime() {
         let (ws, dir) = temp_dirs();
         let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
@@ -1370,7 +1378,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Local provider rejects language=python; port to python_run or language=shell (Phase 0.0c follow-up)"]
+    #[ignore = "Local provider rejects language=python; port to exec or language=shell (Phase 0.0c follow-up)"]
     async fn background_job_carries_description_in_status_and_list() {
         let (ws, dir) = temp_dirs();
         let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
@@ -1436,7 +1444,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Local provider rejects language=python; port to python_run or language=shell (Phase 0.0c follow-up)"]
+    #[ignore = "Local provider rejects language=python; port to exec or language=shell (Phase 0.0c follow-up)"]
     async fn background_job_cancel_requests_interrupt() {
         let (ws, dir) = temp_dirs();
         let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), dir.clone(), true);

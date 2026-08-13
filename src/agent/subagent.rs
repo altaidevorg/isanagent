@@ -1450,6 +1450,7 @@ mod tests {
                 interactive_edit_mode: crate::config::ShellPolicyMode::Ask,
                 unattended_edit_mode: crate::config::ShellPolicyMode::Deny,
                 approval_patterns: Vec::new(),
+                windows_runner: crate::config::WindowsShellRunner::default(),
             }),
             hook_tool_ctx: None,
             agent_registry: None,

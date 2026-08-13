@@ -5,14 +5,24 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
-use tokio::time::{timeout, Duration};
+use std::time::{Duration, Instant};
+use tokio::time::timeout;
 use walkdir::WalkDir;
 
 use crate::config::JinaWebBackend;
 use crate::tool_runtime::{current_tool_exec_ctx, ToolExecCtx};
+use crate::tools::exec_jobs::{
+    exec_status_str, ExecJobRecord, ExecJobRegistry, EXEC_JOB_CANCELLED, EXEC_JOB_COMPLETED,
+    EXEC_JOB_FAILED, EXEC_JOB_RUNNING,
+};
 use crate::traits::{MutationPreview, Tool, ToolErrorCode, ToolResult};
 use crate::utils::{join_lexically_under_root, normalize_sandbox_relative_input};
 use crate::NodeHandle;
+use std::process::Stdio;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{Mutex, RwLock};
 
 /// Maximum paths returned by `glob_files`.
 const MAX_GLOB_RESULTS: usize = 500;
@@ -1095,6 +1105,8 @@ impl Tool for SearchTextTool {
 pub struct ShellExecTool {
     pub workspace_dir: PathBuf,
     pub restrict_to_workspace: bool,
+    pub exec_jobs: Option<ExecJobRegistry>,
+    pub windows_runner: crate::config::WindowsShellRunner,
 }
 
 struct ShellExecOutcome {
@@ -1153,73 +1165,219 @@ impl ShellExecTool {
             .unwrap_or(60)
             .clamp(1, 3600);
 
+        let wait_ms_before_async = args
+            .get("wait_ms_before_async")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10000)
+            .clamp(0, 3_600_000);
+
         let actual_dir = resolve_path(cwd_str, &self.workspace_dir, self.restrict_to_workspace)?;
 
+        let (chat_id, channel) = current_tool_exec_ctx()
+            .map(|c| (c.chat_id.clone(), c.channel.clone()))
+            .unwrap_or_else(|| (String::new(), String::new()));
+
+        let command_id = format!("exec-{}", uuid::Uuid::new_v4());
+        let started_at = Instant::now();
+        let started_rfc3339 = Utc::now().to_rfc3339();
+
         let mut cmd = if cfg!(target_os = "windows") {
-            let mut c = tokio::process::Command::new("cmd");
-            c.arg("/C").arg(command);
-            c
+            self.windows_runner.build_command(command)
         } else {
             let mut c = tokio::process::Command::new("sh");
             c.arg("-c").arg(command);
             c
         };
 
-        cmd.current_dir(actual_dir);
+        cmd.current_dir(&actual_dir);
         cmd.envs(std::env::vars());
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
 
-        let output =
-            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output())
-                .await
-            {
-                Ok(Ok(output)) => output,
-                Ok(Err(error)) => return Err(format!("Failed to execute command: {error}")),
-                Err(_) => return Err(format!("Command timed out after {timeout_secs} seconds")),
-            };
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to spawn command: {e}"))?;
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
 
-        let mut result = String::new();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if !stdout.trim().is_empty() {
-            result.push_str(&stdout);
+        let record = Arc::new(ExecJobRecord {
+            command_id: command_id.clone(),
+            command: command.to_string(),
+            cwd: actual_dir.display().to_string(),
+            status: std::sync::atomic::AtomicU8::new(EXEC_JOB_RUNNING),
+            exit_code: RwLock::new(None),
+            stdout_buf: RwLock::new(String::new()),
+            stderr_buf: RwLock::new(String::new()),
+            stdin_tx: Mutex::new(stdin),
+            started_at,
+            started_rfc3339,
+            finished_rfc3339: RwLock::new(None),
+            chat_id: chat_id.clone(),
+            channel: channel.clone(),
+            join_handle: Mutex::new(None),
+        });
+
+        if let Some(ref registry) = self.exec_jobs {
+            registry.register_job(record.clone());
         }
 
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.trim().is_empty() {
-            if !result.is_empty() {
-                result.push_str("\nSTDERR:\n");
+        let record_bg = record.clone();
+        let registry_bg = self.exec_jobs.clone();
+        let command_bg = command.to_string();
+
+        let bg_task = tokio::spawn(async move {
+            let mut stream_tasks = Vec::new();
+
+            if let Some(mut out) = stdout {
+                let rec = record_bg.clone();
+                stream_tasks.push(tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    while let Ok(n) = out.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        let chunk = String::from_utf8_lossy(&buf[..n]);
+                        let mut guard = rec.stdout_buf.write().await;
+                        guard.push_str(&chunk);
+                    }
+                }));
             }
-            result.push_str(&stderr);
+
+            if let Some(mut err) = stderr {
+                let rec = record_bg.clone();
+                stream_tasks.push(tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    while let Ok(n) = err.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        let chunk = String::from_utf8_lossy(&buf[..n]);
+                        let mut guard = rec.stderr_buf.write().await;
+                        guard.push_str(&chunk);
+                    }
+                }));
+            }
+
+            let status_code =
+                match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
+                    Ok(Ok(s)) => {
+                        let code = s.code().unwrap_or(-1);
+                        *record_bg.exit_code.write().await = Some(code);
+                        if s.success() {
+                            record_bg
+                                .status
+                                .store(EXEC_JOB_COMPLETED, Ordering::Release);
+                            EXEC_JOB_COMPLETED
+                        } else {
+                            record_bg.status.store(EXEC_JOB_FAILED, Ordering::Release);
+                            EXEC_JOB_FAILED
+                        }
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        let _ = child.kill().await;
+                        record_bg.status.store(EXEC_JOB_FAILED, Ordering::Release);
+                        EXEC_JOB_FAILED
+                    }
+                };
+
+            for t in stream_tasks {
+                let _ = t.await;
+            }
+
+            *record_bg.finished_rfc3339.write().await = Some(Utc::now().to_rfc3339());
+
+            if let Some(reg) = registry_bg {
+                let exit = *record_bg.exit_code.read().await;
+                reg.send_synthetic_completion_inbound(
+                    &record_bg.chat_id,
+                    &record_bg.channel,
+                    &record_bg.command_id,
+                    &command_bg,
+                    exec_status_str(status_code),
+                    exit,
+                )
+                .await;
+            }
+        });
+
+        *record.join_handle.lock().await = Some(bg_task);
+
+        if wait_ms_before_async == 0 {
+            let envelope = serde_json::json!({
+                "background": true,
+                "command_id": command_id,
+                "status": "running",
+                "message": "Command launched in background. Use `exec_status` to monitor output and `exec_send` to send stdin or terminate."
+            });
+            return Ok(ShellExecOutcome {
+                content: serde_json::to_string_pretty(&envelope).unwrap_or_default(),
+                failure_exit_code: None,
+            });
         }
 
-        let failure_exit_code =
-            (!output.status.success()).then(|| output.status.code().unwrap_or(-1));
+        let is_done = match record.join_handle.lock().await.as_mut() {
+            Some(h) => tokio::time::timeout(Duration::from_millis(wait_ms_before_async), h).await,
+            None => Ok(Ok(())),
+        };
 
-        if result.is_empty() && failure_exit_code.is_none() {
-            result = "(no output)".to_string();
-        } else {
-            if grep_like {
-                result.push_str("\n\n[advisory] Prefer `search_text` for code/log discovery and `read_file` for file reads; shell grep/cat pipelines are less portable across hosts.");
+        if is_done.is_ok() {
+            let stdout = record.stdout_buf.read().await.clone();
+            let stderr = record.stderr_buf.read().await.clone();
+            let exit_code = *record.exit_code.read().await;
+
+            let mut result = String::new();
+            if !stdout.trim().is_empty() {
+                result.push_str(&stdout);
             }
-            if result.len() > 10000 {
-                let mut cut = 10000;
-                while cut > 0 && !result.is_char_boundary(cut) {
-                    cut -= 1;
+            if !stderr.trim().is_empty() {
+                if !result.is_empty() {
+                    result.push_str("\nSTDERR:\n");
                 }
-                result = format!(
-                    "{}\n... (truncated, {} more chars)",
-                    &result[..cut],
-                    result.len() - cut
-                );
+                result.push_str(&stderr);
             }
-            if let Some(code) = failure_exit_code {
-                result.push_str(&format!("\nExit code: {code}"));
-            }
-        }
 
-        Ok(ShellExecOutcome {
-            content: result,
-            failure_exit_code,
-        })
+            let failure_exit_code = exit_code.filter(|&c| c != 0);
+
+            if result.is_empty() && failure_exit_code.is_none() {
+                result = "(no output)".to_string();
+            } else {
+                if grep_like {
+                    result.push_str("\n\n[advisory] Prefer `search_text` for code/log discovery and `read_file` for file reads; shell grep/cat pipelines are less portable across hosts.");
+                }
+                if result.len() > 10000 {
+                    let mut cut = 10000;
+                    while cut > 0 && !result.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    result = format!(
+                        "{}\n... (truncated, {} more chars)",
+                        &result[..cut],
+                        result.len() - cut
+                    );
+                }
+                if let Some(code) = failure_exit_code {
+                    result.push_str(&format!("\nExit code: {code}"));
+                }
+            }
+
+            Ok(ShellExecOutcome {
+                content: result,
+                failure_exit_code,
+            })
+        } else {
+            let envelope = serde_json::json!({
+                "background": true,
+                "command_id": command_id,
+                "status": "running",
+                "message": format!("Command took longer than {}ms and was sent to the background. Use `exec_status` to view output and `exec_send` to send stdin or terminate.", wait_ms_before_async)
+            });
+            Ok(ShellExecOutcome {
+                content: serde_json::to_string_pretty(&envelope).unwrap_or_default(),
+                failure_exit_code: None,
+            })
+        }
     }
 }
 
@@ -1230,8 +1388,25 @@ impl Tool for ShellExecTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command and return its output (60s timeout). Host details (OS/shell/path style) are provided in RUNTIME CONTEXT each turn; write commands for that host. Prefer first-class tools (`search_text`, `read_file`, `glob_files`, `web_fetch`) before shell one-liners, especially for grep/cat/wc style tasks. \
-         On **Windows** this runs under **cmd /C** one string: nested double-quotes often break remote **ssh** compound commands (e.g. `ssh user@host \"mkdir -p /tmp/x && cmd\"`). Prefer a **single** remote argument without inner double-quotes, use **execution_* / SSH harness** for remote work, or run **two** short exec calls instead of one over-quoted line."
+        if cfg!(target_os = "windows") {
+            match self.windows_runner {
+                crate::config::WindowsShellRunner::Cmd => {
+                    "Execute a shell command on the host. By default waits up to 10000ms synchronously; if the command takes longer, it auto-promotes to a background job and returns a `command_id`. When backgrounded, a synthetic notification wakes you up when finished. Use `exec_status` to inspect output and `exec_send` to send stdin or terminate. \
+                     On **Windows**, commands execute under **cmd.exe /C**. Write commands using standard cmd syntax. Prefer first-class tools (`search_text`, `read_file`, `glob_files`, `web_fetch`) over shell grep/cat pipelines."
+                }
+                crate::config::WindowsShellRunner::PowerShell => {
+                    "Execute a shell command on the host. By default waits up to 10000ms synchronously; if the command takes longer, it auto-promotes to a background job and returns a `command_id`. When backgrounded, a synthetic notification wakes you up when finished. Use `exec_status` to inspect output and `exec_send` to send stdin or terminate. \
+                     On **Windows**, commands execute under **powershell.exe -Command**. Write commands using PowerShell syntax. Prefer first-class tools (`search_text`, `read_file`, `glob_files`, `web_fetch`) over shell grep/cat pipelines."
+                }
+                crate::config::WindowsShellRunner::Pwsh => {
+                    "Execute a shell command on the host. By default waits up to 10000ms synchronously; if the command takes longer, it auto-promotes to a background job and returns a `command_id`. When backgrounded, a synthetic notification wakes you up when finished. Use `exec_status` to inspect output and `exec_send` to send stdin or terminate. \
+                     On **Windows**, commands execute under **pwsh.exe -Command**. Write commands using PowerShell Core syntax. Prefer first-class tools (`search_text`, `read_file`, `glob_files`, `web_fetch`) over shell grep/cat pipelines."
+                }
+            }
+        } else {
+            "Execute a shell command on the host. By default waits up to 10000ms synchronously; if the command takes longer, it auto-promotes to a background job and returns a `command_id`. When backgrounded, a synthetic notification wakes you up when finished. Use `exec_status` to inspect output and `exec_send` to send stdin or terminate. \
+             On **Unix**, commands execute under **sh -c**. Prefer first-class tools (`search_text`, `read_file`, `glob_files`, `web_fetch`) over shell grep/cat pipelines."
+        }
     }
 
     fn parameters(&self) -> Value {
@@ -1248,7 +1423,11 @@ impl Tool for ShellExecTool {
                 },
                 "timeout_secs": {
                     "type": "integer",
-                    "description": "Optional timeout in seconds (defaults to 60, max 3600)"
+                    "description": "Optional hard timeout in seconds (defaults to 60, max 3600)"
+                },
+                "wait_ms_before_async": {
+                    "type": "integer",
+                    "description": "Number of milliseconds to wait synchronously before sending the command to the background (defaults to 10000ms). Set to 0 to background immediately."
                 },
                 "description": {
                     "type": "string",
@@ -1281,6 +1460,200 @@ impl Tool for ShellExecTool {
             },
             Err(error) => ToolResult::error(ToolErrorCode::ExecutionFailed, error),
         }
+    }
+}
+
+pub struct ExecStatusTool {
+    pub exec_jobs: ExecJobRegistry,
+}
+
+#[async_trait]
+impl Tool for ExecStatusTool {
+    fn name(&self) -> &str {
+        "exec_status"
+    }
+
+    fn description(&self) -> &str {
+        "Get status and output of a background shell `exec` command by its `command_id`."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command_id": {
+                    "type": "string",
+                    "description": "ID of the background command returned by `exec`"
+                },
+                "output_character_count": {
+                    "type": "integer",
+                    "description": "Max output characters to view (defaults to 10000)"
+                },
+                "wait_duration_seconds": {
+                    "type": "integer",
+                    "description": "Optional seconds to wait for command completion before returning (0 to 60)"
+                }
+            },
+            "required": ["command_id"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, String> {
+        let command_id = args
+            .get("command_id")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'command_id' argument")?;
+        let max_chars = args
+            .get("output_character_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10000) as usize;
+        let wait_secs = args
+            .get("wait_duration_seconds")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            .clamp(0, 60);
+
+        let job = self
+            .exec_jobs
+            .get_job(command_id)
+            .ok_or_else(|| {
+                if command_id.starts_with("exec-job-") || command_id.starts_with("run-") {
+                    format!("Command ID '{command_id}' not found in host exec jobs. It appears to be an execution harness job — use `execution_job_status` instead.")
+                } else {
+                    format!("Command ID '{command_id}' not found")
+                }
+            })?;
+
+        if wait_secs > 0 && !job.is_terminal() {
+            let started = Instant::now();
+            while started.elapsed().as_secs() < wait_secs && !job.is_terminal() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+
+        let status = job.status_name();
+        let stdout = job.stdout_buf.read().await.clone();
+        let stderr = job.stderr_buf.read().await.clone();
+        let exit_code = *job.exit_code.read().await;
+
+        let mut out = format!(
+            "Command ID: {}\nStatus: {}\nCommand: {}\nCWD: {}\nStarted: {}\n",
+            job.command_id, status, job.command, job.cwd, job.started_rfc3339
+        );
+
+        if let Some(ref fin) = *job.finished_rfc3339.read().await {
+            out.push_str(&format!("Finished: {fin}\n"));
+        }
+        if let Some(code) = exit_code {
+            out.push_str(&format!("Exit Code: {code}\n"));
+        }
+
+        out.push_str("\n--- STDOUT ---\n");
+        if stdout.is_empty() {
+            out.push_str("(no stdout output)\n");
+        } else {
+            out.push_str(&crate::execution::truncate_utf8_str_cap(&stdout, max_chars));
+            out.push('\n');
+        }
+
+        if !stderr.is_empty() {
+            out.push_str("--- STDERR ---\n");
+            out.push_str(&crate::execution::truncate_utf8_str_cap(&stderr, max_chars));
+            out.push('\n');
+        }
+
+        Ok(out)
+    }
+}
+
+pub struct ExecSendTool {
+    pub exec_jobs: ExecJobRegistry,
+}
+
+#[async_trait]
+impl Tool for ExecSendTool {
+    fn name(&self) -> &str {
+        "exec_send"
+    }
+
+    fn description(&self) -> &str {
+        "Send stdin input or terminate a running background `exec` command."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command_id": {
+                    "type": "string",
+                    "description": "ID of the background command returned by `exec`"
+                },
+                "input": {
+                    "type": "string",
+                    "description": "Standard input string to send to the command"
+                },
+                "terminate": {
+                    "type": "boolean",
+                    "description": "Set to true to terminate the background process"
+                }
+            },
+            "required": ["command_id"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, String> {
+        let command_id = args
+            .get("command_id")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'command_id' argument")?;
+        let input = args.get("input").and_then(|v| v.as_str());
+        let terminate = args
+            .get("terminate")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let job = self
+            .exec_jobs
+            .get_job(command_id)
+            .ok_or_else(|| format!("Command ID '{command_id}' not found"))?;
+
+        if terminate {
+            let mut stdin_guard = job.stdin_tx.lock().await;
+            *stdin_guard = None;
+            let mut join_guard = job.join_handle.lock().await;
+            if let Some(handle) = join_guard.take() {
+                handle.abort();
+            }
+            job.status.store(EXEC_JOB_CANCELLED, Ordering::Release);
+            return Ok(format!("Command '{command_id}' terminated successfully."));
+        }
+
+        if let Some(text) = input {
+            let mut stdin_guard = job.stdin_tx.lock().await;
+            if let Some(ref mut stdin) = *stdin_guard {
+                stdin
+                    .write_all(text.as_bytes())
+                    .await
+                    .map_err(|e| format!("Failed writing to stdin: {e}"))?;
+                stdin
+                    .flush()
+                    .await
+                    .map_err(|e| format!("Failed flushing stdin: {e}"))?;
+                return Ok(format!(
+                    "Sent {} bytes to command '{command_id}' stdin.",
+                    text.len()
+                ));
+            } else {
+                return Err(format!(
+                    "Command '{command_id}' stdin is closed or process finished."
+                ));
+            }
+        }
+
+        Err(
+            "Specify either 'input' to write to stdin or 'terminate: true' to kill the command."
+                .to_string(),
+        )
     }
 }
 
@@ -2608,102 +2981,6 @@ impl Tool for GetEnvTool {
     }
 }
 
-pub struct PythonRunTool {
-    pub workspace_dir: PathBuf,
-}
-
-#[async_trait]
-impl Tool for PythonRunTool {
-    fn name(&self) -> &str {
-        "python_run"
-    }
-
-    fn description(&self) -> &str {
-        "Run raw python code. The code will be piped to `uv run python -` via stdin, bypassing shell quoting issues while running inside the uv managed environment. Use this for quick calculations, and prefer writing Python scripts to execute with uv for more complex tasks. Outputs stdout/stderr."
-    }
-
-    fn parameters(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "code": {
-                    "type": "string",
-                    "description": "Python code to execute"
-                }
-            },
-            "required": ["code"]
-        })
-    }
-
-    async fn execute(&self, args: Value) -> Result<String, String> {
-        let code = args
-            .get("code")
-            .and_then(|v| v.as_str())
-            .ok_or("Missing 'code' argument")?;
-
-        let mut cmd = tokio::process::Command::new("uv");
-        cmd.arg("run");
-        cmd.arg("python");
-        cmd.arg("-");
-        cmd.current_dir(&self.workspace_dir);
-        // Explicitly forward host environment so secrets/API keys are visible to the child.
-        cmd.envs(std::env::vars());
-        cmd.stdin(std::process::Stdio::piped());
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("Failed to spawn python: {e}"))?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            stdin
-                .write_all(code.as_bytes())
-                .await
-                .map_err(|e| format!("Failed to write to python stdin: {e}"))?;
-        }
-
-        let output =
-            tokio::time::timeout(std::time::Duration::from_secs(60), child.wait_with_output())
-                .await
-                .map_err(|_| "Python execution timed out after 60 seconds")?
-                .map_err(|e| format!("Failed to wait for python: {e}"))?;
-
-        let mut result = String::new();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if !stdout.trim().is_empty() {
-            result.push_str(&stdout);
-        }
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.trim().is_empty() {
-            if !result.is_empty() {
-                result.push_str("\nSTDERR:\n");
-            }
-            result.push_str(&stderr);
-        }
-
-        // Keep this the LAST append to `result`: the agent tail-anchors on the final `Exit code:`
-        // line to derive is_error (utils::tool_output_signals_failure). python_run currently has no
-        // grep advisory and no size truncation, so the marker is already the final line; if either
-        // is ever added here, append it BEFORE this marker (see the exec path in ShellExecTool,
-        // which appends the marker last for exactly this invariant).
-        if !output.status.success() {
-            result.push_str(&format!(
-                "\nExit code: {}",
-                output.status.code().unwrap_or(-1)
-            ));
-        }
-
-        if result.is_empty() {
-            Ok("(no output)".to_string())
-        } else {
-            Ok(result)
-        }
-    }
-}
-
 #[cfg(test)]
 mod resolve_path_tests {
     use super::resolve_path;
@@ -3024,38 +3301,6 @@ mod get_env_tests {
     }
 }
 
-#[cfg(test)]
-mod python_run_tests {
-    use super::*;
-    use serde_json::json;
-    use std::fs;
-
-    #[tokio::test]
-    async fn test_python_run_basic() {
-        if which::which("python").is_err() && which::which("python3").is_err() {
-            return;
-        }
-        let root = std::env::temp_dir().join(format!("isanagent_py_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&root).unwrap();
-
-        let tool = PythonRunTool {
-            workspace_dir: root.clone(),
-        };
-        let out = tool
-            .execute(json!({ "code": "print('hello from python')" }))
-            .await
-            .unwrap();
-
-        println!("PYTHON RUN OUTPUT: {out}");
-        if out.contains("Microsoft Store") && out.contains("9009") {
-            println!("Skipping test due to Windows python app execution alias.");
-            return;
-        }
-        assert!(out.contains("hello from python"));
-        let _ = fs::remove_dir_all(&root);
-    }
-}
-
 #[cfg(all(test, unix))]
 mod exec_failure_tests {
     use super::*;
@@ -3067,6 +3312,8 @@ mod exec_failure_tests {
         ShellExecTool {
             workspace_dir: root,
             restrict_to_workspace: false,
+            exec_jobs: None,
+            windows_runner: crate::config::WindowsShellRunner::default(),
         }
     }
 
@@ -3161,5 +3408,102 @@ mod exec_failure_tests {
             .expect("exec returns Ok without panicking on a mid-char truncation");
         // Reaching here at all proves no char-boundary panic (the String is valid UTF-8 by type).
         assert!(out.contains("(truncated,"), "expected truncation notice");
+    }
+}
+
+#[cfg(test)]
+mod exec_background_tests {
+    use super::*;
+    use crate::tools::exec_jobs::ExecJobRegistry;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn test_exec_auto_promotes_when_exceeding_wait_ms() {
+        let root = std::env::temp_dir().join(format!("isanagent_exec_bg_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let registry = ExecJobRegistry::new(None);
+        let exec_tool = ShellExecTool {
+            workspace_dir: root.clone(),
+            restrict_to_workspace: false,
+            exec_jobs: Some(registry.clone()),
+            windows_runner: crate::config::WindowsShellRunner::default(),
+        };
+        let status_tool = ExecStatusTool {
+            exec_jobs: registry.clone(),
+        };
+
+        let cmd = if cfg!(windows) {
+            "ping 127.0.0.1 -n 3 > nul"
+        } else {
+            "sleep 2"
+        };
+        let res = exec_tool
+            .execute(json!({
+                "command": cmd,
+                "wait_ms_before_async": 200
+            }))
+            .await
+            .unwrap();
+
+        let json_val: serde_json::Value = serde_json::from_str(&res).unwrap();
+        assert_eq!(json_val["background"], true);
+        let cid = json_val["command_id"].as_str().unwrap();
+
+        let status_res = status_tool
+            .execute(json!({
+                "command_id": cid,
+                "wait_duration_seconds": 5
+            }))
+            .await
+            .unwrap();
+
+        assert!(status_res.contains("Status: completed"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn test_exec_send_terminates_job() {
+        let root =
+            std::env::temp_dir().join(format!("isanagent_exec_term_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let registry = ExecJobRegistry::new(None);
+        let exec_tool = ShellExecTool {
+            workspace_dir: root.clone(),
+            restrict_to_workspace: false,
+            exec_jobs: Some(registry.clone()),
+            windows_runner: crate::config::WindowsShellRunner::default(),
+        };
+        let send_tool = ExecSendTool {
+            exec_jobs: registry.clone(),
+        };
+
+        let cmd = if cfg!(windows) {
+            "ping 127.0.0.1 -n 60 > nul"
+        } else {
+            "sleep 60"
+        };
+        let res = exec_tool
+            .execute(json!({
+                "command": cmd,
+                "wait_ms_before_async": 100
+            }))
+            .await
+            .unwrap();
+
+        let json_val: serde_json::Value = serde_json::from_str(&res).unwrap();
+        let cid = json_val["command_id"].as_str().unwrap();
+
+        let term_res = send_tool
+            .execute(json!({
+                "command_id": cid,
+                "terminate": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(term_res.contains("terminated successfully"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

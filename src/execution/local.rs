@@ -1,7 +1,7 @@
 //! Local subprocess execution (Phase 1): sandbox cwd, timeouts, output caps, best-effort cancel.
 //!
 //! Sessions run **shell** commands only (`cmd /C` on Windows, `sh -c` on Unix).
-//! For Python, use `python_run` or write scripts and run them via `exec` / `uv run`.
+//! For Python, write scripts and run them via `exec` / `uv run`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
@@ -453,9 +453,8 @@ impl LocalExecutionProvider {
             .filter(|s| !s.is_empty());
         match lang {
             Some("python") | Some("py") => Err(ExecutionError::InvalidArgument(
-                "Local execution sessions no longer support Python. \
-                 Use `python_run` for quick inline code, or write a .py file \
-                 and run it with `exec` via `uv run script.py` for complex tasks."
+                "Local execution sessions do not directly run raw Python code. \
+                 Write a .py file and run it with `exec` via `uv run script.py`."
                     .to_string(),
             )),
             None | Some("shell") | Some("sh") | Some("bash") | Some("cmd") | Some("powershell") => {

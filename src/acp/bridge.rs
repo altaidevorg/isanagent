@@ -8,9 +8,7 @@ pub fn classify_tool_kind(tool_name: &str) -> AcpToolKind {
         "write_file" | "edit_file" => AcpToolKind::Edit,
         "search_text" | "glob_files" | "tool_search" | "arxiv_search" => AcpToolKind::Search,
         "web_search" | "web_fetch" | "arxiv_fetch" | "hf_hub_file_fetch" => AcpToolKind::Fetch,
-        "shell_exec" | "python_run" | "execution_run" | "execution_run_background" => {
-            AcpToolKind::Execute
-        }
+        "shell_exec" | "execution_run" | "execution_run_background" => AcpToolKind::Execute,
         "todo_write" | "ask_user" | "compact_context" => AcpToolKind::Think,
         _ => AcpToolKind::Other,
     }
