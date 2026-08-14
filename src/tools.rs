@@ -115,6 +115,11 @@ impl ToolRegistry {
         self.tools.get(name).map(|t| t.as_ref())
     }
 
+    /// Retrieve the metadata policy for a tool if registered.
+    pub fn get_tool_policy(&self, name: &str) -> Option<crate::traits::ToolPolicy> {
+        self.tools.get(name).map(|t| t.policy())
+    }
+
     pub fn get_tool_names(&self) -> Vec<String> {
         self.tools.keys().cloned().collect()
     }

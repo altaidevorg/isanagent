@@ -638,6 +638,8 @@ impl ExecutionProvider for LocalExecutionProvider {
                 }
             }
 
+            crate::environment::ExecutionEnvironmentPolicy::default_safe()
+                .apply_to_tokio_command(&mut cmd);
             cmd.current_dir(&cwd);
             cmd.stdin(if stdin_body.is_some() {
                 Stdio::piped()
@@ -833,8 +835,8 @@ async fn run_uv_command(
         if let Some(cwd) = cwd.as_ref() {
             cmd.current_dir(cwd);
         }
-        // Explicitly forward host environment so secrets/API keys are visible to the child.
-        cmd.envs(std::env::vars());
+        crate::environment::ExecutionEnvironmentPolicy::default_safe()
+            .apply_to_std_command(&mut cmd);
         cmd.stdin(Stdio::null());
         let out = cmd
             .output()

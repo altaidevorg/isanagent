@@ -579,6 +579,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     tools.register(Box::new(crate::tools::recall::RecallToolResultTool {
         memory_node: memory_node.clone(),
         outbound_tx: global_outbound_tx.clone(),
+        spill_store: Some(crate::spill::SpillStore::new(&workspace.dir)),
     }));
     tools.register(Box::new(crate::tools::builtin::SearchMemoryTool {
         memory_node: memory_node.clone(),

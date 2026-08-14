@@ -15,7 +15,7 @@ use crate::tools::exec_jobs::{
     exec_status_str, ExecJobRecord, ExecJobRegistry, EXEC_JOB_CANCELLED, EXEC_JOB_COMPLETED,
     EXEC_JOB_FAILED, EXEC_JOB_RUNNING,
 };
-use crate::traits::{MutationPreview, Tool, ToolErrorCode, ToolResult};
+use crate::traits::{MutationPreview, Tool, ToolErrorCode, ToolPolicy, ToolResult};
 use crate::utils::{join_lexically_under_root, normalize_sandbox_relative_input};
 use crate::NodeHandle;
 use std::process::Stdio;
@@ -253,6 +253,10 @@ impl Tool for ReadFileTool {
             },
             "required": ["path"]
         })
+    }
+
+    fn policy(&self) -> ToolPolicy {
+        ToolPolicy::parallel()
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
@@ -649,6 +653,10 @@ impl Tool for ListDirTool {
         })
     }
 
+    fn policy(&self) -> ToolPolicy {
+        ToolPolicy::parallel()
+    }
+
     async fn execute(&self, args: Value) -> Result<String, String> {
         let path_str = args
             .get("path")
@@ -733,6 +741,10 @@ impl Tool for GlobFilesTool {
             },
             "required": ["pattern"]
         })
+    }
+
+    fn policy(&self) -> ToolPolicy {
+        ToolPolicy::parallel()
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
@@ -1056,6 +1068,10 @@ impl Tool for SearchTextTool {
         })
     }
 
+    fn policy(&self) -> ToolPolicy {
+        ToolPolicy::parallel()
+    }
+
     async fn execute(&self, args: Value) -> Result<String, String> {
         let pattern = args
             .get("pattern")
@@ -1224,7 +1240,8 @@ impl ShellExecTool {
         };
 
         cmd.current_dir(&actual_dir);
-        cmd.envs(std::env::vars());
+        crate::environment::ExecutionEnvironmentPolicy::default_safe()
+            .apply_to_tokio_command(&mut cmd);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -2809,6 +2826,10 @@ impl Tool for GitWorktreeTool {
             },
             "required": ["action"]
         })
+    }
+
+    fn policy(&self) -> ToolPolicy {
+        ToolPolicy::barrier()
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {

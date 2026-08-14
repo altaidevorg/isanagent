@@ -22,6 +22,7 @@ use crate::NodeHandle;
 pub struct RecallToolResultTool {
     pub memory_node: NodeHandle<MemoryMessage>,
     pub outbound_tx: Sender<BusMessage>,
+    pub spill_store: Option<crate::spill::SpillStore>,
 }
 
 #[async_trait]
@@ -32,9 +33,8 @@ impl Tool for RecallToolResultTool {
 
     fn description(&self) -> &str {
         "Retrieve the full content of an earlier tool result that has been compacted out \
-         of the active conversation. Pass the tool_call_id printed inside the \
-         `[Tool result archived. …]` placeholder. Returns an error if no result is \
-         cached for that id (it was never cached, or the cache has been cleared). \
+         of the active conversation or saved to large output spill storage. Pass the tool_call_id \
+         or spill_id. Returns an error if no result is cached for that id. \
          Use sparingly — every recall undoes part of the compaction's win."
     }
 
@@ -44,7 +44,15 @@ impl Tool for RecallToolResultTool {
             "properties": {
                 "tool_call_id": {
                     "type": "string",
-                    "description": "The LLM-supplied id of the tool call whose result you want to retrieve. Copy it verbatim from the archived placeholder text."
+                    "description": "The LLM-supplied id of the tool call or spill ID (e.g. 'spill_...') whose result you want to retrieve."
+                },
+                "start_line": {
+                    "type": "integer",
+                    "description": "Optional start line for spill slices (1-indexed). Defaults to 1."
+                },
+                "line_count": {
+                    "type": "integer",
+                    "description": "Optional number of lines to retrieve for spill slices (max 500). Defaults to 100."
                 }
             },
             "required": ["tool_call_id"]
@@ -59,9 +67,29 @@ impl Tool for RecallToolResultTool {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 "Missing or empty 'tool_call_id' (string). Copy it verbatim from the \
-                 [Tool result archived. …] placeholder."
+                 [Tool result archived. …] placeholder or [Spill ID: spill_...] header."
                     .to_string()
             })?;
+
+        let start_line = args.get("start_line").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+        let line_count = args
+            .get("line_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(100) as usize;
+
+        // 1. Check SpillStore if id starts with spill_
+        if tool_call_id.starts_with("spill_") {
+            let chat_id = current_tool_exec_ctx()
+                .map(|c| c.chat_id)
+                .unwrap_or_default();
+            let default_store = crate::spill::SpillStore::new(std::path::Path::new("."));
+            let store = self.spill_store.as_ref().unwrap_or(&default_store);
+            if let Ok(slice) =
+                store.read_spill_slice(&chat_id, &tool_call_id, start_line, line_count)
+            {
+                return Ok(slice);
+            }
+        }
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.memory_node

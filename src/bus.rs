@@ -794,6 +794,13 @@ pub enum BusMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         skill_name: Option<String>,
     },
+    /// Incremental provider streaming chunk for real-time UI/client rendering.
+    StreamDelta {
+        chat_id: String,
+        chunk: crate::traits::StreamChunk,
+    },
+    /// Authoritative state projection snapshot for client state synchronization.
+    SessionProjection(crate::projections::SessionProjection),
 }
 
 #[cfg(test)]
