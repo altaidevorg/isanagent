@@ -126,6 +126,23 @@ isanagent skills add huggingface/sentence-transformers --skill train-sentence-tr
 
 Skills are installed directly to your workspace's `skills/` directory and are immediately available for the agent to load using the `load_skill_instructions` tool. Use `/skills list` (TUI) or `isanagent skills list` (CLI) to see what's installed.
 
+### Agent Plugins 1.0 (Portable Extensions)
+
+isanagent natively supports the open **Agent Plugins 1.0 Specification** ([agent-plugins.org](https://agent-plugins.org)), allowing you to bundle Agent Skills, MCP servers, declarative subagents, rules, and hooks into one portable package:
+
+```bash
+# Install a plugin into your workspace (.agents/plugins/)
+isanagent plugin install https://github.com/altaidevorg/plugin-ml-engineer
+
+# Install globally to ~/.agent-plugins
+isanagent plugin install https://github.com/altaidevorg/plugin-ml-engineer --global
+
+# List installed plugins
+isanagent plugin list
+```
+
+See the [Agent Plugins User Guide](docs/plugins-user-guide.md) and [Harness Hardening Guide](docs/harness-hardening-user-guide.md) for full architectural details.
+
 ### Build from source (optional)
 
 From a clone of this repo, **`ui/dist` is already present**, so a normal Rust build is enough unless you edited `ui/`:

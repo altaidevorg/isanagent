@@ -54,10 +54,10 @@ Items below carry no `[consumed-by:]` annotation until evidence appears.
 [src/lib.rs:9-33](../src/lib.rs#L9-L33):
 
 ```
-agent, bus, channels, clarification, config, execution, hooks, logging,
-memory, ml_engineer, multi_tenant_edge, onboarding, onboarding_interactive,
-provider, provider_registry, reflection, scheduler, session, skills,
-tool_activity, tool_runtime, tools, traits, utils, workspace
+agent, bus, channels, clarification, config, environment, execution, hooks, logging,
+memory, ml_engineer, multi_tenant_edge, onboarding, onboarding_interactive, plugins,
+projections, provider, provider_registry, redact, reflection, scheduler, session, skills,
+spill, tool_activity, tool_runtime, tools, traits, utils, workspace
 ```
 
 Every module is fully `pub`. No `pub(crate)` gating at the lib.rs level.
@@ -155,21 +155,26 @@ Many variants already use `#[serde(default)]` on `channel`, `tool_call_id`, `bac
 
 ### 4.4 `BusMessage` — enum [src/bus.rs:461](../src/bus.rs#L461)
 
-`#[derive(Debug, Clone, Serialize, Deserialize)]`. Top-level routing wrapper.
+`#[derive(Debug, Clone, Serialize, Deserialize)]`. 
 
 | Variant | Payload |
 | --- | --- |
-| `Inbound(InboundMessage)` | — |
-| `Outbound(OutboundMessage)` | — |
-| `Telemetry(TelemetryEvent)` | — |
-| `Log(LogEvent)` | — |
-| `LoggerControl(LoggerControlMessage)` | — |
-| `Cancel(String)` | `chat_id` |
+| `Inbound(InboundMessage)` | Inbound user or synthetic trigger message |
+| `Outbound(OutboundMessage)` | Outbound reply payload |
+| `Telemetry(TelemetryEvent)` | Analytical & tracing events |
+| `Log(LogEvent)` | Structured file log event |
+| `RunLifecycle(RunLifecycleEvent)` | Reasoning run lifecycle event |
+| `LoggerControl(LoggerControlMessage)` | Logger synchronization |
+| `Cancel(String)` | `chat_id` explicit cancel |
+| `CancelRun { chat_id, run_id }` | Specific foreground reasoning run cancel |
+| `Steer { chat_id, run_id, content }` | Mid-flight user direction injection |
 | `PromoteSyncToBackground(String)` | `chat_id`; from `/background` slash command |
 | `SetTerminalSessionChat { chat_id: String }` | TUI session focus |
-| `SwitchModel { provider_name, model_name, base_url, api_key }` | from `/model` slash command |
-
-PR-5 of the overhaul adds `TriggerCompaction { chat_id, focus_instructions }`.
+| `SwitchModel { provider_name, model_name, base_url, api_key }` | Runtime provider switch |
+| `TriggerCompaction { session_key, focus_instructions, trigger }` | Manual session compaction trigger |
+| `InstallSkill { repo_url, skill_name }` | Dynamic skill installer |
+| `StreamDelta { chat_id, chunk }` | Incremental LLM provider streaming delta |
+| `SessionProjection(SessionProjection)` | Authoritative session state projection snapshot |
 
 ### 4.5 `LogLevel` — enum [src/bus.rs:257](../src/bus.rs#L257)
 
@@ -356,7 +361,7 @@ Manages execution providers (`local`, `jupyter`, `ssh`). Mostly private fields. 
 
 The trait surface is small and stable:
 
-### 7.1 `Provider` — [src/traits.rs:8](../src/traits.rs#L8)
+### 7.1 `Provider` — [src/traits.rs:162](../src/traits.rs#L162)
 
 ```rust
 #[async_trait]
@@ -366,10 +371,21 @@ pub trait Provider: Send + Sync + dyn_clone::DynClone {
         messages: &[crate::utils::ChatMessage],
         tools: Option<serde_json::Value>,
     ) -> Result<crate::utils::LLMResponse, crate::utils::LLMError>;
+
+    async fn stream(
+        &self,
+        messages: &[crate::utils::ChatMessage],
+        tools: Option<serde_json::Value>,
+        sink: tokio::sync::mpsc::Sender<crate::traits::StreamChunk>,
+    ) -> Result<crate::utils::LLMResponse, crate::utils::LLMError>;
+
+    fn context_window_tokens(&self) -> Option<usize> {
+        None
+    }
 }
 ```
 
-`dyn_clone::clone_trait_object!(Provider)` enables `Box<dyn Provider>` cloning.
+`dyn_clone::clone_trait_object!(Provider)` enables `Box<dyn Provider>` cloning. `StreamChunk` variants: `TextDelta`, `ReasoningDelta`, `ToolCallDelta`, `Usage`, `Finish`.
 
 ### 7.2 `Memory` — [src/traits.rs:23](../src/traits.rs#L23)
 
@@ -383,9 +399,14 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn parameters(&self) -> Value;
+    fn policy(&self) -> ToolPolicy {
+        ToolPolicy::serial()
+    }
     async fn execute(&self, args: Value) -> Result<String, String>;
 }
 ```
+
+`ExecutionMode` variants: `Parallel` (read-only), `Serial` (standard mutating), `Barrier` (environment mutating), `Background` (async process).
 
 Concrete implementations live across `src/tools/builtin.rs`, `src/tools/execution.rs`, `src/tools/workflow.rs`, `src/tools/ml_domain.rs`, plus `src/agent/mod.rs::LoadSkillTool` and `src/agent/subagent.rs`. **Trait additions are breaking** (new required methods break existing impls) — defaultable methods preferred.
 
