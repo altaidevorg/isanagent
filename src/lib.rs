@@ -23,6 +23,7 @@ pub mod ml_engineer;
 pub mod multi_tenant_edge;
 pub mod onboarding;
 pub mod onboarding_interactive;
+pub mod plugins;
 pub mod provider;
 pub mod provider_registry;
 pub mod redact;

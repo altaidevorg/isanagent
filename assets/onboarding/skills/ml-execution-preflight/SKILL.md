@@ -1,7 +1,7 @@
 ---
 name: ml-execution-preflight
 description: Checklist before long execution_run or execution_run_background for ML/training scripts.
-always: true
+always: false
 ---
 
 # ML execution preflight

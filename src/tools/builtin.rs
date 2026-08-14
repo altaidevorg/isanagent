@@ -231,10 +231,7 @@ impl Tool for ReadFileTool {
     }
 
     fn description(&self) -> &str {
-        "Read a slice of a local file. REQUIRED on every call: path, start_line, and end_line \
-(1-indexed, inclusive). Each call returns at most 100 lines — never omit the line range, \
-and never rely on a default. For longer files, issue multiple read_file calls with adjacent \
-ranges (e.g. 1–100, then 101–200). Prefer absolute or workspace-relative paths."
+        "Read content from a local file within a specified line range (1-indexed, inclusive). If start_line and end_line are omitted, reads the first 100 lines. Each call returns at most 100 lines. For longer files, issue multiple read_file calls with adjacent ranges (e.g. 1–100, then 101–200). Prefer absolute or workspace-relative paths."
     }
 
     fn parameters(&self) -> Value {
@@ -247,14 +244,14 @@ ranges (e.g. 1–100, then 101–200). Prefer absolute or workspace-relative pat
                 },
                 "start_line": {
                     "type": "integer",
-                    "description": "Required. First line to include (1-indexed, inclusive). Always pass explicitly — there is no default."
+                    "description": "Optional. First line to include (1-indexed, inclusive). Defaults to 1."
                 },
                 "end_line": {
                     "type": "integer",
-                    "description": "Required. Last line to include (1-indexed, inclusive). Must be >= start_line. The tool caps each call at 100 lines even if the range is wider."
+                    "description": "Optional. Last line to include (1-indexed, inclusive). Defaults to start_line + 99. The tool caps each call at 100 lines even if the range is wider."
                 }
             },
-            "required": ["path", "start_line", "end_line"]
+            "required": ["path"]
         })
     }
 
@@ -273,14 +270,11 @@ ranges (e.g. 1–100, then 101–200). Prefer absolute or workspace-relative pat
             ));
         }
 
-        let start_line = args.get("start_line").and_then(|v| v.as_u64()).ok_or(
-            "Missing required 'start_line'. Every read_file call must pass start_line and \
-end_line (1-indexed, inclusive); max 100 lines per call — e.g. start_line=1, end_line=100.",
-        )?;
-        let end_line = args.get("end_line").and_then(|v| v.as_u64()).ok_or(
-            "Missing required 'end_line'. Every read_file call must pass start_line and \
-end_line (1-indexed, inclusive); max 100 lines per call — e.g. start_line=1, end_line=100.",
-        )?;
+        let start_line = args.get("start_line").and_then(|v| v.as_u64()).unwrap_or(1);
+        let end_line = args
+            .get("end_line")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(start_line + 99);
 
         let content = fs::read_to_string(&actual_path).map_err(|e| e.to_string())?;
 
@@ -296,7 +290,17 @@ end_line (1-indexed, inclusive); max 100 lines per call — e.g. start_line=1, e
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
 
-        let actual_start = start.min(total_lines.max(1));
+        if total_lines == 0 {
+            return Ok(String::new());
+        }
+
+        if start > total_lines {
+            return Ok(format!(
+                "[File has only {total_lines} lines; start_line {start} is beyond end of file]"
+            ));
+        }
+
+        let actual_start = start;
         let actual_end = (actual_start + lines_to_read - 1).min(total_lines);
 
         let snippet: Vec<String> = lines[actual_start - 1..actual_end]
@@ -353,6 +357,13 @@ impl Tool for WriteFileTool {
 
         let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
 
+        if super::isanagent_ignore::is_ignored(&actual_path, false) {
+            return Err(format!(
+                "blocked by .isanagentignore: {}",
+                actual_path.display()
+            ));
+        }
+
         if let Some(parent) = actual_path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create parent directories: {e}"))?;
@@ -374,6 +385,14 @@ impl Tool for WriteFileTool {
             .and_then(|v| v.as_str())
             .ok_or("Missing 'content' argument")?;
         let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
+
+        if super::isanagent_ignore::is_ignored(&actual_path, false) {
+            return Err(format!(
+                "blocked by .isanagentignore: {}",
+                actual_path.display()
+            ));
+        }
+
         let before = match fs::read_to_string(&actual_path) {
             Ok(current_content) => {
                 // No-op write: the file already holds the exact content. Skip the
@@ -484,6 +503,13 @@ impl Tool for EditFileTool {
 
         let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
 
+        if super::isanagent_ignore::is_ignored(&actual_path, false) {
+            return Err(format!(
+                "blocked by .isanagentignore: {}",
+                actual_path.display()
+            ));
+        }
+
         let content =
             fs::read_to_string(&actual_path).map_err(|e| format!("Error reading file: {e}"))?;
 
@@ -542,6 +568,14 @@ impl Tool for EditFileTool {
             return Ok(None);
         }
         let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
+
+        if super::isanagent_ignore::is_ignored(&actual_path, false) {
+            return Err(format!(
+                "blocked by .isanagentignore: {}",
+                actual_path.display()
+            ));
+        }
+
         let before = fs::read_to_string(&actual_path)
             .map_err(|error| format!("Could not preview edit target: {error}"))?;
         if !before.contains(old_text) {

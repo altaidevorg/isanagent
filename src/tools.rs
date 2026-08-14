@@ -235,9 +235,19 @@ impl ToolRegistry {
         Ok(())
     }
 
-    /// Tools that must not run inside a sub-agent loop (prevents unbounded recursion).
+    /// Tools that must not run inside a sub-agent loop (prevents unbounded recursion and chat confusion).
     pub fn is_subagent_restricted_tool(name: &str) -> bool {
-        matches!(name, "subagent_spawn" | "subagent_plan_execute")
+        matches!(
+            name,
+            "subagent_spawn"
+                | "subagent_plan_execute"
+                | "task_list"
+                | "task_get"
+                | "task_cancel"
+                | "task_history_list"
+                | "task_dashboard"
+                | "cron"
+        )
     }
 
     /// Read-only or side-effect-free tools safe to run concurrently (same assistant turn).

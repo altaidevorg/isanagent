@@ -79,24 +79,57 @@ impl SkillRegistry {
         }
     }
 
+    /// Ingests skills from any custom directory containing `skills/<name>/SKILL.md` or direct `<name>/SKILL.md`.
+    pub fn load_from_directory(&mut self, dir: &std::path::Path) {
+        if !dir.exists() {
+            return;
+        }
+
+        let entries = match fs::read_dir(dir) {
+            Ok(pwd) => pwd,
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let skill_md = path.join("SKILL.md");
+                let skill_md = if skill_md.exists() {
+                    skill_md
+                } else {
+                    path.join("skill.md")
+                };
+
+                if skill_md.exists() {
+                    if let Some(def) = Self::parse_skill_md(&skill_md) {
+                        if !def.available {
+                            warn!("Skill {} loaded but marked UNAVAILABLE due to missing requirements.", def.name);
+                        } else {
+                            info!("Loaded Skill: {}", def.name);
+                        }
+                        self.skills.insert(def.name.clone(), def);
+                    }
+                }
+            }
+        }
+    }
+
     /// Parses a SKILL.md file extracting YAML frontmatter and the Markdown body.
-    fn parse_skill_md(path: &PathBuf) -> Option<SkillDefinition> {
+    fn parse_skill_md(path: &std::path::Path) -> Option<SkillDefinition> {
         let content = fs::read_to_string(path).ok()?;
 
         let lines: Vec<&str> = content.lines().collect();
-        if lines.is_empty() {
-            return None;
-        }
+        let first_non_empty = lines.iter().position(|l| !l.trim().is_empty())?;
 
-        // Extremely basic frontmatter parsing: looks for --- ... ---
-        if lines[0] != "---" {
+        // YAML frontmatter parsing: looks for --- ... ---
+        if lines[first_non_empty].trim() != "---" {
             warn!("Skipping {path:?}: No YAML frontmatter found (must start with '---')");
             return None;
         }
 
         let mut end_idx = 0;
-        for (i, &line) in lines.iter().enumerate().skip(1) {
-            if line == "---" {
+        for (i, &line) in lines.iter().enumerate().skip(first_non_empty + 1) {
+            if line.trim() == "---" {
                 end_idx = i;
                 break;
             }
@@ -107,7 +140,7 @@ impl SkillRegistry {
             return None;
         }
 
-        let frontmatter_str = lines[1..end_idx].join("\n");
+        let frontmatter_str = lines[first_non_empty + 1..end_idx].join("\n");
         let body_str = lines[end_idx + 1..].join("\n");
 
         match serde_yaml::from_str::<SkillFrontmatter>(&frontmatter_str) {
@@ -148,7 +181,7 @@ impl SkillRegistry {
                     name: metadata.name,
                     description: final_desc,
                     instructions: body_str,
-                    path: path.clone(),
+                    path: path.to_path_buf(),
                     always: metadata.always.unwrap_or(false),
                     available,
                 })
@@ -295,7 +328,7 @@ impl SkillRegistry {
                 let skill_dir = skill_md_path.parent().ok_or("Invalid skill path")?;
 
                 // Parse to get the skill name
-                if let Some(def) = Self::parse_skill_md(&skill_md_path.to_path_buf()) {
+                if let Some(def) = Self::parse_skill_md(skill_md_path) {
                     // Filter if specific skill requested
                     if let Some(requested) = specific_skill {
                         if def.name != requested {
