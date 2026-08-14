@@ -36,7 +36,13 @@ impl SpillStore {
 
         let clean_session: String = session_id
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         let clean_session = if clean_session.is_empty() {
             "default".to_string()
@@ -46,7 +52,13 @@ impl SpillStore {
 
         let clean_tool_name: String = tool_name
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         let clean_tool_name = if clean_tool_name.is_empty() {
             "tool".to_string()
@@ -113,7 +125,13 @@ impl SpillStore {
     ) -> Result<String, String> {
         let clean_session: String = session_id
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         let clean_session = if clean_session.is_empty() {
             "default".to_string()
@@ -243,12 +261,19 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = SpillStore::new(temp.path());
 
-        let (preview, spill_id) = store.maybe_spill("chat/../../hack:1", "my::tool", "a\n".repeat(200).as_str(), 10);
+        let (preview, spill_id) = store.maybe_spill(
+            "chat/../../hack:1",
+            "my::tool",
+            "a\n".repeat(200).as_str(),
+            10,
+        );
         assert!(spill_id.is_some());
         let id = spill_id.unwrap();
         assert!(preview.contains(&id));
 
-        let slice = store.read_spill_slice("chat/../../hack:1", &id, 1, 5).expect("slice");
+        let slice = store
+            .read_spill_slice("chat/../../hack:1", &id, 1, 5)
+            .expect("slice");
         assert!(slice.contains("Lines 1–5"));
     }
 }

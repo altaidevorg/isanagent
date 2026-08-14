@@ -28,38 +28,39 @@ enum Commands {
     Acp(AcpArgs),
     /// Create workspace layout and starter files; optional flags override generated config.toml
     Onboard(OnboardArgs),
-    /// Manage harness packs and plugins (install, list, remove)
-    Pack(PackArgs),
+    /// Manage Agent Plugins 1.0 (install, list, remove)
+    #[command(alias = "pack")]
+    Plugin(PluginArgs),
     /// Manage skills (add, list, etc.)
     Skills(SkillsArgs),
 }
 
 #[derive(ClapArgs, Debug)]
-struct PackArgs {
+struct PluginArgs {
     #[command(subcommand)]
-    command: PackCommands,
+    command: PluginCommands,
 }
 
 #[derive(Subcommand, Debug)]
-enum PackCommands {
-    /// Install a harness pack or plugin from a Git repository
+enum PluginCommands {
+    /// Install an Agent Plugin from a Git repository
     Install {
-        /// Repository URL (e.g., https://github.com/altaidevorg/pack-ml-engineer or owner/repo)
+        /// Repository URL (e.g., https://github.com/agentplugins/agent-plugins-example or owner/repo)
         source: String,
         /// Optional custom name for the installed plugin
         #[arg(short, long)]
         name: Option<String>,
-        /// Install globally to ~/.isanagent/plugins instead of the workspace
+        /// Install globally to ~/.agent-plugins instead of the workspace
         #[arg(short, long)]
         global: bool,
     },
-    /// List all discovered plugins and harness packs
+    /// List all discovered Agent Plugins
     List,
     /// Remove an installed plugin from the workspace or global directory
     Remove {
         /// Name of the plugin to remove
         name: String,
-        /// Remove from the global directory (~/.isanagent/plugins)
+        /// Remove from the global directory (~/.agent-plugins)
         #[arg(short, long)]
         global: bool,
     },
@@ -126,7 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .map_err(|e| e as Box<dyn std::error::Error>),
         Some(Commands::Onboard(args)) => run_onboard(cli.workspace, args).await,
-        Some(Commands::Pack(args)) => run_pack(cli.workspace, args).await,
+        Some(Commands::Plugin(args)) => run_plugin(cli.workspace, args).await,
         Some(Commands::Skills(args)) => run_skills(cli.workspace, args).await,
         None => {
             // First-run UX: when the user invokes `isanagent` with no `--workspace` and the
@@ -198,22 +199,22 @@ async fn start_embedded_host(
     Ok(())
 }
 
-async fn run_pack(
+async fn run_plugin(
     workspace_arg: Option<String>,
-    args: PackArgs,
+    args: PluginArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let workspace = IsanagentWorkspace::new(workspace_arg.as_deref(), None)?;
     let global_root = resolve_workspace_root(None);
 
     match args.command {
-        PackCommands::List => {
+        PluginCommands::List => {
             let registry =
                 isanagent::plugins::PluginRegistry::discover(&workspace.dir, Some(&global_root));
             if registry.is_empty() {
-                println!("No harness packs or plugins installed.");
-                println!("Install with: isanagent pack install <repo_url>");
+                println!("No Agent Plugins installed.");
+                println!("Install with: isanagent plugin install <repo_url>");
             } else {
-                println!("Installed Harness Packs & Plugins ({}):", registry.len());
+                println!("Installed Agent Plugins ({}):", registry.len());
                 for p in registry.list() {
                     let version = p.manifest.version.as_deref().unwrap_or("0.1.0");
                     let desc = p.manifest.description.as_deref().unwrap_or("");
@@ -224,10 +225,13 @@ async fn run_pack(
                     if let Some(ref skills_dir) = p.skills_dir {
                         println!("    └─ Skills: {}", skills_dir.display());
                     }
+                    if let Some(ref mcp_path) = p.mcp_config_path {
+                        println!("    └─ MCP: {}", mcp_path.display());
+                    }
                 }
             }
         }
-        PackCommands::Install {
+        PluginCommands::Install {
             source,
             name,
             global,
@@ -238,7 +242,7 @@ async fn run_pack(
                 workspace.dir.join(".agents").join("plugins")
             };
             println!(
-                "Installing harness pack from {source} into {}...",
+                "Installing Agent Plugin from {source} into {}...",
                 target_dir.display()
             );
             match isanagent::plugins::PluginRegistry::install_from_repo(
@@ -250,17 +254,17 @@ async fn run_pack(
             {
                 Ok(plugin) => {
                     println!(
-                        "Successfully installed pack '{}' (v{})",
+                        "Successfully installed plugin '{}' (v{})",
                         plugin.name,
                         plugin.manifest.version.as_deref().unwrap_or("0.1.0")
                     );
                 }
                 Err(e) => {
-                    return Err(format!("Error installing harness pack: {e}").into());
+                    return Err(format!("Error installing plugin: {e}").into());
                 }
             }
         }
-        PackCommands::Remove { name, global } => {
+        PluginCommands::Remove { name, global } => {
             let clean_name = name.trim();
             if clean_name.is_empty()
                 || clean_name.contains('/')
