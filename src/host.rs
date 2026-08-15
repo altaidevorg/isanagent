@@ -605,6 +605,8 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             std::sync::Arc::new(workspace.config.clone()),
         );
     }
+    let uv_bin = workspace.config.execution_uv_binary();
+    plugins.populate_tool_registry(&mut tools, &uv_bin).await;
     let tool_catalog = tools.catalog_handle();
     tools.register(Box::new(ToolSearchTool {
         catalog: tool_catalog,

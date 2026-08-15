@@ -10,6 +10,7 @@ pub mod exec_jobs;
 pub mod execution;
 pub mod isanagent_ignore;
 pub mod kernel_porting;
+pub mod mcp;
 pub mod ml_domain;
 pub mod recall;
 pub mod workflow;

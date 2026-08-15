@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::agent::registry::AgentRegistry;
 use crate::skills::SkillRegistry;
+use crate::tools::ToolRegistry;
 
 /// Canonical Agent Plugins 1.0 JSON Schema URL.
 pub const AGENT_PLUGINS_SCHEMA_URL: &str =
@@ -132,6 +133,13 @@ impl Plugin {
             let mut m: PluginManifest = serde_json::from_str(&content).ok()?;
             if m.name.is_empty() {
                 m.name = dir_name.clone();
+            }
+            if let Err(err) = validate_plugin_name(&m.name) {
+                log::warn!(
+                    "Plugin manifest at {} has invalid name: {err}",
+                    plugin_json.display()
+                );
+                return None;
             }
             m
         } else if pack_toml.is_file() {
@@ -314,6 +322,7 @@ impl PluginRegistry {
         registry.scan_directory(&workspace_root.join(".isanagent").join("plugins"));
         registry.scan_directory(&workspace_root.join(".isanagent").join("packs"));
         registry.scan_directory(&workspace_root.join("plugins"));
+        registry.scan_directory(&workspace_root.join("assets").join("plugins"));
 
         registry
     }
@@ -406,6 +415,63 @@ impl PluginRegistry {
         section
     }
 
+    /// Ingests and initializes all plugin MCP tools into the provided `ToolRegistry`.
+    pub async fn populate_tool_registry(&self, tool_registry: &mut ToolRegistry, uv_binary: &str) {
+        for plugin in self.plugins.values() {
+            if let Some(ref mcp_path) = plugin.mcp_config_path {
+                let Ok(content) = std::fs::read_to_string(mcp_path) else {
+                    continue;
+                };
+                let Ok(config) = serde_json::from_str::<crate::tools::mcp::McpConfigFile>(&content)
+                else {
+                    log::warn!("Failed to parse MCP config at {}", mcp_path.display());
+                    continue;
+                };
+
+                for (server_name, entry) in config.mcp_servers {
+                    log::info!(
+                        "Launching MCP server '{server_name}' for plugin '{}'",
+                        plugin.name
+                    );
+                    match crate::tools::mcp::McpClient::launch(&plugin.dir, &entry, uv_binary).await
+                    {
+                        Ok(client) => {
+                            let client_arc = std::sync::Arc::new(client);
+                            match client_arc.list_tools().await {
+                                Ok(tools) => {
+                                    for tool_def in tools {
+                                        log::info!(
+                                            "Registering MCP tool '{}' from plugin '{}'",
+                                            tool_def.name,
+                                            plugin.name
+                                        );
+                                        let proxy = crate::tools::mcp::McpProxyTool::new(
+                                            tool_def,
+                                            client_arc.clone(),
+                                        );
+                                        tool_registry.register(Box::new(proxy));
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "Failed to list tools for MCP server '{server_name}' in plugin '{}': {e}",
+                                        plugin.name
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "Failed to launch MCP server '{server_name}' for plugin '{}': {e}",
+                                plugin.name
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Clones and installs a remote Agent Plugin Git repository into `target_dir/<plugin_name>`.
     pub async fn install_from_repo(
         target_plugins_dir: &Path,
@@ -433,16 +499,8 @@ impl PluginRegistry {
             .unwrap_or(leaf);
 
         let target_name = custom_name.unwrap_or(inferred_name).trim();
-        if target_name.is_empty()
-            || target_name.contains('/')
-            || target_name.contains('\\')
-            || target_name == "."
-            || target_name == ".."
-        {
-            return Err(format!(
-                "Invalid plugin name '{target_name}': must not contain path separators or parent directory references"
-            ));
-        }
+        validate_plugin_name(target_name)?;
+
         let destination = target_plugins_dir.join(target_name);
 
         if destination.exists() {
@@ -477,6 +535,101 @@ impl PluginRegistry {
             )
         })
     }
+}
+
+/// Validates a plugin name against the Agent Plugins 1.0 Specification (§5.5).
+/// Name must be 1–64 characters, using only lowercase alphanumeric characters, hyphens, and periods,
+/// starting and ending with an alphanumeric character, and without consecutive separators (`--`, `..`, `.-`, `-.`).
+pub fn validate_plugin_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Plugin name cannot be empty".to_string());
+    }
+    if name.len() > 64 {
+        return Err(format!(
+            "Plugin name '{name}' exceeds maximum length of 64 characters (has {})",
+            name.len()
+        ));
+    }
+
+    let bytes = name.as_bytes();
+    let first = bytes[0];
+    let last = bytes[bytes.len() - 1];
+
+    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+        return Err(format!(
+            "Plugin name '{name}' must start with a lowercase alphanumeric character"
+        ));
+    }
+    if !last.is_ascii_lowercase() && !last.is_ascii_digit() {
+        return Err(format!(
+            "Plugin name '{name}' must end with a lowercase alphanumeric character"
+        ));
+    }
+
+    let mut prev = '\0';
+    for ch in name.chars() {
+        if !ch.is_ascii_lowercase() && !ch.is_ascii_digit() && ch != '-' && ch != '.' {
+            return Err(format!(
+                "Plugin name '{name}' contains invalid character '{ch}': only lowercase alphanumeric, '-' and '.' are allowed"
+            ));
+        }
+        if (ch == '-' || ch == '.') && (prev == '-' || prev == '.') {
+            return Err(format!(
+                "Plugin name '{name}' must not contain consecutive separators ('{prev}{ch}')"
+            ));
+        }
+        prev = ch;
+    }
+
+    Ok(())
+}
+
+/// Resolves a plugin-relative path ensuring containment within the plugin root (§4.1).
+pub fn resolve_contained_path(plugin_root: &Path, rel_path: &str) -> Result<PathBuf, String> {
+    let raw = Path::new(rel_path);
+    if raw.is_absolute() {
+        return Err(format!(
+            "Absolute path '{rel_path}' is not allowed as a plugin-relative path"
+        ));
+    }
+
+    let mut out = plugin_root.to_path_buf();
+    for comp in raw.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if out == plugin_root {
+                    return Err(format!(
+                        "Path '{rel_path}' escapes plugin root '{}'",
+                        plugin_root.display()
+                    ));
+                }
+                out.pop();
+            }
+            std::path::Component::Normal(name) => out.push(name),
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(format!(
+                    "Path '{rel_path}' contains forbidden root or prefix component"
+                ));
+            }
+        }
+    }
+
+    // If target exists on disk, check symlink resolution doesn't escape plugin_root
+    if out.exists() && plugin_root.exists() {
+        if let (Ok(canon_out), Ok(canon_root)) = (out.canonicalize(), plugin_root.canonicalize()) {
+            if !canon_out.starts_with(&canon_root) {
+                return Err(format!(
+                    "Path '{}' canonicalizes to '{}' outside plugin root '{}'",
+                    rel_path,
+                    canon_out.display(),
+                    canon_root.display()
+                ));
+            }
+        }
+    }
+
+    Ok(out)
 }
 
 fn dirs_next_home_dir() -> Option<PathBuf> {
@@ -570,5 +723,40 @@ mod tests {
         assert_eq!(registry.len(), 2);
         assert!(registry.get("plugin-one").is_some());
         assert!(registry.get("plugin-two").is_some());
+    }
+
+    #[test]
+    fn validates_spec_conforming_plugin_names() {
+        assert!(validate_plugin_name("kernel-porting").is_ok());
+        assert!(validate_plugin_name("autotrainess").is_ok());
+        assert!(validate_plugin_name("tool.v1").is_ok());
+        assert!(validate_plugin_name("a").is_ok());
+        assert!(validate_plugin_name("0").is_ok());
+
+        assert!(validate_plugin_name("").is_err());
+        assert!(validate_plugin_name("-abc").is_err());
+        assert!(validate_plugin_name("abc-").is_err());
+        assert!(validate_plugin_name(".abc").is_err());
+        assert!(validate_plugin_name("abc.").is_err());
+        assert!(validate_plugin_name("a--b").is_err());
+        assert!(validate_plugin_name("a..b").is_err());
+        assert!(validate_plugin_name("a.-b").is_err());
+        assert!(validate_plugin_name("a-.b").is_err());
+        assert!(validate_plugin_name("ML-Kit").is_err());
+        assert!(validate_plugin_name("a/b").is_err());
+        assert!(validate_plugin_name("a b").is_err());
+    }
+
+    #[test]
+    fn enforces_path_containment() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let plugin_dir = temp_dir.path().join("my-plugin");
+        std::fs::create_dir_all(&plugin_dir).expect("mkdir");
+
+        let valid = resolve_contained_path(&plugin_dir, "./skills/test").expect("valid path");
+        assert!(valid.starts_with(&plugin_dir));
+
+        let escaping = resolve_contained_path(&plugin_dir, "../outside");
+        assert!(escaping.is_err());
     }
 }
