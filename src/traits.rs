@@ -136,6 +136,38 @@ impl ToolResult {
 
 // --- Trait Definitions ---
 
+/// Reasons why an LLM generation finished.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FinishReason {
+    Stop,
+    ToolCalls,
+    Length,
+    ContentFilter,
+    Other(String),
+}
+
+/// Typed incremental chunk emitted during streaming LLM generation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum StreamChunk {
+    /// Incremental model text output delta.
+    TextDelta(String),
+    /// Incremental reasoning/thinking token delta.
+    ReasoningDelta(String),
+    /// Tool call invocation start or argument delta.
+    ToolCallDelta {
+        id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        args_delta: String,
+    },
+    /// Final token usage metadata.
+    Usage(crate::utils::TokenUsage),
+    /// Stream finished event.
+    Finish(FinishReason),
+}
+
 /// A Provider abstracts the generation capabilities of an LLM.
 #[async_trait]
 pub trait Provider: Send + Sync + dyn_clone::DynClone {
@@ -147,6 +179,32 @@ pub trait Provider: Send + Sync + dyn_clone::DynClone {
         messages: &[crate::utils::ChatMessage],
         tools: Option<serde_json::Value>,
     ) -> Result<crate::utils::LLMResponse, crate::utils::LLMError>;
+
+    /// Send a streaming chat completion request, forwarding chunks into `sink`.
+    /// Default implementation calls `chat()` and emits one full `TextDelta` and `Finish`.
+    async fn stream(
+        &self,
+        messages: &[crate::utils::ChatMessage],
+        tools: Option<serde_json::Value>,
+        sink: tokio::sync::mpsc::Sender<StreamChunk>,
+    ) -> Result<crate::utils::LLMResponse, crate::utils::LLMError> {
+        let resp = self.chat(messages, tools).await?;
+        if !resp.content.is_empty() {
+            let _ = sink
+                .send(StreamChunk::TextDelta(resp.content.clone()))
+                .await;
+        }
+        if let Some(ref reasoning) = resp.reasoning_content {
+            let _ = sink
+                .send(StreamChunk::ReasoningDelta(reasoning.clone()))
+                .await;
+        }
+        if let Some(ref usage) = resp.usage {
+            let _ = sink.send(StreamChunk::Usage(usage.clone())).await;
+        }
+        let _ = sink.send(StreamChunk::Finish(FinishReason::Stop)).await;
+        Ok(resp)
+    }
 
     /// PR-3: the model's input context window in tokens, if known. Used by
     /// `effective_compaction_threshold` to fire compaction at a fraction of the
@@ -182,6 +240,67 @@ pub trait Memory: Send + Sync {
     async fn clear_keep_last(&mut self, keep_last: usize) -> Result<(), String>;
 }
 
+/// Execution concurrency classification for metadata-driven tool scheduling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMode {
+    /// Safe to execute concurrently alongside other read-only tools (e.g. read_file, search_text, glob_files).
+    Parallel,
+    /// Standard mutating tool executed in strict sequential order (e.g. write_file, edit_file).
+    Serial,
+    /// Environmental barrier that requires all preceding in-flight tools to finish before execution (e.g. git_worktree).
+    Barrier,
+    /// Asynchronous, long-running job managed out of band (e.g. exec_background).
+    Background,
+}
+
+/// Metadata policy governing tool scheduling, execution mode, and default timeout caps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolPolicy {
+    pub execution_mode: ExecutionMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+impl Default for ToolPolicy {
+    fn default() -> Self {
+        Self {
+            execution_mode: ExecutionMode::Serial,
+            timeout_secs: None,
+        }
+    }
+}
+
+impl ToolPolicy {
+    pub fn parallel() -> Self {
+        Self {
+            execution_mode: ExecutionMode::Parallel,
+            timeout_secs: None,
+        }
+    }
+
+    pub fn serial() -> Self {
+        Self {
+            execution_mode: ExecutionMode::Serial,
+            timeout_secs: None,
+        }
+    }
+
+    pub fn barrier() -> Self {
+        Self {
+            execution_mode: ExecutionMode::Barrier,
+            timeout_secs: None,
+        }
+    }
+
+    pub fn background() -> Self {
+        Self {
+            execution_mode: ExecutionMode::Background,
+            timeout_secs: None,
+        }
+    }
+}
+
 /// A Tool definition that can be executed by the Agent.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -193,6 +312,11 @@ pub trait Tool: Send + Sync {
 
     /// JSON Schema of the arguments expected by the tool.
     fn parameters(&self) -> Value;
+
+    /// Returns the execution policy (concurrency mode, timeout) for this tool.
+    fn policy(&self) -> ToolPolicy {
+        ToolPolicy::default()
+    }
 
     /// Execute the tool with the given JSON arguments.
     async fn execute(&self, args: Value) -> Result<String, String>;

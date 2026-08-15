@@ -257,6 +257,8 @@ impl LoggingActor {
             // shows up in the conversation log via the `Telemetry(_)` arm above.
             BusMessage::TriggerCompaction { .. } => return,
             BusMessage::InstallSkill { .. } => return,
+            BusMessage::StreamDelta { .. } => return,
+            BusMessage::SessionProjection(_) => return,
         };
         let mut value = match serialized {
             Ok(value) => value,
@@ -397,6 +399,20 @@ impl LoggingActor {
                     skill_name.as_deref().unwrap_or("-")
                 ),
             ),
+            BusMessage::StreamDelta { chat_id, .. } => {
+                LogEvent::trace("BusMessage", "StreamDelta emitted").with_chat_id(chat_id)
+            }
+            BusMessage::SessionProjection(proj) => LogEvent::debug(
+                "BusMessage",
+                &format!(
+                    "SessionProjection seq={} status={} todos={} jobs={}",
+                    proj.seq,
+                    proj.run_status,
+                    proj.todos.len(),
+                    proj.jobs.len()
+                ),
+            )
+            .with_chat_id(&proj.chat_id),
         };
 
         self.write_runtime_event(&event);

@@ -2673,7 +2673,9 @@ impl ActorLogic<BusMessage> for AgentLogic {
             | BusMessage::LoggerControl(_)
             | BusMessage::Log(_)
             | BusMessage::PromoteSyncToBackground(_)
-            | BusMessage::SetTerminalSessionChat { .. } => Ok(None),
+            | BusMessage::SetTerminalSessionChat { .. }
+            | BusMessage::StreamDelta { .. }
+            | BusMessage::SessionProjection(_) => Ok(None),
         }
     }
 }

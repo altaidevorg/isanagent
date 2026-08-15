@@ -51,11 +51,11 @@ use crate::workspace::{resolve_workspace_root, IsanagentWorkspace};
 use crate::{NodeHandle, Supervisor, SupervisorPolicy};
 use colored::Colorize;
 
-const DEFAULT_PROVIDER_NAME: &str = "gemini";
-const DEFAULT_PROVIDER_MODEL_NAME: &str = "gemini-2.5-flash";
-const DEFAULT_PROVIDER_API_KEY_ENV: &str = "GEMINI_API_KEY";
+pub const DEFAULT_PROVIDER_NAME: &str = "gemini";
+pub const DEFAULT_PROVIDER_MODEL_NAME: &str = "gemini-2.5-flash";
+pub const DEFAULT_PROVIDER_API_KEY_ENV: &str = "GEMINI_API_KEY";
 
-const EXECUTION_HARNESS_SYSTEM_GUIDANCE: &str = r#"
+pub const EXECUTION_HARNESS_SYSTEM_GUIDANCE: &str = r#"
 
 --- Execution harness ---
 - Call execution_env_info to read max_wall_secs and default_run_timeout_secs before long runs.
@@ -353,8 +353,11 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     let (bus_tx, mut bus_rx) = mpsc::channel(100);
     let clarification_hub = ClarificationHub::shared();
 
-    // 2. Setup Skills
-    let skills = SkillRegistry::new(workspace.skills_path());
+    // 2. Setup Skills & Plugins
+    let mut skills = SkillRegistry::new(workspace.skills_path());
+    let global_root = crate::workspace::resolve_workspace_root(None);
+    let plugins = crate::plugins::PluginRegistry::discover(&workspace.dir, Some(&global_root));
+    plugins.populate_skill_registry(&mut skills);
     let multi_tenant_edge_cfg = workspace
         .config
         .multi_tenant_edge
@@ -576,6 +579,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     tools.register(Box::new(crate::tools::recall::RecallToolResultTool {
         memory_node: memory_node.clone(),
         outbound_tx: global_outbound_tx.clone(),
+        spill_store: Some(crate::spill::SpillStore::new(&workspace.dir)),
     }));
     tools.register(Box::new(crate::tools::builtin::SearchMemoryTool {
         memory_node: memory_node.clone(),
@@ -601,6 +605,8 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             std::sync::Arc::new(workspace.config.clone()),
         );
     }
+    let uv_bin = workspace.config.execution_uv_binary();
+    plugins.populate_tool_registry(&mut tools, &uv_bin).await;
     let tool_catalog = tools.catalog_handle();
     tools.register(Box::new(ToolSearchTool {
         catalog: tool_catalog,
@@ -763,6 +769,10 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
 
     // 6. Compile Agent System Prompt
     let mut system_prompt = workspace.compile_system_prompt();
+    let plugin_overlays = plugins.compile_overlay_prompts();
+    if !plugin_overlays.is_empty() {
+        system_prompt.push_str(&plugin_overlays);
+    }
     if workspace.config.ml_engineer_harness_enabled() {
         system_prompt.push_str("\n\n");
         system_prompt.push_str(crate::ml_engineer::HARNESS_OVERLAY);
@@ -857,10 +867,10 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     } else {
         agent_defs
     };
-    let agent_registry = std::sync::Arc::new(crate::agent::AgentRegistry::from_definitions(
-        &agent_defs,
-        &workspace.sandbox_dir,
-    ));
+    let mut agent_registry =
+        crate::agent::AgentRegistry::from_definitions(&agent_defs, &workspace.sandbox_dir);
+    plugins.populate_agent_registry(&mut agent_registry);
+    let agent_registry = std::sync::Arc::new(agent_registry);
 
     // Inject agent descriptions into the system prompt
     let agent_prompt_section = agent_registry.compile_agent_prompt_section();

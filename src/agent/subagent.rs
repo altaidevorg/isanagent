@@ -279,6 +279,10 @@ impl SubagentHarness {
             ));
         }
 
+        if which::which("uvx").is_err() {
+            return Err("The 'uvx' tool was not found on PATH. Install uv (https://astral.sh/uv) to enable Semble Scout code search.".to_string());
+        }
+
         let cache_dir = workspace_dir
             .join(".isanagent")
             .join("cache")

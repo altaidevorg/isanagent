@@ -57,6 +57,18 @@ Sub-agents (`subagent_spawn`, `task_*`, `subagent_plan_execute`, `task_history_l
 
 **Run-scoped LLM providers:** `AgentLogic` keeps the active provider and its credentials behind one lock and snapshots that pair, plus the filtered failover candidates, when a run is admitted. Active runs and already-admitted FIFO items never read process-global provider state. A `/model` switch atomically changes the pair for subsequent admissions; an inbound accepted after the switch keeps the new pair even when it waits behind an older run. Sub-agents use the same snapshot contract. Embedders that need failover candidates use `AgentLogic::new_with_fallback_providers`; `AgentLogic::new` remains the compatibility path with no candidates. Runtime changes must use `switch_provider_with_credentials`; provider-only and credential-only mutation APIs are intentionally unsupported.
 
+**Agent Plugins 1.0** (`src/plugins/`): open standard package format conforming to Agent Plugins 1.0 (`agent-plugins.org`). Plugins are discovered hierarchically from `<workspace>/.agents/plugins/`, `<workspace>/.isanagent/plugins/`, and `~/.agent-plugins/`. A plugin contains `plugin.json` (`$schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"`), standard skills (`skills/<name>/SKILL.md`), standard MCP servers (`mcp.json`), and client extension namespace `dev.altai.isanagent/` containing declarative subagents (`agents/<name>/AGENT.md`), rules (`rules/*.md`), and hooks (`hooks.json`). The CLI provides `isanagent plugin install <repo_url>`, `isanagent plugin list`, and `isanagent plugin remove <name>`. At startup, `PluginRegistry` ingests skills into `SkillRegistry`, subagents into `AgentRegistry`, and injects extension overlay prompts into the coordinator system prompt.
+
+**Secret-Safe Subprocess Environments** (`src/environment.rs`): `ExecutionEnvironmentPolicy` prevents agent-controlled child processes (`exec`, `execution_run`, `python_run`, UV setups) from inheriting master host credentials (e.g. `OPENAI_API_KEY`, `GITHUB_TOKEN`, `ALTAI_*`) by default, while allowing declared explicit credential grants and standard system variables.
+
+**Metadata Tool Scheduler & Concurrency** (`src/traits.rs`): `ToolPolicy` classifies tools into `ExecutionMode` (`Parallel` for read-only tools like `read_file`/`search_text`, `Serial` for standard mutations, `Barrier` for environment mutators like `git_worktree`, and `Background` for async jobs).
+
+**Large Output Spill Storage** (`src/spill.rs`): when tool output exceeds character limits, untruncated content is persisted to `<workspace>/.system_generated/spill/{session_id}/{spill_id}.log`. The agent receives a structured head/tail preview with a `spill_id`, and lines can be selectively queried via `recall_tool_result`.
+
+**Authoritative Session Projections** (`src/projections.rs`): `SessionProjection` provides structured snapshots (`todos`, `subagents`, `jobs`, `run_status`) emitted over the actor bus, allowing frontend clients like `altai-app` to treat client stores as disposable projections of server truth.
+
+**Native LLM Streaming** (`src/traits.rs`): `Provider::stream` sends typed `StreamChunk` events (`TextDelta`, `ReasoningDelta`, `ToolCallDelta`, `Usage`, `Finish`) and emits `BusMessage::StreamDelta` for real-time frontend rendering.
+
 ### Structured LLM Extraction
 If you are asking the LLM to yield a structured JSON payload internally (e.g. for reflection or summarization outside of the standard `ToolCall` registry):
 **DO NOT** use brittle string matching like `text.find('{')`. 

@@ -10,6 +10,7 @@ pub mod exec_jobs;
 pub mod execution;
 pub mod isanagent_ignore;
 pub mod kernel_porting;
+pub mod mcp;
 pub mod ml_domain;
 pub mod recall;
 pub mod workflow;
@@ -113,6 +114,11 @@ impl ToolRegistry {
 
     pub fn get_tool(&self, name: &str) -> Option<&dyn Tool> {
         self.tools.get(name).map(|t| t.as_ref())
+    }
+
+    /// Retrieve the metadata policy for a tool if registered.
+    pub fn get_tool_policy(&self, name: &str) -> Option<crate::traits::ToolPolicy> {
+        self.tools.get(name).map(|t| t.policy())
     }
 
     pub fn get_tool_names(&self) -> Vec<String> {
@@ -235,9 +241,19 @@ impl ToolRegistry {
         Ok(())
     }
 
-    /// Tools that must not run inside a sub-agent loop (prevents unbounded recursion).
+    /// Tools that must not run inside a sub-agent loop (prevents unbounded recursion and chat confusion).
     pub fn is_subagent_restricted_tool(name: &str) -> bool {
-        matches!(name, "subagent_spawn" | "subagent_plan_execute")
+        matches!(
+            name,
+            "subagent_spawn"
+                | "subagent_plan_execute"
+                | "task_list"
+                | "task_get"
+                | "task_cancel"
+                | "task_history_list"
+                | "task_dashboard"
+                | "cron"
+        )
     }
 
     /// Read-only or side-effect-free tools safe to run concurrently (same assistant turn).

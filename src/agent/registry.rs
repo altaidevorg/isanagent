@@ -26,6 +26,94 @@ impl AgentManifest {
     }
 }
 
+/// Frontmatter metadata parsed from `AGENT.md` or `AGENT.markdown` files.
+#[derive(Clone, Debug, serde::Deserialize, Default)]
+pub struct AgentFrontmatter {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub mode: Option<AgentMode>,
+    pub allowed_tools: Option<Vec<String>>,
+    pub model: Option<String>,
+    pub temperature: Option<f64>,
+    pub max_iterations: Option<usize>,
+    pub hidden: Option<bool>,
+    pub color: Option<String>,
+}
+
+/// Parses an `AGENT.md` file extracting YAML frontmatter and using the Markdown body as system prompt.
+pub fn parse_agent_md(path: &std::path::Path) -> Option<AgentManifest> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return None;
+    }
+
+    let default_name = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .filter(|&n| n != "agents" && n != ".")
+        .or_else(|| {
+            path.file_stem()
+                .and_then(|n| n.to_str())
+                .filter(|&n| n != "AGENT" && n != "agent")
+        })
+        .unwrap_or("unnamed-agent")
+        .to_string();
+
+    let first_non_empty = lines.iter().position(|l| !l.trim().is_empty())?;
+
+    if lines[first_non_empty].trim() != "---" {
+        // No frontmatter, treat entire file as system prompt
+        return Some(AgentManifest {
+            name: default_name,
+            description: String::new(),
+            mode: AgentMode::Subagent,
+            system_prompt: content.trim().to_string(),
+            allowed_tools: None,
+            model: None,
+            temperature: None,
+            max_iterations: None,
+            hidden: false,
+            color: None,
+        });
+    }
+
+    let mut end_idx = 0;
+    for (i, &line) in lines.iter().enumerate().skip(first_non_empty + 1) {
+        if line.trim() == "---" {
+            end_idx = i;
+            break;
+        }
+    }
+
+    if end_idx == 0 {
+        return None;
+    }
+
+    let frontmatter_str = lines[first_non_empty + 1..end_idx].join("\n");
+    let body_str = lines[end_idx + 1..].join("\n").trim().to_string();
+
+    let meta: AgentFrontmatter = serde_yaml::from_str(&frontmatter_str).ok()?;
+
+    let name = meta.name.unwrap_or(default_name);
+    let description = meta.description.unwrap_or_default();
+    let mode = meta.mode.unwrap_or(AgentMode::Subagent);
+
+    Some(AgentManifest {
+        name,
+        description,
+        mode,
+        system_prompt: body_str,
+        allowed_tools: meta.allowed_tools,
+        model: meta.model,
+        temperature: meta.temperature,
+        max_iterations: meta.max_iterations,
+        hidden: meta.hidden.unwrap_or(false),
+        color: meta.color,
+    })
+}
+
 /// Holds all loaded named agents and provides spawn-time lookups.
 #[derive(Clone, Debug, Default)]
 pub struct AgentRegistry {
@@ -33,6 +121,66 @@ pub struct AgentRegistry {
 }
 
 impl AgentRegistry {
+    pub fn new() -> Self {
+        Self {
+            agents: HashMap::new(),
+        }
+    }
+
+    pub fn register(&mut self, manifest: AgentManifest) {
+        self.agents
+            .insert(manifest.name.clone(), Arc::new(manifest));
+    }
+
+    /// Load all `AGENT.md` subagent declarations from an agents directory tree.
+    /// Traverses both direct files (`agents/<name>.md`) and directories (`agents/<name>/AGENT.md`).
+    pub fn load_from_directory(&mut self, agents_dir: &std::path::Path) {
+        if !agents_dir.is_dir() {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(agents_dir) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let agent_md = path.join("AGENT.md");
+                if agent_md.is_file() {
+                    if let Some(manifest) = parse_agent_md(&agent_md) {
+                        self.register(manifest);
+                    }
+                } else {
+                    let agent_md_lower = path.join("agent.md");
+                    if agent_md_lower.is_file() {
+                        if let Some(manifest) = parse_agent_md(&agent_md_lower) {
+                            self.register(manifest);
+                        }
+                    }
+                }
+            } else if path.is_file() {
+                let file_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                if (file_name.ends_with(".md") || file_name.ends_with(".markdown"))
+                    && file_name != "README.md"
+                {
+                    if let Some(manifest) = parse_agent_md(&path) {
+                        self.register(manifest);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Merges another `AgentRegistry` into this one, overwriting duplicates.
+    pub fn merge(&mut self, other: AgentRegistry) {
+        for (name, manifest) in other.agents {
+            self.agents.insert(name, manifest);
+        }
+    }
+
     pub fn from_definitions(
         definitions: &HashMap<String, AgentDefinition>,
         sandbox_dir: &std::path::Path,
@@ -344,5 +492,65 @@ mod tests {
         assert!(prompt.contains("visible"));
         assert!(prompt.contains("seen"));
         assert!(!prompt.contains("secret"));
+    }
+
+    #[test]
+    fn parse_agent_md_extracts_frontmatter_and_prompt() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let agent_file = temp_dir.path().join("AGENT.md");
+        let content = r#"---
+name: custom_analyst
+description: Expert in system analysis
+model: gpt-4o
+temperature: 0.15
+max_iterations: 25
+allowed_tools:
+  - read_file
+  - search_text
+---
+
+# Analysis Expert
+You are a principal system analyst. Follow strict verification.
+"#;
+        std::fs::write(&agent_file, content).expect("write");
+
+        let manifest = parse_agent_md(&agent_file).expect("parsed manifest");
+        assert_eq!(manifest.name, "custom_analyst");
+        assert_eq!(manifest.description, "Expert in system analysis");
+        assert_eq!(manifest.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(manifest.temperature, Some(0.15));
+        assert_eq!(manifest.max_iterations, Some(25));
+        assert_eq!(
+            manifest.allowed_tools,
+            Some(vec!["read_file".into(), "search_text".into()])
+        );
+        assert_eq!(
+            manifest.system_prompt,
+            "# Analysis Expert\nYou are a principal system analyst. Follow strict verification."
+        );
+    }
+
+    #[test]
+    fn load_from_directory_scans_nested_agent_directories() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = temp_dir.path().join("researcher");
+        std::fs::create_dir_all(&agent_dir).expect("mkdir");
+        let agent_file = agent_dir.join("AGENT.md");
+        let content = r#"---
+description: Deep web researcher
+temperature: 0.0
+---
+
+Always cite sources.
+"#;
+        std::fs::write(&agent_file, content).expect("write");
+
+        let mut reg = AgentRegistry::new();
+        reg.load_from_directory(temp_dir.path());
+
+        let m = reg.get("researcher").expect("found researcher agent");
+        assert_eq!(m.name, "researcher");
+        assert_eq!(m.description, "Deep web researcher");
+        assert_eq!(m.system_prompt, "Always cite sources.");
     }
 }

@@ -22,6 +22,10 @@ static ONBOARD_KERNEL_REFERENCE_DIR: Dir<'static> =
     include_dir!("$CARGO_MANIFEST_DIR/assets/onboarding/kernels/reference");
 static ONBOARD_KERNEL_BENCHMARKS_DIR: Dir<'static> =
     include_dir!("$CARGO_MANIFEST_DIR/assets/onboarding/benchmarks");
+static ONBOARD_KERNEL_PORTING_PLUGIN_DIR: Dir<'static> =
+    include_dir!("$CARGO_MANIFEST_DIR/assets/plugins/kernel-porting");
+static ONBOARD_AUTOTRAINESS_PLUGIN_DIR: Dir<'static> =
+    include_dir!("$CARGO_MANIFEST_DIR/assets/plugins/autotrainess");
 
 const CONFIG_TEMPLATE: &str = include_str!("../assets/onboarding/config.toml");
 const AGENTS_TEMPLATE: &str = include_str!("../assets/onboarding/AGENTS.md");
@@ -562,6 +566,7 @@ fn write_all_templates(
     write_embedded_synthetic_skill_tree(&layout.root, report)?;
     write_embedded_kernel_porting_tree(&layout.root, report)?;
     write_embedded_autotrainess_tree(&layout.root, report)?;
+    write_embedded_plugin_trees(&layout.root, report)?;
 
     let overlay_ref = workspace_ml_engineer_overlay_reference();
     write_if_missing_string(
@@ -589,9 +594,29 @@ directory (merged by `compile_system_prompt`).\n\n---\n\n{HARNESS_OVERLAY}"
 const SYNTHETIC_SKILL_REL_PREFIX: &str = "workspace/skills/synthetic-dataset-with-afterimage";
 const KERNEL_PORTING_SKILL_REL_PREFIX: &str = "workspace/skills/kernel-porting";
 const AUTOTRAINESS_SKILL_REL_PREFIX: &str = "workspace/skills/autotrainess";
+const KERNEL_PORTING_PLUGIN_REL_PREFIX: &str = "workspace/.agents/plugins/kernel-porting";
+const AUTOTRAINESS_PLUGIN_REL_PREFIX: &str = "workspace/.agents/plugins/autotrainess";
 const KERNEL_AGENT_PROMPTS_REL_PREFIX: &str = "workspace/.agents/prompts";
 const KERNEL_REFERENCE_REL_PREFIX: &str = "workspace/kernels/reference";
 const KERNEL_BENCHMARKS_REL_PREFIX: &str = "workspace/benchmarks";
+
+fn write_embedded_plugin_trees(root: &Path, report: &mut BootstrapReport) -> Result<(), String> {
+    write_embedded_dir_recursive(
+        &ONBOARD_KERNEL_PORTING_PLUGIN_DIR,
+        root,
+        KERNEL_PORTING_PLUGIN_REL_PREFIX,
+        Path::new(""),
+        report,
+    )?;
+    write_embedded_dir_recursive(
+        &ONBOARD_AUTOTRAINESS_PLUGIN_DIR,
+        root,
+        AUTOTRAINESS_PLUGIN_REL_PREFIX,
+        Path::new(""),
+        report,
+    )?;
+    Ok(())
+}
 
 fn write_embedded_synthetic_skill_tree(
     root: &Path,
