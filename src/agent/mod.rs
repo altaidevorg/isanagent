@@ -4591,8 +4591,22 @@ impl AgentLogic {
                             reason: "search_without_primary_fetch".to_string(),
                         }))
                         .await;
-                    let nudge = "[SYSTEM: Research depth check — you used discovery search but did not fetch primary sources. Before finalizing, use `web_fetch`/`arxiv_fetch` (and/or `hf_hub_file_fetch`) on concrete sources, cross-verify at least two sources, then synthesize findings with explicit uncertainties.]";
-                    let correction = crate::utils::ChatMessage::user(nudge);
+                    // Audit X4: name only fetch tools that are actually registered so the nudge
+                    // never recommends opt-in ML tools gated off by `ml_domain_enabled`.
+                    let mut fetch_targets = String::from("`web_fetch`");
+                    if tools.get_tool("arxiv_fetch").is_some() {
+                        fetch_targets.push_str("/`arxiv_fetch`");
+                    }
+                    if tools.get_tool("hf_hub_file_fetch").is_some() {
+                        fetch_targets.push_str("/`hf_hub_file_fetch`");
+                    }
+                    let nudge = format!(
+    "[SYSTEM: Research depth check - you used discovery search but did not fetch \
+primary sources. Before finalizing, use {fetch_targets} on concrete sources, \
+cross-verify at least two sources, then synthesize findings with explicit \
+uncertainties.]"
+);
+                    let correction = crate::utils::ChatMessage::user(&nudge);
                     mem.add_message(correction)
                         .await
                         .map_err(ReasoningLoopError::persistence)?;

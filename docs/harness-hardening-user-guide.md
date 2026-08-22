@@ -56,7 +56,7 @@ pub enum ExecutionMode {
 
 | Tool | Policy Mode | Description |
 | :--- | :--- | :--- |
-| `read_file`, `glob_files`, `list_dir`, `search_text`, `web_search`, `web_fetch`, `search_memory`, `fetch_memory_by_date`, `search_tools`, `load_skill_instructions`, `arxiv_search`, `arxiv_fetch`, `hf_hub_file_fetch`, `execution_env_info`, `task_history_list` | **Parallel** | Read-only operations declared via each tool's typed `policy()` metadata (single source of truth — audit X1). |
+| `read_file`, `glob_files`, `list_dir`, `search_text`, `web_search`, `web_fetch`, `search_memory`, `fetch_memory_by_date`, `search_tools`, `load_skill_instructions`, `arxiv_search`, `arxiv_fetch`, `hf_hub_file_fetch`, `execution_env_info`, `task_history_list` | **Parallel** | Read-only operations declared via each tool's typed `policy()` metadata (single source of truth — audit X1). The three ML research tools additionally require top-level `ml_domain_enabled = true` (opt-in, audit X4) and are absent from the registry by default. |
 | All other built-in and MCP tools (`write_file`, `edit_file`, `exec`, …) | **Serial** (default) | Mutating or stateful tools executed in strict sequential order. |
 | `git_worktree` | **Barrier** | Modifies working branches and root directories; drains all active tools before and after execution. |
 

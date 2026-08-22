@@ -452,7 +452,7 @@ Discovered via `grep "fn name(&self) -> &str"` across [src/tools/](../src/tools/
 
 **[src/tools/workflow.rs](../src/tools/workflow.rs) — 3 tools.** `todo_write`, `search_tools`, `ask_user`.
 
-**[src/tools/ml_domain.rs](../src/tools/ml_domain.rs) — 3 tools.** `arxiv_search`, `arxiv_fetch`, `hf_hub_file_fetch`.
+**[src/tools/ml_domain.rs](../src/tools/ml_domain.rs) — 3 tools.** `arxiv_search`, `arxiv_fetch`, `hf_hub_file_fetch`. Opt-in only: registered when top-level `ml_domain_enabled = true` (audit X4).
 
 **Other.** `LoadSkillTool` in [src/agent/mod.rs:2591](../src/agent/mod.rs#L2591) (`load_skill_instructions`). Sub-agent tools (`subagent_spawn`, `subagent_plan_execute`, `task_history_list`) referenced by name in [src/tools.rs:117](../src/tools.rs#L117) and [src/tools.rs:138](../src/tools.rs#L138).
 

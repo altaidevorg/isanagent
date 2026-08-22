@@ -2021,7 +2021,7 @@ impl Tool for WebFetchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch a URL in detail (docs, raw GitHub, paper pages). Use after `web_search` to read primary sources and extract evidence. Uses Jina Reader (r.jina.ai) when [jina].enabled is true; otherwise direct GET with HTML text extraction or JSON pretty-print. Prefer official docs and pinned `raw.githubusercontent.com` sources when validating ML APIs."
+        "Fetch a URL in detail (docs, raw GitHub, paper pages). Use after `web_search` to read primary sources and extract evidence. Uses Jina Reader (r.jina.ai) when [jina].enabled is true; otherwise direct GET with HTML text extraction or JSON pretty-print. Prefer official docs and pinned `raw.githubusercontent.com` sources when validating third-party APIs."
     }
 
     fn policy(&self) -> ToolPolicy {

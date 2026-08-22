@@ -5,6 +5,11 @@ max_iterations = 999
 max_tool_output_chars = 20000
 max_web_tool_output_chars = 50000
 
+# Opt-in ML research tools (`arxiv_search`, `arxiv_fetch`, `hf_hub_file_fetch`). Default false:
+# general-purpose hosts stay tool-neutral; set true for research/ML workloads (audit X4).
+# When disabled, built-in agents also omit arXiv tools from their allowlists.
+# ml_domain_enabled = false
+
 # Local stdin/stdout chat. Set enabled = false for API-only or headless runs (requires another channel).
 # While a reply is in flight, further lines are queued (FIFO per chat). Use /cancel or /stop to abort
 # the current turn and discard queued prompts (see /help in the TUI).
@@ -106,7 +111,7 @@ enabled = true
 #
 # [agents.researcher]
 # description = "Research topics, find papers, and gather context from web and files"
-# allowed_tools = ["web_search", "web_fetch", "arxiv_search", "arxiv_fetch", "read_file", "search_text"]
+# allowed_tools = ["web_search", "web_fetch", "read_file", "search_text"]
 # temperature = 0.1
 #
 # [agents.coder]
@@ -127,9 +132,10 @@ mode = "ask"                # ask | deny | allow
 unattended_default = "allow" # ask | deny | allow
 # interactive_requires_approval_for = ["rm -rf", "git reset --hard"]
 
-# ML policy overlay (embedded in the isanagent binary when enabled). Reference copy: workspace/ML_ENGINEER_OVERLAY.md (onboard). Optional rules merge: workspace/ML_POLICY.md
+# ML policy overlay (embedded in the isanagent binary when enabled). Reference copy: workspace/ML_ENGINEER_OVERLAY.md (onboard). Optional rules merge: workspace/ML_POLICY.md.
+# Opt-in (audit X4): enable only for ML-focused workspaces; the general-purpose default is false.
 [harness.ml_engineer]
-enabled = true
+enabled = false
 # subagent_research_overlay = false  # default true when enabled: extra research instructions for sub-agents only
 # forbid_final_without_tools = true   # default false: require at least one tool call before ending a reasoning step (also overridable via inbound metadata isanagent_autonomous_forbid_final_without_tools)
 
@@ -185,7 +191,8 @@ kernel_name = "python3"
 # Named agents (defining [agents.*] replaces built-in researcher/coder/evaluator defaults)
 [agents.researcher]
 description = "Research topics, find papers, and gather context from web and files"
-allowed_tools = ["web_search", "web_fetch", "arxiv_search", "arxiv_fetch", "read_file", "search_text", "glob_files", "list_dir"]
+# With ml_domain_enabled = true you can add "arxiv_search", "arxiv_fetch" here.
+allowed_tools = ["web_search", "web_fetch", "read_file", "search_text", "glob_files", "list_dir"]
 temperature = 0.1
 
 [agents.coder]

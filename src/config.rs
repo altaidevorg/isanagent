@@ -400,6 +400,10 @@ pub struct AppConfig {
     /// When true, back up each file before `edit_file`/`write_file` mutates it and register the
     /// `checkpoint` tool for one-step undo. Default false. Only touched files are backed up.
     pub checkpoint_enabled: Option<bool>,
+    /// When true, register the ML research tools (`arxiv_search`, `arxiv_fetch`,
+    /// `hf_hub_file_fetch`). Default false: general-purpose hosts stay tool-neutral; opt in
+    /// for research/ML workloads (audit X4).
+    pub ml_domain_enabled: Option<bool>,
     pub max_tool_output_chars: Option<usize>,
     /// Max characters returned by `web_search` / `web_fetch` (default 50_000). Separate from
     /// `max_tool_output_chars`, which caps tool output when passed to the model.
@@ -681,6 +685,13 @@ impl AppConfig {
     /// Pre-edit file checkpointing for one-step undo (default: disabled).
     pub fn checkpoint_enabled(&self) -> bool {
         self.checkpoint_enabled.unwrap_or(false)
+    }
+
+    /// ML research tools (`arxiv_search` / `arxiv_fetch` / `hf_hub_file_fetch`) registration
+    /// gate (default: disabled). Audit X4: these are domain-specific and must be opt-in so
+    /// general-purpose hosts do not leak ML-era assumptions into every workspace.
+    pub fn ml_domain_enabled(&self) -> bool {
+        self.ml_domain_enabled.unwrap_or(false)
     }
 
     /// When true, `git_worktree` is registered (see `[harness.git_worktree]` in config).
@@ -971,6 +982,10 @@ impl AppConfig {
         lines.push(format!(
             "ml_engineer_harness_enabled={}",
             self.ml_engineer_harness_enabled()
+        ));
+        lines.push(format!(
+            "ml_domain_tools_enabled={}",
+            self.ml_domain_enabled()
         ));
         lines.push(format!(
             "ml_engineer_forbid_final_without_tools_default={}",

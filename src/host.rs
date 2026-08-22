@@ -554,15 +554,19 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         max_output_chars: max_web_output_chars,
         workspace_dir: workspace.dir.clone(),
     }));
-    tools.register(Box::new(ArxivSearchTool {
-        max_output_chars: max_web_output_chars,
-    }));
-    tools.register(Box::new(ArxivFetchTool {
-        workspace_dir: workspace.dir.clone(),
-    }));
-    tools.register(Box::new(HfHubFileFetchTool {
-        max_output_chars: max_web_output_chars,
-    }));
+    // Audit X4: ML research tools are opt-in (`ml_domain_enabled`); general-purpose
+    // hosts do not register arXiv/Hugging Face domain tools by default.
+    if workspace.config.ml_domain_enabled() {
+        tools.register(Box::new(ArxivSearchTool {
+            max_output_chars: max_web_output_chars,
+        }));
+        tools.register(Box::new(ArxivFetchTool {
+            workspace_dir: workspace.dir.clone(),
+        }));
+        tools.register(Box::new(HfHubFileFetchTool {
+            max_output_chars: max_web_output_chars,
+        }));
+    }
     tools.register(Box::new(CronTool {
         cron_node: cron_node.clone(),
         multi_tenant_edge_cron_enabled: mte_cron_scheduler.is_some(),
@@ -868,7 +872,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     // Load agent definitions from config; use built-in defaults when none configured.
     let agent_defs = workspace.config.agent_definitions();
     let agent_defs = if agent_defs.is_empty() {
-        crate::agent::registry::default_agent_definitions()
+        crate::agent::registry::default_agent_definitions(workspace.config.ml_domain_enabled())
     } else {
         agent_defs
     };

@@ -320,7 +320,10 @@ fn resolve_system_prompt(def: &AgentDefinition, sandbox_dir: &std::path::Path) -
     }
 }
 
-pub fn default_agent_definitions() -> HashMap<String, AgentDefinition> {
+/// Built-in named-agent defaults. `ml_domain_enabled` mirrors the config gate of the
+/// same name (audit X4): when false, the `researcher` allowlist omits arXiv tools so
+/// `agent_list` never advertises tools that are not registered.
+pub fn default_agent_definitions(ml_domain_enabled: bool) -> HashMap<String, AgentDefinition> {
     let mut map = HashMap::new();
     map.insert(
         "semble-scout".to_string(),
@@ -345,25 +348,31 @@ pub fn default_agent_definitions() -> HashMap<String, AgentDefinition> {
             mode: AgentMode::Subagent,
             system_prompt: None,
             system_prompt_file: None,
-            allowed_tools: Some(vec![
-                "web_search".into(),
-                "web_fetch".into(),
-                "arxiv_search".into(),
-                "arxiv_fetch".into(),
-                "read_file".into(),
-                "search_text".into(),
-                "glob_files".into(),
-                "list_dir".into(),
-                "search_memory".into(),
-                "fetch_memory_by_date".into(),
-                "exec_status".into(),
-                "exec_send".into(),
-                "execution_job_status".into(),
-                "execution_job_result".into(),
-                "execution_artifact_list".into(),
-                "todo_write".into(),
-                "recall_tool_result".into(),
-            ]),
+            allowed_tools: Some({
+                let mut tools = vec![
+                    "web_search".to_string(),
+                    "web_fetch".to_string(),
+                    "read_file".to_string(),
+                    "search_text".to_string(),
+                    "glob_files".to_string(),
+                    "list_dir".to_string(),
+                    "search_memory".to_string(),
+                    "fetch_memory_by_date".to_string(),
+                    "exec_status".to_string(),
+                    "exec_send".to_string(),
+                    "execution_job_status".to_string(),
+                    "execution_job_result".to_string(),
+                    "execution_artifact_list".to_string(),
+                    "todo_write".to_string(),
+                    "recall_tool_result".to_string(),
+                ];
+                // Audit X4: arXiv tools only when the ML domain gate is on.
+                if ml_domain_enabled {
+                    tools.push("arxiv_search".to_string());
+                    tools.push("arxiv_fetch".to_string());
+                }
+                tools
+            }),
             model: None,
             temperature: Some(0.1),
             max_iterations: Some(15),
@@ -457,7 +466,7 @@ mod tests {
 
     #[test]
     fn default_agents_have_expected_roles() {
-        let defs = default_agent_definitions();
+        let defs = default_agent_definitions(false);
         assert_eq!(defs.len(), 4);
         assert!(matches!(
             defs.get("semble-scout").map(|agent| agent.mode.clone()),
@@ -466,6 +475,22 @@ mod tests {
         assert!(defs.contains_key("researcher"));
         assert!(defs.contains_key("coder"));
         assert!(defs.contains_key("evaluator"));
+    }
+
+    #[test]
+    fn researcher_allowlist_gates_ml_tools_on_flag() {
+        // Audit X4: arXiv tool names appear in the built-in researcher allowlist
+        // only when the ML domain gate is enabled.
+        let off = default_agent_definitions(false);
+        let on = default_agent_definitions(true);
+        let researcher_off = off.get("researcher").expect("researcher");
+        let researcher_on = on.get("researcher").expect("researcher");
+        let allowed_off = researcher_off.allowed_tools.as_ref().expect("tools");
+        let allowed_on = researcher_on.allowed_tools.as_ref().expect("tools");
+        assert!(!allowed_off.iter().any(|t| t.starts_with("arxiv_")));
+        assert!(allowed_on.contains(&"arxiv_search".to_string()));
+        assert!(allowed_on.contains(&"arxiv_fetch".to_string()));
+        assert_eq!(allowed_off.len() + 2, allowed_on.len());
     }
 
     #[test]

@@ -22,7 +22,7 @@ When the execution harness is **not** turned off in config (it is **on by defaul
 
 ### Research helpers (related tools)
 
-The agent also ships read-only **arXiv** (`arxiv_search`, `arxiv_fetch`) and **Hugging Face Hub file** (`hf_hub_file_fetch`, uses host env **`HF_TOKEN`** when set) tools. Use them together with **`web_fetch`** on stable URLs—e.g. `https://raw.githubusercontent.com/.../refs/heads/main/...` for pinned examples—when checking current library APIs before long **`execution_run_background`** jobs.
+These research helpers are **opt-in**: they are registered only when top-level `ml_domain_enabled = true` is set in `config.toml` (disabled by default; audit X4). The agent also ships read-only **arXiv** (`arxiv_search`, `arxiv_fetch`) and **Hugging Face Hub file** (`hf_hub_file_fetch`, uses host env **`HF_TOKEN`** when set) tools. Use them together with **`web_fetch`** on stable URLs—e.g. `https://raw.githubusercontent.com/.../refs/heads/main/...` for pinned examples—when checking current library APIs before long **`execution_run_background`** jobs.
 
 Three providers are implemented today:
 
