@@ -786,14 +786,22 @@ fn fold_display_data_payload(v: &Value, ctx: &mut ExecuteFoldCtx<'_>) {
             ("image/jpg", ".jpg"),
         ] {
             if let Some(bytes) = decode_jupyter_base64_data(data, mime, lim) {
-                let _ = collector.try_push(mime.to_string(), bytes, ext);
+                // Audit R11: silent drops made the model believe output existed.
+                if !collector.try_push(mime.to_string(), bytes, ext) {
+                    log::warn!("execution artifact dropped: per-run artifact cap reached ({mime})");
+                }
             }
         }
         for (mime, ext) in [("text/csv", ".csv"), ("application/json", ".json")] {
             if let Some(s) = jupyter_data_utf8_string(data, mime) {
                 if s.len() > LARGE_TEXT_SPILL_THRESHOLD {
                     let bytes = s.into_bytes();
-                    let _ = collector.try_push(mime.to_string(), bytes, ext);
+                    // Audit R11: surface cap drops instead of discarding silently.
+                    if !collector.try_push(mime.to_string(), bytes, ext) {
+                        log::warn!(
+                            "execution artifact dropped: per-run artifact cap reached ({mime})"
+                        );
+                    }
                 } else if !s.is_empty() {
                     append_truncated(ctx.stdout, &s, ctx.budget);
                 }

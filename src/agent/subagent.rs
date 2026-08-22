@@ -160,7 +160,10 @@ async fn persist_subagent_end(
     let result = result.map(|s| truncate_sqlite_field(s, 400_000));
     let error = error.map(|s| truncate_sqlite_field(s, 50_000));
     let (tx, rx) = oneshot::channel();
-    let _ = memory
+    // Audit R7: terminal persistence must not be fire-and-forget — a failed finalize
+    // used to leave task history stuck on "running" with no trace anywhere.
+    let task_label = task_id.clone();
+    if let Err(e) = memory
         .send_packet(MemoryMessage::FinalizeSubagentTask {
             task_id,
             parent_chat_id,
@@ -170,8 +173,14 @@ async fn persist_subagent_end(
             execution_job_id,
             reply: SharedReply::new(tx),
         })
-        .await;
-    let _ = rx.await;
+        .await
+    {
+        log::error!("sub-agent task {task_label}: failed to send final state to memory: {e}");
+        return;
+    }
+    if let Err(e) = rx.await {
+        log::error!("sub-agent task {task_label}: finalize acknowledgement lost: {e}");
+    }
 }
 
 impl TaskRecord {
