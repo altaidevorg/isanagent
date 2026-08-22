@@ -282,7 +282,8 @@ fn resolve_system_prompt(def: &AgentDefinition, sandbox_dir: &std::path::Path) -
                 .strip_prefix("{file:")
                 .and_then(|s| s.strip_suffix('}'))
             {
-                if let Some(resolved) = crate::utils::resolve_path(sandbox_dir, path.trim()) {
+                if let Some(resolved) = crate::utils::resolve_sandbox_path(sandbox_dir, path.trim())
+                {
                     if let Ok(content) = std::fs::read_to_string(&resolved) {
                         return content;
                     }
@@ -298,7 +299,7 @@ fn resolve_system_prompt(def: &AgentDefinition, sandbox_dir: &std::path::Path) -
         }
     }
     if let Some(ref file_path) = def.system_prompt_file {
-        if let Some(resolved) = crate::utils::resolve_path(sandbox_dir, file_path.trim()) {
+        if let Some(resolved) = crate::utils::resolve_sandbox_path(sandbox_dir, file_path.trim()) {
             if let Ok(content) = std::fs::read_to_string(&resolved) {
                 return content;
             }

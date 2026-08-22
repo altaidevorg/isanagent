@@ -1,6 +1,6 @@
 //! `@path` attachment parsing for terminal input (Ratatui compose + line mode).
 
-use crate::utils::{resolve_path, ContentPart, Document, ImageUrl};
+use crate::utils::{resolve_sandbox_path, ContentPart, Document, ImageUrl};
 use base64::Engine as _;
 use std::path::{Path, PathBuf};
 
@@ -90,7 +90,7 @@ pub fn load_sandbox_file_attachment(
     path: &Path,
 ) -> Result<ContentPart, String> {
     let expanded = shellexpand::tilde(&path.display().to_string()).into_owned();
-    let resolved = resolve_path(sandbox_dir, &expanded)
+    let resolved = resolve_sandbox_path(sandbox_dir, &expanded)
         .or_else(|| fuzzy_resolve_in_sandbox(sandbox_dir, &expanded))
         .ok_or_else(|| {
             format!(

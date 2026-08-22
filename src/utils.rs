@@ -789,7 +789,7 @@ pub fn normalize_sandbox_relative_input(workspace_dir: &Path, path: &str) -> Pat
 /// - the path escapes the sandbox via `../` traversal or absolute references
 ///   outside the sandbox directory, or
 /// - the path does not exist on disk (canonicalization requires existence).
-pub fn resolve_path(sandbox_dir: &Path, agent_path: &str) -> Option<PathBuf> {
+pub fn resolve_sandbox_path(sandbox_dir: &Path, agent_path: &str) -> Option<PathBuf> {
     // Canonicalize the sandbox root first so we can fail fast before touching
     // any user-supplied path data.
     let sandbox_canonical = sandbox_dir.canonicalize().ok()?;
