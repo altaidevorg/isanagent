@@ -16,6 +16,10 @@ pub mod workflow;
 /// Convert one legacy `Result<String, String>` into the typed contract. This is
 /// the only text-classification fallback in the executor: natively typed tool
 /// results bypass it completely and therefore cannot be overwritten by prose.
+/// Audit X5: no tool-name special cases remain here — a real shell `exec` is
+/// natively typed (its true exit code yields `NonZeroExit` from the typed hook),
+/// so any *legacy* result is classified as `LegacyReportedFailure` regardless
+/// of what the tool happens to be called.
 fn normalize_legacy_tool_result(tool_name: &str, mut result: ToolResult) -> ToolResult {
     if !result.is_legacy() {
         return result;
@@ -28,16 +32,11 @@ fn normalize_legacy_tool_result(tool_name: &str, mut result: ToolResult) -> Tool
         return result;
     }
 
-    let code = if tool_name == "exec" {
-        ToolErrorCode::NonZeroExit
-    } else {
-        ToolErrorCode::LegacyReportedFailure
-    };
-    let message = match code {
-        ToolErrorCode::NonZeroExit => format!("{tool_name} exited with a non-zero status"),
-        _ => format!("{tool_name} reported a failure"),
-    };
-    ToolResult::error_with_content(code, message, result.content)
+    ToolResult::error_with_content(
+        ToolErrorCode::LegacyReportedFailure,
+        format!("{tool_name} reported a failure"),
+        result.content,
+    )
 }
 
 /// Score `(name, description)` entries for a free-text `query`. Higher is better.
@@ -688,7 +687,13 @@ mod typed_result_tests {
         }));
 
         let failed = registry.execute_tool_result("exec", Value::Null).await;
-        assert_eq!(failed.error_code(), Some(ToolErrorCode::NonZeroExit));
+        // Audit X5: the name special-case is retired. A *legacy* tool named
+        // "exec" no longer gets NonZeroExit from prose sniffing — only the
+        // natively typed shell exec hook can produce that code.
+        assert_eq!(
+            failed.error_code(),
+            Some(ToolErrorCode::LegacyReportedFailure)
+        );
         assert_eq!(failed.content, "build failed\nExit code: 7");
 
         let content = registry.execute_tool_result("read_file", Value::Null).await;

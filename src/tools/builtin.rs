@@ -33,6 +33,29 @@ const MAX_DIFF_OUTPUT_LINES: usize = 80;
 /// Bound approval metadata so a large write cannot flood the UI event channel.
 const MAX_EDIT_APPROVAL_DIFF_CHARS: usize = 16_000;
 
+/// Audit X5: classify a legacy-adapter error message from the file/search tools
+/// into a stable root-cause code. These strings are our own constants in this
+/// file (not external output); this backs only the legacy `execute()` path so
+/// old callers keep working while the typed hook carries the precise code.
+fn classify_tool_error_message(message: &str) -> ToolErrorCode {
+    if message.starts_with("PermissionError") || message.starts_with("blocked by .isanagentignore")
+    {
+        ToolErrorCode::NotAllowed
+    } else if message.starts_with("Missing '")
+        || message.starts_with("old_text")
+        || message.starts_with("end_line")
+        || message.starts_with("Not a directory")
+        || message.contains("is not a directory")
+        || message.contains("Invalid")
+    {
+        ToolErrorCode::InvalidToolArguments
+    } else if message.contains("path not found") || message.contains("No such file") {
+        ToolErrorCode::NotFound
+    } else {
+        ToolErrorCode::ExecutionFailed
+    }
+}
+
 /// Resolves a path against the workspace and enforces boundary restrictions.
 pub fn resolve_path(path: &str, workspace_dir: &Path, restrict: bool) -> Result<PathBuf, String> {
     // 1. Expand naive relativity to the workspace dir. When restricted, resolve `.` / `..`
@@ -226,6 +249,19 @@ pub struct ReadFileTool {
 
 #[async_trait]
 impl Tool for ReadFileTool {
+    // Audit X5: native typed result — precise root-cause code, immune to prose
+    // reclassification at the registry boundary.
+    async fn execute_with_approved_mutation_typed(
+        &self,
+        args: Value,
+        _approved_preview: Option<&MutationPreview>,
+    ) -> ToolResult {
+        match self.execute(args).await {
+            Ok(content) => ToolResult::success(content),
+            Err(message) => ToolResult::error(classify_tool_error_message(&message), message),
+        }
+    }
+
     fn name(&self) -> &str {
         "read_file"
     }
@@ -316,6 +352,39 @@ pub struct WriteFileTool {
 
 #[async_trait]
 impl Tool for WriteFileTool {
+    // Audit X5: native typed result. The dispatcher calls this hook directly
+    // (bypassing the legacy adapter), so the approved-preview fingerprint check
+    // is replicated here rather than inherited via `execute_with_approved_mutation`.
+    async fn execute_with_approved_mutation_typed(
+        &self,
+        args: Value,
+        approved_preview: Option<&MutationPreview>,
+    ) -> ToolResult {
+        if let Some(preview) = approved_preview {
+            let path_str = match args.get("path").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => {
+                    return ToolResult::error(
+                        ToolErrorCode::InvalidToolArguments,
+                        "Missing 'path' argument",
+                    )
+                }
+            };
+            if let Err(message) = validate_approved_preview(
+                &self.workspace_dir,
+                self.restrict_to_workspace,
+                path_str,
+                preview,
+            ) {
+                return ToolResult::error(classify_tool_error_message(&message), message);
+            }
+        }
+        match self.execute(args).await {
+            Ok(content) => ToolResult::success(content),
+            Err(message) => ToolResult::error(classify_tool_error_message(&message), message),
+        }
+    }
+
     fn name(&self) -> &str {
         "write_file"
     }
@@ -440,6 +509,39 @@ pub struct EditFileTool {
 
 #[async_trait]
 impl Tool for EditFileTool {
+    // Audit X5: native typed result. Same shape as WriteFileTool: the approved
+    // preview fingerprint is validated on this typed path (see ReadFileTool for
+    // the read-only variant).
+    async fn execute_with_approved_mutation_typed(
+        &self,
+        args: Value,
+        approved_preview: Option<&MutationPreview>,
+    ) -> ToolResult {
+        if let Some(preview) = approved_preview {
+            let path_str = match args.get("path").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => {
+                    return ToolResult::error(
+                        ToolErrorCode::InvalidToolArguments,
+                        "Missing 'path' argument",
+                    )
+                }
+            };
+            if let Err(message) = validate_approved_preview(
+                &self.workspace_dir,
+                self.restrict_to_workspace,
+                path_str,
+                preview,
+            ) {
+                return ToolResult::error(classify_tool_error_message(&message), message);
+            }
+        }
+        match self.execute(args).await {
+            Ok(content) => ToolResult::success(content),
+            Err(message) => ToolResult::error(classify_tool_error_message(&message), message),
+        }
+    }
+
     fn name(&self) -> &str {
         "edit_file"
     }
@@ -495,7 +597,7 @@ impl Tool for EditFileTool {
             .unwrap_or(false);
 
         if old_text == new_text {
-            return Ok("Error: old_text and new_text are identical.".to_string());
+            return Err("old_text and new_text are identical.".to_string());
         }
 
         let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
@@ -511,13 +613,13 @@ impl Tool for EditFileTool {
             fs::read_to_string(&actual_path).map_err(|e| format!("Error reading file: {e}"))?;
 
         if !content.contains(old_text) {
-            return Ok("Error: old_text not found in file.".to_string());
+            return Err("old_text not found in file.".to_string());
         }
 
         let count = content.matches(old_text).count();
         if count > 1 && !replace_all {
-            return Ok(format!(
-                "Error: old_text appears {count} times. Provide more surrounding context to make it unique, or set replace_all to true."
+            return Err(format!(
+                "old_text appears {count} times. Provide more surrounding context to make it unique, or set replace_all to true."
             ));
         }
 
@@ -625,6 +727,18 @@ pub struct ListDirTool {
 
 #[async_trait]
 impl Tool for ListDirTool {
+    // Audit X5: native typed result (see ReadFileTool).
+    async fn execute_with_approved_mutation_typed(
+        &self,
+        args: Value,
+        _approved_preview: Option<&MutationPreview>,
+    ) -> ToolResult {
+        match self.execute(args).await {
+            Ok(content) => ToolResult::success(content),
+            Err(message) => ToolResult::error(classify_tool_error_message(&message), message),
+        }
+    }
+
     fn name(&self) -> &str {
         "list_dir"
     }
@@ -659,12 +773,12 @@ impl Tool for ListDirTool {
         let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
 
         if !actual_path.is_dir() {
-            return Ok(format!("Error: Not a directory: {}", actual_path.display()));
+            return Err(format!("Not a directory: {}", actual_path.display()));
         }
 
         let mut entries = match fs::read_dir(&actual_path) {
             Ok(iter) => iter,
-            Err(e) => return Ok(format!("Error reading dir: {e}")),
+            Err(e) => return Err(e.to_string()),
         };
 
         let mut items = Vec::new();
@@ -711,6 +825,18 @@ fn compile_glob_single(pattern: &str) -> Result<GlobSet, String> {
 
 #[async_trait]
 impl Tool for GlobFilesTool {
+    // Audit X5: native typed result (see ReadFileTool).
+    async fn execute_with_approved_mutation_typed(
+        &self,
+        args: Value,
+        _approved_preview: Option<&MutationPreview>,
+    ) -> ToolResult {
+        match self.execute(args).await {
+            Ok(content) => ToolResult::success(content),
+            Err(message) => ToolResult::error(classify_tool_error_message(&message), message),
+        }
+    }
+
     fn name(&self) -> &str {
         "glob_files"
     }
@@ -750,13 +876,10 @@ impl Tool for GlobFilesTool {
 
         let base = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
         if !base.exists() {
-            return Ok(format!("Error: path not found: {}", base.display()));
+            return Err(format!("path not found: {}", base.display()));
         }
         if !base.is_dir() {
-            return Ok(format!(
-                "Error: base path is not a directory: {}",
-                base.display()
-            ));
+            return Err(format!("base path is not a directory: {}", base.display()));
         }
 
         // Align with WalkDir output so `strip_prefix` works on all platforms (notably Windows).
@@ -1015,6 +1138,18 @@ fn search_text_native(
 
 #[async_trait]
 impl Tool for SearchTextTool {
+    // Audit X5: native typed result (see ReadFileTool).
+    async fn execute_with_approved_mutation_typed(
+        &self,
+        args: Value,
+        _approved_preview: Option<&MutationPreview>,
+    ) -> ToolResult {
+        match self.execute(args).await {
+            Ok(content) => ToolResult::success(content),
+            Err(message) => ToolResult::error(classify_tool_error_message(&message), message),
+        }
+    }
+
     fn name(&self) -> &str {
         "search_text"
     }
@@ -1096,7 +1231,7 @@ impl Tool for SearchTextTool {
         let resolved = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
 
         if !resolved.exists() {
-            return Ok(format!("Error: path not found: {}", resolved.display()));
+            return Err(format!("path not found: {}", resolved.display()));
         }
 
         let search_target = fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
@@ -3222,6 +3357,72 @@ mod mutation_preview_tests {
             .expect_err("intervening change must invalidate approval");
         assert!(error.contains("changed after approval"), "{error}");
         assert_eq!(fs::read_to_string(&target).unwrap(), "changed elsewhere\n");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn file_tools_report_typed_root_causes_not_prose_success() {
+        // Audit X5: the high-traffic file tools return natively typed results.
+        // Cases that used to be `Ok("Error: ...")` prose (success status!) must
+        // now be typed errors with stable root-cause codes, and the legacy
+        // adapter must surface the same message text without the old prefix.
+        let root = workspace();
+        fs::write(root.join("notes.txt"), "alpha\nbeta\n").unwrap();
+        let edit = EditFileTool {
+            workspace_dir: root.clone(),
+            restrict_to_workspace: true,
+        };
+
+        // Identical old/new text: was Ok-prose, now InvalidToolArguments.
+        let r = edit
+            .execute_with_approved_mutation_typed(
+                json!({ "path": "notes.txt", "old_text": "x", "new_text": "x" }),
+                None,
+            )
+            .await;
+        assert_eq!(r.error_code(), Some(ToolErrorCode::InvalidToolArguments));
+
+        // Missing old_text occurrence: typed error, message preserved for legacy callers.
+        let r = edit
+            .execute_with_approved_mutation_typed(
+                json!({ "path": "notes.txt", "old_text": "missing", "new_text": "y" }),
+                None,
+            )
+            .await;
+        assert_eq!(r.error_code(), Some(ToolErrorCode::InvalidToolArguments));
+        assert_eq!(
+            r.clone().into_legacy_result().unwrap_err(),
+            "old_text not found in file."
+        );
+
+        // Glob on a nonexistent base: NotFound instead of success-status prose.
+        let glob = GlobFilesTool {
+            workspace_dir: root.clone(),
+            restrict_to_workspace: true,
+        };
+        let r = glob
+            .execute_with_approved_mutation_typed(
+                json!({ "pattern": "*.rs", "path": "does/not/exist" }),
+                None,
+            )
+            .await;
+        assert_eq!(r.error_code(), Some(ToolErrorCode::NotFound));
+
+        // Sandbox escape via resolve_path classifies as NotAllowed.
+        let read = ReadFileTool {
+            workspace_dir: root.clone(),
+            restrict_to_workspace: true,
+        };
+        let outside = if cfg!(windows) {
+            "C:\\definitely-not-the-workspace\\x.txt"
+        } else {
+            "/definitely-not-the-workspace/x.txt"
+        };
+        let r = read
+            .execute_with_approved_mutation_typed(json!({ "path": outside }), None)
+            .await;
+        assert_eq!(r.error_code(), Some(ToolErrorCode::NotAllowed));
+
         let _ = fs::remove_dir_all(root);
     }
 
