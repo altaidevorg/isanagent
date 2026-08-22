@@ -12,20 +12,6 @@ use toml_edit::{value, DocumentMut};
 /// Full skill tree (SKILL.md, reference.md, examples/) embedded at compile time.
 static ONBOARD_SYNTHETIC_SKILL_DIR: Dir<'static> =
     include_dir!("$CARGO_MANIFEST_DIR/assets/onboarding/skills/synthetic-dataset-with-afterimage");
-static ONBOARD_KERNEL_PORTING_SKILL_DIR: Dir<'static> =
-    include_dir!("$CARGO_MANIFEST_DIR/assets/onboarding/skills/kernel-porting");
-static ONBOARD_AUTOTRAINESS_SKILL_DIR: Dir<'static> =
-    include_dir!("$CARGO_MANIFEST_DIR/assets/onboarding/skills/autotrainess");
-static ONBOARD_KERNEL_AGENT_PROMPTS_DIR: Dir<'static> =
-    include_dir!("$CARGO_MANIFEST_DIR/assets/onboarding/agents/prompts");
-static ONBOARD_KERNEL_REFERENCE_DIR: Dir<'static> =
-    include_dir!("$CARGO_MANIFEST_DIR/assets/onboarding/kernels/reference");
-static ONBOARD_KERNEL_BENCHMARKS_DIR: Dir<'static> =
-    include_dir!("$CARGO_MANIFEST_DIR/assets/onboarding/benchmarks");
-static ONBOARD_KERNEL_PORTING_PLUGIN_DIR: Dir<'static> =
-    include_dir!("$CARGO_MANIFEST_DIR/assets/plugins/kernel-porting");
-static ONBOARD_AUTOTRAINESS_PLUGIN_DIR: Dir<'static> =
-    include_dir!("$CARGO_MANIFEST_DIR/assets/plugins/autotrainess");
 
 const CONFIG_TEMPLATE: &str = include_str!("../assets/onboarding/config.toml");
 const AGENTS_TEMPLATE: &str = include_str!("../assets/onboarding/AGENTS.md");
@@ -565,21 +551,6 @@ fn write_all_templates(
 
     write_embedded_synthetic_skill_tree(&layout.root, report)?;
 
-    // Audit R6: only materialize optional feature trees when the config actually being
-    // written enables them. Previously kernel-porting/autotrainess skills, prompts,
-    // reference docs, benchmarks, and their plugin trees were copied into every new
-    // workspace even when their [harness.*] blocks were disabled — dead weight on disk
-    // and noise in skill/plugin discovery.
-    let kernel_porting_on = harness_section_enabled(&config_body, "kernel_porting");
-    let autotrainess_on = harness_section_enabled(&config_body, "autotrainess");
-    if kernel_porting_on {
-        write_embedded_kernel_porting_tree(&layout.root, report)?;
-    }
-    if autotrainess_on {
-        write_embedded_autotrainess_tree(&layout.root, report)?;
-    }
-    write_embedded_plugin_trees(&layout.root, report, kernel_porting_on, autotrainess_on)?;
-
     let overlay_ref = workspace_ml_engineer_overlay_reference();
     write_if_missing_string(
         &layout.root,
@@ -604,54 +575,6 @@ directory (merged by `compile_system_prompt`).\n\n---\n\n{HARNESS_OVERLAY}"
 }
 
 const SYNTHETIC_SKILL_REL_PREFIX: &str = "workspace/skills/synthetic-dataset-with-afterimage";
-const KERNEL_PORTING_SKILL_REL_PREFIX: &str = "workspace/skills/kernel-porting";
-
-/// Read `[harness.<section>] enabled` from the config text about to be written
-/// (audit R6 gating). Missing sections or keys count as disabled.
-fn harness_section_enabled(config_body: &str, section: &str) -> bool {
-    toml::from_str::<toml::Value>(config_body)
-        .ok()
-        .and_then(|v| {
-            v.get("harness")
-                .and_then(|h| h.get(section))
-                .and_then(|s| s.get("enabled"))
-                .and_then(|e| e.as_bool())
-        })
-        .unwrap_or(false)
-}
-const AUTOTRAINESS_SKILL_REL_PREFIX: &str = "workspace/skills/autotrainess";
-const KERNEL_PORTING_PLUGIN_REL_PREFIX: &str = "workspace/.agents/plugins/kernel-porting";
-const AUTOTRAINESS_PLUGIN_REL_PREFIX: &str = "workspace/.agents/plugins/autotrainess";
-const KERNEL_AGENT_PROMPTS_REL_PREFIX: &str = "workspace/.agents/prompts";
-const KERNEL_REFERENCE_REL_PREFIX: &str = "workspace/kernels/reference";
-const KERNEL_BENCHMARKS_REL_PREFIX: &str = "workspace/benchmarks";
-
-fn write_embedded_plugin_trees(
-    root: &Path,
-    report: &mut BootstrapReport,
-    include_kernel_porting: bool,
-    include_autotrainess: bool,
-) -> Result<(), String> {
-    if include_kernel_porting {
-        write_embedded_dir_recursive(
-            &ONBOARD_KERNEL_PORTING_PLUGIN_DIR,
-            root,
-            KERNEL_PORTING_PLUGIN_REL_PREFIX,
-            Path::new(""),
-            report,
-        )?;
-    }
-    if include_autotrainess {
-        write_embedded_dir_recursive(
-            &ONBOARD_AUTOTRAINESS_PLUGIN_DIR,
-            root,
-            AUTOTRAINESS_PLUGIN_REL_PREFIX,
-            Path::new(""),
-            report,
-        )?;
-    }
-    Ok(())
-}
 
 fn write_embedded_synthetic_skill_tree(
     root: &Path,
@@ -664,99 +587,6 @@ fn write_embedded_synthetic_skill_tree(
         Path::new(""),
         report,
     )
-}
-
-fn write_embedded_kernel_porting_tree(
-    root: &Path,
-    report: &mut BootstrapReport,
-) -> Result<(), String> {
-    write_embedded_dir_recursive(
-        &ONBOARD_KERNEL_PORTING_SKILL_DIR,
-        root,
-        KERNEL_PORTING_SKILL_REL_PREFIX,
-        Path::new(""),
-        report,
-    )?;
-    write_embedded_dir_recursive(
-        &ONBOARD_KERNEL_AGENT_PROMPTS_DIR,
-        root,
-        KERNEL_AGENT_PROMPTS_REL_PREFIX,
-        Path::new(""),
-        report,
-    )?;
-    write_embedded_dir_recursive(
-        &ONBOARD_KERNEL_REFERENCE_DIR,
-        root,
-        KERNEL_REFERENCE_REL_PREFIX,
-        Path::new(""),
-        report,
-    )?;
-    write_embedded_dir_recursive(
-        &ONBOARD_KERNEL_BENCHMARKS_DIR,
-        root,
-        KERNEL_BENCHMARKS_REL_PREFIX,
-        Path::new(""),
-        report,
-    )?;
-    // Symlink-style copy: gpu_to_jax plan accessible at .agents/kernel-porting/
-    let plan_src = root.join(format!(
-        "{KERNEL_PORTING_SKILL_REL_PREFIX}/gpu_to_jax_plan.json"
-    ));
-    let plan_dest = root.join("workspace/.agents/kernel-porting/gpu_to_jax_plan.json");
-    if plan_src.exists() {
-        if let Some(parent) = plan_dest.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if !plan_dest.exists() && fs::copy(&plan_src, &plan_dest).is_ok() {
-            report.created.push(PathBuf::from(
-                "workspace/.agents/kernel-porting/gpu_to_jax_plan.json",
-            ));
-        }
-    }
-    let schema_src = root.join(format!(
-        "{KERNEL_PORTING_SKILL_REL_PREFIX}/map_elites.schema.json"
-    ));
-    let schema_dest = root.join("workspace/.agents/kernel-porting/map_elites.schema.json");
-    if schema_src.exists() {
-        if let Some(parent) = schema_dest.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if !schema_dest.exists() && fs::copy(&schema_src, &schema_dest).is_ok() {
-            report.created.push(PathBuf::from(
-                "workspace/.agents/kernel-porting/map_elites.schema.json",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn write_embedded_autotrainess_tree(
-    root: &Path,
-    report: &mut BootstrapReport,
-) -> Result<(), String> {
-    write_embedded_dir_recursive(
-        &ONBOARD_AUTOTRAINESS_SKILL_DIR,
-        root,
-        AUTOTRAINESS_SKILL_REL_PREFIX,
-        Path::new(""),
-        report,
-    )?;
-    // Convenience copy: iteration plan accessible at .agents/autotrainess/
-    let plan_src = root.join(format!(
-        "{AUTOTRAINESS_SKILL_REL_PREFIX}/iteration_plan.json"
-    ));
-    let plan_dest = root.join("workspace/.agents/autotrainess/iteration_plan.json");
-    if plan_src.exists() {
-        if let Some(parent) = plan_dest.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if !plan_dest.exists() && fs::copy(&plan_src, &plan_dest).is_ok() {
-            report.created.push(PathBuf::from(
-                "workspace/.agents/autotrainess/iteration_plan.json",
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn write_embedded_dir_recursive(

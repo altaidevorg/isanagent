@@ -594,20 +594,6 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     tools.register(Box::new(TodoWriteTool {
         memory_node: memory_node.clone(),
     }));
-    if workspace.config.kernel_porting_harness_enabled() {
-        crate::tools::kernel_porting::register_kernel_porting_tools(
-            &mut tools,
-            workspace.sandbox_dir.clone(),
-            std::sync::Arc::new(workspace.config.clone()),
-        );
-    }
-    if workspace.config.autotrainess_harness_enabled() {
-        crate::tools::autotrainess::register_autotrainess_tools(
-            &mut tools,
-            workspace.sandbox_dir.clone(),
-            std::sync::Arc::new(workspace.config.clone()),
-        );
-    }
     let uv_bin = workspace.config.execution_uv_binary();
     plugins.populate_tool_registry(&mut tools, &uv_bin).await;
     let tool_catalog = tools.catalog_handle();
