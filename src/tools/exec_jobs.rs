@@ -78,10 +78,6 @@ impl ExecJobRegistry {
         self.jobs.get(command_id).map(|r| r.value().clone())
     }
 
-    pub fn list_jobs(&self) -> Vec<Arc<ExecJobRecord>> {
-        self.jobs.iter().map(|r| r.value().clone()).collect()
-    }
-
     pub async fn send_synthetic_completion_inbound(
         &self,
         chat_id: &str,

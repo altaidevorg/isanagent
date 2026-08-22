@@ -85,7 +85,6 @@ enabled = true
 short_term_threshold_turns = 20
 short_term_threshold_tokens = 100000
 short_term_threshold_mins = 15
-long_term_interval_mins = 360
 long_term_threshold_summaries = 5
 max_recent_summaries = 5
 

@@ -1404,7 +1404,6 @@ pub struct MemoryConfig {
     pub short_term_threshold_turns: Option<usize>,
     pub short_term_threshold_tokens: Option<usize>,
     pub short_term_threshold_mins: Option<u64>,
-    pub long_term_interval_mins: Option<u64>,
     pub max_recent_summaries: Option<usize>,
     pub long_term_threshold_summaries: Option<usize>,
 }
