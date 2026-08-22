@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use reqwest::header::AUTHORIZATION;
 use serde_json::Value;
 
-use crate::traits::Tool;
+use crate::traits::{Tool, ToolPolicy};
 
 const HF_USER_AGENT: &str =
     "isanagent-ml-domain/0.1 (https://github.com/huggingface; research tool)";
@@ -35,6 +35,11 @@ impl Tool for ArxivSearchTool {
 
     fn description(&self) -> &str {
         "Search arXiv (papers) via the public API. Discovery tool: returns Atom/XML snippets (titles, ids, summaries) so you can shortlist candidates. Follow up with `arxiv_fetch` to read details before citing claims. Prefer precise English keywords."
+    }
+
+    fn policy(&self) -> ToolPolicy {
+        // Read-only network discovery.
+        ToolPolicy::parallel()
     }
 
     fn parameters(&self) -> Value {
@@ -140,6 +145,11 @@ impl Tool for ArxivFetchTool {
 
     fn description(&self) -> &str {
         "Fetch an arXiv paper by id (e.g. `2401.0001` or `cs.CL/0001001`). Returns Markdown text (truncated). Use after `arxiv_search` for downloading full text and cross-verification; do not rely on search snippets alone."
+    }
+
+    fn policy(&self) -> ToolPolicy {
+        // Read-only network fetch.
+        ToolPolicy::parallel()
     }
 
     fn parameters(&self) -> Value {
@@ -259,6 +269,11 @@ impl Tool for HfHubFileFetchTool {
 
     fn description(&self) -> &str {
         "Download a **single text file** from the Hugging Face Hub via the public `resolve` URL (e.g. config.json, README). Pass `repo` like `org/model`, optional `revision` (branch/commit, default `main`), and relative `path`. Requires network; respects `HF_TOKEN` for gated models. Not for huge binaries—use `web_fetch` on the raw URL if needed."
+    }
+
+    fn policy(&self) -> ToolPolicy {
+        // Read-only network fetch.
+        ToolPolicy::parallel()
     }
 
     fn parameters(&self) -> Value {

@@ -5,7 +5,6 @@ use crate::memory::{MemoryMessage, SharedReply};
 use crate::traits::Provider;
 use crate::utils::ChatMessage;
 use crate::NodeHandle;
-use std::fs;
 use std::path::PathBuf;
 use tokio::sync::watch;
 use tokio::time::{sleep, Duration};
@@ -190,7 +189,15 @@ impl ReflectionEngine {
                             .map_err(|e| e.to_string())?;
                         rx.await??;
 
-                        let highest_id = new_messages.last().unwrap().0;
+                        // Structural guard (audit X16): the emptiness check
+                        // above sits many awaits back; derive the id without
+                        // an unwrap so the invariant cannot regress.
+                        let Some(highest_id) = new_messages.last().map(|(id, _)| *id) else {
+                            log::warn!(
+                                "short-term reflection: thread {session_id} has no messages to record; skipping metadata update"
+                            );
+                            continue;
+                        };
                         let (tx, rx) = tokio::sync::oneshot::channel();
                         self.memory_node
                             .send_packet(MemoryMessage::UpdateThreadMetadata {

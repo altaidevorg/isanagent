@@ -13,7 +13,7 @@ use crate::clarification::{
 };
 use crate::memory::{MemoryMessage, SharedReply};
 use crate::tool_runtime::current_tool_exec_ctx;
-use crate::traits::Tool;
+use crate::traits::{Tool, ToolPolicy};
 use crate::NodeHandle;
 
 use super::search_tool_index;
@@ -186,6 +186,11 @@ impl Tool for ToolSearchTool {
 
     fn description(&self) -> &str {
         "Find built-in tools by keyword or short phrase. Use when unsure which tool fits a task. Matches tool names and descriptions."
+    }
+
+    fn policy(&self) -> ToolPolicy {
+        // Read-only registry lookup.
+        ToolPolicy::parallel()
     }
 
     fn parameters(&self) -> Value {

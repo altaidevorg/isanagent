@@ -114,11 +114,6 @@ impl ToolRegistry {
         self.tools.get(name).map(|t| t.as_ref())
     }
 
-    /// Retrieve the metadata policy for a tool if registered.
-    pub fn get_tool_policy(&self, name: &str) -> Option<crate::traits::ToolPolicy> {
-        self.tools.get(name).map(|t| t.policy())
-    }
-
     pub fn get_tool_names(&self) -> Vec<String> {
         self.tools.keys().cloned().collect()
     }
@@ -254,26 +249,18 @@ impl ToolRegistry {
         )
     }
 
-    /// Read-only or side-effect-free tools safe to run concurrently (same assistant turn).
-    pub fn is_parallel_safe_tool(name: &str) -> bool {
-        matches!(
-            name,
-            "read_file"
-                | "glob_files"
-                | "list_dir"
-                | "search_text"
-                | "web_search"
-                | "web_fetch"
-                | "search_memory"
-                | "fetch_memory_by_date"
-                | "search_tools"
-                | "load_skill_instructions"
-                | "arxiv_search"
-                | "arxiv_fetch"
-                | "hf_hub_file_fetch"
-                | "execution_env_info"
-                | "task_history_list"
-        )
+    /// True iff *every* named tool declares [`crate::traits::ExecutionMode::Parallel`].
+    ///
+    /// Audit X1: same-turn concurrency decisions consult each tool's typed
+    /// `policy()` metadata instead of a hardcoded name list that drifts from
+    /// reality. Unregistered names fail closed (not parallel-safe).
+    pub fn all_parallel_safe<'a>(&self, mut names: impl Iterator<Item = &'a str>) -> bool {
+        names.all(|name| {
+            matches!(
+                self.tools.get(name).map(|t| t.policy().execution_mode),
+                Some(crate::traits::ExecutionMode::Parallel)
+            )
+        })
     }
 
     /// Tool list for provider calls when `is_subagent` is true and/or an allowlist applies.
@@ -366,6 +353,66 @@ mod registry_tests {
             .map(|v| v["function"]["name"].as_str().expect("name").to_string())
             .collect();
         assert_eq!(names, vec!["first_tool", "second_tool"]);
+    }
+
+    /// Fixture declaring an explicit execution mode (audit X1).
+    struct PolicyTool {
+        n: &'static str,
+        mode: crate::traits::ExecutionMode,
+    }
+
+    #[async_trait]
+    impl Tool for PolicyTool {
+        fn name(&self) -> &str {
+            self.n
+        }
+
+        fn description(&self) -> &str {
+            "d"
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({})
+        }
+
+        fn policy(&self) -> crate::traits::ToolPolicy {
+            crate::traits::ToolPolicy {
+                execution_mode: self.mode,
+                timeout_secs: None,
+            }
+        }
+
+        async fn execute(&self, _: Value) -> Result<String, String> {
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn parallel_safety_consults_typed_policy_not_name_list() {
+        let mut r = ToolRegistry::new();
+        r.register(Box::new(PolicyTool {
+            n: "reader_one",
+            mode: crate::traits::ExecutionMode::Parallel,
+        }));
+        r.register(Box::new(PolicyTool {
+            n: "writer_one",
+            mode: crate::traits::ExecutionMode::Serial,
+        }));
+        r.register(Box::new(PolicyTool {
+            n: "barrier_one",
+            mode: crate::traits::ExecutionMode::Barrier,
+        }));
+
+        // All-Parallel batch is allowed.
+        assert!(r.all_parallel_safe(["reader_one"].into_iter()));
+        assert!(r.all_parallel_safe(["reader_one", "reader_one"].into_iter()));
+
+        // Any Serial / Barrier member fails the batch.
+        assert!(!r.all_parallel_safe(["reader_one", "writer_one"].into_iter()));
+        assert!(!r.all_parallel_safe(["barrier_one"].into_iter()));
+
+        // Unregistered names fail closed.
+        assert!(!r.all_parallel_safe(["reader_one", "not_registered"].into_iter()));
     }
 }
 

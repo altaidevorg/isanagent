@@ -37,7 +37,7 @@ use crate::session::SessionManager;
 use crate::skills::{SharedSkillRegistry, SkillRegistry};
 use crate::tool_activity::SharedToolExecutionActivity;
 use crate::tools::ToolRegistry;
-use crate::traits::{Memory, Provider, Tool, ToolErrorCode, ToolResult};
+use crate::traits::{Memory, Provider, Tool, ToolErrorCode, ToolPolicy, ToolResult};
 use crate::NodeHandle;
 use crate::{ActorError, ActorLogic};
 use futures::{future::join_all, FutureExt};
@@ -4259,9 +4259,8 @@ impl AgentLogic {
 
                 let parallel_ok = !is_subagent
                     && tool_calls.len() > 1
-                    && tool_calls.iter().all(|tc| {
-                        crate::tools::ToolRegistry::is_parallel_safe_tool(tc.function.name.as_str())
-                    });
+                    && tools
+                        .all_parallel_safe(tool_calls.iter().map(|tc| tc.function.name.as_str()));
 
                 let finalize_tool_output = |mut result: ToolResult| -> String {
                     crate::utils::truncate_utf8_safe(
@@ -4775,6 +4774,11 @@ impl Tool for LoadSkillTool {
 
     fn description(&self) -> &str {
         "Loads the full markdown instructions for a specific Agent Skill. Use this when you need to execute a skill."
+    }
+
+    fn policy(&self) -> ToolPolicy {
+        // Read-only registry lookup.
+        ToolPolicy::parallel()
     }
 
     fn parameters(&self) -> Value {

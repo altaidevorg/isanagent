@@ -26,7 +26,7 @@ use crate::skills::SharedSkillRegistry;
 use crate::tool_activity::SharedToolExecutionActivity;
 use crate::tool_runtime::ToolExecCtx;
 use crate::tools::ToolRegistry;
-use crate::traits::Tool;
+use crate::traits::{Tool, ToolPolicy};
 use crate::NodeHandle;
 use tokio::sync::oneshot;
 
@@ -1180,6 +1180,11 @@ impl Tool for TaskHistoryListTool {
 
     fn description(&self) -> &str {
         "List recent persisted sub-agent tasks for this chat (newest first, from SQLite). Use after parallel `subagent_spawn` runs complete to audit results. Optional `limit` (default 40, max 200)."
+    }
+
+    fn policy(&self) -> ToolPolicy {
+        // Read-only history query.
+        ToolPolicy::parallel()
     }
 
     fn parameters(&self) -> Value {

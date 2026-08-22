@@ -265,6 +265,29 @@ pub struct ClarificationTicketRecord {
     pub updated_at_ms: i64,
 }
 
+/// Add a column via `ALTER TABLE ... ADD COLUMN`, tolerating *only* the
+/// expected `duplicate column name` failure on already-migrated databases.
+///
+/// Audit X16: these migrations previously swallowed every error with
+/// `let _ =`, hiding real failures (locked DB, disk I/O, corrupt file) that
+/// would only surface later as confusing `no such column` errors far from
+/// the root cause. Genuine errors now propagate to the schema-init caller.
+fn add_column_if_missing(conn: &Connection, ddl: &str) -> Result<(), rusqlite::Error> {
+    match conn.execute(ddl, []) {
+        Ok(_) => Ok(()),
+        // Expected on existing databases where the column already exists.
+        Err(e) if is_duplicate_column_error(&e) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn is_duplicate_column_error(e: &rusqlite::Error) -> bool {
+    match e {
+        rusqlite::Error::SqliteFailure(_, Some(msg)) => msg.contains("duplicate column"),
+        _ => false,
+    }
+}
+
 pub fn ensure_subagent_tasks_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS subagent_tasks (
@@ -289,11 +312,14 @@ pub fn ensure_subagent_tasks_schema(conn: &Connection) -> Result<(), rusqlite::E
         [],
     )?;
     // Migrate existing tables that were created before display_name / agent_name were added.
-    let _ = conn.execute(
+    add_column_if_missing(
+        conn,
         "ALTER TABLE subagent_tasks ADD COLUMN display_name TEXT",
-        [],
-    );
-    let _ = conn.execute("ALTER TABLE subagent_tasks ADD COLUMN agent_name TEXT", []);
+    )?;
+    add_column_if_missing(
+        conn,
+        "ALTER TABLE subagent_tasks ADD COLUMN agent_name TEXT",
+    )?;
     Ok(())
 }
 
@@ -825,11 +851,15 @@ impl SqliteMemoryActor {
         )?;
 
         // Try adding the native tool calling schema columns dynamically.
-        // Failures here are expected on existing databases after the first run.
-        let _ = conn.execute("ALTER TABLE messages ADD COLUMN name TEXT", []);
-        let _ = conn.execute("ALTER TABLE messages ADD COLUMN tool_calls TEXT", []);
-        let _ = conn.execute("ALTER TABLE messages ADD COLUMN tool_call_id TEXT", []);
-        let _ = conn.execute("ALTER TABLE messages ADD COLUMN reasoning_content TEXT", []);
+        // `duplicate column name` failures are expected on existing databases
+        // after the first run; anything else propagates (audit X16).
+        add_column_if_missing(&conn, "ALTER TABLE messages ADD COLUMN name TEXT")?;
+        add_column_if_missing(&conn, "ALTER TABLE messages ADD COLUMN tool_calls TEXT")?;
+        add_column_if_missing(&conn, "ALTER TABLE messages ADD COLUMN tool_call_id TEXT")?;
+        add_column_if_missing(
+            &conn,
+            "ALTER TABLE messages ADD COLUMN reasoning_content TEXT",
+        )?;
 
         // Create the session_summaries table for reflections
         conn.execute(
@@ -843,12 +873,13 @@ impl SqliteMemoryActor {
             )",
             [],
         )?;
-        // PR-2: structured sectional summary as JSON. Idempotent ALTER —
-        // failures on existing databases that already have the column are expected.
-        let _ = conn.execute(
+        // PR-2: structured sectional summary as JSON. Idempotent `ALTER` —
+        // `duplicate column name` on existing databases that already have
+        // the column is the expected outcome; real errors propagate.
+        add_column_if_missing(
+            &conn,
             "ALTER TABLE session_summaries ADD COLUMN sections_json TEXT",
-            [],
-        );
+        )?;
         // PR-7: cache for tool results. Populated on every tool-result add
         // (see agent/mod.rs) and read by the `recall_tool_result` tool when
         // the LLM wants to recover content that was compacted out of the

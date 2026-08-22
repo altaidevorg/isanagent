@@ -1967,6 +1967,12 @@ impl Tool for WebSearchTool {
         "Search the web for **current** facts, docs, and release notes. Discovery tool only: use this to find candidate sources, then follow with `web_fetch` on authoritative URLs before concluding. Uses Jina (s.jina.ai) when [jina].enabled is true in config; otherwise DuckDuckGo Lite."
     }
 
+    fn policy(&self) -> ToolPolicy {
+        // Read-only network discovery (audit X1: typed policy replaces the
+        // hardcoded parallel-safe name list).
+        ToolPolicy::parallel()
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -2010,6 +2016,11 @@ impl Tool for WebFetchTool {
 
     fn description(&self) -> &str {
         "Fetch a URL in detail (docs, raw GitHub, paper pages). Use after `web_search` to read primary sources and extract evidence. Uses Jina Reader (r.jina.ai) when [jina].enabled is true; otherwise direct GET with HTML text extraction or JSON pretty-print. Prefer official docs and pinned `raw.githubusercontent.com` sources when validating ML APIs."
+    }
+
+    fn policy(&self) -> ToolPolicy {
+        // Read-only network fetch.
+        ToolPolicy::parallel()
     }
 
     fn parameters(&self) -> Value {
@@ -2905,6 +2916,11 @@ impl Tool for SearchMemoryTool {
         "Search your long-term and short-term memory (session summaries) for past context, facts, or keywords."
     }
 
+    fn policy(&self) -> ToolPolicy {
+        // Read-only memory query.
+        ToolPolicy::parallel()
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -2963,6 +2979,11 @@ impl Tool for FetchMemoryByDateTool {
 
     fn description(&self) -> &str {
         "Fetch long-term and short-term memory (session summaries) from a specific relative time range, like the last 7 days."
+    }
+
+    fn policy(&self) -> ToolPolicy {
+        // Read-only memory query.
+        ToolPolicy::parallel()
     }
 
     fn parameters(&self) -> Value {

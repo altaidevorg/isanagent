@@ -18,7 +18,7 @@ use crate::execution::{
     RunResult, RunSpec, SessionCreateRequest, SessionId, SpawnBackgroundRunRequest,
 };
 use crate::tool_runtime::current_tool_exec_ctx;
-use crate::traits::Tool;
+use crate::traits::{Tool, ToolPolicy};
 
 fn exec_err(e: ExecutionError) -> String {
     e.to_string()
@@ -1007,6 +1007,11 @@ impl Tool for ExecutionEnvInfoTool {
 
     fn description(&self) -> &str {
         "Return provider capability summary. For local execution, also runs python_executable -V on the agent host (best effort). For jupyter, that probe is still the host interpreter (sanity check only); the kernel Python environment is whatever the Jupyter server started for that kernelspec. For ssh, the probe is still the agent host interpreter (not the remote remote_python)."
+    }
+
+    fn policy(&self) -> ToolPolicy {
+        // Read-only capability snapshot.
+        ToolPolicy::parallel()
     }
 
     fn parameters(&self) -> Value {
