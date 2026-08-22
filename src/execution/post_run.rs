@@ -4,7 +4,6 @@ use std::path::Path;
 
 use log::warn;
 use serde::Serialize;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 use crate::bus::{BusMessage, TelemetryEvent};
@@ -44,19 +43,10 @@ async fn append_execution_manifest(
         .await
         .map_err(|e| format!("manifest mkdir: {e}"))?;
     let path = dir.join("execution_runs.jsonl");
-    let mut f = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .await
-        .map_err(|e| format!("manifest open: {e}"))?;
     let json = serde_json::to_string(&line).map_err(|e| e.to_string())?;
-    f.write_all(json.as_bytes())
+    crate::utils::append_jsonl_line(&path, &json, crate::utils::JSONL_ROTATE_MAX_BYTES)
         .await
         .map_err(|e| format!("manifest write: {e}"))?;
-    f.write_all(b"\n")
-        .await
-        .map_err(|e| format!("manifest nl: {e}"))?;
     Ok(())
 }
 

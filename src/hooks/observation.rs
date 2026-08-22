@@ -129,6 +129,8 @@ async fn append_jsonl(path: &Path, envelope: &Value) -> Result<(), String> {
             .await
             .map_err(|e| format!("create_dir_all {}: {}", parent.display(), e))?;
     }
+    // Audit R1: bound the observation JSONL the same way as the execution audit logs.
+    crate::utils::rotate_jsonl_if_large(path, crate::utils::JSONL_ROTATE_MAX_BYTES).await;
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)

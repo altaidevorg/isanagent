@@ -13,7 +13,6 @@ use dashmap::DashMap;
 use log::{info, warn};
 use serde::Serialize;
 use serde_json::json;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::{AbortHandle, JoinHandle};
 
@@ -92,19 +91,10 @@ async fn append_job_audit_line(
         .await
         .map_err(|e| format!("execution_jobs audit mkdir: {e}"))?;
     let path = dir.join("execution_jobs.jsonl");
-    let mut f = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .await
-        .map_err(|e| format!("execution_jobs audit open: {e}"))?;
     let json = serde_json::to_string(line).map_err(|e| e.to_string())?;
-    f.write_all(json.as_bytes())
+    crate::utils::append_jsonl_line(&path, &json, crate::utils::JSONL_ROTATE_MAX_BYTES)
         .await
         .map_err(|e| format!("execution_jobs audit write: {e}"))?;
-    f.write_all(b"\n")
-        .await
-        .map_err(|e| format!("execution_jobs audit nl: {e}"))?;
     Ok(())
 }
 
