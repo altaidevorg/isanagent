@@ -458,56 +458,70 @@ impl ExecutionProvider for JupyterExecutionProvider {
         let nb_path = session.notebook_server_path.clone();
         let auth_token = self.config.token.clone();
 
-        let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
-            let exec_msg_id = uuid::Uuid::new_v4().to_string();
-            let session_key = uuid::Uuid::new_v4().to_string();
-            let run_id = spec
-                .run_id
-                .clone()
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            let msg = build_execute_request(&exec_msg_id, &session_key, &spec.code);
-            let payload = encode_kernel_ws_frame(&msg)?;
+        let result =
+            tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+                let exec_msg_id = uuid::Uuid::new_v4().to_string();
+                let session_key = uuid::Uuid::new_v4().to_string();
+                let run_id = spec
+                    .run_id
+                    .clone()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let msg = build_execute_request(&exec_msg_id, &session_key, &spec.code);
+                let payload = encode_kernel_ws_frame(&msg)?;
 
-            let throttle = spec
-                .run_event_tx
-                .as_ref()
-                .map(|_| Arc::new(RunEventThrottle::new(Duration::from_millis(40))));
+                let throttle = spec
+                    .run_event_tx
+                    .as_ref()
+                    .map(|_| Arc::new(RunEventThrottle::new(Duration::from_millis(40))));
 
-            let mut ws_guard = session.ws.lock().await;
-            let ws = ws_guard
-                .as_mut()
-                .ok_or_else(|| ExecutionError::Provider("jupyter ws not connected".into()))?;
+                // Take the socket out of the session slot under a short lock (audit R10).
+                // Holding the guard across the whole collect loop used to block
+                // execution_session_close for up to max_wall_secs. While we own the stream the
+                // slot stays None; on success we republish it below, and on error, timeout, or
+                // cancel the dropped future leaves it None so ensure_ws() reconnects cleanly.
+                let mut ws =
+                    session.ws.lock().await.take().ok_or_else(|| {
+                        ExecutionError::Provider("jupyter ws not connected".into())
+                    })?;
 
-            ws.send(Message::Binary(payload.into()))
-                .await
-                .map_err(|e| ExecutionError::Provider(format!("jupyter ws send: {e}")))?;
+                if let Err(e) = ws.send(Message::Binary(payload.into())).await {
+                    return Err(ExecutionError::Provider(format!("jupyter ws send: {e}")));
+                }
 
-            let io = JupyterWsIoContext {
-                client: &self.client,
-                base_http: &self.config.base_url,
-                token: self.config.token.as_deref(),
-                kernel_id: &session.kernel_id,
-            };
-            let artifact_sink = JupyterRunArtifactSink {
-                sandbox_dir: self.config.artifact_sandbox_dir.clone(),
-                session_id: session_id.clone(),
-                run_id,
-                limits: self.config.artifact_limits,
-                collector: ArtifactCollector::new(self.config.artifact_limits),
-            };
-            collect_execute_output(
-                ws,
-                &exec_msg_id,
-                self.config.max_output_bytes,
-                cancel,
-                io,
-                artifact_sink,
-                spec.run_event_tx.clone(),
-                throttle,
-            )
-            .await
-        })
-        .await;
+                let io = JupyterWsIoContext {
+                    client: &self.client,
+                    base_http: &self.config.base_url,
+                    token: self.config.token.as_deref(),
+                    kernel_id: &session.kernel_id,
+                };
+                let artifact_sink = JupyterRunArtifactSink {
+                    sandbox_dir: self.config.artifact_sandbox_dir.clone(),
+                    session_id: session_id.clone(),
+                    run_id,
+                    limits: self.config.artifact_limits,
+                    collector: ArtifactCollector::new(self.config.artifact_limits),
+                };
+                let collected = collect_execute_output(
+                    &mut ws,
+                    &exec_msg_id,
+                    self.config.max_output_bytes,
+                    cancel,
+                    io,
+                    artifact_sink,
+                    spec.run_event_tx.clone(),
+                    throttle,
+                )
+                .await;
+                match collected {
+                    // Idle and healthy again — republish for reuse by the next run.
+                    Ok(r) => {
+                        *session.ws.lock().await = Some(ws);
+                        Ok(r)
+                    }
+                    Err(e) => Err(e),
+                }
+            })
+            .await;
 
         *session.run_cancel.lock().await = None;
 
@@ -528,13 +542,10 @@ impl ExecutionProvider for JupyterExecutionProvider {
             Ok(inner) => inner,
         };
 
-        // A failed run can leave the cached websocket dead or mid-frame (send/read error,
-        // Close frame, or the whole future dropped by the timeout). Reset the slot so
-        // ensure_ws() reconnects cleanly on the next run instead of reusing a wedged
-        // stream forever.
-        if out.is_err() {
-            *session.ws.lock().await = None;
-        }
+        // Slot invariant (audit R10/C3): while no run owns the stream, the slot holds it
+        // only if the last run succeeded — failures, timeouts, and cancels drop the future
+        // owning the socket, leaving None so ensure_ws() reconnects instead of reusing a
+        // wedged stream.
 
         if let (Ok(_), Some(path)) = (&out, nb_path.as_ref()) {
             let token = auth_token.clone();

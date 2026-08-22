@@ -15,10 +15,9 @@ use super::run::{RunResult, RunSpec, SessionCreateRequest, SessionHandle};
 ///
 /// ## Object safety and extensions
 ///
-/// Optional features (SSH shell, package installs beyond `run`, GPU queries) are **not** methods
-/// on this trait. Use separate [`SshRemoteShell`], [`PackageOperations`], etc., implemented by the
-/// concrete provider type; the executor resolves them via `provider_id`, [`ProviderCapabilities`]
-/// preflight, or `downcast_rs` / enum dispatch where static typing is available.
+/// Optional features (SSH shell, package installs beyond `run`, GPU queries) are **not**
+/// methods on this trait; introduce focused traits implemented by concrete providers only
+/// when such features actually ship, and gate them via [`ProviderCapabilities`] preflight.
 #[async_trait]
 pub trait ExecutionProvider: Send + Sync {
     fn provider_id(&self) -> &str;
@@ -45,25 +44,4 @@ pub trait ExecutionProvider: Send + Sync {
 
     /// Best-effort interrupt (kernel interrupt, SIGINT, remote equivalent).
     async fn cancel(&self, session_id: &SessionId) -> Result<(), ExecutionError>;
-}
-
-/// Non-universal: interactive or batch remote shell over SSH (Phase 4 providers).
-#[async_trait]
-pub trait SshRemoteShell: Send + Sync {
-    /// Run a non-interactive remote command in the session’s remote context.
-    async fn exec_remote_argv(
-        &self,
-        session_id: &SessionId,
-        argv: &[String],
-    ) -> Result<RunResult, ExecutionError>;
-}
-
-/// Optional package / environment mutations (guarded by config in later phases).
-#[async_trait]
-pub trait PackageOperations: Send + Sync {
-    async fn install_packages(
-        &self,
-        session_id: &SessionId,
-        spec: &str,
-    ) -> Result<RunResult, ExecutionError>;
 }
