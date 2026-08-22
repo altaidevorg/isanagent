@@ -541,18 +541,18 @@ fn write_all_templates(
     interactive_merged_config_toml: Option<&str>,
     report: &mut BootstrapReport,
 ) -> Result<(), String> {
+    let config_body =
+        if let Some(s) = interactive_merged_config_toml.filter(|_| options.has_overrides()) {
+            s.to_string()
+        } else if options.has_overrides() {
+            build_config_toml(options)?
+        } else {
+            CONFIG_TEMPLATE.to_string()
+        };
+
     for template in embedded_templates() {
         if template.relative_path == "config.toml" {
-            let body = if let Some(s) =
-                interactive_merged_config_toml.filter(|_| options.has_overrides())
-            {
-                s.to_string()
-            } else if options.has_overrides() {
-                build_config_toml(options)?
-            } else {
-                CONFIG_TEMPLATE.to_string()
-            };
-            write_if_missing_string(&layout.root, template.relative_path, &body, report)?;
+            write_if_missing_string(&layout.root, template.relative_path, &config_body, report)?;
         } else {
             write_if_missing_string(
                 &layout.root,
@@ -564,9 +564,21 @@ fn write_all_templates(
     }
 
     write_embedded_synthetic_skill_tree(&layout.root, report)?;
-    write_embedded_kernel_porting_tree(&layout.root, report)?;
-    write_embedded_autotrainess_tree(&layout.root, report)?;
-    write_embedded_plugin_trees(&layout.root, report)?;
+
+    // Audit R6: only materialize optional feature trees when the config actually being
+    // written enables them. Previously kernel-porting/autotrainess skills, prompts,
+    // reference docs, benchmarks, and their plugin trees were copied into every new
+    // workspace even when their [harness.*] blocks were disabled — dead weight on disk
+    // and noise in skill/plugin discovery.
+    let kernel_porting_on = harness_section_enabled(&config_body, "kernel_porting");
+    let autotrainess_on = harness_section_enabled(&config_body, "autotrainess");
+    if kernel_porting_on {
+        write_embedded_kernel_porting_tree(&layout.root, report)?;
+    }
+    if autotrainess_on {
+        write_embedded_autotrainess_tree(&layout.root, report)?;
+    }
+    write_embedded_plugin_trees(&layout.root, report, kernel_porting_on, autotrainess_on)?;
 
     let overlay_ref = workspace_ml_engineer_overlay_reference();
     write_if_missing_string(
@@ -593,6 +605,20 @@ directory (merged by `compile_system_prompt`).\n\n---\n\n{HARNESS_OVERLAY}"
 
 const SYNTHETIC_SKILL_REL_PREFIX: &str = "workspace/skills/synthetic-dataset-with-afterimage";
 const KERNEL_PORTING_SKILL_REL_PREFIX: &str = "workspace/skills/kernel-porting";
+
+/// Read `[harness.<section>] enabled` from the config text about to be written
+/// (audit R6 gating). Missing sections or keys count as disabled.
+fn harness_section_enabled(config_body: &str, section: &str) -> bool {
+    toml::from_str::<toml::Value>(config_body)
+        .ok()
+        .and_then(|v| {
+            v.get("harness")
+                .and_then(|h| h.get(section))
+                .and_then(|s| s.get("enabled"))
+                .and_then(|e| e.as_bool())
+        })
+        .unwrap_or(false)
+}
 const AUTOTRAINESS_SKILL_REL_PREFIX: &str = "workspace/skills/autotrainess";
 const KERNEL_PORTING_PLUGIN_REL_PREFIX: &str = "workspace/.agents/plugins/kernel-porting";
 const AUTOTRAINESS_PLUGIN_REL_PREFIX: &str = "workspace/.agents/plugins/autotrainess";
@@ -600,21 +626,30 @@ const KERNEL_AGENT_PROMPTS_REL_PREFIX: &str = "workspace/.agents/prompts";
 const KERNEL_REFERENCE_REL_PREFIX: &str = "workspace/kernels/reference";
 const KERNEL_BENCHMARKS_REL_PREFIX: &str = "workspace/benchmarks";
 
-fn write_embedded_plugin_trees(root: &Path, report: &mut BootstrapReport) -> Result<(), String> {
-    write_embedded_dir_recursive(
-        &ONBOARD_KERNEL_PORTING_PLUGIN_DIR,
-        root,
-        KERNEL_PORTING_PLUGIN_REL_PREFIX,
-        Path::new(""),
-        report,
-    )?;
-    write_embedded_dir_recursive(
-        &ONBOARD_AUTOTRAINESS_PLUGIN_DIR,
-        root,
-        AUTOTRAINESS_PLUGIN_REL_PREFIX,
-        Path::new(""),
-        report,
-    )?;
+fn write_embedded_plugin_trees(
+    root: &Path,
+    report: &mut BootstrapReport,
+    include_kernel_porting: bool,
+    include_autotrainess: bool,
+) -> Result<(), String> {
+    if include_kernel_porting {
+        write_embedded_dir_recursive(
+            &ONBOARD_KERNEL_PORTING_PLUGIN_DIR,
+            root,
+            KERNEL_PORTING_PLUGIN_REL_PREFIX,
+            Path::new(""),
+            report,
+        )?;
+    }
+    if include_autotrainess {
+        write_embedded_dir_recursive(
+            &ONBOARD_AUTOTRAINESS_PLUGIN_DIR,
+            root,
+            AUTOTRAINESS_PLUGIN_REL_PREFIX,
+            Path::new(""),
+            report,
+        )?;
+    }
     Ok(())
 }
 

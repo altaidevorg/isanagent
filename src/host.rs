@@ -658,12 +658,18 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         else if let Ok(key) = default_provider_cfg.resolve_api_key() {
             (Some(default_provider_cfg.clone()), Some(key))
         } else {
-            // 2. Try any expanded [providers.*] entry
+            // 2. Try any expanded [providers.*] entry — in deterministic (sorted) key
+            // order (audit R4): HashMap iteration order is randomized per process,
+            // which made the "first entry with a key" fallback vary across restarts.
+            let mut sorted_ids: Vec<&String> = expanded_providers.keys().collect();
+            sorted_ids.sort();
             let mut found: Option<(crate::config::ProviderConfig, String)> = None;
-            for cfg in expanded_providers.values() {
-                if let Ok(key) = cfg.resolve_api_key() {
-                    found = Some((cfg.clone(), key));
-                    break;
+            for id in sorted_ids {
+                if let Some(cfg) = expanded_providers.get(id.as_str()) {
+                    if let Ok(key) = cfg.resolve_api_key() {
+                        found = Some((cfg.clone(), key));
+                        break;
+                    }
                 }
             }
             if let Some((cfg, key)) = found {
@@ -698,9 +704,14 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         // Keep all configured providers as immutable candidates owned by this AgentLogic. Each run
         // filters its own primary by full (provider, base_url, model) identity while snapshotting,
         // so concurrent runs and `/model` switches cannot rewrite one another's fallback policy.
-        let candidates: Vec<crate::agent::FallbackProviderSpec> = expanded_providers
-            .values()
-            .filter_map(|fb_cfg| {
+        // Deterministic failover priority (audit R4): sort provider ids instead of
+        // relying on randomized HashMap iteration order.
+        let mut sorted_fb_ids: Vec<&String> = expanded_providers.keys().collect();
+        sorted_fb_ids.sort();
+        let candidates: Vec<crate::agent::FallbackProviderSpec> = sorted_fb_ids
+            .into_iter()
+            .filter_map(|id| {
+                let fb_cfg = expanded_providers.get(id.as_str())?;
                 let fb_key = fb_cfg.resolve_api_key().ok()?;
                 let fb_base = fb_cfg.resolved_base_url().ok()?;
                 Some(crate::agent::FallbackProviderSpec {

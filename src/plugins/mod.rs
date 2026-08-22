@@ -513,27 +513,60 @@ impl PluginRegistry {
         std::fs::create_dir_all(target_plugins_dir)
             .map_err(|e| format!("Failed to create plugins directory: {e}"))?;
 
+        // Audit R5: stage the clone in a temporary sibling directory and only move it
+        // into place after the plugin validates. A failed/interrupted install can no
+        // longer leave a half-cloned tree that discovery would pick up as a broken
+        // plugin. Rename within the same directory/volume is atomic on all platforms.
+        let staging = target_plugins_dir.join(format!(
+            ".{}.tmp-{}-{}",
+            target_name,
+            std::process::id(),
+            chrono::Utc::now().timestamp_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&staging);
+
         let output = tokio::process::Command::new("git")
             .arg("clone")
             .arg("--depth")
             .arg("1")
             .arg(&url)
-            .arg(&destination)
+            .arg(&staging)
             .output()
             .await
-            .map_err(|e| format!("Failed to execute git clone: {e}"))?;
+            .map_err(|e| format!("Failed to execute git clone: {e}"));
+
+        // Any failure from here on must not leave staging behind.
+        let output = match output {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(e);
+            }
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            let _ = std::fs::remove_dir_all(&staging);
             return Err(format!("git clone failed: {stderr}"));
         }
 
-        Plugin::load_from_dir(&destination).ok_or_else(|| {
-            format!(
-                "Installed repository at {} is not a valid plugin",
-                destination.display()
-            )
-        })
+        let plugin = match Plugin::load_from_dir(&staging) {
+            Some(p) => p,
+            None => {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(format!(
+                    "Cloned repository at {} is not a valid plugin",
+                    staging.display()
+                ));
+            }
+        };
+
+        std::fs::rename(&staging, &destination).map_err(|e| {
+            let _ = std::fs::remove_dir_all(&staging);
+            format!("Failed to move staged plugin into place: {e}")
+        })?;
+
+        Ok(plugin)
     }
 }
 
