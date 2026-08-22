@@ -707,14 +707,8 @@ impl Tool for ExecutionReadLogTool {
 
         let mut reader = BufReader::new(file);
 
-        let start = start_line.max(1) as usize;
-        let end = end_line as usize;
-
-        if end < start {
-            return Err("end_line must be greater than or equal to start_line".to_string());
-        }
-
-        let actual_end = start + 99.min(end - start);
+        // Audit X3-tail: shared window arithmetic (validate + 100-line cap).
+        let (start, actual_end) = crate::utils::resolve_line_window(start_line, end_line, 100)?;
 
         let mut lines = Vec::new();
         let mut current_line = 1;

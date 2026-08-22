@@ -9,6 +9,27 @@ use std::time::Duration;
 /// generation kept, older one overwritten).
 pub const JSONL_ROTATE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
+/// Shared line-range arithmetic for ranged readers (`read_file`,
+/// `execution_read_log`). Audit X3-tail: single source of truth for the
+/// validate-and-clamp semantics so the two tools cannot drift apart.
+///
+/// Returns `(start, window_end_inclusive)` with `start` clamped to >= 1 and
+/// the window capped at `max_lines` entries. Callers still clamp
+/// `window_end` by the file's real line count.
+pub fn resolve_line_window(
+    start_line: u64,
+    end_line: u64,
+    max_lines: usize,
+) -> Result<(usize, usize), String> {
+    let start = start_line.max(1) as usize;
+    let end = end_line as usize;
+    if end < start {
+        return Err("end_line must be greater than or equal to start_line".to_string());
+    }
+    let count = (end - start + 1).min(max_lines);
+    Ok((start, start + count - 1))
+}
+
 /// Rename `path` to `<name>.1` if it is at or above `max_bytes`. Best-effort: errors
 /// are ignored so logging problems never break the caller's operation.
 pub async fn rotate_jsonl_if_large(path: &Path, max_bytes: u64) {
@@ -1149,6 +1170,36 @@ mod tests {
             "read_file",
             &Ok("Error: line one of a log file".to_string())
         ));
+    }
+
+    #[test]
+    fn resolve_line_window_validates_and_caps() {
+        // Audit X3-tail: single shared semantics for read_file/execution_read_log.
+        assert_eq!(
+            crate::utils::resolve_line_window(1, 100, 100).unwrap(),
+            (1, 100)
+        );
+        // Wide request clamps to max_lines entries.
+        assert_eq!(
+            crate::utils::resolve_line_window(1, 500, 100).unwrap(),
+            (1, 100)
+        );
+        assert_eq!(
+            crate::utils::resolve_line_window(200, 450, 100).unwrap(),
+            (200, 299)
+        );
+        // start clamped up to 1; single-line window works.
+        assert_eq!(
+            crate::utils::resolve_line_window(0, 5, 100).unwrap(),
+            (1, 5)
+        );
+        assert_eq!(
+            crate::utils::resolve_line_window(7, 7, 100).unwrap(),
+            (7, 7)
+        );
+        // Inverted range rejected with the exact legacy error text.
+        let err = crate::utils::resolve_line_window(10, 5, 100).unwrap_err();
+        assert_eq!(err, "end_line must be greater than or equal to start_line");
     }
 
     #[tokio::test]

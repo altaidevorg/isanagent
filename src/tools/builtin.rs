@@ -282,14 +282,8 @@ impl Tool for ReadFileTool {
 
         let content = fs::read_to_string(&actual_path).map_err(|e| e.to_string())?;
 
-        let start = start_line.max(1) as usize;
-        let end = end_line as usize;
-
-        if end < start {
-            return Err("end_line must be greater than or equal to start_line".to_string());
-        }
-
-        let lines_to_read = (end - start + 1).min(100);
+        // Audit X3-tail: shared window arithmetic (validate + 100-line cap).
+        let (start, requested_end) = crate::utils::resolve_line_window(start_line, end_line, 100)?;
 
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
@@ -304,10 +298,9 @@ impl Tool for ReadFileTool {
             ));
         }
 
-        let actual_start = start;
-        let actual_end = (actual_start + lines_to_read - 1).min(total_lines);
+        let actual_end = requested_end.min(total_lines);
 
-        let snippet: Vec<String> = lines[actual_start - 1..actual_end]
+        let snippet: Vec<String> = lines[start - 1..actual_end]
             .iter()
             .map(|l| l.to_string())
             .collect();
