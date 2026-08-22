@@ -63,7 +63,7 @@ Sub-agents (`subagent_spawn`, `task_*`, `subagent_plan_execute`, `task_history_l
 
 **Metadata Tool Scheduler & Concurrency** (`src/traits.rs`): `ToolPolicy` classifies tools into `ExecutionMode` (`Parallel` for read-only tools like `read_file`/`search_text`, `Serial` for standard mutations, `Barrier` for environment mutators like `git_worktree`, and `Background` for async jobs).
 
-**Large Output Spill Storage** (`src/spill.rs`): when tool output exceeds character limits, untruncated content is persisted to `<workspace>/.system_generated/spill/{session_id}/{spill_id}.log`. The agent receives a structured head/tail preview with a `spill_id`, and lines can be selectively queried via `recall_tool_result`.
+**Tool Result Cache** (`tool_result_cache` SQLite table in `agent_memory.db`): when auto-compaction swaps an oversized tool result out of the active conversation, the untruncated content is persisted to the cache (newest 500 rows kept) and the message is replaced by an archival placeholder. The full content can be re-materialized via `recall_tool_result(tool_call_id=...)`.
 
 **Authoritative Session Projections** (`src/projections.rs`): `SessionProjection` provides structured snapshots (`todos`, `subagents`, `jobs`, `run_status`) emitted over the actor bus, allowing frontend clients like `altai-app` to treat client stores as disposable projections of server truth.
 

@@ -452,9 +452,6 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         exec_jobs: Some(exec_jobs.clone()),
         windows_runner: workspace.config.windows_shell_runner(),
     }));
-    tools.register(Box::new(crate::tools::builtin::ExecStatusTool {
-        exec_jobs: exec_jobs.clone(),
-    }));
     tools.register(Box::new(crate::tools::builtin::ExecSendTool {
         exec_jobs: exec_jobs.clone(),
     }));
@@ -477,6 +474,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     }
     let mut inflight_sync_outer: Option<Arc<InflightSyncRegistry>> = None;
     let mut execution_harness_for_shutdown: Option<Arc<crate::execution::ExecutionHarness>> = None;
+    let mut execution_jobs_outer: Option<Arc<ExecutionJobManager>> = None;
     if workspace.config.execution_harness_enabled() {
         let harness = crate::execution::build_execution_harness(
             workspace.dir.clone(),
@@ -494,6 +492,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         ));
         let inflight_sync = Arc::new(InflightSyncRegistry::new());
         inflight_sync_outer = Some(inflight_sync.clone());
+        execution_jobs_outer = Some(execution_jobs.clone());
         tools.register(Box::new(ExecutionSessionCreateTool {
             harness: harness.clone(),
         }));
@@ -509,6 +508,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         }));
         tools.register(Box::new(ExecutionJobStatusTool {
             jobs: execution_jobs.clone(),
+            exec_jobs: Some(exec_jobs.clone()),
         }));
         tools.register(Box::new(ExecutionJobResultTool {
             jobs: execution_jobs.clone(),
@@ -537,6 +537,12 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             harness: harness.clone(),
         }));
     }
+    // Audit X3: registered after the execution-harness block so `exec_status`
+    // can route misses to the execution job registry by *real lookup*.
+    tools.register(Box::new(crate::tools::builtin::ExecStatusTool {
+        exec_jobs: exec_jobs.clone(),
+        execution_jobs: execution_jobs_outer.clone(),
+    }));
     let jina = workspace.config.jina_web_backend();
     let max_web_output_chars = workspace.config.effective_max_web_tool_output_chars();
     tools.register(Box::new(WebSearchTool {
@@ -582,7 +588,6 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     tools.register(Box::new(crate::tools::recall::RecallToolResultTool {
         memory_node: memory_node.clone(),
         outbound_tx: global_outbound_tx.clone(),
-        spill_store: Some(crate::spill::SpillStore::new(&workspace.dir)),
     }));
     tools.register(Box::new(crate::tools::builtin::SearchMemoryTool {
         memory_node: memory_node.clone(),

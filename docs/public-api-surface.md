@@ -57,7 +57,7 @@ Items below carry no `[consumed-by:]` annotation until evidence appears.
 agent, bus, channels, clarification, config, environment, execution, hooks, logging,
 memory, ml_engineer, multi_tenant_edge, onboarding, onboarding_interactive, plugins,
 projections, provider, provider_registry, redact, reflection, scheduler, session, skills,
-spill, tool_activity, tool_runtime, tools, traits, utils, workspace
+tool_activity, tool_runtime, tools, traits, utils, workspace
 ```
 
 Every module is fully `pub`. No `pub(crate)` gating at the lib.rs level.

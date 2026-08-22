@@ -493,6 +493,9 @@ impl Tool for ExecutionRunBackgroundTool {
 
 pub struct ExecutionJobStatusTool {
     pub jobs: Arc<ExecutionJobManager>,
+    /// Audit X3: the other job plane. On a miss here we do a *real* lookup in
+    /// the host shell-exec registry instead of sniffing id prefixes.
+    pub exec_jobs: Option<crate::tools::exec_jobs::ExecJobRegistry>,
 }
 
 #[async_trait]
@@ -523,8 +526,18 @@ impl Tool for ExecutionJobStatusTool {
         let v = match self.jobs.job_status_json(job_id).await {
             Ok(v) => v,
             Err(e) => {
-                if job_id.starts_with("exec-") && !job_id.starts_with("exec-job-") {
-                    return Err(format!("Job ID '{job_id}' not found in ExecutionJobManager. It appears to be a host shell exec job — use `exec_status` instead."));
+                // Audit X3: real cross-plane lookup replaces prefix sniffing.
+                // Rendering the shell-exec plane here would duplicate
+                // `exec_status`; a precise redirect keyed on an actual hit is
+                // the honest router behavior.
+                if let Some(reg) = &self.exec_jobs {
+                    if reg.get_job(job_id).is_some() {
+                        return Err(format!(
+                            "Job ID '{job_id}' not found in ExecutionJobManager, but it IS a \
+                             live host shell exec job — call `exec_status` with \
+                             command_id=\"{job_id}\"."
+                        ));
+                    }
                 }
                 return Err(e);
             }
@@ -1249,7 +1262,10 @@ mod tests {
             .expect("bg");
         let jv: Value = serde_json::from_str(&started).expect("json");
         let jid = jv["job_id"].as_str().expect("job_id");
-        let status_tool = ExecutionJobStatusTool { jobs: jobs.clone() };
+        let status_tool = ExecutionJobStatusTool {
+            jobs: jobs.clone(),
+            exec_jobs: None,
+        };
         let mut terminal = false;
         for _ in 0..80 {
             let s = status_tool
@@ -1353,7 +1369,10 @@ mod tests {
             .expect("job_id missing in envelope");
         // Drain the spawned job so the test does not leave background work running.
         for _ in 0..200 {
-            let st = ExecutionJobStatusTool { jobs: jobs.clone() };
+            let st = ExecutionJobStatusTool {
+                jobs: jobs.clone(),
+                exec_jobs: None,
+            };
             let s = st.execute(json!({ "job_id": jid })).await.expect("st");
             if s.contains("\"terminal\": true") {
                 break;
@@ -1442,7 +1461,10 @@ mod tests {
         let jv: Value = serde_json::from_str(&started).expect("json");
         let jid = jv["job_id"].as_str().expect("job_id");
         for _ in 0..80 {
-            let st = ExecutionJobStatusTool { jobs: jobs.clone() };
+            let st = ExecutionJobStatusTool {
+                jobs: jobs.clone(),
+                exec_jobs: None,
+            };
             let s = st.execute(json!({ "job_id": jid })).await.expect("st");
             if s.contains("\"terminal\": true") {
                 assert!(s.contains("Unit test background label"));
@@ -1512,7 +1534,10 @@ mod tests {
             .execute(json!({ "job_id": jid }))
             .await
             .expect("cancel");
-        let status_tool = ExecutionJobStatusTool { jobs };
+        let status_tool = ExecutionJobStatusTool {
+            jobs,
+            exec_jobs: None,
+        };
         let mut saw = false;
         for _ in 0..120 {
             let s = status_tool

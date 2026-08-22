@@ -56,43 +56,28 @@ pub enum ExecutionMode {
 
 | Tool | Policy Mode | Description |
 | :--- | :--- | :--- |
-| `read_file`, `list_dir`, `search_text`, `glob_files`, `get_env` | **Parallel** | Read-only operations that can run concurrently without state conflicts. |
-| `write_file`, `edit_file`, `kernel_db_*`, `train_db_*` | **Serial** | Filesystem mutations executed sequentially. |
+| `read_file`, `glob_files`, `list_dir`, `search_text`, `web_search`, `web_fetch`, `search_memory`, `fetch_memory_by_date`, `search_tools`, `load_skill_instructions`, `arxiv_search`, `arxiv_fetch`, `hf_hub_file_fetch`, `execution_env_info`, `task_history_list` | **Parallel** | Read-only operations declared via each tool's typed `policy()` metadata (single source of truth — audit X1). |
+| All other built-in and MCP tools (`write_file`, `edit_file`, `exec`, …) | **Serial** (default) | Mutating or stateful tools executed in strict sequential order. |
 | `git_worktree` | **Barrier** | Modifies working branches and root directories; drains all active tools before and after execution. |
-| `exec_background` | **Background** | Out-of-band asynchronous jobs with polling and lifecycle signals. |
 
 ---
 
-## 3. Large Output Spill Storage (`SpillStore`)
+## 3. Tool Result Cache (`tool_result_cache`)
 
 ### Overview
 When tools produce massive outputs (large compiler traces, test suite dumps, dataset previews), dumping megabytes into the LLM conversation context causes context window saturation and reasoning degradation.
 
-`isanagent` automatically catches outputs exceeding character thresholds and routes them to session-scoped **Spill Storage**.
+When auto-compaction swaps an oversized tool result out of the active conversation, the untruncated content is preserved in the session database (`agent_memory.db`, `tool_result_cache` table) and the message is replaced by an archival placeholder pointing at the original `tool_call_id`.
 
-### Storage & Format
-- **Location**: `<workspace>/.system_generated/spill/{session_id}/{spill_id}.log`
-- **Preview Header**: The LLM receives a structured head/tail preview:
-  ```text
-  [Spill ID: spill_exec_4a2f8b] (Output exceeded limit: 124500 bytes, 1850 lines)
-  Full output saved to spill storage. Retrieve specific line ranges with `recall_tool_result` using spill_id 'spill_exec_4a2f8b'.
-
-  --- [Lines 1–60] ---
-  Compiling crate v0.13.0...
-  ... [1730 lines omitted] ...
-  --- [Lines 1791–1850] ---
-  Finished release target in 42.1s
-  ```
-
-### Slicing with `recall_tool_result`
-The agent can query specific slices on demand:
+### Recovery with `recall_tool_result`
+The agent can re-materialize the original content on demand:
 ```json
 {
-  "tool_call_id": "spill_exec_4a2f8b",
-  "start_line": 200,
-  "line_count": 50
+  "tool_call_id": "call_abc123"
 }
 ```
+
+Retention: the newest 500 cached results are kept per database (older rows pruned automatically).
 
 ---
 

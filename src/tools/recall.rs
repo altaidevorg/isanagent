@@ -2,10 +2,16 @@
 //!
 //! Re-materializes a previously cached tool result that was compacted out of
 //! the active conversation. Cache is populated by the agent on every tool-result
-//! add ([src/agent/mod.rs](../src/agent/mod.rs)) and queried via
+//! add ([src/agent/mod.rs](../src/agent/mod.rs)) and by the compaction swap step
+//! ([src/agent/compaction.rs](../src/agent/compaction.rs)), and queried via
 //! `MemoryMessage::FetchToolResult`. Each successful recall emits a
 //! `TelemetryEvent::ToolResultRefetch` so eval tooling can measure how often
 //! the swap-and-recall cycle pays off versus generating rework.
+//!
+//! Audit X2: this is the *single* large-output archiving mechanism. The former
+//! parallel `SpillStore` design (never wired into the tool-output path) was
+//! deleted; the SQLite `tool_result_cache` — retention-capped, actor-serialized,
+//! session-scoped — covers the same responsibility.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -22,7 +28,6 @@ use crate::NodeHandle;
 pub struct RecallToolResultTool {
     pub memory_node: NodeHandle<MemoryMessage>,
     pub outbound_tx: Sender<BusMessage>,
-    pub spill_store: Option<crate::spill::SpillStore>,
 }
 
 #[async_trait]
@@ -33,8 +38,8 @@ impl Tool for RecallToolResultTool {
 
     fn description(&self) -> &str {
         "Retrieve the full content of an earlier tool result that has been compacted out \
-         of the active conversation or saved to large output spill storage. Pass the tool_call_id \
-         or spill_id. Returns an error if no result is cached for that id. \
+         of the active conversation. Pass the tool_call_id copied verbatim from the \
+         archived placeholder. Returns an error if no result is cached for that id. \
          Use sparingly — every recall undoes part of the compaction's win."
     }
 
@@ -44,15 +49,7 @@ impl Tool for RecallToolResultTool {
             "properties": {
                 "tool_call_id": {
                     "type": "string",
-                    "description": "The LLM-supplied id of the tool call or spill ID (e.g. 'spill_...') whose result you want to retrieve."
-                },
-                "start_line": {
-                    "type": "integer",
-                    "description": "Optional start line for spill slices (1-indexed). Defaults to 1."
-                },
-                "line_count": {
-                    "type": "integer",
-                    "description": "Optional number of lines to retrieve for spill slices (max 500). Defaults to 100."
+                    "description": "The LLM-supplied id of the archived tool call, copied from the [Tool result archived. …] placeholder."
                 }
             },
             "required": ["tool_call_id"]
@@ -67,29 +64,9 @@ impl Tool for RecallToolResultTool {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 "Missing or empty 'tool_call_id' (string). Copy it verbatim from the \
-                 [Tool result archived. …] placeholder or [Spill ID: spill_...] header."
+                 [Tool result archived. …] placeholder."
                     .to_string()
             })?;
-
-        let start_line = args.get("start_line").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
-        let line_count = args
-            .get("line_count")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(100) as usize;
-
-        // 1. Check SpillStore if id starts with spill_
-        if tool_call_id.starts_with("spill_") {
-            let chat_id = current_tool_exec_ctx()
-                .map(|c| c.chat_id)
-                .unwrap_or_default();
-            let default_store = crate::spill::SpillStore::new(std::path::Path::new("."));
-            let store = self.spill_store.as_ref().unwrap_or(&default_store);
-            if let Ok(slice) =
-                store.read_spill_slice(&chat_id, &tool_call_id, start_line, line_count)
-            {
-                return Ok(slice);
-            }
-        }
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.memory_node

@@ -1516,6 +1516,9 @@ impl Tool for ShellExecTool {
 
 pub struct ExecStatusTool {
     pub exec_jobs: ExecJobRegistry,
+    /// Audit X3: the other job plane. On a miss here we do a *real* lookup in
+    /// the execution-harness registry instead of sniffing id prefixes.
+    pub execution_jobs: Option<std::sync::Arc<crate::execution::ExecutionJobManager>>,
 }
 
 #[async_trait]
@@ -1564,16 +1567,26 @@ impl Tool for ExecStatusTool {
             .unwrap_or(0)
             .clamp(0, 60);
 
-        let job = self
-            .exec_jobs
-            .get_job(command_id)
-            .ok_or_else(|| {
-                if command_id.starts_with("exec-job-") || command_id.starts_with("run-") {
-                    format!("Command ID '{command_id}' not found in host exec jobs. It appears to be an execution harness job — use `execution_job_status` instead.")
-                } else {
-                    format!("Command ID '{command_id}' not found")
+        let job = match self.exec_jobs.get_job(command_id) {
+            Some(job) => job,
+            None => {
+                // Audit X3: real cross-plane lookup replaces prefix sniffing.
+                // If the id lives in the execution-harness registry, serve its
+                // status JSON directly so the model gets an answer without a
+                // second round trip.
+                if let Some(ej) = &self.execution_jobs {
+                    if let Ok(v) = ej.job_status_json(command_id).await {
+                        let rendered = serde_json::to_string_pretty(&v)
+                            .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
+                        return Ok(format!(
+                            "Note: '{command_id}' is an execution-harness job id (for full \
+                             detail use `execution_job_status`).\n{rendered}"
+                        ));
+                    }
                 }
-            })?;
+                return Err(format!("Command ID '{command_id}' not found"));
+            }
+        };
 
         if wait_secs > 0 && !job.is_terminal() {
             let started = Instant::now();
@@ -3532,6 +3545,7 @@ mod exec_background_tests {
         };
         let status_tool = ExecStatusTool {
             exec_jobs: registry.clone(),
+            execution_jobs: None,
         };
 
         let cmd = if cfg!(windows) {

@@ -33,7 +33,6 @@ pub mod reflection;
 pub mod scheduler;
 pub mod session;
 pub mod skills;
-pub mod spill;
 pub mod tool_activity;
 pub mod tool_runtime;
 pub mod tools;
