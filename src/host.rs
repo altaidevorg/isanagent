@@ -334,9 +334,12 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     let db_path_str = db_path
         .to_str()
         .ok_or_else(|| std::io::Error::other("workspace DB path is not valid UTF-8"))?;
-    let memory_actor = crate::memory::SqliteMemoryActor::new(db_path_str).map_err(|e| {
+    let mut memory_actor = crate::memory::SqliteMemoryActor::new(db_path_str).map_err(|e| {
         std::io::Error::other(format!("Failed to initialize SqliteMemoryActor: {e}"))
     })?;
+    // Audit R1: wire the configured retention bound so subagent task history cannot
+    // grow unbounded in the always-on process.
+    memory_actor.set_task_history_retention(workspace.config.subagent_task_history_retention());
     let memory_node = NodeHandle::<crate::memory::MemoryMessage>::new(
         memory_actor,
         100,

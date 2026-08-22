@@ -742,9 +742,65 @@ pub enum MemoryMessage {
     },
 }
 
+/// Max rows kept in `tool_result_cache` (audit R1): bounds always-on memory growth while
+/// still letting `recall_tool_result` recover recently compacted content.
+const TOOL_RESULT_CACHE_MAX_ROWS: i64 = 500;
+
+/// Default terminal-task retention for `subagent_tasks` when the host does not wire
+/// `AppConfig::subagent_task_history_retention` (audit R1).
+const SUBAGENT_TASK_RETENTION_DEFAULT: usize = 200;
+
 /// Persistent SQLite-based memory Actor for agents.
 pub struct SqliteMemoryActor {
     conn: Connection,
+    /// Max *terminal* `subagent_tasks` rows retained per parent chat during pruning;
+    /// 'running' tasks are never pruned.
+    task_history_retention: usize,
+}
+
+impl SqliteMemoryActor {
+    /// Override the terminal subagent-task retention bound (rows per parent chat).
+    pub fn set_task_history_retention(&mut self, n: usize) {
+        self.task_history_retention = n.max(1);
+    }
+
+    /// Prune terminal `subagent_tasks` rows beyond the retention bound, keeping the
+    /// newest rows per parent chat. 'running' tasks are never touched. Best-effort:
+    /// failures are logged and swallowed so finalize results are unaffected.
+    fn prune_subagent_tasks(&self) {
+        let keep = self.task_history_retention as i64;
+        if let Err(e) = self.conn.execute(
+            "DELETE FROM subagent_tasks
+             WHERE status != 'running'
+               AND task_id NOT IN (
+                   SELECT task_id FROM (
+                       SELECT task_id, ROW_NUMBER() OVER (
+                           PARTITION BY parent_chat_id
+                           ORDER BY created_at_ms DESC, task_id DESC
+                       ) AS rn
+                       FROM subagent_tasks
+                       WHERE status != 'running'
+                   ) WHERE rn <= ?1
+               )",
+            params![keep],
+        ) {
+            log::debug!("subagent_tasks prune failed: {e}");
+        }
+    }
+
+    /// Keep only the newest [`TOOL_RESULT_CACHE_MAX_ROWS`] cached tool results
+    /// (audit R1: the cache previously grew without bound). Best-effort.
+    fn prune_tool_result_cache(&self) {
+        if let Err(e) = self.conn.execute(
+            "DELETE FROM tool_result_cache WHERE tool_call_id NOT IN (
+                 SELECT tool_call_id FROM tool_result_cache
+                 ORDER BY created_at_ms DESC LIMIT ?1
+             )",
+            params![TOOL_RESULT_CACHE_MAX_ROWS],
+        ) {
+            log::debug!("tool_result_cache prune failed: {e}");
+        }
+    }
 }
 
 impl SqliteMemoryActor {
@@ -886,7 +942,10 @@ impl SqliteMemoryActor {
         })()
         .map_err(|e| format!("SQLite init ({db_path}): {e}"))?;
 
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            task_history_retention: SUBAGENT_TASK_RETENTION_DEFAULT,
+        })
     }
 }
 
@@ -1222,6 +1281,8 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     )
                     .map_err(|e| e.to_string())
                     .map(|_| ());
+                // Audit R1: evict old entries so the spill cache cannot grow unbounded.
+                self.prune_tool_result_cache();
                 let _ = reply.send(res);
             }
             MemoryMessage::FetchToolResult {
@@ -1687,6 +1748,8 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     if n == 0 {
                         return Err("subagent_tasks update: no matching row".to_string());
                     }
+                    // Audit R1: bound task history once a task reaches a terminal state.
+                    self.prune_subagent_tasks();
                     Ok(())
                 })();
                 let _ = reply.send(res);
@@ -2361,11 +2424,12 @@ mod root_thread_id_tests {
     use super::{
         chat_id_from_root_thread_id, is_root_session_thread_id, BackgroundJobRecord,
         ClarificationTicketRecord, MemoryMessage, NotificationRecord, SharedReply,
-        SqliteMemoryActor,
+        SqliteMemoryActor, TOOL_RESULT_CACHE_MAX_ROWS,
     };
     use crate::session::SessionManager;
     use crate::traits::Memory;
     use crate::NodeHandle;
+    use rusqlite::params;
     use std::time::Duration;
 
     #[test]
@@ -2929,5 +2993,102 @@ mod root_thread_id_tests {
         .expect("send get-summaries");
         let summaries = rx.await.expect("reply").expect("summaries ok");
         assert!(summaries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn subagent_task_prune_keeps_newest_terminal_and_running() {
+        // Audit R1: task history must be bounded. Terminal rows beyond the retention
+        // bound are pruned (newest kept, per parent chat); 'running' tasks survive.
+        let mut actor = SqliteMemoryActor::new(":memory:").expect("memory actor");
+        actor.set_task_history_retention(2);
+        for i in 0..4i64 {
+            actor
+                .conn
+                .execute(
+                    "INSERT INTO subagent_tasks (task_id, parent_chat_id, child_chat_id, prompt,
+                        status, created_at_ms, updated_at_ms)
+                     VALUES (?1, 'p1', 'c1', 'x', 'completed', ?2, ?2)",
+                    params![format!("t{i}"), 1000 + i],
+                )
+                .unwrap();
+        }
+        actor
+            .conn
+            .execute(
+                "INSERT INTO subagent_tasks (task_id, parent_chat_id, child_chat_id, prompt,
+                    status, created_at_ms, updated_at_ms)
+                 VALUES ('live', 'p1', 'c2', 'x', 'running', 9999, 9999)",
+                [],
+            )
+            .unwrap();
+
+        actor.prune_subagent_tasks();
+
+        let n: i64 = actor
+            .conn
+            .query_row("SELECT COUNT(*) FROM subagent_tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 3, "2 newest terminal + the running task");
+        let live: i64 = actor
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM subagent_tasks WHERE status = 'running'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(live, 1);
+        let oldest: i64 = actor
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM subagent_tasks WHERE task_id = 't0'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(oldest, 0, "oldest terminal row must be evicted first");
+    }
+
+    #[tokio::test]
+    async fn tool_result_cache_prune_keeps_newest_rows() {
+        // Audit R1: tool_result_cache previously grew without bound.
+        let actor = SqliteMemoryActor::new(":memory:").expect("memory actor");
+        for i in 0..(TOOL_RESULT_CACHE_MAX_ROWS + 25) {
+            actor
+                .conn
+                .execute(
+                    "INSERT INTO tool_result_cache (tool_call_id, chat_id, session_key,
+                        tool_name, full_content, compact_summary, created_at_ms)
+                     VALUES (?1, 'chat', 'sess', 'exec', 'full', 'compact', ?2)",
+                    params![format!("call{i}"), i],
+                )
+                .unwrap();
+        }
+
+        actor.prune_tool_result_cache();
+
+        let n: i64 = actor
+            .conn
+            .query_row("SELECT COUNT(*) FROM tool_result_cache", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, TOOL_RESULT_CACHE_MAX_ROWS);
+        let newest_kept: i64 = actor
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM tool_result_cache WHERE tool_call_id = ?1",
+                params![format!("call{}", TOOL_RESULT_CACHE_MAX_ROWS + 24)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(newest_kept, 1, "newest row must be retained");
+        let oldest_gone: i64 = actor
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM tool_result_cache WHERE tool_call_id = 'call0'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(oldest_gone, 0, "oldest row must be evicted");
     }
 }
