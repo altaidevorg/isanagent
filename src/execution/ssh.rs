@@ -178,6 +178,9 @@ struct SshPythonRepl {
     cwd: String,
     read: ReadHalf<ChannelStream<client::Msg>>,
     write: WriteHalf<ChannelStream<client::Msg>>,
+    /// Remote OS pid of the REPL worker, captured via the first framed round-trip so
+    /// cancel/timeout can kill the process deterministically (see `kill_ssh_repl_worker`).
+    pid: Option<u32>,
 }
 
 struct SshConnected {
@@ -232,6 +235,10 @@ impl SshExecutionProvider {
         let mut caps = ProviderCapabilities::minimal("ssh");
         caps.languages = vec!["python".into(), "shell".into()];
         caps.supports_persistent_sessions = true;
+        // No separate interrupt operation is exposed for SSH; instead, cancellation and
+        // timeout deterministically kill the Python REPL worker remotely by pid
+        // (`kill_ssh_repl_worker`). Shell-mode runs rely on channel close signalling the
+        // remote `bash -s` process.
         caps.supports_interrupt = false;
         caps.supports_package_install = false;
         caps.supports_remote_shell = false;
@@ -531,6 +538,21 @@ async fn open_ssh_handle(
 
 const SSH_REPL_PROBE_MAX_EACH: usize = 8192;
 
+/// First REPL round-trip payload: makes the worker report its own OS pid inside the
+/// normal framed reply. We must NOT echo the pid outside the framing protocol (e.g. from
+/// the shell exec line) — stray bytes before the first 12-byte reply header would
+/// desynchronize the length-prefixed stream. Executed inside the worker, the print is
+/// captured as regular stdout of the reply frame.
+const SSH_REPL_PID_PROBE: &str = "import os;print(f'@@ISANAGENT_REPL_PID:{os.getpid()}@@')";
+
+fn parse_repl_pid(stdout: &str) -> Option<u32> {
+    stdout.lines().find_map(|l| {
+        let rest = l.trim().strip_prefix("@@ISANAGENT_REPL_PID:")?;
+        let num = rest.strip_suffix("@@")?;
+        num.parse::<u32>().ok()
+    })
+}
+
 async fn open_ssh_python_repl_once(
     conn: &mut SshConnected,
     cwd: &str,
@@ -547,13 +569,28 @@ async fn open_ssh_python_repl_once(
         .map_err(|e| ExecutionError::Provider(format!("ssh: exec: {e}")))?;
     let stream = ch.into_stream();
     let (mut read, mut write) = split(stream);
-    match repl_framing::repl_round_trip(&mut write, &mut read, "pass", None, None, SSH_REPL_PROBE_MAX_EACH).await
+    match repl_framing::repl_round_trip(
+        &mut write,
+        &mut read,
+        SSH_REPL_PID_PROBE,
+        None,
+        None,
+        SSH_REPL_PROBE_MAX_EACH,
+    )
+    .await
     {
-        Ok((_stdout, _stderr, 0)) => Ok(SshPythonRepl {
-            cwd: cwd.to_string(),
-            read,
-            write,
-        }),
+        Ok((stdout, _stderr, 0)) => {
+            let pid = parse_repl_pid(&stdout);
+            if pid.is_none() {
+                log::debug!("ssh: REPL worker did not report a pid (probe stdout={stdout:?})");
+            }
+            Ok(SshPythonRepl {
+                cwd: cwd.to_string(),
+                read,
+                write,
+                pid,
+            })
+        }
         Ok((stdout, stderr, code)) => Err(ExecutionError::Provider(format!(
             "ssh: Python REPL failed self-test on remote (exit {code}); stdout={stdout:?} stderr={stderr:?}. \
              Check [harness.execution.ssh].remote_python and disk permissions for the cwd."
@@ -650,6 +687,38 @@ async fn run_ssh_channel_oneway(
         String::from_utf8_lossy(&stderr),
         code.map(|c| c as i32),
     ))
+}
+
+/// Best-effort remote kill of the REPL worker process after cancel/timeout. Aborting the
+/// local task only drops the SSH channel; the worker may keep running server-side, so we
+/// kill it by pid: SIGINT first (lets well-behaved code flush), then SIGKILL if still
+/// alive. Never fails the caller — errors are logged and swallowed.
+async fn kill_ssh_repl_worker(handle: &mut client::Handle<SshClientHandler>, pid: u32) {
+    let line = format!(
+        "kill -INT {pid} 2>/dev/null; sleep 1; \
+         if kill -0 {pid} 2>/dev/null; then kill -KILL {pid} 2>/dev/null; fi; true"
+    );
+    let opened = tokio::time::timeout(Duration::from_secs(4), async {
+        match handle.channel_open_session().await {
+            Ok(mut channel) => {
+                if let Err(e) = channel.exec(true, line).await {
+                    log::debug!("ssh: repl kill exec failed for pid {pid}: {e}");
+                    return;
+                }
+                // Drain until the channel closes so sshd can reap the one-shot command.
+                while let Some(msg) = channel.wait().await {
+                    if matches!(msg, ChannelMsg::Close | ChannelMsg::Eof) {
+                        continue;
+                    }
+                }
+            }
+            Err(e) => log::debug!("ssh: repl kill channel open failed for pid {pid}: {e}"),
+        }
+    })
+    .await;
+    if opened.is_err() {
+        log::debug!("ssh: repl kill timed out for pid {pid}");
+    }
 }
 
 fn truncate_run_result(mut r: RunResult, max_total: usize) -> RunResult {
@@ -804,7 +873,14 @@ impl ExecutionProvider for SshExecutionProvider {
         if result.is_err() {
             let mut cg = session.connected.lock().await;
             if let Some(c) = cg.as_mut() {
-                c.python_repl.take();
+                // Deterministic remote cleanup (audit R2): aborting the local task only
+                // drops the channel; kill the worker by its recorded pid so it cannot
+                // keep running server-side. Best-effort — never masks the run's error.
+                if let Some(repl) = c.python_repl.take() {
+                    if let Some(pid) = repl.pid {
+                        kill_ssh_repl_worker(&mut c.handle, pid).await;
+                    }
+                }
             }
         }
 
@@ -939,5 +1015,25 @@ mod tests {
         assert!(s.contains("cd '/tmp/w'"));
         assert!(s.contains("python3"));
         assert!(s.contains("standard_b64decode"));
+    }
+
+    #[test]
+    fn parse_repl_pid_extracts_worker_pid() {
+        // Exact probe reply shape (print adds a trailing newline).
+        assert_eq!(
+            parse_repl_pid("@@ISANAGENT_REPL_PID:424242@@\n"),
+            Some(424242)
+        );
+        // Tolerates surrounding worker output and whitespace.
+        assert_eq!(
+            parse_repl_pid("noise\n  @@ISANAGENT_REPL_PID:7@@  \n"),
+            Some(7)
+        );
+        // Missing / malformed markers yield None rather than a bogus pid.
+        assert_eq!(parse_repl_pid(""), None);
+        assert_eq!(parse_repl_pid("pass\n"), None);
+        assert_eq!(parse_repl_pid("@@ISANAGENT_REPL_PID:abc@@\n"), None);
+        // Guard against partial-marker false positives.
+        assert_eq!(parse_repl_pid("@@ISANAGENT_REPL_PID:12@\n"), None);
     }
 }

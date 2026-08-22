@@ -590,11 +590,15 @@ impl Tool for ExecutionReadLogTool {
             "properties": {
                 "job_id": { "type": "string", "description": "The job ID to read logs from. Provide either this or run_id." },
                 "run_id": { "type": "string", "description": "The run ID to read logs from. Provide either this or job_id." },
-                "stream": { "type": "string", "enum": ["stdout", "stderr"], "description": "Which stream to read." },
+                "stream": { "type": "string", "enum": ["stdout", "stderr"], "description": "Which stream to read (defaults to \"stdout\")." },
                 "start_line": { "type": "integer", "description": "Starting line number (1-indexed, inclusive)" },
                 "end_line": { "type": "integer", "description": "Ending line number (1-indexed, inclusive)" }
             },
-            "required": ["stream", "start_line", "end_line"]
+            "required": ["start_line", "end_line"],
+            "anyOf": [
+                { "required": ["job_id"] },
+                { "required": ["run_id"] }
+            ]
         })
     }
 
@@ -612,11 +616,17 @@ impl Tool for ExecutionReadLogTool {
             .and_then(|v| v.as_u64())
             .ok_or("Missing 'end_line' argument")?;
 
+        let job_supplied = args.get("job_id").and_then(|v| v.as_str());
+        let run_supplied = args.get("run_id").and_then(|v| v.as_str());
+        if job_supplied.is_some() && run_supplied.is_some() {
+            return Err("Provide either job_id or run_id, not both".to_string());
+        }
+
         let run_id;
         let mut sid = None;
         let mut prov = None;
 
-        if let Some(jid) = args.get("job_id").and_then(|v| v.as_str()) {
+        if let Some(jid) = job_supplied {
             if let Some(job) = self.jobs.get(jid) {
                 run_id = job.run_id.clone();
                 sid = Some(job.session_id.to_string());
@@ -629,7 +639,7 @@ impl Tool for ExecutionReadLogTool {
             } else {
                 return Err(format!("Job not found: {jid}"));
             }
-        } else if let Some(run) = args.get("run_id").and_then(|v| v.as_str()) {
+        } else if let Some(run) = run_supplied {
             run_id = run.to_string();
         } else {
             return Err("Must provide either job_id or run_id".to_string());
@@ -1513,6 +1523,89 @@ mod tests {
         assert!(saw, "expected terminal non-success after cancel");
         let close = ExecutionSessionCloseTool { harness };
         close.execute(json!({ "session_id": sid })).await.unwrap();
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn execution_read_log_reads_persisted_journal_streams() {
+        // Regression (audit C1): run journals must persist stdout.txt/stderr.txt so
+        // `execution_read_log` can page through them. Previously nothing wrote those
+        // files and every read failed with "Log file not found".
+        let (ws, dir) = temp_dirs();
+        let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
+        let prov: Arc<dyn crate::execution::ExecutionProvider> =
+            Arc::new(crate::execution::LocalExecutionProvider::new(cfg).expect("local provider"));
+        let harness = Arc::new(ExecutionHarness::new(
+            prov,
+            "python",
+            ws.clone(),
+            dir.clone(),
+            ArtifactLimits::default(),
+            60,
+            3600,
+            0,
+        ));
+
+        let sid = SessionId::new("sess-readlog");
+        let stdout: String = (1..=250).map(|i| format!("out-{i:03}\n")).collect();
+        let result = RunResult::new(stdout, "err-001\nerr-002\nerr-003\n".to_string(), Some(0));
+        crate::execution::write_run_journal(crate::execution::RunJournalParams {
+            workspace_dir: &ws,
+            provider_id: "local",
+            session_id: &sid,
+            run_id: "run-readlog",
+            code: "demo",
+            result: &result,
+            jupyter_kernel_id: None,
+            jupyter_notebook_path: None,
+            started_rfc3339: "t0",
+            finished_rfc3339: "t1",
+            duration_ms: 1,
+        })
+        .await
+        .expect("journal write");
+
+        let (otx, _orx) = mpsc::channel::<BusMessage>(8);
+        let jobs = Arc::new(ExecutionJobManager::new(harness.clone(), otx, None, false));
+        let tool = ExecutionReadLogTool { jobs, harness };
+
+        // Windowed stderr read via the run_id-only lookup path (scans the journal tree).
+        let out = tool
+            .execute(json!({
+                "run_id": "run-readlog",
+                "stream": "stderr",
+                "start_line": 2,
+                "end_line": 3
+            }))
+            .await
+            .expect("read stderr window");
+        assert!(
+            out.contains("err-002") && out.contains("err-003") && !out.contains("err-001"),
+            "unexpected window: {out}"
+        );
+
+        // Requests spanning >100 lines are capped at 100 lines per call.
+        let capped = tool
+            .execute(json!({
+                "run_id": "run-readlog",
+                "stream": "stdout",
+                "start_line": 101,
+                "end_line": 250
+            }))
+            .await
+            .expect("read capped window");
+        assert!(capped.contains("out-101"), "missing first line: {capped}");
+        assert!(capped.contains("out-200"), "missing cap boundary: {capped}");
+        assert!(!capped.contains("out-201"), "cap not enforced: {capped}");
+
+        // Exactly one of job_id / run_id must be supplied.
+        let both = tool
+            .execute(json!({"job_id": "j", "run_id": "r", "start_line": 1, "end_line": 2}))
+            .await;
+        assert!(both.is_err(), "expected rejection when both ids provided");
+        let neither = tool.execute(json!({"start_line": 1, "end_line": 2})).await;
+        assert!(neither.is_err(), "expected rejection when no id provided");
+
         let _ = std::fs::remove_dir_all(&ws);
     }
 }

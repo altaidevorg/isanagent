@@ -1264,4 +1264,43 @@ mod tests {
         prov.close_session(&h.id).await.unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[tokio::test]
+    async fn uv_managed_injects_uv_project_environment_without_local_venv() {
+        // Positive-path counterpart to `uv_managed_honors_local_venv_priority`
+        // (audit C2): with no sibling .venv, the uv-managed env dir MUST be injected as
+        // UV_PROJECT_ENVIRONMENT so `uv run` resolves the env this provider provisioned
+        // (regression guard for the env-sanitizer dropping it again).
+        let dir = temp_sandbox();
+
+        let mut cfg = LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
+        cfg.python_runtime = LocalPythonRuntime::UvManaged;
+        let prov = LocalExecutionProvider::new(cfg).unwrap();
+
+        let h = prov
+            .create_session(SessionCreateRequest::default())
+            .await
+            .unwrap();
+
+        let code = if cfg!(windows) {
+            "echo %UV_PROJECT_ENVIRONMENT%"
+        } else {
+            "echo $UV_PROJECT_ENVIRONMENT"
+        };
+        let r = prov.run(&h.id, RunSpec::new(code, 120)).await.unwrap();
+
+        assert!(
+            r.stdout.contains(".system_generated"),
+            "UV_PROJECT_ENVIRONMENT missing without local .venv (stdout={:?})",
+            r.stdout
+        );
+        assert!(
+            r.stdout.contains("uv"),
+            "injected path is not under the managed uv env dir (stdout={:?})",
+            r.stdout
+        );
+
+        prov.close_session(&h.id).await.unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

@@ -512,9 +512,29 @@ impl ExecutionProvider for JupyterExecutionProvider {
         *session.run_cancel.lock().await = None;
 
         let out = match result {
-            Err(_) => Err(ExecutionError::Timeout { timeout_secs }),
+            Err(_) => {
+                // The cell may still be executing on the kernel after a local timeout; an
+                // interrupted-but-busy kernel can wedge subsequent runs. Best-effort SIGINT
+                // via the server REST API before reporting the timeout.
+                let _ = interrupt_kernel_rest(
+                    &self.client,
+                    &self.config.base_url,
+                    self.config.token.as_deref(),
+                    &session.kernel_id,
+                )
+                .await;
+                Err(ExecutionError::Timeout { timeout_secs })
+            }
             Ok(inner) => inner,
         };
+
+        // A failed run can leave the cached websocket dead or mid-frame (send/read error,
+        // Close frame, or the whole future dropped by the timeout). Reset the slot so
+        // ensure_ws() reconnects cleanly on the next run instead of reusing a wedged
+        // stream forever.
+        if out.is_err() {
+            *session.ws.lock().await = None;
+        }
 
         if let (Ok(_), Some(path)) = (&out, nb_path.as_ref()) {
             let token = auth_token.clone();

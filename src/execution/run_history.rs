@@ -83,7 +83,8 @@ pub struct RunJournalParams<'a> {
     pub duration_ms: u64,
 }
 
-/// Writes `run.json` and `source.txt`; returns journal directory.
+/// Writes `run.json`, `source.txt`, and full redacted `stdout.txt` / `stderr.txt` streams;
+/// returns journal directory.
 pub async fn write_run_journal(p: RunJournalParams<'_>) -> Result<PathBuf, String> {
     let dir = run_history_dir(p.workspace_dir, p.provider_id, p.session_id, p.run_id);
     tokio::fs::create_dir_all(&dir)
@@ -98,14 +99,21 @@ pub async fn write_run_journal(p: RunJournalParams<'_>) -> Result<PathBuf, Strin
         .await
         .map_err(|e| format!("run journal source write: {e}"))?;
 
-    let (stdout, stdout_truncated) = truncate_field(
-        redactor.redact(&p.result.stdout).into_owned(),
-        MAX_INLINE_TEXT,
-    );
-    let (stderr, stderr_truncated) = truncate_field(
-        redactor.redact(&p.result.stderr).into_owned(),
-        MAX_INLINE_TEXT,
-    );
+    let stdout_redacted = redactor.redact(&p.result.stdout).into_owned();
+    let stderr_redacted = redactor.redact(&p.result.stderr).into_owned();
+
+    // Full redacted streams as plain text next to run.json: `execution_read_log` pages
+    // through these by line range (run.json only keeps 64 KiB inline copies). Sizes are
+    // bounded upstream by the provider's max_output_bytes.
+    tokio::fs::write(dir.join("stdout.txt"), stdout_redacted.as_bytes())
+        .await
+        .map_err(|e| format!("run journal stdout write: {e}"))?;
+    tokio::fs::write(dir.join("stderr.txt"), stderr_redacted.as_bytes())
+        .await
+        .map_err(|e| format!("run journal stderr write: {e}"))?;
+
+    let (stdout, stdout_truncated) = truncate_field(stdout_redacted, MAX_INLINE_TEXT);
+    let (stderr, stderr_truncated) = truncate_field(stderr_redacted, MAX_INLINE_TEXT);
 
     let journal = RunJournal {
         schema_version: 1,
