@@ -29,8 +29,9 @@ pub struct SshExecutionConfig {
     pub remote_workdir: Option<String>,
     /// Remote Python interpreter for `language: python` (default `python3`).
     pub remote_python: Option<String>,
-    /// When true (default), `check_server_key` accepts any host key (**MITM risk**). When false,
-    /// host key verification fails until strict known-hosts support exists.
+    /// When true, `check_server_key` accepts any host key (**MITM risk**). Default is **false**
+    /// (fail closed): unknown host keys are stored TOFU-style under
+    /// `.system_generated/ssh/known_hosts`, and a *changed* key for a known host always refuses.
     pub accept_unknown_host_keys: Option<bool>,
 }
 

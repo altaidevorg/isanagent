@@ -105,10 +105,25 @@ impl Tool for TodoWriteTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
-        let chat_id = args
-            .get("chat_id")
-            .and_then(|v| v.as_str())
-            .ok_or("Missing 'chat_id'")?;
+        // Todos are persisted per conversation: when a runtime context is installed, the
+        // destination is the live session and a mismatched `chat_id` argument is rejected so a
+        // model can never clobber another chat's harness todo list.
+        let chat_id: String = match current_tool_exec_ctx() {
+            Some(ctx) => {
+                if let Some(supplied) = args.get("chat_id").and_then(|v| v.as_str()) {
+                    if supplied != ctx.chat_id {
+                        return Err("todo_write chat_id does not match the current tool session"
+                            .to_string());
+                    }
+                }
+                ctx.chat_id.clone()
+            }
+            None => args
+                .get("chat_id")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing 'chat_id'")?
+                .to_string(),
+        };
 
         let items_val = args
             .get("items")
@@ -141,11 +156,11 @@ impl Tool for TodoWriteTool {
             });
         }
 
-        let summary = format_todo_list(chat_id, &rows);
+        let summary = format_todo_list(&chat_id, &rows);
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.memory_node
             .send_packet(MemoryMessage::ReplaceHarnessTodos {
-                chat_id: chat_id.to_string(),
+                chat_id,
                 items: rows,
                 reply: SharedReply::new(tx),
             })

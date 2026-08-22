@@ -2108,6 +2108,35 @@ fn cron_job_is_in_scope(job: &crate::scheduler::ActiveJob, exec_ctx: &ToolExecCt
     job.chat_id == exec_ctx.chat_id && job.channel == exec_ctx.channel
 }
 
+/// Resolve the `message` destination from the trusted per-invocation runtime context when one
+/// exists. Supplied `channel` / `chat_id` arguments remain supported only for callers without
+/// a context (external integrations invoking the tool directly).
+///
+/// A model must never be able to redirect an outbound message into another conversation by
+/// fabricating a destination in tool arguments.
+fn message_target_from_args(args: &Value) -> Result<(String, String), String> {
+    let supplied_chat_id = args.get("chat_id").and_then(|v| v.as_str());
+    let supplied_channel = args.get("channel").and_then(|v| v.as_str());
+
+    if let Some(ctx) = crate::tool_runtime::current_tool_exec_ctx() {
+        if let Some(chat_id) = supplied_chat_id {
+            if chat_id != ctx.chat_id {
+                return Err("message chat_id does not match the current tool session".to_string());
+            }
+        }
+        if let Some(channel) = supplied_channel {
+            if channel != ctx.channel {
+                return Err("message channel does not match the current tool session".to_string());
+            }
+        }
+        return Ok((ctx.channel.clone(), ctx.chat_id.clone()));
+    }
+
+    let chat_id = supplied_chat_id.ok_or("Missing 'chat_id'")?;
+    let channel = supplied_channel.ok_or("Missing 'channel'")?;
+    Ok((channel.to_string(), chat_id.to_string()))
+}
+
 #[async_trait]
 impl Tool for CronTool {
     fn name(&self) -> &str {
@@ -2457,29 +2486,25 @@ impl Tool for MessageTool {
             .get("content")
             .and_then(|v| v.as_str())
             .ok_or("Missing 'content'")?;
-        let channel = args
-            .get("channel")
-            .and_then(|v| v.as_str())
-            .ok_or("Missing 'channel'")?;
-        let chat_id = args
-            .get("chat_id")
-            .and_then(|v| v.as_str())
-            .ok_or("Missing 'chat_id'")?;
+        // Destination is bound to the live session whenever runtime context exists; supplied
+        // channel/chat_id are only honored when they match (or when no context is installed).
+        let (channel, chat_id) = message_target_from_args(&args)?;
         let thread_id = args
             .get("thread_id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
+        let sent_target = format!("{channel}:{chat_id}");
         let msg = crate::bus::BusMessage::Outbound(crate::bus::OutboundMessage {
-            channel: channel.to_string(),
-            chat_id: chat_id.to_string(),
+            channel,
+            chat_id,
             thread_id,
             content: content.to_string(),
             metadata: std::collections::HashMap::new(),
         });
 
         match self.outbound_tx.send(msg).await {
-            Ok(_) => Ok(format!("Message sent to {channel}:{chat_id}")),
+            Ok(_) => Ok(format!("Message sent to {sent_target}")),
             Err(e) => Err(format!("Failed to send message: {e}")),
         }
     }

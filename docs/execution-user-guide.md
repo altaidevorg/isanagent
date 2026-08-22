@@ -82,7 +82,7 @@ When `default_provider = "ssh"`, add **`[harness.execution.ssh]`**:
 | `identity_file` | Path to an OpenSSH **private** key (optional if **`SSH_PASSWORD`** is set in the agent process environment). Tilde (`~`) expansion is applied. |
 | `remote_workdir` | **Absolute** path on the remote host (POSIX, e.g. `/home/you/isanagent-runs`). Only letters, digits, `/`, `_`, `-`, `.`; no `..`. **Required**. |
 | `remote_python` | Remote Python executable for `language: python` (default **`python3`**). |
-| `accept_unknown_host_keys` | Default **true**: accept any server host key (**vulnerable to MITM** on untrusted networks). Set **false** to fail closed until strict host-key verification exists. |
+| `accept_unknown_host_keys` | Default **false** (fail closed): unknown host keys are recorded TOFU-style under `workspace/.system_generated/ssh/known_hosts`; a *changed* key for a known host always refuses the connection. Set **true** only to accept never-seen keys on first connect (**MITM risk** on untrusted networks). |
 
 ## Workspace layout (important)
 

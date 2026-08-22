@@ -121,6 +121,11 @@ impl McpClient {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::inherit());
 
+        // MCP servers are agent-controlled child processes: start from the scrubbed safe
+        // environment (never the host's master credentials), then layer the server's declared
+        // env on top so per-server configuration still applies.
+        crate::environment::ExecutionEnvironmentPolicy::default_safe()
+            .apply_to_tokio_command(&mut cmd);
         for (k, v) in &entry.env {
             cmd.env(k, expand_vars(v));
         }

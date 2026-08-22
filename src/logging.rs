@@ -289,8 +289,13 @@ impl LoggingActor {
     }
 
     fn write_runtime_event(&mut self, event: &LogEvent) {
+        // Route through the shared redactor so credential-shaped strings (ghp_/hf_/AKIA/JWT/PEM…)
+        // never reach disk in plaintext; `sanitize_message` alone only covers 3 legacy patterns.
+        let redacted_line = crate::redact::shared()
+            .redact(&event.format_line())
+            .into_owned();
         let result = match self.runtime_writer.as_mut() {
-            Some(writer) => write_runtime_record(writer, &event.format_line()),
+            Some(writer) => write_runtime_record(writer, &redacted_line),
             None => return,
         };
         if let Err(error) = result {

@@ -181,7 +181,7 @@ kernel_name = "python3"
 # identity_file = "~/.ssh/id_ed25519"
 # remote_workdir = "/tmp/isanagent-exec"
 # remote_python = "python3"
-# accept_unknown_host_keys = true
+# accept_unknown_host_keys = false
 
 # MaxEvolve kernel porting (Triton→Pallas). See docs/kernel-porting-user-guide.md
 [harness.kernel_porting]

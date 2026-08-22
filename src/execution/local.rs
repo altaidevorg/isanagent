@@ -626,6 +626,7 @@ impl ExecutionProvider for LocalExecutionProvider {
                 }
             }
 
+            let mut uv_project_env_dir: Option<std::path::PathBuf> = None;
             if !has_local_venv {
                 if let Some(state) = &self.uv_state {
                     if let Some(path) = state.env_python_path.lock().await.as_ref() {
@@ -633,6 +634,7 @@ impl ExecutionProvider for LocalExecutionProvider {
                         // UV_PROJECT_ENVIRONMENT should point to <env_dir>
                         if let Some(env_dir) = path.parent().and_then(|p| p.parent()) {
                             cmd.env("UV_PROJECT_ENVIRONMENT", env_dir);
+                            uv_project_env_dir = Some(env_dir.to_path_buf());
                         }
                     }
                 }
@@ -640,6 +642,12 @@ impl ExecutionProvider for LocalExecutionProvider {
 
             crate::environment::ExecutionEnvironmentPolicy::default_safe()
                 .apply_to_tokio_command(&mut cmd);
+            // The sanitizer rebuilds the child env from an allowlist and would silently drop
+            // `UV_PROJECT_ENVIRONMENT`; re-apply it so `uv run` still resolves the managed env
+            // this provider provisioned.
+            if let Some(env_dir) = uv_project_env_dir {
+                cmd.env("UV_PROJECT_ENVIRONMENT", env_dir);
+            }
             cmd.current_dir(&cwd);
             cmd.stdin(if stdin_body.is_some() {
                 Stdio::piped()

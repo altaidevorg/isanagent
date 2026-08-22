@@ -134,7 +134,10 @@ async fn run_hook_command(
     capture_failure: bool,
 ) -> Result<Option<String>, String> {
     let (shell, arg) = shell_invocation();
-    let mut child = Command::new(shell)
+    // Hook commands come from workspace/plugin config (third-party code): run them in the
+    // scrubbed safe environment so host master credentials never leak into hook processes.
+    let mut hook_cmd = Command::new(shell);
+    hook_cmd
         .arg(arg)
         .arg(command)
         .current_dir(cwd)
@@ -145,9 +148,10 @@ async fn run_hook_command(
         } else {
             Stdio::null()
         })
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("spawn hook: {e}"))?;
+        .kill_on_drop(true);
+    crate::environment::ExecutionEnvironmentPolicy::default_safe()
+        .apply_to_tokio_command(&mut hook_cmd);
+    let mut child = hook_cmd.spawn().map_err(|e| format!("spawn hook: {e}"))?;
 
     let mut stdin = child
         .stdin
