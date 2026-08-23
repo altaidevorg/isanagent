@@ -270,6 +270,18 @@ pub(crate) async fn chat_with_retry(
                 let transient = e.is_transient();
                 let is_last = attempt + 1 >= MAX_ATTEMPTS;
                 if !transient || is_last {
+                    let _ = logger_tx.send(BusMessage::Log(
+                        LogEvent::warn(
+                            name,
+                            &format!(
+                                "Primary LLM call failed (attempt {}/{}): {}.",
+                                attempt + 1,
+                                MAX_ATTEMPTS,
+                                e,
+                            ),
+                        )
+                        .with_chat_id(chat_id),
+                    ));
                     last_err = Some(e);
                     break;
                 }

@@ -607,11 +607,7 @@ impl Tool for ExecutionReadLogTool {
                 "start_line": { "type": "integer", "description": "Starting line number (1-indexed, inclusive)" },
                 "end_line": { "type": "integer", "description": "Ending line number (1-indexed, inclusive)" }
             },
-            "required": ["start_line", "end_line"],
-            "anyOf": [
-                { "required": ["job_id"] },
-                { "required": ["run_id"] }
-            ]
+            "required": ["start_line", "end_line"]
         })
     }
 
@@ -1630,6 +1626,39 @@ mod tests {
         let neither = tool.execute(json!({"start_line": 1, "end_line": 2})).await;
         assert!(neither.is_err(), "expected rejection when no id provided");
 
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn execution_read_log_parameters_schema_is_standard_object() {
+        let (ws, dir) = temp_dirs();
+        let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
+        let prov: Arc<dyn crate::execution::ExecutionProvider> =
+            Arc::new(crate::execution::LocalExecutionProvider::new(cfg).expect("local provider"));
+        let harness = Arc::new(ExecutionHarness::new(
+            prov,
+            "python",
+            ws.clone(),
+            dir.clone(),
+            ArtifactLimits::default(),
+            60,
+            3600,
+            0,
+        ));
+        let (otx, _orx) = mpsc::channel::<BusMessage>(8);
+        let jobs = Arc::new(ExecutionJobManager::new(harness.clone(), otx, None, false));
+        let tool = ExecutionReadLogTool { jobs, harness };
+        let params = tool.parameters();
+        assert_eq!(params["type"], "object");
+        assert!(params.get("anyOf").is_none());
+        assert!(params.get("oneOf").is_none());
+        assert!(params.get("allOf").is_none());
+        let props = params["properties"].as_object().unwrap();
+        assert!(props.contains_key("job_id"));
+        assert!(props.contains_key("run_id"));
+        assert!(props.contains_key("stream"));
+        assert!(props.contains_key("start_line"));
+        assert!(props.contains_key("end_line"));
         let _ = std::fs::remove_dir_all(&ws);
     }
 }
