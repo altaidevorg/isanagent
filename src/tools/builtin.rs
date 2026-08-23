@@ -2146,7 +2146,19 @@ pub struct WebFetchTool {
     pub jina: Option<JinaWebBackend>,
     /// From `max_web_tool_output_chars` in config (see `AppConfig::effective_max_web_tool_output_chars`).
     pub max_output_chars: usize,
-    pub workspace_dir: std::path::PathBuf,
+    /// Audit X12: sandbox downloads root injected at registration
+    /// (`<sandbox>/downloads`); fetched pages land in its `web/` subfolder.
+    /// Never guessed from the outer workspace rim, so embedders whose sandbox
+    /// differs from the default layout stay inside agent visibility.
+    /// Retention/capping is permanently out of scope.
+    pub downloads_dir: std::path::PathBuf,
+}
+
+impl WebFetchTool {
+    /// Audit X12: fetch target under the injected sandbox downloads root.
+    fn download_target(&self, filename: &str) -> std::path::PathBuf {
+        self.downloads_dir.join("web").join(filename)
+    }
 }
 
 #[async_trait]
@@ -2190,13 +2202,10 @@ impl Tool for WebFetchTool {
         };
 
         let uuid = uuid::Uuid::new_v4().to_string();
-        let downloads_dir = self
-            .workspace_dir
-            .join("workspace")
-            .join("downloads")
-            .join("web");
-        let _ = tokio::fs::create_dir_all(&downloads_dir).await;
-        let file_path = downloads_dir.join(format!("{uuid}.txt"));
+        let file_path = self.download_target(&format!("{uuid}.txt"));
+        if let Some(parent) = file_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
         tokio::fs::write(&file_path, &full_content)
             .await
             .map_err(|e| e.to_string())?;
@@ -3814,5 +3823,30 @@ mod exec_background_tests {
 
         assert!(term_res.contains("terminated successfully"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod download_path_tests {
+    use super::*;
+
+    /// Audit X12: web_fetch targets `<injected sandbox downloads>/web`, never a
+    /// path guessed from an outer workspace rim.
+    #[test]
+    fn web_fetch_download_target_stays_under_injected_sandbox_downloads() {
+        let tmp = std::env::temp_dir().join(format!("isanagent_x12_web_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        let tool = WebFetchTool {
+            jina: None,
+            max_output_chars: 1000,
+            downloads_dir: tmp.join("downloads"),
+        };
+        let target = tool.download_target("abc.txt");
+        assert_eq!(target, tmp.join("downloads").join("web").join("abc.txt"));
+        assert!(
+            target.starts_with(&tmp),
+            "download escaped the sandbox: {target:?}"
+        );
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

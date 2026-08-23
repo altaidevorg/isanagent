@@ -554,7 +554,9 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     tools.register(Box::new(WebFetchTool {
         jina,
         max_output_chars: max_web_output_chars,
-        workspace_dir: workspace.dir.clone(),
+        // Audit X12: inject the resolved sandbox downloads dir instead of
+        // letting the tool guess it from the outer workspace rim.
+        downloads_dir: workspace.sandbox_dir.join("downloads"),
     }));
     // Audit X4: ML research tools are opt-in (`ml_domain_enabled`); general-purpose
     // hosts do not register arXiv/Hugging Face domain tools by default.
@@ -563,7 +565,9 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             max_output_chars: max_web_output_chars,
         }));
         tools.register(Box::new(ArxivFetchTool {
-            workspace_dir: workspace.dir.clone(),
+            // Audit X12: inject the resolved sandbox downloads dir instead of
+            // letting the tool guess it from the outer workspace rim.
+            downloads_dir: workspace.sandbox_dir.join("downloads"),
         }));
         tools.register(Box::new(HfHubFileFetchTool {
             max_output_chars: max_web_output_chars,

@@ -134,7 +134,19 @@ impl Tool for ArxivSearchTool {
 
 /// Fetch one arXiv abstract page (abs HTML) by id.
 pub struct ArxivFetchTool {
-    pub workspace_dir: std::path::PathBuf,
+    /// Audit X12: sandbox downloads root injected at registration
+    /// (`<sandbox>/downloads`); fetched papers land in its `arxiv/` subfolder.
+    /// Never guessed from the outer workspace rim, so embedders whose sandbox
+    /// differs from the default layout stay inside agent visibility.
+    /// Retention/capping is permanently out of scope.
+    pub downloads_dir: std::path::PathBuf,
+}
+
+impl ArxivFetchTool {
+    /// Audit X12: paper target under the injected sandbox downloads root.
+    fn download_target(&self, filename: &str) -> std::path::PathBuf {
+        self.downloads_dir.join("arxiv").join(filename)
+    }
 }
 
 #[async_trait]
@@ -220,13 +232,10 @@ impl Tool for ArxivFetchTool {
             html_markdown_content
         };
 
-        let downloads_dir = self
-            .workspace_dir
-            .join("workspace")
-            .join("downloads")
-            .join("arxiv");
-        let _ = tokio::fs::create_dir_all(&downloads_dir).await;
-        let file_path = downloads_dir.join(format!("{id}.md"));
+        let file_path = self.download_target(&format!("{id}.md"));
+        if let Some(parent) = file_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
         tokio::fs::write(&file_path, &full_content)
             .await
             .map_err(|e| e.to_string())?;
@@ -372,5 +381,32 @@ impl Tool for HfHubFileFetchTool {
             .map_err(|e| format!("hf_hub_file_fetch body: {e}"))?;
         crate::utils::truncate_utf8_safe(&mut body, self.max_output_chars, "\n... [TRUNCATED]");
         Ok(body)
+    }
+}
+
+#[cfg(test)]
+mod download_path_tests {
+    use super::*;
+
+    /// Audit X12: arxiv_fetch targets `<injected sandbox downloads>/arxiv`,
+    /// never a path guessed from an outer workspace rim.
+    #[test]
+    fn arxiv_fetch_download_target_stays_under_injected_sandbox_downloads() {
+        let tmp =
+            std::env::temp_dir().join(format!("isanagent_x12_arxiv_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let tool = ArxivFetchTool {
+            downloads_dir: tmp.join("downloads"),
+        };
+        let target = tool.download_target("2401.0001v2.md");
+        assert_eq!(
+            target,
+            tmp.join("downloads").join("arxiv").join("2401.0001v2.md")
+        );
+        assert!(
+            target.starts_with(&tmp),
+            "download escaped the sandbox: {target:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
