@@ -1,6 +1,6 @@
 # Code execution harness — user guide
 
-This guide is for **operators and users** of isanagent who want to run code safely inside the agent workspace. For the internal roadmap and trait design, see **`execution-implementation-plan.md`**.
+This guide is for **operators and users** of isanagent who want to run code safely inside the agent workspace. Internal trait contracts live in `crate::execution`, provider sources under `src/execution/`.
 
 ## What you get
 
@@ -14,6 +14,7 @@ When the execution harness is **not** turned off in config (it is **on by defaul
 | **`execution_job_status`** | Poll a background job: status, timestamps, error text. |
 | **`execution_job_result`** | When the job is finished, fetch **`RunResult`** JSON (truncated to the session **`max_tool_output_chars`** cap). |
 | **`execution_job_list`** | List in-memory background jobs (optional **`session_id`** filter). |
+| **`execution_read_log`** | Read raw **stdout/stderr** lines for a background **`job_id`** or **`run_id`** without fetching the entire output (**`start_line`**/`end_line`, 1-indexed inclusive, capped at 100 lines per call). Useful for inspecting massive logs from tools or background processes that are otherwise truncated in the result. |
 | **`execution_job_cancel`** | Best-effort interrupt by **`job_id`** (same capability rules as **`execution_cancel`**). |
 | **`execution_artifact_list`** | List files under `.execution_artifacts/<session_id>/` for that session (paths relative to sandbox). |
 | **`execution_cancel`** | Best-effort interrupt of the current run for a **`session_id`** (when the provider supports it). |
@@ -43,6 +44,7 @@ Optional keys (defaults are sensible if omitted):
 | `default_provider` | **`local`** (default), **`jupyter`** (remote kernel), or **`ssh`** (remote exec over SSH). |
 | `max_wall_secs` | Upper bound on each run’s **`timeout_secs`** (default **3600**, clamped **1–86400** seconds = up to 24h). Raise this when you need longer blocking or background runs. |
 | `default_execution_timeout_secs` | Default wall clock when the model omits **`timeout_secs`** on **`execution_run`** / **`execution_run_background`** (default **600**, clamped to **`max_wall_secs`**). |
+| `auto_promote_after_secs` | Short bound after which a synchronous **`execution_run`** auto-promotes to a background job and returns a **`job_id`** envelope (default **120** when unset, clamped to **5..=max_wall_secs**; set to **0** to disable auto-promotion so synchronous calls run up to their full `timeout_secs`). |
 | `max_output_bytes` | Max combined stdout+stderr per run (default 256 KiB). |
 | `max_sessions` | Max concurrent sessions (default 32). |
 | `allowed_providers` | e.g. `["local"]`, `["jupyter"]`, `["ssh"]`; if empty or omitted, any implemented provider is allowed. |
@@ -146,7 +148,7 @@ If you use **`[harness.subagents]`** with **`allowed_tools`**, include the execu
 
 ## Roadmap (where this doc stays in sync)
 
-- **Implemented:** Jupyter provider (`execution-implementation-plan.md` Phase 3); SSH MVP (`execution-implementation-plan.md` Phase 4); UV-managed local runtime; Phase 6 artifacts, **`execution_artifact_list`**, run manifest (`execution_runs.jsonl`), telemetry **`ExecutionRunFinished`**, background jobs (**`execution_run_background`**, **`execution_jobs.jsonl`**, **`ExecutionJobFinished`**), and **`doom_loop_enabled`**.  
+- **Implemented:** Jupyter provider; SSH MVP; UV-managed local runtime; Phase 6 artifacts, **`execution_artifact_list`**, run manifest (`execution_runs.jsonl`), telemetry **`ExecutionRunFinished`**, background jobs (**`execution_run_background`**, **`execution_jobs.jsonl`**, **`ExecutionJobFinished`**), and **`doom_loop_enabled`**.  
 - **Later:** OAuth-native Colab integration feasibility output and execution provisioners (deferred design doc).
 
 When we add providers or config keys, this guide and **`AGENTS.md`** should be updated in the same change so operators are not surprised.

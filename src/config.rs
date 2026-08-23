@@ -322,7 +322,7 @@ pub struct AcpHarnessConfig {
     pub allow_client_mcp: Option<bool>,
 }
 
-/// Optional harness features (see `docs/harness-implementation-plan.md`).
+/// Optional harness features.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct HarnessConfig {
     pub acp: Option<AcpHarnessConfig>,
@@ -334,7 +334,7 @@ pub struct HarnessConfig {
     pub agents: std::collections::HashMap<String, AgentDefinition>,
     /// Shell command policy (`exec`), including approval-vs-deny behavior.
     pub shell_policy: Option<ShellPolicyConfig>,
-    /// Local / future execution providers (`execution_*` tools). See `docs/execution-implementation-plan.md`.
+    /// Local / future execution providers (`execution_*` tools).
     pub execution: Option<ExecutionHarnessConfig>,
     /// ML engineer prompt overlay and related defaults.
     pub ml_engineer: Option<MlEngineerHarnessConfig>,

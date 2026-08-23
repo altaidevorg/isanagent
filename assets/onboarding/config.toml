@@ -94,7 +94,7 @@ long_term_threshold_summaries = 5
 max_recent_summaries = 5
 
 # Registers the `git_worktree` tool (list / add / remove). Paths stay inside the sandbox unless you
-# set allow_path_outside_sandbox = true. See docs/harness-implementation-plan.md Phase 4.
+# set allow_path_outside_sandbox = true.
 [harness.git_worktree]
 enabled = true
 

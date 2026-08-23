@@ -1,0 +1,16 @@
+# Sprint 5 remainder: D1-D7 (X9 committed as 5e87cd4)
+
+- [x] Committed: Sprints 1-3, X16, X1-X7, X10 (320c0e7), X12 (77cfd29), X14 (108d799), X15 (6f2f04c), R11 (4e03b75), X9 (5e87cd4 god-file split).
+- [x] D1 AGENTS.md stale claims — DONE (BusMessage 16 variants; sandbox=workspace_dir/workspace; plugin roots 9-container truth; phantom plan-doc refs removed from AGENTS.md, execution-user-guide.md, onboarding/config.toml:97 comment, src/config.rs comments)
+- [x] D2 regenerate docs/public-api-surface.md — DONE v0.13.0 truth (33 mods, 24 TelemetryEvent, 43 MemoryMessage, NodeHandle::new sig, METADATA_RUN_ID, tools 43 static / 46 ml_domain / +dynamic MCP)
+- [x] D3 execution docs drift — DONE (exec_background→execution_run_background; execution_read_log row; auto_promote_after_secs row; local_python_mode left as-is — audit claim disproven, it IS functional)
+- [ ] D4 scripts — REVERTING per user: assets/onboarding/skills is auto-install deployment material, NEVER a dev target. Restore update_skill_dependencies.py + test_unsloth_skill.py to original skills/unsloth paths; verify assets untouched; ask user delete-vs-keep (do NOT delete unilaterally)
+- [ ] D5 TLS unify on rustls — Cargo.toml edited (lettre tokio1-rustls-tls; native-tls dep deleted), compile UNVERIFIED → cargo check now
+- [ ] D6 misc verified gaps (empty assets/onboarding/agents/prompts claim; wizard omits Anthropic; hook matcher ignored for user_prompt; LoggingActor re-parses config.toml ignoring --config; placeholder [providers.*] beside chosen [provider]; ML_POLICY.md merge ignores ml_engineer gate)
+- [ ] D7 cosmetic (doom-loop log string mismatch in use-cases doc; SessionId(pub String); notebook GET<->PUT last-writer-wins; Windows pid<=1 guard; RunEventThrottle Mutex::unwrap poison path)
+- [ ] Verify sprint placement of X8 (dead config keys — minus disproven local_python_mode sub-claim, AUDIT_REPORT.md:97) and X11 (build decouple, :98)
+- [ ] Batch-end ritual: clippy --release --all-targets -D warnings EXIT=0; cargo fmt; full test suite (505 lib + 2 bin + 3 acp + 1 doc / 0 failed; 6 ignored); eyeball ALL four suite lines
+- [ ] Housekeeping: delete .d1_tmp scratch dir before commit; AUDIT_REPORT.md stays untracked
+- [ ] Deferred small: X3 router redirect unit test; OutputCapture streaming in execution/local.rs (~:613)
+- [ ] PARKED FUTURE: disk-backed tool-result archive; C4 blocking SQLite refactor + CronStore second connection.
+- Standing rules: WriteAllText+LF never WriteAllLines; edit needles byte-exact (grep first); clippy lints PER-TARGET; super::* glob unreliable for private use-bindings; doc-tests compile external -> true pub; powershell DIRECT -NoProfile; ASCII-only new code/comments; AUDIT_REPORT.md untracked; downloads dir never capped; plugins opt-in only; assets/onboarding/skills NEVER touched/targeted by dev tooling.

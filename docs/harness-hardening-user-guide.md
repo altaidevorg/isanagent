@@ -47,7 +47,7 @@ pub enum ExecutionMode {
     Serial,
     /// Mutates workspace or environment root; blocks until all pending tools finish (e.g. git_worktree).
     Barrier,
-    /// Long-running asynchronous process (e.g. exec_background).
+    /// Long-running asynchronous process (e.g. execution_run_background).
     Background,
 }
 ```

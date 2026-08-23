@@ -44,10 +44,11 @@ clap = { version = "4.5.60", features = ["derive"] }
 axum = "0.8.8"
 tokio-stream = "0.1.18"
 dashmap = "6.1.0"
-lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "tokio1", "tokio1-native-tls"] }
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "tokio1", "tokio1-rustls-tls"] }
 # 3.x alpha tracks imap-proto 0.16+ (2.4.1 pinned 0.10.2, which triggers a rustc future-incompat warning).
-imap = "3.0.0-alpha.15"
-native-tls = "0.2.11"
+# rustls-tls keeps the system root-cert store (loads native certs); ClientBuilder::connect() picks the
+# only compiled-in backend, so no call-site change is needed.
+imap = { version = "3.0.0-alpha.15", default-features = false, features = ["rustls-tls"] }
 moka = { version = "0.12.10", features = ["sync"] }
 hmac = "0.12.1"
 sha2 = "0.10.9"
