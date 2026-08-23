@@ -12,15 +12,15 @@ use tokio_util::sync::CancellationToken;
 
 use super::{ActiveProviderConfig, ReasoningLoopCtx, RunProviderContext};
 use crate::bus::{BusMessage, InboundMessage, OutboundMessage, TelemetryEvent};
-use crate::channels::terminal_ui::protocol::{
-    ISANAGENT_SUBAGENT_TASK_FINISHED, ISANAGENT_SUBAGENT_TASK_STARTED,
-    METADATA_SUBAGENT_AGENT_NAME, METADATA_SUBAGENT_CHILD_CHAT_ID, METADATA_SUBAGENT_DISPLAY_NAME,
-    METADATA_SUBAGENT_STATUS, METADATA_SUBAGENT_TASK_ID,
-};
 use crate::clarification::ClarificationHub;
 use crate::config::{AgentMode, ResolvedShellPolicy};
 use crate::logging::LoggerHandle;
 use crate::memory::{MemoryMessage, SharedReply};
+use crate::protocol::{
+    ISANAGENT_SUBAGENT_TASK_FINISHED, ISANAGENT_SUBAGENT_TASK_STARTED,
+    METADATA_SUBAGENT_AGENT_NAME, METADATA_SUBAGENT_CHILD_CHAT_ID, METADATA_SUBAGENT_DISPLAY_NAME,
+    METADATA_SUBAGENT_STATUS, METADATA_SUBAGENT_TASK_ID,
+};
 use crate::session::SessionManager;
 use crate::skills::SharedSkillRegistry;
 use crate::tool_activity::SharedToolExecutionActivity;

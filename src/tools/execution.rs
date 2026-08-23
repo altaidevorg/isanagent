@@ -10,13 +10,13 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::bus::BusMessage;
-use crate::channels::terminal::build_execution_stream_notice;
 use crate::execution::{
     persist_successful_execution_run, run_with_auto_promote, sanitize_session_segment,
     AdoptInflightRequest, AutoPromoteOutcome, CwdPolicy, ExecutionError, ExecutionHarness,
     ExecutionJobManager, InflightSyncRegistry, PersistSuccessfulExecutionRunParams, RunEvent,
     RunResult, RunSpec, SessionCreateRequest, SessionId, SpawnBackgroundRunRequest,
 };
+use crate::protocol::build_execution_stream_notice;
 use crate::tool_runtime::current_tool_exec_ctx;
 use crate::traits::{Tool, ToolPolicy};
 

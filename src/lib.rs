@@ -26,6 +26,7 @@ pub mod onboarding;
 pub mod onboarding_interactive;
 pub mod plugins;
 pub mod projections;
+pub mod protocol;
 pub mod provider;
 pub mod provider_registry;
 pub mod redact;

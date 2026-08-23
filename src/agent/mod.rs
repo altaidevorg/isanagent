@@ -1518,21 +1518,21 @@ fn send_background_job_notification(
     let mut meta = HashMap::new();
     if is_start {
         meta.insert(
-            crate::channels::terminal_ui::protocol::ISANAGENT_BACKGROUND_JOB_STARTED.to_string(),
+            crate::protocol::ISANAGENT_BACKGROUND_JOB_STARTED.to_string(),
             serde_json::json!(true),
         );
         meta.insert(
-            crate::channels::terminal_ui::protocol::METADATA_BACKGROUND_JOB_TOOL_NAME.to_string(),
+            crate::protocol::METADATA_BACKGROUND_JOB_TOOL_NAME.to_string(),
             serde_json::json!("background_reasoning"),
         );
     } else {
         meta.insert(
-            crate::channels::terminal_ui::protocol::ISANAGENT_BACKGROUND_JOB_FINISHED.to_string(),
+            crate::protocol::ISANAGENT_BACKGROUND_JOB_FINISHED.to_string(),
             serde_json::json!(true),
         );
         if let Some(s) = status {
             meta.insert(
-                crate::channels::terminal_ui::protocol::METADATA_BACKGROUND_JOB_STATUS.to_string(),
+                crate::protocol::METADATA_BACKGROUND_JOB_STATUS.to_string(),
                 serde_json::json!(s),
             );
         }
@@ -1816,7 +1816,7 @@ fn spawn_main_chat_reasoning_turn(
                     )
                     .with_chat_id(&task_chat_id),
                 ));
-                let notice = crate::channels::terminal::build_channel_error_notice(
+                let notice = crate::protocol::build_channel_error_notice(
                     &inbound_channel,
                     &task_chat_id,
                     inbound_thread_id.as_deref(),
@@ -1867,7 +1867,7 @@ fn spawn_main_chat_reasoning_turn(
                     .await;
                 }
 
-                let notice = crate::channels::terminal::build_channel_error_notice(
+                let notice = crate::protocol::build_channel_error_notice(
                     &inbound_channel,
                     &task_chat_id,
                     inbound_thread_id.as_deref(),
@@ -2532,7 +2532,7 @@ impl ActorLogic<BusMessage> for AgentLogic {
                             )
                             .with_chat_id(&inbound.chat_id),
                         ));
-                        let notice = crate::channels::terminal::build_channel_error_notice(
+                        let notice = crate::protocol::build_channel_error_notice(
                             &inbound.channel,
                             &inbound.chat_id,
                             inbound.thread_id.as_deref(),
@@ -2834,7 +2834,7 @@ impl AgentLogic {
                         )
                         .with_chat_id(chat_id),
                     ));
-                    let notice = crate::channels::terminal::build_channel_error_notice(
+                    let notice = crate::protocol::build_channel_error_notice(
                         &inbound.channel,
                         chat_id,
                         inbound.thread_id.as_deref(),
@@ -2923,7 +2923,7 @@ impl AgentLogic {
                                 )
                                 .with_chat_id(chat_id),
                             ));
-                            let notice = crate::channels::terminal::build_channel_error_notice(
+                            let notice = crate::protocol::build_channel_error_notice(
                                 &inbound.channel,
                                 chat_id,
                                 inbound.thread_id.as_deref(),
@@ -3372,12 +3372,12 @@ fn build_llm_failed_banner(
     let mut metadata: HashMap<String, serde_json::Value> = HashMap::new();
     if channel == "terminal" {
         metadata.insert(
-            crate::channels::terminal_ui::protocol::ISANAGENT_TERMINAL_ERROR.to_string(),
+            crate::protocol::ISANAGENT_TERMINAL_ERROR.to_string(),
             serde_json::json!(true),
         );
         if retryable {
             metadata.insert(
-                crate::channels::terminal_ui::protocol::ISANAGENT_LLM_RETRY_AVAILABLE.to_string(),
+                crate::protocol::ISANAGENT_LLM_RETRY_AVAILABLE.to_string(),
                 serde_json::json!(true),
             );
         }
@@ -4951,10 +4951,10 @@ mod tests {
         assert!(banner.content.contains("retried from the client"));
         assert!(!banner
             .metadata
-            .contains_key(crate::channels::terminal_ui::protocol::ISANAGENT_LLM_RETRY_AVAILABLE));
+            .contains_key(crate::protocol::ISANAGENT_LLM_RETRY_AVAILABLE));
         assert!(!banner
             .metadata
-            .contains_key(crate::channels::terminal_ui::protocol::ISANAGENT_TERMINAL_ERROR));
+            .contains_key(crate::protocol::ISANAGENT_TERMINAL_ERROR));
     }
 
     #[test]
@@ -4966,13 +4966,13 @@ mod tests {
         assert_eq!(
             banner
                 .metadata
-                .get(crate::channels::terminal_ui::protocol::ISANAGENT_LLM_RETRY_AVAILABLE),
+                .get(crate::protocol::ISANAGENT_LLM_RETRY_AVAILABLE),
             Some(&serde_json::json!(true))
         );
         assert_eq!(
             banner
                 .metadata
-                .get(crate::channels::terminal_ui::protocol::ISANAGENT_TERMINAL_ERROR),
+                .get(crate::protocol::ISANAGENT_TERMINAL_ERROR),
             Some(&serde_json::json!(true))
         );
     }
@@ -4984,11 +4984,11 @@ mod tests {
         assert!(!banner.content.contains("/retry"));
         assert!(!banner
             .metadata
-            .contains_key(crate::channels::terminal_ui::protocol::ISANAGENT_LLM_RETRY_AVAILABLE));
+            .contains_key(crate::protocol::ISANAGENT_LLM_RETRY_AVAILABLE));
         assert_eq!(
             banner
                 .metadata
-                .get(crate::channels::terminal_ui::protocol::ISANAGENT_TERMINAL_ERROR),
+                .get(crate::protocol::ISANAGENT_TERMINAL_ERROR),
             Some(&serde_json::json!(true))
         );
     }

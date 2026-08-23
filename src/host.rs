@@ -15,8 +15,6 @@ use crate::agent::{AgentLogic, AgentLogicParams};
 use crate::bus::{BusMessage, InboundMessage, LoggerControlMessage, TelemetryEvent};
 use crate::channels::oneshot::OneshotChannel;
 use crate::channels::terminal::{
-    build_agent_thought_terminal_notice, build_tool_call_terminal_notice,
-    build_tool_progress_terminal_notice, build_tool_result_terminal_notice,
     terminal_startup_suppresses_plain_banner, TerminalChannelConfig, TerminalMode,
 };
 use crate::channels::{
@@ -28,6 +26,10 @@ use crate::execution::{ExecutionJobManager, InflightSyncRegistry};
 use crate::logging::{
     create_logger_channel, create_logging_actor_or_fallback, init_runtime_logger,
     LOGGER_QUEUE_CAPACITY,
+};
+use crate::protocol::{
+    build_agent_thought_terminal_notice, build_tool_call_terminal_notice,
+    build_tool_progress_terminal_notice, build_tool_result_terminal_notice,
 };
 use crate::scheduler::{
     validate_multi_tenant_edge_runtime, CronActor, CronSchedulingMode, MultiTenantEdgeCronScheduler,
@@ -1355,9 +1357,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                     tool_call_id,
                     background_job_id,
                 }) if channel == "terminal" => {
-                    if crate::channels::terminal::should_suppress_tool_notice_for_terminal(
-                        tool_name, args,
-                    ) {
+                    if crate::protocol::should_suppress_tool_notice_for_terminal(tool_name, args) {
                         // MessageTool already emits its own user-visible Outbound to the
                         // terminal; a synthetic tool-call notice would duplicate that line.
                     } else {
@@ -1384,9 +1384,8 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                     tool_call_id,
                     background_job_id,
                 }) if channel == "terminal" => {
-                    if crate::channels::terminal::should_suppress_tool_notice_for_terminal(
-                        tool_name, result,
-                    ) {
+                    if crate::protocol::should_suppress_tool_notice_for_terminal(tool_name, result)
+                    {
                         // See ToolCall arm: avoid duplicating the user-visible MessageTool
                         // outbound with a redundant ack notice.
                     } else {

@@ -27,7 +27,14 @@ use crate::channels::terminal_ui::panes::{
     executions_output_paragraph, extract_selection_text, tool_history_paragraph,
     transcript_paragraph,
 };
-use crate::channels::terminal_ui::protocol::{
+use crate::channels::terminal_ui::text_format::truncate_chars_display;
+use crate::channels::terminal_ui::{
+    execution_browser, uses_ansi_color, AgentTaskStatus, App, Cell, JobStripStatus, ModelSelector,
+    TerminalUiFocus, Theme, ToastKind, ToolNoticePhase, ToolRailEntry, TranscriptSelection,
+};
+use crate::clarification::{METADATA_CLARIFICATION, METADATA_CLARIFICATION_CHOICES};
+use crate::memory::{chat_id_from_root_thread_id, MemoryMessage, SharedReply};
+use crate::protocol::{
     ISANAGENT_AGENT_THOUGHT, ISANAGENT_BACKGROUND_JOB_FINISHED, ISANAGENT_BACKGROUND_JOB_STARTED,
     ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_JOB_STARTED, ISANAGENT_EXECUTION_STREAM,
     ISANAGENT_LLM_RETRY_AVAILABLE, ISANAGENT_SUBAGENT_TASK_FINISHED,
@@ -40,13 +47,6 @@ use crate::channels::terminal_ui::protocol::{
     METADATA_TOOL_CALL_ID, METADATA_TOOL_CALL_PREVIEW, METADATA_TOOL_NAME,
     METADATA_TOOL_RESULT_CHAR_COUNT, METADATA_TOOL_RESULT_PREVIEW,
 };
-use crate::channels::terminal_ui::text_format::truncate_chars_display;
-use crate::channels::terminal_ui::{
-    execution_browser, uses_ansi_color, AgentTaskStatus, App, Cell, JobStripStatus, ModelSelector,
-    TerminalUiFocus, Theme, ToastKind, ToolNoticePhase, ToolRailEntry, TranscriptSelection,
-};
-use crate::clarification::{METADATA_CLARIFICATION, METADATA_CLARIFICATION_CHOICES};
-use crate::memory::{chat_id_from_root_thread_id, MemoryMessage, SharedReply};
 use crate::NodeHandle;
 
 /// Second component of `execution_stream_label`: prefer model-provided description, else short id.
