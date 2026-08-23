@@ -255,9 +255,15 @@ async fn run_host(
         std::io::Error::other(format!("failed to initialize runtime logger: {e:?}"))
     })?;
 
+    // Honor `--config` for diagnostic logging as well (audit D6): without this the logger
+    // re-parses <workspace>/config.toml and silently ignores a custom config path.
+    let logging_config_override = config_arg
+        .as_deref()
+        .map(|s| std::path::PathBuf::from(shellexpand::tilde(s).to_string()));
     let logger_factory = {
         let wd = workspace_dir.clone();
-        move || create_logging_actor_or_fallback(wd.clone())
+        let cfg_override = logging_config_override.clone();
+        move || create_logging_actor_or_fallback(wd.clone(), cfg_override.clone())
     };
     let logger_sup = Supervisor::new(SupervisorPolicy::Restart, logger_factory);
     let logger_node = NodeHandle::<BusMessage>::new(logger_sup, 1000, 1, Duration::from_millis(10));

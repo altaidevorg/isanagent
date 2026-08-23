@@ -92,6 +92,7 @@ pub struct InteractiveOnboardOutcome {
 enum ProviderChoice {
     Gemini,
     OpenAI,
+    Anthropic,
     DeepSeek,
     OpenRouter,
     Custom,
@@ -102,19 +103,21 @@ impl ProviderChoice {
         match self {
             ProviderChoice::Gemini => "Gemini",
             ProviderChoice::OpenAI => "OpenAI",
+            ProviderChoice::Anthropic => "Anthropic",
             ProviderChoice::DeepSeek => "DeepSeek",
             ProviderChoice::OpenRouter => "OpenRouter",
             ProviderChoice::Custom => "Custom AI Compatible",
         }
     }
 
-    /// Canonical name written into `[provider].provider_name`. The four built-in entries match
+    /// Canonical name written into `[provider].provider_name`. The five built-in entries match
     /// keys in [`crate::provider_registry::KNOWN_PROVIDERS`]; `Custom` maps to the
     /// [`crate::provider_registry::OPENAI_COMPATIBLE`] sentinel.
     fn provider_name(self) -> &'static str {
         match self {
             ProviderChoice::Gemini => "gemini",
             ProviderChoice::OpenAI => "openai",
+            ProviderChoice::Anthropic => "anthropic",
             ProviderChoice::DeepSeek => "deepseek",
             ProviderChoice::OpenRouter => "openrouter",
             ProviderChoice::Custom => provider_registry::OPENAI_COMPATIBLE,
@@ -129,9 +132,10 @@ impl ProviderChoice {
     }
 }
 
-const PROVIDERS: [ProviderChoice; 5] = [
+const PROVIDERS: [ProviderChoice; 6] = [
     ProviderChoice::Gemini,
     ProviderChoice::OpenAI,
+    ProviderChoice::Anthropic,
     ProviderChoice::DeepSeek,
     ProviderChoice::OpenRouter,
     ProviderChoice::Custom,
@@ -153,6 +157,9 @@ struct ModelId {
 fn models_endpoint_url(chat_completions_url: &str) -> String {
     let u = chat_completions_url.trim();
     if let Some(prefix) = u.strip_suffix("/chat/completions") {
+        format!("{}/models", prefix.trim_end_matches('/'))
+    } else if let Some(prefix) = u.strip_suffix("/messages") {
+        // Anthropic-style API: /v1/messages lists models at /v1/models.
         format!("{}/models", prefix.trim_end_matches('/'))
     } else {
         format!("{}/models", u.trim_end_matches('/'))
@@ -177,9 +184,17 @@ async fn fetch_model_ids(
     api_key: &str,
 ) -> Result<Vec<String>, String> {
     let url = models_endpoint_url(chat_url);
-    let res = client
+    // Anthropic authenticates with `x-api-key` + `anthropic-version` rather than Bearer-only.
+    let is_anthropic = chat_url.contains("api.anthropic.com");
+    let mut request = client
         .get(&url)
-        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Authorization", format!("Bearer {api_key}"));
+    if is_anthropic {
+        request = request
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01");
+    }
+    let res = request
         .timeout(Duration::from_secs(60))
         .send()
         .await

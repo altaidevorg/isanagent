@@ -147,10 +147,14 @@ impl IsanagentWorkspace {
         if let Some(memory) = self.read_md_file("MEMORY.md") {
             prompt_parts.push(format!("--- LONG TERM MEMORY ---\n{memory}\n"));
         }
-        if let Some(ml) = self.read_md_file("ML_POLICY.md") {
-            prompt_parts.push(format!(
-                "--- ML / TRAINING POLICY (ML_POLICY.md) ---\n{ml}\n"
-            ));
+        // ML_POLICY.md belongs to the `[harness.ml_engineer]` feature: only merge it when that
+        // gate is enabled, matching the embedded HARNESS_OVERLAY injection in host.rs.
+        if self.config.ml_engineer_harness_enabled() {
+            if let Some(ml) = self.read_md_file("ML_POLICY.md") {
+                prompt_parts.push(format!(
+                    "--- ML / TRAINING POLICY (ML_POLICY.md) ---\n{ml}\n"
+                ));
+            }
         }
 
         if prompt_parts.is_empty() {

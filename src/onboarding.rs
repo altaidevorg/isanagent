@@ -81,8 +81,8 @@ pub struct OnboardOptions {
     pub terminal_enable: Option<bool>,
 
     /// One of the well-known names from `provider_registry::KNOWN_PROVIDERS` (e.g. `gemini`,
-    /// `openai`, `deepseek`, `openrouter`) or `openai_compatible` for any third-party endpoint
-    /// (which then requires `--provider-base-url`).
+    /// `openai`, `anthropic`, `deepseek`, `openrouter`) or `openai_compatible` for any third-party
+    /// endpoint (which then requires `--provider-base-url`).
     #[arg(long, help_heading = "Provider")]
     pub provider_name: Option<String>,
     #[arg(long, help_heading = "Provider")]
@@ -198,6 +198,23 @@ pub fn build_merged_config_toml(options: &OnboardOptions) -> Result<String, Stri
 
     if let Some(v) = options.terminal_enable {
         doc["terminal"]["enabled"] = value(v);
+    }
+
+    // Explicit provider overrides make the template's `[providers.*]` starter families redundant
+    // and misleading: the chosen `[provider]` block wins at startup, but leftover families with
+    // `<changethis>` keys still participate in fallback resolution whenever their env vars
+    // happen to exist. Strip the active families; the commented examples stay as documentation.
+    if options.provider_name.is_some()
+        || options.provider_model.is_some()
+        || options.provider_api_key_env.is_some()
+        || options.provider_base_url.is_some()
+    {
+        if let Some(families) = doc.get_mut("providers").and_then(|i| i.as_table_mut()) {
+            let family_keys: Vec<String> = families.iter().map(|(k, _)| k.to_string()).collect();
+            for key in &family_keys {
+                families.remove(key);
+            }
+        }
     }
 
     if (options.provider_name.is_some()
@@ -484,7 +501,8 @@ This file is created by **`isanagent onboard`**. It mirrors the policy text that
 appends to the system prompt when **`[harness.ml_engineer] enabled = true`** in `config.toml`. \
 Editing this file does **not** change runtime behavior (the live text is embedded in the \
 `isanagent` build). For workspace-specific ML rules, add or edit **`ML_POLICY.md`** in this \
-directory (merged by `compile_system_prompt`).\n\n---\n\n{HARNESS_OVERLAY}"
+directory (merged into the system prompt by `compile_system_prompt` when \
+**`[harness.ml_engineer] enabled = true`**).\n\n---\n\n{HARNESS_OVERLAY}"
     )
 }
 

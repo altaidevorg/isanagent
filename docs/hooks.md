@@ -50,7 +50,7 @@ queue_capacity = 512
 When `enabled = true`, the agent runs external **shell commands** at fixed lifecycle points. Commands receive **JSON on stdin** (UTF-8). On success (exit code 0), **stdout** may contain a small JSON object to influence behavior.
 
 - **`default_timeout_ms`**, **`max_stdout_bytes`**: bounds per hook (defaults 30_000 ms, 64 KiB stdout). Per-hook and default `timeout_ms` values are **clamped to at least 1000 ms** (and the subprocess wait uses the same floor) so hooks stay usable under load.
-- **`matcher`**: optional regex against **tool name** for `pre_tool` / `post_tool`; omitted or empty matches all tools.
+- **`matcher`**: optional regex against **tool name** for `pre_tool` / `post_tool`, and against the **prompt content** for `user_prompt`; omitted or empty matches everything.
 - **`cwd`**: optional path relative to **sandbox** (`workspace/.agents`); default is sandbox root. Paths are joined lexically under the sandbox (no escape via `..`).
 
 ### Events

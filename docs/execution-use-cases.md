@@ -56,4 +56,4 @@ After any successful **`execution_run`**, check **`workspace_dir/.system_generat
 
 ## 7. Doom loop correction (agent behavior)
 
-With **`doom_loop_enabled = true`** (default) at the top level of **`config.toml`**, if the model issues the same tool with identical arguments three times in a row, the agent injects a corrective **user** message into history before the next LLM call. Verify in logs: “Doom loop detected”.
+With **`doom_loop_enabled = true`** (default) at the top level of **`config.toml`**, if the model issues the same tool with identical arguments three times in a row, the agent injects a corrective **user** message into history before the next LLM call. Verify in history for the corrective message: `[SYSTEM: DOOM LOOP DETECTED]`.

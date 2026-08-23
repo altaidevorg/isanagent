@@ -3,9 +3,12 @@
 use serde::{Deserialize, Serialize};
 
 /// Opaque session id (assigned by provider or execution actor).
+///
+/// The inner string is deliberately private: construct via [`SessionId::new`] and read via
+/// [`SessionId::as_str`], `Display`, or the transparent serde impl.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct SessionId(pub String);
+pub struct SessionId(String);
 
 impl SessionId {
     pub fn new(s: impl Into<String>) -> Self {

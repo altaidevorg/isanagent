@@ -72,10 +72,10 @@ struct HookStdoutEnvelope {
     args: Option<Value>,
 }
 
-fn matches_tool(matcher: &Option<Regex>, tool_name: &str) -> bool {
+fn matcher_matches(matcher: &Option<Regex>, text: &str) -> bool {
     match matcher {
         None => true,
-        Some(re) => re.is_match(tool_name),
+        Some(re) => re.is_match(text),
     }
 }
 
@@ -311,7 +311,7 @@ pub async fn run_pre_tool_hooks(
     session: HookSessionInfo<'_>,
 ) -> PreToolOutcome {
     for h in engine.pre_tool.iter() {
-        if !matches_tool(&h.matcher, tool_name) {
+        if !matcher_matches(&h.matcher, tool_name) {
             continue;
         }
         let cwd = match hook_cwd(&engine.sandbox_dir, h.cwd_relative.as_deref()) {
@@ -380,7 +380,7 @@ pub async fn run_post_tool_hooks(
 ) -> Option<String> {
     let mut outputs: Vec<String> = Vec::new();
     for h in engine.post_tool.iter() {
-        if !matches_tool(&h.matcher, tool_name) {
+        if !matcher_matches(&h.matcher, tool_name) {
             continue;
         }
         let cwd = match hook_cwd(&engine.sandbox_dir, h.cwd_relative.as_deref()) {
@@ -437,6 +437,11 @@ pub async fn run_user_prompt_hooks(
 ) -> UserPromptHookOutcome {
     let mut inject: Option<String> = None;
     for h in engine.user_prompt.iter() {
+        // `matcher` regex-tests the prompt content for user_prompt hooks (analogous to the tool
+        // name filter on pre_tool/post_tool); omitted or empty matches every prompt.
+        if !matcher_matches(&h.matcher, content) {
+            continue;
+        }
         let cwd = match hook_cwd(&engine.sandbox_dir, h.cwd_relative.as_deref()) {
             Ok(p) => p,
             Err(e) => {

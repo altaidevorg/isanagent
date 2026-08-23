@@ -911,9 +911,9 @@ fn build_command(
 
 #[cfg(windows)]
 fn kill_process_best_effort(pid: u32) {
-    if pid <= 1 {
-        return;
-    }
+    // Unlike the Unix variant below, there is deliberately no `pid <= 1` guard: `taskkill /PID n`
+    // addresses one exact process tree, so a low pid could at worst fail to kill anything -- it
+    // can never fan out system-wide the way `kill(-pgid)` would if `pid == 1`.
     let _ = StdCommand::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdin(Stdio::null())
