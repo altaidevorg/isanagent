@@ -20,7 +20,9 @@ use tokio::runtime::Handle;
 use crate::onboarding::OnboardOptions;
 use crate::provider_registry;
 
-/// Matches [`assets/onboarding/config.toml`] defaults for boolean-ish sections.
+/// Number of boolean-ish template sections exposed as wizard toggles. Their default values
+/// are derived from the embedded config template at runtime (audit X7) via
+/// [`crate::onboarding::template_feature_toggle_defaults`] instead of being hardcoded here.
 const FEATURE_TOGGLE_COUNT: usize = 15;
 const FEATURE_TOGGLE_LABELS: [&str; FEATURE_TOGGLE_COUNT] = [
     "[terminal] stdin/stdout chat",
@@ -39,26 +41,6 @@ const FEATURE_TOGGLE_LABELS: [&str; FEATURE_TOGGLE_COUNT] = [
     "[harness.background_jobs] job tracking and auto-resume",
     "[harness.notifications] in-app background notifications",
 ];
-
-fn default_feature_toggle_values() -> [bool; FEATURE_TOGGLE_COUNT] {
-    [
-        true,  // terminal
-        false, // slack
-        false, // email
-        false, // api
-        false, // serve_ui
-        false, // mte activity
-        false, // mte cron
-        false, // jina
-        true,  // memory
-        true,  // harness git_worktree
-        true,  // harness subagents
-        true,  // harness ml_engineer
-        true,  // harness execution
-        true,  // harness background_jobs
-        true,  // harness notifications
-    ]
-}
 
 fn build_onboard_options_with_toggles(
     provider: ProviderChoice,
@@ -626,9 +608,10 @@ fn run_ui_loop(handle: &Handle) -> Result<InteractiveOnboardOutcome, String> {
                         if models.get(*selected).is_none() {
                             return Err("invalid selection".to_string());
                         }
-                        let values = state
-                            .feature_toggle_values_cache
-                            .unwrap_or_else(default_feature_toggle_values);
+                        let values = match state.feature_toggle_values_cache {
+                            Some(v) => v,
+                            None => crate::onboarding::template_feature_toggle_defaults()?,
+                        };
                         state.step = Step::FeatureToggles {
                             models: models.clone(),
                             model_selected: *selected,

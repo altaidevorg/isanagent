@@ -1,6 +1,6 @@
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use isanagent::onboarding::{
-    build_interactive_config_toml, onboard_workspace, BootstrapReport, OnboardOptions,
+    build_merged_config_toml, onboard_workspace, BootstrapReport, OnboardOptions,
 };
 use isanagent::onboarding_interactive;
 use isanagent::skills::SkillRegistry;
@@ -391,7 +391,7 @@ async fn run_onboard_inner(
     let config_overrides_used = options.has_overrides();
 
     let interactive_merged_toml = if interactive_outcome.is_some() {
-        Some(build_interactive_config_toml(&options).map_err(std::io::Error::other)?)
+        Some(build_merged_config_toml(&options).map_err(std::io::Error::other)?)
     } else {
         None
     };
