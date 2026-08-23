@@ -789,12 +789,56 @@ impl AppConfig {
     }
 
     /// Returns merged agent definitions from `[agents.<name>]` and `[harness.agents.<name>]`.
-    /// Harness-level definitions override top-level ones of the same name.
+    ///
+    /// Audit X14 merge semantics (field-wise deep merge, not whole-entry replacement):
+    /// - Same name at both levels: the harness-level entry **refines** the
+    ///   top-level one. `Some` values at harness level win; `None` inherits the
+    ///   top-level value. `allowed_tools` is replaced as a whole list (lists
+    ///   never concatenate).
+    /// - `description` (required in TOML) inherits from the top level when the
+    ///   harness entry's is empty.
+    /// - Non-optional scalars `mode` and `hidden` cannot distinguish "omitted"
+    ///   from an explicit default after deserialization, so the harness-level
+    ///   value replaces them: restate `mode`/`hidden` in a harness override
+    ///   when the top-level definition sets them to non-default values.
+    /// - Names present at only one level pass through unchanged.
     pub fn agent_definitions(&self) -> std::collections::HashMap<String, AgentDefinition> {
         let mut merged = self.agents.clone();
         if let Some(h) = self.harness.as_ref() {
             for (k, v) in &h.agents {
-                merged.insert(k.clone(), v.clone());
+                if let Some(base) = merged.get_mut(k) {
+                    // Audit X14: a partial harness-level entry refines the
+                    // top-level definition instead of erasing its fields.
+                    if !v.description.is_empty() {
+                        base.description = v.description.clone();
+                    }
+                    if v.system_prompt.is_some() {
+                        base.system_prompt = v.system_prompt.clone();
+                    }
+                    if v.system_prompt_file.is_some() {
+                        base.system_prompt_file = v.system_prompt_file.clone();
+                    }
+                    if v.allowed_tools.is_some() {
+                        base.allowed_tools = v.allowed_tools.clone();
+                    }
+                    if v.model.is_some() {
+                        base.model = v.model.clone();
+                    }
+                    if v.temperature.is_some() {
+                        base.temperature = v.temperature;
+                    }
+                    if v.max_iterations.is_some() {
+                        base.max_iterations = v.max_iterations;
+                    }
+                    if v.color.is_some() {
+                        base.color = v.color.clone();
+                    }
+                    // Non-optional scalars: harness value replaces (see doc above).
+                    base.mode = v.mode.clone();
+                    base.hidden = v.hidden;
+                } else {
+                    merged.insert(k.clone(), v.clone());
+                }
             }
         }
         merged
@@ -1977,29 +2021,64 @@ color = "4CAF50"
     }
 
     #[test]
-    fn agent_definitions_harness_merge() {
-        let s = r#"
+    fn agent_definitions_harness_deep_merge() {
+        let s = r##"
 [agents.shared]
 description = "Top-level agent"
+temperature = 0.4
+color = "#2196F3"
+max_iterations = 20
 
 [harness.agents.shared]
 description = "Harness-level agent"
 allowed_tools = ["read_file"]
+model = "gemini-2.5-pro"
 
 [harness.agents.harness_only]
 description = "Only in harness"
-"#;
+"##;
         let c: AppConfig = toml::from_str(s).expect("parse");
         let agents = c.agent_definitions();
-        // Harness-level wins over top-level for same name
+        // Harness-level Some fields win over top-level for same name
         let shared = agents.get("shared").expect("shared");
         assert_eq!(shared.description, "Harness-level agent");
         assert_eq!(
             shared.allowed_tools.as_deref(),
             Some(&["read_file".to_string()][..])
         );
+        assert_eq!(shared.model.as_deref(), Some("gemini-2.5-pro"));
+        // Audit X14: omitted (None) harness fields inherit the top-level
+        // definition instead of being erased by whole-entry replacement.
+        assert_eq!(shared.temperature, Some(0.4));
+        assert_eq!(shared.color.as_deref(), Some("#2196F3"));
+        assert_eq!(shared.max_iterations, Some(20));
+        assert_eq!(shared.mode, AgentMode::Subagent);
         // Harness-only entry surfaces
         assert!(agents.contains_key("harness_only"));
+    }
+
+    #[test]
+    fn agent_definitions_harness_non_option_fields_replace() {
+        // Audit X14 documented caveat: `mode` and `hidden` are non-optional
+        // with serde defaults, so a harness-level override cannot distinguish
+        // "omitted" from an explicit default and replaces them. Option fields
+        // still inherit.
+        let s = r#"
+[agents.scout]
+description = "Top-level scout"
+mode = "semble_scout"
+hidden = true
+
+[harness.agents.scout]
+description = "Harness-level scout"
+"#;
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        let agents = c.agent_definitions();
+        let scout = agents.get("scout").expect("scout");
+        assert_eq!(scout.description, "Harness-level scout");
+        // Replaced by harness defaults (documented on `agent_definitions`):
+        assert_eq!(scout.mode, AgentMode::Subagent);
+        assert!(!scout.hidden);
     }
 
     #[test]
