@@ -192,6 +192,8 @@ struct SshSession {
     mode: SshExecMode,
     run_cancel: Mutex<Option<CancellationToken>>,
     connected: Mutex<Option<SshConnected>>,
+    /// Audit X15: held for the session's lifetime; released on map removal.
+    _slot: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// SSH-backed [`ExecutionProvider`] (Linux-oriented remote: `bash` + stdin-fed `python` / `bash -s`).
@@ -200,6 +202,8 @@ pub struct SshExecutionProvider {
     private_key: Option<Arc<keys::PrivateKey>>,
     caps: ProviderCapabilities,
     sessions: DashMap<SessionId, Arc<SshSession>>,
+    /// Audit X15: atomic `max_sessions` budget (see `super::limits`).
+    session_slots: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl SshExecutionProvider {
@@ -254,6 +258,7 @@ impl SshExecutionProvider {
             private_key,
             caps,
             sessions: DashMap::new(),
+            session_slots: super::limits::session_slot_semaphore(config.max_sessions),
         })
     }
 
@@ -747,12 +752,12 @@ impl ExecutionProvider for SshExecutionProvider {
         &self,
         req: SessionCreateRequest,
     ) -> Result<SessionHandle, ExecutionError> {
-        if self.config.max_sessions > 0 && self.sessions.len() >= self.config.max_sessions {
-            return Err(ExecutionError::limit_exceeded(
-                "sessions",
-                format!("max_sessions={} reached", self.config.max_sessions),
-            ));
-        }
+        // Audit X15: reserve a session slot with a single compare-and-set
+        // instead of the racy `sessions.len()` probe. The permit stays a
+        // local until the session record takes ownership below, so any
+        // fallible setup step (`?`) releases it automatically.
+        let slot =
+            super::limits::try_acquire_session_slot(&self.session_slots, self.config.max_sessions)?;
         let mode = self.pick_mode(&req)?;
         let handle = open_ssh_handle(&self.config, &self.private_key).await?;
         let id = SessionId::new(uuid::Uuid::new_v4().to_string());
@@ -764,6 +769,7 @@ impl ExecutionProvider for SshExecutionProvider {
                 handle,
                 python_repl: None,
             })),
+            _slot: slot,
         });
         self.sessions.insert(id.clone(), session);
         Ok(SessionHandle {

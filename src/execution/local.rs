@@ -100,6 +100,8 @@ pub struct LocalExecutionProvider {
     config: LocalExecutionConfig,
     caps: ProviderCapabilities,
     sessions: DashMap<SessionId, Arc<LocalSession>>,
+    /// Audit X15: atomic `max_sessions` budget (see `super::limits`).
+    session_slots: std::sync::Arc<tokio::sync::Semaphore>,
     uv_state: Option<Arc<UvManagedState>>,
 }
 
@@ -114,6 +116,8 @@ struct LocalSession {
     active_pid: Mutex<Option<u32>>,
     /// Present while a `run` is in flight (also used to reject overlapping runs).
     run_cancel: Mutex<Option<CancellationToken>>,
+    /// Audit X15: held for the session's lifetime; released on map removal.
+    _slot: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// Host `python` invocation for REPL and subprocess runs. On Windows, bare `python` / `python3`
@@ -380,11 +384,13 @@ impl LocalExecutionProvider {
         } else {
             None
         };
+        let session_slots = super::limits::session_slot_semaphore(config.max_sessions);
 
         Ok(Self {
             config,
             caps,
             sessions: DashMap::new(),
+            session_slots,
             uv_state,
         })
     }
@@ -532,12 +538,12 @@ impl ExecutionProvider for LocalExecutionProvider {
         &self,
         req: SessionCreateRequest,
     ) -> Result<SessionHandle, ExecutionError> {
-        if self.config.max_sessions > 0 && self.sessions.len() >= self.config.max_sessions {
-            return Err(ExecutionError::limit_exceeded(
-                "sessions",
-                format!("max_sessions={} reached", self.config.max_sessions),
-            ));
-        }
+        // Audit X15: reserve a session slot with a single compare-and-set
+        // instead of the racy `sessions.len()` probe. The permit stays a
+        // local until the session record takes ownership below, so any
+        // fallible setup step (`?`) releases it automatically.
+        let slot =
+            super::limits::try_acquire_session_slot(&self.session_slots, self.config.max_sessions)?;
 
         let mode = self.pick_mode(&req).await?;
 
@@ -559,6 +565,7 @@ impl ExecutionProvider for LocalExecutionProvider {
             mode,
             active_pid: Mutex::new(None),
             run_cancel: Mutex::new(None),
+            _slot: slot,
         });
         self.sessions.insert(id.clone(), session);
 

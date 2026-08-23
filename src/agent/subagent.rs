@@ -227,6 +227,11 @@ struct Inner {
     deps: SubagentSpawnDeps,
     tasks: DashMap<String, Arc<TaskRecord>>,
     tools: std::sync::OnceLock<Arc<ToolRegistry>>,
+    /// Audit X15: atomic spawn-slot budget derived from `deps.max_tasks`.
+    /// Reserving a permit is a single compare-and-set, so parallel spawns
+    /// cannot overshoot the cap the way the previous check-then-act
+    /// `tasks.len()` probe allowed.
+    spawn_slots: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 /// Task registry + spawn helper; tools call into this type.
@@ -239,6 +244,7 @@ impl SubagentHarness {
     pub fn new(deps: SubagentSpawnDeps) -> Self {
         Self {
             inner: Arc::new(Inner {
+                spawn_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(deps.max_tasks)),
                 deps,
                 tasks: DashMap::new(),
                 tools: std::sync::OnceLock::new(),
@@ -345,6 +351,20 @@ impl SubagentHarness {
         ))
     }
 
+    /// Audit X15: atomically claim one of the `max_tasks` sub-agent slots.
+    fn try_reserve_spawn_slot(&self) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
+        self.inner
+            .spawn_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                format!(
+                    "Maximum number of sub-agent tasks ({}) reached",
+                    self.inner.deps.max_tasks
+                )
+            })
+    }
+
     pub async fn spawn(&self, spec: SubagentSpawnSpec) -> Result<String, String> {
         let SubagentSpawnSpec {
             parent_channel,
@@ -357,13 +377,6 @@ impl SubagentHarness {
             agent_name,
             background_job_id,
         } = spec;
-
-        if self.inner.tasks.len() >= self.inner.deps.max_tasks {
-            return Err(format!(
-                "Maximum number of sub-agent tasks ({}) reached",
-                self.inner.deps.max_tasks
-            ));
-        }
 
         // Resolve named agent manifest if specified
         let manifest = match agent_name.as_deref() {
@@ -404,6 +417,14 @@ impl SubagentHarness {
         }
 
         let tools = self.tools()?;
+        // Audit X15: reserve a reasoning slot atomically instead of the old
+        // check-then-act `tasks.len()` probe, which let parallel spawns all
+        // pass the cap before any of them inserted a task record. The permit
+        // moves into the spawned task below and is released when that task
+        // ends (all outcome paths fall through its final statements).
+        // Semble Scout deliberately bypassed this above: it never occupies a
+        // slot because no reasoning loop is started for it.
+        let spawn_slot = self.try_reserve_spawn_slot()?;
         let task_id = uuid::Uuid::new_v4().simple().to_string();
         let child_chat_id = format!("subagent-{}", &task_id[..12.min(task_id.len())]);
 
@@ -626,6 +647,9 @@ impl SubagentHarness {
         let parent_thread_for_wake = parent_thread_id.clone();
         let display_name_for_finish = display_name.clone();
         tokio::spawn(async move {
+            // Audit X15: held for the task's whole lifetime; dropping it here
+            // (after the record left the index above) releases the slot.
+            let _spawn_slot = spawn_slot;
             let outcome = super::AgentLogic::run_reasoning_loop(ctx).await;
             let (status_str, result_opt, err_opt) = match outcome {
                 Ok(super::ReasoningLoopExit::Cancelled { .. }) => {
@@ -1506,5 +1530,81 @@ mod tests {
             .await
             .expect_err("missing workspace must be rejected");
         assert!(err.contains("workspace is unavailable"));
+    }
+
+    #[tokio::test]
+    async fn spawn_slot_reservation_is_atomic_and_releases() {
+        // Audit X15: the cap must be enforced by a single compare-and-set on a
+        // semaphore permit (not a racy `tasks.len()` probe) and a released slot
+        // must become reservable again.
+        let memory_actor = SqliteMemoryActor::new(":memory:").expect("memory actor");
+        let memory_node = NodeHandle::new(memory_actor, 16, 1, Duration::from_millis(1));
+        let session_manager = Arc::new(SessionManager::new(memory_node.clone()));
+        let skills_dir = TempDir::new();
+        let skills = Arc::new(tokio::sync::RwLock::new(SkillRegistry::new(
+            skills_dir.path().to_path_buf(),
+        )));
+        let (outbound_tx, _outbound_rx) = mpsc::channel::<BusMessage>(8);
+        let (logger_tx, _logger_rx) = create_logger_channel(16);
+        let harness = SubagentHarness::new(SubagentSpawnDeps {
+            agent_name: "SubagentTest".to_string(),
+            provider_config: Arc::new(tokio::sync::RwLock::new(ActiveProviderConfig {
+                provider: Box::new(NeverUsedProvider),
+                credentials: crate::provider::ProviderCredentials::empty(),
+            })),
+            fallback_candidates: Arc::new(Vec::new()),
+            session_manager,
+            skills,
+            system_prompt: "test system prompt".to_string(),
+            max_iterations: 2,
+            max_tool_output_chars: 4_000,
+            max_recent_summaries: 0,
+            short_term_threshold_turns: 10,
+            short_term_threshold_tokens: 10_000,
+            tool_execution_activity: None,
+            outbound_tx,
+            logger_tx,
+            clarification_hub: Arc::new(ClarificationHub::new()),
+            cancel_children_on_parent_cancel: true,
+            default_allowlist: None,
+            max_tasks: 2,
+            max_wait_secs: 5,
+            doom_loop_enabled: false,
+            memory_node,
+            harness_runtime_summary: String::new(),
+            shell_policy: Arc::new(ResolvedShellPolicy {
+                interactive_mode: crate::config::ShellPolicyMode::Ask,
+                unattended_mode: crate::config::ShellPolicyMode::Deny,
+                interactive_edit_mode: crate::config::ShellPolicyMode::Ask,
+                unattended_edit_mode: crate::config::ShellPolicyMode::Deny,
+                approval_patterns: Vec::new(),
+                windows_runner: crate::config::WindowsShellRunner::default(),
+            }),
+            hook_tool_ctx: None,
+            agent_registry: None,
+            wake_on_completion: false,
+            task_history_retention: 20,
+            bus_tx: None,
+            workspace_dir: skills_dir.path().to_path_buf(),
+        });
+
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            held.push(
+                harness
+                    .try_reserve_spawn_slot()
+                    .expect("slot should be available under the cap"),
+            );
+        }
+        let err = harness
+            .try_reserve_spawn_slot()
+            .expect_err("exhausted cap must reject further reservations");
+        assert_eq!(err, "Maximum number of sub-agent tasks (2) reached");
+
+        drop(held.pop());
+        assert!(
+            harness.try_reserve_spawn_slot().is_ok(),
+            "released slot must become reservable again"
+        );
     }
 }

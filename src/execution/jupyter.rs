@@ -57,6 +57,8 @@ pub struct JupyterExecutionProvider {
     client: reqwest::Client,
     caps: ProviderCapabilities,
     sessions: DashMap<SessionId, Arc<JupyterSession>>,
+    /// Audit X15: atomic `max_sessions` budget (see `super::limits`).
+    session_slots: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 /// Per-run state for Phase 6 artifact materialization (WS loop → disk).
@@ -74,6 +76,8 @@ struct JupyterSession {
     run_cancel: Mutex<Option<CancellationToken>>,
     /// Resolved server-side `.ipynb` path for optional Contents sync (from template at session create).
     notebook_server_path: Option<String>,
+    /// Audit X15: held for the session's lifetime; released on map removal.
+    _slot: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl JupyterExecutionProvider {
@@ -113,6 +117,7 @@ impl JupyterExecutionProvider {
             client,
             caps,
             sessions: DashMap::new(),
+            session_slots: super::limits::session_slot_semaphore(config.max_sessions),
         })
     }
 
@@ -357,12 +362,12 @@ impl ExecutionProvider for JupyterExecutionProvider {
         &self,
         req: SessionCreateRequest,
     ) -> Result<SessionHandle, ExecutionError> {
-        if self.config.max_sessions > 0 && self.sessions.len() >= self.config.max_sessions {
-            return Err(ExecutionError::limit_exceeded(
-                "sessions",
-                format!("max_sessions={} reached", self.config.max_sessions),
-            ));
-        }
+        // Audit X15: reserve a session slot with a single compare-and-set
+        // instead of the racy `sessions.len()` probe. The permit stays a
+        // local until the session record takes ownership below, so any
+        // fallible setup step (`?`) releases it automatically.
+        let slot =
+            super::limits::try_acquire_session_slot(&self.session_slots, self.config.max_sessions)?;
         let kernel_name = self.pick_kernel_name(&req)?;
         let id = SessionId::new(uuid::Uuid::new_v4().to_string());
         let kernel_id = if let Some(ref kid) = req.resume_jupyter_kernel_id {
@@ -397,6 +402,7 @@ impl ExecutionProvider for JupyterExecutionProvider {
             ws: Mutex::new(None),
             run_cancel: Mutex::new(None),
             notebook_server_path,
+            _slot: slot,
         });
         self.sessions.insert(id.clone(), session);
         Ok(SessionHandle {
