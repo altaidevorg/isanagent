@@ -747,18 +747,14 @@ fn text_plain_from_data(data: &Value) -> Option<String> {
 }
 
 fn append_truncated(buf: &mut String, chunk: &str, budget: &mut usize) {
-    if *budget == 0 {
+    // Audit X6b: byte-slicing here could panic mid-character; delegate the cut
+    // to the canonical UTF-8-safe primitive (same semantics as OutputCapture).
+    if *budget == 0 || chunk.is_empty() {
         return;
     }
-    let take = (*budget).min(chunk.len());
-    if take < chunk.len() {
-        buf.push_str(&chunk[..take]);
-        buf.push_str("\n... (truncated)");
-        *budget = 0;
-    } else {
-        buf.push_str(chunk);
-        *budget -= take;
-    }
+    let appended = super::repl_framing::truncate_utf8_str_cap(chunk, *budget);
+    *budget = budget.saturating_sub(appended.len());
+    buf.push_str(&appended);
 }
 
 /// Mutable state while folding Jupyter execute WebSocket messages for one `execute_request`.

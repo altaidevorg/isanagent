@@ -721,11 +721,16 @@ async fn kill_ssh_repl_worker(handle: &mut client::Handle<SshClientHandler>, pid
     }
 }
 
-fn truncate_run_result(mut r: RunResult, max_total: usize) -> RunResult {
-    let max_each = (max_total / 2).max(1024);
-    r.stdout = repl_framing::truncate_utf8_str_cap(&r.stdout, max_each);
-    r.stderr = repl_framing::truncate_utf8_str_cap(&r.stderr, max_each);
-    r
+fn truncate_run_result(r: RunResult, max_total: usize) -> RunResult {
+    // Audit X6b: one shared-budget pass via the canonical OutputCapture replaces
+    // the old double truncation (per-pipe halves applied a second time here).
+    let (stdout, stderr) =
+        super::capture::OutputCapture::from_captured(r.stdout, r.stderr, max_total).into_parts();
+    RunResult {
+        stdout,
+        stderr,
+        ..r
+    }
 }
 
 #[async_trait]

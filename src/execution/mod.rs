@@ -13,6 +13,7 @@
 mod artifacts;
 mod auto_promote;
 mod capabilities;
+mod capture;
 mod error;
 mod execution_jobs;
 mod harness;
