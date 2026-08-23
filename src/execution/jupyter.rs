@@ -834,9 +834,16 @@ fn fold_execute_ws_message(v: &Value, exec_msg_id: &str, ctx: &mut ExecuteFoldCt
                 append_truncated(ctx.stdout, &text, ctx.budget);
             }
         }
-        "execute_result" | "display_data" | "update_display_data" => {
+        "execute_result" | "display_data" => {
             fold_display_data_payload(v, ctx);
         }
+        // Audit R11 (tail): `update_display_data` REPLACES previously displayed
+        // content under the same `display_id` (progress bars, chart refreshes).
+        // Folding it duplicates artifact blobs and burns output budget on
+        // repeated text, so transient updates are skipped entirely; the live
+        // run-event emitter already ignores them. Trade-off: a kernel that only
+        // ever refines via updates leaves the initial display captured above.
+        "update_display_data" => {}
         "error" => {
             let ename = v["content"]["ename"].as_str().unwrap_or("Error");
             let evalue = v["content"]["evalue"].as_str().unwrap_or("");
@@ -1335,5 +1342,90 @@ mod tests {
         assert_eq!(collector.pending.len(), 1);
         assert_eq!(collector.pending[0].mime, "image/png");
         assert!(!collector.pending[0].bytes.is_empty());
+    }
+
+    #[test]
+    fn update_display_data_is_skipped_not_folded() {
+        let pid = "exec-update";
+        let b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        let msg = |msg_type: &str, png: &str, text: &str| -> Value {
+            serde_json::from_str(&format!(
+                r#"{{
+                "channel":"iopub",
+                "header":{{"msg_type":"{msg_type}"}},
+                "parent_header":{{"msg_id":"{pid}"}},
+                "content":{{"data":{{"image/png":"{png}","text/plain":"{text}"}}}}
+            }}"#
+            ))
+            .unwrap()
+        };
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let mut budget = 10_000usize;
+        let mut exit_code = Some(0i32);
+        let mut got_execute_reply = false;
+        let mut got_iopub_idle = false;
+        let limits = ArtifactLimits::default();
+        let mut collector = ArtifactCollector::new(limits);
+
+        // Initial genuine display folds normally (artifact + text).
+        {
+            let mut ctx = ExecuteFoldCtx {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+                budget: &mut budget,
+                exit_code: &mut exit_code,
+                got_execute_reply: &mut got_execute_reply,
+                got_iopub_idle: &mut got_iopub_idle,
+                artifact_limits: limits,
+                artifact_collector: Some(&mut collector),
+            };
+            fold_execute_ws_message(&msg("display_data", b64, "initial"), pid, &mut ctx);
+        }
+        assert_eq!(collector.pending.len(), 1);
+        assert_eq!(stdout, "initial");
+
+        // A burst of transient updates must change nothing at all.
+        let out_before = stdout.clone();
+        let budget_before = budget;
+        {
+            let mut ctx = ExecuteFoldCtx {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+                budget: &mut budget,
+                exit_code: &mut exit_code,
+                got_execute_reply: &mut got_execute_reply,
+                got_iopub_idle: &mut got_iopub_idle,
+                artifact_limits: limits,
+                artifact_collector: Some(&mut collector),
+            };
+            for _ in 0..3 {
+                fold_execute_ws_message(
+                    &msg("update_display_data", b64, "refreshed"),
+                    pid,
+                    &mut ctx,
+                );
+            }
+        }
+        assert_eq!(collector.pending.len(), 1, "no duplicate artifacts");
+        assert_eq!(stdout, out_before, "no duplicate text");
+        assert_eq!(budget, budget_before, "budget untouched");
+
+        // A later genuine result still folds.
+        {
+            let mut ctx = ExecuteFoldCtx {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+                budget: &mut budget,
+                exit_code: &mut exit_code,
+                got_execute_reply: &mut got_execute_reply,
+                got_iopub_idle: &mut got_iopub_idle,
+                artifact_limits: limits,
+                artifact_collector: Some(&mut collector),
+            };
+            fold_execute_ws_message(&msg("execute_result", b64, "final"), pid, &mut ctx);
+        }
+        assert_eq!(collector.pending.len(), 2);
+        assert!(stdout.ends_with("initialfinal"));
     }
 }
