@@ -354,6 +354,8 @@ mod registry_tests {
         assert_eq!(names, vec!["first_tool", "second_tool"]);
     }
 
+
+
     /// Fixture declaring an explicit execution mode (audit X1).
     struct PolicyTool {
         n: &'static str,

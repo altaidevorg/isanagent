@@ -472,7 +472,21 @@ pub fn format_api_error(status: u16, body: &str, base_url: &str, model: &str) ->
             "({status}{code_tag}) Server error from provider while using model '{model}'. Try again later."
         ),
         _ => {
-            let detail = msg.unwrap_or_else(|| body.chars().take(200).collect());
+            let detail = if let Some(m) = &msg {
+                if let Some(err_obj) = parsed.as_ref().and_then(|p| p.get("error")) {
+                    if let Some(meta) = err_obj.get("metadata") {
+                        format!("{m} (metadata: {meta})")
+                    } else if let Some(d) = err_obj.get("details") {
+                        format!("{m} (details: {d})")
+                    } else {
+                        m.clone()
+                    }
+                } else {
+                    m.clone()
+                }
+            } else {
+                body.chars().take(500).collect()
+            };
             format!(
                 "({status}{code_tag}) API error for model '{model}': {detail}"
             )
@@ -590,6 +604,7 @@ impl LLMClient {
         let status = res.status();
         if !status.is_success() {
             let text = res.text().await.unwrap_or_default();
+            log::warn!("LLM Request to '{}' returned HTTP {}: {}", self.model, status, text);
             // PR-4: classify context-length overflow as a typed error so the
             // reasoning loop can compact-and-retry instead of bouncing the turn.
             if status == reqwest::StatusCode::BAD_REQUEST
@@ -1237,3 +1252,5 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+

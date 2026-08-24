@@ -1501,16 +1501,27 @@ fn apply_host_overrides(config: &mut AppConfig, host: &HostConfig) -> Result<(),
             return Err("model override cannot be empty".to_string());
         }
 
+        let model = model.strip_prefix("models/").unwrap_or(model);
         let provider = config.provider.get_or_insert_with(ProviderConfig::default);
         if let Some((provider_name, model_name)) = model.split_once('/') {
             if provider_name.is_empty() || model_name.is_empty() {
                 return Err(format!("invalid provider/model override: {model}"));
             }
-            provider.provider_name = provider_name.to_string();
-            provider.model_name = model_name.to_string();
-            // Let the provider's conventional key variable be inferred after
-            // changing provider family (for example ANTHROPIC_API_KEY).
-            provider.api_key_env.clear();
+            if crate::provider_registry::is_recognized(provider_name)
+                || config
+                    .providers
+                    .as_ref()
+                    .map(|p| p.contains_key(provider_name))
+                    .unwrap_or(false)
+            {
+                provider.provider_name = provider_name.to_string();
+                provider.model_name = model_name.to_string();
+                // Let the provider's conventional key variable be inferred after
+                // changing provider family (for example ANTHROPIC_API_KEY).
+                provider.api_key_env.clear();
+            } else {
+                provider.model_name = model.to_string();
+            }
         } else {
             provider.model_name = model.to_string();
         }
@@ -1521,14 +1532,25 @@ fn apply_host_overrides(config: &mut AppConfig, host: &HostConfig) -> Result<(),
         if model.is_empty() {
             return Err("fallback model override cannot be empty".to_string());
         }
+        let model = model.strip_prefix("models/").unwrap_or(model);
         let mut fallback = config.provider.clone().unwrap_or_default();
         if let Some((provider_name, model_name)) = model.split_once('/') {
             if provider_name.is_empty() || model_name.is_empty() {
                 return Err(format!("invalid fallback provider/model override: {model}"));
             }
-            fallback.provider_name = provider_name.to_string();
-            fallback.model_name = model_name.to_string();
-            fallback.api_key_env.clear();
+            if crate::provider_registry::is_recognized(provider_name)
+                || config
+                    .providers
+                    .as_ref()
+                    .map(|p| p.contains_key(provider_name))
+                    .unwrap_or(false)
+            {
+                fallback.provider_name = provider_name.to_string();
+                fallback.model_name = model_name.to_string();
+                fallback.api_key_env.clear();
+            } else {
+                fallback.model_name = model.to_string();
+            }
         } else {
             fallback.model_name = model.to_string();
         }
