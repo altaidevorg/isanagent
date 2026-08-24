@@ -20,34 +20,30 @@ enabled = true
 # Use `/model` in the TUI to switch between them at runtime.
 #
 # Family format: list all models under one provider block. The map key is used as provider_name.
-# API key resolution: $<PROVIDER>_API_KEY env var first, then inline `api_key` as fallback.
+# API keys are securely loaded from:
+#   1. Environment variable ($<PROVIDER>_API_KEY or explicit `api_key_env`)
+#   2. OS Keychain (managed automatically via `/model` or `/key <provider>` in the TUI / altai-app)
 #
 [providers.gemini]
 models = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-3.1-pro", "gemini-3.1-flash-lite"]
-api_key = "<changethis>"
 
 [providers.openai]
 models = ["gpt-5.5", "gpt-5.5-instant", "gpt-5.4-mini", "gpt-5.4-nano", "o3", "o4-mini"]
-api_key = "<changethis>"
 
 [providers.anthropic]
 models = ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"]
-api_key = "<changethis>"
 
 [providers.deepseek]
 models = ["deepseek-v4-pro", "deepseek-v4-flash"]
-api_key = "<changethis>"
 
-# [providers.openrouter]
-# models = ["anthropic/claude-opus-4-7", "openai/gpt-5.5", "google/gemini-3.1-pro"]
-# # Uses $OPENROUTER_API_KEY
-#
+[providers.openrouter]
+models = ["anthropic/claude-opus-4-7", "openai/gpt-5.5", "google/gemini-3.1-pro", "stealth/ox-alpha"]
+
 # Custom endpoint (legacy per-model format):
 # [providers.my-proxy]
 # provider_name = "openai_compatible"
 # model_name = "my-model"
 # base_url = "https://my-proxy.example/v1/chat/completions"
-# api_key = "sk-..."
 
 [slack]
 enabled = false

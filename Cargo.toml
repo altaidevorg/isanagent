@@ -43,6 +43,7 @@ shellexpand = "3.1.2"
 uuid = { version = "1.21.0", features = ["v4"] }
 toml = "1.0.3"
 toml_edit = "0.22"
+keyring = "3"
 tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3.32"
 # Align with ratatui's crossterm backend (avoids duplicate crossterm versions).

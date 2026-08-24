@@ -17,7 +17,7 @@ mod theme;
 
 pub use app::{
     AgentTaskEntry, AgentTaskStatus, App, Cell, JobStripEntry, JobStripStatus, ModelSelector,
-    TerminalUiFocus, TerminalUiMode, ToastKind, ToolNoticePhase, ToolRailEntry,
+    ModelSelectorStage, TerminalUiFocus, TerminalUiMode, ToastKind, ToolNoticePhase, ToolRailEntry,
     TranscriptSelection,
 };
 pub use approval::{approval_hotkey_reply, EditDiffPayload, APPROVAL_CHOICES};

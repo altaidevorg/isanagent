@@ -1525,25 +1525,28 @@ impl ProviderConfig {
         format!("{}_API_KEY", self.provider_name.to_uppercase())
     }
 
-    /// Resolve the API key: env var (from `resolved_api_key_env()`) first, then the inline
-    /// `api_key` field in config.toml. Returns `Err` when neither source provides a non-empty key.
+    /// Resolve the API key: env var (from `resolved_api_key_env()`) first, then the OS Keychain
+    /// (service `dev.altai.isanagent`). Returns `Err` when neither source provides a non-empty key.
     pub fn resolve_api_key(&self) -> Result<String, String> {
         let env_var = self.resolved_api_key_env();
         if !env_var.is_empty() {
             if let Ok(key) = std::env::var(&env_var) {
-                if !key.is_empty() {
-                    return Ok(key);
+                let trimmed = key.trim();
+                if !trimmed.is_empty() && !api_key_looks_like_placeholder(trimmed) {
+                    return Ok(trimmed.to_string());
                 }
             }
         }
-        if let Some(key) = &self.api_key {
+        if let Some(key) = crate::credentials::get_provider_key(&self.provider_name) {
             let trimmed = key.trim();
             if !trimmed.is_empty() && !api_key_looks_like_placeholder(trimmed) {
                 return Ok(trimmed.to_string());
             }
         }
         Err(format!(
-            "No API key found (checked env ${env_var} and config api_key)"
+            "No API key found for provider '{}' (checked env ${env_var} and OS Keychain namespace '{}')",
+            self.provider_name,
+            crate::credentials::KEYRING_SERVICE
         ))
     }
 
@@ -2273,42 +2276,28 @@ models = []
 mod placeholder_key_tests {
     use super::*;
 
-    fn provider_with_key(key: &str) -> ProviderConfig {
-        ProviderConfig {
-            provider_name: "nonexistent-provider".to_string(),
-            model_name: "some-model".to_string(),
-            models: None,
-            api_key_env: "".to_string(),
-            api_key: Some(key.to_string()),
-            base_url: None,
-        }
-    }
-
     #[test]
     fn rejects_angle_bracket_placeholder() {
-        assert!(provider_with_key("<changethis>").resolve_api_key().is_err());
+        assert!(api_key_looks_like_placeholder("<changethis>"));
     }
 
     #[test]
     fn rejects_changethis_without_brackets() {
-        assert!(provider_with_key("changethis").resolve_api_key().is_err());
+        assert!(api_key_looks_like_placeholder("changethis"));
     }
 
     #[test]
     fn rejects_replace_me() {
-        assert!(provider_with_key("replace_me").resolve_api_key().is_err());
+        assert!(api_key_looks_like_placeholder("replace_me"));
     }
 
     #[test]
     fn rejects_placeholder_keyword() {
-        assert!(provider_with_key("my_placeholder_key")
-            .resolve_api_key()
-            .is_err());
+        assert!(api_key_looks_like_placeholder("my_placeholder_key"));
     }
 
     #[test]
     fn accepts_real_api_key() {
-        let result = provider_with_key("sk-abc123def456").resolve_api_key();
-        assert_eq!(result.unwrap(), "sk-abc123def456");
+        assert!(!api_key_looks_like_placeholder("sk-abc123def456"));
     }
 }

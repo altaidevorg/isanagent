@@ -13,6 +13,7 @@ pub mod channels;
 pub mod checkpoint;
 pub mod clarification;
 pub mod config;
+pub mod credentials;
 pub mod environment;
 pub mod execution;
 pub mod hooks;
