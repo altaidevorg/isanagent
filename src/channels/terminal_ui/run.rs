@@ -3016,9 +3016,15 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 continue;
                             }
                             if text.eq_ignore_ascii_case("/model")
+                                || text.eq_ignore_ascii_case("/models")
                                 || text.to_ascii_lowercase().starts_with("/model ")
+                                || text.to_ascii_lowercase().starts_with("/models ")
                             {
-                                let arg = text.strip_prefix("/model").unwrap_or("").trim();
+                                let arg = text
+                                    .strip_prefix("/models")
+                                    .or_else(|| text.strip_prefix("/model"))
+                                    .unwrap_or("")
+                                    .trim();
                                 if arg.is_empty() {
                                     // Open interactive model selector popup
                                     if providers.is_empty() {

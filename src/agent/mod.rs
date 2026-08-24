@@ -1248,7 +1248,9 @@ mod tests {
         let banner = build_llm_failed_banner("tauri", "chat-1", None, "provider unavailable", true);
 
         assert!(!banner.content.contains("/retry"));
-        assert!(banner.content.contains("retried from the client"));
+        assert!(banner
+            .content
+            .contains("switch to another LLM from the client"));
         assert!(!banner
             .metadata
             .contains_key(crate::protocol::ISANAGENT_LLM_RETRY_AVAILABLE));
@@ -3102,7 +3104,7 @@ mod tests {
             .map(|c| c.text_content())
             .unwrap_or_default();
         assert!(
-            text.contains("LLM call failed after 3 attempts"),
+            text.contains("This LLM is failing after 3 retries"),
             "persisted terminal failure not found: {text}"
         );
     }

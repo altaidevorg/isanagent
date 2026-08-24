@@ -604,7 +604,12 @@ impl LLMClient {
         let status = res.status();
         if !status.is_success() {
             let text = res.text().await.unwrap_or_default();
-            log::warn!("LLM Request to '{}' returned HTTP {}: {}", self.model, status, text);
+            log::warn!(
+                "LLM Request to '{}' returned HTTP {}: {}",
+                self.model,
+                status,
+                text
+            );
             // PR-4: classify context-length overflow as a typed error so the
             // reasoning loop can compact-and-retry instead of bouncing the turn.
             if status == reqwest::StatusCode::BAD_REQUEST
@@ -1252,5 +1257,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-
-

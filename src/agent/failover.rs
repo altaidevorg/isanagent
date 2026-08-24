@@ -125,6 +125,7 @@ fn provider_secret_identity(api_key: &str) -> String {
 }
 
 /// Result of attempting the configured fallback providers.
+#[cfg(test)]
 pub(crate) enum FallbackOutcome {
     Ok(crate::utils::LLMResponse),
     Cancelled,
@@ -142,6 +143,7 @@ pub(crate) struct FailoverLogCtx<'a> {
 /// a provider from a spec — real code passes [`crate::provider::create_provider`]; tests inject a
 /// mock builder, keeping this loop fully testable without network. Cancellation preempts a
 /// fallback chat.
+#[cfg(test)]
 pub(crate) async fn try_fallbacks<F>(
     fallbacks: &[FallbackProviderSpec],
     build: F,
@@ -225,7 +227,7 @@ pub(crate) async fn chat_with_retry(
     provider: &dyn crate::traits::Provider,
     context: &[crate::utils::ChatMessage],
     tools_payload: Option<serde_json::Value>,
-    fallback_providers: &[FallbackProviderSpec],
+    _fallback_providers: &[FallbackProviderSpec],
     cancel_token: &tokio_util::sync::CancellationToken,
     log_ctx: FailoverLogCtx<'_>,
 ) -> ChatRetryOutcome {
@@ -309,40 +311,7 @@ pub(crate) async fn chat_with_retry(
             }
         }
     }
-    // Primary exhausted. Before surfacing a failure, try each configured fallback provider once, so
-    // a transient outage / key rotation / model deprecation on the primary doesn't drop a long
-    // unattended turn. The primary stays the active provider — failover is per-call.
-    match try_fallbacks(
-        fallback_providers,
-        |s| {
-            crate::provider::create_provider(
-                &s.provider_name,
-                &s.base_url,
-                &s.api_key,
-                &s.model_name,
-            )
-        },
-        context,
-        &tools_payload,
-        cancel_token,
-        FailoverLogCtx {
-            logger_tx,
-            name,
-            chat_id,
-        },
-    )
-    .await
-    {
-        FallbackOutcome::Ok(resp) => {
-            return ChatRetryOutcome::Ok {
-                response: resp,
-                retries: MAX_ATTEMPTS.saturating_sub(1),
-            }
-        }
-        FallbackOutcome::Cancelled => return ChatRetryOutcome::Cancelled,
-        FallbackOutcome::Exhausted => {}
-    }
-
+    // Primary exhausted — return failure transparently so the user is informed with full context.
     ChatRetryOutcome::Failed(
         last_err
             .map(|e| e.to_string())
@@ -364,11 +333,11 @@ pub(crate) fn build_llm_failed_banner(
 ) -> OutboundMessage {
     let content = if channel == "terminal" && retryable {
         format!(
-            "LLM call failed after 3 attempts: {error}\nPress /retry to try again or /cancel to abandon."
+            "This LLM is failing after 3 retries with the following upstream message:\n{error}\n\nPress /retry to try again later, or switch to another LLM with the /model command."
         )
     } else if retryable {
         format!(
-            "LLM call failed after provider retries were exhausted: {error}\nThis run can be retried from the client."
+            "This LLM is failing after 3 retries with the following upstream message:\n{error}\n\nYou can try again later or switch to another LLM from the client."
         )
     } else {
         format!("LLM call failed: {error}")
