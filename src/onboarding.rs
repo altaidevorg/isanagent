@@ -12,20 +12,6 @@ use toml_edit::{value, DocumentMut};
 /// Full skill tree (SKILL.md, reference.md, examples/) embedded at compile time.
 static ONBOARD_SYNTHETIC_SKILL_DIR: Dir<'static> =
     include_dir!("$CARGO_MANIFEST_DIR/assets/onboarding/skills/synthetic-dataset-with-afterimage");
-static ONBOARD_KERNEL_PORTING_SKILL_DIR: Dir<'static> =
-    include_dir!("$CARGO_MANIFEST_DIR/assets/onboarding/skills/kernel-porting");
-static ONBOARD_AUTOTRAINESS_SKILL_DIR: Dir<'static> =
-    include_dir!("$CARGO_MANIFEST_DIR/assets/onboarding/skills/autotrainess");
-static ONBOARD_KERNEL_AGENT_PROMPTS_DIR: Dir<'static> =
-    include_dir!("$CARGO_MANIFEST_DIR/assets/onboarding/agents/prompts");
-static ONBOARD_KERNEL_REFERENCE_DIR: Dir<'static> =
-    include_dir!("$CARGO_MANIFEST_DIR/assets/onboarding/kernels/reference");
-static ONBOARD_KERNEL_BENCHMARKS_DIR: Dir<'static> =
-    include_dir!("$CARGO_MANIFEST_DIR/assets/onboarding/benchmarks");
-static ONBOARD_KERNEL_PORTING_PLUGIN_DIR: Dir<'static> =
-    include_dir!("$CARGO_MANIFEST_DIR/assets/plugins/kernel-porting");
-static ONBOARD_AUTOTRAINESS_PLUGIN_DIR: Dir<'static> =
-    include_dir!("$CARGO_MANIFEST_DIR/assets/plugins/autotrainess");
 
 const CONFIG_TEMPLATE: &str = include_str!("../assets/onboarding/config.toml");
 const AGENTS_TEMPLATE: &str = include_str!("../assets/onboarding/AGENTS.md");
@@ -74,10 +60,10 @@ impl BootstrapReport {
 /// Optional `config.toml` field overrides for [`onboard_workspace`].
 ///
 /// Derives [`clap::Args`] so the binary can `flatten` these into `onboard` for scripting.
-/// When any field is set, the written `config.toml` is normally produced by parse → merge →
-/// serialize (comments omitted). `onboard --interactive` uses [`build_interactive_config_toml`]
-/// instead so comments are kept. With all fields unset, the embedded template file is copied
-/// verbatim (comments preserved).
+/// When any field is set, the written `config.toml` comes from
+/// [`build_merged_config_toml`] (audit X7): a single merge engine applies every override
+/// to the embedded template with `toml_edit`, keeping the template's documentation
+/// comments. With all fields unset, the embedded template file is copied verbatim.
 #[derive(Debug, Clone, Default, Args)]
 #[command(next_help_heading = "config.toml overrides")]
 pub struct OnboardOptions {
@@ -95,8 +81,8 @@ pub struct OnboardOptions {
     pub terminal_enable: Option<bool>,
 
     /// One of the well-known names from `provider_registry::KNOWN_PROVIDERS` (e.g. `gemini`,
-    /// `openai`, `deepseek`, `openrouter`) or `openai_compatible` for any third-party endpoint
-    /// (which then requires `--provider-base-url`).
+    /// `openai`, `anthropic`, `deepseek`, `openrouter`) or `openai_compatible` for any third-party
+    /// endpoint (which then requires `--provider-base-url`).
     #[arg(long, help_heading = "Provider")]
     pub provider_name: Option<String>,
     #[arg(long, help_heading = "Provider")]
@@ -180,139 +166,16 @@ impl OnboardOptions {
     }
 }
 
-fn apply_onboard_options(cfg: &mut AppConfig, opts: &OnboardOptions) {
-    if let Some(v) = opts.restrict_to_workspace {
-        cfg.restrict_to_workspace = Some(v);
-    }
-    if let Some(v) = opts.max_iterations {
-        cfg.max_iterations = Some(v);
-    }
-    if let Some(v) = opts.max_tool_output_chars {
-        cfg.max_tool_output_chars = Some(v);
-    }
-    if let Some(v) = opts.max_web_tool_output_chars {
-        cfg.max_web_tool_output_chars = Some(v);
-    }
-
-    if let Some(v) = opts.terminal_enable {
-        cfg.terminal.get_or_insert_with(Default::default).enabled = Some(v);
-    }
-
-    if opts.provider_name.is_some()
-        || opts.provider_model.is_some()
-        || opts.provider_api_key_env.is_some()
-        || opts.provider_base_url.is_some()
-    {
-        let p = cfg.provider.get_or_insert_with(Default::default);
-        if let Some(ref n) = opts.provider_name {
-            p.provider_name = n.clone();
-        }
-        if let Some(ref m) = opts.provider_model {
-            p.model_name = m.clone();
-        }
-        if let Some(ref e) = opts.provider_api_key_env {
-            p.api_key_env = e.clone();
-        }
-        // Only persist `base_url` when explicitly set via the CLI flag. For known names we
-        // intentionally leave the field unset so the registry stays the single source of truth.
-        if let Some(ref u) = opts.provider_base_url {
-            p.base_url = Some(u.clone());
-        }
-    }
-
-    if let Some(a) = cfg.api.as_mut() {
-        if let Some(v) = opts.api_enabled {
-            a.enabled = Some(v);
-        }
-        if let Some(p) = opts.api_port {
-            a.port = p;
-        }
-        if let Some(v) = opts.api_serve_ui {
-            a.serve_ui = Some(v);
-        }
-        if let Some(ref addr) = opts.api_bind_address {
-            a.bind_address = Some(addr.clone());
-        }
-    }
-
-    if let Some(s) = cfg.slack.as_mut() {
-        if let Some(v) = opts.slack_enabled {
-            s.enabled = Some(v);
-        }
-        if let Some(m) = opts.slack_mode {
-            s.mode = Some(m);
-        }
-    }
-
-    if let Some(e) = cfg.email.as_mut() {
-        if let Some(v) = opts.email_enabled {
-            e.enabled = Some(v);
-        }
-    }
-
-    if let Some(v) = opts.jina_enabled {
-        cfg.jina.get_or_insert_with(Default::default).enabled = Some(v);
-    }
-
-    if let Some(v) = opts.memory_enabled {
-        cfg.memory.get_or_insert_with(Default::default).enabled = Some(v);
-    }
-
-    if opts.multi_tenant_activity_heartbeat.is_some() || opts.multi_tenant_cron_scheduling.is_some()
-    {
-        let m = cfg.multi_tenant_edge.get_or_insert_with(Default::default);
-        if let Some(v) = opts.multi_tenant_activity_heartbeat {
-            m.activity_heartbeat_enabled = Some(v);
-        }
-        if let Some(v) = opts.multi_tenant_cron_scheduling {
-            m.cron_scheduling_enabled = Some(v);
-        }
-    }
-
-    if opts.harness_git_worktree_enabled.is_some()
-        || opts.harness_subagents_enabled.is_some()
-        || opts.harness_ml_engineer_enabled.is_some()
-        || opts.harness_execution_enabled.is_some()
-        || opts.harness_background_jobs_enabled.is_some()
-        || opts.harness_notifications_enabled.is_some()
-    {
-        let h = cfg.harness.get_or_insert_with(Default::default);
-        if let Some(v) = opts.harness_git_worktree_enabled {
-            h.git_worktree.get_or_insert_with(Default::default).enabled = Some(v);
-        }
-        if let Some(v) = opts.harness_subagents_enabled {
-            h.subagents.get_or_insert_with(Default::default).enabled = Some(v);
-        }
-        if let Some(v) = opts.harness_ml_engineer_enabled {
-            h.ml_engineer.get_or_insert_with(Default::default).enabled = Some(v);
-        }
-        if let Some(v) = opts.harness_execution_enabled {
-            h.execution.get_or_insert_with(Default::default).enabled = Some(v);
-        }
-        if let Some(v) = opts.harness_background_jobs_enabled {
-            h.background_jobs
-                .get_or_insert_with(Default::default)
-                .enabled = Some(v);
-        }
-        if let Some(v) = opts.harness_notifications_enabled {
-            h.notifications.get_or_insert_with(Default::default).enabled = Some(v);
-        }
-    }
-}
-
-fn build_config_toml(options: &OnboardOptions) -> Result<String, String> {
-    let mut cfg: AppConfig = toml::from_str(CONFIG_TEMPLATE)
-        .map_err(|e| format!("Internal error: embedded config template is invalid TOML: {e}"))?;
-    apply_onboard_options(&mut cfg, options);
-    toml::to_string_pretty(&cfg).map_err(|e| format!("Failed to serialize config.toml: {e}"))
-}
-
-/// Same overrides as [`apply_onboard_options`], applied in-place on the embedded template with
-/// `toml_edit` so **comments are preserved** (used for `onboard --interactive`).
-pub fn build_interactive_config_toml(options: &OnboardOptions) -> Result<String, String> {
+/// Merge [`OnboardOptions`] overrides into the embedded config template.
+///
+/// Audit X7: this is the single onboarding merge engine. Overrides are applied in-place
+/// with `toml_edit` so the template's documentation comments survive, and the result is
+/// validated against [`AppConfig`] before returning. Scripted `onboard` flags and
+/// `onboard --interactive` both funnel through here.
+pub fn build_merged_config_toml(options: &OnboardOptions) -> Result<String, String> {
     let mut doc: DocumentMut = CONFIG_TEMPLATE
         .parse()
-        .map_err(|e| format!("interactive config template parse (toml_edit): {e}"))?;
+        .map_err(|e| format!("config template parse (toml_edit): {e}"))?;
 
     if let Some(v) = options.restrict_to_workspace {
         doc["restrict_to_workspace"] = value(v);
@@ -335,6 +198,23 @@ pub fn build_interactive_config_toml(options: &OnboardOptions) -> Result<String,
 
     if let Some(v) = options.terminal_enable {
         doc["terminal"]["enabled"] = value(v);
+    }
+
+    // Explicit provider overrides make the template's `[providers.*]` starter families redundant
+    // and misleading: the chosen `[provider]` block wins at startup, but leftover families with
+    // `<changethis>` keys still participate in fallback resolution whenever their env vars
+    // happen to exist. Strip the active families; the commented examples stay as documentation.
+    if options.provider_name.is_some()
+        || options.provider_model.is_some()
+        || options.provider_api_key_env.is_some()
+        || options.provider_base_url.is_some()
+    {
+        if let Some(families) = doc.get_mut("providers").and_then(|i| i.as_table_mut()) {
+            let family_keys: Vec<String> = families.iter().map(|(k, _)| k.to_string()).collect();
+            for key in &family_keys {
+                families.remove(key);
+            }
+        }
     }
 
     if (options.provider_name.is_some()
@@ -436,14 +316,51 @@ pub fn build_interactive_config_toml(options: &OnboardOptions) -> Result<String,
 
     let out = doc.to_string();
     let _: AppConfig = toml::from_str(&out)
-        .map_err(|e| format!("interactive merged config.toml failed AppConfig validation: {e}"))?;
+        .map_err(|e| format!("merged config.toml failed AppConfig validation: {e}"))?;
     Ok(out)
+}
+
+/// Boolean-ish section defaults the interactive wizard presents as toggles, derived by
+/// parsing [`CONFIG_TEMPLATE`] so wizard defaults cannot drift from the template
+/// (audit X7). Order matches the wizard's `FEATURE_TOGGLE_LABELS`.
+pub(crate) fn template_feature_toggle_defaults() -> Result<[bool; 15], String> {
+    let value: toml::Value = toml::from_str(CONFIG_TEMPLATE)
+        .map_err(|e| format!("Internal error: embedded config template is invalid TOML: {e}"))?;
+    let read_bool = |path: &[&str]| -> Result<bool, String> {
+        let joined = path.join(".");
+        let mut cur = &value;
+        for key in path {
+            cur = cur
+                .get(key)
+                .ok_or_else(|| format!("embedded config template missing key `{joined}`"))?;
+        }
+        cur.as_bool()
+            .ok_or_else(|| format!("embedded config template key `{joined}` is not a bool"))
+    };
+    Ok([
+        read_bool(&["terminal", "enabled"])?,
+        read_bool(&["slack", "enabled"])?,
+        read_bool(&["email", "enabled"])?,
+        read_bool(&["api", "enabled"])?,
+        read_bool(&["api", "serve_ui"])?,
+        read_bool(&["multi_tenant_edge", "activity_heartbeat_enabled"])?,
+        read_bool(&["multi_tenant_edge", "cron_scheduling_enabled"])?,
+        read_bool(&["jina", "enabled"])?,
+        read_bool(&["memory", "enabled"])?,
+        read_bool(&["harness", "git_worktree", "enabled"])?,
+        read_bool(&["harness", "subagents", "enabled"])?,
+        read_bool(&["harness", "ml_engineer", "enabled"])?,
+        read_bool(&["harness", "execution", "enabled"])?,
+        read_bool(&["harness", "background_jobs", "enabled"])?,
+        read_bool(&["harness", "notifications", "enabled"])?,
+    ])
 }
 
 /// Bootstrap a workspace at `root`, optionally overriding embedded `config.toml` values.
 ///
-/// When `interactive_merged_config_toml` is `Some`, it is written as `config.toml` (instead of
-/// serde-pretty output) so template **comments stay**; used for `onboard --interactive`.
+/// When `interactive_merged_config_toml` is `Some`, it is written verbatim as `config.toml`;
+/// used for `onboard --interactive` (the wizard merges once up front so config errors
+/// surface while the UI is still running).
 pub fn onboard_workspace(
     root: &Path,
     options: &OnboardOptions,
@@ -541,18 +458,18 @@ fn write_all_templates(
     interactive_merged_config_toml: Option<&str>,
     report: &mut BootstrapReport,
 ) -> Result<(), String> {
+    let config_body =
+        if let Some(s) = interactive_merged_config_toml.filter(|_| options.has_overrides()) {
+            s.to_string()
+        } else if options.has_overrides() {
+            build_merged_config_toml(options)?
+        } else {
+            CONFIG_TEMPLATE.to_string()
+        };
+
     for template in embedded_templates() {
         if template.relative_path == "config.toml" {
-            let body = if let Some(s) =
-                interactive_merged_config_toml.filter(|_| options.has_overrides())
-            {
-                s.to_string()
-            } else if options.has_overrides() {
-                build_config_toml(options)?
-            } else {
-                CONFIG_TEMPLATE.to_string()
-            };
-            write_if_missing_string(&layout.root, template.relative_path, &body, report)?;
+            write_if_missing_string(&layout.root, template.relative_path, &config_body, report)?;
         } else {
             write_if_missing_string(
                 &layout.root,
@@ -564,9 +481,6 @@ fn write_all_templates(
     }
 
     write_embedded_synthetic_skill_tree(&layout.root, report)?;
-    write_embedded_kernel_porting_tree(&layout.root, report)?;
-    write_embedded_autotrainess_tree(&layout.root, report)?;
-    write_embedded_plugin_trees(&layout.root, report)?;
 
     let overlay_ref = workspace_ml_engineer_overlay_reference();
     write_if_missing_string(
@@ -587,36 +501,12 @@ This file is created by **`isanagent onboard`**. It mirrors the policy text that
 appends to the system prompt when **`[harness.ml_engineer] enabled = true`** in `config.toml`. \
 Editing this file does **not** change runtime behavior (the live text is embedded in the \
 `isanagent` build). For workspace-specific ML rules, add or edit **`ML_POLICY.md`** in this \
-directory (merged by `compile_system_prompt`).\n\n---\n\n{HARNESS_OVERLAY}"
+directory (merged into the system prompt by `compile_system_prompt` when \
+**`[harness.ml_engineer] enabled = true`**).\n\n---\n\n{HARNESS_OVERLAY}"
     )
 }
 
 const SYNTHETIC_SKILL_REL_PREFIX: &str = "workspace/skills/synthetic-dataset-with-afterimage";
-const KERNEL_PORTING_SKILL_REL_PREFIX: &str = "workspace/skills/kernel-porting";
-const AUTOTRAINESS_SKILL_REL_PREFIX: &str = "workspace/skills/autotrainess";
-const KERNEL_PORTING_PLUGIN_REL_PREFIX: &str = "workspace/.agents/plugins/kernel-porting";
-const AUTOTRAINESS_PLUGIN_REL_PREFIX: &str = "workspace/.agents/plugins/autotrainess";
-const KERNEL_AGENT_PROMPTS_REL_PREFIX: &str = "workspace/.agents/prompts";
-const KERNEL_REFERENCE_REL_PREFIX: &str = "workspace/kernels/reference";
-const KERNEL_BENCHMARKS_REL_PREFIX: &str = "workspace/benchmarks";
-
-fn write_embedded_plugin_trees(root: &Path, report: &mut BootstrapReport) -> Result<(), String> {
-    write_embedded_dir_recursive(
-        &ONBOARD_KERNEL_PORTING_PLUGIN_DIR,
-        root,
-        KERNEL_PORTING_PLUGIN_REL_PREFIX,
-        Path::new(""),
-        report,
-    )?;
-    write_embedded_dir_recursive(
-        &ONBOARD_AUTOTRAINESS_PLUGIN_DIR,
-        root,
-        AUTOTRAINESS_PLUGIN_REL_PREFIX,
-        Path::new(""),
-        report,
-    )?;
-    Ok(())
-}
 
 fn write_embedded_synthetic_skill_tree(
     root: &Path,
@@ -629,99 +519,6 @@ fn write_embedded_synthetic_skill_tree(
         Path::new(""),
         report,
     )
-}
-
-fn write_embedded_kernel_porting_tree(
-    root: &Path,
-    report: &mut BootstrapReport,
-) -> Result<(), String> {
-    write_embedded_dir_recursive(
-        &ONBOARD_KERNEL_PORTING_SKILL_DIR,
-        root,
-        KERNEL_PORTING_SKILL_REL_PREFIX,
-        Path::new(""),
-        report,
-    )?;
-    write_embedded_dir_recursive(
-        &ONBOARD_KERNEL_AGENT_PROMPTS_DIR,
-        root,
-        KERNEL_AGENT_PROMPTS_REL_PREFIX,
-        Path::new(""),
-        report,
-    )?;
-    write_embedded_dir_recursive(
-        &ONBOARD_KERNEL_REFERENCE_DIR,
-        root,
-        KERNEL_REFERENCE_REL_PREFIX,
-        Path::new(""),
-        report,
-    )?;
-    write_embedded_dir_recursive(
-        &ONBOARD_KERNEL_BENCHMARKS_DIR,
-        root,
-        KERNEL_BENCHMARKS_REL_PREFIX,
-        Path::new(""),
-        report,
-    )?;
-    // Symlink-style copy: gpu_to_jax plan accessible at .agents/kernel-porting/
-    let plan_src = root.join(format!(
-        "{KERNEL_PORTING_SKILL_REL_PREFIX}/gpu_to_jax_plan.json"
-    ));
-    let plan_dest = root.join("workspace/.agents/kernel-porting/gpu_to_jax_plan.json");
-    if plan_src.exists() {
-        if let Some(parent) = plan_dest.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if !plan_dest.exists() && fs::copy(&plan_src, &plan_dest).is_ok() {
-            report.created.push(PathBuf::from(
-                "workspace/.agents/kernel-porting/gpu_to_jax_plan.json",
-            ));
-        }
-    }
-    let schema_src = root.join(format!(
-        "{KERNEL_PORTING_SKILL_REL_PREFIX}/map_elites.schema.json"
-    ));
-    let schema_dest = root.join("workspace/.agents/kernel-porting/map_elites.schema.json");
-    if schema_src.exists() {
-        if let Some(parent) = schema_dest.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if !schema_dest.exists() && fs::copy(&schema_src, &schema_dest).is_ok() {
-            report.created.push(PathBuf::from(
-                "workspace/.agents/kernel-porting/map_elites.schema.json",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn write_embedded_autotrainess_tree(
-    root: &Path,
-    report: &mut BootstrapReport,
-) -> Result<(), String> {
-    write_embedded_dir_recursive(
-        &ONBOARD_AUTOTRAINESS_SKILL_DIR,
-        root,
-        AUTOTRAINESS_SKILL_REL_PREFIX,
-        Path::new(""),
-        report,
-    )?;
-    // Convenience copy: iteration plan accessible at .agents/autotrainess/
-    let plan_src = root.join(format!(
-        "{AUTOTRAINESS_SKILL_REL_PREFIX}/iteration_plan.json"
-    ));
-    let plan_dest = root.join("workspace/.agents/autotrainess/iteration_plan.json");
-    if plan_src.exists() {
-        if let Some(parent) = plan_dest.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if !plan_dest.exists() && fs::copy(&plan_src, &plan_dest).is_ok() {
-            report.created.push(PathBuf::from(
-                "workspace/.agents/autotrainess/iteration_plan.json",
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn write_embedded_dir_recursive(
@@ -844,14 +641,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_config_toml_merge_api_and_terminal() {
+    fn build_merged_config_toml_applies_flag_overrides() {
         let o = OnboardOptions {
             api_enabled: Some(true),
             api_port: Some(9090),
             terminal_enable: Some(false),
             ..Default::default()
         };
-        let s = build_config_toml(&o).expect("toml");
+        let s = build_merged_config_toml(&o).expect("merged toml");
+        assert!(
+            s.contains("# Local stdin/stdout chat"),
+            "flag-driven merges keep template comments too (single engine, audit X7): {s}"
+        );
         let cfg: AppConfig = toml::from_str(&s).expect("parse back");
         let api = cfg.api.as_ref().expect("api section");
         assert_eq!(api.enabled, Some(true));
@@ -878,12 +679,12 @@ mod tests {
     }
 
     #[test]
-    fn build_config_toml_merge_preserves_ml_engineer_section() {
+    fn build_merged_config_toml_keeps_unmentioned_sections() {
         let o = OnboardOptions {
             api_enabled: Some(true),
             ..Default::default()
         };
-        let s = build_config_toml(&o).expect("toml");
+        let s = build_merged_config_toml(&o).expect("merged toml");
         assert!(
             s.contains("ml_engineer") && s.contains("enabled"),
             "merged config should still carry harness.ml_engineer from template: {s}"
@@ -891,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn build_interactive_config_toml_preserves_template_comments() {
+    fn build_merged_config_toml_preserves_template_comments() {
         let o = OnboardOptions {
             provider_name: Some("openai_compatible".to_string()),
             provider_model: Some("test-model".to_string()),
@@ -899,7 +700,7 @@ mod tests {
             provider_base_url: Some("https://example.com/v1/chat/completions".to_string()),
             ..Default::default()
         };
-        let s = build_interactive_config_toml(&o).expect("toml_edit merge");
+        let s = build_merged_config_toml(&o).expect("toml_edit merge");
         assert!(
             s.contains("# Local stdin/stdout chat"),
             "expected terminal section comment from template"
@@ -944,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn build_interactive_config_toml_known_provider_drops_base_url() {
+    fn build_merged_config_toml_known_provider_drops_base_url() {
         let o = OnboardOptions {
             provider_name: Some("gemini".to_string()),
             provider_model: Some("gemini-2.5-flash".to_string()),
@@ -952,7 +753,7 @@ mod tests {
             provider_base_url: None,
             ..Default::default()
         };
-        let s = build_interactive_config_toml(&o).expect("toml_edit merge");
+        let s = build_merged_config_toml(&o).expect("toml_edit merge");
         let doc: toml_edit::DocumentMut = s.parse().expect("parse merged toml");
         let provider = doc["provider"]
             .as_table()
@@ -969,7 +770,7 @@ mod tests {
     }
 
     #[test]
-    fn build_interactive_config_toml_openai_compatible_keeps_base_url() {
+    fn build_merged_config_toml_openai_compatible_keeps_base_url() {
         let o = OnboardOptions {
             provider_name: Some("openai_compatible".to_string()),
             provider_model: Some("custom-model".to_string()),
@@ -977,7 +778,7 @@ mod tests {
             provider_base_url: Some("https://my-relay.example/v1/chat/completions".to_string()),
             ..Default::default()
         };
-        let s = build_interactive_config_toml(&o).expect("toml_edit merge");
+        let s = build_merged_config_toml(&o).expect("toml_edit merge");
         let doc: toml_edit::DocumentMut = s.parse().expect("parse merged toml");
         let provider = doc["provider"].as_table().expect("[provider]");
         assert_eq!(
@@ -987,6 +788,41 @@ mod tests {
         assert_eq!(
             provider["base_url"].as_str(),
             Some("https://my-relay.example/v1/chat/completions"),
+        );
+    }
+
+    #[test]
+    fn template_feature_toggle_defaults_match_template() {
+        let derived = template_feature_toggle_defaults().expect("embedded template parses");
+        let expected = [
+            true,  // terminal.enabled
+            false, // slack.enabled
+            false, // email.enabled
+            false, // api.enabled
+            false, // api.serve_ui
+            false, // multi_tenant_edge.activity_heartbeat_enabled
+            false, // multi_tenant_edge.cron_scheduling_enabled
+            false, // jina.enabled
+            true,  // memory.enabled
+            true,  // harness.git_worktree.enabled
+            true,  // harness.subagents.enabled
+            false, // harness.ml_engineer.enabled (opt-in since audit X4)
+            true,  // harness.execution.enabled
+            true,  // harness.background_jobs.enabled
+            true,  // harness.notifications.enabled
+        ];
+        assert_eq!(
+            derived, expected,
+            "wizard toggle defaults must mirror assets/onboarding/config.toml (audit X7)"
+        );
+    }
+
+    #[test]
+    fn merged_config_without_overrides_roundtrips_template_verbatim() {
+        let s = build_merged_config_toml(&OnboardOptions::default()).expect("merge");
+        assert_eq!(
+            s, CONFIG_TEMPLATE,
+            "toml_edit roundtrip with no overrides should be lossless"
         );
     }
 }

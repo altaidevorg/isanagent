@@ -250,8 +250,6 @@ pub enum ExecutionMode {
     Serial,
     /// Environmental barrier that requires all preceding in-flight tools to finish before execution (e.g. git_worktree).
     Barrier,
-    /// Asynchronous, long-running job managed out of band (e.g. exec_background).
-    Background,
 }
 
 /// Metadata policy governing tool scheduling, execution mode, and default timeout caps.
@@ -289,13 +287,6 @@ impl ToolPolicy {
     pub fn barrier() -> Self {
         Self {
             execution_mode: ExecutionMode::Barrier,
-            timeout_secs: None,
-        }
-    }
-
-    pub fn background() -> Self {
-        Self {
-            execution_mode: ExecutionMode::Background,
             timeout_secs: None,
         }
     }

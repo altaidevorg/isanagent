@@ -10,15 +10,15 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::bus::BusMessage;
-use crate::channels::terminal::build_execution_stream_notice;
 use crate::execution::{
     persist_successful_execution_run, run_with_auto_promote, sanitize_session_segment,
     AdoptInflightRequest, AutoPromoteOutcome, CwdPolicy, ExecutionError, ExecutionHarness,
     ExecutionJobManager, InflightSyncRegistry, PersistSuccessfulExecutionRunParams, RunEvent,
     RunResult, RunSpec, SessionCreateRequest, SessionId, SpawnBackgroundRunRequest,
 };
+use crate::protocol::build_execution_stream_notice;
 use crate::tool_runtime::current_tool_exec_ctx;
-use crate::traits::Tool;
+use crate::traits::{Tool, ToolPolicy};
 
 fn exec_err(e: ExecutionError) -> String {
     e.to_string()
@@ -493,6 +493,9 @@ impl Tool for ExecutionRunBackgroundTool {
 
 pub struct ExecutionJobStatusTool {
     pub jobs: Arc<ExecutionJobManager>,
+    /// Audit X3: the other job plane. On a miss here we do a *real* lookup in
+    /// the host shell-exec registry instead of sniffing id prefixes.
+    pub exec_jobs: Option<crate::tools::exec_jobs::ExecJobRegistry>,
 }
 
 #[async_trait]
@@ -523,8 +526,18 @@ impl Tool for ExecutionJobStatusTool {
         let v = match self.jobs.job_status_json(job_id).await {
             Ok(v) => v,
             Err(e) => {
-                if job_id.starts_with("exec-") && !job_id.starts_with("exec-job-") {
-                    return Err(format!("Job ID '{job_id}' not found in ExecutionJobManager. It appears to be a host shell exec job — use `exec_status` instead."));
+                // Audit X3: real cross-plane lookup replaces prefix sniffing.
+                // Rendering the shell-exec plane here would duplicate
+                // `exec_status`; a precise redirect keyed on an actual hit is
+                // the honest router behavior.
+                if let Some(reg) = &self.exec_jobs {
+                    if reg.get_job(job_id).is_some() {
+                        return Err(format!(
+                            "Job ID '{job_id}' not found in ExecutionJobManager, but it IS a \
+                             live host shell exec job — call `exec_status` with \
+                             command_id=\"{job_id}\"."
+                        ));
+                    }
                 }
                 return Err(e);
             }
@@ -590,11 +603,11 @@ impl Tool for ExecutionReadLogTool {
             "properties": {
                 "job_id": { "type": "string", "description": "The job ID to read logs from. Provide either this or run_id." },
                 "run_id": { "type": "string", "description": "The run ID to read logs from. Provide either this or job_id." },
-                "stream": { "type": "string", "enum": ["stdout", "stderr"], "description": "Which stream to read." },
+                "stream": { "type": "string", "enum": ["stdout", "stderr"], "description": "Which stream to read (defaults to \"stdout\")." },
                 "start_line": { "type": "integer", "description": "Starting line number (1-indexed, inclusive)" },
                 "end_line": { "type": "integer", "description": "Ending line number (1-indexed, inclusive)" }
             },
-            "required": ["stream", "start_line", "end_line"]
+            "required": ["start_line", "end_line"]
         })
     }
 
@@ -612,11 +625,17 @@ impl Tool for ExecutionReadLogTool {
             .and_then(|v| v.as_u64())
             .ok_or("Missing 'end_line' argument")?;
 
+        let job_supplied = args.get("job_id").and_then(|v| v.as_str());
+        let run_supplied = args.get("run_id").and_then(|v| v.as_str());
+        if job_supplied.is_some() && run_supplied.is_some() {
+            return Err("Provide either job_id or run_id, not both".to_string());
+        }
+
         let run_id;
         let mut sid = None;
         let mut prov = None;
 
-        if let Some(jid) = args.get("job_id").and_then(|v| v.as_str()) {
+        if let Some(jid) = job_supplied {
             if let Some(job) = self.jobs.get(jid) {
                 run_id = job.run_id.clone();
                 sid = Some(job.session_id.to_string());
@@ -629,7 +648,7 @@ impl Tool for ExecutionReadLogTool {
             } else {
                 return Err(format!("Job not found: {jid}"));
             }
-        } else if let Some(run) = args.get("run_id").and_then(|v| v.as_str()) {
+        } else if let Some(run) = run_supplied {
             run_id = run.to_string();
         } else {
             return Err("Must provide either job_id or run_id".to_string());
@@ -684,14 +703,8 @@ impl Tool for ExecutionReadLogTool {
 
         let mut reader = BufReader::new(file);
 
-        let start = start_line.max(1) as usize;
-        let end = end_line as usize;
-
-        if end < start {
-            return Err("end_line must be greater than or equal to start_line".to_string());
-        }
-
-        let actual_end = start + 99.min(end - start);
+        // Audit X3-tail: shared window arithmetic (validate + 100-line cap).
+        let (start, actual_end) = crate::utils::resolve_line_window(start_line, end_line, 100)?;
 
         let mut lines = Vec::new();
         let mut current_line = 1;
@@ -999,6 +1012,11 @@ impl Tool for ExecutionEnvInfoTool {
         "Return provider capability summary. For local execution, also runs python_executable -V on the agent host (best effort). For jupyter, that probe is still the host interpreter (sanity check only); the kernel Python environment is whatever the Jupyter server started for that kernelspec. For ssh, the probe is still the agent host interpreter (not the remote remote_python)."
     }
 
+    fn policy(&self) -> ToolPolicy {
+        // Read-only capability snapshot.
+        ToolPolicy::parallel()
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -1234,7 +1252,10 @@ mod tests {
             .expect("bg");
         let jv: Value = serde_json::from_str(&started).expect("json");
         let jid = jv["job_id"].as_str().expect("job_id");
-        let status_tool = ExecutionJobStatusTool { jobs: jobs.clone() };
+        let status_tool = ExecutionJobStatusTool {
+            jobs: jobs.clone(),
+            exec_jobs: None,
+        };
         let mut terminal = false;
         for _ in 0..80 {
             let s = status_tool
@@ -1338,7 +1359,10 @@ mod tests {
             .expect("job_id missing in envelope");
         // Drain the spawned job so the test does not leave background work running.
         for _ in 0..200 {
-            let st = ExecutionJobStatusTool { jobs: jobs.clone() };
+            let st = ExecutionJobStatusTool {
+                jobs: jobs.clone(),
+                exec_jobs: None,
+            };
             let s = st.execute(json!({ "job_id": jid })).await.expect("st");
             if s.contains("\"terminal\": true") {
                 break;
@@ -1427,7 +1451,10 @@ mod tests {
         let jv: Value = serde_json::from_str(&started).expect("json");
         let jid = jv["job_id"].as_str().expect("job_id");
         for _ in 0..80 {
-            let st = ExecutionJobStatusTool { jobs: jobs.clone() };
+            let st = ExecutionJobStatusTool {
+                jobs: jobs.clone(),
+                exec_jobs: None,
+            };
             let s = st.execute(json!({ "job_id": jid })).await.expect("st");
             if s.contains("\"terminal\": true") {
                 assert!(s.contains("Unit test background label"));
@@ -1497,7 +1524,10 @@ mod tests {
             .execute(json!({ "job_id": jid }))
             .await
             .expect("cancel");
-        let status_tool = ExecutionJobStatusTool { jobs };
+        let status_tool = ExecutionJobStatusTool {
+            jobs,
+            exec_jobs: None,
+        };
         let mut saw = false;
         for _ in 0..120 {
             let s = status_tool
@@ -1513,6 +1543,122 @@ mod tests {
         assert!(saw, "expected terminal non-success after cancel");
         let close = ExecutionSessionCloseTool { harness };
         close.execute(json!({ "session_id": sid })).await.unwrap();
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn execution_read_log_reads_persisted_journal_streams() {
+        // Regression (audit C1): run journals must persist stdout.txt/stderr.txt so
+        // `execution_read_log` can page through them. Previously nothing wrote those
+        // files and every read failed with "Log file not found".
+        let (ws, dir) = temp_dirs();
+        let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
+        let prov: Arc<dyn crate::execution::ExecutionProvider> =
+            Arc::new(crate::execution::LocalExecutionProvider::new(cfg).expect("local provider"));
+        let harness = Arc::new(ExecutionHarness::new(
+            prov,
+            "python",
+            ws.clone(),
+            dir.clone(),
+            ArtifactLimits::default(),
+            60,
+            3600,
+            0,
+        ));
+
+        let sid = SessionId::new("sess-readlog");
+        let stdout: String = (1..=250).map(|i| format!("out-{i:03}\n")).collect();
+        let result = RunResult::new(stdout, "err-001\nerr-002\nerr-003\n".to_string(), Some(0));
+        crate::execution::write_run_journal(crate::execution::RunJournalParams {
+            workspace_dir: &ws,
+            provider_id: "local",
+            session_id: &sid,
+            run_id: "run-readlog",
+            code: "demo",
+            result: &result,
+            jupyter_kernel_id: None,
+            jupyter_notebook_path: None,
+            started_rfc3339: "t0",
+            finished_rfc3339: "t1",
+            duration_ms: 1,
+        })
+        .await
+        .expect("journal write");
+
+        let (otx, _orx) = mpsc::channel::<BusMessage>(8);
+        let jobs = Arc::new(ExecutionJobManager::new(harness.clone(), otx, None, false));
+        let tool = ExecutionReadLogTool { jobs, harness };
+
+        // Windowed stderr read via the run_id-only lookup path (scans the journal tree).
+        let out = tool
+            .execute(json!({
+                "run_id": "run-readlog",
+                "stream": "stderr",
+                "start_line": 2,
+                "end_line": 3
+            }))
+            .await
+            .expect("read stderr window");
+        assert!(
+            out.contains("err-002") && out.contains("err-003") && !out.contains("err-001"),
+            "unexpected window: {out}"
+        );
+
+        // Requests spanning >100 lines are capped at 100 lines per call.
+        let capped = tool
+            .execute(json!({
+                "run_id": "run-readlog",
+                "stream": "stdout",
+                "start_line": 101,
+                "end_line": 250
+            }))
+            .await
+            .expect("read capped window");
+        assert!(capped.contains("out-101"), "missing first line: {capped}");
+        assert!(capped.contains("out-200"), "missing cap boundary: {capped}");
+        assert!(!capped.contains("out-201"), "cap not enforced: {capped}");
+
+        // Exactly one of job_id / run_id must be supplied.
+        let both = tool
+            .execute(json!({"job_id": "j", "run_id": "r", "start_line": 1, "end_line": 2}))
+            .await;
+        assert!(both.is_err(), "expected rejection when both ids provided");
+        let neither = tool.execute(json!({"start_line": 1, "end_line": 2})).await;
+        assert!(neither.is_err(), "expected rejection when no id provided");
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn execution_read_log_parameters_schema_is_standard_object() {
+        let (ws, dir) = temp_dirs();
+        let cfg = crate::execution::LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
+        let prov: Arc<dyn crate::execution::ExecutionProvider> =
+            Arc::new(crate::execution::LocalExecutionProvider::new(cfg).expect("local provider"));
+        let harness = Arc::new(ExecutionHarness::new(
+            prov,
+            "python",
+            ws.clone(),
+            dir.clone(),
+            ArtifactLimits::default(),
+            60,
+            3600,
+            0,
+        ));
+        let (otx, _orx) = mpsc::channel::<BusMessage>(8);
+        let jobs = Arc::new(ExecutionJobManager::new(harness.clone(), otx, None, false));
+        let tool = ExecutionReadLogTool { jobs, harness };
+        let params = tool.parameters();
+        assert_eq!(params["type"], "object");
+        assert!(params.get("anyOf").is_none());
+        assert!(params.get("oneOf").is_none());
+        assert!(params.get("allOf").is_none());
+        let props = params["properties"].as_object().unwrap();
+        assert!(props.contains_key("job_id"));
+        assert!(props.contains_key("run_id"));
+        assert!(props.contains_key("stream"));
+        assert!(props.contains_key("start_line"));
+        assert!(props.contains_key("end_line"));
         let _ = std::fs::remove_dir_all(&ws);
     }
 }

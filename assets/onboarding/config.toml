@@ -5,6 +5,11 @@ max_iterations = 999
 max_tool_output_chars = 20000
 max_web_tool_output_chars = 50000
 
+# Opt-in ML research tools (`arxiv_search`, `arxiv_fetch`, `hf_hub_file_fetch`). Default false:
+# general-purpose hosts stay tool-neutral; set true for research/ML workloads (audit X4).
+# When disabled, built-in agents also omit arXiv tools from their allowlists.
+# ml_domain_enabled = false
+
 # Local stdin/stdout chat. Set enabled = false for API-only or headless runs (requires another channel).
 # While a reply is in flight, further lines are queued (FIFO per chat). Use /cancel or /stop to abort
 # the current turn and discard queued prompts (see /help in the TUI).
@@ -15,34 +20,30 @@ enabled = true
 # Use `/model` in the TUI to switch between them at runtime.
 #
 # Family format: list all models under one provider block. The map key is used as provider_name.
-# API key resolution: $<PROVIDER>_API_KEY env var first, then inline `api_key` as fallback.
+# API keys are securely loaded from:
+#   1. Environment variable ($<PROVIDER>_API_KEY or explicit `api_key_env`)
+#   2. OS Keychain (managed automatically via `/model` or `/key <provider>` in the TUI / altai-app)
 #
 [providers.gemini]
 models = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-3.1-pro", "gemini-3.1-flash-lite"]
-api_key = "<changethis>"
 
 [providers.openai]
 models = ["gpt-5.5", "gpt-5.5-instant", "gpt-5.4-mini", "gpt-5.4-nano", "o3", "o4-mini"]
-api_key = "<changethis>"
 
 [providers.anthropic]
 models = ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"]
-api_key = "<changethis>"
 
 [providers.deepseek]
 models = ["deepseek-v4-pro", "deepseek-v4-flash"]
-api_key = "<changethis>"
 
-# [providers.openrouter]
-# models = ["anthropic/claude-opus-4-7", "openai/gpt-5.5", "google/gemini-3.1-pro"]
-# # Uses $OPENROUTER_API_KEY
-#
+[providers.openrouter]
+models = ["anthropic/claude-opus-4-7", "openai/gpt-5.5", "google/gemini-3.1-pro", "stealth/ox-alpha"]
+
 # Custom endpoint (legacy per-model format):
 # [providers.my-proxy]
 # provider_name = "openai_compatible"
 # model_name = "my-model"
 # base_url = "https://my-proxy.example/v1/chat/completions"
-# api_key = "sk-..."
 
 [slack]
 enabled = false
@@ -85,12 +86,11 @@ enabled = true
 short_term_threshold_turns = 20
 short_term_threshold_tokens = 100000
 short_term_threshold_mins = 15
-long_term_interval_mins = 360
 long_term_threshold_summaries = 5
 max_recent_summaries = 5
 
 # Registers the `git_worktree` tool (list / add / remove). Paths stay inside the sandbox unless you
-# set allow_path_outside_sandbox = true. See docs/harness-implementation-plan.md Phase 4.
+# set allow_path_outside_sandbox = true.
 [harness.git_worktree]
 enabled = true
 
@@ -100,26 +100,7 @@ enabled = true
 # allowed_tools = ["read_file", "glob_files", "search_text", "edit_file"]  # omit = all tools except nested_spawn/plan
 # wake_on_completion = true    # default true: auto-notify parent when a subagent finishes
 # task_history_retention = 200 # default 200: max completed tasks retained in SQLite per parent chat
-
-# Named agents (Phase 5b): specialized sub-agents with per-agent system prompts, tool sets,
-# and optional model/temperature overrides. When no agents are defined, three built-in
-# defaults are auto-registered: researcher, coder, evaluator.
-#
-# [agents.researcher]
-# description = "Research topics, find papers, and gather context from web and files"
-# allowed_tools = ["web_search", "web_fetch", "arxiv_search", "arxiv_fetch", "read_file", "search_text"]
-# temperature = 0.1
-#
-# [agents.coder]
-# description = "Implement code changes, write tests, refactor, and fix bugs"
-# # allowed_tools omitted = inherit harness allowlist
-# temperature = 0.2
-#
-# [agents.evaluator]
-# description = "Review code, find bugs, assess quality, and audit changes"
-# allowed_tools = ["read_file", "search_text", "glob_files", "list_dir", "web_search"]
-# temperature = 0.0
-# hidden = false
+# Note: Specialized subagents are defined in the [agents.*] section at the bottom of this file.
 
 # Shell policy for `exec` safety. mode applies to interactive sessions; unattended_default applies
 # when inbound metadata indicates autonomous/headless execution.
@@ -128,9 +109,10 @@ mode = "ask"                # ask | deny | allow
 unattended_default = "allow" # ask | deny | allow
 # interactive_requires_approval_for = ["rm -rf", "git reset --hard"]
 
-# ML policy overlay (embedded in the isanagent binary when enabled). Reference copy: workspace/ML_ENGINEER_OVERLAY.md (onboard). Optional rules merge: workspace/ML_POLICY.md
+# ML policy overlay (embedded in the isanagent binary when enabled). Reference copy: workspace/ML_ENGINEER_OVERLAY.md (onboard). Optional rules merge: workspace/ML_POLICY.md.
+# Opt-in (audit X4): enable only for ML-focused workspaces; the general-purpose default is false.
 [harness.ml_engineer]
-enabled = true
+enabled = false
 # subagent_research_overlay = false  # default true when enabled: extra research instructions for sub-agents only
 # forbid_final_without_tools = true   # default false: require at least one tool call before ending a reasoning step (also overridable via inbound metadata isanagent_autonomous_forbid_final_without_tools)
 
@@ -181,25 +163,13 @@ kernel_name = "python3"
 # identity_file = "~/.ssh/id_ed25519"
 # remote_workdir = "/tmp/isanagent-exec"
 # remote_python = "python3"
-# accept_unknown_host_keys = true
+# accept_unknown_host_keys = false
 
-# MaxEvolve kernel porting (Triton→Pallas). See docs/kernel-porting-user-guide.md
-[harness.kernel_porting]
-enabled = true
-default_project_root = "kernels/projects"
-map_elites_schema = ".agents/kernel-porting/map_elites.schema.json"
-max_archive_entries = 500
-mutation_batch_size = 4
-
-[harness.autotrainess]
-enabled = true
-default_project_root = "train/projects"
-max_log_entries = 500
-
-# MaxEvolve named agents (defining [agents.*] replaces built-in researcher/coder/evaluator defaults)
+# Named agents (defining [agents.*] replaces built-in researcher/coder/evaluator defaults)
 [agents.researcher]
 description = "Research topics, find papers, and gather context from web and files"
-allowed_tools = ["web_search", "web_fetch", "arxiv_search", "arxiv_fetch", "read_file", "search_text", "glob_files", "list_dir"]
+# With ml_domain_enabled = true you can add "arxiv_search", "arxiv_fetch" here.
+allowed_tools = ["web_search", "web_fetch", "read_file", "search_text", "glob_files", "list_dir"]
 temperature = 0.1
 
 [agents.coder]
@@ -210,102 +180,3 @@ temperature = 0.2
 description = "Review code, find bugs, assess quality, and audit changes"
 allowed_tools = ["read_file", "search_text", "glob_files", "list_dir", "web_search", "web_fetch"]
 temperature = 0.0
-
-[agents.kernel_orchestrator]
-description = "Coordinates MaxEvolve Triton→Pallas porting and evolution pipeline"
-system_prompt_file = ".agents/prompts/kernel_orchestrator.md"
-allowed_tools = ["subagent_spawn", "subagent_plan_execute", "task_dashboard", "task_list", "task_get", "agent_list", "todo_write", "read_file", "write_file", "ask_user", "load_skill_instructions", "kernel_db_init", "kernel_db_status"]
-temperature = 0.2
-max_iterations = 40
-
-[agents.plan_kernel]
-description = "Creates Pallas optimization plans before implementation"
-system_prompt_file = ".agents/prompts/plan_kernel.md"
-allowed_tools = ["read_file", "write_file", "search_text", "glob_files", "web_search", "web_fetch", "arxiv_search", "arxiv_fetch"]
-temperature = 0.1
-
-[agents.gpu_to_jax]
-description = "12-step GPU/Triton→JAX Pallas conversion pipeline step executor"
-system_prompt_file = ".agents/prompts/gpu_to_jax.md"
-allowed_tools = ["read_file", "write_file", "edit_file", "search_text", "execution_session_create", "execution_run", "execution_env_info", "load_skill_instructions"]
-temperature = 0.1
-max_iterations = 25
-
-[agents.implement_kernel]
-description = "Implements or repairs Pallas kernels from approved plans"
-system_prompt_file = ".agents/prompts/implement_kernel.md"
-allowed_tools = ["read_file", "write_file", "edit_file", "execution_session_create", "execution_run"]
-temperature = 0.1
-
-[agents.test_generator]
-description = "Generates pytest correctness suites with interpret=True"
-system_prompt_file = ".agents/prompts/test_generator.md"
-allowed_tools = ["read_file", "write_file", "edit_file", "execution_run"]
-temperature = 0.1
-
-[agents.test_runner]
-description = "Runs correctness validation gate"
-system_prompt_file = ".agents/prompts/test_runner.md"
-allowed_tools = ["read_file", "execution_session_create", "execution_run", "execution_run_background", "execution_job_status", "execution_job_result"]
-temperature = 0.0
-
-[agents.kernel_profiler]
-description = "Hardware profiling via execution harness and colab-cli"
-system_prompt_file = ".agents/prompts/kernel_profiler.md"
-allowed_tools = ["read_file", "write_file", "execution_session_create", "execution_run", "execution_run_background", "execution_job_status", "execution_job_result", "exec", "load_skill_instructions"]
-temperature = 0.0
-
-[agents.kernel_mutator]
-description = "MAP-Elites mutation operator for scheduling parameters"
-system_prompt_file = ".agents/prompts/kernel_mutator.md"
-allowed_tools = ["read_file", "write_file", "edit_file", "kernel_db_sample"]
-temperature = 0.3
-
-[agents.evolve_orchestrator]
-description = "Runs evolutionary MAP-Elites optimization loop"
-system_prompt_file = ".agents/prompts/evolve_orchestrator.md"
-allowed_tools = ["subagent_spawn", "task_dashboard", "todo_write", "read_file", "kernel_db_sample", "kernel_db_insert", "kernel_db_status", "execution_run_background", "execution_job_status", "execution_job_result", "load_skill_instructions"]
-temperature = 0.2
-max_iterations = 50
-
-[agents.kernel_explainer]
-description = "Explains TPU/Pallas concepts for HITL sessions"
-system_prompt_file = ".agents/prompts/kernel_explainer.md"
-allowed_tools = ["read_file", "search_text", "web_search", "web_fetch", "arxiv_search", "arxiv_fetch"]
-temperature = 0.2
-hidden = true
-
-# AutoTrainess named agents
-[agents.train_orchestrator]
-description = "Coordinates AutoTrainess autonomous post-training loop (plan→data→train→eval→log)"
-system_prompt_file = ".agents/prompts/train_orchestrator.md"
-allowed_tools = ["subagent_spawn", "subagent_plan_execute", "task_dashboard", "task_list", "task_get", "agent_list", "todo_write", "read_file", "write_file", "ask_user", "load_skill_instructions", "train_db_init", "train_db_append", "train_db_list", "train_db_status", "train_db_get"]
-temperature = 0.2
-max_iterations = 40
-
-[agents.train_planner]
-description = "Plans the next AutoTrainess experiment iteration from prior evidence"
-system_prompt_file = ".agents/prompts/train_planner.md"
-allowed_tools = ["read_file", "write_file", "search_text", "glob_files", "list_dir", "web_search", "web_fetch", "arxiv_search", "arxiv_fetch", "train_db_list", "train_db_status", "train_db_get"]
-temperature = 0.1
-
-[agents.data_prep]
-description = "Selects, constructs, and validates benchmark-aligned training data"
-system_prompt_file = ".agents/prompts/data_prep.md"
-allowed_tools = ["read_file", "write_file", "edit_file", "search_text", "glob_files", "list_dir", "web_search", "web_fetch", "execution_session_create", "execution_run", "execution_env_info", "load_skill_instructions"]
-temperature = 0.1
-max_iterations = 30
-
-[agents.trainer]
-description = "Runs LlamaFactory SFT/RL and exports final_model/"
-system_prompt_file = ".agents/prompts/trainer.md"
-allowed_tools = ["read_file", "write_file", "edit_file", "execution_session_create", "execution_run", "execution_run_background", "execution_job_status", "execution_job_result", "execution_env_info", "load_skill_instructions"]
-temperature = 0.1
-max_iterations = 25
-
-[agents.train_evaluator]
-description = "Runs real benchmark evaluation and failure-mode diagnosis"
-system_prompt_file = ".agents/prompts/train_evaluator.md"
-allowed_tools = ["read_file", "write_file", "edit_file", "search_text", "glob_files", "execution_session_create", "execution_run", "execution_run_background", "execution_job_status", "execution_job_result", "load_skill_instructions"]
-temperature = 0.0
-max_iterations = 25

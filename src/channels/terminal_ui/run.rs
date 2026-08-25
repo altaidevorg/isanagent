@@ -27,7 +27,15 @@ use crate::channels::terminal_ui::panes::{
     executions_output_paragraph, extract_selection_text, tool_history_paragraph,
     transcript_paragraph,
 };
-use crate::channels::terminal_ui::protocol::{
+use crate::channels::terminal_ui::text_format::truncate_chars_display;
+use crate::channels::terminal_ui::{
+    execution_browser, uses_ansi_color, AgentTaskStatus, App, Cell, JobStripStatus, ModelSelector,
+    ModelSelectorStage, TerminalUiFocus, Theme, ToastKind, ToolNoticePhase, ToolRailEntry,
+    TranscriptSelection,
+};
+use crate::clarification::{METADATA_CLARIFICATION, METADATA_CLARIFICATION_CHOICES};
+use crate::memory::{chat_id_from_root_thread_id, MemoryMessage, SharedReply};
+use crate::protocol::{
     ISANAGENT_AGENT_THOUGHT, ISANAGENT_BACKGROUND_JOB_FINISHED, ISANAGENT_BACKGROUND_JOB_STARTED,
     ISANAGENT_EXECUTION_JOB, ISANAGENT_EXECUTION_JOB_STARTED, ISANAGENT_EXECUTION_STREAM,
     ISANAGENT_LLM_RETRY_AVAILABLE, ISANAGENT_SUBAGENT_TASK_FINISHED,
@@ -40,13 +48,6 @@ use crate::channels::terminal_ui::protocol::{
     METADATA_TOOL_CALL_ID, METADATA_TOOL_CALL_PREVIEW, METADATA_TOOL_NAME,
     METADATA_TOOL_RESULT_CHAR_COUNT, METADATA_TOOL_RESULT_PREVIEW,
 };
-use crate::channels::terminal_ui::text_format::truncate_chars_display;
-use crate::channels::terminal_ui::{
-    execution_browser, uses_ansi_color, AgentTaskStatus, App, Cell, JobStripStatus, ModelSelector,
-    TerminalUiFocus, Theme, ToastKind, ToolNoticePhase, ToolRailEntry, TranscriptSelection,
-};
-use crate::clarification::{METADATA_CLARIFICATION, METADATA_CLARIFICATION_CHOICES};
-use crate::memory::{chat_id_from_root_thread_id, MemoryMessage, SharedReply};
 use crate::NodeHandle;
 
 /// Second component of `execution_stream_label`: prefer model-provided description, else short id.
@@ -326,31 +327,22 @@ fn try_set_api_key(
         });
         return;
     };
-    cfg.api_key = Some(api_key.to_string());
     let provider_name = cfg.provider_name.clone();
     let model_name = cfg.model_name.clone();
     let resolved_url = cfg.resolved_base_url().unwrap_or_default();
-    let resolved_key = match cfg.resolve_api_key() {
-        Ok(k) => k,
-        Err(e) => {
-            app.cells.push(Cell::Error {
-                message: format!("Key was set, but could not resolve it for switching: {e}"),
-            });
-            return;
-        }
-    };
-    let masked = mask_api_key_suffix(&resolved_key);
+    let masked = mask_api_key_suffix(api_key);
 
-    match persist_provider_api_key(workspace_dir, config_key, api_key) {
+    match crate::credentials::set_provider_key(&provider_name, api_key) {
         Ok(()) => app.cells.push(Cell::System {
             message: format!(
-                "API key updated for '{config_key}' (ends in {masked}) and saved to config.toml."
+                "API key updated for '{provider_name}' (ends in {masked}) and securely saved in OS Keychain ({}).",
+                crate::credentials::KEYRING_SERVICE
             ),
         }),
         Err(e) => app.cells.push(Cell::System {
             message: format!(
-                "API key updated for '{config_key}' (ends in {masked}) for this session, but \
-                 could not persist to config.toml: {e}"
+                "API key updated for '{provider_name}' (ends in {masked}) for this session, but \
+                 could not save to OS Keychain: {e}"
             ),
         }),
     }
@@ -359,7 +351,7 @@ fn try_set_api_key(
         provider_name,
         model_name: model_name.clone(),
         base_url: resolved_url,
-        api_key: resolved_key,
+        api_key: api_key.to_string(),
     };
     if bus_tx.blocking_send(msg).is_err() {
         app.cells.push(Cell::System {
@@ -2462,52 +2454,194 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
             );
             // Model selector popup overlay.
             if let Some(selector) = &app.model_selector {
-                let popup_h = (selector.items.len() as u16 + 4).min(area.height.saturating_sub(4));
-                let popup_w = 50u16.min(area.width.saturating_sub(4));
-                let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
-                let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 2;
-                let popup_area = Rect::new(popup_x, popup_y, popup_w, popup_h);
+                match &selector.stage {
+                    ModelSelectorStage::ProviderSelect => {
+                        let popup_h = (selector.providers.len() as u16 + 4)
+                            .min(area.height.saturating_sub(4));
+                        let popup_w = 62u16.min(area.width.saturating_sub(4));
+                        let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
+                        let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 2;
+                        let popup_area = Rect::new(popup_x, popup_y, popup_w, popup_h);
 
-                f.render_widget(Clear, popup_area);
+                        f.render_widget(Clear, popup_area);
 
-                let inner_block = Block::default()
-                    .borders(Borders::ALL)
-                    .title(Span::styled(
-                        " Select Model (↑↓ Enter Esc) ",
-                        Theme::tool_call(),
-                    ))
-                    .border_style(Style::default().fg(Color::Cyan));
-                let inner = inner_block.inner(popup_area);
-                f.render_widget(inner_block, popup_area);
+                        let inner_block = Block::default()
+                            .borders(Borders::ALL)
+                            .title(Span::styled(
+                                " 1. Select LLM Provider (↑↓ Enter Esc) ",
+                                Theme::tool_call(),
+                            ))
+                            .border_style(Style::default().fg(Color::Cyan));
+                        let inner = inner_block.inner(popup_area);
+                        f.render_widget(inner_block, popup_area);
 
-                let visible_h = inner.height as usize;
-                let scroll_offset = if selector.selected >= visible_h {
-                    selector.selected - visible_h + 1
-                } else {
-                    0
-                };
+                        let visible_h = inner.height as usize;
+                        let scroll_offset = if selector.selected_provider >= visible_h {
+                            selector.selected_provider - visible_h + 1
+                        } else {
+                            0
+                        };
 
-                let mut lines: Vec<Line> = Vec::new();
-                for (i, entry) in selector
-                    .items
-                    .iter()
-                    .enumerate()
-                    .skip(scroll_offset)
-                    .take(visible_h)
-                {
-                    let marker = if i == selector.selected { "▶ " } else { "  " };
-                    let style = if i == selector.selected {
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::White)
-                    };
-                    let line_text = format!("{}{}", marker, entry.label);
-                    lines.push(Line::from(Span::styled(line_text, style)));
+                        let mut lines: Vec<Line> = Vec::new();
+                        for (i, entry) in selector
+                            .providers
+                            .iter()
+                            .enumerate()
+                            .skip(scroll_offset)
+                            .take(visible_h)
+                        {
+                            let marker = if i == selector.selected_provider {
+                                "▶ "
+                            } else {
+                                "  "
+                            };
+                            let style = if i == selector.selected_provider {
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(Color::White)
+                            };
+                            let status_badge = if entry.has_key {
+                                Span::styled(
+                                    " [Key: Configured]",
+                                    Style::default().fg(Color::Green),
+                                )
+                            } else {
+                                Span::styled(
+                                    " [Key: Prompt on select]",
+                                    Style::default().fg(Color::Yellow),
+                                )
+                            };
+                            lines.push(Line::from(vec![
+                                Span::styled(format!("{}{:<22}", marker, entry.label), style),
+                                status_badge,
+                            ]));
+                        }
+                        let list_para = Paragraph::new(Text::from(lines));
+                        f.render_widget(list_para, inner);
+                    }
+                    ModelSelectorStage::ApiKeyInput {
+                        provider_name,
+                        input,
+                        error,
+                    } => {
+                        let popup_h = 9u16.min(area.height.saturating_sub(4));
+                        let popup_w = 66u16.min(area.width.saturating_sub(4));
+                        let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
+                        let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 2;
+                        let popup_area = Rect::new(popup_x, popup_y, popup_w, popup_h);
+
+                        f.render_widget(Clear, popup_area);
+
+                        let inner_block = Block::default()
+                            .borders(Borders::ALL)
+                            .title(Span::styled(
+                                format!(" 2. Enter API Key for {provider_name} "),
+                                Theme::tool_call(),
+                            ))
+                            .border_style(Style::default().fg(Color::Yellow));
+                        let inner = inner_block.inner(popup_area);
+                        f.render_widget(inner_block, popup_area);
+
+                        let masked: String = if input.is_empty() {
+                            "<paste or type key here>".into()
+                        } else if input.len() <= 8 {
+                            "*".repeat(input.len())
+                        } else {
+                            format!(
+                                "{}...{}",
+                                &input[..3],
+                                &input[input.len().saturating_sub(4)..]
+                            )
+                        };
+
+                        let mut lines = vec![
+                            Line::from(Span::styled(
+                                format!(
+                                    "Key will be securely saved in OS Keychain ({}):",
+                                    crate::credentials::KEYRING_SERVICE
+                                ),
+                                Style::default().fg(Color::DarkGray),
+                            )),
+                            Line::from(""),
+                            Line::from(vec![
+                                Span::styled(
+                                    "Key: ",
+                                    Style::default()
+                                        .fg(Color::Cyan)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(masked, Style::default().fg(Color::White)),
+                            ]),
+                            Line::from(""),
+                        ];
+                        if let Some(err) = error {
+                            lines.push(Line::from(Span::styled(
+                                err.as_str(),
+                                Style::default().fg(Color::Red),
+                            )));
+                        } else {
+                            lines.push(Line::from(Span::styled(
+                                "[Enter: Save & Continue | Esc: Back]",
+                                Style::default().fg(Color::DarkGray),
+                            )));
+                        }
+                        let para = Paragraph::new(Text::from(lines));
+                        f.render_widget(para, inner);
+                    }
+                    ModelSelectorStage::ModelSelect {
+                        provider_name,
+                        models,
+                        selected_model,
+                    } => {
+                        let popup_h = (models.len() as u16 + 4).min(area.height.saturating_sub(4));
+                        let popup_w = 62u16.min(area.width.saturating_sub(4));
+                        let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
+                        let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 2;
+                        let popup_area = Rect::new(popup_x, popup_y, popup_w, popup_h);
+
+                        f.render_widget(Clear, popup_area);
+
+                        let inner_block = Block::default()
+                            .borders(Borders::ALL)
+                            .title(Span::styled(
+                                format!(" 3. Select Model for {provider_name} (↑↓ Enter Esc) "),
+                                Theme::tool_call(),
+                            ))
+                            .border_style(Style::default().fg(Color::Cyan));
+                        let inner = inner_block.inner(popup_area);
+                        f.render_widget(inner_block, popup_area);
+
+                        let visible_h = inner.height as usize;
+                        let scroll_offset = if *selected_model >= visible_h {
+                            *selected_model - visible_h + 1
+                        } else {
+                            0
+                        };
+
+                        let mut lines: Vec<Line> = Vec::new();
+                        for (i, entry) in models
+                            .iter()
+                            .enumerate()
+                            .skip(scroll_offset)
+                            .take(visible_h)
+                        {
+                            let marker = if i == *selected_model { "▶ " } else { "  " };
+                            let style = if i == *selected_model {
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(Color::White)
+                            };
+                            let line_text = format!("{}{}", marker, entry.label);
+                            lines.push(Line::from(Span::styled(line_text, style)));
+                        }
+                        let list_para = Paragraph::new(Text::from(lines));
+                        f.render_widget(list_para, inner);
+                    }
                 }
-                let list_para = Paragraph::new(Text::from(lines));
-                f.render_widget(list_para, inner);
             }
 
             // Slash command hint popup (shown when input starts with "/" and no model selector).
@@ -2582,39 +2716,135 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 // Model selector popup intercepts all keys when active.
-                if app.model_selector.is_some() {
-                    match key.code {
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            if let Some(sel) = &mut app.model_selector {
-                                sel.move_up();
+                if let Some(sel) = &mut app.model_selector {
+                    match &mut sel.stage {
+                        ModelSelectorStage::ProviderSelect => match key.code {
+                            KeyCode::Up | KeyCode::Char('k') => sel.move_up(),
+                            KeyCode::Down | KeyCode::Char('j') => sel.move_down(),
+                            KeyCode::Enter => {
+                                if let Some(provider_entry) =
+                                    sel.providers.get(sel.selected_provider)
+                                {
+                                    let provider_name = provider_entry.name.clone();
+                                    let has_key = provider_entry.has_key;
+                                    if has_key || provider_name == "ollama" {
+                                        let models = ModelSelector::build_models_for_provider(
+                                            &provider_name,
+                                            &providers,
+                                        );
+                                        sel.stage = ModelSelectorStage::ModelSelect {
+                                            provider_name,
+                                            models,
+                                            selected_model: 0,
+                                        };
+                                    } else {
+                                        sel.stage = ModelSelectorStage::ApiKeyInput {
+                                            provider_name,
+                                            input: String::new(),
+                                            error: None,
+                                        };
+                                    }
+                                }
                             }
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            if let Some(sel) = &mut app.model_selector {
-                                sel.move_down();
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                app.model_selector = None;
                             }
-                        }
-                        KeyCode::Enter => {
-                            let selection = app
-                                .model_selector
-                                .as_ref()
-                                .and_then(|s| s.selected_entry().map(|e| e.config_key.clone()));
-                            app.model_selector = None;
-                            if let Some(config_key) = selection {
-                                try_switch_model(
-                                    &mut app,
-                                    &bus_tx,
-                                    &providers,
-                                    &workspace_dir,
-                                    &config_key,
-                                    &mut active_provider_key,
-                                );
+                            _ => {}
+                        },
+                        ModelSelectorStage::ApiKeyInput {
+                            provider_name,
+                            input,
+                            error,
+                        } => match key.code {
+                            KeyCode::Char(c) => {
+                                input.push(c);
+                                *error = None;
                             }
-                        }
-                        KeyCode::Esc | KeyCode::Char('q') => {
-                            app.model_selector = None;
-                        }
-                        _ => {}
+                            KeyCode::Backspace => {
+                                input.pop();
+                                *error = None;
+                            }
+                            KeyCode::Enter => {
+                                let trimmed = input.trim().to_string();
+                                if trimmed.is_empty() {
+                                    *error = Some("API key cannot be empty".to_string());
+                                } else {
+                                    let p_name = provider_name.clone();
+                                    match crate::credentials::set_provider_key(&p_name, &trimmed) {
+                                        Ok(()) => {
+                                            if let Some(p) =
+                                                sel.providers.get_mut(sel.selected_provider)
+                                            {
+                                                p.has_key = true;
+                                            }
+                                            let models = ModelSelector::build_models_for_provider(
+                                                &p_name, &providers,
+                                            );
+                                            sel.stage = ModelSelectorStage::ModelSelect {
+                                                provider_name: p_name,
+                                                models,
+                                                selected_model: 0,
+                                            };
+                                        }
+                                        Err(e) => {
+                                            *error = Some(format!("Error saving key: {e}"));
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Esc => {
+                                sel.stage = ModelSelectorStage::ProviderSelect;
+                            }
+                            _ => {}
+                        },
+                        ModelSelectorStage::ModelSelect {
+                            provider_name,
+                            models,
+                            selected_model,
+                        } => match key.code {
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if *selected_model > 0 {
+                                    *selected_model -= 1;
+                                }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if *selected_model + 1 < models.len() {
+                                    *selected_model += 1;
+                                }
+                            }
+                            KeyCode::Enter => {
+                                let chosen = models.get(*selected_model).cloned();
+                                let p_name = provider_name.clone();
+                                app.model_selector = None;
+                                if let Some(entry) = chosen {
+                                    if !providers.contains_key(&entry.config_key) {
+                                        providers.insert(
+                                            entry.config_key.clone(),
+                                            crate::config::ProviderConfig {
+                                                provider_name: p_name,
+                                                model_name: entry.model_name.clone(),
+                                                models: None,
+                                                api_key_env: String::new(),
+                                                api_key: None,
+                                                base_url: None,
+                                            },
+                                        );
+                                    }
+                                    try_switch_model(
+                                        &mut app,
+                                        &bus_tx,
+                                        &providers,
+                                        &workspace_dir,
+                                        &entry.config_key,
+                                        &mut active_provider_key,
+                                    );
+                                }
+                            }
+                            KeyCode::Esc => {
+                                sel.stage = ModelSelectorStage::ProviderSelect;
+                            }
+                            _ => {}
+                        },
                     }
                     continue;
                 }
@@ -3016,9 +3246,15 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 continue;
                             }
                             if text.eq_ignore_ascii_case("/model")
+                                || text.eq_ignore_ascii_case("/models")
                                 || text.to_ascii_lowercase().starts_with("/model ")
+                                || text.to_ascii_lowercase().starts_with("/models ")
                             {
-                                let arg = text.strip_prefix("/model").unwrap_or("").trim();
+                                let arg = text
+                                    .strip_prefix("/models")
+                                    .or_else(|| text.strip_prefix("/model"))
+                                    .unwrap_or("")
+                                    .trim();
                                 if arg.is_empty() {
                                     // Open interactive model selector popup
                                     if providers.is_empty() {

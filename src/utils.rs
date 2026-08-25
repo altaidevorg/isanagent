@@ -4,6 +4,68 @@ use serde_json::json;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
+/// Rotation threshold for always-on JSONL audit logs (audit R1): when a log reaches
+/// this size it is renamed to `<name>.1` before the next append (one previous
+/// generation kept, older one overwritten).
+pub const JSONL_ROTATE_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Shared line-range arithmetic for ranged readers (`read_file`,
+/// `execution_read_log`). Audit X3-tail: single source of truth for the
+/// validate-and-clamp semantics so the two tools cannot drift apart.
+///
+/// Returns `(start, window_end_inclusive)` with `start` clamped to >= 1 and
+/// the window capped at `max_lines` entries. Callers still clamp
+/// `window_end` by the file's real line count.
+pub fn resolve_line_window(
+    start_line: u64,
+    end_line: u64,
+    max_lines: usize,
+) -> Result<(usize, usize), String> {
+    let start = start_line.max(1) as usize;
+    let end = end_line as usize;
+    if end < start {
+        return Err("end_line must be greater than or equal to start_line".to_string());
+    }
+    let count = (end - start + 1).min(max_lines);
+    Ok((start, start + count - 1))
+}
+
+/// Rename `path` to `<name>.1` if it is at or above `max_bytes`. Best-effort: errors
+/// are ignored so logging problems never break the caller's operation.
+pub async fn rotate_jsonl_if_large(path: &Path, max_bytes: u64) {
+    if let Ok(meta) = tokio::fs::metadata(path).await {
+        if meta.len() >= max_bytes {
+            let rotated = path.with_extension(format!(
+                "{}.1",
+                path.extension()
+                    .map(|e| e.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "log".to_string())
+            ));
+            let _ = tokio::fs::rename(path, &rotated).await;
+        }
+    }
+}
+
+/// Append one pre-serialized line to a JSONL log with bounded growth (audit R1):
+/// rotates the file via [`rotate_jsonl_if_large`] before appending when oversized.
+pub async fn append_jsonl_line(path: &Path, line: &str, max_bytes: u64) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    rotate_jsonl_if_large(path, max_bytes).await;
+    let mut f = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+        .map_err(|e| format!("jsonl open {}: {e}", path.display()))?;
+    f.write_all(line.as_bytes())
+        .await
+        .map_err(|e| format!("jsonl write: {e}"))?;
+    f.write_all(b"\n")
+        .await
+        .map_err(|e| format!("jsonl nl: {e}"))?;
+    Ok(())
+}
+
 /// Suffix after the human-readable runtime context line on user messages (see `agent` injection).
 /// API and previews strip through this marker so wording inside the `[RUNTIME CONTEXT]` line can evolve.
 pub const RUNTIME_CONTEXT_END_SUFFIX: &str = "\n---ISANAGENT_RUNTIME_CONTEXT_END---\n\n";
@@ -410,7 +472,21 @@ pub fn format_api_error(status: u16, body: &str, base_url: &str, model: &str) ->
             "({status}{code_tag}) Server error from provider while using model '{model}'. Try again later."
         ),
         _ => {
-            let detail = msg.unwrap_or_else(|| body.chars().take(200).collect());
+            let detail = if let Some(m) = &msg {
+                if let Some(err_obj) = parsed.as_ref().and_then(|p| p.get("error")) {
+                    if let Some(meta) = err_obj.get("metadata") {
+                        format!("{m} (metadata: {meta})")
+                    } else if let Some(d) = err_obj.get("details") {
+                        format!("{m} (details: {d})")
+                    } else {
+                        m.clone()
+                    }
+                } else {
+                    m.clone()
+                }
+            } else {
+                body.chars().take(500).collect()
+            };
             format!(
                 "({status}{code_tag}) API error for model '{model}': {detail}"
             )
@@ -528,6 +604,12 @@ impl LLMClient {
         let status = res.status();
         if !status.is_success() {
             let text = res.text().await.unwrap_or_default();
+            log::warn!(
+                "LLM Request to '{}' returned HTTP {}: {}",
+                self.model,
+                status,
+                text
+            );
             // PR-4: classify context-length overflow as a typed error so the
             // reasoning loop can compact-and-retry instead of bouncing the turn.
             if status == reqwest::StatusCode::BAD_REQUEST
@@ -727,7 +809,7 @@ pub fn normalize_sandbox_relative_input(workspace_dir: &Path, path: &str) -> Pat
 /// - the path escapes the sandbox via `../` traversal or absolute references
 ///   outside the sandbox directory, or
 /// - the path does not exist on disk (canonicalization requires existence).
-pub fn resolve_path(sandbox_dir: &Path, agent_path: &str) -> Option<PathBuf> {
+pub fn resolve_sandbox_path(sandbox_dir: &Path, agent_path: &str) -> Option<PathBuf> {
     // Canonicalize the sandbox root first so we can fail fast before touching
     // any user-supplied path data.
     let sandbox_canonical = sandbox_dir.canonicalize().ok()?;
@@ -1108,5 +1190,70 @@ mod tests {
             "read_file",
             &Ok("Error: line one of a log file".to_string())
         ));
+    }
+
+    #[test]
+    fn resolve_line_window_validates_and_caps() {
+        // Audit X3-tail: single shared semantics for read_file/execution_read_log.
+        assert_eq!(
+            crate::utils::resolve_line_window(1, 100, 100).unwrap(),
+            (1, 100)
+        );
+        // Wide request clamps to max_lines entries.
+        assert_eq!(
+            crate::utils::resolve_line_window(1, 500, 100).unwrap(),
+            (1, 100)
+        );
+        assert_eq!(
+            crate::utils::resolve_line_window(200, 450, 100).unwrap(),
+            (200, 299)
+        );
+        // start clamped up to 1; single-line window works.
+        assert_eq!(
+            crate::utils::resolve_line_window(0, 5, 100).unwrap(),
+            (1, 5)
+        );
+        assert_eq!(
+            crate::utils::resolve_line_window(7, 7, 100).unwrap(),
+            (7, 7)
+        );
+        // Inverted range rejected with the exact legacy error text.
+        let err = crate::utils::resolve_line_window(10, 5, 100).unwrap_err();
+        assert_eq!(err, "end_line must be greater than or equal to start_line");
+    }
+
+    #[tokio::test]
+    async fn append_jsonl_line_rotates_oversized_log() {
+        // Audit R1: JSONL audit logs must stay bounded. Crossing the cap rotates the
+        // current file to `<name>.1` (overwriting any previous generation) and the
+        // append continues into a fresh file.
+        let dir =
+            std::env::temp_dir().join(format!("isanagent-jsonl-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+
+        append_jsonl_line(&path, "line-1", 40).await.unwrap();
+        append_jsonl_line(&path, "line-2", 40).await.unwrap();
+        // The cap is checked before each append: after these writes the file holds
+        // 14 + 28 = 42 bytes, so the NEXT append crosses the 40-byte threshold and
+        // rotates first.
+        append_jsonl_line(&path, "line-3-is-longer-to-trigger", 40)
+            .await
+            .unwrap();
+        append_jsonl_line(&path, "line-4", 40).await.unwrap();
+
+        let rotated = dir.join("audit.jsonl.1");
+        assert!(rotated.exists(), "oversized log must be rotated");
+        let rotated_content = std::fs::read_to_string(&rotated).unwrap();
+        assert!(
+            rotated_content.contains("line-1")
+                && rotated_content.contains("line-2")
+                && rotated_content.contains("line-3"),
+            "rotated generation keeps earlier lines: {rotated_content:?}"
+        );
+        let current = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(current.trim(), "line-4");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -33,6 +33,29 @@ const MAX_DIFF_OUTPUT_LINES: usize = 80;
 /// Bound approval metadata so a large write cannot flood the UI event channel.
 const MAX_EDIT_APPROVAL_DIFF_CHARS: usize = 16_000;
 
+/// Audit X5: classify a legacy-adapter error message from the file/search tools
+/// into a stable root-cause code. These strings are our own constants in this
+/// file (not external output); this backs only the legacy `execute()` path so
+/// old callers keep working while the typed hook carries the precise code.
+fn classify_tool_error_message(message: &str) -> ToolErrorCode {
+    if message.starts_with("PermissionError") || message.starts_with("blocked by .isanagentignore")
+    {
+        ToolErrorCode::NotAllowed
+    } else if message.starts_with("Missing '")
+        || message.starts_with("old_text")
+        || message.starts_with("end_line")
+        || message.starts_with("Not a directory")
+        || message.contains("is not a directory")
+        || message.contains("Invalid")
+    {
+        ToolErrorCode::InvalidToolArguments
+    } else if message.contains("path not found") || message.contains("No such file") {
+        ToolErrorCode::NotFound
+    } else {
+        ToolErrorCode::ExecutionFailed
+    }
+}
+
 /// Resolves a path against the workspace and enforces boundary restrictions.
 pub fn resolve_path(path: &str, workspace_dir: &Path, restrict: bool) -> Result<PathBuf, String> {
     // 1. Expand naive relativity to the workspace dir. When restricted, resolve `.` / `..`
@@ -226,6 +249,19 @@ pub struct ReadFileTool {
 
 #[async_trait]
 impl Tool for ReadFileTool {
+    // Audit X5: native typed result — precise root-cause code, immune to prose
+    // reclassification at the registry boundary.
+    async fn execute_with_approved_mutation_typed(
+        &self,
+        args: Value,
+        _approved_preview: Option<&MutationPreview>,
+    ) -> ToolResult {
+        match self.execute(args).await {
+            Ok(content) => ToolResult::success(content),
+            Err(message) => ToolResult::error(classify_tool_error_message(&message), message),
+        }
+    }
+
     fn name(&self) -> &str {
         "read_file"
     }
@@ -282,14 +318,8 @@ impl Tool for ReadFileTool {
 
         let content = fs::read_to_string(&actual_path).map_err(|e| e.to_string())?;
 
-        let start = start_line.max(1) as usize;
-        let end = end_line as usize;
-
-        if end < start {
-            return Err("end_line must be greater than or equal to start_line".to_string());
-        }
-
-        let lines_to_read = (end - start + 1).min(100);
+        // Audit X3-tail: shared window arithmetic (validate + 100-line cap).
+        let (start, requested_end) = crate::utils::resolve_line_window(start_line, end_line, 100)?;
 
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
@@ -304,10 +334,9 @@ impl Tool for ReadFileTool {
             ));
         }
 
-        let actual_start = start;
-        let actual_end = (actual_start + lines_to_read - 1).min(total_lines);
+        let actual_end = requested_end.min(total_lines);
 
-        let snippet: Vec<String> = lines[actual_start - 1..actual_end]
+        let snippet: Vec<String> = lines[start - 1..actual_end]
             .iter()
             .map(|l| l.to_string())
             .collect();
@@ -323,6 +352,39 @@ pub struct WriteFileTool {
 
 #[async_trait]
 impl Tool for WriteFileTool {
+    // Audit X5: native typed result. The dispatcher calls this hook directly
+    // (bypassing the legacy adapter), so the approved-preview fingerprint check
+    // is replicated here rather than inherited via `execute_with_approved_mutation`.
+    async fn execute_with_approved_mutation_typed(
+        &self,
+        args: Value,
+        approved_preview: Option<&MutationPreview>,
+    ) -> ToolResult {
+        if let Some(preview) = approved_preview {
+            let path_str = match args.get("path").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => {
+                    return ToolResult::error(
+                        ToolErrorCode::InvalidToolArguments,
+                        "Missing 'path' argument",
+                    )
+                }
+            };
+            if let Err(message) = validate_approved_preview(
+                &self.workspace_dir,
+                self.restrict_to_workspace,
+                path_str,
+                preview,
+            ) {
+                return ToolResult::error(classify_tool_error_message(&message), message);
+            }
+        }
+        match self.execute(args).await {
+            Ok(content) => ToolResult::success(content),
+            Err(message) => ToolResult::error(classify_tool_error_message(&message), message),
+        }
+    }
+
     fn name(&self) -> &str {
         "write_file"
     }
@@ -447,6 +509,39 @@ pub struct EditFileTool {
 
 #[async_trait]
 impl Tool for EditFileTool {
+    // Audit X5: native typed result. Same shape as WriteFileTool: the approved
+    // preview fingerprint is validated on this typed path (see ReadFileTool for
+    // the read-only variant).
+    async fn execute_with_approved_mutation_typed(
+        &self,
+        args: Value,
+        approved_preview: Option<&MutationPreview>,
+    ) -> ToolResult {
+        if let Some(preview) = approved_preview {
+            let path_str = match args.get("path").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => {
+                    return ToolResult::error(
+                        ToolErrorCode::InvalidToolArguments,
+                        "Missing 'path' argument",
+                    )
+                }
+            };
+            if let Err(message) = validate_approved_preview(
+                &self.workspace_dir,
+                self.restrict_to_workspace,
+                path_str,
+                preview,
+            ) {
+                return ToolResult::error(classify_tool_error_message(&message), message);
+            }
+        }
+        match self.execute(args).await {
+            Ok(content) => ToolResult::success(content),
+            Err(message) => ToolResult::error(classify_tool_error_message(&message), message),
+        }
+    }
+
     fn name(&self) -> &str {
         "edit_file"
     }
@@ -502,7 +597,7 @@ impl Tool for EditFileTool {
             .unwrap_or(false);
 
         if old_text == new_text {
-            return Ok("Error: old_text and new_text are identical.".to_string());
+            return Err("old_text and new_text are identical.".to_string());
         }
 
         let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
@@ -518,13 +613,13 @@ impl Tool for EditFileTool {
             fs::read_to_string(&actual_path).map_err(|e| format!("Error reading file: {e}"))?;
 
         if !content.contains(old_text) {
-            return Ok("Error: old_text not found in file.".to_string());
+            return Err("old_text not found in file.".to_string());
         }
 
         let count = content.matches(old_text).count();
         if count > 1 && !replace_all {
-            return Ok(format!(
-                "Error: old_text appears {count} times. Provide more surrounding context to make it unique, or set replace_all to true."
+            return Err(format!(
+                "old_text appears {count} times. Provide more surrounding context to make it unique, or set replace_all to true."
             ));
         }
 
@@ -632,6 +727,18 @@ pub struct ListDirTool {
 
 #[async_trait]
 impl Tool for ListDirTool {
+    // Audit X5: native typed result (see ReadFileTool).
+    async fn execute_with_approved_mutation_typed(
+        &self,
+        args: Value,
+        _approved_preview: Option<&MutationPreview>,
+    ) -> ToolResult {
+        match self.execute(args).await {
+            Ok(content) => ToolResult::success(content),
+            Err(message) => ToolResult::error(classify_tool_error_message(&message), message),
+        }
+    }
+
     fn name(&self) -> &str {
         "list_dir"
     }
@@ -666,12 +773,12 @@ impl Tool for ListDirTool {
         let actual_path = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
 
         if !actual_path.is_dir() {
-            return Ok(format!("Error: Not a directory: {}", actual_path.display()));
+            return Err(format!("Not a directory: {}", actual_path.display()));
         }
 
         let mut entries = match fs::read_dir(&actual_path) {
             Ok(iter) => iter,
-            Err(e) => return Ok(format!("Error reading dir: {e}")),
+            Err(e) => return Err(e.to_string()),
         };
 
         let mut items = Vec::new();
@@ -718,6 +825,18 @@ fn compile_glob_single(pattern: &str) -> Result<GlobSet, String> {
 
 #[async_trait]
 impl Tool for GlobFilesTool {
+    // Audit X5: native typed result (see ReadFileTool).
+    async fn execute_with_approved_mutation_typed(
+        &self,
+        args: Value,
+        _approved_preview: Option<&MutationPreview>,
+    ) -> ToolResult {
+        match self.execute(args).await {
+            Ok(content) => ToolResult::success(content),
+            Err(message) => ToolResult::error(classify_tool_error_message(&message), message),
+        }
+    }
+
     fn name(&self) -> &str {
         "glob_files"
     }
@@ -757,13 +876,10 @@ impl Tool for GlobFilesTool {
 
         let base = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
         if !base.exists() {
-            return Ok(format!("Error: path not found: {}", base.display()));
+            return Err(format!("path not found: {}", base.display()));
         }
         if !base.is_dir() {
-            return Ok(format!(
-                "Error: base path is not a directory: {}",
-                base.display()
-            ));
+            return Err(format!("base path is not a directory: {}", base.display()));
         }
 
         // Align with WalkDir output so `strip_prefix` works on all platforms (notably Windows).
@@ -1022,6 +1138,18 @@ fn search_text_native(
 
 #[async_trait]
 impl Tool for SearchTextTool {
+    // Audit X5: native typed result (see ReadFileTool).
+    async fn execute_with_approved_mutation_typed(
+        &self,
+        args: Value,
+        _approved_preview: Option<&MutationPreview>,
+    ) -> ToolResult {
+        match self.execute(args).await {
+            Ok(content) => ToolResult::success(content),
+            Err(message) => ToolResult::error(classify_tool_error_message(&message), message),
+        }
+    }
+
     fn name(&self) -> &str {
         "search_text"
     }
@@ -1103,7 +1231,7 @@ impl Tool for SearchTextTool {
         let resolved = resolve_path(path_str, &self.workspace_dir, self.restrict_to_workspace)?;
 
         if !resolved.exists() {
-            return Ok(format!("Error: path not found: {}", resolved.display()));
+            return Err(format!("path not found: {}", resolved.display()));
         }
 
         let search_target = fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
@@ -1516,6 +1644,9 @@ impl Tool for ShellExecTool {
 
 pub struct ExecStatusTool {
     pub exec_jobs: ExecJobRegistry,
+    /// Audit X3: the other job plane. On a miss here we do a *real* lookup in
+    /// the execution-harness registry instead of sniffing id prefixes.
+    pub execution_jobs: Option<std::sync::Arc<crate::execution::ExecutionJobManager>>,
 }
 
 #[async_trait]
@@ -1564,16 +1695,26 @@ impl Tool for ExecStatusTool {
             .unwrap_or(0)
             .clamp(0, 60);
 
-        let job = self
-            .exec_jobs
-            .get_job(command_id)
-            .ok_or_else(|| {
-                if command_id.starts_with("exec-job-") || command_id.starts_with("run-") {
-                    format!("Command ID '{command_id}' not found in host exec jobs. It appears to be an execution harness job — use `execution_job_status` instead.")
-                } else {
-                    format!("Command ID '{command_id}' not found")
+        let job = match self.exec_jobs.get_job(command_id) {
+            Some(job) => job,
+            None => {
+                // Audit X3: real cross-plane lookup replaces prefix sniffing.
+                // If the id lives in the execution-harness registry, serve its
+                // status JSON directly so the model gets an answer without a
+                // second round trip.
+                if let Some(ej) = &self.execution_jobs {
+                    if let Ok(v) = ej.job_status_json(command_id).await {
+                        let rendered = serde_json::to_string_pretty(&v)
+                            .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
+                        return Ok(format!(
+                            "Note: '{command_id}' is an execution-harness job id (for full \
+                             detail use `execution_job_status`).\n{rendered}"
+                        ));
+                    }
                 }
-            })?;
+                return Err(format!("Command ID '{command_id}' not found"));
+            }
+        };
 
         if wait_secs > 0 && !job.is_terminal() {
             let started = Instant::now();
@@ -1967,6 +2108,12 @@ impl Tool for WebSearchTool {
         "Search the web for **current** facts, docs, and release notes. Discovery tool only: use this to find candidate sources, then follow with `web_fetch` on authoritative URLs before concluding. Uses Jina (s.jina.ai) when [jina].enabled is true in config; otherwise DuckDuckGo Lite."
     }
 
+    fn policy(&self) -> ToolPolicy {
+        // Read-only network discovery (audit X1: typed policy replaces the
+        // hardcoded parallel-safe name list).
+        ToolPolicy::parallel()
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -1999,7 +2146,19 @@ pub struct WebFetchTool {
     pub jina: Option<JinaWebBackend>,
     /// From `max_web_tool_output_chars` in config (see `AppConfig::effective_max_web_tool_output_chars`).
     pub max_output_chars: usize,
-    pub workspace_dir: std::path::PathBuf,
+    /// Audit X12: sandbox downloads root injected at registration
+    /// (`<sandbox>/downloads`); fetched pages land in its `web/` subfolder.
+    /// Never guessed from the outer workspace rim, so embedders whose sandbox
+    /// differs from the default layout stay inside agent visibility.
+    /// Retention/capping is permanently out of scope.
+    pub downloads_dir: std::path::PathBuf,
+}
+
+impl WebFetchTool {
+    /// Audit X12: fetch target under the injected sandbox downloads root.
+    fn download_target(&self, filename: &str) -> std::path::PathBuf {
+        self.downloads_dir.join("web").join(filename)
+    }
 }
 
 #[async_trait]
@@ -2009,7 +2168,12 @@ impl Tool for WebFetchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch a URL in detail (docs, raw GitHub, paper pages). Use after `web_search` to read primary sources and extract evidence. Uses Jina Reader (r.jina.ai) when [jina].enabled is true; otherwise direct GET with HTML text extraction or JSON pretty-print. Prefer official docs and pinned `raw.githubusercontent.com` sources when validating ML APIs."
+        "Fetch a URL in detail (docs, raw GitHub, paper pages). Use after `web_search` to read primary sources and extract evidence. Uses Jina Reader (r.jina.ai) when [jina].enabled is true; otherwise direct GET with HTML text extraction or JSON pretty-print. Prefer official docs and pinned `raw.githubusercontent.com` sources when validating third-party APIs."
+    }
+
+    fn policy(&self) -> ToolPolicy {
+        // Read-only network fetch.
+        ToolPolicy::parallel()
     }
 
     fn parameters(&self) -> Value {
@@ -2038,13 +2202,10 @@ impl Tool for WebFetchTool {
         };
 
         let uuid = uuid::Uuid::new_v4().to_string();
-        let downloads_dir = self
-            .workspace_dir
-            .join("workspace")
-            .join("downloads")
-            .join("web");
-        let _ = tokio::fs::create_dir_all(&downloads_dir).await;
-        let file_path = downloads_dir.join(format!("{uuid}.txt"));
+        let file_path = self.download_target(&format!("{uuid}.txt"));
+        if let Some(parent) = file_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
         tokio::fs::write(&file_path, &full_content)
             .await
             .map_err(|e| e.to_string())?;
@@ -2106,6 +2267,35 @@ fn cron_target_from_args(
 
 fn cron_job_is_in_scope(job: &crate::scheduler::ActiveJob, exec_ctx: &ToolExecCtx) -> bool {
     job.chat_id == exec_ctx.chat_id && job.channel == exec_ctx.channel
+}
+
+/// Resolve the `message` destination from the trusted per-invocation runtime context when one
+/// exists. Supplied `channel` / `chat_id` arguments remain supported only for callers without
+/// a context (external integrations invoking the tool directly).
+///
+/// A model must never be able to redirect an outbound message into another conversation by
+/// fabricating a destination in tool arguments.
+fn message_target_from_args(args: &Value) -> Result<(String, String), String> {
+    let supplied_chat_id = args.get("chat_id").and_then(|v| v.as_str());
+    let supplied_channel = args.get("channel").and_then(|v| v.as_str());
+
+    if let Some(ctx) = crate::tool_runtime::current_tool_exec_ctx() {
+        if let Some(chat_id) = supplied_chat_id {
+            if chat_id != ctx.chat_id {
+                return Err("message chat_id does not match the current tool session".to_string());
+            }
+        }
+        if let Some(channel) = supplied_channel {
+            if channel != ctx.channel {
+                return Err("message channel does not match the current tool session".to_string());
+            }
+        }
+        return Ok((ctx.channel.clone(), ctx.chat_id.clone()));
+    }
+
+    let chat_id = supplied_chat_id.ok_or("Missing 'chat_id'")?;
+    let channel = supplied_channel.ok_or("Missing 'channel'")?;
+    Ok((channel.to_string(), chat_id.to_string()))
 }
 
 #[async_trait]
@@ -2457,29 +2647,25 @@ impl Tool for MessageTool {
             .get("content")
             .and_then(|v| v.as_str())
             .ok_or("Missing 'content'")?;
-        let channel = args
-            .get("channel")
-            .and_then(|v| v.as_str())
-            .ok_or("Missing 'channel'")?;
-        let chat_id = args
-            .get("chat_id")
-            .and_then(|v| v.as_str())
-            .ok_or("Missing 'chat_id'")?;
+        // Destination is bound to the live session whenever runtime context exists; supplied
+        // channel/chat_id are only honored when they match (or when no context is installed).
+        let (channel, chat_id) = message_target_from_args(&args)?;
         let thread_id = args
             .get("thread_id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
+        let sent_target = format!("{channel}:{chat_id}");
         let msg = crate::bus::BusMessage::Outbound(crate::bus::OutboundMessage {
-            channel: channel.to_string(),
-            chat_id: chat_id.to_string(),
+            channel,
+            chat_id,
             thread_id,
             content: content.to_string(),
             metadata: std::collections::HashMap::new(),
         });
 
         match self.outbound_tx.send(msg).await {
-            Ok(_) => Ok(format!("Message sent to {channel}:{chat_id}")),
+            Ok(_) => Ok(format!("Message sent to {sent_target}")),
             Err(e) => Err(format!("Failed to send message: {e}")),
         }
     }
@@ -2880,6 +3066,11 @@ impl Tool for SearchMemoryTool {
         "Search your long-term and short-term memory (session summaries) for past context, facts, or keywords."
     }
 
+    fn policy(&self) -> ToolPolicy {
+        // Read-only memory query.
+        ToolPolicy::parallel()
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -2938,6 +3129,11 @@ impl Tool for FetchMemoryByDateTool {
 
     fn description(&self) -> &str {
         "Fetch long-term and short-term memory (session summaries) from a specific relative time range, like the last 7 days."
+    }
+
+    fn policy(&self) -> ToolPolicy {
+        // Read-only memory query.
+        ToolPolicy::parallel()
     }
 
     fn parameters(&self) -> Value {
@@ -3170,6 +3366,72 @@ mod mutation_preview_tests {
             .expect_err("intervening change must invalidate approval");
         assert!(error.contains("changed after approval"), "{error}");
         assert_eq!(fs::read_to_string(&target).unwrap(), "changed elsewhere\n");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn file_tools_report_typed_root_causes_not_prose_success() {
+        // Audit X5: the high-traffic file tools return natively typed results.
+        // Cases that used to be `Ok("Error: ...")` prose (success status!) must
+        // now be typed errors with stable root-cause codes, and the legacy
+        // adapter must surface the same message text without the old prefix.
+        let root = workspace();
+        fs::write(root.join("notes.txt"), "alpha\nbeta\n").unwrap();
+        let edit = EditFileTool {
+            workspace_dir: root.clone(),
+            restrict_to_workspace: true,
+        };
+
+        // Identical old/new text: was Ok-prose, now InvalidToolArguments.
+        let r = edit
+            .execute_with_approved_mutation_typed(
+                json!({ "path": "notes.txt", "old_text": "x", "new_text": "x" }),
+                None,
+            )
+            .await;
+        assert_eq!(r.error_code(), Some(ToolErrorCode::InvalidToolArguments));
+
+        // Missing old_text occurrence: typed error, message preserved for legacy callers.
+        let r = edit
+            .execute_with_approved_mutation_typed(
+                json!({ "path": "notes.txt", "old_text": "missing", "new_text": "y" }),
+                None,
+            )
+            .await;
+        assert_eq!(r.error_code(), Some(ToolErrorCode::InvalidToolArguments));
+        assert_eq!(
+            r.clone().into_legacy_result().unwrap_err(),
+            "old_text not found in file."
+        );
+
+        // Glob on a nonexistent base: NotFound instead of success-status prose.
+        let glob = GlobFilesTool {
+            workspace_dir: root.clone(),
+            restrict_to_workspace: true,
+        };
+        let r = glob
+            .execute_with_approved_mutation_typed(
+                json!({ "pattern": "*.rs", "path": "does/not/exist" }),
+                None,
+            )
+            .await;
+        assert_eq!(r.error_code(), Some(ToolErrorCode::NotFound));
+
+        // Sandbox escape via resolve_path classifies as NotAllowed.
+        let read = ReadFileTool {
+            workspace_dir: root.clone(),
+            restrict_to_workspace: true,
+        };
+        let outside = if cfg!(windows) {
+            "C:\\definitely-not-the-workspace\\x.txt"
+        } else {
+            "/definitely-not-the-workspace/x.txt"
+        };
+        let r = read
+            .execute_with_approved_mutation_typed(json!({ "path": outside }), None)
+            .await;
+        assert_eq!(r.error_code(), Some(ToolErrorCode::NotAllowed));
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3486,6 +3748,7 @@ mod exec_background_tests {
         };
         let status_tool = ExecStatusTool {
             exec_jobs: registry.clone(),
+            execution_jobs: None,
         };
 
         let cmd = if cfg!(windows) {
@@ -3560,5 +3823,30 @@ mod exec_background_tests {
 
         assert!(term_res.contains("terminated successfully"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod download_path_tests {
+    use super::*;
+
+    /// Audit X12: web_fetch targets `<injected sandbox downloads>/web`, never a
+    /// path guessed from an outer workspace rim.
+    #[test]
+    fn web_fetch_download_target_stays_under_injected_sandbox_downloads() {
+        let tmp = std::env::temp_dir().join(format!("isanagent_x12_web_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        let tool = WebFetchTool {
+            jina: None,
+            max_output_chars: 1000,
+            downloads_dir: tmp.join("downloads"),
+        };
+        let target = tool.download_target("abc.txt");
+        assert_eq!(target, tmp.join("downloads").join("web").join("abc.txt"));
+        assert!(
+            target.starts_with(&tmp),
+            "download escaped the sandbox: {target:?}"
+        );
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

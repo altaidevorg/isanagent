@@ -13,17 +13,16 @@ use dashmap::DashMap;
 use log::{info, warn};
 use serde::Serialize;
 use serde_json::json;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::bus::{BusMessage, InboundMessage, TelemetryEvent, METADATA_SYNTHETIC_JOB_FOLLOWUP};
-use crate::channels::terminal::{
-    build_execution_job_notice, build_execution_job_started_notice, build_execution_stream_notice,
-};
 use crate::execution::error::ExecutionError;
 use crate::execution::{persist_successful_execution_run, PersistSuccessfulExecutionRunParams};
 use crate::execution::{CwdPolicy, ExecutionHarness, RunEvent, RunResult, RunSpec, SessionId};
+use crate::protocol::{
+    build_execution_job_notice, build_execution_job_started_notice, build_execution_stream_notice,
+};
 
 const JOB_RUNNING: u8 = 1;
 const JOB_COMPLETED: u8 = 2;
@@ -92,19 +91,10 @@ async fn append_job_audit_line(
         .await
         .map_err(|e| format!("execution_jobs audit mkdir: {e}"))?;
     let path = dir.join("execution_jobs.jsonl");
-    let mut f = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .await
-        .map_err(|e| format!("execution_jobs audit open: {e}"))?;
     let json = serde_json::to_string(line).map_err(|e| e.to_string())?;
-    f.write_all(json.as_bytes())
+    crate::utils::append_jsonl_line(&path, &json, crate::utils::JSONL_ROTATE_MAX_BYTES)
         .await
         .map_err(|e| format!("execution_jobs audit write: {e}"))?;
-    f.write_all(b"\n")
-        .await
-        .map_err(|e| format!("execution_jobs audit nl: {e}"))?;
     Ok(())
 }
 

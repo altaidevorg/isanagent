@@ -5,7 +5,6 @@ use crate::memory::{MemoryMessage, SharedReply};
 use crate::traits::Provider;
 use crate::utils::ChatMessage;
 use crate::NodeHandle;
-use std::fs;
 use std::path::PathBuf;
 use tokio::sync::watch;
 use tokio::time::{sleep, Duration};
@@ -190,7 +189,15 @@ impl ReflectionEngine {
                             .map_err(|e| e.to_string())?;
                         rx.await??;
 
-                        let highest_id = new_messages.last().unwrap().0;
+                        // Structural guard (audit X16): the emptiness check
+                        // above sits many awaits back; derive the id without
+                        // an unwrap so the invariant cannot regress.
+                        let Some(highest_id) = new_messages.last().map(|(id, _)| *id) else {
+                            log::warn!(
+                                "short-term reflection: thread {session_id} has no messages to record; skipping metadata update"
+                            );
+                            continue;
+                        };
                         let (tx, rx) = tokio::sync::oneshot::channel();
                         self.memory_node
                             .send_packet(MemoryMessage::UpdateThreadMetadata {
@@ -274,7 +281,10 @@ impl ReflectionEngine {
             }));
 
         let current_memory = if memory_md_path.exists() {
-            fs::read_to_string(&memory_md_path).unwrap_or_default()
+            // Audit R9: async read (this runs on the reflection supervisor loop).
+            tokio::fs::read_to_string(&memory_md_path)
+                .await
+                .unwrap_or_default()
         } else {
             "No memory currently.".to_string()
         };
@@ -287,44 +297,52 @@ impl ReflectionEngine {
         );
 
         let context = vec![ChatMessage::user(&prompt)];
-        if let Ok(response) = self.provider.chat(&context, None).await {
-            let mut answer = response.content;
-            if let Some(start) = answer.find("```markdown") {
-                if let Some(end) = answer[start + 11..].find("```") {
-                    answer = answer[start + 11..start + 11 + end].to_string();
-                }
+        let response = match self.provider.chat(&context, None).await {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!(
+                    "long-term reflection provider call failed ({e}); keeping current MEMORY.md"
+                );
+                return Ok(());
             }
-            let trimmed = answer.trim();
-            let output_bytes = trimmed.len().min(u32::MAX as usize) as u32;
-            fs::write(&memory_md_path, trimmed)?;
-
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            self.memory_node
-                .send_packet(MemoryMessage::SetLongTermReflectionState {
-                    max_id,
-                    reply: SharedReply::new(tx),
-                })
-                .await
-                .map_err(|e| e.to_string())?;
-            rx.await??;
-
-            let _ =
-                self.logger_tx
-                    .send(BusMessage::Telemetry(TelemetryEvent::ReflectionCompleted {
-                        chat_id: None,
-                        kind: ReflectionKind::LongTerm,
-                        output_bytes,
-                        wall_ms: reflection_started
-                            .elapsed()
-                            .as_millis()
-                            .min(u64::MAX as u128) as u64,
-                    }));
-
-            let _ = self.logger_tx.send(BusMessage::Log(LogEvent::info(
-                "ReflectionEngine",
-                "Generated long-term memory update",
-            )));
+        };
+        let mut answer = response.content;
+        if let Some(start) = answer.find("```markdown") {
+            if let Some(end) = answer[start + 11..].find("```") {
+                answer = answer[start + 11..start + 11 + end].to_string();
+            }
         }
+        let trimmed = answer.trim();
+        let output_bytes = trimmed.len().min(u32::MAX as usize) as u32;
+        // Audit R9: non-blocking IO inside the async reflection loop.
+        tokio::fs::write(&memory_md_path, trimmed).await?;
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.memory_node
+            .send_packet(MemoryMessage::SetLongTermReflectionState {
+                max_id,
+                reply: SharedReply::new(tx),
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        rx.await??;
+
+        let _ = self
+            .logger_tx
+            .send(BusMessage::Telemetry(TelemetryEvent::ReflectionCompleted {
+                chat_id: None,
+                kind: ReflectionKind::LongTerm,
+                output_bytes,
+                wall_ms: reflection_started
+                    .elapsed()
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64,
+            }));
+
+        let _ = self.logger_tx.send(BusMessage::Log(LogEvent::info(
+            "ReflectionEngine",
+            "Generated long-term memory update",
+        )));
 
         Ok(())
     }

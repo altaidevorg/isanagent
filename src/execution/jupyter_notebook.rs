@@ -32,6 +32,15 @@ pub async fn append_code_cell(
         .send()
         .await
         .map_err(|e| ExecutionError::Provider(format!("jupyter contents GET: {e}")))?;
+    // Capture the server ETag so the PUT below can be conditional (`If-Match`). When another
+    // writer changes the notebook between this GET and our PUT, a conforming server rejects the
+    // write with 400 instead of silently dropping their cells (last-writer-wins data loss).
+    // Servers without ETag support simply ignore the header and behave as before.
+    let etag = resp
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let mut nb = if resp.status() == reqwest::StatusCode::NOT_FOUND {
         json!({
             "nbformat": 4,
@@ -75,6 +84,11 @@ pub async fn append_code_cell(
     });
 
     let mut put = client.put(&url).json(&body);
+    if let Some(tag) = &etag {
+        let value = reqwest::header::HeaderValue::from_str(tag)
+            .map_err(|e| ExecutionError::Provider(format!("jupyter contents ETag invalid: {e}")))?;
+        put = put.header(reqwest::header::IF_MATCH, value);
+    }
     put = apply_auth(put);
     let put_resp = put
         .send()
@@ -83,8 +97,14 @@ pub async fn append_code_cell(
     if !put_resp.status().is_success() {
         let st = put_resp.status();
         let t = put_resp.text().await.unwrap_or_default();
+        let concurrent = etag.is_some() && st == reqwest::StatusCode::BAD_REQUEST;
+        let hint = if concurrent {
+            " (notebook changed concurrently since last read; the append was rejected to avoid overwriting another writer's cells)"
+        } else {
+            ""
+        };
         return Err(ExecutionError::Provider(format!(
-            "jupyter contents PUT {path}: {st} {t}"
+            "jupyter contents PUT {path}: {st}{hint} {t}"
         )));
     }
     Ok(())

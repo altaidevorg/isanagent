@@ -6,13 +6,14 @@
 //! ## Design: object-safe core + capability traits
 //!
 //! - [`ExecutionProvider`] is `async_trait`-object-safe (`Arc<dyn ExecutionProvider>`).
-//! - Optional features use additional traits ([`SshRemoteShell`], [`PackageOperations`]) on concrete
-//!   types, plus [`ProviderCapabilities`] for preflight and prompt injection.
+//! - Optional features are expressed as focused traits implemented by concrete provider types
+//!   (added only when they ship), plus [`ProviderCapabilities`] for preflight and prompt injection.
 //! - See [`preflight::PREFLIGHT_MARKDOWN`] for the capability → tool mapping.
 
 mod artifacts;
 mod auto_promote;
 mod capabilities;
+mod capture;
 mod error;
 mod execution_jobs;
 mod harness;
@@ -20,6 +21,7 @@ mod ids;
 mod inflight;
 mod jupyter;
 mod jupyter_notebook;
+mod limits;
 mod local;
 mod post_run;
 mod preflight;
@@ -53,7 +55,7 @@ pub use local::{
 };
 pub use post_run::{persist_successful_execution_run, PersistSuccessfulExecutionRunParams};
 pub use preflight::{allowed_optional_tool_tags, PREFLIGHT_MARKDOWN};
-pub use provider::{ExecutionProvider, PackageOperations, SshRemoteShell};
+pub use provider::ExecutionProvider;
 pub use repl_framing::{
     repl_round_trip, string_from_utf8_lossy_trim_cap, truncate_utf8_str_cap, MAX_REPL_SOURCE_BYTES,
     PYTHON_REPL_BOOTSTRAP,

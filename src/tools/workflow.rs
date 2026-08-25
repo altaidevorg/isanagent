@@ -13,7 +13,7 @@ use crate::clarification::{
 };
 use crate::memory::{MemoryMessage, SharedReply};
 use crate::tool_runtime::current_tool_exec_ctx;
-use crate::traits::Tool;
+use crate::traits::{Tool, ToolPolicy};
 use crate::NodeHandle;
 
 use super::search_tool_index;
@@ -105,10 +105,25 @@ impl Tool for TodoWriteTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
-        let chat_id = args
-            .get("chat_id")
-            .and_then(|v| v.as_str())
-            .ok_or("Missing 'chat_id'")?;
+        // Todos are persisted per conversation: when a runtime context is installed, the
+        // destination is the live session and a mismatched `chat_id` argument is rejected so a
+        // model can never clobber another chat's harness todo list.
+        let chat_id: String = match current_tool_exec_ctx() {
+            Some(ctx) => {
+                if let Some(supplied) = args.get("chat_id").and_then(|v| v.as_str()) {
+                    if supplied != ctx.chat_id {
+                        return Err("todo_write chat_id does not match the current tool session"
+                            .to_string());
+                    }
+                }
+                ctx.chat_id.clone()
+            }
+            None => args
+                .get("chat_id")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing 'chat_id'")?
+                .to_string(),
+        };
 
         let items_val = args
             .get("items")
@@ -141,11 +156,11 @@ impl Tool for TodoWriteTool {
             });
         }
 
-        let summary = format_todo_list(chat_id, &rows);
+        let summary = format_todo_list(&chat_id, &rows);
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.memory_node
             .send_packet(MemoryMessage::ReplaceHarnessTodos {
-                chat_id: chat_id.to_string(),
+                chat_id,
                 items: rows,
                 reply: SharedReply::new(tx),
             })
@@ -171,6 +186,11 @@ impl Tool for ToolSearchTool {
 
     fn description(&self) -> &str {
         "Find built-in tools by keyword or short phrase. Use when unsure which tool fits a task. Matches tool names and descriptions."
+    }
+
+    fn policy(&self) -> ToolPolicy {
+        // Read-only registry lookup.
+        ToolPolicy::parallel()
     }
 
     fn parameters(&self) -> Value {

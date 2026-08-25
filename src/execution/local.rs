@@ -100,6 +100,8 @@ pub struct LocalExecutionProvider {
     config: LocalExecutionConfig,
     caps: ProviderCapabilities,
     sessions: DashMap<SessionId, Arc<LocalSession>>,
+    /// Audit X15: atomic `max_sessions` budget (see `super::limits`).
+    session_slots: std::sync::Arc<tokio::sync::Semaphore>,
     uv_state: Option<Arc<UvManagedState>>,
 }
 
@@ -114,6 +116,8 @@ struct LocalSession {
     active_pid: Mutex<Option<u32>>,
     /// Present while a `run` is in flight (also used to reject overlapping runs).
     run_cancel: Mutex<Option<CancellationToken>>,
+    /// Audit X15: held for the session's lifetime; released on map removal.
+    _slot: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// Host `python` invocation for REPL and subprocess runs. On Windows, bare `python` / `python3`
@@ -380,11 +384,13 @@ impl LocalExecutionProvider {
         } else {
             None
         };
+        let session_slots = super::limits::session_slot_semaphore(config.max_sessions);
 
         Ok(Self {
             config,
             caps,
             sessions: DashMap::new(),
+            session_slots,
             uv_state,
         })
     }
@@ -532,12 +538,12 @@ impl ExecutionProvider for LocalExecutionProvider {
         &self,
         req: SessionCreateRequest,
     ) -> Result<SessionHandle, ExecutionError> {
-        if self.config.max_sessions > 0 && self.sessions.len() >= self.config.max_sessions {
-            return Err(ExecutionError::limit_exceeded(
-                "sessions",
-                format!("max_sessions={} reached", self.config.max_sessions),
-            ));
-        }
+        // Audit X15: reserve a session slot with a single compare-and-set
+        // instead of the racy `sessions.len()` probe. The permit stays a
+        // local until the session record takes ownership below, so any
+        // fallible setup step (`?`) releases it automatically.
+        let slot =
+            super::limits::try_acquire_session_slot(&self.session_slots, self.config.max_sessions)?;
 
         let mode = self.pick_mode(&req).await?;
 
@@ -559,6 +565,7 @@ impl ExecutionProvider for LocalExecutionProvider {
             mode,
             active_pid: Mutex::new(None),
             run_cancel: Mutex::new(None),
+            _slot: slot,
         });
         self.sessions.insert(id.clone(), session);
 
@@ -626,6 +633,7 @@ impl ExecutionProvider for LocalExecutionProvider {
                 }
             }
 
+            let mut uv_project_env_dir: Option<std::path::PathBuf> = None;
             if !has_local_venv {
                 if let Some(state) = &self.uv_state {
                     if let Some(path) = state.env_python_path.lock().await.as_ref() {
@@ -633,6 +641,7 @@ impl ExecutionProvider for LocalExecutionProvider {
                         // UV_PROJECT_ENVIRONMENT should point to <env_dir>
                         if let Some(env_dir) = path.parent().and_then(|p| p.parent()) {
                             cmd.env("UV_PROJECT_ENVIRONMENT", env_dir);
+                            uv_project_env_dir = Some(env_dir.to_path_buf());
                         }
                     }
                 }
@@ -640,6 +649,12 @@ impl ExecutionProvider for LocalExecutionProvider {
 
             crate::environment::ExecutionEnvironmentPolicy::default_safe()
                 .apply_to_tokio_command(&mut cmd);
+            // The sanitizer rebuilds the child env from an allowlist and would silently drop
+            // `UV_PROJECT_ENVIRONMENT`; re-apply it so `uv run` still resolves the managed env
+            // this provider provisioned.
+            if let Some(env_dir) = uv_project_env_dir {
+                cmd.env("UV_PROJECT_ENVIRONMENT", env_dir);
+            }
             cmd.current_dir(&cwd);
             cmd.stdin(if stdin_body.is_some() {
                 Stdio::piped()
@@ -896,9 +911,9 @@ fn build_command(
 
 #[cfg(windows)]
 fn kill_process_best_effort(pid: u32) {
-    if pid <= 1 {
-        return;
-    }
+    // Unlike the Unix variant below, there is deliberately no `pid <= 1` guard: `taskkill /PID n`
+    // addresses one exact process tree, so a low pid could at worst fail to kill anything -- it
+    // can never fan out system-wide the way `kill(-pgid)` would if `pid == 1`.
     let _ = StdCommand::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdin(Stdio::null())
@@ -1250,6 +1265,45 @@ mod tests {
         assert!(
             !r.stdout.contains(".system_generated"),
             "UV_PROJECT_ENVIRONMENT was injected despite local .venv: {}",
+            r.stdout
+        );
+
+        prov.close_session(&h.id).await.unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn uv_managed_injects_uv_project_environment_without_local_venv() {
+        // Positive-path counterpart to `uv_managed_honors_local_venv_priority`
+        // (audit C2): with no sibling .venv, the uv-managed env dir MUST be injected as
+        // UV_PROJECT_ENVIRONMENT so `uv run` resolves the env this provider provisioned
+        // (regression guard for the env-sanitizer dropping it again).
+        let dir = temp_sandbox();
+
+        let mut cfg = LocalExecutionConfig::new(dir.clone(), dir.clone(), true);
+        cfg.python_runtime = LocalPythonRuntime::UvManaged;
+        let prov = LocalExecutionProvider::new(cfg).unwrap();
+
+        let h = prov
+            .create_session(SessionCreateRequest::default())
+            .await
+            .unwrap();
+
+        let code = if cfg!(windows) {
+            "echo %UV_PROJECT_ENVIRONMENT%"
+        } else {
+            "echo $UV_PROJECT_ENVIRONMENT"
+        };
+        let r = prov.run(&h.id, RunSpec::new(code, 120)).await.unwrap();
+
+        assert!(
+            r.stdout.contains(".system_generated"),
+            "UV_PROJECT_ENVIRONMENT missing without local .venv (stdout={:?})",
+            r.stdout
+        );
+        assert!(
+            r.stdout.contains("uv"),
+            "injected path is not under the managed uv env dir (stdout={:?})",
             r.stdout
         );
 

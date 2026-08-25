@@ -15,8 +15,6 @@ use crate::agent::{AgentLogic, AgentLogicParams};
 use crate::bus::{BusMessage, InboundMessage, LoggerControlMessage, TelemetryEvent};
 use crate::channels::oneshot::OneshotChannel;
 use crate::channels::terminal::{
-    build_agent_thought_terminal_notice, build_tool_call_terminal_notice,
-    build_tool_progress_terminal_notice, build_tool_result_terminal_notice,
     terminal_startup_suppresses_plain_banner, TerminalChannelConfig, TerminalMode,
 };
 use crate::channels::{
@@ -28,6 +26,10 @@ use crate::execution::{ExecutionJobManager, InflightSyncRegistry};
 use crate::logging::{
     create_logger_channel, create_logging_actor_or_fallback, init_runtime_logger,
     LOGGER_QUEUE_CAPACITY,
+};
+use crate::protocol::{
+    build_agent_thought_terminal_notice, build_tool_call_terminal_notice,
+    build_tool_progress_terminal_notice, build_tool_result_terminal_notice,
 };
 use crate::scheduler::{
     validate_multi_tenant_edge_runtime, CronActor, CronSchedulingMode, MultiTenantEdgeCronScheduler,
@@ -253,9 +255,15 @@ async fn run_host(
         std::io::Error::other(format!("failed to initialize runtime logger: {e:?}"))
     })?;
 
+    // Honor `--config` for diagnostic logging as well (audit D6): without this the logger
+    // re-parses <workspace>/config.toml and silently ignores a custom config path.
+    let logging_config_override = config_arg
+        .as_deref()
+        .map(|s| std::path::PathBuf::from(shellexpand::tilde(s).to_string()));
     let logger_factory = {
         let wd = workspace_dir.clone();
-        move || create_logging_actor_or_fallback(wd.clone())
+        let cfg_override = logging_config_override.clone();
+        move || create_logging_actor_or_fallback(wd.clone(), cfg_override.clone())
     };
     let logger_sup = Supervisor::new(SupervisorPolicy::Restart, logger_factory);
     let logger_node = NodeHandle::<BusMessage>::new(logger_sup, 1000, 1, Duration::from_millis(10));
@@ -334,9 +342,12 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     let db_path_str = db_path
         .to_str()
         .ok_or_else(|| std::io::Error::other("workspace DB path is not valid UTF-8"))?;
-    let memory_actor = crate::memory::SqliteMemoryActor::new(db_path_str).map_err(|e| {
+    let mut memory_actor = crate::memory::SqliteMemoryActor::new(db_path_str).map_err(|e| {
         std::io::Error::other(format!("Failed to initialize SqliteMemoryActor: {e}"))
     })?;
+    // Audit R1: wire the configured retention bound so subagent task history cannot
+    // grow unbounded in the always-on process.
+    memory_actor.set_task_history_retention(workspace.config.subagent_task_history_retention());
     let memory_node = NodeHandle::<crate::memory::MemoryMessage>::new(
         memory_actor,
         100,
@@ -449,9 +460,6 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         exec_jobs: Some(exec_jobs.clone()),
         windows_runner: workspace.config.windows_shell_runner(),
     }));
-    tools.register(Box::new(crate::tools::builtin::ExecStatusTool {
-        exec_jobs: exec_jobs.clone(),
-    }));
     tools.register(Box::new(crate::tools::builtin::ExecSendTool {
         exec_jobs: exec_jobs.clone(),
     }));
@@ -474,6 +482,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     }
     let mut inflight_sync_outer: Option<Arc<InflightSyncRegistry>> = None;
     let mut execution_harness_for_shutdown: Option<Arc<crate::execution::ExecutionHarness>> = None;
+    let mut execution_jobs_outer: Option<Arc<ExecutionJobManager>> = None;
     if workspace.config.execution_harness_enabled() {
         let harness = crate::execution::build_execution_harness(
             workspace.dir.clone(),
@@ -491,6 +500,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         ));
         let inflight_sync = Arc::new(InflightSyncRegistry::new());
         inflight_sync_outer = Some(inflight_sync.clone());
+        execution_jobs_outer = Some(execution_jobs.clone());
         tools.register(Box::new(ExecutionSessionCreateTool {
             harness: harness.clone(),
         }));
@@ -506,6 +516,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         }));
         tools.register(Box::new(ExecutionJobStatusTool {
             jobs: execution_jobs.clone(),
+            exec_jobs: Some(exec_jobs.clone()),
         }));
         tools.register(Box::new(ExecutionJobResultTool {
             jobs: execution_jobs.clone(),
@@ -534,6 +545,12 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             harness: harness.clone(),
         }));
     }
+    // Audit X3: registered after the execution-harness block so `exec_status`
+    // can route misses to the execution job registry by *real lookup*.
+    tools.register(Box::new(crate::tools::builtin::ExecStatusTool {
+        exec_jobs: exec_jobs.clone(),
+        execution_jobs: execution_jobs_outer.clone(),
+    }));
     let jina = workspace.config.jina_web_backend();
     let max_web_output_chars = workspace.config.effective_max_web_tool_output_chars();
     tools.register(Box::new(WebSearchTool {
@@ -543,17 +560,25 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     tools.register(Box::new(WebFetchTool {
         jina,
         max_output_chars: max_web_output_chars,
-        workspace_dir: workspace.dir.clone(),
+        // Audit X12: inject the resolved sandbox downloads dir instead of
+        // letting the tool guess it from the outer workspace rim.
+        downloads_dir: workspace.sandbox_dir.join("downloads"),
     }));
-    tools.register(Box::new(ArxivSearchTool {
-        max_output_chars: max_web_output_chars,
-    }));
-    tools.register(Box::new(ArxivFetchTool {
-        workspace_dir: workspace.dir.clone(),
-    }));
-    tools.register(Box::new(HfHubFileFetchTool {
-        max_output_chars: max_web_output_chars,
-    }));
+    // Audit X4: ML research tools are opt-in (`ml_domain_enabled`); general-purpose
+    // hosts do not register arXiv/Hugging Face domain tools by default.
+    if workspace.config.ml_domain_enabled() {
+        tools.register(Box::new(ArxivSearchTool {
+            max_output_chars: max_web_output_chars,
+        }));
+        tools.register(Box::new(ArxivFetchTool {
+            // Audit X12: inject the resolved sandbox downloads dir instead of
+            // letting the tool guess it from the outer workspace rim.
+            downloads_dir: workspace.sandbox_dir.join("downloads"),
+        }));
+        tools.register(Box::new(HfHubFileFetchTool {
+            max_output_chars: max_web_output_chars,
+        }));
+    }
     tools.register(Box::new(CronTool {
         cron_node: cron_node.clone(),
         multi_tenant_edge_cron_enabled: mte_cron_scheduler.is_some(),
@@ -579,7 +604,6 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     tools.register(Box::new(crate::tools::recall::RecallToolResultTool {
         memory_node: memory_node.clone(),
         outbound_tx: global_outbound_tx.clone(),
-        spill_store: Some(crate::spill::SpillStore::new(&workspace.dir)),
     }));
     tools.register(Box::new(crate::tools::builtin::SearchMemoryTool {
         memory_node: memory_node.clone(),
@@ -591,20 +615,6 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     tools.register(Box::new(TodoWriteTool {
         memory_node: memory_node.clone(),
     }));
-    if workspace.config.kernel_porting_harness_enabled() {
-        crate::tools::kernel_porting::register_kernel_porting_tools(
-            &mut tools,
-            workspace.sandbox_dir.clone(),
-            std::sync::Arc::new(workspace.config.clone()),
-        );
-    }
-    if workspace.config.autotrainess_harness_enabled() {
-        crate::tools::autotrainess::register_autotrainess_tools(
-            &mut tools,
-            workspace.sandbox_dir.clone(),
-            std::sync::Arc::new(workspace.config.clone()),
-        );
-    }
     let uv_bin = workspace.config.execution_uv_binary();
     plugins.populate_tool_registry(&mut tools, &uv_bin).await;
     let tool_catalog = tools.catalog_handle();
@@ -655,12 +665,18 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         else if let Ok(key) = default_provider_cfg.resolve_api_key() {
             (Some(default_provider_cfg.clone()), Some(key))
         } else {
-            // 2. Try any expanded [providers.*] entry
+            // 2. Try any expanded [providers.*] entry — in deterministic (sorted) key
+            // order (audit R4): HashMap iteration order is randomized per process,
+            // which made the "first entry with a key" fallback vary across restarts.
+            let mut sorted_ids: Vec<&String> = expanded_providers.keys().collect();
+            sorted_ids.sort();
             let mut found: Option<(crate::config::ProviderConfig, String)> = None;
-            for cfg in expanded_providers.values() {
-                if let Ok(key) = cfg.resolve_api_key() {
-                    found = Some((cfg.clone(), key));
-                    break;
+            for id in sorted_ids {
+                if let Some(cfg) = expanded_providers.get(id.as_str()) {
+                    if let Ok(key) = cfg.resolve_api_key() {
+                        found = Some((cfg.clone(), key));
+                        break;
+                    }
                 }
             }
             if let Some((cfg, key)) = found {
@@ -695,9 +711,14 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         // Keep all configured providers as immutable candidates owned by this AgentLogic. Each run
         // filters its own primary by full (provider, base_url, model) identity while snapshotting,
         // so concurrent runs and `/model` switches cannot rewrite one another's fallback policy.
-        let candidates: Vec<crate::agent::FallbackProviderSpec> = expanded_providers
-            .values()
-            .filter_map(|fb_cfg| {
+        // Deterministic failover priority (audit R4): sort provider ids instead of
+        // relying on randomized HashMap iteration order.
+        let mut sorted_fb_ids: Vec<&String> = expanded_providers.keys().collect();
+        sorted_fb_ids.sort();
+        let candidates: Vec<crate::agent::FallbackProviderSpec> = sorted_fb_ids
+            .into_iter()
+            .filter_map(|id| {
+                let fb_cfg = expanded_providers.get(id.as_str())?;
                 let fb_key = fb_cfg.resolve_api_key().ok()?;
                 let fb_base = fb_cfg.resolved_base_url().ok()?;
                 Some(crate::agent::FallbackProviderSpec {
@@ -863,7 +884,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     // Load agent definitions from config; use built-in defaults when none configured.
     let agent_defs = workspace.config.agent_definitions();
     let agent_defs = if agent_defs.is_empty() {
-        crate::agent::registry::default_agent_definitions()
+        crate::agent::registry::default_agent_definitions(workspace.config.ml_domain_enabled())
     } else {
         agent_defs
     };
@@ -1346,9 +1367,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                     tool_call_id,
                     background_job_id,
                 }) if channel == "terminal" => {
-                    if crate::channels::terminal::should_suppress_tool_notice_for_terminal(
-                        tool_name, args,
-                    ) {
+                    if crate::protocol::should_suppress_tool_notice_for_terminal(tool_name, args) {
                         // MessageTool already emits its own user-visible Outbound to the
                         // terminal; a synthetic tool-call notice would duplicate that line.
                     } else {
@@ -1375,9 +1394,8 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                     tool_call_id,
                     background_job_id,
                 }) if channel == "terminal" => {
-                    if crate::channels::terminal::should_suppress_tool_notice_for_terminal(
-                        tool_name, result,
-                    ) {
+                    if crate::protocol::should_suppress_tool_notice_for_terminal(tool_name, result)
+                    {
                         // See ToolCall arm: avoid duplicating the user-visible MessageTool
                         // outbound with a redundant ack notice.
                     } else {
@@ -1483,16 +1501,27 @@ fn apply_host_overrides(config: &mut AppConfig, host: &HostConfig) -> Result<(),
             return Err("model override cannot be empty".to_string());
         }
 
+        let model = model.strip_prefix("models/").unwrap_or(model);
         let provider = config.provider.get_or_insert_with(ProviderConfig::default);
         if let Some((provider_name, model_name)) = model.split_once('/') {
             if provider_name.is_empty() || model_name.is_empty() {
                 return Err(format!("invalid provider/model override: {model}"));
             }
-            provider.provider_name = provider_name.to_string();
-            provider.model_name = model_name.to_string();
-            // Let the provider's conventional key variable be inferred after
-            // changing provider family (for example ANTHROPIC_API_KEY).
-            provider.api_key_env.clear();
+            if crate::provider_registry::is_recognized(provider_name)
+                || config
+                    .providers
+                    .as_ref()
+                    .map(|p| p.contains_key(provider_name))
+                    .unwrap_or(false)
+            {
+                provider.provider_name = provider_name.to_string();
+                provider.model_name = model_name.to_string();
+                // Let the provider's conventional key variable be inferred after
+                // changing provider family (for example ANTHROPIC_API_KEY).
+                provider.api_key_env.clear();
+            } else {
+                provider.model_name = model.to_string();
+            }
         } else {
             provider.model_name = model.to_string();
         }
@@ -1503,14 +1532,25 @@ fn apply_host_overrides(config: &mut AppConfig, host: &HostConfig) -> Result<(),
         if model.is_empty() {
             return Err("fallback model override cannot be empty".to_string());
         }
+        let model = model.strip_prefix("models/").unwrap_or(model);
         let mut fallback = config.provider.clone().unwrap_or_default();
         if let Some((provider_name, model_name)) = model.split_once('/') {
             if provider_name.is_empty() || model_name.is_empty() {
                 return Err(format!("invalid fallback provider/model override: {model}"));
             }
-            fallback.provider_name = provider_name.to_string();
-            fallback.model_name = model_name.to_string();
-            fallback.api_key_env.clear();
+            if crate::provider_registry::is_recognized(provider_name)
+                || config
+                    .providers
+                    .as_ref()
+                    .map(|p| p.contains_key(provider_name))
+                    .unwrap_or(false)
+            {
+                fallback.provider_name = provider_name.to_string();
+                fallback.model_name = model_name.to_string();
+                fallback.api_key_env.clear();
+            } else {
+                fallback.model_name = model.to_string();
+            }
         } else {
             fallback.model_name = model.to_string();
         }

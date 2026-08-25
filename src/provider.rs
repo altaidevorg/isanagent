@@ -56,7 +56,8 @@ pub fn provider_for_agent(
     model_override: Option<&str>,
     temperature_override: Option<f32>,
 ) -> Box<dyn Provider> {
-    let model = model_override.unwrap_or(&creds.model_name);
+    let raw_model = model_override.unwrap_or(&creds.model_name);
+    let model = raw_model.strip_prefix("models/").unwrap_or(raw_model);
     let temp = temperature_override.unwrap_or(0.3);
     if creds.provider_name == "anthropic" {
         Box::new(
@@ -240,10 +241,11 @@ impl GeminiProvider {
             .next()
             .unwrap_or(openai_compatible_url)
             .trim_end_matches('/');
+        let clean_model = model.strip_prefix("models/").unwrap_or(model);
         Self {
             api_key: api_key.to_string(),
-            model: model.to_string(),
-            base_url: format!("{origin}/v1beta/models/{model}:generateContent"),
+            model: clean_model.to_string(),
+            base_url: format!("{origin}/v1beta/models/{clean_model}:generateContent"),
             temperature: 0.3,
             client: build_reqwest_client(),
         }

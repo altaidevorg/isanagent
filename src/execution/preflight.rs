@@ -13,8 +13,8 @@ pub const PREFLIGHT_MARKDOWN: &str = r#"# Execution preflight (capabilities → 
 | `execution_job_status` / `execution_job_result` / `execution_job_list` | Jobs registry (always available when execution harness is enabled). |
 | `execution_job_cancel` | `supports_interrupt` (same as `execution_cancel` for the job’s session). |
 | `execution_cancel` | `supports_interrupt` |
-| `execution_package_install` (optional) | `supports_package_install` |
-| `execution_ssh_exec` (optional) | `supports_remote_shell` + provider implements `SshRemoteShell` |
+| (no dedicated tool yet) | `supports_package_install` is informational today: the local uv-managed runtime provisions packages itself during env setup; install further packages by running code through `execution_run`. |
+| (no dedicated tool yet) | `supports_remote_shell` is reserved; no provider reports true today. |
 | `execution_env_info` / GPU summary (optional) | Provider-specific; gate on session or extension trait |
 
 **Preflight rule:** the executor MUST reject calls with [`crate::execution::ExecutionError::Unsupported`] before hitting the network or subprocess when the capability matrix says the operation is unavailable—even if the model requests it.

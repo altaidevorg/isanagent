@@ -29,8 +29,9 @@ pub struct SshExecutionConfig {
     pub remote_workdir: Option<String>,
     /// Remote Python interpreter for `language: python` (default `python3`).
     pub remote_python: Option<String>,
-    /// When true (default), `check_server_key` accepts any host key (**MITM risk**). When false,
-    /// host key verification fails until strict known-hosts support exists.
+    /// When true, `check_server_key` accepts any host key (**MITM risk**). Default is **false**
+    /// (fail closed): unknown host keys are stored TOFU-style under
+    /// `.system_generated/ssh/known_hosts`, and a *changed* key for a known host always refuses.
     pub accept_unknown_host_keys: Option<bool>,
 }
 
@@ -313,30 +314,6 @@ pub struct NotificationsConfig {
     pub enabled: Option<bool>,
 }
 
-/// MaxEvolve kernel porting (`kernel_db_*` tools). See `docs/kernel-porting-user-guide.md`.
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
-pub struct KernelPortingHarnessConfig {
-    pub enabled: Option<bool>,
-    /// Sandbox-relative root for kernel projects (default `kernels/projects`).
-    pub default_project_root: Option<String>,
-    /// Sandbox-relative JSON schema path for MAP-Elites archives.
-    pub map_elites_schema: Option<String>,
-    /// Max elite entries retained per project archive (default 500).
-    pub max_archive_entries: Option<usize>,
-    /// Default mutation batch size hint for evolve orchestrator (default 4).
-    pub mutation_batch_size: Option<usize>,
-}
-
-/// AutoTrainess autonomous post-training (`train_db_*` tools). See `docs/autotrainess-user-guide.md`.
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
-pub struct AutoTrainessHarnessConfig {
-    pub enabled: Option<bool>,
-    /// Sandbox-relative root for training projects (default `train/projects`).
-    pub default_project_root: Option<String>,
-    /// Max iteration entries retained per project ledger (default 500).
-    pub max_log_entries: Option<usize>,
-}
-
 /// ACP protocol agent config (`[harness.acp]`).
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct AcpHarnessConfig {
@@ -345,23 +322,19 @@ pub struct AcpHarnessConfig {
     pub allow_client_mcp: Option<bool>,
 }
 
-/// Optional harness features (see `docs/harness-implementation-plan.md`).
+/// Optional harness features.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct HarnessConfig {
     pub acp: Option<AcpHarnessConfig>,
     pub git_worktree: Option<GitWorktreeConfig>,
     /// Background sub-agents, task tools, and optional plan execution (Phase 5).
     pub subagents: Option<SubagentHarnessConfig>,
-    /// Triton→Pallas porting and MAP-Elites evolution tools.
-    pub kernel_porting: Option<KernelPortingHarnessConfig>,
-    /// AutoTrainess experiment ledger and post-training workflow tools.
-    pub autotrainess: Option<AutoTrainessHarnessConfig>,
     /// Named agent definitions loaded from `[agents.<name>]` (Phase 5b).
     #[serde(default)]
     pub agents: std::collections::HashMap<String, AgentDefinition>,
     /// Shell command policy (`exec`), including approval-vs-deny behavior.
     pub shell_policy: Option<ShellPolicyConfig>,
-    /// Local / future execution providers (`execution_*` tools). See `docs/execution-implementation-plan.md`.
+    /// Local / future execution providers (`execution_*` tools).
     pub execution: Option<ExecutionHarnessConfig>,
     /// ML engineer prompt overlay and related defaults.
     pub ml_engineer: Option<MlEngineerHarnessConfig>,
@@ -427,6 +400,10 @@ pub struct AppConfig {
     /// When true, back up each file before `edit_file`/`write_file` mutates it and register the
     /// `checkpoint` tool for one-step undo. Default false. Only touched files are backed up.
     pub checkpoint_enabled: Option<bool>,
+    /// When true, register the ML research tools (`arxiv_search`, `arxiv_fetch`,
+    /// `hf_hub_file_fetch`). Default false: general-purpose hosts stay tool-neutral; opt in
+    /// for research/ML workloads (audit X4).
+    pub ml_domain_enabled: Option<bool>,
     pub max_tool_output_chars: Option<usize>,
     /// Max characters returned by `web_search` / `web_fetch` (default 50_000). Separate from
     /// `max_tool_output_chars`, which caps tool output when passed to the model.
@@ -710,6 +687,13 @@ impl AppConfig {
         self.checkpoint_enabled.unwrap_or(false)
     }
 
+    /// ML research tools (`arxiv_search` / `arxiv_fetch` / `hf_hub_file_fetch`) registration
+    /// gate (default: disabled). Audit X4: these are domain-specific and must be opt-in so
+    /// general-purpose hosts do not leak ML-era assumptions into every workspace.
+    pub fn ml_domain_enabled(&self) -> bool {
+        self.ml_domain_enabled.unwrap_or(false)
+    }
+
     /// When true, `git_worktree` is registered (see `[harness.git_worktree]` in config).
     pub fn git_worktree_tool_enabled(&self) -> bool {
         self.harness
@@ -805,12 +789,56 @@ impl AppConfig {
     }
 
     /// Returns merged agent definitions from `[agents.<name>]` and `[harness.agents.<name>]`.
-    /// Harness-level definitions override top-level ones of the same name.
+    ///
+    /// Audit X14 merge semantics (field-wise deep merge, not whole-entry replacement):
+    /// - Same name at both levels: the harness-level entry **refines** the
+    ///   top-level one. `Some` values at harness level win; `None` inherits the
+    ///   top-level value. `allowed_tools` is replaced as a whole list (lists
+    ///   never concatenate).
+    /// - `description` (required in TOML) inherits from the top level when the
+    ///   harness entry's is empty.
+    /// - Non-optional scalars `mode` and `hidden` cannot distinguish "omitted"
+    ///   from an explicit default after deserialization, so the harness-level
+    ///   value replaces them: restate `mode`/`hidden` in a harness override
+    ///   when the top-level definition sets them to non-default values.
+    /// - Names present at only one level pass through unchanged.
     pub fn agent_definitions(&self) -> std::collections::HashMap<String, AgentDefinition> {
         let mut merged = self.agents.clone();
         if let Some(h) = self.harness.as_ref() {
             for (k, v) in &h.agents {
-                merged.insert(k.clone(), v.clone());
+                if let Some(base) = merged.get_mut(k) {
+                    // Audit X14: a partial harness-level entry refines the
+                    // top-level definition instead of erasing its fields.
+                    if !v.description.is_empty() {
+                        base.description = v.description.clone();
+                    }
+                    if v.system_prompt.is_some() {
+                        base.system_prompt = v.system_prompt.clone();
+                    }
+                    if v.system_prompt_file.is_some() {
+                        base.system_prompt_file = v.system_prompt_file.clone();
+                    }
+                    if v.allowed_tools.is_some() {
+                        base.allowed_tools = v.allowed_tools.clone();
+                    }
+                    if v.model.is_some() {
+                        base.model = v.model.clone();
+                    }
+                    if v.temperature.is_some() {
+                        base.temperature = v.temperature;
+                    }
+                    if v.max_iterations.is_some() {
+                        base.max_iterations = v.max_iterations;
+                    }
+                    if v.color.is_some() {
+                        base.color = v.color.clone();
+                    }
+                    // Non-optional scalars: harness value replaces (see doc above).
+                    base.mode = v.mode.clone();
+                    base.hidden = v.hidden;
+                } else {
+                    merged.insert(k.clone(), v.clone());
+                }
             }
         }
         merged
@@ -822,81 +850,6 @@ impl AppConfig {
             None => true,
             Some(e) => e.enabled.unwrap_or(true),
         }
-    }
-
-    /// When true under `[harness.kernel_porting]`, `kernel_db_*` tools are registered.
-    pub fn kernel_porting_harness_enabled(&self) -> bool {
-        self.harness
-            .as_ref()
-            .and_then(|h| h.kernel_porting.as_ref())
-            .and_then(|k| k.enabled)
-            .unwrap_or(false)
-    }
-
-    pub fn kernel_porting_default_project_root(&self) -> String {
-        self.harness
-            .as_ref()
-            .and_then(|h| h.kernel_porting.as_ref())
-            .and_then(|k| k.default_project_root.as_ref())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "kernels/projects".to_string())
-    }
-
-    pub fn kernel_porting_map_elites_schema(&self) -> String {
-        self.harness
-            .as_ref()
-            .and_then(|h| h.kernel_porting.as_ref())
-            .and_then(|k| k.map_elites_schema.as_ref())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| ".agents/kernel-porting/map_elites.schema.json".to_string())
-    }
-
-    pub fn kernel_porting_max_archive_entries(&self) -> usize {
-        self.harness
-            .as_ref()
-            .and_then(|h| h.kernel_porting.as_ref())
-            .and_then(|k| k.max_archive_entries)
-            .unwrap_or(500)
-            .clamp(10, 10_000)
-    }
-
-    pub fn kernel_porting_mutation_batch_size(&self) -> usize {
-        self.harness
-            .as_ref()
-            .and_then(|h| h.kernel_porting.as_ref())
-            .and_then(|k| k.mutation_batch_size)
-            .unwrap_or(4)
-            .clamp(1, 64)
-    }
-
-    /// When true under `[harness.autotrainess]`, `train_db_*` tools are registered.
-    pub fn autotrainess_harness_enabled(&self) -> bool {
-        self.harness
-            .as_ref()
-            .and_then(|h| h.autotrainess.as_ref())
-            .and_then(|a| a.enabled)
-            .unwrap_or(false)
-    }
-
-    pub fn autotrainess_default_project_root(&self) -> String {
-        self.harness
-            .as_ref()
-            .and_then(|h| h.autotrainess.as_ref())
-            .and_then(|a| a.default_project_root.as_ref())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "train/projects".to_string())
-    }
-
-    pub fn autotrainess_max_log_entries(&self) -> usize {
-        self.harness
-            .as_ref()
-            .and_then(|h| h.autotrainess.as_ref())
-            .and_then(|a| a.max_log_entries)
-            .unwrap_or(500)
-            .clamp(10, 10_000)
     }
 
     /// `[harness.ml_engineer] enabled = true` appends ML policy overlay to the system prompt.
@@ -1073,6 +1026,10 @@ impl AppConfig {
         lines.push(format!(
             "ml_engineer_harness_enabled={}",
             self.ml_engineer_harness_enabled()
+        ));
+        lines.push(format!(
+            "ml_domain_tools_enabled={}",
+            self.ml_domain_enabled()
         ));
         lines.push(format!(
             "ml_engineer_forbid_final_without_tools_default={}",
@@ -1506,7 +1463,6 @@ pub struct MemoryConfig {
     pub short_term_threshold_turns: Option<usize>,
     pub short_term_threshold_tokens: Option<usize>,
     pub short_term_threshold_mins: Option<u64>,
-    pub long_term_interval_mins: Option<u64>,
     pub max_recent_summaries: Option<usize>,
     pub long_term_threshold_summaries: Option<usize>,
 }
@@ -1569,25 +1525,28 @@ impl ProviderConfig {
         format!("{}_API_KEY", self.provider_name.to_uppercase())
     }
 
-    /// Resolve the API key: env var (from `resolved_api_key_env()`) first, then the inline
-    /// `api_key` field in config.toml. Returns `Err` when neither source provides a non-empty key.
+    /// Resolve the API key: env var (from `resolved_api_key_env()`) first, then the OS Keychain
+    /// (service `dev.altai.isanagent`). Returns `Err` when neither source provides a non-empty key.
     pub fn resolve_api_key(&self) -> Result<String, String> {
         let env_var = self.resolved_api_key_env();
         if !env_var.is_empty() {
             if let Ok(key) = std::env::var(&env_var) {
-                if !key.is_empty() {
-                    return Ok(key);
+                let trimmed = key.trim();
+                if !trimmed.is_empty() && !api_key_looks_like_placeholder(trimmed) {
+                    return Ok(trimmed.to_string());
                 }
             }
         }
-        if let Some(key) = &self.api_key {
+        if let Some(key) = crate::credentials::get_provider_key(&self.provider_name) {
             let trimmed = key.trim();
             if !trimmed.is_empty() && !api_key_looks_like_placeholder(trimmed) {
                 return Ok(trimmed.to_string());
             }
         }
         Err(format!(
-            "No API key found (checked env ${env_var} and config api_key)"
+            "No API key found for provider '{}' (checked env ${env_var} and OS Keychain namespace '{}')",
+            self.provider_name,
+            crate::credentials::KEYRING_SERVICE
         ))
     }
 
@@ -2065,29 +2024,64 @@ color = "4CAF50"
     }
 
     #[test]
-    fn agent_definitions_harness_merge() {
-        let s = r#"
+    fn agent_definitions_harness_deep_merge() {
+        let s = r##"
 [agents.shared]
 description = "Top-level agent"
+temperature = 0.4
+color = "#2196F3"
+max_iterations = 20
 
 [harness.agents.shared]
 description = "Harness-level agent"
 allowed_tools = ["read_file"]
+model = "gemini-2.5-pro"
 
 [harness.agents.harness_only]
 description = "Only in harness"
-"#;
+"##;
         let c: AppConfig = toml::from_str(s).expect("parse");
         let agents = c.agent_definitions();
-        // Harness-level wins over top-level for same name
+        // Harness-level Some fields win over top-level for same name
         let shared = agents.get("shared").expect("shared");
         assert_eq!(shared.description, "Harness-level agent");
         assert_eq!(
             shared.allowed_tools.as_deref(),
             Some(&["read_file".to_string()][..])
         );
+        assert_eq!(shared.model.as_deref(), Some("gemini-2.5-pro"));
+        // Audit X14: omitted (None) harness fields inherit the top-level
+        // definition instead of being erased by whole-entry replacement.
+        assert_eq!(shared.temperature, Some(0.4));
+        assert_eq!(shared.color.as_deref(), Some("#2196F3"));
+        assert_eq!(shared.max_iterations, Some(20));
+        assert_eq!(shared.mode, AgentMode::Subagent);
         // Harness-only entry surfaces
         assert!(agents.contains_key("harness_only"));
+    }
+
+    #[test]
+    fn agent_definitions_harness_non_option_fields_replace() {
+        // Audit X14 documented caveat: `mode` and `hidden` are non-optional
+        // with serde defaults, so a harness-level override cannot distinguish
+        // "omitted" from an explicit default and replaces them. Option fields
+        // still inherit.
+        let s = r#"
+[agents.scout]
+description = "Top-level scout"
+mode = "semble_scout"
+hidden = true
+
+[harness.agents.scout]
+description = "Harness-level scout"
+"#;
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        let agents = c.agent_definitions();
+        let scout = agents.get("scout").expect("scout");
+        assert_eq!(scout.description, "Harness-level scout");
+        // Replaced by harness defaults (documented on `agent_definitions`):
+        assert_eq!(scout.mode, AgentMode::Subagent);
+        assert!(!scout.hidden);
     }
 
     #[test]
@@ -2282,42 +2276,28 @@ models = []
 mod placeholder_key_tests {
     use super::*;
 
-    fn provider_with_key(key: &str) -> ProviderConfig {
-        ProviderConfig {
-            provider_name: "nonexistent-provider".to_string(),
-            model_name: "some-model".to_string(),
-            models: None,
-            api_key_env: "".to_string(),
-            api_key: Some(key.to_string()),
-            base_url: None,
-        }
-    }
-
     #[test]
     fn rejects_angle_bracket_placeholder() {
-        assert!(provider_with_key("<changethis>").resolve_api_key().is_err());
+        assert!(api_key_looks_like_placeholder("<changethis>"));
     }
 
     #[test]
     fn rejects_changethis_without_brackets() {
-        assert!(provider_with_key("changethis").resolve_api_key().is_err());
+        assert!(api_key_looks_like_placeholder("changethis"));
     }
 
     #[test]
     fn rejects_replace_me() {
-        assert!(provider_with_key("replace_me").resolve_api_key().is_err());
+        assert!(api_key_looks_like_placeholder("replace_me"));
     }
 
     #[test]
     fn rejects_placeholder_keyword() {
-        assert!(provider_with_key("my_placeholder_key")
-            .resolve_api_key()
-            .is_err());
+        assert!(api_key_looks_like_placeholder("my_placeholder_key"));
     }
 
     #[test]
     fn accepts_real_api_key() {
-        let result = provider_with_key("sk-abc123def456").resolve_api_key();
-        assert_eq!(result.unwrap(), "sk-abc123def456");
+        assert!(!api_key_looks_like_placeholder("sk-abc123def456"));
     }
 }

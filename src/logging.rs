@@ -180,8 +180,11 @@ impl LoggingFallbackActor {
     }
 }
 
-pub fn create_logging_actor_or_fallback(workspace_dir: PathBuf) -> Box<dyn ActorLogic<BusMessage>> {
-    match LoggingActor::new(workspace_dir) {
+pub fn create_logging_actor_or_fallback(
+    workspace_dir: PathBuf,
+    config_path_override: Option<PathBuf>,
+) -> Box<dyn ActorLogic<BusMessage>> {
+    match LoggingActor::new_with_config_path(workspace_dir, config_path_override) {
         Ok(actor) => Box::new(actor),
         Err(err) => Box::new(LoggingFallbackActor::new(err)),
     }
@@ -189,7 +192,17 @@ pub fn create_logging_actor_or_fallback(workspace_dir: PathBuf) -> Box<dyn Actor
 
 impl LoggingActor {
     pub fn new(workspace_dir: PathBuf) -> Result<Self, String> {
-        let logging_config = load_logging_config(&workspace_dir);
+        Self::new_with_config_path(workspace_dir, None)
+    }
+
+    /// Like [`LoggingActor::new`], but reads logging settings from `config_path_override` when
+    /// set. Hosts pass their `--config` value here so diagnostic logging honors a custom config
+    /// file instead of silently re-parsing `<workspace>/config.toml`.
+    pub fn new_with_config_path(
+        workspace_dir: PathBuf,
+        config_path_override: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        let logging_config = load_logging_config(&workspace_dir, config_path_override.as_deref());
         Self::new_with_config(workspace_dir, logging_config)
     }
 
@@ -289,8 +302,13 @@ impl LoggingActor {
     }
 
     fn write_runtime_event(&mut self, event: &LogEvent) {
+        // Route through the shared redactor so credential-shaped strings (ghp_/hf_/AKIA/JWT/PEM…)
+        // never reach disk in plaintext; `sanitize_message` alone only covers 3 legacy patterns.
+        let redacted_line = crate::redact::shared()
+            .redact(&event.format_line())
+            .into_owned();
         let result = match self.runtime_writer.as_mut() {
-            Some(writer) => write_runtime_record(writer, &event.format_line()),
+            Some(writer) => write_runtime_record(writer, &redacted_line),
             None => return,
         };
         if let Err(error) = result {
@@ -520,8 +538,12 @@ impl Drop for LoggingActor {
     }
 }
 
-fn load_logging_config(workspace_dir: &Path) -> EffectiveLoggingConfig {
-    let config_path = workspace_dir.join("config.toml");
+fn load_logging_config(
+    workspace_dir: &Path,
+    config_path_override: Option<&Path>,
+) -> EffectiveLoggingConfig {
+    let default_path = workspace_dir.join("config.toml");
+    let config_path = config_path_override.unwrap_or(default_path.as_path());
     fs::read_to_string(config_path)
         .ok()
         .and_then(|contents| toml::from_str::<AppConfig>(&contents).ok())

@@ -1,6 +1,6 @@
 # Code execution harness — user guide
 
-This guide is for **operators and users** of isanagent who want to run code safely inside the agent workspace. For the internal roadmap and trait design, see **`execution-implementation-plan.md`**.
+This guide is for **operators and users** of isanagent who want to run code safely inside the agent workspace. Internal trait contracts live in `crate::execution`, provider sources under `src/execution/`.
 
 ## What you get
 
@@ -14,6 +14,7 @@ When the execution harness is **not** turned off in config (it is **on by defaul
 | **`execution_job_status`** | Poll a background job: status, timestamps, error text. |
 | **`execution_job_result`** | When the job is finished, fetch **`RunResult`** JSON (truncated to the session **`max_tool_output_chars`** cap). |
 | **`execution_job_list`** | List in-memory background jobs (optional **`session_id`** filter). |
+| **`execution_read_log`** | Read raw **stdout/stderr** lines for a background **`job_id`** or **`run_id`** without fetching the entire output (**`start_line`**/`end_line`, 1-indexed inclusive, capped at 100 lines per call). Useful for inspecting massive logs from tools or background processes that are otherwise truncated in the result. |
 | **`execution_job_cancel`** | Best-effort interrupt by **`job_id`** (same capability rules as **`execution_cancel`**). |
 | **`execution_artifact_list`** | List files under `.execution_artifacts/<session_id>/` for that session (paths relative to sandbox). |
 | **`execution_cancel`** | Best-effort interrupt of the current run for a **`session_id`** (when the provider supports it). |
@@ -22,13 +23,13 @@ When the execution harness is **not** turned off in config (it is **on by defaul
 
 ### Research helpers (related tools)
 
-The agent also ships read-only **arXiv** (`arxiv_search`, `arxiv_fetch`) and **Hugging Face Hub file** (`hf_hub_file_fetch`, uses host env **`HF_TOKEN`** when set) tools. Use them together with **`web_fetch`** on stable URLs—e.g. `https://raw.githubusercontent.com/.../refs/heads/main/...` for pinned examples—when checking current library APIs before long **`execution_run_background`** jobs.
+These research helpers are **opt-in**: they are registered only when top-level `ml_domain_enabled = true` is set in `config.toml` (disabled by default; audit X4). The agent also ships read-only **arXiv** (`arxiv_search`, `arxiv_fetch`) and **Hugging Face Hub file** (`hf_hub_file_fetch`, uses host env **`HF_TOKEN`** when set) tools. Use them together with **`web_fetch`** on stable URLs—e.g. `https://raw.githubusercontent.com/.../refs/heads/main/...` for pinned examples—when checking current library APIs before long **`execution_run_background`** jobs.
 
 Three providers are implemented today:
 
 - **`local`** — each session uses a working directory under your workspace sandbox. **Python (default):** one long-lived interpreter per session (**REPL-like**): variables and imports persist across **`execution_run`** calls until the session closes, you cancel, a run times out, or the working directory for the run changes (then the interpreter is restarted in the new cwd). Code is sent over a framed stdin/stdout channel to the worker (not via argv). **Opt out** with **`local_python_mode = "subprocess"`** in **`[harness.execution]`** to use a fresh **`python -u -`** subprocess per run (legacy, stateless). **Runtime choice:** `local_python_runtime = "uv_managed"` (default) provisions and reuses a managed env under `workspace_dir/.system_generated/uv/envs/`; `local_python_runtime = "system"` requires explicitly setting `python_executable`. If uv is missing at startup and uv-managed runtime is active, terminal mode prompts for yes/no auto-install and `/install-python` can be used later. **Shell** sessions still use one short-lived **`sh -c`** / **`cmd /C`** per run. Stdout/stderr are capped the same as **`max_output_bytes`** (half per stream, minimum each side). On Unix the child is placed in its own process group and cancellation/timeout sends **SIGKILL** to that group (similar to Windows **`taskkill /T`**); **`SIGKILL`** is never sent for PID 0 or 1.
 - **`jupyter`** — each session is a **Jupyter Server** kernel you point at with `base_url` + token; runs use the kernel’s WebSocket execute channel (persistent variables, interrupt via server API). **`display_data` / `execute_result`** may include **`image/png`**, **`image/jpeg`**, large **`text/csv`**, or large **`application/json`** payloads: those are written under **`sandbox_dir/.execution_artifacts/<session_id>/<run_uuid>/`** (size-capped) and referenced in **`RunResult.attachments`**; stdout gets short `[execution artifact] …` lines. Use **`execution_artifact_list`** to browse.
-- **`ssh`** — **`execution_session_create`** opens one authenticated SSH session (TCP + handshake) to the configured host and keeps it open for that session; each **`execution_run`** opens a new exec channel, runs a short remote `cd … && exec python3 -u -` (or `exec bash -s` for shell), and **streams your code on channel stdin** so large payloads are not embedded in `argv`. There is **no** Jupyter-style persistent kernel variables across runs—only the transport is reused. **`execution_cancel`** only cancels the client wait (remote process may keep running). Use **`identity_file`** (OpenSSH private key) and/or host env **`SSH_PASSWORD`** (never commit passwords in `config.toml`).
+- **`ssh`** — **`execution_session_create`** opens one authenticated SSH session (TCP + handshake) to the configured host and keeps it open for that session; each **`execution_run`** opens a new exec channel, runs a short remote `cd … && exec python3 -u -` (or `exec bash -s` for shell), and **streams your code on channel stdin** so large payloads are not embedded in `argv`. There is **no** Jupyter-style persistent kernel variables across runs—only the transport is reused. **`execution_cancel`** cancels the client wait and **best-effort kills the remote Python REPL worker by pid** (recorded at startup; `SIGINT`, then `SIGKILL` if still alive); shell-mode runs rely on channel close to signal the remote `bash -s` process. Use **`identity_file`** (OpenSSH private key) and/or host env **`SSH_PASSWORD`** (never commit passwords in `config.toml`).
 
 For **Google Colab**, use the **`colab-cli`** skill (invoke `colab` commands via `exec`) instead of the built-in execution harness providers. This allows more flexible management of Colab VMs including GPU/TPU provisioning.
 
@@ -43,6 +44,7 @@ Optional keys (defaults are sensible if omitted):
 | `default_provider` | **`local`** (default), **`jupyter`** (remote kernel), or **`ssh`** (remote exec over SSH). |
 | `max_wall_secs` | Upper bound on each run’s **`timeout_secs`** (default **3600**, clamped **1–86400** seconds = up to 24h). Raise this when you need longer blocking or background runs. |
 | `default_execution_timeout_secs` | Default wall clock when the model omits **`timeout_secs`** on **`execution_run`** / **`execution_run_background`** (default **600**, clamped to **`max_wall_secs`**). |
+| `auto_promote_after_secs` | Short bound after which a synchronous **`execution_run`** auto-promotes to a background job and returns a **`job_id`** envelope (default **120** when unset, clamped to **5..=max_wall_secs**; set to **0** to disable auto-promotion so synchronous calls run up to their full `timeout_secs`). |
 | `max_output_bytes` | Max combined stdout+stderr per run (default 256 KiB). |
 | `max_sessions` | Max concurrent sessions (default 32). |
 | `allowed_providers` | e.g. `["local"]`, `["jupyter"]`, `["ssh"]`; if empty or omitted, any implemented provider is allowed. |
@@ -82,7 +84,7 @@ When `default_provider = "ssh"`, add **`[harness.execution.ssh]`**:
 | `identity_file` | Path to an OpenSSH **private** key (optional if **`SSH_PASSWORD`** is set in the agent process environment). Tilde (`~`) expansion is applied. |
 | `remote_workdir` | **Absolute** path on the remote host (POSIX, e.g. `/home/you/isanagent-runs`). Only letters, digits, `/`, `_`, `-`, `.`; no `..`. **Required**. |
 | `remote_python` | Remote Python executable for `language: python` (default **`python3`**). |
-| `accept_unknown_host_keys` | Default **true**: accept any server host key (**vulnerable to MITM** on untrusted networks). Set **false** to fail closed until strict host-key verification exists. |
+| `accept_unknown_host_keys` | Default **false** (fail closed): unknown host keys are recorded TOFU-style under `workspace/.system_generated/ssh/known_hosts`; a *changed* key for a known host always refuses the connection. Set **true** only to accept never-seen keys on first connect (**MITM risk** on untrusted networks). |
 
 ## Workspace layout (important)
 
@@ -109,7 +111,7 @@ Materialized run artifacts live under **`sandbox_dir/.execution_artifacts/`** (s
 
 4. When finished (or to free slots): **`execution_session_close`** with the same `session_id`.
 
-Use **`execution_cancel`** (by session) or **`execution_job_cancel`** (by `job_id`) if a run is stuck and the provider reports **`supports_interrupt`** (true for **`local`** and **`jupyter`**; **false** for **`ssh`** in the current release).
+Use **`execution_cancel`** (by session) or **`execution_job_cancel`** (by `job_id`) if a run is stuck. Provider capability **`supports_interrupt`**: true for **`local`** and **`jupyter`**, false for **`ssh`** (no separate interrupt op — but SSH cancel/timeout still best-effort kills Python REPL workers remotely by pid; shell mode relies on channel close).
 
 ## Python and virtual environments (local provider)
 
@@ -146,7 +148,7 @@ If you use **`[harness.subagents]`** with **`allowed_tools`**, include the execu
 
 ## Roadmap (where this doc stays in sync)
 
-- **Implemented:** Jupyter provider (`execution-implementation-plan.md` Phase 3); SSH MVP (`execution-implementation-plan.md` Phase 4); UV-managed local runtime; Phase 6 artifacts, **`execution_artifact_list`**, run manifest (`execution_runs.jsonl`), telemetry **`ExecutionRunFinished`**, background jobs (**`execution_run_background`**, **`execution_jobs.jsonl`**, **`ExecutionJobFinished`**), and **`doom_loop_enabled`**.  
+- **Implemented:** Jupyter provider; SSH MVP; UV-managed local runtime; Phase 6 artifacts, **`execution_artifact_list`**, run manifest (`execution_runs.jsonl`), telemetry **`ExecutionRunFinished`**, background jobs (**`execution_run_background`**, **`execution_jobs.jsonl`**, **`ExecutionJobFinished`**), and **`doom_loop_enabled`**.  
 - **Later:** OAuth-native Colab integration feasibility output and execution provisioners (deferred design doc).
 
 When we add providers or config keys, this guide and **`AGENTS.md`** should be updated in the same change so operators are not surprised.

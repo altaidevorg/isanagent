@@ -72,10 +72,10 @@ struct HookStdoutEnvelope {
     args: Option<Value>,
 }
 
-fn matches_tool(matcher: &Option<Regex>, tool_name: &str) -> bool {
+fn matcher_matches(matcher: &Option<Regex>, text: &str) -> bool {
     match matcher {
         None => true,
-        Some(re) => re.is_match(tool_name),
+        Some(re) => re.is_match(text),
     }
 }
 
@@ -134,7 +134,10 @@ async fn run_hook_command(
     capture_failure: bool,
 ) -> Result<Option<String>, String> {
     let (shell, arg) = shell_invocation();
-    let mut child = Command::new(shell)
+    // Hook commands come from workspace/plugin config (third-party code): run them in the
+    // scrubbed safe environment so host master credentials never leak into hook processes.
+    let mut hook_cmd = Command::new(shell);
+    hook_cmd
         .arg(arg)
         .arg(command)
         .current_dir(cwd)
@@ -145,9 +148,10 @@ async fn run_hook_command(
         } else {
             Stdio::null()
         })
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("spawn hook: {e}"))?;
+        .kill_on_drop(true);
+    crate::environment::ExecutionEnvironmentPolicy::default_safe()
+        .apply_to_tokio_command(&mut hook_cmd);
+    let mut child = hook_cmd.spawn().map_err(|e| format!("spawn hook: {e}"))?;
 
     let mut stdin = child
         .stdin
@@ -307,7 +311,7 @@ pub async fn run_pre_tool_hooks(
     session: HookSessionInfo<'_>,
 ) -> PreToolOutcome {
     for h in engine.pre_tool.iter() {
-        if !matches_tool(&h.matcher, tool_name) {
+        if !matcher_matches(&h.matcher, tool_name) {
             continue;
         }
         let cwd = match hook_cwd(&engine.sandbox_dir, h.cwd_relative.as_deref()) {
@@ -376,7 +380,7 @@ pub async fn run_post_tool_hooks(
 ) -> Option<String> {
     let mut outputs: Vec<String> = Vec::new();
     for h in engine.post_tool.iter() {
-        if !matches_tool(&h.matcher, tool_name) {
+        if !matcher_matches(&h.matcher, tool_name) {
             continue;
         }
         let cwd = match hook_cwd(&engine.sandbox_dir, h.cwd_relative.as_deref()) {
@@ -433,6 +437,11 @@ pub async fn run_user_prompt_hooks(
 ) -> UserPromptHookOutcome {
     let mut inject: Option<String> = None;
     for h in engine.user_prompt.iter() {
+        // `matcher` regex-tests the prompt content for user_prompt hooks (analogous to the tool
+        // name filter on pre_tool/post_tool); omitted or empty matches every prompt.
+        if !matcher_matches(&h.matcher, content) {
+            continue;
+        }
         let cwd = match hook_cwd(&engine.sandbox_dir, h.cwd_relative.as_deref()) {
             Ok(p) => p,
             Err(e) => {

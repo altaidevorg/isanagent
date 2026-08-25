@@ -1,7 +1,7 @@
 # Public API Surface — isanagent
 
 > **Status:** Phase 0.0 (a, b partial, c), Phase 0 (telemetry baseline), Phase 1 (PR-1, PR-2, PR-2.1, PR-6 v1, PR-4 v1, PR-4.1, PR-5, PR-5.1, PR-10, PR-6.1, PR-3 v1, PR-2.2, PR-7 full = v0 + 7.1 + 7.2) landed. Builder follow-up (0.0b.3), config sweep (0.0b.2), PR-1.1 config plumbing, and PR-11 deferred. **Phase 1 substantively complete.**
-> **Generated against:** `Cargo.toml` package `isanagent` v0.9.0, rust-version 1.85.
+> **Generated against:** `Cargo.toml` package `isanagent` v0.13.0, rust-version 1.85.
 > **Purpose.** Catalogue every public item that downstream consumers may depend on. After Phase 0.0b lands, this document becomes the source of truth for the **additive-only contract**: every later PR in the overhaul must (a) extend this surface only, never remove or break it, and (b) update this document as part of the same PR.
 
 ---
@@ -51,13 +51,14 @@ Items below carry no `[consumed-by:]` annotation until evidence appears.
 
 ### 3.2 `pub mod` declarations
 
-[src/lib.rs:9-33](../src/lib.rs#L9-L33):
+[src/lib.rs:9-42](../src/lib.rs#L9-L42):
 
 ```
-agent, bus, channels, clarification, config, environment, execution, hooks, logging,
-memory, ml_engineer, multi_tenant_edge, onboarding, onboarding_interactive, plugins,
-projections, provider, provider_registry, redact, reflection, scheduler, session, skills,
-spill, tool_activity, tool_runtime, tools, traits, utils, workspace
+acp, agent, bus, channels, checkpoint, clarification, config, environment, execution, hooks,
+host, log_rotation, logging, memory, ml_engineer, multi_tenant_edge, onboarding,
+onboarding_interactive, plugins, projections, protocol, provider, provider_registry, redact,
+reflection, scheduler, session, skills, tool_activity, tool_runtime, tools, traits, utils,
+workspace
 ```
 
 Every module is fully `pub`. No `pub(crate)` gating at the lib.rs level.
@@ -68,15 +69,15 @@ The crate root is also the actor-graph framework. These types are likely the mos
 
 | Item | Kind | Location | `#[non_exhaustive]` | Notes |
 | --- | --- | --- | --- | --- |
-| `Message<T>` | enum | [src/lib.rs:41](../src/lib.rs#L41) | **NO** | Variants: `Packet(T)`, `Terminate`, `AddSuccessor { action, sender }`. Generic over payload `T`. |
-| `ActorError` | enum | [src/lib.rs:58](../src/lib.rs#L58) | **NO** | Variants: `LogicError { actor, source }`, `MaxRetriesReached { actor, max_retries, last_error }`, `Generic(String)`. Has `From<String>` and `From<&str>` impls. |
-| `SupervisorPolicy` | enum | [src/lib.rs:91](../src/lib.rs#L91) | **NO** | Variants: `Stop`, `Restart`. `#[derive(Copy)]`. |
-| `Supervisor<T, F>` | struct | [src/lib.rs:99](../src/lib.rs#L99) | n/a | Constructor: `pub fn new(policy, factory)`. Implements `ActorLogic<T>`. |
-| `ActorLogic<T>` | trait | [src/lib.rs:188](../src/lib.rs#L188) | n/a | `async_trait`. Methods: `name`, `prep`, `process` (required), `post`, `tick_interval`, `on_tick`. Default-implemented except `process`. |
-| `ActorNode<T>` | struct | [src/lib.rs:242](../src/lib.rs#L242) | n/a | Constructor: `pub fn new(logic, receiver, max_retries, retry_wait)`. Method `pub async fn run(self)`. |
-| `Batcher<T, F>` | struct | [src/lib.rs:443](../src/lib.rs#L443) | n/a | Constructor: `pub fn new(batch_size, timeout, action, wrapper)`. Implements `ActorLogic<T>`. |
-| `NodeHandle<T>` | struct | [src/lib.rs:518](../src/lib.rs#L518) | n/a | `#[derive(Clone, Debug)]`. Pub fields `sender`, `name`. Methods: `new`, `send_packet`, `wire`, `create_listener`. |
-| `Connector<T>` | struct | [src/lib.rs:591](../src/lib.rs#L591) | n/a | Temporary returned by `Sub for &NodeHandle<T>`. Implements `Shr<&NodeHandle<T>>`. |
+| `Message<T>` | enum | [src/lib.rs:41](../src/lib.rs#L51) | **NO** | Variants: `Packet(T)`, `Terminate`, `AddSuccessor { action, sender }`. Generic over payload `T`. |
+| `ActorError` | enum | [src/lib.rs:58](../src/lib.rs#L69) | **NO** | Variants: `LogicError { actor, source }`, `MaxRetriesReached { actor, max_retries, last_error }`, `Generic(String)`. Has `From<String>` and `From<&str>` impls. |
+| `SupervisorPolicy` | enum | [src/lib.rs:91](../src/lib.rs#L102) | **NO** | Variants: `Stop`, `Restart`. `#[derive(Copy)]`. |
+| `Supervisor<T, F>` | struct | [src/lib.rs:99](../src/lib.rs#L110) | n/a | Constructor: `pub fn new(policy, factory)`. Implements `ActorLogic<T>`. |
+| `ActorLogic<T>` | trait | [src/lib.rs:188](../src/lib.rs#L199) | n/a | `async_trait`. Methods: `name`, `prep`, `process` (required), `post`, `tick_interval`, `on_tick`. Default-implemented except `process`. |
+| `ActorNode<T>` | struct | [src/lib.rs:242](../src/lib.rs#L253) | n/a | Constructor: `pub fn new(logic, receiver, max_retries, retry_wait)`. Method `pub async fn run(self)`. |
+| `Batcher<T, F>` | struct | [src/lib.rs:443](../src/lib.rs#L454) | n/a | Constructor: `pub fn new(batch_size, timeout, action, wrapper)`. Implements `ActorLogic<T>`. |
+| `NodeHandle<T>` | struct | [src/lib.rs:518](../src/lib.rs#L529) | n/a | `#[derive(Clone, Debug)]`. Pub fields `sender`, `name`. Constructor: `pub fn new<L>(logic: L, buffer: usize, max_retries: u32, retry_wait: Duration) -> Self` where `L: ActorLogic<T>`. Methods: `new`, `send_packet`, `wire`, `create_listener`. |
+| `Connector<T>` | struct | [src/lib.rs:591](../src/lib.rs#L602) | n/a | Temporary returned by `Sub for &NodeHandle<T>`. Implements `Shr<&NodeHandle<T>>`. |
 
 Operator overloads: `&NodeHandle<T> - "action"` returns `Connector<T>`, `Connector<T> >> &NodeHandle<T>` wires successor and returns RHS clone.
 
@@ -119,9 +120,9 @@ pub struct OutboundMessage {
 
 `#[derive(Debug, Clone, Serialize, Deserialize)]`. None of the fields have `#[serde(default)]`.
 
-### 4.3 `TelemetryEvent` — enum [src/bus.rs:73](../src/bus.rs#L73)
+### 4.3 `TelemetryEvent` — enum [src/bus.rs:73](../src/bus.rs#L122)
 
-`#[derive(Debug, Clone, Serialize, Deserialize)]`. **18 variants today, zero compaction-related.** This is the baseline — Phase 0 of the overhaul adds the first compaction telemetry; the variants below are pre-existing.
+`#[derive(Debug, Clone, Serialize, Deserialize)]`. **24 variants today**: the pre-existing set plus Phase 0 compaction/reflection telemetry and the PR-7.x tool-result-swap signal (`ToolResultRefetch`).
 
 | Variant | Notable fields |
 | --- | --- |
@@ -148,12 +149,13 @@ pub struct OutboundMessage {
 | `CompactionFailed` *(Phase 0)* | `chat_id`, `reason`, `tokens_at_failure` |
 | `ReflectionStarted` *(Phase 0)* | `chat_id: Option<String>` (None for long-term global), `kind: ReflectionKind`, `inputs_consumed` |
 | `ReflectionCompleted` *(Phase 0)* | `chat_id: Option<String>`, `kind: ReflectionKind`, `output_bytes`, `wall_ms` |
+| `ToolResultRefetch` *(PR-7.x)* | `chat_id`, `tool_call_id` |
 
-Supporting enums (added in Phase 0): `CompactionTrigger { TurnLimit, TokenLimit, BothLimits }` and `ReflectionKind { ShortTerm, LongTerm }`. Both `#[non_exhaustive]`. Future overhaul PRs will extend `CompactionTrigger` with `Manual`, `AgentSelf`, `Overflow400`.
+Supporting enums (added in Phase 0): `CompactionTrigger { TurnLimit, TokenLimit, BothLimits, Overflow400, Manual, AgentSelf }` and `ReflectionKind { ShortTerm, LongTerm }`. Both `#[non_exhaustive]`.
 
 Many variants already use `#[serde(default)]` on `channel`, `tool_call_id`, `background_job_id`, and `description`. Pattern is well-established — easy to extend.
 
-### 4.4 `BusMessage` — enum [src/bus.rs:461](../src/bus.rs#L461)
+### 4.4 `BusMessage` — enum [src/bus.rs:461](../src/bus.rs#L729)
 
 `#[derive(Debug, Clone, Serialize, Deserialize)]`. 
 
@@ -176,15 +178,15 @@ Many variants already use `#[serde(default)]` on `channel`, `tool_call_id`, `bac
 | `StreamDelta { chat_id, chunk }` | Incremental LLM provider streaming delta |
 | `SessionProjection(SessionProjection)` | Authoritative session state projection snapshot |
 
-### 4.5 `LogLevel` — enum [src/bus.rs:257](../src/bus.rs#L257)
+### 4.5 `LogLevel` — enum [src/bus.rs:257](../src/bus.rs#L387)
 
 `#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]`. Variants: `Trace, Debug, Info, Warn, Error`. Has `Display` impl emitting uppercase.
 
-### 4.6 `LoggerControlMessage` — enum [src/bus.rs:279](../src/bus.rs#L279)
+### 4.6 `LoggerControlMessage` — enum [src/bus.rs:279](../src/bus.rs#L409)
 
 `#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]`. Variants: `Flush, Flushed`. Internal logger handshake.
 
-### 4.7 `LogEvent` — struct [src/bus.rs:287](../src/bus.rs#L287)
+### 4.7 `LogEvent` — struct [src/bus.rs:287](../src/bus.rs#L418)
 
 ```rust
 pub struct LogEvent {
@@ -204,7 +206,7 @@ Constructors: `new`, `trace`, `debug`, `info`, `warn`, `error`, builder methods 
 
 ### 4.8 Public constants
 
-[src/bus.rs:6-20](../src/bus.rs#L6-L20):
+[src/bus.rs:6-22](../src/bus.rs#L6-L22):
 
 - `METADATA_SYNTHETIC_JOB_FOLLOWUP`
 - `METADATA_SYNTHETIC_CRON_TRIGGER`
@@ -213,27 +215,30 @@ Constructors: `new`, `trace`, `debug`, `info`, `warn`, `error`, builder methods 
 - `METADATA_SYNTHETIC_BACKGROUND_RESUME`
 - `METADATA_BACKGROUND_JOB_ID`
 - `METADATA_CLARIFICATION_TICKET_ID`
+- `METADATA_RUN_ID`
 
 All `pub const &str`. Used as `metadata` HashMap keys on `InboundMessage`.
 
 ### 4.9 Public functions
 
-- `pub fn get_background_job_id(metadata) -> Option<String>` [src/bus.rs:37](../src/bus.rs#L37)
-- `pub fn clarification_session_key(channel, chat_id, thread_id) -> String` [src/bus.rs:50](../src/bus.rs#L50) — kept in lockstep with [`crate::tool_runtime::ToolExecCtx`](../src/tool_runtime.rs).
+- `pub fn get_background_job_id(metadata) -> Option<String>` [src/bus.rs:45](../src/bus.rs#L45)
+- `pub fn clarification_session_key(channel, chat_id, thread_id) -> String` [src/bus.rs:58](../src/bus.rs#L58) — kept in lockstep with [`crate::tool_runtime::ToolExecCtx`](../src/tool_runtime.rs).
 
 ---
 
 ## 5. Memory subsystem (`src/memory.rs`)
 
-### 5.1 `MemoryMessage` — enum [src/memory.rs:434](../src/memory.rs#L434)
+### 5.1 `MemoryMessage` — enum [src/memory.rs:493](../src/memory.rs#L493)
 
-`#[derive(Debug)]` (no Serialize/Deserialize — contains `SharedReply` which is not serializable). Variants always carry a `reply: SharedReply<Result<T, String>>`. **27 variants today.** Adding new variants is the standard way to extend SqliteMemoryActor's capabilities.
+`#[derive(Debug)]` (no Serialize/Deserialize — contains `SharedReply` which is not serializable). Variants always carry a `reply: SharedReply<Result<T, String>>`. **43 variants today.** Adding new variants is the standard way to extend SqliteMemoryActor's capabilities.
 
 Grouped by domain:
 
-**Messages / context (5 variants).** `AddMessage`, `GetContext`, `FirstUserMessagePreview`, `FirstUserMessagePreviewsBatch`, `Clear`.
+**Messages / context (6 variants).** `AddMessage`, `GetContext`, `FirstUserMessagePreview`, `FirstUserMessagePreviewsBatch`, `TruncateAfterUserMessage`, `Clear`.
 
-**Reflection / summaries (10 variants).** `AddSummary`, `UpdateSummary`, `GetRecentSummaries`, `GetSummaries`, `DeleteSummary`, `UpdateThreadMetadata`, `GetThreadMetadata`, `SearchSummaries`, `FetchSummariesByTimeRange`, `GetThreadsNeedingReflection`, `GetMessagesSinceReflection`, `GetLongTermReflectionState`, `SetLongTermReflectionState`.
+**Message content & tool-result cache (3 variants).** `UpdateMessageContent`, `CacheToolResult`, `FetchToolResult` (PR-7.x swap machinery).
+
+**Reflection / summaries (14 variants).** `AddSummary`, `WriteSectionsJson`, `UpdateSummary`, `GetRecentSummaries`, `GetSummaries`, `DeleteSummary`, `UpdateThreadMetadata`, `GetThreadMetadata`, `SearchSummaries`, `FetchSummariesByTimeRange`, `GetThreadsNeedingReflection`, `GetMessagesSinceReflection`, `GetLongTermReflectionState`, `SetLongTermReflectionState`.
 
 > **Overhaul touchpoint.** PR-2 and Initiative-A extend this group. The existing `AddSummary` schema already carries `summary, key_info, knowledge_gaps` — PR-2's "sectional summary template" should be reconciled with this 3-slot pre-existing structure rather than introducing a parallel one.
 
@@ -245,7 +250,7 @@ Grouped by domain:
 
 **Background jobs (3 variants).** `UpsertBackgroundJob`, `ListBackgroundJobs`, `UpdateBackgroundJobState`. Plus active-cron count via `GetActiveCronsCount`.
 
-**Notifications (3 variants).** `InsertNotification`, `ListNotifications`, `MarkNotificationSeen`, `ResolveNotification`.
+**Notifications (4 variants).** `InsertNotification`, `ListNotifications`, `MarkNotificationSeen`, `ResolveNotification`.
 
 **Clarifications (5 variants).** `UpsertClarificationTicket`, `ResolveClarificationTicket`, `GetClarificationTicket`, `ResolveClarificationTicketFull`, `ListClarificationTickets`.
 
@@ -276,7 +281,7 @@ Constructor: `pub fn new(db_path: &str) -> Result<Self, String>` [src/memory.rs:
 | `chat_id_from_root_thread_id` | [src/memory.rs:139](../src/memory.rs#L139) | `pub fn`. |
 | `configure_agent_sqlite_connection` | [src/memory.rs:172](../src/memory.rs#L172) | `pub fn` — sets busy timeout, WAL, etc. |
 | `ensure_harness_todos_schema` | [src/memory.rs:179](../src/memory.rs#L179) | Idempotent migration. |
-| `ensure_subagent_tasks_schema` | [src/memory.rs:257](../src/memory.rs#L257) | Idempotent migration. |
+| `ensure_subagent_tasks_schema` | [src/memory.rs:291](../src/memory.rs#L291) | Idempotent migration. |
 | `ensure_background_runtime_schema` | [src/memory.rs:289](../src/memory.rs#L289) | Idempotent migration. |
 | `ensure_cron_jobs_schema` | [src/memory.rs:359](../src/memory.rs#L359) | Idempotent migration. |
 
@@ -300,9 +305,9 @@ There are no provider-only or credential-only mutation shims. All runtime
 provider changes must use `switch_provider_with_credentials` so the provider
 and its credentials become visible atomically.
 
-### 6.1 `AgentLogic` — struct [src/agent/mod.rs:1045](../src/agent/mod.rs#L1045)
+### 6.1 `AgentLogic` — struct [src/agent/mod.rs:153](../src/agent/mod.rs#L153)
 
-The central reasoning actor. All fields private. Constructed via `pub fn new(params: AgentLogicParams) -> Self` [src/agent/mod.rs:1073](../src/agent/mod.rs#L1073). Implements `ActorLogic<BusMessage>` at [src/agent/mod.rs:1270](../src/agent/mod.rs#L1270).
+The central reasoning actor. All fields private. Constructed via `pub fn new(params: AgentLogicParams) -> Self` [src/agent/mod.rs:182](../src/agent/mod.rs#L182). Implements `ActorLogic<BusMessage>` at [src/agent/mod.rs:479](../src/agent/mod.rs#L479).
 
 Provider configuration changes must use
 `switch_provider_with_credentials(provider, credentials)` so the provider and
@@ -312,7 +317,7 @@ handle.
 
 > **Overhaul touchpoint.** PR-5 adds a pub method `trigger_compaction(chat_id, options)` to this struct.
 
-### 6.2 `AgentLogicParams` — struct [src/agent/mod.rs:999](../src/agent/mod.rs#L999)
+### 6.2 `AgentLogicParams` — struct [src/agent/mod.rs:98](../src/agent/mod.rs#L98)
 
 Constructor params for `AgentLogic::new`. **All fields `pub`** — embedding crates set them directly.
 
@@ -347,13 +352,13 @@ pub struct AgentLogicParams {
 
 **This struct is on the critical compatibility path.** Adding fields here is breaking without `#[non_exhaustive]` because constructors enumerate every field. Phase 0.0b must add the marker and document the workaround (use struct-update syntax with a default).
 
-### 6.3 `SubagentHarnessParams` — struct [src/agent/mod.rs:1032](../src/agent/mod.rs#L1032)
+### 6.3 `SubagentHarnessParams` — struct [src/agent/mod.rs:137](../src/agent/mod.rs#L137)
 
 `#[derive(Clone, Debug)]`. All `pub` fields. Same compatibility concern as `AgentLogicParams`.
 
-### 6.4 `ExecutionHarness` — struct [src/execution/harness.rs:32](../src/execution/harness.rs#L32)
+### 6.4 `ExecutionHarness` — struct [src/execution/harness.rs:31](../src/execution/harness.rs#L31)
 
-Manages execution providers (`local`, `jupyter`, `ssh`). Mostly private fields. Pub fields: `default_run_timeout_secs`, `max_wall_secs`, `auto_promote_after_secs`. Constructed via `pub fn new_with_providers(...)` [src/execution/harness.rs:60](../src/execution/harness.rs#L60) — 10-arg constructor; the builder [`build_execution_harness`](../src/execution/harness.rs#L403) wraps it.
+Manages execution providers (`local`, `jupyter`, `ssh`). Mostly private fields. Pub fields: `default_run_timeout_secs`, `max_wall_secs`, `auto_promote_after_secs`. Constructed via `pub fn new_with_providers(...)` [src/execution/harness.rs:55](../src/execution/harness.rs#L55) — 10-arg constructor; the builder [`build_execution_harness`](../src/execution/harness.rs#L321) wraps it.
 
 ---
 
@@ -442,20 +447,25 @@ Public methods:
 
 `pub fn search_tool_index(entries: &[(String, String)], query: &str, limit: usize) -> Vec<(String, usize)>`. Lexical scoring for the `search_tools` tool.
 
-### 8.3 Built-in tool names (34 total)
+### 8.3 Built-in tool names (43 static; 46 with `ml_domain_enabled`; plus dynamic MCP tools)
 
-Discovered via `grep "fn name(&self) -> &str"` across [src/tools/](../src/tools/). Tool *names* are part of the contract — they are the strings the LLM emits in function calls, and they appear in saved chat transcripts.
+Discovered via `grep "fn name(&self) -> &str"` across [src/tools/](../src/tools/) and the agent modules. Tool *names* are part of the contract - they are the strings the LLM emits in function calls, and they appear in saved chat transcripts.
 
-**[src/tools/builtin.rs](../src/tools/builtin.rs) — 15 tools.** `read_file`, `write_file`, `edit_file`, `list_dir`, `glob_files`, `search_text`, `exec`, `web_search`, `web_fetch`, `cron`, `message`, `git_worktree`, `search_memory`, `fetch_memory_by_date`, `get_env`.
+**[src/tools/builtin.rs](../src/tools/builtin.rs) - 17 tools.** `read_file`, `write_file`, `edit_file`, `list_dir`, `glob_files`, `search_text`, `exec`, `exec_status`, `exec_send`, `web_search`, `web_fetch`, `cron`, `message`, `git_worktree`, `search_memory`, `fetch_memory_by_date`, `get_env`.
 
-**[src/tools/execution.rs](../src/tools/execution.rs) — 11 tools.** `execution_session_create`, `execution_run`, `execution_run_background`, `execution_job_status`, `execution_job_result`, `execution_read_log`, `execution_job_list`, `execution_job_cancel`, `execution_artifact_list`, `execution_cancel`, `execution_session_close`, `execution_env_info`.
+**[src/tools/execution.rs](../src/tools/execution.rs) - 12 tools.** `execution_session_create`, `execution_run`, `execution_run_background`, `execution_job_status`, `execution_job_result`, `execution_read_log`, `execution_job_list`, `execution_job_cancel`, `execution_artifact_list`, `execution_cancel`, `execution_session_close`, `execution_env_info`.
 
-**[src/tools/workflow.rs](../src/tools/workflow.rs) — 3 tools.** `todo_write`, `search_tools`, `ask_user`.
+**[src/tools/workflow.rs](../src/tools/workflow.rs) - 3 tools.** `todo_write`, `search_tools`, `ask_user`.
 
-**[src/tools/ml_domain.rs](../src/tools/ml_domain.rs) — 3 tools.** `arxiv_search`, `arxiv_fetch`, `hf_hub_file_fetch`.
+**[src/tools/recall.rs](../src/tools/recall.rs) - 1 tool.** `recall_tool_result` (re-materializes a tool result that was compacted out of the active context, by `tool_call_id`).
 
-**Other.** `LoadSkillTool` in [src/agent/mod.rs:2591](../src/agent/mod.rs#L2591) (`load_skill_instructions`). Sub-agent tools (`subagent_spawn`, `subagent_plan_execute`, `task_history_list`) referenced by name in [src/tools.rs:117](../src/tools.rs#L117) and [src/tools.rs:138](../src/tools.rs#L138).
+**[src/tools/compact.rs](../src/tools/compact.rs) - 1 tool.** `compact_context` (agent-triggered manual compaction).
 
+**[src/tools/ml_domain.rs](../src/tools/ml_domain.rs) - 3 tools.** `arxiv_search`, `arxiv_fetch`, `hf_hub_file_fetch`. Opt-in only: registered when top-level `ml_domain_enabled = true` (audit X4).
+
+**[src/tools/mcp.rs](../src/tools/mcp.rs) - dynamic.** MCP-server tools are registered at runtime; their names come from server configuration and are not part of this static contract.
+
+**Other.** `LoadSkillTool` in [src/agent/mod.rs:1078](../src/agent/mod.rs#L1078) (`load_skill_instructions`). Sub-agent/task tools defined in [src/agent/subagent.rs](../src/agent/subagent.rs) - 8 tools: `subagent_spawn`, `subagent_plan_execute`, `task_list`, `task_get`, `task_cancel`, `task_history_list`, `agent_list`, `task_dashboard` (the name set is also matched in [src/tools.rs:240-246](../src/tools.rs#L240-L246)).
 ### 8.4 Tool schemas
 
 Tool parameter JSON Schemas are returned by `Tool::parameters(&self) -> Value`. They are the contract surface for any consumer that bypasses the registry (e.g. inspects `list_tools()` output and feeds it to a provider directly). **Schemas not enumerated here** — the source is the authoritative form. A future Phase 0.0a follow-up could snapshot them under `docs/tool-schemas/` for diff visibility.
@@ -545,14 +555,14 @@ Kept below as the original Phase 0.0b proposal. Subsections are numbered §9.5.x
 
 Apply the marker to:
 
-- [ ] `Message<T>` — [src/lib.rs:41](../src/lib.rs#L41)
-- [ ] `ActorError` — [src/lib.rs:58](../src/lib.rs#L58)
-- [ ] `SupervisorPolicy` — [src/lib.rs:91](../src/lib.rs#L91). *(Borderline — only two variants and unlikely to grow. Defer if it creates churn.)*
-- [ ] `TelemetryEvent` — [src/bus.rs:73](../src/bus.rs#L73). **Highest priority** — the overhaul adds at least 5 new variants.
-- [ ] `BusMessage` — [src/bus.rs:461](../src/bus.rs#L461). **High priority** — PR-5 adds `TriggerCompaction`.
-- [ ] `LogLevel` — [src/bus.rs:257](../src/bus.rs#L257). *(Defer — unlikely to grow.)*
-- [ ] `LoggerControlMessage` — [src/bus.rs:279](../src/bus.rs#L279). *(Defer.)*
-- [ ] `MemoryMessage` — [src/memory.rs:434](../src/memory.rs#L434). **Highest priority** — Initiative-A adds many variants.
+- [ ] `Message<T>` — [src/lib.rs:41](../src/lib.rs#L51)
+- [ ] `ActorError` — [src/lib.rs:58](../src/lib.rs#L69)
+- [ ] `SupervisorPolicy` — [src/lib.rs:91](../src/lib.rs#L102). *(Borderline — only two variants and unlikely to grow. Defer if it creates churn.)*
+- [ ] `TelemetryEvent` — [src/bus.rs:73](../src/bus.rs#L122). **Highest priority** — the overhaul adds at least 5 new variants.
+- [ ] `BusMessage` — [src/bus.rs:461](../src/bus.rs#L729). **High priority** — PR-5 adds `TriggerCompaction`.
+- [ ] `LogLevel` — [src/bus.rs:257](../src/bus.rs#L387). *(Defer — unlikely to grow.)*
+- [ ] `LoggerControlMessage` — [src/bus.rs:279](../src/bus.rs#L409). *(Defer.)*
+- [ ] `MemoryMessage` — [src/memory.rs:493](../src/memory.rs#L493). **Highest priority** — Initiative-A adds many variants.
 - [ ] `AgentMode` — [src/config.rs:185](../src/config.rs#L185)
 - [ ] `ShellPolicyMode` — [src/config.rs:214](../src/config.rs#L214)
 - [ ] `SlackMode` — [src/config.rs:1554](../src/config.rs#L1554)
@@ -564,9 +574,9 @@ Apply `#[non_exhaustive]` to these **structs** (forces struct-update syntax on c
 
 - [ ] `InboundMessage` — [src/bus.rs:24](../src/bus.rs#L24)
 - [ ] `OutboundMessage` — [src/bus.rs:63](../src/bus.rs#L63)
-- [ ] `LogEvent` — [src/bus.rs:287](../src/bus.rs#L287)
-- [ ] `AgentLogicParams` — [src/agent/mod.rs:999](../src/agent/mod.rs#L999). **Highest priority** — most likely to grow new construction-time options.
-- [ ] `SubagentHarnessParams` — [src/agent/mod.rs:1032](../src/agent/mod.rs#L1032)
+- [ ] `LogEvent` — [src/bus.rs:287](../src/bus.rs#L418)
+- [ ] `AgentLogicParams` — [src/agent/mod.rs:98](../src/agent/mod.rs#L98). **Highest priority** — most likely to grow new construction-time options.
+- [ ] `SubagentHarnessParams` — [src/agent/mod.rs:137](../src/agent/mod.rs#L137)
 - [ ] Every persisted record type: `RootThreadListItem`, `SubagentTaskRecord`, `BackgroundJobRecord`, `NotificationRecord`, `ClarificationTicketRecord`, `TodoRow`, `SummaryEntry`.
 - [ ] All public config structs under [src/config.rs](../src/config.rs) — at least `AppConfig`, `HarnessConfig`, `ExecutionHarnessConfig`, `SubagentHarnessConfig`, `MemoryConfig`, `ShellPolicyConfig`, `ResolvedShellPolicy`, `HarnessHooksConfig`, `BackgroundJobsConfig`, `NotificationsConfig`, `AgentDefinition`. *(There are ~30 pub structs in this file; an audit pass should batch-apply.)*
 
@@ -611,7 +621,7 @@ Bootstrapped in `SqliteMemoryActor::new` [src/memory.rs:646](../src/memory.rs#L6
 | `session_summaries_fts` | [src/memory.rs:710](../src/memory.rs#L710) | FTS5 virtual table over `session_summaries`. Triggers `_ai` / `_ad` keep it in sync. |
 | `global_metadata` | [src/memory.rs:735](../src/memory.rs#L735) | Key-value store; holds long-term reflection cursor. |
 | `harness_todos` | via `ensure_harness_todos_schema` [src/memory.rs:179](../src/memory.rs#L179) | Persisted `TodoRow`. |
-| `subagent_tasks` | via `ensure_subagent_tasks_schema` [src/memory.rs:257](../src/memory.rs#L257) | Sub-agent task history. |
+| `subagent_tasks` | via `ensure_subagent_tasks_schema` [src/memory.rs:291](../src/memory.rs#L291) | Sub-agent task history. |
 | `cron_jobs` | via `ensure_cron_jobs_schema` [src/memory.rs:359](../src/memory.rs#L359) | Cron schedule + completion. |
 | Background-runtime tables | via `ensure_background_runtime_schema` [src/memory.rs:289](../src/memory.rs#L289) | Background jobs, notifications, clarification tickets. |
 

@@ -10,7 +10,6 @@ mod execution_browser;
 mod history_cells;
 mod markdown;
 pub mod panes;
-pub(crate) mod protocol;
 mod run;
 mod syntect_highlight;
 mod text_format;
@@ -18,7 +17,7 @@ mod theme;
 
 pub use app::{
     AgentTaskEntry, AgentTaskStatus, App, Cell, JobStripEntry, JobStripStatus, ModelSelector,
-    TerminalUiFocus, TerminalUiMode, ToastKind, ToolNoticePhase, ToolRailEntry,
+    ModelSelectorStage, TerminalUiFocus, TerminalUiMode, ToastKind, ToolNoticePhase, ToolRailEntry,
     TranscriptSelection,
 };
 pub use approval::{approval_hotkey_reply, EditDiffPayload, APPROVAL_CHOICES};

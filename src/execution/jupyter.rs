@@ -57,6 +57,8 @@ pub struct JupyterExecutionProvider {
     client: reqwest::Client,
     caps: ProviderCapabilities,
     sessions: DashMap<SessionId, Arc<JupyterSession>>,
+    /// Audit X15: atomic `max_sessions` budget (see `super::limits`).
+    session_slots: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 /// Per-run state for Phase 6 artifact materialization (WS loop → disk).
@@ -74,6 +76,8 @@ struct JupyterSession {
     run_cancel: Mutex<Option<CancellationToken>>,
     /// Resolved server-side `.ipynb` path for optional Contents sync (from template at session create).
     notebook_server_path: Option<String>,
+    /// Audit X15: held for the session's lifetime; released on map removal.
+    _slot: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl JupyterExecutionProvider {
@@ -113,6 +117,7 @@ impl JupyterExecutionProvider {
             client,
             caps,
             sessions: DashMap::new(),
+            session_slots: super::limits::session_slot_semaphore(config.max_sessions),
         })
     }
 
@@ -357,12 +362,12 @@ impl ExecutionProvider for JupyterExecutionProvider {
         &self,
         req: SessionCreateRequest,
     ) -> Result<SessionHandle, ExecutionError> {
-        if self.config.max_sessions > 0 && self.sessions.len() >= self.config.max_sessions {
-            return Err(ExecutionError::limit_exceeded(
-                "sessions",
-                format!("max_sessions={} reached", self.config.max_sessions),
-            ));
-        }
+        // Audit X15: reserve a session slot with a single compare-and-set
+        // instead of the racy `sessions.len()` probe. The permit stays a
+        // local until the session record takes ownership below, so any
+        // fallible setup step (`?`) releases it automatically.
+        let slot =
+            super::limits::try_acquire_session_slot(&self.session_slots, self.config.max_sessions)?;
         let kernel_name = self.pick_kernel_name(&req)?;
         let id = SessionId::new(uuid::Uuid::new_v4().to_string());
         let kernel_id = if let Some(ref kid) = req.resume_jupyter_kernel_id {
@@ -397,6 +402,7 @@ impl ExecutionProvider for JupyterExecutionProvider {
             ws: Mutex::new(None),
             run_cancel: Mutex::new(None),
             notebook_server_path,
+            _slot: slot,
         });
         self.sessions.insert(id.clone(), session);
         Ok(SessionHandle {
@@ -458,63 +464,94 @@ impl ExecutionProvider for JupyterExecutionProvider {
         let nb_path = session.notebook_server_path.clone();
         let auth_token = self.config.token.clone();
 
-        let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
-            let exec_msg_id = uuid::Uuid::new_v4().to_string();
-            let session_key = uuid::Uuid::new_v4().to_string();
-            let run_id = spec
-                .run_id
-                .clone()
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            let msg = build_execute_request(&exec_msg_id, &session_key, &spec.code);
-            let payload = encode_kernel_ws_frame(&msg)?;
+        let result =
+            tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+                let exec_msg_id = uuid::Uuid::new_v4().to_string();
+                let session_key = uuid::Uuid::new_v4().to_string();
+                let run_id = spec
+                    .run_id
+                    .clone()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let msg = build_execute_request(&exec_msg_id, &session_key, &spec.code);
+                let payload = encode_kernel_ws_frame(&msg)?;
 
-            let throttle = spec
-                .run_event_tx
-                .as_ref()
-                .map(|_| Arc::new(RunEventThrottle::new(Duration::from_millis(40))));
+                let throttle = spec
+                    .run_event_tx
+                    .as_ref()
+                    .map(|_| Arc::new(RunEventThrottle::new(Duration::from_millis(40))));
 
-            let mut ws_guard = session.ws.lock().await;
-            let ws = ws_guard
-                .as_mut()
-                .ok_or_else(|| ExecutionError::Provider("jupyter ws not connected".into()))?;
+                // Take the socket out of the session slot under a short lock (audit R10).
+                // Holding the guard across the whole collect loop used to block
+                // execution_session_close for up to max_wall_secs. While we own the stream the
+                // slot stays None; on success we republish it below, and on error, timeout, or
+                // cancel the dropped future leaves it None so ensure_ws() reconnects cleanly.
+                let mut ws =
+                    session.ws.lock().await.take().ok_or_else(|| {
+                        ExecutionError::Provider("jupyter ws not connected".into())
+                    })?;
 
-            ws.send(Message::Binary(payload.into()))
-                .await
-                .map_err(|e| ExecutionError::Provider(format!("jupyter ws send: {e}")))?;
+                if let Err(e) = ws.send(Message::Binary(payload.into())).await {
+                    return Err(ExecutionError::Provider(format!("jupyter ws send: {e}")));
+                }
 
-            let io = JupyterWsIoContext {
-                client: &self.client,
-                base_http: &self.config.base_url,
-                token: self.config.token.as_deref(),
-                kernel_id: &session.kernel_id,
-            };
-            let artifact_sink = JupyterRunArtifactSink {
-                sandbox_dir: self.config.artifact_sandbox_dir.clone(),
-                session_id: session_id.clone(),
-                run_id,
-                limits: self.config.artifact_limits,
-                collector: ArtifactCollector::new(self.config.artifact_limits),
-            };
-            collect_execute_output(
-                ws,
-                &exec_msg_id,
-                self.config.max_output_bytes,
-                cancel,
-                io,
-                artifact_sink,
-                spec.run_event_tx.clone(),
-                throttle,
-            )
-            .await
-        })
-        .await;
+                let io = JupyterWsIoContext {
+                    client: &self.client,
+                    base_http: &self.config.base_url,
+                    token: self.config.token.as_deref(),
+                    kernel_id: &session.kernel_id,
+                };
+                let artifact_sink = JupyterRunArtifactSink {
+                    sandbox_dir: self.config.artifact_sandbox_dir.clone(),
+                    session_id: session_id.clone(),
+                    run_id,
+                    limits: self.config.artifact_limits,
+                    collector: ArtifactCollector::new(self.config.artifact_limits),
+                };
+                let collected = collect_execute_output(
+                    &mut ws,
+                    &exec_msg_id,
+                    self.config.max_output_bytes,
+                    cancel,
+                    io,
+                    artifact_sink,
+                    spec.run_event_tx.clone(),
+                    throttle,
+                )
+                .await;
+                match collected {
+                    // Idle and healthy again — republish for reuse by the next run.
+                    Ok(r) => {
+                        *session.ws.lock().await = Some(ws);
+                        Ok(r)
+                    }
+                    Err(e) => Err(e),
+                }
+            })
+            .await;
 
         *session.run_cancel.lock().await = None;
 
         let out = match result {
-            Err(_) => Err(ExecutionError::Timeout { timeout_secs }),
+            Err(_) => {
+                // The cell may still be executing on the kernel after a local timeout; an
+                // interrupted-but-busy kernel can wedge subsequent runs. Best-effort SIGINT
+                // via the server REST API before reporting the timeout.
+                let _ = interrupt_kernel_rest(
+                    &self.client,
+                    &self.config.base_url,
+                    self.config.token.as_deref(),
+                    &session.kernel_id,
+                )
+                .await;
+                Err(ExecutionError::Timeout { timeout_secs })
+            }
             Ok(inner) => inner,
         };
+
+        // Slot invariant (audit R10/C3): while no run owns the stream, the slot holds it
+        // only if the last run succeeded — failures, timeouts, and cancels drop the future
+        // owning the socket, leaving None so ensure_ws() reconnects instead of reusing a
+        // wedged stream.
 
         if let (Ok(_), Some(path)) = (&out, nb_path.as_ref()) {
             let token = auth_token.clone();
@@ -716,18 +753,14 @@ fn text_plain_from_data(data: &Value) -> Option<String> {
 }
 
 fn append_truncated(buf: &mut String, chunk: &str, budget: &mut usize) {
-    if *budget == 0 {
+    // Audit X6b: byte-slicing here could panic mid-character; delegate the cut
+    // to the canonical UTF-8-safe primitive (same semantics as OutputCapture).
+    if *budget == 0 || chunk.is_empty() {
         return;
     }
-    let take = (*budget).min(chunk.len());
-    if take < chunk.len() {
-        buf.push_str(&chunk[..take]);
-        buf.push_str("\n... (truncated)");
-        *budget = 0;
-    } else {
-        buf.push_str(chunk);
-        *budget -= take;
-    }
+    let appended = super::repl_framing::truncate_utf8_str_cap(chunk, *budget);
+    *budget = budget.saturating_sub(appended.len());
+    buf.push_str(&appended);
 }
 
 /// Mutable state while folding Jupyter execute WebSocket messages for one `execute_request`.
@@ -755,14 +788,22 @@ fn fold_display_data_payload(v: &Value, ctx: &mut ExecuteFoldCtx<'_>) {
             ("image/jpg", ".jpg"),
         ] {
             if let Some(bytes) = decode_jupyter_base64_data(data, mime, lim) {
-                let _ = collector.try_push(mime.to_string(), bytes, ext);
+                // Audit R11: silent drops made the model believe output existed.
+                if !collector.try_push(mime.to_string(), bytes, ext) {
+                    log::warn!("execution artifact dropped: per-run artifact cap reached ({mime})");
+                }
             }
         }
         for (mime, ext) in [("text/csv", ".csv"), ("application/json", ".json")] {
             if let Some(s) = jupyter_data_utf8_string(data, mime) {
                 if s.len() > LARGE_TEXT_SPILL_THRESHOLD {
                     let bytes = s.into_bytes();
-                    let _ = collector.try_push(mime.to_string(), bytes, ext);
+                    // Audit R11: surface cap drops instead of discarding silently.
+                    if !collector.try_push(mime.to_string(), bytes, ext) {
+                        log::warn!(
+                            "execution artifact dropped: per-run artifact cap reached ({mime})"
+                        );
+                    }
                 } else if !s.is_empty() {
                     append_truncated(ctx.stdout, &s, ctx.budget);
                 }
@@ -793,9 +834,16 @@ fn fold_execute_ws_message(v: &Value, exec_msg_id: &str, ctx: &mut ExecuteFoldCt
                 append_truncated(ctx.stdout, &text, ctx.budget);
             }
         }
-        "execute_result" | "display_data" | "update_display_data" => {
+        "execute_result" | "display_data" => {
             fold_display_data_payload(v, ctx);
         }
+        // Audit R11 (tail): `update_display_data` REPLACES previously displayed
+        // content under the same `display_id` (progress bars, chart refreshes).
+        // Folding it duplicates artifact blobs and burns output budget on
+        // repeated text, so transient updates are skipped entirely; the live
+        // run-event emitter already ignores them. Trade-off: a kernel that only
+        // ever refines via updates leaves the initial display captured above.
+        "update_display_data" => {}
         "error" => {
             let ename = v["content"]["ename"].as_str().unwrap_or("Error");
             let evalue = v["content"]["evalue"].as_str().unwrap_or("");
@@ -1294,5 +1342,90 @@ mod tests {
         assert_eq!(collector.pending.len(), 1);
         assert_eq!(collector.pending[0].mime, "image/png");
         assert!(!collector.pending[0].bytes.is_empty());
+    }
+
+    #[test]
+    fn update_display_data_is_skipped_not_folded() {
+        let pid = "exec-update";
+        let b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        let msg = |msg_type: &str, png: &str, text: &str| -> Value {
+            serde_json::from_str(&format!(
+                r#"{{
+                "channel":"iopub",
+                "header":{{"msg_type":"{msg_type}"}},
+                "parent_header":{{"msg_id":"{pid}"}},
+                "content":{{"data":{{"image/png":"{png}","text/plain":"{text}"}}}}
+            }}"#
+            ))
+            .unwrap()
+        };
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let mut budget = 10_000usize;
+        let mut exit_code = Some(0i32);
+        let mut got_execute_reply = false;
+        let mut got_iopub_idle = false;
+        let limits = ArtifactLimits::default();
+        let mut collector = ArtifactCollector::new(limits);
+
+        // Initial genuine display folds normally (artifact + text).
+        {
+            let mut ctx = ExecuteFoldCtx {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+                budget: &mut budget,
+                exit_code: &mut exit_code,
+                got_execute_reply: &mut got_execute_reply,
+                got_iopub_idle: &mut got_iopub_idle,
+                artifact_limits: limits,
+                artifact_collector: Some(&mut collector),
+            };
+            fold_execute_ws_message(&msg("display_data", b64, "initial"), pid, &mut ctx);
+        }
+        assert_eq!(collector.pending.len(), 1);
+        assert_eq!(stdout, "initial");
+
+        // A burst of transient updates must change nothing at all.
+        let out_before = stdout.clone();
+        let budget_before = budget;
+        {
+            let mut ctx = ExecuteFoldCtx {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+                budget: &mut budget,
+                exit_code: &mut exit_code,
+                got_execute_reply: &mut got_execute_reply,
+                got_iopub_idle: &mut got_iopub_idle,
+                artifact_limits: limits,
+                artifact_collector: Some(&mut collector),
+            };
+            for _ in 0..3 {
+                fold_execute_ws_message(
+                    &msg("update_display_data", b64, "refreshed"),
+                    pid,
+                    &mut ctx,
+                );
+            }
+        }
+        assert_eq!(collector.pending.len(), 1, "no duplicate artifacts");
+        assert_eq!(stdout, out_before, "no duplicate text");
+        assert_eq!(budget, budget_before, "budget untouched");
+
+        // A later genuine result still folds.
+        {
+            let mut ctx = ExecuteFoldCtx {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+                budget: &mut budget,
+                exit_code: &mut exit_code,
+                got_execute_reply: &mut got_execute_reply,
+                got_iopub_idle: &mut got_iopub_idle,
+                artifact_limits: limits,
+                artifact_collector: Some(&mut collector),
+            };
+            fold_execute_ws_message(&msg("execute_result", b64, "final"), pid, &mut ctx);
+        }
+        assert_eq!(collector.pending.len(), 2);
+        assert!(stdout.ends_with("initialfinal"));
     }
 }

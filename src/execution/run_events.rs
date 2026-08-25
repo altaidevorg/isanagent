@@ -32,8 +32,16 @@ impl RunEventThrottle {
     }
 
     /// Returns true if caller should emit now (and updates last emit time).
+    ///
+    /// A poisoned mutex (a panic in another thread while holding the lock) only loses the last
+    /// emit timestamp; recovering the inner value keeps throttling functional instead of
+    /// propagating the poison to every future caller.
     pub fn should_emit(&self) -> bool {
-        let mut last = self.last_emit.lock().unwrap();
+        let mut last = self.last_emit.lock().unwrap_or_else(|poisoned| {
+            let mut guard = poisoned.into_inner();
+            *guard = Instant::now() - self.min_interval * 2;
+            guard
+        });
         let now = Instant::now();
         if now.duration_since(*last) >= self.min_interval {
             *last = now;

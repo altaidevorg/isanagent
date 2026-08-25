@@ -23,42 +23,221 @@ pub struct ModelSelectorEntry {
     pub model_name: String,
 }
 
-/// Popup state for interactive model selection via `/model`.
+#[derive(Debug, Clone)]
+pub struct ProviderEntry {
+    pub name: String,
+    pub label: String,
+    pub has_key: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum ModelSelectorStage {
+    /// Step 1: Select Provider (e.g. Gemini, OpenAI, Anthropic, DeepSeek, OpenRouter, etc.)
+    ProviderSelect,
+    /// Step 2: Input API Key (if key missing in env & keychain)
+    ApiKeyInput {
+        provider_name: String,
+        input: String,
+        error: Option<String>,
+    },
+    /// Step 3: Select Model for the chosen provider
+    ModelSelect {
+        provider_name: String,
+        models: Vec<ModelSelectorEntry>,
+        selected_model: usize,
+    },
+}
+
+/// Popup state for interactive provider and model selection via `/model`.
 #[derive(Debug, Clone)]
 pub struct ModelSelector {
-    pub items: Vec<ModelSelectorEntry>,
-    pub selected: usize,
+    pub stage: ModelSelectorStage,
+    pub providers: Vec<ProviderEntry>,
+    pub selected_provider: usize,
+}
+
+pub fn default_models_for_provider(provider_name: &str) -> Vec<String> {
+    match provider_name.to_lowercase().as_str() {
+        "gemini" => vec![
+            "gemini-2.5-flash".into(),
+            "gemini-2.5-pro".into(),
+            "gemini-3.1-pro".into(),
+            "gemini-3.1-flash-lite".into(),
+        ],
+        "openai" => vec![
+            "gpt-5.5".into(),
+            "gpt-5.5-instant".into(),
+            "gpt-5.4-mini".into(),
+            "gpt-5.4-nano".into(),
+            "o3".into(),
+            "o4-mini".into(),
+        ],
+        "anthropic" => vec![
+            "claude-opus-4-7".into(),
+            "claude-opus-4-6".into(),
+            "claude-sonnet-4-6".into(),
+            "claude-haiku-4-5-20251001".into(),
+        ],
+        "deepseek" => vec!["deepseek-v4-pro".into(), "deepseek-v4-flash".into()],
+        "openrouter" => vec![
+            "anthropic/claude-opus-4-7".into(),
+            "openai/gpt-5.5".into(),
+            "google/gemini-3.1-pro".into(),
+            "stealth/ox-alpha".into(),
+        ],
+        "groq" => vec![
+            "llama-3.3-70b-versatile".into(),
+            "mixtral-8x7b-32768".into(),
+        ],
+        "ollama" => vec![
+            "llama3.3".into(),
+            "qwen2.5-coder:32b".into(),
+            "deepseek-r1:32b".into(),
+        ],
+        _ => vec![],
+    }
 }
 
 impl ModelSelector {
+    pub fn new(providers: &std::collections::HashMap<String, ProviderConfig>) -> Self {
+        let known_order = [
+            "gemini",
+            "openai",
+            "anthropic",
+            "deepseek",
+            "openrouter",
+            "groq",
+            "ollama",
+        ];
+        let mut seen = std::collections::HashSet::new();
+        let mut list = Vec::new();
+
+        // Add known providers in order
+        for name in known_order {
+            let has_key = if name == "ollama" {
+                true
+            } else {
+                let env_var = format!("{}_API_KEY", name.to_uppercase());
+                std::env::var(&env_var)
+                    .map(|v| !v.trim().is_empty())
+                    .unwrap_or(false)
+                    || crate::credentials::get_provider_key(name).is_some()
+            };
+            let label = match name {
+                "gemini" => "Google Gemini",
+                "openai" => "OpenAI",
+                "anthropic" => "Anthropic Claude",
+                "deepseek" => "DeepSeek",
+                "openrouter" => "OpenRouter",
+                "groq" => "Groq",
+                "ollama" => "Ollama (Local)",
+                other => other,
+            };
+            list.push(ProviderEntry {
+                name: name.to_string(),
+                label: label.to_string(),
+                has_key,
+            });
+            seen.insert(name.to_string());
+        }
+
+        // Add any additional providers from config
+        for cfg in providers.values() {
+            let p_name = cfg.provider_name.to_lowercase();
+            if !seen.contains(&p_name) {
+                let has_key = cfg.resolve_api_key().is_ok();
+                list.push(ProviderEntry {
+                    name: p_name.clone(),
+                    label: cfg.provider_name.clone(),
+                    has_key,
+                });
+                seen.insert(p_name);
+            }
+        }
+
+        Self {
+            stage: ModelSelectorStage::ProviderSelect,
+            providers: list,
+            selected_provider: 0,
+        }
+    }
+
     pub fn from_providers(providers: &std::collections::HashMap<String, ProviderConfig>) -> Self {
-        let mut items: Vec<ModelSelectorEntry> = providers
-            .iter()
-            .map(|(key, cfg)| ModelSelectorEntry {
-                label: format!("{} ({})", cfg.model_name, cfg.provider_name),
-                config_key: key.clone(),
-                provider_name: cfg.provider_name.clone(),
-                model_name: cfg.model_name.clone(),
-            })
-            .collect();
-        items.sort_by(|a, b| a.config_key.cmp(&b.config_key));
-        Self { items, selected: 0 }
+        Self::new(providers)
     }
 
     pub fn move_up(&mut self) {
-        if self.selected > 0 {
-            self.selected -= 1;
+        match &mut self.stage {
+            ModelSelectorStage::ProviderSelect => {
+                if self.selected_provider > 0 {
+                    self.selected_provider -= 1;
+                }
+            }
+            ModelSelectorStage::ModelSelect { selected_model, .. } => {
+                if *selected_model > 0 {
+                    *selected_model -= 1;
+                }
+            }
+            ModelSelectorStage::ApiKeyInput { .. } => {}
         }
     }
 
     pub fn move_down(&mut self) {
-        if self.selected + 1 < self.items.len() {
-            self.selected += 1;
+        match &mut self.stage {
+            ModelSelectorStage::ProviderSelect => {
+                if self.selected_provider + 1 < self.providers.len() {
+                    self.selected_provider += 1;
+                }
+            }
+            ModelSelectorStage::ModelSelect {
+                models,
+                selected_model,
+                ..
+            } => {
+                if *selected_model + 1 < models.len() {
+                    *selected_model += 1;
+                }
+            }
+            ModelSelectorStage::ApiKeyInput { .. } => {}
         }
     }
 
-    pub fn selected_entry(&self) -> Option<&ModelSelectorEntry> {
-        self.items.get(self.selected)
+    pub fn build_models_for_provider(
+        provider_name: &str,
+        providers: &std::collections::HashMap<String, ProviderConfig>,
+    ) -> Vec<ModelSelectorEntry> {
+        let mut models = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        // 1. Models from config matching this provider
+        for (key, cfg) in providers {
+            if cfg.provider_name.eq_ignore_ascii_case(provider_name)
+                && !seen.contains(&cfg.model_name)
+            {
+                models.push(ModelSelectorEntry {
+                    label: cfg.model_name.clone(),
+                    config_key: key.clone(),
+                    provider_name: cfg.provider_name.clone(),
+                    model_name: cfg.model_name.clone(),
+                });
+                seen.insert(cfg.model_name.clone());
+            }
+        }
+
+        // 2. Curated default models for known providers
+        for default_model in default_models_for_provider(provider_name) {
+            if !seen.contains(&default_model) {
+                models.push(ModelSelectorEntry {
+                    label: default_model.clone(),
+                    config_key: default_model.clone(),
+                    provider_name: provider_name.to_string(),
+                    model_name: default_model.clone(),
+                });
+                seen.insert(default_model);
+            }
+        }
+
+        models
     }
 }
 

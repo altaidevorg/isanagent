@@ -3,13 +3,11 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
-pub mod autotrainess;
 pub mod builtin;
 pub mod compact;
 pub mod exec_jobs;
 pub mod execution;
 pub mod isanagent_ignore;
-pub mod kernel_porting;
 pub mod mcp;
 pub mod ml_domain;
 pub mod recall;
@@ -18,6 +16,10 @@ pub mod workflow;
 /// Convert one legacy `Result<String, String>` into the typed contract. This is
 /// the only text-classification fallback in the executor: natively typed tool
 /// results bypass it completely and therefore cannot be overwritten by prose.
+/// Audit X5: no tool-name special cases remain here — a real shell `exec` is
+/// natively typed (its true exit code yields `NonZeroExit` from the typed hook),
+/// so any *legacy* result is classified as `LegacyReportedFailure` regardless
+/// of what the tool happens to be called.
 fn normalize_legacy_tool_result(tool_name: &str, mut result: ToolResult) -> ToolResult {
     if !result.is_legacy() {
         return result;
@@ -30,16 +32,11 @@ fn normalize_legacy_tool_result(tool_name: &str, mut result: ToolResult) -> Tool
         return result;
     }
 
-    let code = if tool_name == "exec" {
-        ToolErrorCode::NonZeroExit
-    } else {
-        ToolErrorCode::LegacyReportedFailure
-    };
-    let message = match code {
-        ToolErrorCode::NonZeroExit => format!("{tool_name} exited with a non-zero status"),
-        _ => format!("{tool_name} reported a failure"),
-    };
-    ToolResult::error_with_content(code, message, result.content)
+    ToolResult::error_with_content(
+        ToolErrorCode::LegacyReportedFailure,
+        format!("{tool_name} reported a failure"),
+        result.content,
+    )
 }
 
 /// Score `(name, description)` entries for a free-text `query`. Higher is better.
@@ -114,11 +111,6 @@ impl ToolRegistry {
 
     pub fn get_tool(&self, name: &str) -> Option<&dyn Tool> {
         self.tools.get(name).map(|t| t.as_ref())
-    }
-
-    /// Retrieve the metadata policy for a tool if registered.
-    pub fn get_tool_policy(&self, name: &str) -> Option<crate::traits::ToolPolicy> {
-        self.tools.get(name).map(|t| t.policy())
     }
 
     pub fn get_tool_names(&self) -> Vec<String> {
@@ -256,26 +248,18 @@ impl ToolRegistry {
         )
     }
 
-    /// Read-only or side-effect-free tools safe to run concurrently (same assistant turn).
-    pub fn is_parallel_safe_tool(name: &str) -> bool {
-        matches!(
-            name,
-            "read_file"
-                | "glob_files"
-                | "list_dir"
-                | "search_text"
-                | "web_search"
-                | "web_fetch"
-                | "search_memory"
-                | "fetch_memory_by_date"
-                | "search_tools"
-                | "load_skill_instructions"
-                | "arxiv_search"
-                | "arxiv_fetch"
-                | "hf_hub_file_fetch"
-                | "execution_env_info"
-                | "task_history_list"
-        )
+    /// True iff *every* named tool declares [`crate::traits::ExecutionMode::Parallel`].
+    ///
+    /// Audit X1: same-turn concurrency decisions consult each tool's typed
+    /// `policy()` metadata instead of a hardcoded name list that drifts from
+    /// reality. Unregistered names fail closed (not parallel-safe).
+    pub fn all_parallel_safe<'a>(&self, mut names: impl Iterator<Item = &'a str>) -> bool {
+        names.all(|name| {
+            matches!(
+                self.tools.get(name).map(|t| t.policy().execution_mode),
+                Some(crate::traits::ExecutionMode::Parallel)
+            )
+        })
     }
 
     /// Tool list for provider calls when `is_subagent` is true and/or an allowlist applies.
@@ -368,6 +352,66 @@ mod registry_tests {
             .map(|v| v["function"]["name"].as_str().expect("name").to_string())
             .collect();
         assert_eq!(names, vec!["first_tool", "second_tool"]);
+    }
+
+    /// Fixture declaring an explicit execution mode (audit X1).
+    struct PolicyTool {
+        n: &'static str,
+        mode: crate::traits::ExecutionMode,
+    }
+
+    #[async_trait]
+    impl Tool for PolicyTool {
+        fn name(&self) -> &str {
+            self.n
+        }
+
+        fn description(&self) -> &str {
+            "d"
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({})
+        }
+
+        fn policy(&self) -> crate::traits::ToolPolicy {
+            crate::traits::ToolPolicy {
+                execution_mode: self.mode,
+                timeout_secs: None,
+            }
+        }
+
+        async fn execute(&self, _: Value) -> Result<String, String> {
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn parallel_safety_consults_typed_policy_not_name_list() {
+        let mut r = ToolRegistry::new();
+        r.register(Box::new(PolicyTool {
+            n: "reader_one",
+            mode: crate::traits::ExecutionMode::Parallel,
+        }));
+        r.register(Box::new(PolicyTool {
+            n: "writer_one",
+            mode: crate::traits::ExecutionMode::Serial,
+        }));
+        r.register(Box::new(PolicyTool {
+            n: "barrier_one",
+            mode: crate::traits::ExecutionMode::Barrier,
+        }));
+
+        // All-Parallel batch is allowed.
+        assert!(r.all_parallel_safe(["reader_one"].into_iter()));
+        assert!(r.all_parallel_safe(["reader_one", "reader_one"].into_iter()));
+
+        // Any Serial / Barrier member fails the batch.
+        assert!(!r.all_parallel_safe(["reader_one", "writer_one"].into_iter()));
+        assert!(!r.all_parallel_safe(["barrier_one"].into_iter()));
+
+        // Unregistered names fail closed.
+        assert!(!r.all_parallel_safe(["reader_one", "not_registered"].into_iter()));
     }
 }
 
@@ -643,7 +687,13 @@ mod typed_result_tests {
         }));
 
         let failed = registry.execute_tool_result("exec", Value::Null).await;
-        assert_eq!(failed.error_code(), Some(ToolErrorCode::NonZeroExit));
+        // Audit X5: the name special-case is retired. A *legacy* tool named
+        // "exec" no longer gets NonZeroExit from prose sniffing — only the
+        // natively typed shell exec hook can produce that code.
+        assert_eq!(
+            failed.error_code(),
+            Some(ToolErrorCode::LegacyReportedFailure)
+        );
         assert_eq!(failed.content, "build failed\nExit code: 7");
 
         let content = registry.execute_tool_result("read_file", Value::Null).await;
