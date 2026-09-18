@@ -220,6 +220,52 @@ impl Provider for OpenAIProvider {
     }
 }
 
+/// Gemini `Schema` is a subset of JSON Schema. MCP servers (FastMCP/Pydantic) emit
+/// keys such as `additionalProperties` that `generateContent` rejects as
+/// `INVALID_ARGUMENT`. Strip unsupported keys recursively while keeping the
+/// documented Gemini fields (`anyOf`, `properties`, `items`, …).
+fn sanitize_gemini_schema(value: &mut Value) {
+    const STRIP: &[&str] = &[
+        "additionalProperties",
+        "$schema",
+        "$id",
+        "$ref",
+        "$defs",
+        "definitions",
+        "unevaluatedProperties",
+        "prefixItems",
+        "dependentRequired",
+        "dependentSchemas",
+        "if",
+        "then",
+        "else",
+        "not",
+        "oneOf",
+        "allOf",
+        "uniqueItems",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "contentMediaType",
+        "contentEncoding",
+    ];
+    match value {
+        Value::Object(map) => {
+            for key in STRIP {
+                map.remove(*key);
+            }
+            for child in map.values_mut() {
+                sanitize_gemini_schema(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                sanitize_gemini_schema(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Native Gemini GenerateContent provider.
 ///
 /// Gemini's OpenAI-compatible endpoint is useful for text chat, but does not expose the
@@ -262,6 +308,12 @@ impl GeminiProvider {
             .into_iter()
             .flatten()
             .filter_map(|tool| tool.get("function").cloned())
+            .map(|mut func| {
+                if let Some(parameters) = func.get_mut("parameters") {
+                    sanitize_gemini_schema(parameters);
+                }
+                func
+            })
             .collect();
         json!([{"functionDeclarations": declarations}])
     }
@@ -1107,6 +1159,44 @@ mod is_error_tests {
         assert_eq!(
             contents[1]["parts"][0]["functionResponse"]["id"],
             serde_json::json!("gemini-call-1")
+        );
+    }
+
+    #[test]
+    fn gemini_strips_mcp_additional_properties_from_tool_schemas() {
+        let openai_tools = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "list_documents",
+                "description": "List indexed documents",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "category": {
+                            "anyOf": [{"type": "string"}, {"type": "null"}],
+                            "default": null
+                        },
+                        "hits": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": true
+                            }
+                        }
+                    }
+                }
+            }
+        }]);
+        let gemini_tools = GeminiProvider::convert_tools(&openai_tools);
+        let params = &gemini_tools[0]["functionDeclarations"][0]["parameters"];
+        assert!(params.get("additionalProperties").is_none());
+        assert!(params["properties"]["hits"]["items"]
+            .get("additionalProperties")
+            .is_none());
+        assert_eq!(
+            params["properties"]["category"]["anyOf"][0]["type"],
+            serde_json::json!("string")
         );
     }
 
