@@ -49,10 +49,10 @@ pub struct JupyterExecutionConfig {
     pub notebook_sync_path_template: Option<String>,
 }
 
-/// Code execution harness (`execution_*` tools). On by default; set `[harness.execution] enabled = false` to disable.
+/// Code execution harness (`execution_*` tools). Off by default; set `[harness.execution] enabled = true` to enable.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct ExecutionHarnessConfig {
-    /// When `Some(false)`, execution tools are not registered. Omitted or `Some(true)` keeps them on.
+    /// When `Some(true)`, execution tools are registered. Omitted or `Some(false)` keeps them off.
     pub enabled: Option<bool>,
     /// Provider id: `local` (subprocess), `jupyter` (remote kernel), or `ssh` (remote exec).
     pub default_provider: Option<String>,
@@ -336,12 +336,36 @@ pub struct HarnessConfig {
     pub shell_policy: Option<ShellPolicyConfig>,
     /// Local / future execution providers (`execution_*` tools).
     pub execution: Option<ExecutionHarnessConfig>,
+    /// Core host tools (filesystem, web, `exec`, cron, memory, todos, skill loader, …).
+    /// Plugin MCP tools still register when this is disabled.
+    pub builtin_tools: Option<BuiltinToolsHarnessConfig>,
+    /// Workspace identity files (`AGENTS.md`, `SOUL.md`, `USER.md`, `MEMORY.md`).
+    /// Plugin overlay prompts still apply when this is disabled.
+    pub default_prompt: Option<DefaultPromptHarnessConfig>,
     /// ML engineer prompt overlay and related defaults.
     pub ml_engineer: Option<MlEngineerHarnessConfig>,
     /// Observation + steering hooks (disabled unless sub-tables set `enabled = true`).
     pub hooks: Option<HarnessHooksConfig>,
     pub background_jobs: Option<BackgroundJobsConfig>,
     pub notifications: Option<NotificationsConfig>,
+}
+
+/// Core host tools. On by default; set `[harness.builtin_tools] enabled = false` to leave only
+/// plugin MCP tools (and other harness-gated tools that are independently enabled).
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct BuiltinToolsHarnessConfig {
+    /// Register filesystem / web / exec / cron / memory / todo / skill-loader tools when true
+    /// (default: true).
+    pub enabled: Option<bool>,
+}
+
+/// Workspace identity prompt compiled from `AGENTS.md` / `SOUL.md` / `USER.md` / `MEMORY.md`.
+/// On by default; set `[harness.default_prompt] enabled = false` so only plugin overlays (and
+/// always-on skill bodies) shape the system prompt.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct DefaultPromptHarnessConfig {
+    /// Merge workspace identity markdown into the system prompt when true (default: true).
+    pub enabled: Option<bool>,
 }
 
 /// Git worktree helpers (`git_worktree` tool). Disabled unless `[harness.git_worktree] enabled = true`.
@@ -844,12 +868,34 @@ impl AppConfig {
         merged
     }
 
-    /// When false under `[harness.execution]`, execution tools are not registered. Otherwise on (including when the table is omitted).
+    /// When false under `[harness.execution]`, execution tools are not registered.
+    /// Off when the table is omitted or `enabled` is unset (opt-in harness).
     pub fn execution_harness_enabled(&self) -> bool {
-        match self.harness.as_ref().and_then(|h| h.execution.as_ref()) {
-            None => true,
-            Some(e) => e.enabled.unwrap_or(true),
-        }
+        self.harness
+            .as_ref()
+            .and_then(|h| h.execution.as_ref())
+            .and_then(|e| e.enabled)
+            .unwrap_or(false)
+    }
+
+    /// When false under `[harness.builtin_tools]`, core host tools are not registered.
+    /// Plugin MCP tools still register. Default true.
+    pub fn builtin_tools_enabled(&self) -> bool {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.builtin_tools.as_ref())
+            .and_then(|t| t.enabled)
+            .unwrap_or(true)
+    }
+
+    /// When false under `[harness.default_prompt]`, skip workspace identity files
+    /// (`AGENTS.md`, `SOUL.md`, `USER.md`, `MEMORY.md`). Plugin overlays remain. Default true.
+    pub fn default_prompt_enabled(&self) -> bool {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.default_prompt.as_ref())
+            .and_then(|p| p.enabled)
+            .unwrap_or(true)
     }
 
     /// `[harness.ml_engineer] enabled = true` appends ML policy overlay to the system prompt.
@@ -963,6 +1009,14 @@ impl AppConfig {
             os_family,
             shell_family,
             std::path::MAIN_SEPARATOR
+        ));
+        lines.push(format!(
+            "builtin_tools_enabled={}",
+            self.builtin_tools_enabled()
+        ));
+        lines.push(format!(
+            "default_prompt_enabled={}",
+            self.default_prompt_enabled()
         ));
         lines.push(format!(
             "execution_harness_enabled={}",
@@ -1789,11 +1843,35 @@ python_executable = "python3"
     }
 
     #[test]
-    fn harness_execution_on_by_default_without_harness_section() {
+    fn harness_execution_off_by_default_without_harness_section() {
         let s = "restrict_to_workspace = true\n";
         let c: AppConfig = toml::from_str(s).expect("parse");
-        assert!(c.execution_harness_enabled());
-        assert_eq!(c.execution_default_provider(), "local");
+        assert!(!c.execution_harness_enabled());
+        assert!(c.builtin_tools_enabled());
+        assert!(c.default_prompt_enabled());
+    }
+
+    #[test]
+    fn harness_execution_table_without_enabled_is_off() {
+        let s = r#"
+[harness.execution]
+default_provider = "local"
+"#;
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        assert!(!c.execution_harness_enabled());
+    }
+
+    #[test]
+    fn harness_builtin_tools_and_default_prompt_can_be_disabled() {
+        let s = r#"
+[harness.builtin_tools]
+enabled = false
+[harness.default_prompt]
+enabled = false
+"#;
+        let c: AppConfig = toml::from_str(s).expect("parse");
+        assert!(!c.builtin_tools_enabled());
+        assert!(!c.default_prompt_enabled());
     }
 
     #[test]

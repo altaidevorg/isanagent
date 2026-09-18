@@ -1,4 +1,4 @@
-//! Harness tools for the execution plane (omitted unless `AppConfig::execution_harness_enabled()` is false).
+//! Harness tools for the execution plane (registered only when `AppConfig::execution_harness_enabled()` is true).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

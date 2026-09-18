@@ -426,201 +426,209 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
 
     let mut tools = ToolRegistry::new();
     let restrict = workspace.config.restrict_to_workspace.unwrap_or(true);
-    tools.register(Box::new(ReadFileTool {
-        workspace_dir: workspace.sandbox_dir.clone(),
-        restrict_to_workspace: restrict,
-    }));
-    tools.register(Box::new(WriteFileTool {
-        workspace_dir: workspace.sandbox_dir.clone(),
-        restrict_to_workspace: restrict,
-    }));
-    tools.register(Box::new(EditFileTool {
-        workspace_dir: workspace.sandbox_dir.clone(),
-        restrict_to_workspace: restrict,
-    }));
-    tools.register(Box::new(ListDirTool {
-        workspace_dir: workspace.sandbox_dir.clone(),
-        restrict_to_workspace: restrict,
-    }));
-    tools.register(Box::new(GlobFilesTool {
-        workspace_dir: workspace.sandbox_dir.clone(),
-        restrict_to_workspace: restrict,
-    }));
-    tools.register(Box::new(SearchTextTool {
-        workspace_dir: workspace.sandbox_dir.clone(),
-        restrict_to_workspace: restrict,
-        ripgrep_timeout_secs: workspace
-            .config
-            .effective_search_text_ripgrep_timeout_secs(),
-    }));
-    let exec_jobs = crate::tools::exec_jobs::ExecJobRegistry::new(Some(global_outbound_tx.clone()));
-    tools.register(Box::new(ShellExecTool {
-        workspace_dir: workspace.sandbox_dir.clone(),
-        restrict_to_workspace: restrict,
-        exec_jobs: Some(exec_jobs.clone()),
-        windows_runner: workspace.config.windows_shell_runner(),
-    }));
-    tools.register(Box::new(crate::tools::builtin::ExecSendTool {
-        exec_jobs: exec_jobs.clone(),
-    }));
-    tools.register(Box::new(GetEnvTool));
-    if workspace.config.git_worktree_tool_enabled() {
-        tools.register(Box::new(GitWorktreeTool {
-            workspace_dir: workspace.sandbox_dir.clone(),
-            restrict_to_workspace: restrict,
-            allow_path_outside_sandbox: workspace.config.git_worktree_allow_path_outside_sandbox(),
-        }));
-    }
-    if workspace.config.checkpoint_enabled() {
-        // Backups live in the outer rim (never inside the agent's editable sandbox); restores are
-        // confined to the sandbox when the file tools are workspace-restricted.
-        crate::checkpoint::init(
-            workspace.dir.join(".system_generated").join("checkpoints"),
-            restrict.then(|| workspace.sandbox_dir.clone()),
-        );
-        tools.register(Box::new(crate::checkpoint::CheckpointTool));
-    }
+    let builtin_tools = workspace.config.builtin_tools_enabled();
     let mut inflight_sync_outer: Option<Arc<InflightSyncRegistry>> = None;
     let mut execution_harness_for_shutdown: Option<Arc<crate::execution::ExecutionHarness>> = None;
     let mut execution_jobs_outer: Option<Arc<ExecutionJobManager>> = None;
-    if workspace.config.execution_harness_enabled() {
-        let harness = crate::execution::build_execution_harness(
-            workspace.dir.clone(),
-            workspace.sandbox_dir.clone(),
-            restrict,
-            &workspace.config,
-        )
-        .map_err(|e| std::io::Error::other(format!("execution harness: {e}")))?;
-        execution_harness_for_shutdown = Some(harness.clone());
-        let execution_jobs = Arc::new(ExecutionJobManager::new(
-            harness.clone(),
-            global_outbound_tx.clone(),
-            Some(bus_tx.clone()),
-            workspace.config.execution_wake_on_job_terminal(),
-        ));
-        let inflight_sync = Arc::new(InflightSyncRegistry::new());
-        inflight_sync_outer = Some(inflight_sync.clone());
-        execution_jobs_outer = Some(execution_jobs.clone());
-        tools.register(Box::new(ExecutionSessionCreateTool {
-            harness: harness.clone(),
+    if builtin_tools {
+        tools.register(Box::new(ReadFileTool {
+            workspace_dir: workspace.sandbox_dir.clone(),
+            restrict_to_workspace: restrict,
         }));
-        tools.register(Box::new(ExecutionRunTool {
-            harness: harness.clone(),
-            outbound_tx: global_outbound_tx.clone(),
-            jobs: Some(execution_jobs.clone()),
-            inflight: Some(inflight_sync.clone()),
+        tools.register(Box::new(WriteFileTool {
+            workspace_dir: workspace.sandbox_dir.clone(),
+            restrict_to_workspace: restrict,
         }));
-        tools.register(Box::new(ExecutionRunBackgroundTool {
-            harness: harness.clone(),
-            jobs: execution_jobs.clone(),
+        tools.register(Box::new(EditFileTool {
+            workspace_dir: workspace.sandbox_dir.clone(),
+            restrict_to_workspace: restrict,
         }));
-        tools.register(Box::new(ExecutionJobStatusTool {
-            jobs: execution_jobs.clone(),
+        tools.register(Box::new(ListDirTool {
+            workspace_dir: workspace.sandbox_dir.clone(),
+            restrict_to_workspace: restrict,
+        }));
+        tools.register(Box::new(GlobFilesTool {
+            workspace_dir: workspace.sandbox_dir.clone(),
+            restrict_to_workspace: restrict,
+        }));
+        tools.register(Box::new(SearchTextTool {
+            workspace_dir: workspace.sandbox_dir.clone(),
+            restrict_to_workspace: restrict,
+            ripgrep_timeout_secs: workspace
+                .config
+                .effective_search_text_ripgrep_timeout_secs(),
+        }));
+        let exec_jobs =
+            crate::tools::exec_jobs::ExecJobRegistry::new(Some(global_outbound_tx.clone()));
+        tools.register(Box::new(ShellExecTool {
+            workspace_dir: workspace.sandbox_dir.clone(),
+            restrict_to_workspace: restrict,
             exec_jobs: Some(exec_jobs.clone()),
+            windows_runner: workspace.config.windows_shell_runner(),
         }));
-        tools.register(Box::new(ExecutionJobResultTool {
-            jobs: execution_jobs.clone(),
-            max_tool_output_chars,
+        tools.register(Box::new(crate::tools::builtin::ExecSendTool {
+            exec_jobs: exec_jobs.clone(),
         }));
-        tools.register(Box::new(crate::tools::execution::ExecutionReadLogTool {
-            jobs: execution_jobs.clone(),
-            harness: harness.clone(),
+        tools.register(Box::new(GetEnvTool));
+        if workspace.config.git_worktree_tool_enabled() {
+            tools.register(Box::new(GitWorktreeTool {
+                workspace_dir: workspace.sandbox_dir.clone(),
+                restrict_to_workspace: restrict,
+                allow_path_outside_sandbox: workspace
+                    .config
+                    .git_worktree_allow_path_outside_sandbox(),
+            }));
+        }
+        if workspace.config.checkpoint_enabled() {
+            // Backups live in the outer rim (never inside the agent's editable sandbox); restores are
+            // confined to the sandbox when the file tools are workspace-restricted.
+            crate::checkpoint::init(
+                workspace.dir.join(".system_generated").join("checkpoints"),
+                restrict.then(|| workspace.sandbox_dir.clone()),
+            );
+            tools.register(Box::new(crate::checkpoint::CheckpointTool));
+        }
+        if workspace.config.execution_harness_enabled() {
+            let harness = crate::execution::build_execution_harness(
+                workspace.dir.clone(),
+                workspace.sandbox_dir.clone(),
+                restrict,
+                &workspace.config,
+            )
+            .map_err(|e| std::io::Error::other(format!("execution harness: {e}")))?;
+            execution_harness_for_shutdown = Some(harness.clone());
+            let execution_jobs = Arc::new(ExecutionJobManager::new(
+                harness.clone(),
+                global_outbound_tx.clone(),
+                Some(bus_tx.clone()),
+                workspace.config.execution_wake_on_job_terminal(),
+            ));
+            let inflight_sync = Arc::new(InflightSyncRegistry::new());
+            inflight_sync_outer = Some(inflight_sync.clone());
+            execution_jobs_outer = Some(execution_jobs.clone());
+            tools.register(Box::new(ExecutionSessionCreateTool {
+                harness: harness.clone(),
+            }));
+            tools.register(Box::new(ExecutionRunTool {
+                harness: harness.clone(),
+                outbound_tx: global_outbound_tx.clone(),
+                jobs: Some(execution_jobs.clone()),
+                inflight: Some(inflight_sync.clone()),
+            }));
+            tools.register(Box::new(ExecutionRunBackgroundTool {
+                harness: harness.clone(),
+                jobs: execution_jobs.clone(),
+            }));
+            tools.register(Box::new(ExecutionJobStatusTool {
+                jobs: execution_jobs.clone(),
+                exec_jobs: Some(exec_jobs.clone()),
+            }));
+            tools.register(Box::new(ExecutionJobResultTool {
+                jobs: execution_jobs.clone(),
+                max_tool_output_chars,
+            }));
+            tools.register(Box::new(crate::tools::execution::ExecutionReadLogTool {
+                jobs: execution_jobs.clone(),
+                harness: harness.clone(),
+            }));
+            tools.register(Box::new(ExecutionJobListTool {
+                jobs: execution_jobs.clone(),
+            }));
+            tools.register(Box::new(ExecutionJobCancelTool {
+                jobs: execution_jobs.clone(),
+            }));
+            tools.register(Box::new(ExecutionArtifactListTool {
+                harness: harness.clone(),
+            }));
+            tools.register(Box::new(ExecutionCancelTool {
+                harness: harness.clone(),
+            }));
+            tools.register(Box::new(ExecutionSessionCloseTool {
+                harness: harness.clone(),
+            }));
+            tools.register(Box::new(ExecutionEnvInfoTool {
+                harness: harness.clone(),
+            }));
+        }
+        // Audit X3: registered after the execution-harness block so `exec_status`
+        // can route misses to the execution job registry by *real lookup*.
+        tools.register(Box::new(crate::tools::builtin::ExecStatusTool {
+            exec_jobs: exec_jobs.clone(),
+            execution_jobs: execution_jobs_outer.clone(),
         }));
-        tools.register(Box::new(ExecutionJobListTool {
-            jobs: execution_jobs.clone(),
-        }));
-        tools.register(Box::new(ExecutionJobCancelTool {
-            jobs: execution_jobs.clone(),
-        }));
-        tools.register(Box::new(ExecutionArtifactListTool {
-            harness: harness.clone(),
-        }));
-        tools.register(Box::new(ExecutionCancelTool {
-            harness: harness.clone(),
-        }));
-        tools.register(Box::new(ExecutionSessionCloseTool {
-            harness: harness.clone(),
-        }));
-        tools.register(Box::new(ExecutionEnvInfoTool {
-            harness: harness.clone(),
-        }));
-    }
-    // Audit X3: registered after the execution-harness block so `exec_status`
-    // can route misses to the execution job registry by *real lookup*.
-    tools.register(Box::new(crate::tools::builtin::ExecStatusTool {
-        exec_jobs: exec_jobs.clone(),
-        execution_jobs: execution_jobs_outer.clone(),
-    }));
-    let jina = workspace.config.jina_web_backend();
-    let max_web_output_chars = workspace.config.effective_max_web_tool_output_chars();
-    tools.register(Box::new(WebSearchTool {
-        jina: jina.clone(),
-        max_output_chars: max_web_output_chars,
-    }));
-    tools.register(Box::new(WebFetchTool {
-        jina,
-        max_output_chars: max_web_output_chars,
-        // Audit X12: inject the resolved sandbox downloads dir instead of
-        // letting the tool guess it from the outer workspace rim.
-        downloads_dir: workspace.sandbox_dir.join("downloads"),
-    }));
-    // Audit X4: ML research tools are opt-in (`ml_domain_enabled`); general-purpose
-    // hosts do not register arXiv/Hugging Face domain tools by default.
-    if workspace.config.ml_domain_enabled() {
-        tools.register(Box::new(ArxivSearchTool {
+        let jina = workspace.config.jina_web_backend();
+        let max_web_output_chars = workspace.config.effective_max_web_tool_output_chars();
+        tools.register(Box::new(WebSearchTool {
+            jina: jina.clone(),
             max_output_chars: max_web_output_chars,
         }));
-        tools.register(Box::new(ArxivFetchTool {
+        tools.register(Box::new(WebFetchTool {
+            jina,
+            max_output_chars: max_web_output_chars,
             // Audit X12: inject the resolved sandbox downloads dir instead of
             // letting the tool guess it from the outer workspace rim.
             downloads_dir: workspace.sandbox_dir.join("downloads"),
         }));
-        tools.register(Box::new(HfHubFileFetchTool {
-            max_output_chars: max_web_output_chars,
+        // Audit X4: ML research tools are opt-in (`ml_domain_enabled`); general-purpose
+        // hosts do not register arXiv/Hugging Face domain tools by default.
+        if workspace.config.ml_domain_enabled() {
+            tools.register(Box::new(ArxivSearchTool {
+                max_output_chars: max_web_output_chars,
+            }));
+            tools.register(Box::new(ArxivFetchTool {
+                // Audit X12: inject the resolved sandbox downloads dir instead of
+                // letting the tool guess it from the outer workspace rim.
+                downloads_dir: workspace.sandbox_dir.join("downloads"),
+            }));
+            tools.register(Box::new(HfHubFileFetchTool {
+                max_output_chars: max_web_output_chars,
+            }));
+        }
+        tools.register(Box::new(CronTool {
+            cron_node: cron_node.clone(),
+            multi_tenant_edge_cron_enabled: mte_cron_scheduler.is_some(),
+            mte_cron_scheduler: mte_cron_scheduler.clone(),
+            db_path: db_path_str.to_string(),
+        }));
+        tools.register(Box::new(MessageTool {
+            outbound_tx: global_outbound_tx.clone(),
+        }));
+        tools.register(Box::new(AskUserTool {
+            clarification_hub: clarification_hub.clone(),
+            outbound_tx: global_outbound_tx.clone(),
+            memory_node: Some(memory_node.clone()),
+        }));
+        // PR-10: agent-triggered compaction. Tool posts a TriggerCompaction bus
+        // message with `AgentSelf` reason; the agent processes it between turns
+        // to respect the per-chat FIFO invariant (AGENTS.md).
+        tools.register(Box::new(crate::tools::compact::CompactContextTool {
+            outbound_tx: global_outbound_tx.clone(),
+        }));
+        // PR-7: re-materialize tool results that were compacted out of the active
+        // conversation. Reads the cache populated by `do_compaction`'s swap step.
+        tools.register(Box::new(crate::tools::recall::RecallToolResultTool {
+            memory_node: memory_node.clone(),
+            outbound_tx: global_outbound_tx.clone(),
+        }));
+        tools.register(Box::new(crate::tools::builtin::SearchMemoryTool {
+            memory_node: memory_node.clone(),
+        }));
+        tools.register(Box::new(crate::tools::builtin::FetchMemoryByDateTool {
+            memory_node: memory_node.clone(),
+        }));
+
+        tools.register(Box::new(TodoWriteTool {
+            memory_node: memory_node.clone(),
         }));
     }
-    tools.register(Box::new(CronTool {
-        cron_node: cron_node.clone(),
-        multi_tenant_edge_cron_enabled: mte_cron_scheduler.is_some(),
-        mte_cron_scheduler: mte_cron_scheduler.clone(),
-        db_path: db_path_str.to_string(),
-    }));
-    tools.register(Box::new(MessageTool {
-        outbound_tx: global_outbound_tx.clone(),
-    }));
-    tools.register(Box::new(AskUserTool {
-        clarification_hub: clarification_hub.clone(),
-        outbound_tx: global_outbound_tx.clone(),
-        memory_node: Some(memory_node.clone()),
-    }));
-    // PR-10: agent-triggered compaction. Tool posts a TriggerCompaction bus
-    // message with `AgentSelf` reason; the agent processes it between turns
-    // to respect the per-chat FIFO invariant (AGENTS.md).
-    tools.register(Box::new(crate::tools::compact::CompactContextTool {
-        outbound_tx: global_outbound_tx.clone(),
-    }));
-    // PR-7: re-materialize tool results that were compacted out of the active
-    // conversation. Reads the cache populated by `do_compaction`'s swap step.
-    tools.register(Box::new(crate::tools::recall::RecallToolResultTool {
-        memory_node: memory_node.clone(),
-        outbound_tx: global_outbound_tx.clone(),
-    }));
-    tools.register(Box::new(crate::tools::builtin::SearchMemoryTool {
-        memory_node: memory_node.clone(),
-    }));
-    tools.register(Box::new(crate::tools::builtin::FetchMemoryByDateTool {
-        memory_node: memory_node.clone(),
-    }));
-
-    tools.register(Box::new(TodoWriteTool {
-        memory_node: memory_node.clone(),
-    }));
     let uv_bin = workspace.config.execution_uv_binary();
     plugins.populate_tool_registry(&mut tools, &uv_bin).await;
-    let tool_catalog = tools.catalog_handle();
-    tools.register(Box::new(ToolSearchTool {
-        catalog: tool_catalog,
-    }));
+    if builtin_tools {
+        let tool_catalog = tools.catalog_handle();
+        tools.register(Box::new(ToolSearchTool {
+            catalog: tool_catalog,
+        }));
+    }
 
     // 5. Setup Provider (Dynamic from config)
     let default_provider_cfg =
@@ -789,7 +797,11 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     let reflection_task = reflection_engine.start();
 
     // 6. Compile Agent System Prompt
-    let mut system_prompt = workspace.compile_system_prompt();
+    let mut system_prompt = if workspace.config.default_prompt_enabled() {
+        workspace.compile_system_prompt()
+    } else {
+        String::new()
+    };
     let plugin_overlays = plugins.compile_overlay_prompts();
     if !plugin_overlays.is_empty() {
         system_prompt.push_str(&plugin_overlays);
@@ -893,10 +905,13 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     plugins.populate_agent_registry(&mut agent_registry);
     let agent_registry = std::sync::Arc::new(agent_registry);
 
-    // Inject agent descriptions into the system prompt
-    let agent_prompt_section = agent_registry.compile_agent_prompt_section();
-    if !agent_prompt_section.is_empty() {
-        system_prompt.push_str(&agent_prompt_section);
+    // Inject named-agent descriptions only with the default identity prompt. Plugin overlays
+    // remain the specialization surface when `[harness.default_prompt] enabled = false`.
+    if workspace.config.default_prompt_enabled() {
+        let agent_prompt_section = agent_registry.compile_agent_prompt_section();
+        if !agent_prompt_section.is_empty() {
+            system_prompt.push_str(&agent_prompt_section);
+        }
     }
 
     let subagent = if workspace.config.subagent_harness_enabled() {
@@ -944,6 +959,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             forbid_final_without_tools,
             shell_policy,
             hook_tool_ctx,
+            register_skill_loader: builtin_tools,
         },
         fallback_providers,
     );

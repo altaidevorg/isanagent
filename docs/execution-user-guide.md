@@ -4,7 +4,7 @@ This guide is for **operators and users** of isanagent who want to run code safe
 
 ## What you get
 
-When the execution harness is **not** turned off in config (it is **on by default**), the agent gains these tools:
+When the execution harness is **turned on** in config (`[harness.execution] enabled = true`; it is **off by default**), the agent gains these tools:
 
 | Tool | Purpose |
 |------|--------|
@@ -35,7 +35,7 @@ For **Google Colab**, use the **`colab-cli`** skill (invoke `colab` commands via
 
 ## Configuration
 
-Execution is **on by default** with **`default_provider = "local"`** when keys are omitted. To disable the harness, set **`[harness.execution] enabled = false`** in workspace **`config.toml`** (next to `.agents/`, not inside the sandbox). If you restrict **`allowed_providers`**, set **`default_provider`** to a member of that list (for example **`jupyter`**).
+Execution is **off by default**. To enable the harness, set **`[harness.execution] enabled = true`** in workspace **`config.toml`** (next to `.agents/`, not inside the sandbox). If you restrict **`allowed_providers`**, set **`default_provider`** to a member of that list (for example **`jupyter`**).
 
 Optional keys (defaults are sensible if omitted):
 

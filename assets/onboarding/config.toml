@@ -94,6 +94,16 @@ max_recent_summaries = 5
 [harness.git_worktree]
 enabled = true
 
+# Core host tools (filesystem, web, exec, cron, memory, todos, skill loader, tool search, …).
+# Plugin MCP tools still register when this is false — use that to specialize an agent around plugins.
+[harness.builtin_tools]
+enabled = true
+
+# Workspace identity files (AGENTS.md, SOUL.md, USER.md, MEMORY.md). Plugin overlay prompts
+# still apply when this is false.
+[harness.default_prompt]
+enabled = true
+
 [harness.subagents]
 enabled = true
 # cancel_children_on_parent_cancel = false  # default true: explicit cancel (/cancel, BusMessage::Cancel) also stops sub-tasks
@@ -117,8 +127,9 @@ enabled = false
 # forbid_final_without_tools = true   # default false: require at least one tool call before ending a reasoning step (also overridable via inbound metadata isanagent_autonomous_forbid_final_without_tools)
 
 # Execution: docs/execution-user-guide.md
+# Off by default. Set enabled = true to register execution_* tools.
 [harness.execution]
-enabled = true
+enabled = false
 default_provider = "local"
 allowed_providers = ["local", "jupyter", "ssh"]
 local_python_mode = "repl"

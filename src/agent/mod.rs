@@ -125,6 +125,8 @@ pub struct AgentLogicParams {
     pub shell_policy: ResolvedShellPolicy,
     /// Optional observation + steering hooks (`[harness.hooks]`).
     pub hook_tool_ctx: Option<Arc<ToolCallHookContext>>,
+    /// When false, skip registering `load_skill_instructions` (used with `[harness.builtin_tools] enabled = false`).
+    pub register_skill_loader: bool,
 }
 
 /// Build-time options for the Phase 5 sub-agent harness (see `[harness.subagents]`).
@@ -242,6 +244,7 @@ impl AgentLogic {
             forbid_final_without_tools,
             shell_policy,
             hook_tool_ctx,
+            register_skill_loader,
         } = params;
 
         let harness_for_subagent = harness_runtime_summary.clone();
@@ -323,11 +326,13 @@ impl AgentLogic {
         if let Some(ref h) = subagent_harness {
             subagent::register_subagent_tools(tools_mut, h.clone(), memory_node);
         }
-        let skill_reg = agent.skills.clone();
-        let loader_tool = LoadSkillTool {
-            registry: skill_reg,
-        };
-        tools_mut.register(Box::new(loader_tool));
+        if register_skill_loader {
+            let skill_reg = agent.skills.clone();
+            let loader_tool = LoadSkillTool {
+                registry: skill_reg,
+            };
+            tools_mut.register(Box::new(loader_tool));
+        }
 
         if let Some(ref h) = subagent_harness {
             h.bind_tools(agent.tools.clone())
@@ -1086,7 +1091,7 @@ impl Tool for LoadSkillTool {
     }
 
     fn description(&self) -> &str {
-        "Loads the full markdown instructions for a specific Agent Skill. Use this when you need to execute a skill."
+        "Loads the full markdown instructions for a specific Agent Skill. Call this function through the native tool-calling interface; do not write JSON, XML, or markdown that looks like a tool call."
     }
 
     fn policy(&self) -> ToolPolicy {
@@ -2057,6 +2062,7 @@ mod tests {
                     windows_runner: crate::config::WindowsShellRunner::default(),
                 },
                 hook_tool_ctx: None,
+                register_skill_loader: true,
             },
             fallback_providers,
         );
@@ -2134,6 +2140,7 @@ mod tests {
                 windows_runner: crate::config::WindowsShellRunner::default(),
             },
             hook_tool_ctx: None,
+            register_skill_loader: true,
         });
 
         if let Some(tool_execution_activity) = tool_execution_activity {
