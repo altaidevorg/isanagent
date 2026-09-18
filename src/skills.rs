@@ -194,13 +194,14 @@ impl SkillRegistry {
     }
 
     /// Returns the metadata for progressive disclosure to the prompt
-    pub fn get_capabilities_summary(&self) -> String {
+    pub fn get_capabilities_summary(&self, include_loader_hint: bool) -> String {
         if self.skills.is_empty() {
             return String::new();
         }
 
-        let mut summary = String::from("\n\nAvailable Agent Skills:\n");
+        let mut summary = String::new();
         let mut always_blocks = String::new();
+        let mut deferred = String::new();
 
         for skill in self.skills.values() {
             if skill.always && skill.available {
@@ -208,11 +209,17 @@ impl SkillRegistry {
                     "\n--- SKILL AUTOMATICALLY LOADED: {} ---\n{}\n",
                     skill.name, skill.instructions
                 ));
-            } else {
-                summary.push_str(&format!("- **{}**: {}\n", skill.name, skill.description));
+            } else if include_loader_hint {
+                deferred.push_str(&format!("- **{}**: {}\n", skill.name, skill.description));
             }
         }
-        summary.push_str("\nTo execute a skill, use the 'load_skill_instructions' tool with the skill's name to learn how to use it contextually.\n");
+        if !deferred.is_empty() {
+            summary.push_str("\n\nAvailable Agent Skills:\n");
+            summary.push_str(&deferred);
+            summary.push_str(
+                "\nTo use a listed skill, call the function `load_skill_instructions` through the native tool-calling interface with that skill's name. Do not write JSON, XML, or markdown that looks like a tool call.\n",
+            );
+        }
 
         format!("{summary}{always_blocks}")
     }
@@ -463,6 +470,13 @@ mod skill_metadata_tests {
 
         let dir_txt = reg.format_skill_directory();
         assert!(dir_txt.contains("demo_skill"));
+
+        let with_hint = reg.get_capabilities_summary(true);
+        assert!(with_hint.contains("native tool-calling interface"));
+        assert!(with_hint.contains("demo_skill"));
+        let without_hint = reg.get_capabilities_summary(false);
+        assert!(!without_hint.contains("load_skill_instructions"));
+        assert!(!without_hint.contains("demo_skill"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

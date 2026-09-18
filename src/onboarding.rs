@@ -807,7 +807,7 @@ mod tests {
             true,  // harness.git_worktree.enabled
             true,  // harness.subagents.enabled
             false, // harness.ml_engineer.enabled (opt-in since audit X4)
-            true,  // harness.execution.enabled
+            false, // harness.execution.enabled
             true,  // harness.background_jobs.enabled
             true,  // harness.notifications.enabled
         ];

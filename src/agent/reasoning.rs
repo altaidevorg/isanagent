@@ -1396,7 +1396,10 @@ impl AgentLogic {
                 "{}\n\n{}\n{}{}{}{}",
                 system_prompt,
                 summaries_text,
-                skills.read().await.get_capabilities_summary(),
+                skills
+                    .read()
+                    .await
+                    .get_capabilities_summary(tools.get_tool("load_skill_instructions").is_some(),),
                 harness_block,
                 todo_block,
                 iteration_line
