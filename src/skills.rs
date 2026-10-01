@@ -407,7 +407,7 @@ impl Drop for TempDirGuard {
     }
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     if !dst.exists() {
         fs::create_dir_all(dst).map_err(|e| format!("Failed to create directory {dst:?}: {e}"))?;
     }
@@ -422,6 +422,8 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
 
         if file_type.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
+        } else if file_type.is_symlink() {
+            copy_symlink(&src_path, &dst_path)?;
         } else {
             fs::copy(&src_path, &dst_path)
                 .map_err(|e| format!("Failed to copy file {src_path:?} to {dst_path:?}: {e}"))?;
@@ -429,6 +431,24 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// Recreates a link as a link: one to a directory (a virtualenv's `lib64 -> lib`,
+/// say) cannot be copied as a file. Off unix it copies what the link points to.
+fn copy_symlink(src: &Path, dst: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let target = fs::read_link(src).map_err(|e| format!("Failed to read link {src:?}: {e}"))?;
+        std::os::unix::fs::symlink(&target, dst)
+            .map_err(|e| format!("Failed to create link {dst:?}: {e}"))
+    }
+    #[cfg(not(unix))]
+    {
+        fs::copy(src, dst)
+            .map(|_| ())
+            .map_err(|e| format!("Failed to copy file {src:?} to {dst:?}: {e}"))
+    }
+}
+
 #[cfg(test)]
 mod skill_metadata_tests {
     use super::*;

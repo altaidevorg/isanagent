@@ -188,7 +188,13 @@ isanagent plugin install https://github.com/altaidevorg/plugin-ml-engineer --glo
 
 # Install with custom local name
 isanagent plugin install altaidevorg/plugin-ml-engineer --name ml-tools
+
+# Install from a local directory, e.g. a plugin you are developing
+isanagent plugin install ./my-plugin
+isanagent plugin install ~/src/plugin-ml-engineer --global
 ```
+
+A local directory is copied, not linked: edit the source and install again (after `isanagent plugin remove <name>`) to pick up changes. The copy is validated before it is moved into place, like a Git install. If a local directory exists with the same name as an `owner/repo` shorthand, the directory wins; use a full URL to install from GitHub instead.
 
 ### List Installed Plugins
 ```powershell

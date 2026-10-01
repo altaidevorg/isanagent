@@ -472,27 +472,44 @@ impl PluginRegistry {
         }
     }
 
-    /// Clones and installs a remote Agent Plugin Git repository into `target_dir/<plugin_name>`.
-    pub async fn install_from_repo(
+    /// Installs an Agent Plugin into `target_dir/<plugin_name>` from a local directory
+    /// or a Git repository (`owner/repo`, `https://…`, `git@…`). An existing local
+    /// directory wins over the `owner/repo` shorthand; a full URL always means Git.
+    pub async fn install(
         target_plugins_dir: &Path,
-        repo_url: &str,
+        source: &str,
         custom_name: Option<&str>,
     ) -> Result<Plugin, String> {
-        let url = if !repo_url.starts_with("http://")
-            && !repo_url.starts_with("https://")
-            && !repo_url.starts_with("git@")
-        {
-            format!("https://github.com/{repo_url}")
+        let local_dir = if Path::new(source).is_dir() {
+            Some(
+                std::fs::canonicalize(source)
+                    .map_err(|e| format!("Failed to resolve plugin directory {source}: {e}"))?,
+            )
         } else {
-            repo_url.to_string()
+            None
+        };
+        let url = if local_dir.is_some()
+            || source.starts_with("http://")
+            || source.starts_with("https://")
+            || source.starts_with("git@")
+        {
+            source.to_string()
+        } else {
+            format!("https://github.com/{source}")
         };
 
-        let leaf = url
-            .trim_end_matches('/')
-            .split('/')
-            .next_back()
-            .unwrap_or("plugin")
-            .trim_end_matches(".git");
+        // The canonical path also names `.` after the directory it stands for.
+        let local_leaf = local_dir
+            .as_deref()
+            .and_then(Path::file_name)
+            .map(|name| name.to_string_lossy().into_owned());
+        let leaf = local_leaf.as_deref().unwrap_or_else(|| {
+            url.trim_end_matches('/')
+                .split('/')
+                .next_back()
+                .unwrap_or("plugin")
+                .trim_end_matches(".git")
+        });
         let inferred_name = leaf
             .strip_prefix("pack-")
             .or_else(|| leaf.strip_prefix("plugin-"))
@@ -502,6 +519,18 @@ impl PluginRegistry {
         validate_plugin_name(target_name)?;
 
         let destination = target_plugins_dir.join(target_name);
+
+        // Copying a directory into a folder inside it would copy the copy forever,
+        // e.g. `isanagent plugin install .` from the workspace root.
+        if let Some(dir) = &local_dir {
+            if resolve_existing_prefix(target_plugins_dir).starts_with(dir) {
+                return Err(format!(
+                    "Cannot install {} into {}, which is inside it",
+                    dir.display(),
+                    target_plugins_dir.display()
+                ));
+            }
+        }
 
         if destination.exists() {
             return Err(format!(
@@ -513,10 +542,10 @@ impl PluginRegistry {
         std::fs::create_dir_all(target_plugins_dir)
             .map_err(|e| format!("Failed to create plugins directory: {e}"))?;
 
-        // Audit R5: stage the clone in a temporary sibling directory and only move it
-        // into place after the plugin validates. A failed/interrupted install can no
-        // longer leave a half-cloned tree that discovery would pick up as a broken
-        // plugin. Rename within the same directory/volume is atomic on all platforms.
+        // Audit R5: stage the copy or clone in a temporary sibling directory and only
+        // move it into place after the plugin validates. A failed/interrupted install
+        // can no longer leave a half-copied tree that discovery would pick up as a
+        // broken plugin. Rename within the same directory/volume is atomic on all platforms.
         let staging = target_plugins_dir.join(format!(
             ".{}.tmp-{}-{}",
             target_name,
@@ -525,39 +554,21 @@ impl PluginRegistry {
         ));
         let _ = std::fs::remove_dir_all(&staging);
 
-        let output = tokio::process::Command::new("git")
-            .arg("clone")
-            .arg("--depth")
-            .arg("1")
-            .arg(&url)
-            .arg(&staging)
-            .output()
-            .await
-            .map_err(|e| format!("Failed to execute git clone: {e}"));
-
-        // Any failure from here on must not leave staging behind.
-        let output = match output {
-            Ok(o) => o,
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&staging);
-                return Err(e);
-            }
+        let fetched = match &local_dir {
+            Some(dir) => crate::skills::copy_dir_recursive(dir, &staging),
+            None => clone_repo(&url, &staging).await,
         };
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        // Any failure from here on must not leave staging behind.
+        if let Err(e) = fetched {
             let _ = std::fs::remove_dir_all(&staging);
-            return Err(format!("git clone failed: {stderr}"));
+            return Err(e);
         }
 
         let plugin = match Plugin::load_from_dir(&staging) {
             Some(p) => p,
             None => {
                 let _ = std::fs::remove_dir_all(&staging);
-                return Err(format!(
-                    "Cloned repository at {} is not a valid plugin",
-                    staging.display()
-                ));
+                return Err(format!("{source} is not a valid plugin"));
             }
         };
 
@@ -568,6 +579,44 @@ impl PluginRegistry {
 
         Ok(plugin)
     }
+}
+
+/// `path` with the part that exists resolved like `canonicalize` (symlinks such as
+/// macOS `/tmp` → `/private/tmp` included), so a folder that is not created yet
+/// can still be compared with a canonical path.
+fn resolve_existing_prefix(path: &Path) -> PathBuf {
+    let mut missing = Vec::new();
+    let mut current = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(current) {
+            return missing.iter().rev().fold(real, |p, part| p.join(part));
+        }
+        match (current.parent(), current.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name.to_os_string());
+                current = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// Shallow `git clone` of `url` into `dest`.
+async fn clone_repo(url: &str, dest: &Path) -> Result<(), String> {
+    let output = tokio::process::Command::new("git")
+        .arg("clone")
+        .arg("--depth")
+        .arg("1")
+        .arg(url)
+        .arg(dest)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to execute git clone: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git clone failed: {stderr}"));
+    }
+    Ok(())
 }
 
 /// Validates a plugin name against the Agent Plugins 1.0 Specification (§5.5).
@@ -686,6 +735,70 @@ fn dirs_next_home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn installs_from_a_local_directory() {
+        let source_root = tempfile::tempdir().expect("tempdir");
+        let source = source_root.path().join("plugin-ml-kit");
+        std::fs::create_dir_all(source.join("skills")).expect("mkdir");
+        std::fs::write(
+            source.join("plugin.json"),
+            r#"{"name": "ml-kit", "version": "1.2.0"}"#,
+        )
+        .expect("write manifest");
+        let source_arg = source.display().to_string();
+        let target = tempfile::tempdir().expect("tempdir");
+        let plugins = target.path().join("plugins");
+        let entries = || std::fs::read_dir(&plugins).expect("read plugins").count();
+
+        let plugin = PluginRegistry::install(&plugins, &source_arg, None)
+            .await
+            .expect("install");
+        assert_eq!(plugin.manifest.version.as_deref(), Some("1.2.0"));
+        // Named like a repo install: the `plugin-` prefix is dropped.
+        assert!(plugins.join("ml-kit").join("plugin.json").is_file());
+        assert!(source.join("plugin.json").is_file(), "source left in place");
+        assert_eq!(entries(), 1, "no staging directory left behind");
+
+        assert!(PluginRegistry::install(&plugins, &source_arg, None)
+            .await
+            .is_err());
+        let not_a_plugin = source_root.path().join("notes");
+        std::fs::create_dir_all(&not_a_plugin).expect("mkdir");
+        let err = PluginRegistry::install(&plugins, &not_a_plugin.display().to_string(), None)
+            .await
+            .expect_err("not a plugin");
+        assert!(err.contains("is not a valid plugin"), "{err}");
+        assert_eq!(entries(), 1);
+
+        let inside = source.join(".agents").join("plugins");
+        let err = PluginRegistry::install(&inside, &source_arg, Some("copy"))
+            .await
+            .expect_err("install into itself");
+        assert!(err.contains("which is inside it"), "{err}");
+        assert!(!inside.exists(), "a refused install creates nothing");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_install_keeps_symlinks() {
+        // e.g. a virtualenv's `lib64 -> lib`: a link to a directory cannot be copied as a file.
+        let source_root = tempfile::tempdir().expect("tempdir");
+        let source = source_root.path().join("venv-kit");
+        std::fs::create_dir_all(source.join("skills")).expect("mkdir");
+        std::fs::create_dir_all(source.join(".venv").join("lib")).expect("mkdir");
+        std::os::unix::fs::symlink("lib", source.join(".venv").join("lib64")).expect("symlink");
+        let target = tempfile::tempdir().expect("tempdir");
+
+        PluginRegistry::install(target.path(), &source.display().to_string(), None)
+            .await
+            .expect("install");
+        let link = target.path().join("venv-kit").join(".venv").join("lib64");
+        assert_eq!(
+            std::fs::read_link(link).expect("still a link"),
+            Path::new("lib")
+        );
+    }
 
     #[test]
     fn loads_agent_plugins_1_0_spec_manifest() {
