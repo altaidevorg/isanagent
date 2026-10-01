@@ -22,7 +22,7 @@ use super::approval::{
 };
 use super::WAIT_SIGNAL_PREFIX;
 
-use crate::bus::{BusMessage, LogEvent, TelemetryEvent};
+use crate::bus::{BusMessage, LogEvent, OutboundMessage, TelemetryEvent};
 use crate::clarification::ClarificationHub;
 use crate::config::{ResolvedShellPolicy, ShellPolicyMode};
 use crate::hooks::{
@@ -198,6 +198,30 @@ pub(crate) async fn log_tool_invocation_start(
     );
 }
 
+/// Cancels the run after an `abort` approval reply and tells the channel so. A cancelled run
+/// sends no reply of its own, so a client waiting on the answer (the web UI's stream) would hang.
+async fn abort_run(
+    cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    outbound_tx: &mpsc::Sender<BusMessage>,
+    channel: &str,
+    chat_id: &str,
+    thread_id: Option<String>,
+    notice: &str,
+) {
+    if let Some(token) = cancel_token {
+        token.cancel();
+    }
+    let _ = outbound_tx
+        .send(BusMessage::Outbound(OutboundMessage {
+            channel: channel.to_string(),
+            chat_id: chat_id.to_string(),
+            thread_id,
+            content: notice.to_string(),
+            metadata: HashMap::new(),
+        }))
+        .await;
+}
+
 /// Session-scoped wiring for tools that need the active chat (e.g. `ask_user`).
 #[derive(Clone)]
 pub(crate) struct ToolCallRuntime {
@@ -359,9 +383,15 @@ pub(crate) async fn execute_tool_call_with_activity(
                                                     },
                                                 ))
                                                 .await;
-                                            if let Some(token) = cancel_owned.as_ref() {
-                                                token.cancel();
-                                            }
+                                            abort_run(
+                                                cancel_owned.as_ref(),
+                                                &outbound_tx,
+                                                &channel,
+                                                &chat_id,
+                                                thread_id_for_hooks.clone(),
+                                                "Aborted: the command was not run.",
+                                            )
+                                            .await;
                                             return ToolExecutionFinished::error(
                                                 ToolErrorCode::PolicyDenied,
                                                 "Command approval aborted by user; execution skipped.",
@@ -499,9 +529,15 @@ pub(crate) async fn execute_tool_call_with_activity(
                                 remember_approval_grant(grant_key).await;
                             }
                             ApprovalReply::Abort => {
-                                if let Some(token) = cancel_owned.as_ref() {
-                                    token.cancel();
-                                }
+                                abort_run(
+                                    cancel_owned.as_ref(),
+                                    &outbound_tx,
+                                    &channel,
+                                    &chat_id,
+                                    thread_id_for_hooks.clone(),
+                                    "Aborted: the edit was not applied.",
+                                )
+                                .await;
                                 return ToolExecutionFinished::error(
                                     ToolErrorCode::PolicyDenied,
                                     "Edit approval aborted by user; mutation skipped.",
@@ -605,4 +641,38 @@ pub(crate) async fn execute_tool_call_with_activity(
         }
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::abort_run;
+    use crate::bus::BusMessage;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn abort_cancels_the_run_and_answers_the_waiting_channel() {
+        let token = CancellationToken::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        abort_run(
+            Some(&token),
+            &tx,
+            "api",
+            "chat-1",
+            Some("thread-1".to_string()),
+            "Aborted: the edit was not applied.",
+        )
+        .await;
+
+        assert!(token.is_cancelled());
+        match rx.recv().await {
+            Some(BusMessage::Outbound(out)) => {
+                assert_eq!(out.channel, "api");
+                assert_eq!(out.chat_id, "chat-1");
+                assert_eq!(out.thread_id.as_deref(), Some("thread-1"));
+                assert_eq!(out.content, "Aborted: the edit was not applied.");
+            }
+            _ => panic!("expected an outbound notice"),
+        }
+    }
 }

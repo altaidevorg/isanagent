@@ -101,6 +101,13 @@ type Message = {
   content: string;
   imageUrls?: string[];
   toolCalls?: ToolCall[];
+  clarification?: Clarification;
+};
+
+/** The agent paused on a question (ask_user or an approval); the reply is the next message. */
+type Clarification = {
+  choices: string[];
+  edit_diff?: { file: string; diff: string; truncated: boolean };
 };
 
 type ToolCall = {
@@ -114,7 +121,13 @@ type StreamEvent =
   | { type: "tool_progress"; tool_name: string; message: string }
   | { type: "tool_call_finished"; tool_name: string; result: string }
   | { type: "agent_thought"; thought: string }
-  | { type: "completion"; content: string; thread_id: string; response_id: string }
+  | {
+      type: "completion";
+      content: string;
+      thread_id: string;
+      response_id: string;
+      clarification?: Clarification;
+    }
   | { type: "error"; message: string };
 
 type HistoryRow = {
@@ -395,6 +408,55 @@ function TypingIndicator({ step }: { step: string | null }) {
         </div>
         {step && <span className="text-sm text-muted-foreground animate-pulse">{step}</span>}
       </div>
+    </div>
+  );
+}
+
+function diffLineClass(line: string) {
+  if (line.startsWith("+++") || line.startsWith("---")) return "text-muted-foreground";
+  if (line.startsWith("+")) return "bg-green-500/10 text-green-700 dark:text-green-400";
+  if (line.startsWith("-")) return "bg-red-500/10 text-red-700 dark:text-red-400";
+  if (line.startsWith("@@")) return "text-sky-700 dark:text-sky-400";
+  return "";
+}
+
+/** Shows the proposed edit and the reply buttons; a choice is sent as the next message. */
+function ClarificationCard({
+  clarification,
+  disabled,
+  onChoose,
+}: {
+  clarification: Clarification;
+  disabled: boolean;
+  onChoose: (choice: string) => void;
+}) {
+  const { choices, edit_diff: editDiff } = clarification;
+  return (
+    <div className="mt-3 flex flex-col gap-3">
+      {editDiff && (
+        <div className="overflow-hidden rounded-lg border border-border">
+          <div className="border-b border-border bg-muted/40 px-3 py-1.5 font-mono text-xs">{editDiff.file}</div>
+          <pre className="max-h-80 overflow-auto py-2 font-mono text-[11px] leading-5">
+            {editDiff.diff.split("\n").map((line, i) => (
+              <div className={cn("px-3", diffLineClass(line))} key={i}>
+                {line || " "}
+              </div>
+            ))}
+          </pre>
+          {editDiff.truncated && (
+            <div className="border-t border-border px-3 py-1.5 text-xs text-muted-foreground">Diff truncated.</div>
+          )}
+        </div>
+      )}
+      {choices.length > 0 && (
+        <div className="flex flex-wrap gap-2">
+          {choices.map((choice) => (
+            <Button disabled={disabled} key={choice} onClick={() => onChoose(choice)} size="sm" variant="outline">
+              {choice}
+            </Button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -1026,6 +1088,7 @@ export default function App() {
       let currentToolCall: ToolCall | null = null;
       let finalChatId: string | null = null;
       let finalResponseId: string | null = null;
+      let clarification: Clarification | undefined;
       let buffer = "";
 
       while (true) {
@@ -1076,6 +1139,7 @@ export default function App() {
                 assistantContent = event.content;
                 finalChatId = event.thread_id;
                 finalResponseId = event.response_id;
+                clarification = event.clarification;
                 setCurrentStep(null); // Clear step when completion arrives
                 break;
               case "error":
@@ -1095,6 +1159,7 @@ export default function App() {
           role: "assistant",
           content: assistantContent,
           toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+          clarification,
         },
       ]);
 
@@ -1561,7 +1626,7 @@ export default function App() {
                     })()}
                   </div>
                 )}
-                {messages.map((message) => (
+                {messages.map((message, index) => (
                   <article
                     className={cn(
                       "max-w-[82%] rounded-xl px-4 py-3",
@@ -1577,6 +1642,13 @@ export default function App() {
                     {message.content ? (
                       <p className="mt-2 whitespace-pre-wrap text-sm leading-7">{message.content}</p>
                     ) : null}
+                    {message.clarification && (
+                      <ClarificationCard
+                        clarification={message.clarification}
+                        disabled={pending || index !== messages.length - 1}
+                        onChoose={(choice) => void submitMessage({ text: choice, imageDataUrls: [] })}
+                      />
+                    )}
                     {message.toolCalls && <ToolAccordion toolCalls={message.toolCalls} />}
                     {message.imageUrls?.length ? (
                       <div className="mt-2 flex flex-col gap-2">

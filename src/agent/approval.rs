@@ -9,6 +9,7 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
+use crate::clarification::ASK_USER_REPLY_PREFIX;
 use crate::config::{ResolvedShellPolicy, ShellPolicyMode};
 
 /// Lowercase and collapse every run of whitespace (spaces, tabs, newlines) to a single space so a
@@ -117,6 +118,8 @@ pub(crate) fn classify_approval_reply(reply: &str) -> ApprovalReply {
     const ALWAYS: &[&str] = &["always"];
     const ABORT: &[&str] = &["abort", "cancel", "quit", "stop"];
 
+    // Approval prompts go through `ask_user`, whose result wraps the answer for the model.
+    let reply = reply.strip_prefix(ASK_USER_REPLY_PREFIX).unwrap_or(reply);
     let r = reply.trim().to_ascii_lowercase();
     if r.is_empty() {
         return ApprovalReply::Deny;
@@ -419,6 +422,34 @@ mod code_exec_gate_tests {
         assert_eq!(classify_approval_reply("deny"), ApprovalReply::Deny);
         assert!(shell_approval_reply_is_grant("always"));
         assert!(!shell_approval_reply_is_grant("abort"));
+    }
+
+    #[test]
+    fn approval_reply_reads_through_the_ask_user_result_wrapper() {
+        let wrapped = |answer: &str| format!("{ASK_USER_REPLY_PREFIX}{answer}");
+        assert_eq!(
+            classify_approval_reply(&wrapped("approve")),
+            ApprovalReply::Grant
+        );
+        assert_eq!(
+            classify_approval_reply(&wrapped("always")),
+            ApprovalReply::AlwaysThisRun
+        );
+        assert_eq!(
+            classify_approval_reply(&wrapped("abort")),
+            ApprovalReply::Abort
+        );
+        assert_eq!(
+            classify_approval_reply(&wrapped("deny")),
+            ApprovalReply::Deny
+        );
+        // An off-list answer stays a deny.
+        assert_eq!(
+            classify_approval_reply(
+                "User reply (not among listed choices): maybe\n\nListed options were: []"
+            ),
+            ApprovalReply::Deny
+        );
     }
 
     #[test]
