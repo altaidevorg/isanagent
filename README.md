@@ -137,6 +137,9 @@ isanagent plugin install https://github.com/altaidevorg/plugin-ml-engineer
 # Install globally to ~/.agent-plugins
 isanagent plugin install https://github.com/altaidevorg/plugin-ml-engineer --global
 
+# Install from a local directory (copied; the source stays where it is)
+isanagent plugin install ./my-plugin
+
 # List installed plugins
 isanagent plugin list
 ```

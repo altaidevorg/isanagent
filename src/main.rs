@@ -43,9 +43,9 @@ struct PluginArgs {
 
 #[derive(Subcommand, Debug)]
 enum PluginCommands {
-    /// Install an Agent Plugin from a Git repository
+    /// Install an Agent Plugin from a Git repository or a local directory
     Install {
-        /// Repository URL (e.g., https://github.com/agentplugins/agent-plugins-example or owner/repo)
+        /// Repository URL (e.g., https://github.com/agentplugins/agent-plugins-example or owner/repo), or a local plugin directory
         source: String,
         /// Optional custom name for the installed plugin
         #[arg(short, long)]
@@ -212,7 +212,7 @@ async fn run_plugin(
                 isanagent::plugins::PluginRegistry::discover(&workspace.dir, Some(&global_root));
             if registry.is_empty() {
                 println!("No Agent Plugins installed.");
-                println!("Install with: isanagent plugin install <repo_url>");
+                println!("Install with: isanagent plugin install <repo_url|local_dir>");
             } else {
                 println!("Installed Agent Plugins ({}):", registry.len());
                 for p in registry.list() {
@@ -245,12 +245,8 @@ async fn run_plugin(
                 "Installing Agent Plugin from {source} into {}...",
                 target_dir.display()
             );
-            match isanagent::plugins::PluginRegistry::install_from_repo(
-                &target_dir,
-                &source,
-                name.as_deref(),
-            )
-            .await
+            match isanagent::plugins::PluginRegistry::install(&target_dir, &source, name.as_deref())
+                .await
             {
                 Ok(plugin) => {
                     println!(
