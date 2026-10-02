@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 
 use crate::bus::{BusMessage, OutboundMessage};
 use crate::clarification::{
-    ClarificationHub, METADATA_CLARIFICATION, METADATA_CLARIFICATION_CHOICES,
+    ClarificationHub, ASK_USER_REPLY_PREFIX, METADATA_CLARIFICATION, METADATA_CLARIFICATION_CHOICES,
 };
 use crate::memory::{MemoryMessage, SharedReply};
 use crate::tool_runtime::current_tool_exec_ctx;
@@ -625,7 +625,7 @@ impl Tool for AskUserTool {
             }
         };
 
-        Ok(format!("User reply:\n{canonical_reply}"))
+        Ok(format!("{ASK_USER_REPLY_PREFIX}{canonical_reply}"))
     }
 }
 

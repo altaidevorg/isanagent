@@ -27,6 +27,7 @@ use tokio::sync::oneshot;
 use crate::bus::{BusMessage, InboundMessage, LogEvent, OutboundMessage, TelemetryEvent};
 use crate::channels::api_store::{ResponseStore, StoredResponse};
 use crate::channels::Channel;
+use crate::clarification::{METADATA_CLARIFICATION, METADATA_CLARIFICATION_CHOICES};
 use crate::config::ApiConfig;
 use crate::logging::LoggerHandle;
 use crate::memory::{MemoryMessage, SharedReply};
@@ -107,10 +108,52 @@ enum StreamEvent {
         content: String,
         thread_id: String,
         response_id: String,
+        /// Set when the turn ends on a question to the user (`ask_user`, a shell or edit
+        /// approval); the reply is the next message on the same thread.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        clarification: Option<Clarification>,
     },
     Error {
         message: String,
     },
+}
+
+/// What a client needs to render a question as buttons instead of plain text.
+#[derive(Serialize, Debug, PartialEq)]
+struct Clarification {
+    /// Suggested replies, e.g. `approve`, `deny`, `always`, `abort`; may be empty.
+    choices: Vec<String>,
+    /// For a file edit approval: `{file, diff, truncated}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    edit_diff: Option<serde_json::Value>,
+}
+
+impl Clarification {
+    fn from_outbound(msg: &OutboundMessage) -> Option<Self> {
+        let is_question = msg
+            .metadata
+            .get(METADATA_CLARIFICATION)
+            .and_then(|v| v.as_bool())
+            == Some(true);
+        if !is_question {
+            return None;
+        }
+        let choices = msg
+            .metadata
+            .get(METADATA_CLARIFICATION_CHOICES)
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(Self {
+            choices,
+            edit_diff: msg.metadata.get("edit_diff").cloned(),
+        })
+    }
 }
 
 /// A parsed and normalised chat request: plain text plus optional image attachments.
@@ -592,10 +635,12 @@ impl Channel for ApiChannel {
                         )
                         .with_chat_id(&thread_id),
                     );
+                    let clarification = Clarification::from_outbound(&msg);
                     if let Err(e) = pending.stream_tx.try_send(StreamEvent::Completion {
                         content: msg.content,
                         thread_id,
                         response_id,
+                        clarification,
                     }) {
                         error!("Failed to send completion to stream: {e}");
                     }
@@ -1148,6 +1193,7 @@ async fn handle_responses(
             content: String::new(),
             thread_id: conv_thread_id.clone(),
             response_id: String::new(),
+            clarification: None,
         });
 
         let inbound = InboundMessage {
@@ -2571,7 +2617,7 @@ fn log_api(logger_tx: &LoggerHandle, event: LogEvent) {
 mod tests {
     use super::{
         bearer_token_matches, build_router, is_loopback_bind, validate_bind_security, ApiState,
-        PendingRequest, StreamEvent, EMBEDDED_UI_ASSETS,
+        Clarification, PendingRequest, StreamEvent, EMBEDDED_UI_ASSETS,
     };
     use crate::bus::{BusMessage, OutboundMessage};
     use crate::channels::api_store::ResponseStore;
@@ -2592,6 +2638,74 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::sync::{mpsc, oneshot};
     use tower::ServiceExt;
+
+    #[test]
+    fn completion_carries_approval_choices_and_edit_diff() {
+        let question = OutboundMessage {
+            channel: "api".to_string(),
+            chat_id: "chat".to_string(),
+            thread_id: None,
+            content: "The agent needs your input:\n\nApprove edit?".to_string(),
+            metadata: HashMap::from([
+                ("isanagent_clarification".to_string(), Value::Bool(true)),
+                (
+                    "isanagent_clarification_choices".to_string(),
+                    serde_json::json!(["approve", "deny", "always", "abort"]),
+                ),
+                (
+                    "edit_diff".to_string(),
+                    serde_json::json!({"file": "a.rs", "diff": "-a\n+b", "truncated": false}),
+                ),
+            ]),
+        };
+        let event = StreamEvent::Completion {
+            content: question.content.clone(),
+            thread_id: "t".to_string(),
+            response_id: "r".to_string(),
+            clarification: Clarification::from_outbound(&question),
+        };
+        let encoded = serde_json::to_value(event).expect("serialize stream event");
+
+        assert_eq!(encoded["type"], "completion");
+        assert_eq!(
+            encoded["clarification"]["choices"],
+            serde_json::json!(["approve", "deny", "always", "abort"])
+        );
+        assert_eq!(encoded["clarification"]["edit_diff"]["file"], "a.rs");
+    }
+
+    #[test]
+    fn plain_completion_has_no_clarification_field() {
+        let answer = OutboundMessage {
+            channel: "api".to_string(),
+            chat_id: "chat".to_string(),
+            thread_id: None,
+            content: "done".to_string(),
+            metadata: HashMap::new(),
+        };
+        assert_eq!(Clarification::from_outbound(&answer), None);
+
+        let free_text_question = OutboundMessage {
+            metadata: HashMap::from([("isanagent_clarification".to_string(), Value::Bool(true))]),
+            ..answer.clone()
+        };
+        assert_eq!(
+            Clarification::from_outbound(&free_text_question),
+            Some(Clarification {
+                choices: Vec::new(),
+                edit_diff: None,
+            })
+        );
+
+        let event = StreamEvent::Completion {
+            content: answer.content,
+            thread_id: "t".to_string(),
+            response_id: "r".to_string(),
+            clarification: None,
+        };
+        let encoded = serde_json::to_value(event).expect("serialize stream event");
+        assert!(encoded.get("clarification").is_none());
+    }
 
     #[test]
     fn streamed_tool_completion_preserves_typed_error_status() {

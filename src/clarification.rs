@@ -9,6 +9,8 @@ use tokio::sync::oneshot;
 pub const METADATA_CLARIFICATION: &str = "isanagent_clarification";
 /// Optional JSON array of strings (`ask_user` choices); UIs can render as a numbered list without parsing body text.
 pub const METADATA_CLARIFICATION_CHOICES: &str = "isanagent_clarification_choices";
+/// Prefix of a successful `ask_user` result; approval prompts strip it before classifying.
+pub const ASK_USER_REPLY_PREFIX: &str = "User reply:\n";
 
 /// Routes the next inbound message for a session key to a pending `ask_user` tool call.
 #[derive(Debug, Default)]
