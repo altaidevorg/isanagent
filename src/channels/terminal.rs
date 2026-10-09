@@ -40,6 +40,10 @@ pub struct TerminalChannelConfig {
     /// File references composed into the first user message.
     pub initial_files: Vec<PathBuf>,
     pub mode: TerminalMode,
+    /// `config.toml` the settings popup reads and writes.
+    pub config_path: PathBuf,
+    /// Live skill registry shared with the agent. Empty in line mode.
+    pub skills: Option<crate::skills::SharedSkillRegistry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +76,8 @@ pub struct TerminalChannel {
     resume_session: bool,
     initial_files: Vec<PathBuf>,
     mode: TerminalMode,
+    config_path: PathBuf,
+    skills: Option<crate::skills::SharedSkillRegistry>,
 }
 
 impl TerminalChannel {
@@ -92,6 +98,8 @@ impl TerminalChannel {
             resume_session: config.resume_session,
             initial_files: config.initial_files,
             mode: config.mode,
+            config_path: config.config_path,
+            skills: config.skills,
         }
     }
 }
@@ -464,6 +472,8 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
         let sandbox_dir = self.sandbox_dir.clone();
         let workspace_dir = self.workspace_dir.clone();
         let providers_clone = self.providers.clone();
+        let config_path = self.config_path.clone();
+        let skills = self.skills.clone();
 
         let _ = logger_tx.send(BusMessage::Log(LogEvent::info(
             "TerminalChannel",
@@ -518,6 +528,8 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
                         theme,
                         resume_session,
                         initial_files,
+                        config_path,
+                        skills,
                     },
                 );
                 if let Ok(mut g) = bridge.lock() {

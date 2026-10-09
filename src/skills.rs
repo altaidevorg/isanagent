@@ -243,6 +243,13 @@ impl SkillRegistry {
         self.skills.keys().cloned().collect()
     }
 
+    /// Installed skills in name order. Callers that show this to a user should omit `instructions`.
+    pub fn list_skills(&self) -> Vec<SkillDefinition> {
+        let mut skills: Vec<_> = self.skills.values().cloned().collect();
+        skills.sort_by(|left, right| left.name.cmp(&right.name));
+        skills
+    }
+
     /// One line per skill for quick discovery (includes unavailable entries with their reason).
     pub fn format_skill_directory(&self) -> String {
         if self.skills.is_empty() {
@@ -304,24 +311,39 @@ impl SkillRegistry {
             .map_err(|e| format!("Failed to create temp dir: {e}"))?;
         let _guard = TempDirGuard::new(temp_dir_path.clone());
 
-        // 2. Clone the repository (using git command)
-        let status = std::process::Command::new("git")
+        // Capture git's output. Letting it write to the terminal paints over the
+        // TUI and leaves the screen on the last frame, so Esc looks like it did nothing.
+        let output = std::process::Command::new("git")
             .arg("clone")
             .arg("--depth")
             .arg("1")
             .arg(&full_repo_url)
             .arg(&temp_dir_path)
-            .status()
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output()
             .map_err(|e| {
                 format!(
                     "Failed to execute git clone: {e}. Make sure 'git' is installed and in your PATH."
                 )
             })?;
 
-        if !status.success() {
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = stderr.trim();
+            let stderr = if stderr.len() > 300 {
+                let mut start = stderr.len() - 300;
+                while !stderr.is_char_boundary(start) {
+                    start += 1;
+                }
+                &stderr[start..]
+            } else {
+                stderr
+            };
             return Err(format!(
-                "git clone failed with exit code: {:?}",
-                status.code()
+                "git clone failed ({:?}): {stderr}",
+                output.status.code()
             ));
         }
 

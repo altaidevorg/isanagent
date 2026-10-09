@@ -647,6 +647,13 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
 
     // Expand family-format providers into flat per-model map (once, reused everywhere).
     let expanded_providers = workspace.config.expanded_providers();
+    let mut model_catalog_providers = expanded_providers.clone();
+    if let Some(def) = &workspace.config.provider {
+        let key = format!("{}/{}", def.provider_name, def.model_name);
+        model_catalog_providers
+            .entry(key)
+            .or_insert_with(|| def.clone());
+    }
 
     // Try to find any provider with a valid API key. No key = start with NoKeyProvider.
     // Priority: last_model file (remembers /model choice) → [provider] → first [providers.*] with key.
@@ -656,42 +663,54 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    let (provider_cfg, api_key): (Option<crate::config::ProviderConfig>, Option<String>) = {
+    let (provider_cfg, api_key, selected_model_key): (
+        Option<crate::config::ProviderConfig>,
+        Option<String>,
+        Option<String>,
+    ) = {
         // 0. Try remembered last model choice
         let mut found_remembered = None;
         if let Some(ref key_name) = remembered_key {
             if let Some(cfg) = expanded_providers.get(key_name) {
                 if let Ok(key) = cfg.resolve_api_key() {
-                    found_remembered = Some((cfg.clone(), key));
+                    found_remembered = Some((cfg.clone(), key, key_name.clone()));
                 }
             }
         }
-        if let Some((cfg, key)) = found_remembered {
-            (Some(cfg), Some(key))
+        if let Some((cfg, key, selected)) = found_remembered {
+            (Some(cfg), Some(key), Some(selected))
         }
         // 1. Try default [provider]
         else if let Ok(key) = default_provider_cfg.resolve_api_key() {
-            (Some(default_provider_cfg.clone()), Some(key))
+            let selected = format!(
+                "{}/{}",
+                default_provider_cfg.provider_name, default_provider_cfg.model_name
+            );
+            (
+                Some(default_provider_cfg.clone()),
+                Some(key),
+                Some(selected),
+            )
         } else {
             // 2. Try any expanded [providers.*] entry — in deterministic (sorted) key
             // order (audit R4): HashMap iteration order is randomized per process,
             // which made the "first entry with a key" fallback vary across restarts.
             let mut sorted_ids: Vec<&String> = expanded_providers.keys().collect();
             sorted_ids.sort();
-            let mut found: Option<(crate::config::ProviderConfig, String)> = None;
+            let mut found: Option<(crate::config::ProviderConfig, String, String)> = None;
             for id in sorted_ids {
                 if let Some(cfg) = expanded_providers.get(id.as_str()) {
                     if let Ok(key) = cfg.resolve_api_key() {
-                        found = Some((cfg.clone(), key));
+                        found = Some((cfg.clone(), key, id.clone()));
                         break;
                     }
                 }
             }
-            if let Some((cfg, key)) = found {
-                (Some(cfg), Some(key))
+            if let Some((cfg, key, selected)) = found {
+                (Some(cfg), Some(key), Some(selected))
             } else {
                 // No key anywhere — start without one (NoKeyProvider)
-                (None, None)
+                (None, None, None)
             }
         }
     };
@@ -968,6 +987,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     } else {
         agent_logic
     };
+    let skills_for_settings = agent_logic.shared_skills();
 
     // 8. Wrap Agent in NodeHandle
     let agent_node = NodeHandle::<BusMessage>::new(agent_logic, 100, 3, Duration::from_millis(50));
@@ -994,19 +1014,15 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             status_model: model_name.clone(),
             status_permission: host_permission_label(config.permission),
             memory_node: memory_node.clone(),
-            providers: {
-                // Merge default [provider] + expanded [providers.*] into one map for /model selector
-                let mut all_providers = expanded_providers.clone();
-                if let Some(def) = &workspace.config.provider {
-                    let key = format!("{}/{}", def.provider_name, def.model_name);
-                    all_providers.entry(key).or_insert_with(|| def.clone());
-                }
-                all_providers
-            },
+            providers: model_catalog_providers.clone(),
             color_enabled: !config.no_color && config.theme != HostThemeMode::NoColor,
             theme: config.theme,
             resume_session: config.resume.is_some(),
             initial_files: config.files.clone(),
+            config_path: logging_config_override
+                .clone()
+                .unwrap_or_else(|| workspace.dir.join("config.toml")),
+            skills: Some(skills_for_settings.clone()),
             mode: if config.line_mode {
                 TerminalMode::Line
             } else {
@@ -1090,7 +1106,23 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                 logger_bus_tx.clone(),
                 memory_node.clone(),
                 workspace.sandbox_dir.clone(),
-            )?;
+            )?
+            .with_model_catalog(crate::channels::model_settings::ModelCatalog::new(
+                workspace.dir.clone(),
+                model_catalog_providers.clone(),
+                selected_model_key.clone().or_else(|| {
+                    remembered_key
+                        .as_ref()
+                        .filter(|key| model_catalog_providers.contains_key(key.as_str()))
+                        .cloned()
+                }),
+            ))
+            .with_config_path(
+                logging_config_override
+                    .clone()
+                    .unwrap_or_else(|| workspace.dir.join("config.toml")),
+            )
+            .with_skills(skills_for_settings.clone());
             let api = if let Some(mte_cron_scheduler) = mte_cron_scheduler.clone() {
                 api.with_multi_tenant_edge_cron_scheduler(mte_cron_scheduler)
             } else {

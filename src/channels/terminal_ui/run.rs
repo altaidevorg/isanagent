@@ -240,6 +240,72 @@ pub(crate) fn persist_provider_api_key(
         .map_err(|e| format!("Could not write {}: {}", config_path.display(), e))
 }
 
+fn harness_settings_message(
+    error: crate::channels::harness_settings::HarnessSettingsError,
+) -> String {
+    use crate::channels::harness_settings::HarnessSettingsError;
+    match error {
+        HarnessSettingsError::Io(message) | HarnessSettingsError::Parse(message) => message,
+        HarnessSettingsError::InvalidShellMode => {
+            "shell policy must be ask, deny, or allow.".to_string()
+        }
+    }
+}
+
+fn apply_settings_effect(
+    popup: &mut super::settings::SettingsPopup,
+    effect: super::settings::SettingsEffect,
+    app: &mut App,
+    bus_tx: &Sender<BusMessage>,
+    providers: &mut std::collections::HashMap<String, crate::config::ProviderConfig>,
+    workspace_dir: &Path,
+    config_path: &Path,
+    active_provider_key: &mut Option<String>,
+) {
+    use super::settings::SettingsEffect;
+    match effect {
+        SettingsEffect::None | SettingsEffect::Close => {}
+        SettingsEffect::SwitchModel { key } => {
+            try_switch_model(
+                app,
+                bus_tx,
+                providers,
+                workspace_dir,
+                &key,
+                active_provider_key,
+            );
+            if active_provider_key.as_deref() == Some(key.as_str()) {
+                popup.note_model_active(&key);
+            }
+        }
+        SettingsEffect::SetApiKey { key, secret } => {
+            if key_looks_like_placeholder(&secret) {
+                popup.fail("That doesn't look like a real API key.");
+                return;
+            }
+            try_set_api_key(
+                app,
+                bus_tx,
+                providers,
+                workspace_dir,
+                &key,
+                &secret,
+                active_provider_key,
+            );
+            if active_provider_key.as_deref() == Some(key.as_str()) {
+                popup.note_key_saved(&key);
+            }
+        }
+        SettingsEffect::SaveHarness(settings) => {
+            match crate::channels::harness_settings::write_harness_settings(config_path, &settings)
+            {
+                Ok(_) => popup.note_harness_saved(),
+                Err(error) => popup.fail(harness_settings_message(error)),
+            }
+        }
+    }
+}
+
 /// Shared helper: resolve a provider config by key, send SwitchModel, and update UI.
 /// Used by both the interactive model selector (Enter key) and the `/model <name>` command.
 /// On success, records `config_key` as the active provider so a later bare `/key <secret>`
@@ -374,8 +440,9 @@ const TERMINAL_HELP: &str = r#"Commands (leading slash):
   /exit, /quit   Quit and restore the terminal
   /new           Start a new thread (new chat id)
   /model [name]  Switch LLM model (interactive picker, or /model <config_key>)
-  /key [key]     Set/update an API key at runtime; hot-swaps the live model, saves to
-                 config.toml. Usage: /key <api_key>  or  /key <provider_config_key> <api_key>
+  /settings      Models, harness, and skills (same choices as the web settings screen)
+  /key [key]     Set/update an API key at runtime; hot-swaps the live model and saves it
+                 to the OS keychain. Usage: /key <api_key>  or  /key <provider_config_key> <api_key>
                  (only the last 4 characters are ever shown back to you)
   /copy          Copy the last assistant reply to the clipboard
   /install-python Install uv (best effort) in the background; UI stays responsive
@@ -430,6 +497,7 @@ fn env_falsy(var: &str) -> bool {
 /// Slash commands with descriptions for the autocomplete popup.
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/model", "Switch LLM model"),
+    ("/settings", "Models, harness, and skills"),
     ("/key", "Set/update an API key"),
     ("/new", "Start a new thread"),
     ("/exit", "Quit the terminal"),
@@ -445,6 +513,54 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/skills", "Add remote skills"),
     ("/install-python", "Install uv runtime"),
 ];
+
+/// Hint rows for a compose line that is still a command prefix.
+fn slash_hint_matches(input: &str) -> Vec<(&'static str, &'static str)> {
+    if !input.starts_with('/') || input.contains(' ') {
+        return Vec::new();
+    }
+    let prefix = input.to_ascii_lowercase();
+    SLASH_COMMANDS
+        .iter()
+        .copied()
+        .filter(|(cmd, _)| cmd.starts_with(&prefix))
+        .collect()
+}
+
+/// These commands need text after the name, so choosing one fills the line.
+fn slash_hint_needs_more(cmd: &str) -> bool {
+    matches!(cmd, "/key" | "/skills")
+}
+
+fn slash_hint_move(selected: usize, len: usize, down: bool) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    if down {
+        (selected + 1).min(len - 1)
+    } else {
+        selected.saturating_sub(1)
+    }
+}
+
+#[derive(Debug)]
+enum SlashHintAction {
+    SubmitTyped,
+    Fill(String),
+    Run(String),
+}
+
+fn slash_hint_action(matches: &[(&str, &str)], selected: usize) -> SlashHintAction {
+    if matches.is_empty() {
+        return SlashHintAction::SubmitTyped;
+    }
+    let cmd = matches[selected.min(matches.len() - 1)].0;
+    if slash_hint_needs_more(cmd) {
+        SlashHintAction::Fill(format!("{cmd} "))
+    } else {
+        SlashHintAction::Run(cmd.to_string())
+    }
+}
 
 /// Same as `/cancel`: cancel in-flight work; quit only if the bus is gone.
 fn try_cancel_inflight(app: &mut App, bus_tx: &Sender<BusMessage>, chat_id: &str) {
@@ -1380,6 +1496,21 @@ fn char_wrap_compose(
     out
 }
 
+/// Keeps a popup inside the terminal. A box taller than the window used to be drawn
+/// past the last row, and ratatui panics instead of clipping.
+fn fitted_popup(area: Rect, x: u16, y: u16, width: u16, height: u16) -> Option<Rect> {
+    if area.width < 2 || area.height < 2 || width == 0 || height == 0 {
+        return None;
+    }
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    let max_x = area.x.saturating_add(area.width.saturating_sub(width));
+    let max_y = area.y.saturating_add(area.height.saturating_sub(height));
+    let x = x.clamp(area.x, max_x);
+    let y = y.clamp(area.y, max_y);
+    Some(Rect::new(x, y, width, height))
+}
+
 fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
     let x1 = r.x.saturating_add(r.width);
     let y1 = r.y.saturating_add(r.height);
@@ -1626,6 +1757,10 @@ pub(crate) struct RatatuiMainConfig {
     pub resume_session: bool,
     /// File references composed into the first user message.
     pub initial_files: Vec<PathBuf>,
+    /// `config.toml` for the settings popup.
+    pub config_path: PathBuf,
+    /// Live skill registry. `None` when this session cannot install skills.
+    pub skills: Option<crate::skills::SharedSkillRegistry>,
 }
 
 /// Run until user quits. Restores terminal on exit.
@@ -1647,6 +1782,8 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         theme,
         resume_session,
         initial_files,
+        config_path,
+        skills,
     } = config;
 
     // Which `[providers.*]` entry `/key` (with no explicit target) should update; refreshed by
@@ -1738,8 +1875,15 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 
     // Result of a background `install_uv_best_effort` started from `/install-python`.
     let mut uv_install_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>> = None;
+    let mut settings_popup: Option<super::settings::SettingsPopup> = None;
 
     let tick = Duration::from_millis(80);
+    // Cursor's terminal sometimes reports Escape as a key-release, or swallows the
+    // press after a click selects text. One physical Esc should still count once.
+    let mut last_esc = Instant::now() - Duration::from_secs(5);
+    // Which slash-hint row is highlighted, and the compose line it belongs to.
+    let mut slash_selected: usize = 0;
+    let mut slash_hint_for = String::new();
     let max_transcript_scroll_holder = std::cell::Cell::new(0u16);
     let max_tool_history_scroll_holder = std::cell::Cell::new(0u16);
     let max_exec_list_scroll_holder = std::cell::Cell::new(0usize);
@@ -2055,6 +2199,15 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         // Drop terminal strip rows that are older than the linger window.
         app.evict_expired_jobs(Duration::from_secs(10));
         app.evict_expired_agent_tasks(Duration::from_secs(30));
+
+        if slash_hint_for != app.input {
+            slash_selected = 0;
+            slash_hint_for.clone_from(&app.input);
+        }
+        let slash_matches = slash_hint_matches(&app.input);
+        if slash_matches.is_empty() || slash_selected >= slash_matches.len() {
+            slash_selected = 0;
+        }
 
         terminal.draw(|f| {
             let area = f.area();
@@ -2453,232 +2606,253 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     .saturating_add(inner_area.height.saturating_sub(1)),
             );
             // Model selector popup overlay.
-            if let Some(selector) = &app.model_selector {
-                match &selector.stage {
-                    ModelSelectorStage::ProviderSelect => {
-                        let popup_h = (selector.providers.len() as u16 + 4)
-                            .min(area.height.saturating_sub(4));
-                        let popup_w = 62u16.min(area.width.saturating_sub(4));
-                        let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
-                        let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 2;
-                        let popup_area = Rect::new(popup_x, popup_y, popup_w, popup_h);
+            if settings_popup.is_none() {
+                if let Some(selector) = &app.model_selector {
+                    match &selector.stage {
+                        ModelSelectorStage::ProviderSelect => {
+                            let popup_h = (selector.providers.len() as u16 + 4)
+                                .min(area.height.saturating_sub(4));
+                            let popup_w = 62u16.min(area.width.saturating_sub(4));
+                            let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
+                            let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 2;
+                            let popup_area = Rect::new(popup_x, popup_y, popup_w, popup_h);
 
-                        f.render_widget(Clear, popup_area);
+                            f.render_widget(Clear, popup_area);
 
-                        let inner_block = Block::default()
-                            .borders(Borders::ALL)
-                            .title(Span::styled(
-                                " 1. Select LLM Provider (↑↓ Enter Esc) ",
-                                Theme::tool_call(),
-                            ))
-                            .border_style(Style::default().fg(Color::Cyan));
-                        let inner = inner_block.inner(popup_area);
-                        f.render_widget(inner_block, popup_area);
+                            let inner_block = Block::default()
+                                .borders(Borders::ALL)
+                                .title(Span::styled(
+                                    " 1. Select LLM Provider (↑↓ Enter Esc) ",
+                                    Theme::tool_call(),
+                                ))
+                                .border_style(Style::default().fg(Color::Cyan));
+                            let inner = inner_block.inner(popup_area);
+                            f.render_widget(inner_block, popup_area);
 
-                        let visible_h = inner.height as usize;
-                        let scroll_offset = if selector.selected_provider >= visible_h {
-                            selector.selected_provider - visible_h + 1
-                        } else {
-                            0
-                        };
-
-                        let mut lines: Vec<Line> = Vec::new();
-                        for (i, entry) in selector
-                            .providers
-                            .iter()
-                            .enumerate()
-                            .skip(scroll_offset)
-                            .take(visible_h)
-                        {
-                            let marker = if i == selector.selected_provider {
-                                "▶ "
+                            let visible_h = inner.height as usize;
+                            let scroll_offset = if selector.selected_provider >= visible_h {
+                                selector.selected_provider - visible_h + 1
                             } else {
-                                "  "
+                                0
                             };
-                            let style = if i == selector.selected_provider {
-                                Style::default()
-                                    .fg(Color::Cyan)
-                                    .add_modifier(Modifier::BOLD)
-                            } else {
-                                Style::default().fg(Color::White)
-                            };
-                            let status_badge = if entry.has_key {
-                                Span::styled(
-                                    " [Key: Configured]",
-                                    Style::default().fg(Color::Green),
-                                )
-                            } else {
-                                Span::styled(
-                                    " [Key: Prompt on select]",
-                                    Style::default().fg(Color::Yellow),
-                                )
-                            };
-                            lines.push(Line::from(vec![
-                                Span::styled(format!("{}{:<22}", marker, entry.label), style),
-                                status_badge,
-                            ]));
-                        }
-                        let list_para = Paragraph::new(Text::from(lines));
-                        f.render_widget(list_para, inner);
-                    }
-                    ModelSelectorStage::ApiKeyInput {
-                        provider_name,
-                        input,
-                        error,
-                    } => {
-                        let popup_h = 9u16.min(area.height.saturating_sub(4));
-                        let popup_w = 66u16.min(area.width.saturating_sub(4));
-                        let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
-                        let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 2;
-                        let popup_area = Rect::new(popup_x, popup_y, popup_w, popup_h);
 
-                        f.render_widget(Clear, popup_area);
-
-                        let inner_block = Block::default()
-                            .borders(Borders::ALL)
-                            .title(Span::styled(
-                                format!(" 2. Enter API Key for {provider_name} "),
-                                Theme::tool_call(),
-                            ))
-                            .border_style(Style::default().fg(Color::Yellow));
-                        let inner = inner_block.inner(popup_area);
-                        f.render_widget(inner_block, popup_area);
-
-                        let masked: String = if input.is_empty() {
-                            "<paste or type key here>".into()
-                        } else if input.len() <= 8 {
-                            "*".repeat(input.len())
-                        } else {
-                            format!(
-                                "{}...{}",
-                                &input[..3],
-                                &input[input.len().saturating_sub(4)..]
-                            )
-                        };
-
-                        let mut lines = vec![
-                            Line::from(Span::styled(
-                                format!(
-                                    "Key will be securely saved in OS Keychain ({}):",
-                                    crate::credentials::KEYRING_SERVICE
-                                ),
-                                Style::default().fg(Color::DarkGray),
-                            )),
-                            Line::from(""),
-                            Line::from(vec![
-                                Span::styled(
-                                    "Key: ",
+                            let mut lines: Vec<Line> = Vec::new();
+                            for (i, entry) in selector
+                                .providers
+                                .iter()
+                                .enumerate()
+                                .skip(scroll_offset)
+                                .take(visible_h)
+                            {
+                                let marker = if i == selector.selected_provider {
+                                    "▶ "
+                                } else {
+                                    "  "
+                                };
+                                let style = if i == selector.selected_provider {
                                     Style::default()
                                         .fg(Color::Cyan)
-                                        .add_modifier(Modifier::BOLD),
-                                ),
-                                Span::styled(masked, Style::default().fg(Color::White)),
-                            ]),
-                            Line::from(""),
-                        ];
-                        if let Some(err) = error {
-                            lines.push(Line::from(Span::styled(
-                                err.as_str(),
-                                Style::default().fg(Color::Red),
-                            )));
-                        } else {
-                            lines.push(Line::from(Span::styled(
-                                "[Enter: Save & Continue | Esc: Back]",
-                                Style::default().fg(Color::DarkGray),
-                            )));
+                                        .add_modifier(Modifier::BOLD)
+                                } else {
+                                    Style::default().fg(Color::White)
+                                };
+                                let status_badge = if entry.has_key {
+                                    Span::styled(
+                                        " [Key: Configured]",
+                                        Style::default().fg(Color::Green),
+                                    )
+                                } else {
+                                    Span::styled(
+                                        " [Key: Prompt on select]",
+                                        Style::default().fg(Color::Yellow),
+                                    )
+                                };
+                                lines.push(Line::from(vec![
+                                    Span::styled(format!("{}{:<22}", marker, entry.label), style),
+                                    status_badge,
+                                ]));
+                            }
+                            let list_para = Paragraph::new(Text::from(lines));
+                            f.render_widget(list_para, inner);
                         }
-                        let para = Paragraph::new(Text::from(lines));
-                        f.render_widget(para, inner);
-                    }
-                    ModelSelectorStage::ModelSelect {
-                        provider_name,
-                        models,
-                        selected_model,
-                    } => {
-                        let popup_h = (models.len() as u16 + 4).min(area.height.saturating_sub(4));
-                        let popup_w = 62u16.min(area.width.saturating_sub(4));
-                        let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
-                        let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 2;
-                        let popup_area = Rect::new(popup_x, popup_y, popup_w, popup_h);
+                        ModelSelectorStage::ApiKeyInput {
+                            provider_name,
+                            input,
+                            error,
+                        } => {
+                            let popup_h = 9u16.min(area.height.saturating_sub(4));
+                            let popup_w = 66u16.min(area.width.saturating_sub(4));
+                            let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
+                            let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 2;
+                            let popup_area = Rect::new(popup_x, popup_y, popup_w, popup_h);
 
-                        f.render_widget(Clear, popup_area);
+                            f.render_widget(Clear, popup_area);
 
-                        let inner_block = Block::default()
-                            .borders(Borders::ALL)
-                            .title(Span::styled(
-                                format!(" 3. Select Model for {provider_name} (↑↓ Enter Esc) "),
-                                Theme::tool_call(),
-                            ))
-                            .border_style(Style::default().fg(Color::Cyan));
-                        let inner = inner_block.inner(popup_area);
-                        f.render_widget(inner_block, popup_area);
+                            let inner_block = Block::default()
+                                .borders(Borders::ALL)
+                                .title(Span::styled(
+                                    format!(" 2. Enter API Key for {provider_name} "),
+                                    Theme::tool_call(),
+                                ))
+                                .border_style(Style::default().fg(Color::Yellow));
+                            let inner = inner_block.inner(popup_area);
+                            f.render_widget(inner_block, popup_area);
 
-                        let visible_h = inner.height as usize;
-                        let scroll_offset = if *selected_model >= visible_h {
-                            *selected_model - visible_h + 1
-                        } else {
-                            0
-                        };
-
-                        let mut lines: Vec<Line> = Vec::new();
-                        for (i, entry) in models
-                            .iter()
-                            .enumerate()
-                            .skip(scroll_offset)
-                            .take(visible_h)
-                        {
-                            let marker = if i == *selected_model { "▶ " } else { "  " };
-                            let style = if i == *selected_model {
-                                Style::default()
-                                    .fg(Color::Cyan)
-                                    .add_modifier(Modifier::BOLD)
+                            let masked: String = if input.is_empty() {
+                                "<paste or type key here>".into()
+                            } else if input.len() <= 8 {
+                                "*".repeat(input.len())
                             } else {
-                                Style::default().fg(Color::White)
+                                format!(
+                                    "{}...{}",
+                                    &input[..3],
+                                    &input[input.len().saturating_sub(4)..]
+                                )
                             };
-                            let line_text = format!("{}{}", marker, entry.label);
-                            lines.push(Line::from(Span::styled(line_text, style)));
+
+                            let mut lines = vec![
+                                Line::from(Span::styled(
+                                    format!(
+                                        "Key will be securely saved in OS Keychain ({}):",
+                                        crate::credentials::KEYRING_SERVICE
+                                    ),
+                                    Style::default().fg(Color::DarkGray),
+                                )),
+                                Line::from(""),
+                                Line::from(vec![
+                                    Span::styled(
+                                        "Key: ",
+                                        Style::default()
+                                            .fg(Color::Cyan)
+                                            .add_modifier(Modifier::BOLD),
+                                    ),
+                                    Span::styled(masked, Style::default().fg(Color::White)),
+                                ]),
+                                Line::from(""),
+                            ];
+                            if let Some(err) = error {
+                                lines.push(Line::from(Span::styled(
+                                    err.as_str(),
+                                    Style::default().fg(Color::Red),
+                                )));
+                            } else {
+                                lines.push(Line::from(Span::styled(
+                                    "[Enter: Save & Continue | Esc: Back]",
+                                    Style::default().fg(Color::DarkGray),
+                                )));
+                            }
+                            let para = Paragraph::new(Text::from(lines));
+                            f.render_widget(para, inner);
                         }
-                        let list_para = Paragraph::new(Text::from(lines));
-                        f.render_widget(list_para, inner);
+                        ModelSelectorStage::ModelSelect {
+                            provider_name,
+                            models,
+                            selected_model,
+                        } => {
+                            let popup_h =
+                                (models.len() as u16 + 4).min(area.height.saturating_sub(4));
+                            let popup_w = 62u16.min(area.width.saturating_sub(4));
+                            let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
+                            let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 2;
+                            let popup_area = Rect::new(popup_x, popup_y, popup_w, popup_h);
+
+                            f.render_widget(Clear, popup_area);
+
+                            let inner_block = Block::default()
+                                .borders(Borders::ALL)
+                                .title(Span::styled(
+                                    format!(" 3. Select Model for {provider_name} (↑↓ Enter Esc) "),
+                                    Theme::tool_call(),
+                                ))
+                                .border_style(Style::default().fg(Color::Cyan));
+                            let inner = inner_block.inner(popup_area);
+                            f.render_widget(inner_block, popup_area);
+
+                            let visible_h = inner.height as usize;
+                            let scroll_offset = if *selected_model >= visible_h {
+                                *selected_model - visible_h + 1
+                            } else {
+                                0
+                            };
+
+                            let mut lines: Vec<Line> = Vec::new();
+                            for (i, entry) in models
+                                .iter()
+                                .enumerate()
+                                .skip(scroll_offset)
+                                .take(visible_h)
+                            {
+                                let marker = if i == *selected_model { "▶ " } else { "  " };
+                                let style = if i == *selected_model {
+                                    Style::default()
+                                        .fg(Color::Cyan)
+                                        .add_modifier(Modifier::BOLD)
+                                } else {
+                                    Style::default().fg(Color::White)
+                                };
+                                let line_text = format!("{}{}", marker, entry.label);
+                                lines.push(Line::from(Span::styled(line_text, style)));
+                            }
+                            let list_para = Paragraph::new(Text::from(lines));
+                            f.render_widget(list_para, inner);
+                        }
                     }
                 }
             }
 
-            // Slash command hint popup (shown when input starts with "/" and no model selector).
-            if app.model_selector.is_none()
-                && app.input.starts_with('/')
-                && !app.input.contains(' ')
+            if let Some(popup) = &settings_popup {
+                super::settings::render(f, area, popup);
+            }
+
+            // Slash command hint. Arrow keys move the highlight; Enter runs it.
+            if app.model_selector.is_none() && settings_popup.is_none() && !slash_matches.is_empty()
             {
-                let prefix = app.input.to_ascii_lowercase();
-                let matching: Vec<(&str, &str)> = SLASH_COMMANDS
+                let popup_h = (slash_matches.len() as u16 + 2).min(16);
+                let popup_w = 52u16.min(area.width.saturating_sub(2)).max(2);
+                let popup_y = ch[5].y.saturating_sub(popup_h);
+                let popup_x = ch[5].x.saturating_add(1);
+                let Some(popup_area) = fitted_popup(area, popup_x, popup_y, popup_w, popup_h)
+                else {
+                    return;
+                };
+
+                f.render_widget(Clear, popup_area);
+                let hint_block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(Span::styled(" ↑↓ enter ", Theme::dim()))
+                    .border_style(Style::default().fg(Color::DarkGray));
+                let hint_inner = hint_block.inner(popup_area);
+                f.render_widget(hint_block, popup_area);
+
+                let visible = hint_inner.height as usize;
+                let selected = slash_selected.min(slash_matches.len() - 1);
+                let start = if visible == 0 || selected < visible {
+                    0
+                } else {
+                    selected + 1 - visible
+                };
+                let inner_w = hint_inner.width as usize;
+                let mut lines: Vec<Line> = Vec::new();
+                for (i, (cmd, desc)) in slash_matches
                     .iter()
-                    .filter(|(cmd, _)| cmd.starts_with(&prefix))
-                    .copied()
-                    .collect();
-                if !matching.is_empty() {
-                    let popup_h = (matching.len() as u16 + 2).min(16);
-                    let popup_w = 40u16.min(area.width.saturating_sub(4));
-                    // Position above the compose box
-                    let popup_y = ch[5].y.saturating_sub(popup_h);
-                    let popup_x = ch[5].x + 1;
-                    let popup_area = Rect::new(popup_x, popup_y, popup_w, popup_h);
-
-                    f.render_widget(Clear, popup_area);
-                    let hint_block = Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::DarkGray));
-                    let hint_inner = hint_block.inner(popup_area);
-                    f.render_widget(hint_block, popup_area);
-
-                    let mut lines: Vec<Line> = Vec::new();
-                    for (cmd, desc) in matching.iter().take(hint_inner.height as usize) {
-                        lines.push(Line::from(vec![
-                            Span::styled(format!("{cmd:<16}"), Style::default().fg(Color::Cyan)),
-                            Span::styled(*desc, Style::default().fg(Color::Gray)),
-                        ]));
-                    }
-                    f.render_widget(Paragraph::new(Text::from(lines)), hint_inner);
+                    .enumerate()
+                    .skip(start)
+                    .take(visible)
+                {
+                    let chosen = i == selected;
+                    let marker = if chosen { "▶ " } else { "  " };
+                    let row = format!("{marker}{cmd:<16}{desc}");
+                    let row = super::text_format::truncate_chars_display(&row, inner_w);
+                    let style = if chosen {
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    };
+                    lines.push(Line::from(Span::styled(row, style)));
                 }
+                f.render_widget(Paragraph::new(Text::from(lines)), hint_inner);
             }
 
             f.set_cursor_position((cx, cy));
@@ -2709,12 +2883,81 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 .min(max_conversations_list_scroll_holder.get());
         }
 
+        if let Some(request) = settings_popup
+            .as_mut()
+            .and_then(|popup| popup.take_pending_install())
+        {
+            let outcome = if let Some(registry) = skills.as_ref() {
+                rt.block_on(async {
+                    let installed = crate::channels::skill_settings::install_from_repo(
+                        registry,
+                        &request.repo,
+                        request.skill_name.as_deref(),
+                    )
+                    .await?;
+                    let listed =
+                        crate::channels::skill_settings::list_installed_skills(registry).await;
+                    Ok::<_, String>((installed, listed.skills))
+                })
+            } else {
+                Err("This session has no skill registry.".to_string())
+            };
+            if let Some(popup) = settings_popup.as_mut() {
+                match outcome {
+                    Ok((installed, listed)) => popup.note_skills(listed, &installed),
+                    Err(message) => popup.fail(message),
+                }
+            }
+            // Git may already have written over this screen. Paint the whole frame again.
+            terminal.clear()?;
+        }
+
         if !event::poll(tick)? {
             continue;
         }
 
         match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
+            Event::Key(key)
+                if key.kind == KeyEventKind::Press
+                    || matches!(key.code, KeyCode::Esc | KeyCode::Char('\u{1b}')) =>
+            {
+                let is_esc = matches!(key.code, KeyCode::Esc | KeyCode::Char('\u{1b}'));
+                if is_esc {
+                    if last_esc.elapsed() < Duration::from_millis(200) {
+                        continue;
+                    }
+                    last_esc = Instant::now();
+                    app.selecting = false;
+                    app.transcript_selection = None;
+                }
+                if settings_popup.is_some() {
+                    let mut close_settings = false;
+                    let mut left_skill_detail = false;
+                    if let Some(popup) = settings_popup.as_mut() {
+                        let was_detail = popup.showing_skill_detail();
+                        match popup.on_key(key.code) {
+                            super::settings::SettingsEffect::Close => close_settings = true,
+                            effect => apply_settings_effect(
+                                popup,
+                                effect,
+                                &mut app,
+                                &bus_tx,
+                                &mut providers,
+                                &workspace_dir,
+                                &config_path,
+                                &mut active_provider_key,
+                            ),
+                        }
+                        left_skill_detail = was_detail && !popup.showing_skill_detail();
+                    }
+                    if left_skill_detail {
+                        terminal.clear()?;
+                    }
+                    if close_settings {
+                        settings_popup = None;
+                    }
+                    continue;
+                }
                 // Model selector popup intercepts all keys when active.
                 if let Some(sel) = &mut app.model_selector {
                     match &mut sel.stage {
@@ -2995,6 +3238,22 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             }
                             continue;
                         }
+                        if !slash_matches.is_empty() {
+                            match slash_hint_action(&slash_matches, slash_selected) {
+                                SlashHintAction::Fill(text) => {
+                                    app.input = text;
+                                    app.cursor = app.input.len();
+                                    app.history_idx = None;
+                                    app.draft_input = None;
+                                    continue;
+                                }
+                                SlashHintAction::Run(cmd) => {
+                                    app.input = cmd;
+                                    app.cursor = app.input.len();
+                                }
+                                SlashHintAction::SubmitTyped => {}
+                            }
+                        }
                         let raw = app.take_input();
                         let text = raw.trim();
                         if text.is_empty() {
@@ -3245,6 +3504,41 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 }
                                 continue;
                             }
+                            if text.eq_ignore_ascii_case("/settings") {
+                                app.model_selector = None;
+                                let harness =
+                                    match crate::channels::harness_settings::read_harness_settings(
+                                        &config_path,
+                                    ) {
+                                        Ok(settings) => settings,
+                                        Err(error) => {
+                                            settings_popup = Some(super::settings::SettingsPopup::open(
+                                            &providers,
+                                            active_provider_key.as_deref(),
+                                            crate::channels::harness_settings::HarnessSettings::defaults(),
+                                            None,
+                                            Some(harness_settings_message(error)),
+                                        ));
+                                            continue;
+                                        }
+                                    };
+                                let installed = skills.as_ref().map(|registry| {
+                                    rt.block_on(
+                                        crate::channels::skill_settings::list_installed_skills(
+                                            registry,
+                                        ),
+                                    )
+                                    .skills
+                                });
+                                settings_popup = Some(super::settings::SettingsPopup::open(
+                                    &providers,
+                                    active_provider_key.as_deref(),
+                                    harness,
+                                    installed,
+                                    None,
+                                ));
+                                continue;
+                            }
                             if text.eq_ignore_ascii_case("/model")
                                 || text.eq_ignore_ascii_case("/models")
                                 || text.to_ascii_lowercase().starts_with("/model ")
@@ -3384,7 +3678,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             }
                             app.cells.push(Cell::System {
                             message:
-                                "Unknown command. Try /help, /exit, /new, /chats, /copy, /install-python, /cancel, /background, /retry, /tools, /exec, /agents, /model, /key, /compact, /context, /skills."
+                                "Unknown command. Try /help, /exit, /new, /chats, /copy, /install-python, /cancel, /background, /retry, /tools, /exec, /agents, /model, /settings, /key, /compact, /context, /skills."
                                     .into(),
                         });
                             continue;
@@ -3466,7 +3760,12 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 | TerminalUiFocus::Conversations
                                 | TerminalUiFocus::BackgroundJobs
                         ) {
-                            app.history_up();
+                            if slash_matches.is_empty() {
+                                app.history_up();
+                            } else {
+                                slash_selected =
+                                    slash_hint_move(slash_selected, slash_matches.len(), false);
+                            }
                         }
                     }
                     KeyCode::Down => {
@@ -3516,7 +3815,12 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 | TerminalUiFocus::Conversations
                                 | TerminalUiFocus::BackgroundJobs
                         ) {
-                            app.history_down();
+                            if slash_matches.is_empty() {
+                                app.history_down();
+                            } else {
+                                slash_selected =
+                                    slash_hint_move(slash_selected, slash_matches.len(), true);
+                            }
                         }
                     }
                     KeyCode::Esc => {
@@ -3735,6 +4039,14 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 }
             } // end Event::Key block
             Event::Mouse(me) => {
+                // A click on the settings box was also a transcript selection. The
+                // terminal then uses Esc to clear that selection, so the key never
+                // reaches this process.
+                if settings_popup.is_some() {
+                    app.selecting = false;
+                    app.transcript_selection = None;
+                    continue;
+                }
                 // ── Text selection: drag / release (fires regardless of position) ──
                 if app.selecting {
                     match me.kind {
@@ -3985,10 +4297,26 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 }
             }
             Event::Paste(ref s) => {
-                for c in s.chars() {
-                    // Filter out carriage returns to avoid issues, just keep newlines
-                    if c != '\r' {
-                        app.insert_char(c);
+                if settings_popup.is_some() {
+                    if let Some(popup) = settings_popup.as_mut() {
+                        let effect = popup.on_paste(s);
+                        apply_settings_effect(
+                            popup,
+                            effect,
+                            &mut app,
+                            &bus_tx,
+                            &mut providers,
+                            &workspace_dir,
+                            &config_path,
+                            &mut active_provider_key,
+                        );
+                    }
+                } else {
+                    for c in s.chars() {
+                        // Filter out carriage returns to avoid issues, just keep newlines
+                        if c != '\r' {
+                            app.insert_char(c);
+                        }
                     }
                 }
             }
@@ -4012,7 +4340,9 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 
 #[cfg(test)]
 mod width_fit_tests {
-    use super::{build_status_line, build_title_line, split_main_content, LayoutDensity};
+    use super::{
+        build_status_line, build_title_line, fitted_popup, split_main_content, LayoutDensity,
+    };
     use crate::channels::terminal_ui::app::App;
     use crate::channels::terminal_ui::display_width;
     use crate::channels::terminal_ui::text_format::truncate_chars_display;
@@ -4091,6 +4421,15 @@ mod width_fit_tests {
     }
 
     #[test]
+    fn slash_hint_stays_inside_a_short_terminal() {
+        let area = Rect::new(0, 0, 81, 13);
+        let hint = fitted_popup(area, 1, 0, 40, 16).expect("hint");
+        assert!(hint.y.saturating_add(hint.height) <= area.height);
+        assert!(hint.x.saturating_add(hint.width) <= area.width);
+        assert_eq!(hint.height, 13);
+    }
+
+    #[test]
     fn layout_density_breakpoints() {
         assert_eq!(LayoutDensity::from_cols(79), LayoutDensity::Narrow);
         assert_eq!(LayoutDensity::from_cols(80), LayoutDensity::Medium);
@@ -4109,6 +4448,48 @@ mod width_fit_tests {
             split_main_content(area, LayoutDensity::Medium, TerminalUiFocus::ToolHistory);
         assert!(none.is_none());
         assert_eq!(only, area);
+    }
+}
+
+#[cfg(test)]
+mod slash_hint_tests {
+    use super::{
+        slash_hint_action, slash_hint_matches, slash_hint_move, SlashHintAction, SLASH_COMMANDS,
+    };
+
+    #[test]
+    fn prefix_lists_only_matching_commands() {
+        let set = slash_hint_matches("/set");
+        assert_eq!(set, vec![("/settings", "Models, harness, and skills")]);
+        assert!(slash_hint_matches("hello").is_empty());
+        assert!(slash_hint_matches("/settings ").is_empty());
+        assert_eq!(slash_hint_matches("/").len(), SLASH_COMMANDS.len());
+    }
+
+    #[test]
+    fn arrows_stay_inside_the_list() {
+        assert_eq!(slash_hint_move(0, 3, false), 0);
+        assert_eq!(slash_hint_move(0, 3, true), 1);
+        assert_eq!(slash_hint_move(2, 3, true), 2);
+    }
+
+    #[test]
+    fn enter_runs_the_highlighted_command() {
+        let matches = slash_hint_matches("/s");
+        assert!(matches.len() > 1);
+        match slash_hint_action(&matches, 0) {
+            SlashHintAction::Run(cmd) => assert_eq!(cmd, "/settings"),
+            other => panic!("expected run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_on_key_fills_the_line_for_the_secret() {
+        let matches = slash_hint_matches("/key");
+        match slash_hint_action(&matches, 0) {
+            SlashHintAction::Fill(text) => assert_eq!(text, "/key "),
+            other => panic!("expected fill, got {other:?}"),
+        }
     }
 }
 

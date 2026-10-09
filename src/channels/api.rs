@@ -63,6 +63,12 @@ struct ApiState {
     workspace_sandbox: std::path::PathBuf,
     /// When `Some`, a `Authorization: Bearer <token>` is required on all `/v1` routes.
     auth_token: Option<std::sync::Arc<String>>,
+    /// Configured models for the settings screen. Empty when the host did not attach a catalog.
+    model_catalog: Option<std::sync::Arc<crate::channels::model_settings::ModelCatalog>>,
+    /// `config.toml` the settings screen reads and writes. `None` in tests that do not set one.
+    config_path: Option<std::path::PathBuf>,
+    /// Live skill registry shared with the agent. `None` in tests that do not install skills.
+    skills: Option<crate::skills::SharedSkillRegistry>,
 }
 
 enum PendingRequest {
@@ -341,6 +347,9 @@ pub struct ApiChannel {
     mte_cron_scheduler: Option<std::sync::Arc<MultiTenantEdgeCronScheduler>>,
     logger_tx: LoggerHandle,
     memory_node: NodeHandle<MemoryMessage>,
+    model_catalog: Option<std::sync::Arc<crate::channels::model_settings::ModelCatalog>>,
+    config_path: Option<std::path::PathBuf>,
+    skills: Option<crate::skills::SharedSkillRegistry>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     task_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -393,9 +402,30 @@ impl ApiChannel {
             mte_cron_scheduler: None,
             logger_tx,
             memory_node,
+            model_catalog: None,
+            config_path: None,
+            skills: None,
             shutdown_tx,
             task_handle: Mutex::new(None),
         })
+    }
+
+    pub fn with_model_catalog(
+        mut self,
+        catalog: crate::channels::model_settings::ModelCatalog,
+    ) -> Self {
+        self.model_catalog = Some(std::sync::Arc::new(catalog));
+        self
+    }
+
+    pub fn with_config_path(mut self, config_path: impl Into<std::path::PathBuf>) -> Self {
+        self.config_path = Some(config_path.into());
+        self
+    }
+
+    pub fn with_skills(mut self, skills: crate::skills::SharedSkillRegistry) -> Self {
+        self.skills = Some(skills);
+        self
     }
 
     pub fn with_multi_tenant_edge_cron_scheduler(
@@ -522,6 +552,9 @@ impl Channel for ApiChannel {
             memory_node: self.memory_node.clone(),
             workspace_sandbox: self.workspace_sandbox.clone(),
             auth_token: self.auth_token.clone(),
+            model_catalog: self.model_catalog.clone(),
+            config_path: self.config_path.clone(),
+            skills: self.skills.clone(),
         };
 
         let resolved_bind = self.resolved_bind_address();
@@ -779,6 +812,14 @@ fn build_router(state: ApiState, serve_ui: bool) -> Router {
             "/v1/clarification-tickets/{ticket_id}/dismiss",
             post(handle_clarification_ticket_dismiss),
         )
+        .route("/v1/settings/models", get(handle_list_models))
+        .route("/v1/settings/model", post(handle_select_model))
+        .route(
+            "/v1/settings/harness",
+            get(handle_get_harness).patch(handle_patch_harness),
+        )
+        .route("/v1/settings/skills", get(handle_list_skills))
+        .route("/v1/settings/skills/install", post(handle_install_skill))
         .route("/v1/workspace/list", get(handle_workspace_list))
         .route("/v1/workspace/file", get(handle_workspace_file))
         // POST on a distinct path so clients are not blocked by proxies or older builds that only registered GET on `/v1/workspace/file`.
@@ -878,6 +919,303 @@ async fn handle_ui_fallback(OriginalUri(uri): OriginalUri) -> Response {
     }
 
     handle_ui_index().await
+}
+
+#[derive(Deserialize)]
+struct SelectModelRequest {
+    key: String,
+    #[serde(default)]
+    api_key: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SelectModelResponse {
+    active_key: String,
+    provider_name: String,
+    model_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keychain_saved: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct HarnessSettingsResponse {
+    #[serde(flatten)]
+    settings: crate::channels::harness_settings::HarnessSettings,
+    restart_required: bool,
+}
+
+async fn handle_get_harness(State(state): State<ApiState>) -> Response {
+    let Some(path) = state.config_path.as_ref() else {
+        return Json(HarnessSettingsResponse {
+            settings: crate::channels::harness_settings::HarnessSettings::defaults(),
+            restart_required: false,
+        })
+        .into_response();
+    };
+    match crate::channels::harness_settings::read_harness_settings(path) {
+        Ok(settings) => Json(HarnessSettingsResponse {
+            settings,
+            restart_required: false,
+        })
+        .into_response(),
+        Err(error) => harness_settings_error(error).into_response(),
+    }
+}
+
+async fn handle_patch_harness(
+    State(state): State<ApiState>,
+    Json(patch): Json<crate::channels::harness_settings::HarnessSettings>,
+) -> Response {
+    let Some(path) = state.config_path.as_ref() else {
+        return ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "config_unavailable",
+            "This host has no config.toml path.",
+        )
+        .into_response();
+    };
+    match crate::channels::harness_settings::write_harness_settings(path, &patch) {
+        Ok(settings) => Json(HarnessSettingsResponse {
+            settings,
+            restart_required: true,
+        })
+        .into_response(),
+        Err(error) => harness_settings_error(error).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct InstallSkillRequest {
+    repo: String,
+    #[serde(default)]
+    skill_name: Option<String>,
+}
+
+#[derive(Serialize)]
+struct InstallSkillResponse {
+    installed: Vec<String>,
+    skills: Vec<crate::channels::skill_settings::InstalledSkill>,
+}
+
+async fn handle_list_skills(State(state): State<ApiState>) -> Response {
+    let Some(skills) = state.skills.as_ref() else {
+        return Json(crate::channels::skill_settings::SkillList { skills: Vec::new() })
+            .into_response();
+    };
+    Json(crate::channels::skill_settings::list_installed_skills(skills).await).into_response()
+}
+
+async fn handle_install_skill(
+    State(state): State<ApiState>,
+    Json(payload): Json<InstallSkillRequest>,
+) -> Response {
+    let Some(skills) = state.skills.as_ref() else {
+        return ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "skills_unavailable",
+            "This host has no skill registry.",
+        )
+        .into_response();
+    };
+    let repo = payload.repo.trim();
+    if repo.is_empty() || repo.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_repo",
+            "Give a GitHub owner/repo shorthand or a repository URL with no spaces.",
+        )
+        .into_response();
+    }
+    let skill_name = match payload
+        .skill_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        Some(name) if name.chars().any(|ch| ch.is_whitespace() || ch.is_control()) => {
+            return ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_skill_name",
+                "Skill name must be a single name with no spaces.",
+            )
+            .into_response();
+        }
+        Some(name) => Some(name.to_string()),
+        None => None,
+    };
+
+    let installed = match crate::channels::skill_settings::install_from_repo(
+        skills,
+        repo,
+        skill_name.as_deref(),
+    )
+    .await
+    {
+        Ok(installed) => installed,
+        Err(message) => {
+            log_api(
+                &state.logger_tx,
+                LogEvent::error(
+                    "ApiChannel",
+                    &format!("Failed to install skills from {repo}: {message}"),
+                ),
+            );
+            return ApiError::new(StatusCode::BAD_REQUEST, "skill_install_failed", message)
+                .into_response();
+        }
+    };
+    let listed = crate::channels::skill_settings::list_installed_skills(skills).await;
+    if installed.is_empty() {
+        log_api(
+            &state.logger_tx,
+            LogEvent::info("ApiChannel", "No skills found in the repository."),
+        );
+    } else {
+        log_api(
+            &state.logger_tx,
+            LogEvent::info(
+                "ApiChannel",
+                &format!("Successfully installed skills: {}", installed.join(", ")),
+            ),
+        );
+    }
+    Json(InstallSkillResponse {
+        installed,
+        skills: listed.skills,
+    })
+    .into_response()
+}
+
+fn harness_settings_error(
+    error: crate::channels::harness_settings::HarnessSettingsError,
+) -> ApiError {
+    use crate::channels::harness_settings::HarnessSettingsError;
+    match error {
+        HarnessSettingsError::InvalidShellMode => ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_shell_mode",
+            "shell_mode must be ask, deny, or allow.",
+        ),
+        HarnessSettingsError::Parse(message) => {
+            ApiError::new(StatusCode::BAD_REQUEST, "invalid_config", message)
+        }
+        HarnessSettingsError::Io(message) => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "config_write_failed",
+            message,
+        ),
+    }
+}
+
+async fn handle_list_models(State(state): State<ApiState>) -> Response {
+    let Some(catalog) = state.model_catalog.as_ref() else {
+        return Json(crate::channels::model_settings::ModelList {
+            active_key: None,
+            models: Vec::new(),
+        })
+        .into_response();
+    };
+    Json(crate::channels::model_settings::list_models(catalog)).into_response()
+}
+
+async fn handle_select_model(
+    State(state): State<ApiState>,
+    Json(payload): Json<SelectModelRequest>,
+) -> Response {
+    let Some(catalog) = state.model_catalog.as_ref() else {
+        return ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "models_unavailable",
+            "This host has no model catalog.",
+        )
+        .into_response();
+    };
+    let prepared = match crate::channels::model_settings::prepare_model_switch(
+        catalog,
+        &payload.key,
+        payload.api_key.as_deref(),
+    ) {
+        Ok(prepared) => prepared,
+        Err(crate::channels::model_settings::ModelSwitchError::UnknownModel) => {
+            return ApiError::new(
+                StatusCode::NOT_FOUND,
+                "unknown_model",
+                format!("No configured model with key '{}'.", payload.key.trim()),
+            )
+            .into_response();
+        }
+        Err(crate::channels::model_settings::ModelSwitchError::MissingApiKey { api_key_env }) => {
+            return ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "missing_api_key",
+                format!("No API key for this provider. Set ${api_key_env} or enter a key."),
+            )
+            .into_response();
+        }
+        Err(crate::channels::model_settings::ModelSwitchError::PlaceholderApiKey) => {
+            return ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_api_key",
+                "That value looks like a placeholder, not an API key.",
+            )
+            .into_response();
+        }
+        Err(crate::channels::model_settings::ModelSwitchError::UnresolvedBaseUrl(message)) => {
+            return ApiError::new(StatusCode::BAD_REQUEST, "invalid_provider", message)
+                .into_response();
+        }
+    };
+
+    let keychain_saved = if prepared.store_in_keychain {
+        Some(
+            crate::credentials::set_provider_key(&prepared.provider_name, &prepared.api_key)
+                .is_ok(),
+        )
+    } else {
+        None
+    };
+
+    if state
+        .bus_tx
+        .send(BusMessage::SwitchModel {
+            provider_name: prepared.provider_name.clone(),
+            model_name: prepared.model_name.clone(),
+            base_url: prepared.base_url.clone(),
+            api_key: prepared.api_key.clone(),
+        })
+        .await
+        .is_err()
+    {
+        return ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "bus_closed",
+            "The agent is no longer accepting model changes.",
+        )
+        .into_response();
+    }
+
+    catalog.set_active_key(prepared.key.clone());
+    catalog.note_provider_key(&prepared.provider_name);
+    if let Err(error) = crate::channels::model_settings::persist_active_model_key(
+        &catalog.workspace_dir,
+        &prepared.key,
+    ) {
+        log_api(
+            &state.logger_tx,
+            LogEvent::warn(
+                "ApiChannel",
+                &format!("Model switch applied but was not remembered: {error}"),
+            ),
+        );
+    }
+
+    Json(SelectModelResponse {
+        active_key: prepared.key,
+        provider_name: prepared.provider_name,
+        model_name: prepared.model_name,
+        keychain_saved,
+    })
+    .into_response()
 }
 
 async fn handle_chat(State(state): State<ApiState>, Json(payload): Json<ChatRequest>) -> Response {
@@ -2848,6 +3186,9 @@ mod tests {
             memory_node,
             workspace_sandbox,
             auth_token: None,
+            model_catalog: None,
+            config_path: None,
+            skills: None,
         }
     }
 
@@ -3185,6 +3526,9 @@ bind_address = "127.0.0.1"
             memory_node,
             workspace_sandbox,
             auth_token: None,
+            model_catalog: None,
+            config_path: None,
+            skills: None,
         };
         let app = build_router(state, true);
 
@@ -3509,5 +3853,200 @@ bind_address = "127.0.0.1"
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(store.find_job("job-1").expect("job lookup").is_some());
+    }
+
+    #[tokio::test]
+    async fn settings_model_switch_hides_the_api_key() {
+        let temp = LocalTempDir::new();
+        let (bus_tx, mut bus_rx) = mpsc::channel(4);
+        let mut state = build_state(&temp.db_path(), bus_tx, None);
+        let mut providers = HashMap::new();
+        providers.insert(
+            "proxy-model".to_string(),
+            crate::config::ProviderConfig {
+                provider_name: "openai_compatible".to_string(),
+                model_name: "proxy-model".to_string(),
+                models: None,
+                api_key_env: "ISANAGENT_SETTINGS_ROUTE_TEST_KEY".to_string(),
+                api_key: None,
+                base_url: Some("https://proxy.example/v1/chat/completions".to_string()),
+            },
+        );
+        state.model_catalog = Some(Arc::new(
+            crate::channels::model_settings::ModelCatalog::new(temp.path.clone(), providers, None),
+        ));
+        let app = build_router(state, false);
+
+        let listed = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/settings/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("list models");
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed_body = to_bytes(listed.into_body(), usize::MAX)
+            .await
+            .expect("list body");
+        let listed_json: Value = serde_json::from_slice(&listed_body).expect("list json");
+        assert!(listed_json["active_key"].is_null());
+        assert_eq!(listed_json["models"][0]["key"], "proxy-model");
+        assert!(listed_json["models"][0].get("api_key").is_none());
+        assert_eq!(listed_json["models"][0]["has_api_key"], false);
+
+        let secret = "super-secret-test-key";
+        let switched = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/settings/model")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"key":"proxy-model","api_key":"{secret}"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .expect("select model");
+        assert_eq!(switched.status(), StatusCode::OK);
+        let switched_body = to_bytes(switched.into_body(), usize::MAX)
+            .await
+            .expect("switch body");
+        let switched_text = String::from_utf8(switched_body.to_vec()).expect("utf8");
+        assert!(!switched_text.contains(secret));
+        let switched_json: Value = serde_json::from_str(&switched_text).expect("switch json");
+        assert_eq!(switched_json["active_key"], "proxy-model");
+        assert_eq!(switched_json["model_name"], "proxy-model");
+        assert!(switched_json.get("api_key").is_none());
+
+        let BusMessage::SwitchModel {
+            provider_name,
+            model_name,
+            api_key,
+            ..
+        } = bus_rx.recv().await.expect("switch message")
+        else {
+            panic!("expected SwitchModel");
+        };
+        assert_eq!(provider_name, "openai_compatible");
+        assert_eq!(model_name, "proxy-model");
+        assert_eq!(api_key, secret);
+        let remembered = std::fs::read_to_string(temp.path.join(".system_generated/last_model"))
+            .expect("last model file");
+        assert_eq!(remembered, "proxy-model");
+        let _ = crate::credentials::delete_provider_key("openai_compatible");
+    }
+
+    #[tokio::test]
+    async fn settings_skill_install_updates_the_live_registry() {
+        let temp = LocalTempDir::new();
+        let skills_dir = temp.path.join("skills");
+        write_skill(&skills_dir, "alpha", "ALPHA_BODY_SHOULD_NOT_LEAK");
+
+        let repo = temp.path.join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        write_skill(&repo, "beta", "BETA_BODY_SHOULD_NOT_LEAK");
+        git(&repo, &["init"]);
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "add beta"]);
+
+        let (bus_tx, _bus_rx) = mpsc::channel(4);
+        let mut state = build_state(&temp.db_path(), bus_tx, None);
+        state.skills = Some(Arc::new(tokio::sync::RwLock::new(
+            crate::skills::SkillRegistry::new(skills_dir.clone()),
+        )));
+        let app = build_router(state, false);
+
+        let listed = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/settings/skills")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("list skills");
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed_body = to_bytes(listed.into_body(), usize::MAX)
+            .await
+            .expect("list body");
+        let listed_text = String::from_utf8(listed_body.to_vec()).expect("utf8");
+        assert!(!listed_text.contains("SHOULD_NOT_LEAK"));
+        assert!(!listed_text.contains("instructions"));
+        let listed_json: Value = serde_json::from_str(&listed_text).expect("list json");
+        assert_eq!(listed_json["skills"][0]["name"], "alpha");
+        assert_eq!(listed_json["skills"][0]["available"], true);
+
+        let rejected = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/settings/skills/install")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"repo":"  "}"#))
+                    .unwrap(),
+            )
+            .await
+            .expect("reject empty repo");
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+        let repo_url = format!("file://{}", repo.display());
+        let installed = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/settings/skills/install")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"repo":"{repo_url}","skill_name":"beta"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .expect("install skill");
+        assert_eq!(installed.status(), StatusCode::OK);
+        let installed_body = to_bytes(installed.into_body(), usize::MAX)
+            .await
+            .expect("install body");
+        let installed_text = String::from_utf8(installed_body.to_vec()).expect("utf8");
+        assert!(!installed_text.contains("SHOULD_NOT_LEAK"));
+        let installed_json: Value = serde_json::from_str(&installed_text).expect("install json");
+        assert_eq!(installed_json["installed"][0], "beta");
+        let names: Vec<&str> = installed_json["skills"]
+            .as_array()
+            .expect("skills")
+            .iter()
+            .map(|skill| skill["name"].as_str().expect("name"))
+            .collect();
+        assert_eq!(names, vec!["alpha", "beta"]);
+        assert!(skills_dir.join("beta").join("SKILL.md").is_file());
+    }
+
+    fn write_skill(dir: &std::path::Path, name: &str, body: &str) {
+        let skill_dir = dir.join(name);
+        std::fs::create_dir_all(&skill_dir).expect("skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {name} description\n---\n\n{body}\n"),
+        )
+        .expect("skill file");
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "isanagent")
+            .env("GIT_AUTHOR_EMAIL", "isanagent@example.com")
+            .env("GIT_COMMITTER_NAME", "isanagent")
+            .env("GIT_COMMITTER_EMAIL", "isanagent@example.com")
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
     }
 }
