@@ -8,6 +8,7 @@ import {
   type MouseEvent,
 } from "react";
 
+import { SettingsDialog } from "@/components/SettingsDialog";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
@@ -652,6 +653,8 @@ export default function App() {
   const [showSummaries, setShowSummaries] = useState(false);
   const [showWorkspaceModal, setShowWorkspaceModal] = useState(false);
   const [showBackgroundPanel, setShowBackgroundPanel] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [activeModelLabel, setActiveModelLabel] = useState<string | null>(null);
   const [workspacePaneNonce, setWorkspacePaneNonce] = useState(0);
 
   // Custom dialog state to replace window.confirm/prompt
@@ -899,6 +902,31 @@ export default function App() {
   useEffect(() => {
     void loadSessions();
   }, [loadSessions]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const response = await fetch("/v1/settings/models");
+        if (!response.ok) {
+          return;
+        }
+        const body = (await response.json()) as {
+          active_key: string | null;
+          models: Array<{ key: string; model_name: string }>;
+        };
+        const active = body.models.find((model) => model.key === body.active_key);
+        if (!cancelled && active) {
+          setActiveModelLabel(active.model_name);
+        }
+      } catch {
+        /* settings label is optional */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // loadBackgroundData is now defined above
 
@@ -1237,6 +1265,12 @@ export default function App() {
           </div>
         </div>
       ) : null}
+      {showSettings ? (
+        <SettingsDialog
+          onClose={() => setShowSettings(false)}
+          onActiveModel={setActiveModelLabel}
+        />
+      ) : null}
       {showBackgroundPanel ? (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
@@ -1476,8 +1510,21 @@ export default function App() {
             <p className="text-sm font-semibold tracking-[-0.02em] text-foreground">isanagent</p>
             <ThemeToggle />
           </div>
+          {activeModelLabel ? (
+            <p className="mt-1 truncate text-xs text-muted-foreground" title={activeModelLabel}>
+              {activeModelLabel}
+            </p>
+          ) : null}
           <Button className="mt-2 w-full" size="sm" onClick={startNewConversation}>
             New chat
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="mt-2 w-full"
+            onClick={() => setShowSettings(true)}
+          >
+            Settings
           </Button>
           <Button
             variant="outline"

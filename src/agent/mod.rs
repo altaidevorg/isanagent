@@ -363,6 +363,11 @@ impl AgentLogic {
         self
     }
 
+    /// The registry this agent hot-loads. Settings installs into this same map.
+    pub(crate) fn shared_skills(&self) -> SharedSkillRegistry {
+        self.skills.clone()
+    }
+
     fn reasoning_spawn_args(&self) -> ReasoningSpawnArgs {
         ReasoningSpawnArgs {
             name: self.name.clone(),

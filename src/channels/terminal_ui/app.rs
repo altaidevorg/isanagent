@@ -59,10 +59,14 @@ pub struct ModelSelector {
 pub fn default_models_for_provider(provider_name: &str) -> Vec<String> {
     match provider_name.to_lowercase().as_str() {
         "gemini" => vec![
+            "gemini-3.8-flash".into(),
+            "gemini-3.1-pro-preview".into(),
+            "gemini-3.7-flash".into(),
+            "gemini-3.5-flash".into(),
+            "gemini-3.5-flash-lite".into(),
+            "gemini-3.1-flash-lite".into(),
             "gemini-2.5-flash".into(),
             "gemini-2.5-pro".into(),
-            "gemini-3.1-pro".into(),
-            "gemini-3.1-flash-lite".into(),
         ],
         "openai" => vec![
             "gpt-5.5".into(),

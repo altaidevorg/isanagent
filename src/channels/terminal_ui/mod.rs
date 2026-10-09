@@ -11,6 +11,7 @@ mod history_cells;
 mod markdown;
 pub mod panes;
 mod run;
+mod settings;
 mod syntect_highlight;
 mod text_format;
 mod theme;
