@@ -277,7 +277,6 @@ pub struct GeminiProvider {
     model: String,
     base_url: String,
     temperature: f32,
-    client: reqwest::Client,
 }
 
 impl GeminiProvider {
@@ -293,7 +292,6 @@ impl GeminiProvider {
             model: clean_model.to_string(),
             base_url: format!("{origin}/v1beta/models/{clean_model}:generateContent"),
             temperature: 0.3,
-            client: build_reqwest_client(),
         }
     }
 
@@ -462,12 +460,14 @@ impl Provider for GeminiProvider {
             }
         }
 
-        let res = self
-            .client
+        // A new client each call. The shared pool kept a stalled connection, and
+        // the next chat — including New chat — waited on it until the process restarted.
+        let client = build_reqwest_client();
+        let res = client
             .post(&self.base_url)
             .header("x-goog-api-key", &self.api_key)
             .header("Content-Type", "application/json")
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_secs(45))
             .json(&body)
             .send()
             .await?;
@@ -555,7 +555,6 @@ pub struct AnthropicProvider {
     base_url: String,
     temperature: f32,
     max_tokens: u32,
-    client: reqwest::Client,
 }
 
 impl AnthropicProvider {
@@ -572,7 +571,6 @@ impl AnthropicProvider {
             base_url: base_url.to_string(),
             temperature: 0.3,
             max_tokens,
-            client: build_reqwest_client(),
         }
     }
 
@@ -856,8 +854,8 @@ impl Provider for AnthropicProvider {
             }
         }
 
-        let res = self
-            .client
+        let client = build_reqwest_client();
+        let res = client
             .post(&self.base_url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
@@ -1034,11 +1032,16 @@ mod is_error_tests {
     fn is_error_is_never_serialized_to_openai_wire() {
         // The OpenAI-compatible request serializes ChatMessage directly; `is_error` must NOT
         // appear (strict endpoints reject unknown message fields).
-        let msg = ChatMessage::tool_with_error("Error: boom", "call_1", Some("exec"), true);
+        let msg = ChatMessage::tool_with_error("Error: boom", "call_1", Some("exec"), true)
+            .with_mcp_app("view-1".to_string(), "ui://app/dashboard".to_string());
         let v = serde_json::to_value(&msg).expect("serialize");
         assert!(
             v.get("is_error").is_none(),
             "is_error leaked onto the OpenAI-compatible wire: {v}"
+        );
+        assert!(
+            v.get("mcp_app").is_none(),
+            "mcp_app leaked onto the OpenAI-compatible wire: {v}"
         );
         // Also assert against the real request-body shape (LLMClient::chat serializes
         // `{"messages": [...]}` directly), not just the bare struct.

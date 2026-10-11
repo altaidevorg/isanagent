@@ -80,6 +80,7 @@ export function SettingsDialog({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [pendingKey, setPendingKey] = useState<string | null>(null);
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [keyDrafts, setKeyDrafts] = useState<Record<string, string>>({});
   const [notice, setNotice] = useState<string | null>(null);
   const [harness, setHarness] = useState<HarnessSettings | null>(null);
@@ -109,6 +110,7 @@ export function SettingsDialog({
         const body = (await response.json()) as ModelList;
         if (!cancelled) {
           setModels(body);
+          setSelectedKey(body.active_key);
         }
       } catch (err) {
         if (!cancelled) {
@@ -201,6 +203,15 @@ export function SettingsDialog({
     return [...byProvider.entries()];
   }, [models]);
 
+  const selectedModel = models?.models.find((entry) => entry.key === selectedKey) ?? null;
+  const selectedKeyDraft = selectedModel
+    ? (keyDrafts[selectedModel.provider_name]?.trim() ?? "")
+    : "";
+  const modelDirty = Boolean(
+    selectedModel &&
+      (selectedModel.key !== models?.active_key || selectedKeyDraft.length > 0),
+  );
+
   const selectModel = async (model: ModelEntry) => {
     setError(null);
     setNotice(null);
@@ -234,15 +245,7 @@ export function SettingsDialog({
       );
       setKeyDrafts((current) => ({ ...current, [model.provider_name]: "" }));
       onActiveModel(body.model_name);
-      if (body.keychain_saved === false) {
-        setNotice("Model switched for this session. The key could not be saved to the OS keychain.");
-      } else if (draft) {
-        setNotice(
-          `Using ${body.model_name}. This key covers every ${body.provider_name} model.`,
-        );
-      } else {
-        setNotice(`Using ${body.model_name}. Later messages in this session use it.`);
-      }
+      onClose();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not switch model");
     } finally {
@@ -270,9 +273,24 @@ export function SettingsDialog({
             </h2>
             <p className="mt-1 text-sm text-muted-foreground">{settingsSubtitle(tab)}</p>
           </div>
-          <Button variant="ghost" size="sm" onClick={onClose}>
-            Close
-          </Button>
+          <div className="flex items-center gap-2">
+            {tab === "models" ? (
+              <Button
+                size="sm"
+                disabled={!modelDirty || pendingKey !== null}
+                onClick={() => {
+                  if (selectedModel) {
+                    void selectModel(selectedModel);
+                  }
+                }}
+              >
+                {pendingKey ? "Saving…" : "Save"}
+              </Button>
+            ) : null}
+            <Button variant="ghost" size="sm" onClick={onClose}>
+              Close
+            </Button>
+          </div>
         </div>
         <div className="flex gap-2 border-b border-border px-5 py-3">
           <SettingsTabButton active={tab === "models"} onClick={() => setTab("models")}>
@@ -293,10 +311,11 @@ export function SettingsDialog({
               notice={notice}
               groups={groups}
               activeKey={models?.active_key ?? null}
+              selectedKey={selectedKey}
               pendingKey={pendingKey}
               keyDrafts={keyDrafts}
               onDraft={(key, value) => setKeyDrafts((current) => ({ ...current, [key]: value }))}
-              onSelect={(model) => void selectModel(model)}
+              onSelect={(model) => setSelectedKey(model.key)}
             />
           ) : null}
           {tab === "harness" ? (
@@ -403,7 +422,7 @@ function settingsSubtitle(tab: SettingsTab): string {
   if (tab === "skills") {
     return "Installed skills are available on the next message. Add a GitHub repo or owner/repo shorthand.";
   }
-  return "One API key covers every model from that provider. Active is the model the next message uses.";
+  return "One API key covers every model from that provider. Choose a model, then Save. Active is what the next message uses.";
 }
 
 function harnessFromResponse(body: HarnessResponse): HarnessSettings {
@@ -453,6 +472,7 @@ function ModelsPane({
   notice,
   groups,
   activeKey,
+  selectedKey,
   pendingKey,
   keyDrafts,
   onDraft,
@@ -463,6 +483,7 @@ function ModelsPane({
   notice: string | null;
   groups: Array<[string, ModelEntry[]]>;
   activeKey: string | null;
+  selectedKey: string | null;
   pendingKey: string | null;
   keyDrafts: Record<string, string>;
   onDraft: (key: string, value: string) => void;
@@ -513,6 +534,14 @@ function ModelsPane({
               <ul className="space-y-2">
                 {providerModels.map((model) => {
                   const active = model.key === activeKey;
+                  const selected = model.key === selectedKey;
+                  const label = pendingKey === model.key
+                    ? "Saving…"
+                    : selected && !active
+                      ? "Selected"
+                      : active
+                        ? "Active"
+                        : "Use";
                   return (
                     <li key={model.key} className="rounded-lg border border-border px-3 py-3">
                       <div className="flex items-center justify-between gap-3">
@@ -522,11 +551,11 @@ function ModelsPane({
                         <Button
                           type="button"
                           size="sm"
-                          variant={active ? "secondary" : "outline"}
+                          variant={selected ? "secondary" : "outline"}
                           disabled={pendingKey !== null || (!ready && !draft)}
                           onClick={() => onSelect(model)}
                         >
-                          {pendingKey === model.key ? "Switching…" : active && ready ? "Active" : "Use"}
+                          {label}
                         </Button>
                       </div>
                     </li>

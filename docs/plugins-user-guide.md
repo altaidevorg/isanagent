@@ -158,6 +158,8 @@ Declare MCP servers at the plugin root in `mcp.json`:
 }
 ```
 
+If a tool sets `_meta.ui.resourceUri` to a `ui://` HTML resource (`text/html;profile=mcp-app`), the embedded web UI renders that resource in a sandboxed iframe after the tool runs. The model still receives only the tool's text result. The iframe can call tools on the same server and can send a follow-up chat message. Tools whose `_meta.ui.visibility` does not include `model` are hidden from the LLM and remain callable from the widget.
+
 ---
 
 ## 6. Hierarchical Discovery

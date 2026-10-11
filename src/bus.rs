@@ -116,6 +116,15 @@ pub enum ReflectionKind {
     LongTerm,
 }
 
+/// Pointer to an MCP App view held by [`crate::tools::mcp::McpAppBridge`].
+///
+/// The HTML stays in the bridge. Telemetry and the model only see this id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpAppRef {
+    pub view_id: String,
+    pub resource_uri: String,
+}
+
 /// Specific telemetry events for deep Agent observability.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -190,6 +199,10 @@ pub enum TelemetryEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_call_id: Option<String>,
         background_job_id: Option<String>,
+        /// Set when the tool declared an MCP App UI resource. The web UI loads
+        /// the HTML from the bridge; this field is only the view id.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mcp_app: Option<McpAppRef>,
     },
     /// Mid–tool-call status (e.g. uv-managed Python env setup); not a tool result.
     ToolProgress {

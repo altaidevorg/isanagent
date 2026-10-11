@@ -158,6 +158,14 @@ pub fn tool_output_looks_like_failure(text: &str) -> bool {
 
 // --- Data Structures ---
 
+/// Pointer saved with a tool row so the web UI can reopen an MCP App panel.
+/// The HTML stays in the in-memory bridge and is never written on this row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedMcpApp {
+    pub view_id: String,
+    pub resource_uri: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
@@ -186,6 +194,10 @@ pub struct ChatMessage {
     /// model gets a structured failure signal. `default` so older persisted messages deserialize.
     #[serde(default, skip_serializing)]
     pub is_error: Option<bool>,
+    /// Set on `role == "tool"` when the tool opened an MCP App. Skipped on the
+    /// provider wire, same as [`ChatMessage::is_error`].
+    #[serde(default, skip_serializing)]
+    pub mcp_app: Option<PersistedMcpApp>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,6 +253,7 @@ impl ChatMessage {
             tool_call_id: None,
             reasoning_content: None,
             is_error: None,
+            mcp_app: None,
         }
     }
 
@@ -262,6 +275,7 @@ impl ChatMessage {
             tool_call_id: None,
             reasoning_content: None,
             is_error: None,
+            mcp_app: None,
         }
     }
 
@@ -274,6 +288,7 @@ impl ChatMessage {
             tool_call_id: None,
             reasoning_content: None,
             is_error: None,
+            mcp_app: None,
         }
     }
 
@@ -286,6 +301,7 @@ impl ChatMessage {
             tool_call_id: None,
             reasoning_content: None,
             is_error: None,
+            mcp_app: None,
         }
     }
 
@@ -298,6 +314,7 @@ impl ChatMessage {
             tool_call_id: Some(tool_call_id.to_string()),
             reasoning_content: None,
             is_error: None,
+            mcp_app: None,
         }
     }
 
@@ -314,6 +331,15 @@ impl ChatMessage {
             is_error: Some(is_error),
             ..Self::tool(content, tool_call_id, name)
         }
+    }
+
+    /// Remember which MCP App panel this tool row opened. The HTML is not stored.
+    pub fn with_mcp_app(mut self, view_id: String, resource_uri: String) -> Self {
+        self.mcp_app = Some(PersistedMcpApp {
+            view_id,
+            resource_uri,
+        });
+        self
     }
 }
 
@@ -503,12 +529,17 @@ pub struct LLMClient {
     model: String,
     temperature: f32,
     timeout: Duration,
-    client: reqwest::Client,
 }
 
 pub fn build_reqwest_client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
+        // A stalled HTTP/2 connection stays in the pool and the next chat waits
+        // on it until the process restarts. HTTP/1.1 keeps each request on its
+        // own connection, so a new conversation is not stuck behind the last one.
+        .http1_only()
+        .connect_timeout(Duration::from_secs(10))
+        .pool_idle_timeout(Duration::from_secs(30))
         .build()
         .expect("failed to build reqwest client")
 }
@@ -529,7 +560,6 @@ impl LLMClient {
             model: model.to_string(),
             temperature: 0.7,
             timeout: Duration::from_secs(600),
-            client: build_reqwest_client(),
         }
     }
 
@@ -591,8 +621,8 @@ impl LLMClient {
         // Let's stick to the convention in the example: The URL passed IS the endpoint.
         let url = &self.base_url;
 
-        let res = self
-            .client
+        let client = build_reqwest_client();
+        let res = client
             .post(url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")

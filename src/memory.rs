@@ -5,7 +5,9 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-use crate::utils::{ChatMessage, ContentPart, MessageContent, RUNTIME_CONTEXT_END_SUFFIX};
+use crate::utils::{
+    ChatMessage, ContentPart, MessageContent, PersistedMcpApp, RUNTIME_CONTEXT_END_SUFFIX,
+};
 use crate::{ActorError, ActorLogic};
 use std::collections::HashMap;
 use std::fmt;
@@ -44,6 +46,10 @@ impl<T> SharedReply<T> {
 }
 
 /// Stored `messages.content`: JSON array of [`ContentPart`] or legacy plain text.
+fn persisted_mcp_app_from_stored(raw: Option<String>) -> Option<PersistedMcpApp> {
+    raw.and_then(|value| serde_json::from_str(&value).ok())
+}
+
 fn message_content_from_stored(s: String) -> MessageContent {
     if s.trim_start().starts_with('[') {
         match serde_json::from_str::<Vec<ContentPart>>(&s) {
@@ -860,6 +866,7 @@ impl SqliteMemoryActor {
             &conn,
             "ALTER TABLE messages ADD COLUMN reasoning_content TEXT",
         )?;
+        add_column_if_missing(&conn, "ALTER TABLE messages ADD COLUMN mcp_app TEXT")?;
 
         // Create the session_summaries table for reflections
         conn.execute(
@@ -1004,9 +1011,13 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 let tool_calls_str = message
                     .tool_calls
                     .map(|tc| serde_json::to_string(&tc).unwrap_or_default());
+                let mcp_app_str = message
+                    .mcp_app
+                    .as_ref()
+                    .and_then(|app| serde_json::to_string(app).ok());
                 let res = self.conn.execute(
-                    "INSERT INTO messages (thread_id, role, content, name, tool_calls, tool_call_id, reasoning_content) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![thread_id, message.role, content_str, message.name, tool_calls_str, message.tool_call_id, message.reasoning_content],
+                    "INSERT INTO messages (thread_id, role, content, name, tool_calls, tool_call_id, reasoning_content, mcp_app) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![thread_id, message.role, content_str, message.name, tool_calls_str, message.tool_call_id, message.reasoning_content, mcp_app_str],
                 ).map_err(|e| e.to_string()).map(|_| ());
 
                 let _ = reply.send(res);
@@ -1014,7 +1025,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
             MemoryMessage::GetContext { thread_id, reply } => {
                 let res = (|| -> Result<Vec<ChatMessage>, String> {
                     let mut stmt = self.conn.prepare(
-                        "SELECT role, content, name, tool_calls, tool_call_id, reasoning_content FROM messages WHERE thread_id = ?1 ORDER BY id ASC"
+                        "SELECT role, content, name, tool_calls, tool_call_id, reasoning_content, mcp_app FROM messages WHERE thread_id = ?1 ORDER BY id ASC"
                     ).map_err(|e| e.to_string())?;
 
                     let message_iter = stmt
@@ -1024,6 +1035,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                                 tool_calls_str.and_then(|s| serde_json::from_str(&s).ok());
                             let content_raw: Option<String> = row.get(1)?;
                             let content = content_raw.map(message_content_from_stored);
+                            let mcp_app_raw: Option<String> = row.get(6)?;
                             Ok(ChatMessage {
                                 role: row.get(0)?,
                                 content,
@@ -1034,6 +1046,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                                 // Not persisted (skip_serializing internal field); a reloaded
                                 // message keeps only the "Error:" text already in `content`.
                                 is_error: None,
+                                mcp_app: persisted_mcp_app_from_stored(mcp_app_raw),
                             })
                         })
                         .map_err(|e| e.to_string())?;
@@ -1597,7 +1610,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                     ).unwrap_or(None);
 
                     let mut msg_stmt = self.conn.prepare(
-                        "SELECT id, role, content, name, tool_calls, tool_call_id, reasoning_content FROM messages WHERE thread_id = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id ASC"
+                        "SELECT id, role, content, name, tool_calls, tool_call_id, reasoning_content, mcp_app FROM messages WHERE thread_id = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id ASC"
                     ).map_err(|e| e.to_string())?;
 
                     let messages_iter = msg_stmt
@@ -1612,6 +1625,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                                 tool_calls_str.and_then(|s| serde_json::from_str(&s).ok());
                             let tool_call_id: Option<String> = row.get(5)?;
                             let reasoning_content: Option<String> = row.get(6)?;
+                            let mcp_app_raw: Option<String> = row.get(7)?;
                             Ok((
                                 id,
                                 ChatMessage {
@@ -1622,6 +1636,7 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                                     tool_call_id,
                                     reasoning_content,
                                     is_error: None,
+                                    mcp_app: persisted_mcp_app_from_stored(mcp_app_raw),
                                 },
                             ))
                         })
@@ -2879,6 +2894,28 @@ mod root_thread_id_tests {
     }
 
     #[tokio::test]
+    async fn mcp_app_pointer_round_trips_on_the_tool_row() {
+        let actor = SqliteMemoryActor::new(":memory:").expect("memory actor");
+        let node = NodeHandle::new(actor, 16, 1, Duration::from_millis(1));
+        let manager = SessionManager::new(node);
+        let mut session = manager
+            .get_session("api:mcp-app-thread:")
+            .await
+            .expect("session");
+        session
+            .add_message(
+                crate::utils::ChatMessage::tool("opened", "call_1", Some("open_dashboard"))
+                    .with_mcp_app("view-9".to_string(), "ui://app/dashboard".to_string()),
+            )
+            .await
+            .expect("add");
+        let ctx = session.get_context().await.expect("context");
+        let app = ctx[0].mcp_app.as_ref().expect("pointer stored");
+        assert_eq!(app.view_id, "view-9");
+        assert_eq!(app.resource_uri, "ui://app/dashboard");
+    }
+
+    #[tokio::test]
     async fn truncate_prunes_dropped_tool_cache_and_stale_metadata() {
         let actor = SqliteMemoryActor::new(":memory:").expect("memory actor");
         let node = NodeHandle::new(actor, 16, 1, Duration::from_millis(1));
@@ -2904,6 +2941,7 @@ mod root_thread_id_tests {
                 tool_call_id: Some("call_1".to_string()),
                 reasoning_content: None,
                 is_error: None,
+                mcp_app: None,
             })
             .await
             .expect("add tool");
