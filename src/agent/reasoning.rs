@@ -1742,6 +1742,7 @@ impl AgentLogic {
                     tool_call_id: None,
                     reasoning_content: response.reasoning_content.clone(),
                     is_error: None,
+                    mcp_app: None,
                 };
                 mem.add_message(assistant_msg)
                     .await
@@ -1864,6 +1865,7 @@ impl AgentLogic {
                         // Status is authoritative at the executor boundary. Legacy string
                         // classification is isolated inside ToolRegistry and never runs here.
                         let is_error = tool_result.is_error();
+                        let mcp_app = tool_result.mcp_app.clone();
                         let tool_name = tc.function.name.clone();
                         let intent = tool_intent_signature(&tool_name, &tc.function.arguments);
                         let budget_decision = if is_error {
@@ -1893,17 +1895,23 @@ impl AgentLogic {
                             is_error,
                             tool_call_id: Some(tc.id.clone()),
                             background_job_id: crate::bus::get_background_job_id(&inbound.metadata),
+                            mcp_app: mcp_app.clone(),
                         };
                         let _ = outbound_tx.send(BusMessage::Telemetry(tfin.clone())).await;
                         hook_observe_telemetry(hook_tool_ctx.as_ref(), &inbound, is_subagent, tfin);
-                        mem.add_message(crate::utils::ChatMessage::tool_with_error(
+                        let mut stored_tool = crate::utils::ChatMessage::tool_with_error(
                             &tool_result_text,
                             &tc.id,
                             Some(tool_name.as_str()),
                             is_error,
-                        ))
-                        .await
-                        .map_err(ReasoningLoopError::persistence)?;
+                        );
+                        if let Some(app) = mcp_app.as_ref() {
+                            stored_tool =
+                                stored_tool.with_mcp_app(app.view_id.clone(), app.resource_uri.clone());
+                        }
+                        mem.add_message(stored_tool)
+                            .await
+                            .map_err(ReasoningLoopError::persistence)?;
                         apply_budget_decision!(budget_decision);
                         apply_budget_decision!(budget.record_elapsed(run_started_at.elapsed()));
                     }
@@ -1991,6 +1999,7 @@ impl AgentLogic {
                         };
 
                         let is_error = tool_result.is_error();
+                        let mcp_app = tool_result.mcp_app.clone();
                         let intent = tool_intent_signature(tool_name, &tc.function.arguments);
                         let budget_decision = if is_error {
                             let code = tool_result
@@ -2021,18 +2030,24 @@ impl AgentLogic {
                             is_error,
                             tool_call_id: Some(tc.id.clone()),
                             background_job_id: crate::bus::get_background_job_id(&inbound.metadata),
+                            mcp_app: mcp_app.clone(),
                         };
                         let _ = outbound_tx.send(BusMessage::Telemetry(tfin.clone())).await;
                         hook_observe_telemetry(hook_tool_ctx.as_ref(), &inbound, is_subagent, tfin);
 
-                        mem.add_message(crate::utils::ChatMessage::tool_with_error(
+                        let mut stored_tool = crate::utils::ChatMessage::tool_with_error(
                             &tool_result_text,
                             &tc.id,
                             Some(tool_name.as_str()),
                             is_error,
-                        ))
-                        .await
-                        .map_err(ReasoningLoopError::persistence)?;
+                        );
+                        if let Some(app) = mcp_app.as_ref() {
+                            stored_tool =
+                                stored_tool.with_mcp_app(app.view_id.clone(), app.resource_uri.clone());
+                        }
+                        mem.add_message(stored_tool)
+                            .await
+                            .map_err(ReasoningLoopError::persistence)?;
                         apply_budget_decision!(budget_decision);
                         apply_budget_decision!(budget.record_elapsed(run_started_at.elapsed()));
                         tool_invoked = true;

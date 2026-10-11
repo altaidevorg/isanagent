@@ -416,7 +416,12 @@ impl PluginRegistry {
     }
 
     /// Ingests and initializes all plugin MCP tools into the provided `ToolRegistry`.
-    pub async fn populate_tool_registry(&self, tool_registry: &mut ToolRegistry, uv_binary: &str) {
+    pub async fn populate_tool_registry(
+        &self,
+        tool_registry: &mut ToolRegistry,
+        uv_binary: &str,
+        mcp_apps: &crate::tools::mcp::McpAppBridge,
+    ) {
         for plugin in self.plugins.values() {
             if let Some(ref mcp_path) = plugin.mcp_config_path {
                 let Ok(content) = std::fs::read_to_string(mcp_path) else {
@@ -437,9 +442,20 @@ impl PluginRegistry {
                     {
                         Ok(client) => {
                             let client_arc = std::sync::Arc::new(client);
+                            mcp_apps.retain_client(client_arc.clone());
                             match client_arc.list_tools().await {
                                 Ok(tools) => {
                                     for tool_def in tools {
+                                        if !crate::tools::mcp::tool_visible_to_model(
+                                            tool_def.meta.as_ref(),
+                                        ) {
+                                            log::info!(
+                                                "Skipping app-only MCP tool '{}' from plugin '{}'",
+                                                tool_def.name,
+                                                plugin.name
+                                            );
+                                            continue;
+                                        }
                                         log::info!(
                                             "Registering MCP tool '{}' from plugin '{}'",
                                             tool_def.name,
@@ -448,6 +464,7 @@ impl PluginRegistry {
                                         let proxy = crate::tools::mcp::McpProxyTool::new(
                                             tool_def,
                                             client_arc.clone(),
+                                            mcp_apps.clone(),
                                         );
                                         tool_registry.register(Box::new(proxy));
                                     }

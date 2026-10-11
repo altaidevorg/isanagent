@@ -622,7 +622,10 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         }));
     }
     let uv_bin = workspace.config.execution_uv_binary();
-    plugins.populate_tool_registry(&mut tools, &uv_bin).await;
+    let mcp_apps = crate::tools::mcp::McpAppBridge::new();
+    plugins
+        .populate_tool_registry(&mut tools, &uv_bin, &mcp_apps)
+        .await;
     if builtin_tools {
         let tool_catalog = tools.catalog_handle();
         tools.register(Box::new(ToolSearchTool {
@@ -1122,7 +1125,8 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                     .clone()
                     .unwrap_or_else(|| workspace.dir.join("config.toml")),
             )
-            .with_skills(skills_for_settings.clone());
+            .with_skills(skills_for_settings.clone())
+            .with_mcp_apps(mcp_apps.clone());
             let api = if let Some(mte_cron_scheduler) = mte_cron_scheduler.clone() {
                 api.with_multi_tenant_edge_cron_scheduler(mte_cron_scheduler)
             } else {

@@ -24,7 +24,9 @@ use serde_json::Value;
 use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::oneshot;
 
-use crate::bus::{BusMessage, InboundMessage, LogEvent, OutboundMessage, TelemetryEvent};
+use crate::bus::{
+    BusMessage, InboundMessage, LogEvent, McpAppRef, OutboundMessage, TelemetryEvent,
+};
 use crate::channels::api_store::{ResponseStore, StoredResponse};
 use crate::channels::Channel;
 use crate::clarification::{METADATA_CLARIFICATION, METADATA_CLARIFICATION_CHOICES};
@@ -69,6 +71,8 @@ struct ApiState {
     config_path: Option<std::path::PathBuf>,
     /// Live skill registry shared with the agent. `None` in tests that do not install skills.
     skills: Option<crate::skills::SharedSkillRegistry>,
+    /// MCP App views rendered by the embedded web UI.
+    mcp_apps: crate::tools::mcp::McpAppBridge,
 }
 
 enum PendingRequest {
@@ -106,6 +110,8 @@ enum StreamEvent {
         is_error: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         tool_call_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mcp_app: Option<McpAppRef>,
     },
     AgentThought {
         thought: String,
@@ -222,6 +228,9 @@ struct SessionHistoryMessage {
     /// Image URLs or `data:` URIs from multimodal user/assistant turns (OpenAI-style parts).
     #[serde(skip_serializing_if = "Option::is_none")]
     image_urls: Option<Vec<String>>,
+    /// MCP App panels opened in this turn. The HTML is not included.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mcp_apps: Option<Vec<crate::utils::PersistedMcpApp>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -350,6 +359,7 @@ pub struct ApiChannel {
     model_catalog: Option<std::sync::Arc<crate::channels::model_settings::ModelCatalog>>,
     config_path: Option<std::path::PathBuf>,
     skills: Option<crate::skills::SharedSkillRegistry>,
+    mcp_apps: crate::tools::mcp::McpAppBridge,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     task_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -405,6 +415,7 @@ impl ApiChannel {
             model_catalog: None,
             config_path: None,
             skills: None,
+            mcp_apps: crate::tools::mcp::McpAppBridge::new(),
             shutdown_tx,
             task_handle: Mutex::new(None),
         })
@@ -425,6 +436,11 @@ impl ApiChannel {
 
     pub fn with_skills(mut self, skills: crate::skills::SharedSkillRegistry) -> Self {
         self.skills = Some(skills);
+        self
+    }
+
+    pub fn with_mcp_apps(mut self, mcp_apps: crate::tools::mcp::McpAppBridge) -> Self {
+        self.mcp_apps = mcp_apps;
         self
     }
 
@@ -555,6 +571,7 @@ impl Channel for ApiChannel {
             model_catalog: self.model_catalog.clone(),
             config_path: self.config_path.clone(),
             skills: self.skills.clone(),
+            mcp_apps: self.mcp_apps.clone(),
         };
 
         let resolved_bind = self.resolved_bind_address();
@@ -737,6 +754,7 @@ impl ApiChannel {
                 result,
                 is_error,
                 tool_call_id,
+                mcp_app,
                 ..
             } => {
                 if let Some(pending) = self.pending_requests.get(&chat_id) {
@@ -746,6 +764,7 @@ impl ApiChannel {
                             result,
                             is_error,
                             tool_call_id,
+                            mcp_app,
                         }) {
                             error!("Failed to send tool_call_finished to stream: {e}");
                         }
@@ -767,6 +786,50 @@ impl ApiChannel {
                 }
             }
             _ => {}
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct McpAppToolCallBody {
+    name: String,
+    #[serde(default)]
+    arguments: Value,
+}
+
+async fn handle_mcp_app(
+    State(state): State<ApiState>,
+    AxumPath(view_id): AxumPath<String>,
+) -> Response {
+    match state.mcp_apps.snapshot(&view_id) {
+        Some(snapshot) => Json(snapshot).into_response(),
+        None => ApiError::new(
+            StatusCode::NOT_FOUND,
+            "mcp_app_not_found",
+            "MCP App view not found.",
+        )
+        .into_response(),
+    }
+}
+
+async fn handle_mcp_app_tool_call(
+    State(state): State<ApiState>,
+    AxumPath(view_id): AxumPath<String>,
+    Json(body): Json<McpAppToolCallBody>,
+) -> Response {
+    match state
+        .mcp_apps
+        .call_tool(&view_id, &body.name, body.arguments)
+        .await
+    {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => {
+            let status = if error.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            ApiError::new(status, "mcp_app_tool_call_failed", error).into_response()
         }
     }
 }
@@ -824,7 +887,12 @@ fn build_router(state: ApiState, serve_ui: bool) -> Router {
         .route("/v1/workspace/file", get(handle_workspace_file))
         // POST on a distinct path so clients are not blocked by proxies or older builds that only registered GET on `/v1/workspace/file`.
         .route("/v1/workspace/file/save", post(handle_workspace_file_put))
-        .route("/v1/workspace/rename", post(handle_workspace_rename));
+        .route("/v1/workspace/rename", post(handle_workspace_rename))
+        .route("/v1/mcp/apps/{view_id}", get(handle_mcp_app))
+        .route(
+            "/v1/mcp/apps/{view_id}/tools/call",
+            post(handle_mcp_app_tool_call),
+        );
 
     // Gate the `/v1` control surface with bearer auth when a token is configured. The cron
     // webhook (its own per-job URL token) and the embedded UI assets are intentionally left
@@ -1930,11 +1998,19 @@ fn text_and_images_from_message(message: &ChatMessage) -> (String, Vec<String>) 
 }
 
 /// Transcript rows suitable for the web UI: hides tool traces, runtime injection prefixes, and
-/// tool-only assistant turns (no user-visible assistant text).
+/// tool-only assistant turns (no user-visible assistant text). MCP App pointers saved on tool
+/// rows are attached to the assistant reply that follows them.
 fn chat_messages_to_ui_transcript(messages: &[ChatMessage]) -> Vec<SessionHistoryMessage> {
     let mut out = Vec::new();
+    let mut pending_apps = Vec::new();
     for message in messages {
-        if message.role == "tool" || message.role == "system" {
+        if message.role == "tool" {
+            if let Some(app) = &message.mcp_app {
+                pending_apps.push(app.clone());
+            }
+            continue;
+        }
+        if message.role == "system" {
             continue;
         }
 
@@ -1955,6 +2031,15 @@ fn chat_messages_to_ui_transcript(messages: &[ChatMessage]) -> Vec<SessionHistor
             continue;
         }
 
+        if message.role == "user" {
+            flush_pending_mcp_apps(&mut out, &mut pending_apps);
+        }
+        let mcp_apps = if message.role == "assistant" && !pending_apps.is_empty() {
+            Some(std::mem::take(&mut pending_apps))
+        } else {
+            None
+        };
+
         out.push(SessionHistoryMessage {
             role: message.role.clone(),
             content: text,
@@ -1963,9 +2048,34 @@ fn chat_messages_to_ui_transcript(messages: &[ChatMessage]) -> Vec<SessionHistor
             } else {
                 Some(image_urls)
             },
+            mcp_apps,
         });
     }
+    flush_pending_mcp_apps(&mut out, &mut pending_apps);
     out
+}
+
+fn flush_pending_mcp_apps(
+    out: &mut Vec<SessionHistoryMessage>,
+    pending: &mut Vec<crate::utils::PersistedMcpApp>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let apps = std::mem::take(pending);
+    if let Some(last) = out.iter_mut().rev().find(|row| row.role == "assistant") {
+        match &mut last.mcp_apps {
+            Some(existing) => existing.extend(apps),
+            None => last.mcp_apps = Some(apps),
+        }
+        return;
+    }
+    out.push(SessionHistoryMessage {
+        role: "assistant".to_string(),
+        content: String::new(),
+        image_urls: None,
+        mcp_apps: Some(apps),
+    });
 }
 
 /// Maps a path segment to the SQLite `messages.thread_id` key.
@@ -2978,6 +3088,24 @@ mod tests {
     use tower::ServiceExt;
 
     #[test]
+    fn transcript_puts_mcp_app_on_the_following_reply() {
+        let messages = vec![
+            ChatMessage::user("open the dashboard"),
+            ChatMessage::tool("opened", "call_1", Some("open_dashboard")).with_mcp_app(
+                "view-1".to_string(),
+                "ui://mcp-ui-tester-app/dashboard".to_string(),
+            ),
+            ChatMessage::assistant("Here is the dashboard."),
+        ];
+        let rows = super::chat_messages_to_ui_transcript(&messages);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].mcp_apps.is_none());
+        let apps = rows[1].mcp_apps.as_ref().expect("panel on the reply");
+        assert_eq!(apps[0].view_id, "view-1");
+        assert_eq!(apps[0].resource_uri, "ui://mcp-ui-tester-app/dashboard");
+    }
+
+    #[test]
     fn completion_carries_approval_choices_and_edit_diff() {
         let question = OutboundMessage {
             channel: "api".to_string(),
@@ -3056,13 +3184,36 @@ mod tests {
                 result: result.to_string(),
                 is_error,
                 tool_call_id: Some("call-42".to_string()),
+                mcp_app: None,
             };
             let encoded = serde_json::to_value(event).expect("serialize stream event");
 
             assert_eq!(encoded["type"], "tool_call_finished");
             assert_eq!(encoded["is_error"], is_error);
             assert_eq!(encoded["tool_call_id"], "call-42");
+            assert!(encoded.get("mcp_app").is_none());
         }
+    }
+
+    #[test]
+    fn streamed_tool_completion_carries_mcp_app_ref() {
+        let event = StreamEvent::ToolCallFinished {
+            tool_name: "open_dashboard".to_string(),
+            result: "Opened interactive MCP App dashboard with 3 items.".to_string(),
+            is_error: false,
+            tool_call_id: Some("call-ui".to_string()),
+            mcp_app: Some(crate::bus::McpAppRef {
+                view_id: "view-1".to_string(),
+                resource_uri: "ui://mcp-ui-tester-app/dashboard".to_string(),
+            }),
+        };
+        let encoded = serde_json::to_value(event).expect("serialize stream event");
+        assert_eq!(encoded["mcp_app"]["view_id"], "view-1");
+        assert_eq!(
+            encoded["mcp_app"]["resource_uri"],
+            "ui://mcp-ui-tester-app/dashboard"
+        );
+        assert!(encoded.get("html").is_none());
     }
 
     #[test]
@@ -3083,6 +3234,7 @@ mod tests {
                 result: "done".to_string(),
                 is_error: false,
                 tool_call_id: Some("call-7".to_string()),
+                mcp_app: None,
             },
         ];
 
@@ -3189,6 +3341,7 @@ mod tests {
             model_catalog: None,
             config_path: None,
             skills: None,
+            mcp_apps: crate::tools::mcp::McpAppBridge::new(),
         }
     }
 
@@ -3529,6 +3682,7 @@ bind_address = "127.0.0.1"
             model_catalog: None,
             config_path: None,
             skills: None,
+            mcp_apps: crate::tools::mcp::McpAppBridge::new(),
         };
         let app = build_router(state, true);
 

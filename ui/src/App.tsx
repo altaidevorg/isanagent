@@ -8,6 +8,7 @@ import {
   type MouseEvent,
 } from "react";
 
+import { McpAppFrame, type McpAppRef } from "@/components/McpAppFrame";
 import { SettingsDialog } from "@/components/SettingsDialog";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -115,12 +116,18 @@ type ToolCall = {
   tool_name: string;
   args: string;
   result?: string;
+  mcpApp?: McpAppRef;
 };
 
 type StreamEvent =
   | { type: "tool_call_started"; tool_name: string; args: string }
   | { type: "tool_progress"; tool_name: string; message: string }
-  | { type: "tool_call_finished"; tool_name: string; result: string }
+  | {
+      type: "tool_call_finished";
+      tool_name: string;
+      result: string;
+      mcp_app?: McpAppRef;
+    }
   | { type: "agent_thought"; thought: string }
   | {
       type: "completion";
@@ -135,6 +142,7 @@ type HistoryRow = {
   role: string;
   content: string;
   image_urls?: string[];
+  mcp_apps?: McpAppRef[];
 };
 
 type ThreadListEntry = {
@@ -373,6 +381,13 @@ function historyRowsToMessages(rows: HistoryRow[]): Message[] {
     role: row.role,
     content: row.content,
     imageUrls: row.image_urls && row.image_urls.length > 0 ? row.image_urls : undefined,
+    toolCalls: row.mcp_apps?.length
+      ? row.mcp_apps.map((app) => ({
+          tool_name: "",
+          args: "",
+          mcpApp: app,
+        }))
+      : undefined,
   }));
 }
 
@@ -462,10 +477,35 @@ function ClarificationCard({
   );
 }
 
+function McpAppList({
+  toolCalls,
+  onChatMessage,
+}: {
+  toolCalls?: ToolCall[];
+  onChatMessage: (text: string) => void;
+}) {
+  const apps = toolCalls?.filter((toolCall) => toolCall.mcpApp) ?? [];
+  if (apps.length === 0) {
+    return null;
+  }
+  return (
+    <>
+      {apps.map((toolCall) => (
+        <McpAppFrame
+          app={toolCall.mcpApp!}
+          key={toolCall.mcpApp!.view_id}
+          onChatMessage={onChatMessage}
+        />
+      ))}
+    </>
+  );
+}
+
 function ToolAccordion({ toolCalls }: { toolCalls: ToolCall[] }) {
   const [isOpen, setIsOpen] = useState(false);
+  const listed = toolCalls.filter((toolCall) => toolCall.tool_name);
 
-  if (toolCalls.length === 0) return null;
+  if (listed.length === 0) return null;
 
   return (
     <div className="mt-4 border-t border-border pt-4">
@@ -481,11 +521,11 @@ function ToolAccordion({ toolCalls }: { toolCalls: ToolCall[] }) {
         >
           <path d="M9 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} />
         </svg>
-        {isOpen ? "Hide tool calls" : `Show ${toolCalls.length} tool calls`}
+        {isOpen ? "Hide tool calls" : `Show ${listed.length} tool calls`}
       </button>
       {isOpen && (
         <div className="mt-3 flex flex-col gap-3">
-          {toolCalls.map((tc, i) => (
+          {listed.map((tc, i) => (
             <div key={i} className="rounded-lg border border-border bg-muted/30 p-3 text-xs">
               <div className="flex items-center justify-between gap-2">
                 <span className="font-semibold text-yellow-600 dark:text-yellow-400">{tc.tool_name}</span>
@@ -668,6 +708,8 @@ export default function App() {
   } | null>(null);
 
   const dialogInputRef = useRef<HTMLInputElement>(null);
+  const pendingRef = useRef(false);
+  const queuedUiMessages = useRef<string[]>([]);
 
   const showConfirm = (title: string, message: string, onConfirm: () => void) => {
     setDialogConfig({
@@ -943,6 +985,9 @@ export default function App() {
   }, [messages.length, pending]);
 
   const startNewConversation = () => {
+    // Drop the turn that is still waiting on the model. Otherwise the new
+    // conversation sits behind that request and looks frozen.
+    void stopGeneration();
     startTransition(() => {
       clearSessionPointers();
       setInternalChatId(null);
@@ -1024,6 +1069,7 @@ export default function App() {
       abortControllerRef.current = null;
     }
 
+    pendingRef.current = false;
     setPending(false);
     setCurrentStep(null);
     setCurrentToolCalls([]);
@@ -1043,7 +1089,7 @@ export default function App() {
   };
 
   const submitMessage = async ({ text, imageDataUrls }: { text: string; imageDataUrls: string[] }) => {
-    if (pending) {
+    if (pendingRef.current) {
       return;
     }
     if (!text.trim() && imageDataUrls.length === 0) {
@@ -1064,6 +1110,7 @@ export default function App() {
 
     setErrorMessage(null);
     setMessages((prev) => [...prev, optimisticUser]);
+    pendingRef.current = true;
     setPending(true);
     setCurrentStep(null);
     setCurrentToolCalls([]);
@@ -1077,6 +1124,7 @@ export default function App() {
     abortControllerRef.current = controller;
 
     let previousResponseId: string | undefined = latestResponseId ?? undefined;
+    let turnCompleted = false;
 
     try {
       const response = await fetch("/v1/responses", {
@@ -1149,9 +1197,18 @@ export default function App() {
               case "tool_call_finished":
                 if (currentToolCall && currentToolCall.tool_name === event.tool_name) {
                   currentToolCall.result = event.result;
+                  currentToolCall.mcpApp = event.mcp_app;
                   toolCalls.push({ ...currentToolCall });
                   setCurrentToolCalls([...toolCalls]);
                   currentToolCall = null;
+                } else if (event.mcp_app) {
+                  toolCalls.push({
+                    tool_name: event.tool_name,
+                    args: "",
+                    result: event.result,
+                    mcpApp: event.mcp_app,
+                  });
+                  setCurrentToolCalls([...toolCalls]);
                 }
                 // Don't set currentStep to null here, let the next event (thought or next tool) replace it
                 // This prevents the indicator from flickering or disappearing between steps
@@ -1207,8 +1264,10 @@ export default function App() {
       }
 
       void loadSessions();
+      turnCompleted = true;
     } catch (error) {
       if (error instanceof Error && (error.name === "AbortError" || error.message.includes("aborted"))) {
+        queuedUiMessages.current = [];
         return;
       }
       setMessages((prev) => prev.filter((m) => m.id !== optimisticId));
@@ -1222,10 +1281,29 @@ export default function App() {
         abortControllerRef.current = null;
       }
       cancelChatIdRef.current = null;
+      pendingRef.current = false;
       setPending(false);
       setCurrentStep(null);
       setCurrentToolCalls([]);
+      if (turnCompleted) {
+        const next = queuedUiMessages.current.shift();
+        if (next) {
+          void submitMessage({ text: next, imageDataUrls: [] });
+        }
+      }
     }
+  };
+
+  const deliverUiMessage = (text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed) {
+      return;
+    }
+    if (pendingRef.current) {
+      queuedUiMessages.current.push(trimmed);
+      return;
+    }
+    void submitMessage({ text: trimmed, imageDataUrls: [] });
   };
 
   return (
@@ -1649,7 +1727,7 @@ export default function App() {
 
           <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4 sm:px-6">
             {(messages.length > 0 || summaries.length > 0 || pending) ? (
-              <div className="mx-auto flex min-h-full w-full max-w-3xl flex-col gap-4">
+              <div className="mx-auto flex min-h-full w-full min-w-0 max-w-3xl flex-col gap-4">
                 {summaries.length > 0 && (
                   <div className="space-y-4">
                     {/* Only show the most recent summary (which is now the ONLY summary) */}
@@ -1676,8 +1754,11 @@ export default function App() {
                 {messages.map((message, index) => (
                   <article
                     className={cn(
-                      "max-w-[82%] rounded-xl px-4 py-3",
+                      "rounded-xl px-4 py-3",
                       bubbleStyle(message.role),
+                      message.toolCalls?.some((toolCall) => toolCall.mcpApp)
+                        ? "w-full min-w-0 max-w-full"
+                        : "max-w-[82%]",
                     )}
                     key={message.id}
                   >
@@ -1689,6 +1770,7 @@ export default function App() {
                     {message.content ? (
                       <p className="mt-2 whitespace-pre-wrap text-sm leading-7">{message.content}</p>
                     ) : null}
+                    <McpAppList onChatMessage={deliverUiMessage} toolCalls={message.toolCalls} />
                     {message.clarification && (
                       <ClarificationCard
                         clarification={message.clarification}
@@ -1711,6 +1793,12 @@ export default function App() {
                     ) : null}
                   </article>
                 ))}
+
+                {pending && currentToolCalls.some((toolCall) => toolCall.mcpApp) ? (
+                  <div className="mr-auto w-full min-w-0 max-w-full rounded-xl border border-border bg-card px-4 py-3">
+                    <McpAppList onChatMessage={deliverUiMessage} toolCalls={currentToolCalls} />
+                  </div>
+                ) : null}
 
                 {pending ? <TypingIndicator step={currentStep} /> : null}
 

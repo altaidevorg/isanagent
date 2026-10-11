@@ -169,6 +169,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
             is_error: None,
+            mcp_app: None,
         }
     }
 

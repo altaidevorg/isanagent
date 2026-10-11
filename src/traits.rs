@@ -54,6 +54,10 @@ pub struct ToolResult {
     /// adapter. A natively typed result is never reclassified from its text.
     #[serde(skip)]
     legacy: bool,
+    /// MCP App view to render beside this result. Absent from the model-facing
+    /// `content` string and from serialized tool results.
+    #[serde(skip)]
+    pub mcp_app: Option<crate::bus::McpAppRef>,
 }
 
 impl ToolResult {
@@ -63,7 +67,13 @@ impl ToolResult {
             content: content.into(),
             error: None,
             legacy: false,
+            mcp_app: None,
         }
+    }
+
+    pub fn with_mcp_app(mut self, mcp_app: crate::bus::McpAppRef) -> Self {
+        self.mcp_app = Some(mcp_app);
+        self
     }
 
     pub fn error(code: ToolErrorCode, message: impl Into<String>) -> Self {
@@ -84,6 +94,7 @@ impl ToolResult {
                 message: message.into(),
             }),
             legacy: false,
+            mcp_app: None,
         }
     }
 
@@ -112,6 +123,7 @@ impl ToolResult {
                 content,
                 error: None,
                 legacy: true,
+                mcp_app: None,
             },
             Err(message) => Self {
                 status: ToolResultStatus::Error,
@@ -121,6 +133,7 @@ impl ToolResult {
                     message,
                 }),
                 legacy: true,
+                mcp_app: None,
             },
         }
     }
