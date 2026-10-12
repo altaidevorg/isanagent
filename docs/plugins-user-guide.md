@@ -162,6 +162,20 @@ If a tool sets `_meta.ui.resourceUri` to a `ui://` HTML resource (`text/html;pro
 
 ---
 
+## 5a. Lifecycle Hooks (`hooks.json`)
+
+Plugins can ship steering hooks in `dev.altai.isanagent/hooks.json`, in Claude Code format (`PreToolUse`, `PostToolUse`, `UserPromptSubmit` with `{"type": "command"}` entries) or isanagent format (`pre_tool`, `post_tool`, `user_prompt`, `post_model`). They run only when the operator enables steering and allow-lists the plugin:
+
+```toml
+[harness.hooks.steering]
+enabled = true
+plugin_hooks = ["my-plugin"]   # or ["*"]
+```
+
+Commands find plugin files through `$ISANAGENT_PLUGIN_ROOT` / `$CLAUDE_PLUGIN_ROOT`. See [`hooks.md`](./hooks.md#plugin-hooks-hooksjson) for the full contract.
+
+---
+
 ## 6. Hierarchical Discovery
 
 `isanagent` discovers Agent Plugins automatically at startup:

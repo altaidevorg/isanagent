@@ -2833,12 +2833,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 };
                 let inner_w = hint_inner.width as usize;
                 let mut lines: Vec<Line> = Vec::new();
-                for (i, (cmd, desc)) in slash_matches
-                    .iter()
-                    .enumerate()
-                    .skip(start)
-                    .take(visible)
-                {
+                for (i, (cmd, desc)) in slash_matches.iter().enumerate().skip(start).take(visible) {
                     let chosen = i == selected;
                     let marker = if chosen { "▶ " } else { "  " };
                     let row = format!("{marker}{cmd:<16}{desc}");

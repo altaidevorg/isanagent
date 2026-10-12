@@ -898,6 +898,24 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
             ),
         )
         .with_chat_id(chat_id),
+        TelemetryEvent::HookDecision {
+            chat_id,
+            channel,
+            hook_event,
+            source,
+            tool_name,
+            decision,
+            changed,
+            ..
+        } => LogEvent::info(
+            "Telemetry",
+            &format!(
+                "HookDecision channel={channel} event={hook_event} source={source} tool={} decision={decision} changed={}",
+                tool_name.as_deref().unwrap_or("-"),
+                changed.join(",")
+            ),
+        )
+        .with_chat_id(chat_id),
         TelemetryEvent::ShellGrepLikeDetected {
             chat_id,
             channel,

@@ -614,7 +614,8 @@ impl Tool for McpProxyTool {
             Ok(text) => text,
             Err(error) => return ToolResult::error(ToolErrorCode::ExecutionFailed, error),
         };
-        let resource_uri = ui_resource_uri(raw.get("_meta")).or_else(|| self.ui_resource_uri.clone());
+        let resource_uri =
+            ui_resource_uri(raw.get("_meta")).or_else(|| self.ui_resource_uri.clone());
         let Some(resource_uri) = resource_uri else {
             return ToolResult::success(text);
         };
@@ -642,9 +643,7 @@ impl Tool for McpProxyTool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        tool_visible_to_model, ui_resource_uri, McpAppBridge, McpClient, McpServerEntry,
-    };
+    use super::{tool_visible_to_model, ui_resource_uri, McpAppBridge, McpClient, McpServerEntry};
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -736,9 +735,7 @@ mod tests {
             .call_tool(&app.view_id, "get_items", json!({}))
             .await
             .expect("widget tools/call");
-        let body = items["content"][0]["text"]
-            .as_str()
-            .expect("items text");
+        let body = items["content"][0]["text"].as_str().expect("items text");
         assert!(body.contains("Review MCP Apps spec"));
         assert!(bridge
             .call_tool(&app.view_id, "../exec", json!({}))

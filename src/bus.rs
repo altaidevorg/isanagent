@@ -291,6 +291,29 @@ pub enum TelemetryEvent {
         /// Redacted command preview for diagnostics.
         command_preview: String,
     },
+    /// A steering hook changed something (blocked, rewrote, asked, stopped, …) or failed.
+    /// Emitted only to the observation pipeline (`[harness.hooks.observation]`) as an audit trail.
+    HookDecision {
+        chat_id: String,
+        #[serde(default)]
+        channel: String,
+        /// `pre_tool`, `post_tool`, `user_prompt`, `post_model`.
+        hook_event: String,
+        /// `config` or `plugin:<name>`.
+        source: String,
+        /// The hook command as configured.
+        command: String,
+        #[serde(default)]
+        tool_name: Option<String>,
+        /// `block`, `stop`, `ask`, `modify`, `retry`, `error_blocked`, `error_ignored`.
+        decision: String,
+        /// Block / ask / stop reason or error text (truncated).
+        #[serde(default)]
+        reason: Option<String>,
+        /// For `modify`: `args`, `prompt`, `output`, `content`, `tool_calls`, `context`.
+        #[serde(default)]
+        changed: Vec<String>,
+    },
     /// Non-blocking signal that a grep/cat/wc-style shell pipeline was attempted.
     ShellGrepLikeDetected {
         chat_id: String,

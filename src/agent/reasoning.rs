@@ -38,7 +38,8 @@ use crate::bus::{
 use crate::clarification::ClarificationHub;
 use crate::config::ResolvedShellPolicy;
 use crate::hooks::{
-    run_user_prompt_hooks, HookSessionInfo, ToolCallHookContext, UserPromptHookOutcome,
+    run_post_model_hooks, run_user_prompt_hooks, HookSessionInfo, HookToolCall, PostModelOutcome,
+    ToolCallHookContext, UserPromptHookOutcome,
 };
 use crate::logging::LoggerHandle;
 use crate::memory::{MemoryMessage, SharedReply, TodoRow};
@@ -171,6 +172,73 @@ pub(crate) fn context_has_tool_call(
 }
 
 /// Default context token budget (conservative for most models).
+/// Upper bound on consecutive post_model `block` retries per turn, so a hook that rejects every
+/// response cannot loop forever.
+const MAX_POST_MODEL_RETRIES: u32 = 3;
+
+/// Rebuild the provider tool-call list from a post_model hook's `updatedToolCalls`. Calls whose
+/// `id` matches an original keep its provider-specific `extra_content`. Missing, malformed
+/// (providers require `^[A-Za-z0-9_-]+$`) or duplicate ids are replaced with fresh ones, so the
+/// persisted history always pairs one id with one tool result. An empty list removes every call.
+fn rebuild_tool_calls(
+    original: Vec<crate::utils::ToolCallRequest>,
+    updated: Vec<HookToolCall>,
+) -> Option<Vec<crate::utils::ToolCallRequest>> {
+    if updated.is_empty() {
+        return None;
+    }
+    // Gemini rejects function calls without a thought signature once the model used them; new
+    // hook-made calls get Google's documented "skip validation" placeholder in that case.
+    let signed = original.iter().any(|o| {
+        o.extra_content
+            .as_ref()
+            .is_some_and(|e| e.get("thought_signature").is_some())
+    });
+    let valid_id = |id: &str| {
+        !id.is_empty()
+            && id.len() <= 64
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    };
+    let mut seen: HashSet<String> = HashSet::new();
+    let calls = updated
+        .into_iter()
+        .map(|c| {
+            let id = match c.id {
+                Some(id) if valid_id(&id) && !seen.contains(&id) => id,
+                _ => format!("hook_{}", uuid::Uuid::new_v4().simple()),
+            };
+            seen.insert(id.clone());
+            let prior = original.iter().find(|o| o.id == id);
+            let arguments = match c.arguments {
+                serde_json::Value::String(s) => s,
+                serde_json::Value::Null => "{}".to_string(),
+                other => other.to_string(),
+            };
+            let extra_content = match prior {
+                Some(p) => p.extra_content.clone(),
+                None if signed => Some(serde_json::json!({
+                    "thought_signature": "skip_thought_signature_validator"
+                })),
+                None => None,
+            };
+            crate::utils::ToolCallRequest {
+                id,
+                tool_type: prior
+                    .map(|p| p.tool_type.clone())
+                    .unwrap_or_else(|| "function".to_string()),
+                extra_content,
+                function: crate::utils::ToolCallFunction {
+                    name: c.name,
+                    arguments,
+                },
+            }
+        })
+        .collect();
+    Some(calls)
+}
+
 /// Uses char_count / 4 as the token estimate (same heuristic as compaction logic).
 const MAX_CONTEXT_TOKENS_DEFAULT: usize = 120_000;
 
@@ -1147,7 +1215,8 @@ impl AgentLogic {
         }
         runtime_context.push_str(crate::utils::RUNTIME_CONTEXT_END_SUFFIX);
 
-        let mut contextualized_content = format!("{}{}", runtime_context, inbound.content);
+        let mut user_prompt_text = inbound.content.clone();
+        let mut hook_prefix: Option<String> = None;
         if let Some(ref hc) = hook_tool_ctx {
             if let Some(st) = &hc.steering {
                 let hook_session = HookSessionInfo {
@@ -1159,7 +1228,8 @@ impl AgentLogic {
                 };
                 match run_user_prompt_hooks(
                     st.as_ref(),
-                    contextualized_content.as_str(),
+                    runtime_context.as_str(),
+                    inbound.content.as_str(),
                     hook_session,
                 )
                 .await
@@ -1167,13 +1237,19 @@ impl AgentLogic {
                     UserPromptHookOutcome::Block(msg) => {
                         return Err(ReasoningLoopError::protocol(msg));
                     }
-                    UserPromptHookOutcome::InjectPrefix(prefix) => {
-                        contextualized_content = format!("{prefix}\n{contextualized_content}");
+                    UserPromptHookOutcome::Proceed(decision) => {
+                        if let Some(p) = decision.updated_prompt {
+                            user_prompt_text = p;
+                        }
+                        hook_prefix = decision.prefix;
                     }
-                    UserPromptHookOutcome::Proceed => {}
                 }
             }
         }
+        let contextualized_content = match hook_prefix {
+            Some(prefix) => format!("{prefix}\n{runtime_context}{user_prompt_text}"),
+            None => format!("{runtime_context}{user_prompt_text}"),
+        };
 
         // Build the user message – multimodal when attachments are present
         let user_msg = if inbound.attachments.is_empty() {
@@ -1224,6 +1300,8 @@ impl AgentLogic {
         // task completed. Any tool call resets the count.
         const MAX_FORBID_FINAL_NUDGES: u32 = 3;
         let mut forbid_final_nudges: u32 = 0;
+        // Consecutive responses rejected by a post_model hook (`decision: "block"`) this turn.
+        let mut post_model_retries: u32 = 0;
 
         loop {
             if cancel_token.is_cancelled() {
@@ -1725,6 +1803,111 @@ impl AgentLogic {
                     .await;
             }
 
+            // post_model steering hooks: may rewrite the assistant text / tool calls before
+            // anything is persisted or executed, send the response back with feedback, or stop.
+            let mut response = response;
+            if let Some(st) = hook_tool_ctx.as_ref().and_then(|hc| hc.steering.as_ref()) {
+                if !st.post_model.is_empty() {
+                    let hook_calls: Vec<HookToolCall> = response
+                        .tool_calls
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .map(|tc| HookToolCall {
+                            id: Some(tc.id.clone()),
+                            name: tc.function.name.clone(),
+                            arguments: serde_json::from_str(&tc.function.arguments).unwrap_or_else(
+                                |_| serde_json::Value::String(tc.function.arguments.clone()),
+                            ),
+                        })
+                        .collect();
+                    let hook_session = HookSessionInfo {
+                        channel: inbound.channel.as_str(),
+                        chat_id: inbound.chat_id.as_str(),
+                        thread_id: inbound.thread_id.as_deref(),
+                        metadata: &inbound.metadata,
+                        is_subagent,
+                    };
+                    match run_post_model_hooks(
+                        st.as_ref(),
+                        &response.content,
+                        &hook_calls,
+                        iterations as u32,
+                        hook_session,
+                    )
+                    .await
+                    {
+                        PostModelOutcome::Stop(reason) => {
+                            return Err(ReasoningLoopError::protocol(format!(
+                                "Stopped by post_model hook: {reason}"
+                            )));
+                        }
+                        PostModelOutcome::Retry(feedback) => {
+                            post_model_retries += 1;
+                            if post_model_retries <= MAX_POST_MODEL_RETRIES {
+                                mem.add_message(crate::utils::ChatMessage::user(&format!(
+                                    "[post_model hook] Your previous response was rejected and discarded: {feedback}\nPlease respond again."
+                                )))
+                                .await
+                                .map_err(ReasoningLoopError::persistence)?;
+                                continue;
+                            }
+                            return Err(ReasoningLoopError::protocol(format!(
+                                "post_model hook rejected {post_model_retries} responses in a row: {feedback}"
+                            )));
+                        }
+                        PostModelOutcome::Proceed(decision) => {
+                            if let Some(content) = decision.updated_content {
+                                response.content = content;
+                            }
+                            let removed_calls: Vec<String> = match decision.updated_tool_calls {
+                                Some(calls) => {
+                                    let original = response.tool_calls.take().unwrap_or_default();
+                                    let kept: HashSet<String> =
+                                        calls.iter().filter_map(|c| c.id.clone()).collect();
+                                    let removed = original
+                                        .iter()
+                                        .filter(|o| !kept.contains(&o.id))
+                                        .map(|o| o.function.name.clone())
+                                        .collect();
+                                    response.tool_calls = rebuild_tool_calls(original, calls);
+                                    removed
+                                }
+                                None => Vec::new(),
+                            };
+                            // A rewrite that leaves neither text nor tool calls would persist an
+                            // empty assistant message (rejected by Anthropic for the rest of the
+                            // chat) or end the turn with a blank answer: send it back instead.
+                            if response.content.trim().is_empty()
+                                && response.tool_calls.as_ref().is_none_or(|c| c.is_empty())
+                            {
+                                post_model_retries += 1;
+                                let feedback = if removed_calls.is_empty() {
+                                    "a post_model hook removed the whole response".to_string()
+                                } else {
+                                    format!(
+                                        "a post_model hook removed your tool call(s): {}",
+                                        removed_calls.join(", ")
+                                    )
+                                };
+                                if post_model_retries <= MAX_POST_MODEL_RETRIES {
+                                    mem.add_message(crate::utils::ChatMessage::user(&format!(
+                                        "[post_model hook] Your previous response was discarded: {feedback}. Continue without it."
+                                    )))
+                                    .await
+                                    .map_err(ReasoningLoopError::persistence)?;
+                                    continue;
+                                }
+                                return Err(ReasoningLoopError::protocol(format!(
+                                    "post_model hook rejected {post_model_retries} responses in a row: {feedback}"
+                                )));
+                            }
+                            post_model_retries = 0;
+                        }
+                    }
+                }
+            }
+
             let response_text = response.content.clone();
             let mut tool_invoked = false;
 
@@ -1906,8 +2089,8 @@ impl AgentLogic {
                             is_error,
                         );
                         if let Some(app) = mcp_app.as_ref() {
-                            stored_tool =
-                                stored_tool.with_mcp_app(app.view_id.clone(), app.resource_uri.clone());
+                            stored_tool = stored_tool
+                                .with_mcp_app(app.view_id.clone(), app.resource_uri.clone());
                         }
                         mem.add_message(stored_tool)
                             .await
@@ -2042,8 +2225,8 @@ impl AgentLogic {
                             is_error,
                         );
                         if let Some(app) = mcp_app.as_ref() {
-                            stored_tool =
-                                stored_tool.with_mcp_app(app.view_id.clone(), app.resource_uri.clone());
+                            stored_tool = stored_tool
+                                .with_mcp_app(app.view_id.clone(), app.resource_uri.clone());
                         }
                         mem.add_message(stored_tool)
                             .await
@@ -2367,5 +2550,88 @@ mod context_hardening_tests {
         assert!(!context
             .iter()
             .any(|message| message.role == "assistant" && message.tool_calls.is_some()));
+    }
+}
+
+#[cfg(test)]
+mod post_model_tool_call_tests {
+    use super::*;
+
+    fn call(
+        id: &str,
+        name: &str,
+        extra: Option<serde_json::Value>,
+    ) -> crate::utils::ToolCallRequest {
+        crate::utils::ToolCallRequest {
+            id: id.into(),
+            tool_type: "function".into(),
+            extra_content: extra,
+            function: crate::utils::ToolCallFunction {
+                name: name.into(),
+                arguments: "{}".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn rebuild_keeps_provider_extras_and_mints_ids() {
+        let original = vec![call("a", "exec", Some(serde_json::json!({"sig": "x"})))];
+        let rebuilt = rebuild_tool_calls(
+            original,
+            vec![
+                HookToolCall {
+                    id: Some("a".into()),
+                    name: "exec".into(),
+                    arguments: serde_json::json!({"command": "ls"}),
+                },
+                HookToolCall {
+                    id: None,
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({"path": "x"}),
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            rebuilt[0].extra_content,
+            Some(serde_json::json!({"sig": "x"}))
+        );
+        assert_eq!(rebuilt[0].function.arguments, r#"{"command":"ls"}"#);
+        assert!(rebuilt[1].id.starts_with("hook_"));
+        assert!(rebuilt[1].extra_content.is_none());
+    }
+
+    #[test]
+    fn rebuild_replaces_bad_and_duplicate_ids_and_signs_for_gemini() {
+        let original = vec![call(
+            "a",
+            "exec",
+            Some(serde_json::json!({"thought_signature": "s"})),
+        )];
+        let hc = |id: Option<&str>| HookToolCall {
+            id: id.map(str::to_string),
+            name: "read_file".into(),
+            arguments: serde_json::json!({}),
+        };
+        let rebuilt = rebuild_tool_calls(
+            original,
+            vec![hc(Some("a")), hc(Some("a")), hc(Some("a.b")), hc(Some(""))],
+        )
+        .unwrap();
+        let ids: HashSet<&str> = rebuilt.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids.len(), 4, "ids must be unique: {rebuilt:?}");
+        assert_eq!(rebuilt[0].id, "a");
+        for c in &rebuilt[1..] {
+            assert!(c.id.starts_with("hook_"), "{c:?}");
+            assert_eq!(
+                c.extra_content,
+                Some(serde_json::json!({"thought_signature": "skip_thought_signature_validator"}))
+            );
+        }
+    }
+
+    #[test]
+    fn empty_update_removes_all_calls() {
+        assert!(rebuild_tool_calls(vec![call("a", "exec", None)], vec![]).is_none());
     }
 }
