@@ -284,6 +284,12 @@ pub struct HarnessHooksSteeringConfig {
     pub pre_tool: Option<Vec<HarnessHookCommandConfig>>,
     pub post_tool: Option<Vec<HarnessHookCommandConfig>>,
     pub user_prompt: Option<Vec<HarnessHookCommandConfig>>,
+    /// Runs after each provider response, before it is persisted or any tool call starts.
+    /// Hooks may rewrite the assistant text / tool calls, send feedback, or stop the turn.
+    pub post_model: Option<Vec<HarnessHookCommandConfig>>,
+    /// Agent Plugins whose `hooks.json` may run (plugin names; `"*"` = every plugin). Plugin hooks
+    /// execute code from the plugin, so they are off unless listed here.
+    pub plugin_hooks: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -294,6 +300,11 @@ pub struct HarnessHookCommandConfig {
     pub timeout_ms: Option<u64>,
     /// Sandbox-relative working directory for the hook subprocess.
     pub cwd: Option<String>,
+    /// What to do when the hook itself fails (spawn error, timeout, non-zero exit other than 2,
+    /// unparseable stdout): `"proceed"` (default, fail-open) or `"block"` (fail-closed).
+    /// Policy hooks should use `"block"`. Ignored for `post_tool`, whose failures are reported
+    /// to the model as verification output.
+    pub on_error: Option<String>,
 }
 
 /// Lifecycle hooks for observability and policy (`[harness.hooks]`).

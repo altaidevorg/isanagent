@@ -858,6 +858,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         &workspace.dir,
         &workspace.sandbox_dir,
         harness_ref,
+        Some(&plugins),
     );
 
     // Prepare startup visual references before we move the structs

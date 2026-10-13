@@ -16,3 +16,4 @@ test_altbot2
 !ui/tsconfig.json
 .venv
 __pycache__
+!examples/**/*.json

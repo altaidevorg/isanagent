@@ -1,0 +1,26 @@
+# --- isanagent hooks v2 manual test (added by examples/hooks-v2-manual-test/setup.sh) ---
+# Audit trail: every effective hook decision is written here as a HookDecision event.
+[harness.hooks.observation]
+enabled = true
+jsonl_path = "workspace/hooks-test/audit.jsonl"
+
+[harness.hooks.steering]
+enabled = true
+default_timeout_ms = 5000
+# Plugin hooks only run for plugins listed here (the kit installs hooktest-guard).
+plugin_hooks = ["hooktest-guard"]
+
+[[harness.hooks.steering.user_prompt]]
+command = "python3 hooks-test/hooktest.py user_prompt"
+
+[[harness.hooks.steering.pre_tool]]
+command = "python3 hooks-test/hooktest.py pre_tool"
+# Fail-closed: if this hook crashes, the tool call is blocked (see scenario crash_pre_tool).
+on_error = "block"
+
+[[harness.hooks.steering.post_tool]]
+command = "python3 hooks-test/hooktest.py post_tool"
+
+[[harness.hooks.steering.post_model]]
+command = "python3 hooks-test/hooktest.py post_model"
+# --- end hooks v2 manual test ---
