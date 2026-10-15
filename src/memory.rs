@@ -688,6 +688,11 @@ pub enum MemoryMessage {
         limit: usize,
         reply: SharedReply<Result<Vec<SubagentTaskRecord>, String>>,
     },
+    /// Newest sub-agent tasks across chats, for the work drawer.
+    ListRecentSubagentTasks {
+        limit: usize,
+        reply: SharedReply<Result<Vec<SubagentTaskRecord>, String>>,
+    },
     /// Root `messages.thread_id` rows for a channel prefix (e.g. `terminal` → `terminal:…`), with previews.
     ListRootThreadsForChannelWithPreviews {
         channel: String,
@@ -1820,6 +1825,45 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                         .map_err(|e| e.to_string())?;
                     let rows = stmt
                         .query_map(params![parent_chat_id, lim], |row| {
+                            Ok(SubagentTaskRecord {
+                                task_id: row.get(0)?,
+                                parent_chat_id: row.get(1)?,
+                                child_chat_id: row.get(2)?,
+                                display_name: row.get(3)?,
+                                agent_name: row.get(4)?,
+                                prompt: row.get(5)?,
+                                status: row.get(6)?,
+                                result: row.get(7)?,
+                                error: row.get(8)?,
+                                execution_job_id: row.get(9)?,
+                                created_at_ms: row.get(10)?,
+                                updated_at_ms: row.get(11)?,
+                            })
+                        })
+                        .map_err(|e| e.to_string())?;
+                    let mut out = Vec::new();
+                    for r in rows {
+                        out.push(r.map_err(|e| e.to_string())?);
+                    }
+                    Ok(out)
+                })();
+                let _ = reply.send(res);
+            }
+            MemoryMessage::ListRecentSubagentTasks { limit, reply } => {
+                let res = (|| -> Result<Vec<SubagentTaskRecord>, String> {
+                    let lim = limit.clamp(1, 200) as i64;
+                    let mut stmt = self
+                        .conn
+                        .prepare(
+                            "SELECT task_id, parent_chat_id, child_chat_id, display_name, agent_name, prompt,
+                                    status, result, error, execution_job_id, created_at_ms, updated_at_ms
+                             FROM subagent_tasks
+                             ORDER BY updated_at_ms DESC
+                             LIMIT ?1",
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let rows = stmt
+                        .query_map(params![lim], |row| {
                             Ok(SubagentTaskRecord {
                                 task_id: row.get(0)?,
                                 parent_chat_id: row.get(1)?,

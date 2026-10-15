@@ -96,7 +96,7 @@ Sub-agents (`subagent_spawn`, `task_*`, `subagent_plan_execute`, `task_history_l
 
 **Authoritative Session Projections** (`src/projections.rs`): `SessionProjection` provides structured snapshots (`todos`, `subagents`, `jobs`, `run_status`) emitted over the actor bus, allowing frontend clients like `altai-app` to treat client stores as disposable projections of server truth.
 
-**Native LLM Streaming** (`src/traits.rs`): `Provider::stream` sends typed `StreamChunk` events (`TextDelta`, `ReasoningDelta`, `ToolCallDelta`, `Usage`, `Finish`) and emits `BusMessage::StreamDelta` for real-time frontend rendering.
+**Native LLM Streaming** (`src/traits.rs`): `Provider::stream` sends typed `StreamChunk` events (`TextDelta`, `ReasoningDelta`, `ToolCallDelta`, `Usage`, `Finish`). The reasoning loop calls `stream` (OpenAI-compatible, Gemini `streamGenerateContent`, and Anthropic Messages all stream; other providers fall back to one delta after `chat`). For API chats, text deltas are forwarded as `BusMessage::StreamDelta` and the web UI appends them to the in-flight assistant bubble (`text_delta` SSE; `text_reset` drops a failed attempt). A retry that already showed partial text clears that draft. The composer stays editable during a turn; Enter queues the next message.
 
 ### Structured LLM Extraction
 If you are asking the LLM to yield a structured JSON payload internally (e.g. for reflection or summarization outside of the standard `ToolCall` registry):

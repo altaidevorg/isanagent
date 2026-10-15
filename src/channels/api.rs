@@ -116,6 +116,12 @@ enum StreamEvent {
     AgentThought {
         thought: String,
     },
+    /// Incremental assistant text for the in-flight turn.
+    TextDelta {
+        text: String,
+    },
+    /// Drop the current model attempt's text (a retry started after a partial stream).
+    TextReset,
     Completion {
         content: String,
         thread_id: String,
@@ -788,6 +794,33 @@ impl ApiChannel {
             _ => {}
         }
     }
+
+    /// Forward one provider stream chunk to the open `/v1/responses` SSE stream.
+    pub async fn handle_stream_chunk(&self, chat_id: &str, chunk: &crate::traits::StreamChunk) {
+        let event = match chunk {
+            crate::traits::StreamChunk::TextDelta(text) if !text.is_empty() => {
+                StreamEvent::TextDelta { text: text.clone() }
+            }
+            crate::traits::StreamChunk::Finish(crate::traits::FinishReason::Other(reason))
+                if reason == "discard_partial" =>
+            {
+                StreamEvent::TextReset
+            }
+            _ => return,
+        };
+        let tx = {
+            let Some(pending) = self.pending_requests.get(chat_id) else {
+                return;
+            };
+            let PendingRequest::Stream(pending) = pending.value() else {
+                return;
+            };
+            pending.stream_tx.clone()
+        };
+        if let Err(e) = tx.send(event).await {
+            error!("Failed to send text delta to stream: {e}");
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -854,6 +887,7 @@ fn build_router(state: ApiState, serve_ui: bool) -> Router {
         .route("/v1/summaries/{id}", delete(handle_delete_summary))
         .route("/v1/chat/cancel/{chat_id}", post(handle_cancel_chat))
         .route("/v1/background-jobs", get(handle_list_background_jobs))
+        .route("/v1/subagent-tasks", get(handle_list_subagent_tasks))
         .route(
             "/v1/background-jobs/{job_id}/dismiss",
             post(handle_background_job_dismiss),
@@ -1263,7 +1297,7 @@ async fn handle_select_model(
     }
 
     catalog.set_active_key(prepared.key.clone());
-    catalog.note_provider_key(&prepared.provider_name);
+    catalog.note_provider_key(&prepared.provider_name, &prepared.api_key);
     if let Err(error) = crate::channels::model_settings::persist_active_model_key(
         &catalog.workspace_dir,
         &prepared.key,
@@ -1573,7 +1607,7 @@ async fn handle_responses(
     };
 
     if stream_requested {
-        let (stream_tx, mut stream_rx) = mpsc::channel(100);
+        let (stream_tx, mut stream_rx) = mpsc::channel(512);
         match state.pending_requests.entry(conv_thread_id.clone()) {
             Entry::Occupied(_) => {
                 return ApiError::new(
@@ -2883,6 +2917,29 @@ async fn handle_list_background_jobs(
     })
     .await;
 
+    match res {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct SubagentTasksQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+async fn handle_list_subagent_tasks(
+    State(state): State<ApiState>,
+    Query(params): Query<SubagentTasksQuery>,
+) -> Response {
+    let res = memory_request(&state.memory_node, |reply| {
+        MemoryMessage::ListRecentSubagentTasks {
+            limit: params.limit.unwrap_or(50),
+            reply,
+        }
+    })
+    .await;
     match res {
         Ok(rows) => Json(rows).into_response(),
         Err(e) => e.into_response(),

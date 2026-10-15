@@ -22,7 +22,8 @@ use super::budget::{
 };
 use super::doom_loop;
 use super::failover::{
-    build_llm_failed_banner, chat_with_retry, ChatRetryOutcome, FailoverLogCtx, RunProviderContext,
+    build_llm_failed_banner, chat_with_retry, is_discard_partial, ChatRetryOutcome, FailoverLogCtx,
+    RunProviderContext,
 };
 use super::steering::{steering_guard, SteeringInbox};
 use super::tool_dispatch::{
@@ -48,6 +49,7 @@ use crate::skills::SharedSkillRegistry;
 use crate::tool_activity::SharedToolExecutionActivity;
 use crate::tool_runtime::ToolExecCtx;
 use crate::tools::ToolRegistry;
+use crate::traits::StreamChunk;
 use crate::traits::{Memory, ToolErrorCode, ToolResult};
 use crate::NodeHandle;
 
@@ -1550,7 +1552,28 @@ impl AgentLogic {
                 tools.list_tools_scoped(subagent_allowlist.as_deref(), is_subagent)
             ));
 
-            let (response, provider_retries) = match chat_with_retry(
+            let (delta_tx, mut delta_rx) = mpsc::channel(256);
+            let delta_chat = inbound.chat_id.clone();
+            let delta_channel = inbound.channel.clone();
+            let delta_bus = outbound_tx.clone();
+            let delta_forward = tokio::spawn(async move {
+                while let Some(chunk) = delta_rx.recv().await {
+                    if delta_channel != "api" {
+                        continue;
+                    }
+                    let visible = matches!(&chunk, StreamChunk::TextDelta(text) if !text.is_empty())
+                        || is_discard_partial(&chunk);
+                    if visible {
+                        let _ = delta_bus
+                            .send(BusMessage::StreamDelta {
+                                chat_id: delta_chat.clone(),
+                                chunk,
+                            })
+                            .await;
+                    }
+                }
+            });
+            let outcome = chat_with_retry(
                 provider.as_ref(),
                 &context,
                 tools_payload,
@@ -1561,9 +1584,12 @@ impl AgentLogic {
                     name: &name,
                     chat_id: &inbound.chat_id,
                 },
+                &delta_tx,
             )
-            .await
-            {
+            .await;
+            drop(delta_tx);
+            let _ = delta_forward.await;
+            let (response, provider_retries) = match outcome {
                 ChatRetryOutcome::Ok { response, retries } => (response, retries),
                 ChatRetryOutcome::Cancelled => {
                     persist_and_cancel!();

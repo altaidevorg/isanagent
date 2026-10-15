@@ -666,54 +666,42 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    let (provider_cfg, api_key, selected_model_key): (
-        Option<crate::config::ProviderConfig>,
-        Option<String>,
-        Option<String>,
-    ) = {
+    let (provider_cfg, api_key): (Option<crate::config::ProviderConfig>, Option<String>) = {
         // 0. Try remembered last model choice
         let mut found_remembered = None;
         if let Some(ref key_name) = remembered_key {
             if let Some(cfg) = expanded_providers.get(key_name) {
                 if let Ok(key) = cfg.resolve_api_key() {
-                    found_remembered = Some((cfg.clone(), key, key_name.clone()));
+                    found_remembered = Some((cfg.clone(), key));
                 }
             }
         }
-        if let Some((cfg, key, selected)) = found_remembered {
-            (Some(cfg), Some(key), Some(selected))
+        if let Some((cfg, key)) = found_remembered {
+            (Some(cfg), Some(key))
         }
         // 1. Try default [provider]
         else if let Ok(key) = default_provider_cfg.resolve_api_key() {
-            let selected = format!(
-                "{}/{}",
-                default_provider_cfg.provider_name, default_provider_cfg.model_name
-            );
-            (
-                Some(default_provider_cfg.clone()),
-                Some(key),
-                Some(selected),
-            )
+            (Some(default_provider_cfg.clone()), Some(key))
         } else {
             // 2. Try any expanded [providers.*] entry — in deterministic (sorted) key
             // order (audit R4): HashMap iteration order is randomized per process,
             // which made the "first entry with a key" fallback vary across restarts.
             let mut sorted_ids: Vec<&String> = expanded_providers.keys().collect();
             sorted_ids.sort();
-            let mut found: Option<(crate::config::ProviderConfig, String, String)> = None;
+            let mut found: Option<(crate::config::ProviderConfig, String)> = None;
             for id in sorted_ids {
                 if let Some(cfg) = expanded_providers.get(id.as_str()) {
                     if let Ok(key) = cfg.resolve_api_key() {
-                        found = Some((cfg.clone(), key, id.clone()));
+                        found = Some((cfg.clone(), key));
                         break;
                     }
                 }
             }
-            if let Some((cfg, key, selected)) = found {
-                (Some(cfg), Some(key), Some(selected))
+            if let Some((cfg, key)) = found {
+                (Some(cfg), Some(key))
             } else {
                 // No key anywhere — start without one (NoKeyProvider)
-                (None, None, None)
+                (None, None)
             }
         }
     };
@@ -1114,12 +1102,9 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             .with_model_catalog(crate::channels::model_settings::ModelCatalog::new(
                 workspace.dir.clone(),
                 model_catalog_providers.clone(),
-                selected_model_key.clone().or_else(|| {
-                    remembered_key
-                        .as_ref()
-                        .filter(|key| model_catalog_providers.contains_key(key.as_str()))
-                        .cloned()
-                }),
+                // Active in settings is chosen in this process. A previous run's
+                // last_model file must not keep a model marked Active after restart.
+                None,
             ))
             .with_config_path(
                 logging_config_override
@@ -1481,6 +1466,13 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                     if let Some(api_chan) = delivery_channels.get("api") {
                         if let Some(api_chan) = api_chan.as_any().downcast_ref::<ApiChannel>() {
                             api_chan.handle_telemetry(tel.clone()).await;
+                        }
+                    }
+                }
+                BusMessage::StreamDelta { chat_id, chunk } => {
+                    if let Some(api_chan) = delivery_channels.get("api") {
+                        if let Some(api_chan) = api_chan.as_any().downcast_ref::<ApiChannel>() {
+                            api_chan.handle_stream_chunk(chat_id, chunk).await;
                         }
                     }
                 }

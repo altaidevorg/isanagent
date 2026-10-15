@@ -1,7 +1,7 @@
 use crate::traits::Provider;
 use crate::utils::{
-    build_reqwest_client, ChatMessage, ContentPart, Document, LLMClient, LLMError, LLMResponse,
-    MessageContent, TokenUsage, ToolCallFunction, ToolCallRequest,
+    build_gemini_client, build_reqwest_client, ChatMessage, ContentPart, Document, LLMClient,
+    LLMError, LLMResponse, MessageContent, TokenUsage, ToolCallFunction, ToolCallRequest,
 };
 
 /// Live credentials for the active LLM session (updated on `/model` switch).
@@ -78,8 +78,17 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use log::debug;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// How long to wait for `streamGenerateContent` to send response headers.
+/// The SSE call is abandoned after this and the unary endpoint is used.
+const GEMINI_STREAM_HEADER_WAIT: Duration = Duration::from_secs(30);
+/// Silence allowed between SSE chunks once the stream has started.
+const GEMINI_STREAM_IDLE: Duration = Duration::from_secs(60);
+/// `generateContent` may think for a while before the body arrives.
+const GEMINI_UNARY_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Placeholder provider used when no API key is configured at startup.
 /// Returns an error directing the user to configure a key or use `/model`.
@@ -217,6 +226,42 @@ impl Provider for OpenAIProvider {
     ) -> Result<LLMResponse, LLMError> {
         let messages = messages_with_document_text_fallback(messages);
         self.client.chat(&messages, tools).await
+    }
+
+    async fn stream(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<serde_json::Value>,
+        sink: tokio::sync::mpsc::Sender<crate::traits::StreamChunk>,
+    ) -> Result<LLMResponse, LLMError> {
+        let messages = messages_with_document_text_fallback(messages);
+        let client = self.client.clone();
+        let (text_tx, mut text_rx) = tokio::sync::mpsc::channel(64);
+        let produce =
+            tokio::spawn(async move { client.chat_stream(&messages, tools, &text_tx).await });
+        relay_text_deltas(&mut text_rx, &sink).await;
+        match produce.await {
+            Ok(result) => result,
+            Err(error) => Err(LLMError::ApiError(format!("stream task failed: {error}"))),
+        }
+    }
+}
+
+/// Forward text deltas until the producer drops `text_tx`. A closed UI sink
+/// does not cancel the model call; remaining deltas are discarded.
+async fn relay_text_deltas(
+    text_rx: &mut tokio::sync::mpsc::Receiver<String>,
+    sink: &tokio::sync::mpsc::Sender<crate::traits::StreamChunk>,
+) {
+    while let Some(delta) = text_rx.recv().await {
+        if sink
+            .send(crate::traits::StreamChunk::TextDelta(delta))
+            .await
+            .is_err()
+        {
+            while text_rx.recv().await.is_some() {}
+            break;
+        }
     }
 }
 
@@ -433,15 +478,8 @@ impl GeminiProvider {
             .then(|| json!({"parts": [{"text": system_parts.join("\n\n")} ]}));
         (system, contents)
     }
-}
 
-#[async_trait]
-impl Provider for GeminiProvider {
-    async fn chat(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<Value>,
-    ) -> Result<LLMResponse, LLMError> {
+    fn request_body(&self, messages: &[ChatMessage], tools: Option<&Value>) -> Value {
         let (system_instruction, contents) = Self::convert_messages(messages);
         let mut body = json!({
             "contents": contents,
@@ -451,7 +489,7 @@ impl Provider for GeminiProvider {
             body["systemInstruction"] = system_instruction;
         }
         if let Some(tools) = tools {
-            let tools = Self::convert_tools(&tools);
+            let tools = Self::convert_tools(tools);
             if tools[0]["functionDeclarations"]
                 .as_array()
                 .is_some_and(|declarations| !declarations.is_empty())
@@ -459,18 +497,36 @@ impl Provider for GeminiProvider {
                 body["tools"] = tools;
             }
         }
+        body
+    }
 
-        // A new client each call. The shared pool kept a stalled connection, and
-        // the next chat — including New chat — waited on it until the process restarted.
-        let client = build_reqwest_client();
+    fn stream_url(&self) -> String {
+        let base = self
+            .base_url
+            .replacen(":generateContent", ":streamGenerateContent", 1);
+        format!("{base}?alt=sse")
+    }
+}
+
+#[async_trait]
+impl Provider for GeminiProvider {
+    async fn chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<Value>,
+    ) -> Result<LLMResponse, LLMError> {
+        let body = self.request_body(messages, tools.as_ref());
+
+        let client = build_gemini_client();
         let res = client
             .post(&self.base_url)
             .header("x-goog-api-key", &self.api_key)
             .header("Content-Type", "application/json")
-            .timeout(Duration::from_secs(45))
+            .timeout(GEMINI_UNARY_TIMEOUT)
             .json(&body)
             .send()
-            .await?;
+            .await
+            .map_err(gemini_http_error)?;
         let status = res.status();
         if !status.is_success() {
             let text = res.text().await.unwrap_or_default();
@@ -543,6 +599,243 @@ impl Provider for GeminiProvider {
             reasoning_content: None,
             usage,
         })
+    }
+
+    async fn stream(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<Value>,
+        sink: tokio::sync::mpsc::Sender<crate::traits::StreamChunk>,
+    ) -> Result<LLMResponse, LLMError> {
+        let body = self.request_body(messages, tools.as_ref());
+        let url = self.stream_url();
+        let api_key = self.api_key.clone();
+        let model = self.model.clone();
+        let emitted = Arc::new(AtomicBool::new(false));
+        let emitted_flag = Arc::clone(&emitted);
+        let (text_tx, mut text_rx) = tokio::sync::mpsc::channel(64);
+        let produce = tokio::spawn(async move {
+            gemini_stream_generate(&url, &api_key, &model, body, &text_tx, &emitted_flag).await
+        });
+        relay_text_deltas(&mut text_rx, &sink).await;
+        let streamed = match produce.await {
+            Ok(result) => result,
+            Err(error) => Err(LLMError::ApiError(format!("stream task failed: {error}"))),
+        };
+        match streamed {
+            Ok(response) => Ok(response),
+            Err(error) if emitted.load(Ordering::Relaxed) => Err(error),
+            Err(error) => match self.chat(messages, tools).await {
+                Ok(response) => {
+                    if !response.content.is_empty() {
+                        let _ = sink
+                            .send(crate::traits::StreamChunk::TextDelta(
+                                response.content.clone(),
+                            ))
+                            .await;
+                    }
+                    Ok(response)
+                }
+                Err(fallback) => Err(LLMError::ApiError(format!(
+                    "{error}; generateContent fallback failed: {fallback}"
+                ))),
+            },
+        }
+    }
+}
+
+fn gemini_http_error(error: reqwest::Error) -> LLMError {
+    let mut detail = error.to_string();
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        detail.push_str(": ");
+        detail.push_str(&cause.to_string());
+        source = std::error::Error::source(cause);
+    }
+    LLMError::ApiError(format!("HTTP Request Failed: {detail}"))
+}
+
+async fn gemini_stream_generate(
+    url: &str,
+    api_key: &str,
+    model: &str,
+    body: Value,
+    text_tx: &tokio::sync::mpsc::Sender<String>,
+    emitted: &AtomicBool,
+) -> Result<LLMResponse, LLMError> {
+    let client = build_gemini_client();
+    let pending = client
+        .post(url)
+        .header("x-goog-api-key", api_key)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send();
+    let mut res = match tokio::time::timeout(GEMINI_STREAM_HEADER_WAIT, pending).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => return Err(gemini_http_error(error)),
+        Err(_) => {
+            return Err(LLMError::ApiError(
+                "Gemini did not start a stream within 30s".into(),
+            ))
+        }
+    };
+    let status = res.status();
+    if !status.is_success() {
+        let text = res.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::BAD_REQUEST
+            && LLMError::looks_like_context_overflow(&text)
+        {
+            return Err(LLMError::ContextOverflow {
+                tokens_attempted: 0,
+                max: None,
+            });
+        }
+        return Err(LLMError::ApiError(crate::utils::format_api_error(
+            status.as_u16(),
+            &text,
+            url,
+            model,
+        )));
+    }
+
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut tool_calls = Vec::new();
+    let mut usage = None;
+    let mut line_buf = String::new();
+    let mut next_call = 0usize;
+    loop {
+        let next = match tokio::time::timeout(GEMINI_STREAM_IDLE, res.chunk()).await {
+            Ok(Ok(chunk)) => chunk,
+            Ok(Err(error)) => return Err(gemini_http_error(error)),
+            Err(_) => {
+                return Err(LLMError::ApiError(
+                    "Gemini stream stalled before the next chunk".into(),
+                ))
+            }
+        };
+        match next {
+            Some(bytes) => {
+                line_buf.push_str(&String::from_utf8_lossy(&bytes));
+                while let Some(idx) = line_buf.find('\n') {
+                    let line = line_buf[..idx].trim_end_matches('\r').trim().to_string();
+                    line_buf.drain(..=idx);
+                    if let Some(delta) = apply_gemini_sse_line(
+                        &line,
+                        &mut content,
+                        &mut reasoning,
+                        &mut tool_calls,
+                        &mut usage,
+                        &mut next_call,
+                    ) {
+                        if !delta.is_empty() {
+                            emitted.store(true, Ordering::Relaxed);
+                            let _ = text_tx.send(delta).await;
+                        }
+                    }
+                }
+            }
+            None => break,
+        }
+    }
+    let tail = line_buf.trim().to_string();
+    if let Some(delta) = apply_gemini_sse_line(
+        &tail,
+        &mut content,
+        &mut reasoning,
+        &mut tool_calls,
+        &mut usage,
+        &mut next_call,
+    ) {
+        if !delta.is_empty() {
+            emitted.store(true, Ordering::Relaxed);
+            let _ = text_tx.send(delta).await;
+        }
+    }
+    Ok(LLMResponse {
+        content,
+        tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+        reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
+        usage,
+    })
+}
+
+fn apply_gemini_sse_line(
+    line: &str,
+    content: &mut String,
+    reasoning: &mut String,
+    tool_calls: &mut Vec<ToolCallRequest>,
+    usage: &mut Option<TokenUsage>,
+    next_call: &mut usize,
+) -> Option<String> {
+    let data = line.strip_prefix("data:").unwrap_or(line).trim();
+    if data.is_empty() || data == "[DONE]" || data.starts_with("event:") {
+        return None;
+    }
+    if !data.starts_with('{') {
+        return None;
+    }
+    let response: Value = serde_json::from_str(data).ok()?;
+    if let Some(meta) = response.get("usageMetadata") {
+        *usage = Some(TokenUsage {
+            prompt_tokens: meta["promptTokenCount"].as_u64().unwrap_or(0) as u32,
+            completion_tokens: meta["candidatesTokenCount"].as_u64().unwrap_or(0) as u32,
+            total_tokens: meta["totalTokenCount"].as_u64().unwrap_or(0) as u32,
+            cache_read_tokens: meta["cachedContentTokenCount"].as_u64().unwrap_or(0) as u32,
+            cache_creation_tokens: 0,
+        });
+    }
+    let parts = response["candidates"][0]["content"]["parts"].as_array()?;
+    let mut delta = String::new();
+    for part in parts {
+        let is_thought = part.get("thought").and_then(Value::as_bool) == Some(true);
+        if let Some(text) = part.get("text").and_then(Value::as_str) {
+            if is_thought {
+                reasoning.push_str(text);
+            } else {
+                delta.push_str(text);
+                content.push_str(text);
+            }
+        }
+        if let Some(call) = part.get("functionCall") {
+            let name = call["name"].as_str().unwrap_or("unknown_tool").to_string();
+            let id = call["id"]
+                .as_str()
+                .map(str::to_string)
+                .filter(|id| !id.is_empty())
+                .unwrap_or_else(|| {
+                    *next_call += 1;
+                    format!("gemini_call_{}", *next_call - 1)
+                });
+            if tool_calls.iter().any(|existing| existing.id == id) {
+                continue;
+            }
+            let mut extra_content = serde_json::Map::new();
+            if let Some(signature) = part
+                .get("thoughtSignature")
+                .or_else(|| part.get("thought_signature"))
+            {
+                extra_content.insert("thought_signature".to_string(), signature.clone());
+            }
+            tool_calls.push(ToolCallRequest {
+                id,
+                tool_type: "function".to_string(),
+                extra_content: (!extra_content.is_empty()).then_some(Value::Object(extra_content)),
+                function: ToolCallFunction {
+                    name,
+                    arguments: call
+                        .get("args")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}))
+                        .to_string(),
+                },
+            });
+        }
+    }
+    if delta.is_empty() {
+        None
+    } else {
+        Some(delta)
     }
 }
 
@@ -789,6 +1082,44 @@ impl AnthropicProvider {
         }
         result
     }
+
+    fn request_body(&self, messages: &[ChatMessage], tools: Option<&Value>, stream: bool) -> Value {
+        let (system, anthropic_messages) = Self::convert_messages(&self.model, messages);
+        let mut body = json!({
+            "model": self.model,
+            "messages": anthropic_messages,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature
+        });
+        if stream {
+            body["stream"] = json!(true);
+        }
+        if let Some(system_text) = system {
+            // PR-6: mark the system block as cacheable so repeated summarizations
+            // (and any other repeat call within a ~5 min window) hit the prompt
+            // cache. Cache writes cost ~25% more on the first call; cache reads
+            // cost ~10% of normal input tokens, so break-even is one reuse — system
+            // prompts in a multi-turn agent reuse far more than that. Switching
+            // from `string` to a single-block array form is required because
+            // `cache_control` is a block-level marker.
+            body["system"] = json!([
+                {
+                    "type": "text",
+                    "text": system_text,
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ]);
+        }
+        if let Some(t) = tools {
+            let anthropic_tools = Self::convert_tools(t);
+            if let Some(arr) = anthropic_tools.as_array() {
+                if !arr.is_empty() {
+                    body["tools"] = anthropic_tools;
+                }
+            }
+        }
+        body
+    }
 }
 
 #[async_trait]
@@ -819,40 +1150,7 @@ impl Provider for AnthropicProvider {
             messages.len()
         );
 
-        let (system, anthropic_messages) = Self::convert_messages(&self.model, messages);
-
-        let mut body = json!({
-            "model": self.model,
-            "messages": anthropic_messages,
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature
-        });
-
-        if let Some(system_text) = system {
-            // PR-6: mark the system block as cacheable so repeated summarizations
-            // (and any other repeat call within a ~5 min window) hit the prompt
-            // cache. Cache writes cost ~25% more on the first call; cache reads
-            // cost ~10% of normal input tokens, so break-even is one reuse — system
-            // prompts in a multi-turn agent reuse far more than that. Switching
-            // from `string` to a single-block array form is required because
-            // `cache_control` is a block-level marker.
-            body["system"] = json!([
-                {
-                    "type": "text",
-                    "text": system_text,
-                    "cache_control": {"type": "ephemeral"}
-                }
-            ]);
-        }
-
-        if let Some(ref t) = tools {
-            let anthropic_tools = Self::convert_tools(t);
-            if let Some(arr) = anthropic_tools.as_array() {
-                if !arr.is_empty() {
-                    body["tools"] = anthropic_tools;
-                }
-            }
-        }
+        let body = self.request_body(messages, tools.as_ref(), false);
 
         let client = build_reqwest_client();
         let res = client
@@ -959,6 +1257,227 @@ impl Provider for AnthropicProvider {
             reasoning_content: None,
             usage,
         })
+    }
+
+    async fn stream(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<Value>,
+        sink: tokio::sync::mpsc::Sender<crate::traits::StreamChunk>,
+    ) -> Result<LLMResponse, LLMError> {
+        let body = self.request_body(messages, tools.as_ref(), true);
+        let url = self.base_url.clone();
+        let api_key = self.api_key.clone();
+        let model = self.model.clone();
+        let (text_tx, mut text_rx) = tokio::sync::mpsc::channel(64);
+        let produce = tokio::spawn(async move {
+            anthropic_stream_messages(&url, &api_key, &model, body, &text_tx).await
+        });
+        relay_text_deltas(&mut text_rx, &sink).await;
+        match produce.await {
+            Ok(result) => result,
+            Err(error) => Err(LLMError::ApiError(format!("stream task failed: {error}"))),
+        }
+    }
+}
+
+async fn anthropic_stream_messages(
+    url: &str,
+    api_key: &str,
+    model: &str,
+    body: Value,
+    text_tx: &tokio::sync::mpsc::Sender<String>,
+) -> Result<LLMResponse, LLMError> {
+    let client = build_reqwest_client();
+    let mut res = client
+        .post(url)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("Content-Type", "application/json")
+        .timeout(Duration::from_secs(120))
+        .json(&body)
+        .send()
+        .await?;
+    let status = res.status();
+    if !status.is_success() {
+        let text = res.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::BAD_REQUEST
+            && LLMError::looks_like_context_overflow(&text)
+        {
+            return Err(LLMError::ContextOverflow {
+                tokens_attempted: 0,
+                max: None,
+            });
+        }
+        return Err(LLMError::ApiError(crate::utils::format_api_error(
+            status.as_u16(),
+            &text,
+            url,
+            model,
+        )));
+    }
+
+    let mut acc = AnthropicStreamAcc::default();
+    let mut line_buf = String::new();
+    let mut event_name = String::new();
+    loop {
+        match res
+            .chunk()
+            .await
+            .map_err(|e| LLMError::ApiError(e.to_string()))?
+        {
+            Some(bytes) => {
+                line_buf.push_str(&String::from_utf8_lossy(&bytes));
+                while let Some(idx) = line_buf.find('\n') {
+                    let line = line_buf[..idx].trim_end_matches('\r').trim().to_string();
+                    line_buf.drain(..=idx);
+                    if let Some(delta) = acc.push_line(&mut event_name, &line) {
+                        if !delta.is_empty() {
+                            let _ = text_tx.send(delta).await;
+                        }
+                    }
+                }
+            }
+            None => break,
+        }
+    }
+    let tail = line_buf.trim().to_string();
+    if let Some(delta) = acc.push_line(&mut event_name, &tail) {
+        if !delta.is_empty() {
+            let _ = text_tx.send(delta).await;
+        }
+    }
+    Ok(acc.into_response())
+}
+
+#[derive(Default)]
+struct AnthropicStreamAcc {
+    content: String,
+    /// Parallel to content blocks. `kind` is text, tool_use, or thinking.
+    blocks: Vec<AnthropicStreamBlock>,
+    tool_calls: Vec<ToolCallRequest>,
+    input_tokens: u32,
+    output_tokens: u32,
+}
+
+struct AnthropicStreamBlock {
+    kind: String,
+    id: String,
+    name: String,
+    buf: String,
+}
+
+impl AnthropicStreamAcc {
+    fn push_line(&mut self, event_name: &mut String, line: &str) -> Option<String> {
+        if let Some(name) = line.strip_prefix("event:") {
+            *event_name = name.trim().to_string();
+            return None;
+        }
+        let Some(data) = line.strip_prefix("data:") else {
+            return None;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            return None;
+        }
+        let value: Value = serde_json::from_str(data).ok()?;
+        let kind = if event_name.is_empty() {
+            value["type"].as_str().unwrap_or("")
+        } else {
+            event_name.as_str()
+        };
+        self.apply_event(kind, &value)
+    }
+
+    fn apply_event(&mut self, kind: &str, value: &Value) -> Option<String> {
+        match kind {
+            "message_start" => {
+                let usage = &value["message"]["usage"];
+                self.input_tokens = usage["input_tokens"].as_u64().unwrap_or(0) as u32;
+                None
+            }
+            "content_block_start" => {
+                let block = &value["content_block"];
+                let block_kind = block["type"].as_str().unwrap_or("").to_string();
+                self.blocks.push(AnthropicStreamBlock {
+                    kind: block_kind,
+                    id: block["id"].as_str().unwrap_or("").to_string(),
+                    name: block["name"].as_str().unwrap_or("").to_string(),
+                    buf: String::new(),
+                });
+                None
+            }
+            "content_block_delta" => {
+                let index = value["index"].as_u64().unwrap_or(0) as usize;
+                let delta = &value["delta"];
+                match delta["type"].as_str() {
+                    Some("text_delta") => {
+                        let text = delta["text"].as_str().unwrap_or("");
+                        if let Some(block) = self.blocks.get_mut(index) {
+                            block.buf.push_str(text);
+                        }
+                        self.content.push_str(text);
+                        if text.is_empty() {
+                            None
+                        } else {
+                            Some(text.to_string())
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        if let Some(block) = self.blocks.get_mut(index) {
+                            block
+                                .buf
+                                .push_str(delta["partial_json"].as_str().unwrap_or(""));
+                        }
+                        None
+                    }
+                    _ => None,
+                }
+            }
+            "content_block_stop" => {
+                let index = value["index"].as_u64().unwrap_or(0) as usize;
+                if let Some(block) = self.blocks.get(index) {
+                    if block.kind == "tool_use" {
+                        let arguments = if block.buf.is_empty() {
+                            "{}".to_string()
+                        } else {
+                            block.buf.clone()
+                        };
+                        self.tool_calls.push(ToolCallRequest {
+                            id: block.id.clone(),
+                            tool_type: "function".to_string(),
+                            extra_content: None,
+                            function: ToolCallFunction {
+                                name: block.name.clone(),
+                                arguments,
+                            },
+                        });
+                    }
+                }
+                None
+            }
+            "message_delta" => {
+                self.output_tokens = value["usage"]["output_tokens"].as_u64().unwrap_or(0) as u32;
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn into_response(self) -> LLMResponse {
+        let usage = (self.input_tokens > 0 || self.output_tokens > 0).then_some(TokenUsage {
+            prompt_tokens: self.input_tokens,
+            completion_tokens: self.output_tokens,
+            total_tokens: self.input_tokens.saturating_add(self.output_tokens),
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        });
+        LLMResponse {
+            content: self.content,
+            tool_calls: (!self.tool_calls.is_empty()).then_some(self.tool_calls),
+            reasoning_content: None,
+            usage,
+        }
     }
 }
 
