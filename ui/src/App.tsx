@@ -8,6 +8,7 @@ import {
   type MouseEvent,
 } from "react";
 
+import { MarkdownMessage } from "@/components/MarkdownMessage";
 import { McpAppFrame, type McpAppRef } from "@/components/McpAppFrame";
 import { SettingsDialog } from "@/components/SettingsDialog";
 import { Button } from "@/components/ui/button";
@@ -129,6 +130,8 @@ type StreamEvent =
       mcp_app?: McpAppRef;
     }
   | { type: "agent_thought"; thought: string }
+  | { type: "text_delta"; text: string }
+  | { type: "text_reset" }
   | {
       type: "completion";
       content: string;
@@ -169,6 +172,16 @@ type BackgroundJob = {
   state: string;
   updated_at_ms: number;
 };
+
+type AgentTask = {
+  task_id: string;
+  display_name?: string | null;
+  agent_name?: string | null;
+  status: string;
+  updated_at_ms: number;
+};
+
+type WorkSection = "jobs" | "files" | "agents" | "memory";
 
 type NotificationItem = {
   notification_id: string;
@@ -555,31 +568,52 @@ function fileToDataUrl(file: File): Promise<string> {
   });
 }
 
+type QueuedSend = {
+  id: string;
+  text: string;
+  imageDataUrls: string[];
+};
+
 type ComposerProps = {
-  disabled: boolean;
+  inputLocked: boolean;
   pending: boolean;
+  queue: QueuedSend[];
   onStop: () => void;
+  onEnqueue: (payload: { text: string; imageDataUrls: string[] }) => void;
+  onRemoveQueued: (id: string) => void;
   onSubmit: (payload: { text: string; imageDataUrls: string[] }) => Promise<void>;
 };
 
-function Composer({ disabled: streamingResponse, pending, onStop, onSubmit }: ComposerProps) {
+function Composer({
+  inputLocked,
+  pending,
+  queue,
+  onStop,
+  onEnqueue,
+  onRemoveQueued,
+  onSubmit,
+}: ComposerProps) {
   const [draft, setDraft] = useState("");
   const [attachments, setAttachments] = useState<{ id: string; url: string; name: string }[]>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const submit = async () => {
     const trimmed = draft.trim();
-    if ((!trimmed && attachments.length === 0) || streamingResponse) {
+    if (inputLocked || (!trimmed && attachments.length === 0)) {
       return;
     }
     const urls = attachments.map((a) => a.url);
     setDraft("");
     setAttachments([]);
+    if (pending) {
+      onEnqueue({ text: trimmed, imageDataUrls: urls });
+      return;
+    }
     await onSubmit({ text: trimmed, imageDataUrls: urls });
   };
 
   const onPickFiles = async (list: FileList | null) => {
-    if (!list?.length || streamingResponse) {
+    if (!list?.length || inputLocked) {
       return;
     }
     const imageFiles = Array.from(list).filter((f) => f.type.startsWith("image/"));
@@ -600,6 +634,39 @@ function Composer({ disabled: streamingResponse, pending, onStop, onSubmit }: Co
 
   return (
     <div className="rounded-xl border border-border bg-card p-4 shadow-focus-soft">
+      {queue.length > 0 ? (
+        <div className="mb-3 space-y-2">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.05em] text-muted-foreground">
+            Queued · {queue.length}
+          </p>
+          <ol className="space-y-2">
+            {queue.map((item, index) => (
+              <li
+                className="flex items-start gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2"
+                key={item.id}
+              >
+                <span className="mt-0.5 w-4 shrink-0 text-xs tabular-nums text-muted-foreground">
+                  {index + 1}
+                </span>
+                <p className="min-w-0 flex-1 whitespace-pre-wrap text-sm text-foreground line-clamp-3">
+                  {item.text || "Image"}
+                  {item.imageDataUrls.length > 0
+                    ? ` · ${item.imageDataUrls.length} image${item.imageDataUrls.length === 1 ? "" : "s"}`
+                    : ""}
+                </p>
+                <button
+                  aria-label="Remove from queue"
+                  className="shrink-0 rounded px-1 text-sm leading-none text-muted-foreground hover:bg-accent hover:text-foreground"
+                  type="button"
+                  onClick={() => onRemoveQueued(item.id)}
+                >
+                  ×
+                </button>
+              </li>
+            ))}
+          </ol>
+        </div>
+      ) : null}
       {attachments.length > 0 ? (
         <div className="mb-3 flex flex-wrap gap-2">
           {attachments.map((a) => (
@@ -610,7 +677,7 @@ function Composer({ disabled: streamingResponse, pending, onStop, onSubmit }: Co
               <img alt="" className="h-full w-full object-cover" src={a.url} />
               <button
                 className="absolute right-0.5 top-0.5 rounded bg-background/90 px-1 text-[10px] font-medium text-foreground shadow"
-                disabled={streamingResponse}
+                disabled={inputLocked}
                 type="button"
                 onClick={() => setAttachments((prev) => prev.filter((x) => x.id !== a.id))}
               >
@@ -629,7 +696,12 @@ function Composer({ disabled: streamingResponse, pending, onStop, onSubmit }: Co
             void submit();
           }
         }}
-        placeholder="Message isanagent (images: attach below). Shift+Enter for newline."
+        disabled={inputLocked}
+        placeholder={
+          pending
+            ? "Type the next message. Enter queues it."
+            : "Message isanagent (images: attach below). Shift+Enter for newline."
+        }
         value={draft}
       />
       <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
@@ -643,7 +715,7 @@ function Composer({ disabled: streamingResponse, pending, onStop, onSubmit }: Co
             onChange={(e) => void onPickFiles(e.target.files)}
           />
           <Button
-            disabled={streamingResponse}
+            disabled={inputLocked}
             size="sm"
             type="button"
             variant="outline"
@@ -652,7 +724,11 @@ function Composer({ disabled: streamingResponse, pending, onStop, onSubmit }: Co
             Add images
           </Button>
           <p className="text-xs text-muted-foreground">
-            {streamingResponse ? "Waiting for response…" : "JPEG, PNG, GIF, WebP · up to 8"}
+            {queue.length > 0
+              ? "Sends in this order when the current reply finishes."
+              : pending
+                ? "You can keep typing. Enter adds the message to the queue."
+                : "JPEG, PNG, GIF, WebP · up to 8"}
           </p>
         </div>
         <div className="flex gap-2">
@@ -666,10 +742,10 @@ function Composer({ disabled: streamingResponse, pending, onStop, onSubmit }: Co
             </Button>
           )}
           <Button
-            disabled={streamingResponse || (draft.trim().length === 0 && attachments.length === 0)}
+            disabled={inputLocked || (draft.trim().length === 0 && attachments.length === 0)}
             onClick={() => void submit()}
           >
-            {streamingResponse ? "Working…" : "Send"}
+            {pending ? "Queue" : "Send"}
           </Button>
         </div>
       </div>
@@ -690,9 +766,10 @@ export default function App() {
   const [sessions, setSessions] = useState<ThreadListEntry[]>([]);
   const [sidebarHints, setSidebarHints] = useState<Record<string, string>>(loadSidebarHints);
   const [sessionToDelete, setSessionToDelete] = useState<ThreadListEntry | null>(null);
-  const [showSummaries, setShowSummaries] = useState(false);
-  const [showWorkspaceModal, setShowWorkspaceModal] = useState(false);
-  const [showBackgroundPanel, setShowBackgroundPanel] = useState(false);
+  const [workOpen, setWorkOpen] = useState(false);
+  const [workSection, setWorkSection] = useState<WorkSection>("jobs");
+  const [memoryOpen, setMemoryOpen] = useState(false);
+  const [agents, setAgents] = useState<AgentTask[]>([]);
   const [showSettings, setShowSettings] = useState(false);
   const [activeModelLabel, setActiveModelLabel] = useState<string | null>(null);
   const [workspacePaneNonce, setWorkspacePaneNonce] = useState(0);
@@ -709,7 +786,15 @@ export default function App() {
 
   const dialogInputRef = useRef<HTMLInputElement>(null);
   const pendingRef = useRef(false);
-  const queuedUiMessages = useRef<string[]>([]);
+  const queuedSends = useRef<QueuedSend[]>([]);
+  const [queue, setQueue] = useState<QueuedSend[]>([]);
+  const replaceQueue = (next: QueuedSend[]) => {
+    queuedSends.current = next;
+    setQueue(next);
+  };
+  const [liveText, setLiveText] = useState("");
+  const narrationRef = useRef("");
+  const draftRef = useRef("");
 
   const showConfirm = (title: string, message: string, onConfirm: () => void) => {
     setDialogConfig({
@@ -833,14 +918,14 @@ export default function App() {
       void loadHistory(targetId);
       void loadSummaries(targetId);
     }
-    setShowBackgroundPanel(false);
   }, [sessions, loadHistory, loadSummaries]);
 
   const loadBackgroundData = useCallback(async () => {
     try {
-      const [jobsRes, notifRes] = await Promise.all([
+      const [jobsRes, notifRes, agentRes] = await Promise.all([
         fetch("/v1/background-jobs?limit=100"),
         fetch("/v1/notifications?limit=100"),
+        fetch("/v1/subagent-tasks?limit=50"),
       ]);
       if (jobsRes.ok) {
         setJobs((await jobsRes.json()) as BackgroundJob[]);
@@ -848,10 +933,19 @@ export default function App() {
       if (notifRes.ok) {
         setNotifications((await notifRes.json()) as NotificationItem[]);
       }
+      if (agentRes.ok) {
+        setAgents((await agentRes.json()) as AgentTask[]);
+      }
     } catch {
       // keep UI best-effort
     }
   }, []);
+
+  useEffect(() => {
+    void loadBackgroundData();
+    const id = window.setInterval(() => void loadBackgroundData(), 20000);
+    return () => window.clearInterval(id);
+  }, [loadBackgroundData]);
 
   const replyToTicket = async (ticketId: string, response: string) => {
     try {
@@ -984,6 +1078,13 @@ export default function App() {
     endOfMessagesRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages.length, pending]);
 
+  useEffect(() => {
+    if (!liveText) {
+      return;
+    }
+    endOfMessagesRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
+  }, [liveText]);
+
   const startNewConversation = () => {
     // Drop the turn that is still waiting on the model. Otherwise the new
     // conversation sits behind that request and looks frozen.
@@ -1073,6 +1174,10 @@ export default function App() {
     setPending(false);
     setCurrentStep(null);
     setCurrentToolCalls([]);
+    replaceQueue([]);
+    narrationRef.current = "";
+    draftRef.current = "";
+    setLiveText("");
 
     const chatToCancel = cancelChatIdRef.current ?? internalChatId;
     if (!chatToCancel) {
@@ -1124,7 +1229,6 @@ export default function App() {
     abortControllerRef.current = controller;
 
     let previousResponseId: string | undefined = latestResponseId ?? undefined;
-    let turnCompleted = false;
 
     try {
       const response = await fetch("/v1/responses", {
@@ -1187,7 +1291,23 @@ export default function App() {
               case "agent_thought":
                 setCurrentStep(`Thinking: ${event.thought}`);
                 break;
+              case "text_delta":
+                draftRef.current += event.text;
+                setLiveText(narrationRef.current + draftRef.current);
+                break;
+              case "text_reset":
+                draftRef.current = "";
+                setLiveText(narrationRef.current);
+                break;
               case "tool_call_started":
+                if (draftRef.current.trim()) {
+                  if (narrationRef.current && !narrationRef.current.endsWith("\n")) {
+                    narrationRef.current += "\n\n";
+                  }
+                  narrationRef.current += draftRef.current;
+                  draftRef.current = "";
+                  setLiveText(narrationRef.current);
+                }
                 currentToolCall = { tool_name: event.tool_name, args: event.args };
                 setCurrentStep(`Using tool: ${event.tool_name}`);
                 break;
@@ -1221,7 +1341,19 @@ export default function App() {
                   }
                   break;
                 }
-                assistantContent = event.content;
+                {
+                  const streamed = narrationRef.current + draftRef.current;
+                  if (streamed && event.content && streamed.includes(event.content)) {
+                    assistantContent = streamed;
+                  } else if (event.content) {
+                    assistantContent = event.content;
+                  } else {
+                    assistantContent = streamed;
+                  }
+                  narrationRef.current = "";
+                  draftRef.current = "";
+                  setLiveText("");
+                }
                 finalChatId = event.thread_id;
                 finalResponseId = event.response_id;
                 clarification = event.clarification;
@@ -1264,10 +1396,12 @@ export default function App() {
       }
 
       void loadSessions();
-      turnCompleted = true;
     } catch (error) {
       if (error instanceof Error && (error.name === "AbortError" || error.message.includes("aborted"))) {
-        queuedUiMessages.current = [];
+        replaceQueue([]);
+        narrationRef.current = "";
+        draftRef.current = "";
+        setLiveText("");
         return;
       }
       setMessages((prev) => prev.filter((m) => m.id !== optimisticId));
@@ -1285,13 +1419,23 @@ export default function App() {
       setPending(false);
       setCurrentStep(null);
       setCurrentToolCalls([]);
-      if (turnCompleted) {
-        const next = queuedUiMessages.current.shift();
-        if (next) {
-          void submitMessage({ text: next, imageDataUrls: [] });
-        }
+      narrationRef.current = "";
+      draftRef.current = "";
+      setLiveText("");
+      const next = queuedSends.current[0];
+      replaceQueue(queuedSends.current.slice(1));
+      if (next) {
+        void submitMessage({ text: next.text, imageDataUrls: next.imageDataUrls });
       }
     }
+  };
+
+  const enqueueSend = (payload: { text: string; imageDataUrls: string[] }) => {
+    replaceQueue([...queuedSends.current, { id: createId(), ...payload }]);
+  };
+
+  const removeQueued = (id: string) => {
+    replaceQueue(queuedSends.current.filter((item) => item.id !== id));
   };
 
   const deliverUiMessage = (text: string) => {
@@ -1300,11 +1444,18 @@ export default function App() {
       return;
     }
     if (pendingRef.current) {
-      queuedUiMessages.current.push(trimmed);
+      enqueueSend({ text: trimmed, imageDataUrls: [] });
       return;
     }
     void submitMessage({ text: trimmed, imageDataUrls: [] });
   };
+
+  const workCount =
+    jobs.filter((job) => job.state === "running" || job.state === "waiting").length +
+    notifications.filter(
+      (item) => !item.seen_at_ms || (item.kind === "clarification_ticket" && !item.resolved_at_ms),
+    ).length +
+    agents.filter((agent) => agent.status === "running").length;
 
   return (
     <div className="flex h-dvh overflow-hidden bg-background font-sans">
@@ -1348,188 +1499,6 @@ export default function App() {
           onClose={() => setShowSettings(false)}
           onActiveModel={setActiveModelLabel}
         />
-      ) : null}
-      {showBackgroundPanel ? (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="background-runtime-title"
-          onClick={(e) => {
-            if (e.target === e.currentTarget) {
-              setShowBackgroundPanel(false);
-            }
-          }}
-        >
-          <div className="flex h-full max-h-[85vh] w-full max-w-4xl flex-col rounded-2xl border border-border bg-card shadow-2xl overflow-hidden animate-in fade-in zoom-in duration-200">
-            <div className="flex items-center justify-between border-b border-border px-6 py-4 bg-muted/30">
-              <div className="flex items-center gap-3">
-                <div className="h-2 w-2 rounded-full bg-primary animate-pulse" />
-                <h2 id="background-runtime-title" className="text-lg font-semibold tracking-tight text-foreground">Background Runtime</h2>
-              </div>
-              <Button variant="ghost" size="sm" className="h-8 w-8 p-0 rounded-full" onClick={() => setShowBackgroundPanel(false)}>
-                ×
-              </Button>
-            </div>
-            <div className="flex flex-1 overflow-hidden">
-              {/* Jobs column */}
-              <div className="w-1/2 flex flex-col border-r border-border">
-                <div className="p-4 border-b border-border bg-muted/10">
-                  <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">Active Jobs</p>
-                </div>
-                <div className="flex-1 overflow-y-auto p-4 space-y-3">
-                  {jobs.length === 0 ? (
-                    <div className="flex h-full items-center justify-center text-muted-foreground text-sm italic">
-                      No active background jobs
-                    </div>
-                  ) : (
-                    jobs.map((job) => (
-                      <div 
-                        key={job.job_id} 
-                        className={cn(
-                          "group rounded-xl border border-border p-4 transition-all hover:bg-muted/50 cursor-pointer",
-                          job.state === "waiting" ? "border-yellow-500/50 bg-yellow-500/5 shadow-sm" : ""
-                        )}
-                        onClick={() => jumpToThread(job.chat_id)}
-                      >
-                        <div className="flex items-center justify-between mb-2">
-                          <span className="font-mono text-[10px] text-muted-foreground truncate max-w-[150px]">{job.job_id}</span>
-                          <span className={cn(
-                            "px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-tighter",
-                            job.state === "running" ? "bg-primary/20 text-primary animate-pulse" : 
-                            job.state === "waiting" ? "bg-yellow-500/20 text-yellow-600 dark:text-yellow-400" :
-                            "bg-muted text-muted-foreground"
-                          )}>
-                            {job.state}
-                          </span>
-                        </div>
-                        <p className="text-sm font-medium text-foreground">{job.kind}</p>
-                        <div className="mt-3 flex items-center justify-between">
-                          <div className="flex items-center gap-2">
-                            <span className="text-[10px] text-muted-foreground">Updated {new Date(job.updated_at_ms).toLocaleTimeString()}</span>
-                            <button 
-                              className="text-[10px] text-destructive hover:underline"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                showConfirm("Dismiss Job", "Dismiss this background job and all associated requests?", () => {
-                                  void dismissBackgroundJob(job.job_id);
-                                });
-                              }}
-                            >
-                              Dismiss
-                            </button>
-                          </div>
-                          <span className="text-[10px] text-primary opacity-0 group-hover:opacity-100 transition-opacity">View thread →</span>
-                        </div>
-                      </div>
-                    ))
-                  )}
-                </div>
-              </div>
-
-              {/* Notifications column */}
-              <div className="w-1/2 flex flex-col">
-                <div className="p-4 border-b border-border bg-muted/10">
-                  <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">Notifications</p>
-                </div>
-                <div className="flex-1 overflow-y-auto p-4 space-y-3">
-                  {notifications.length === 0 ? (
-                    <div className="flex h-full items-center justify-center text-muted-foreground text-sm italic">
-                      No notifications
-                    </div>
-                  ) : (
-                    notifications.map((n) => (
-                      <div 
-                        key={n.notification_id} 
-                        className={cn(
-                          "rounded-xl border border-border p-4 transition-all",
-                          !n.seen_at_ms ? "bg-primary/5 border-primary/30" : "bg-card",
-                          n.kind === "clarification_ticket" && !n.resolved_at_ms ? "border-yellow-500/50 shadow-sm" : ""
-                        )}
-                      >
-                        <div className="flex items-center justify-between mb-2">
-                          <span className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
-                            {n.kind.replace(/_/g, ' ')}
-                          </span>
-                          <span className="text-[10px] text-muted-foreground">{new Date(n.created_at_ms).toLocaleTimeString()}</span>
-                        </div>
-                        <h4 className="text-sm font-semibold text-foreground mb-1">{n.title}</h4>
-                        <p className="text-xs text-muted-foreground leading-relaxed mb-4">{n.body}</p>
-                        
-                        <div className="flex flex-wrap gap-2">
-                          {n.kind === "clarification_ticket" && !n.resolved_at_ms ? (
-                            <Button 
-                              size="sm" 
-                              className="h-7 text-[10px] font-bold uppercase tracking-widest bg-yellow-500 hover:bg-yellow-600 text-white border-0"
-                              onClick={() => {
-                                showPrompt("Reply to request", "Enter your response:", "", (reply) => {
-                                  if (reply.trim()) {
-                                    void replyToTicket(n.action_payload || "", reply.trim());
-                                  }
-                                });
-                              }}
-                            >
-                              Reply to request
-                            </Button>
-                          ) : null}
-                          <Button 
-                            variant="outline" 
-                            size="sm" 
-                            className="h-7 text-[10px] font-bold uppercase tracking-widest"
-                            onClick={() => jumpToThread(n.chat_id)}
-                          >
-                            View context
-                          </Button>
-                          {n.kind === "clarification_ticket" && !n.resolved_at_ms && (
-                            <Button 
-                              variant="ghost" 
-                              size="sm" 
-                              className="h-7 text-[10px] font-bold uppercase tracking-widest text-destructive hover:text-destructive hover:bg-destructive/10"
-                              onClick={() => {
-                                showConfirm("Dismiss Request", "Dismiss this request? This will also mark the background job as completed.", () => {
-                                  void dismissTicket(n.action_payload || "");
-                                });
-                              }}
-                            >
-                              Dismiss
-                            </Button>
-                          )}
-                        </div>
-                      </div>
-                    ))
-                  )}
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      ) : null}
-      {showWorkspaceModal ? (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="workspace-modal-title"
-          onClick={(e) => {
-            if (e.target === e.currentTarget) {
-              setShowWorkspaceModal(false);
-            }
-          }}
-        >
-          <div className="flex h-full max-h-[90vh] w-full max-w-2xl flex-col rounded-xl border border-border bg-card shadow-lg overflow-hidden">
-            <div className="flex items-center justify-between border-b border-border p-4">
-              <h2 id="workspace-modal-title" className="text-lg font-semibold text-foreground">
-                Workspace
-              </h2>
-              <Button variant="ghost" size="sm" onClick={() => setShowWorkspaceModal(false)}>
-                Close
-              </Button>
-            </div>
-            <div className="flex-1 overflow-y-auto p-6">
-              <WorkspaceFilePane key={workspacePaneNonce} />
-            </div>
-          </div>
-        </div>
       ) : null}
 
       {dialogConfig ? (
@@ -1607,39 +1576,16 @@ export default function App() {
           <Button
             variant="outline"
             size="sm"
-            className="mt-2 w-full"
+            className="mt-2 w-full justify-between"
             onClick={() => {
-              setShowSummaries(true);
-              void loadSummaries(null); // Load all summaries
-            }}
-            disabled={summariesLoading}
-          >
-            {summariesLoading ? "Loading…" : "Summaries"}
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            className="mt-2 w-full relative"
-            onClick={() => {
+              setWorkOpen((open) => !open);
               void loadBackgroundData();
-              setShowBackgroundPanel(true);
             }}
           >
-            Background
-            {notifications.some(n => !n.seen_at_ms || (n.kind === "clarification_ticket" && !n.resolved_at_ms)) && (
-              <span className="absolute -top-1 -right-1 h-3 w-3 rounded-full bg-primary border-2 border-background animate-pulse" />
-            )}
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            className="mt-2 w-full"
-            onClick={() => {
-              setWorkspacePaneNonce((n) => n + 1);
-              setShowWorkspaceModal(true);
-            }}
-          >
-            Workspace Files
+            Work
+            <span className="rounded-full bg-muted px-2 py-0.5 text-[11px] tabular-nums text-muted-foreground">
+              {workCount}
+            </span>
           </Button>
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto p-2">
@@ -1716,14 +1662,6 @@ export default function App() {
             </div>
           </div>
 
-          {showSummaries && (
-            <SummaryList
-              summaries={summaries}
-              onUpdate={updateSummary}
-              onDelete={deleteSummary}
-              onClose={() => setShowSummaries(false)}
-            />
-          )}
 
           <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4 sm:px-6">
             {(messages.length > 0 || summaries.length > 0 || pending) ? (
@@ -1768,7 +1706,11 @@ export default function App() {
                       </span>
                     </div>
                     {message.content ? (
-                      <p className="mt-2 whitespace-pre-wrap text-sm leading-7">{message.content}</p>
+                      message.role === "assistant" ? (
+                        <MarkdownMessage text={message.content} />
+                      ) : (
+                        <p className="mt-2 whitespace-pre-wrap text-sm leading-7">{message.content}</p>
+                      )
                     ) : null}
                     <McpAppList onChatMessage={deliverUiMessage} toolCalls={message.toolCalls} />
                     {message.clarification && (
@@ -1800,7 +1742,19 @@ export default function App() {
                   </div>
                 ) : null}
 
-                {pending ? <TypingIndicator step={currentStep} /> : null}
+                {pending && liveText ? (
+                  <article className={cn("mr-auto max-w-[82%] rounded-xl px-4 py-3", bubbleStyle("assistant"))}>
+                    <span className="text-[11px] font-semibold uppercase tracking-[0.2em] opacity-70">
+                      assistant
+                    </span>
+                    <MarkdownMessage text={liveText} />
+                  </article>
+                ) : null}
+
+                {pending && !liveText ? <TypingIndicator step={currentStep} /> : null}
+                {pending && liveText && currentStep ? (
+                  <p className="text-xs text-muted-foreground">{currentStep}</p>
+                ) : null}
 
                 <div ref={endOfMessagesRef} />
               </div>
@@ -1828,16 +1782,168 @@ export default function App() {
                   {errorMessage}
                 </div>
               ) : null}
-              <Composer 
-                disabled={pending || historyLoading} 
+              <Composer
+                inputLocked={historyLoading}
                 pending={pending}
+                queue={queue}
+                onEnqueue={enqueueSend}
+                onRemoveQueued={removeQueued}
                 onStop={stopGeneration}
-                onSubmit={submitMessage} 
+                onSubmit={submitMessage}
               />
             </div>
           </div>
         </div>
       </div>
+      {workOpen ? (
+        <aside className="flex h-full w-80 shrink-0 flex-col border-l border-border bg-background">
+          <div className="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
+            <div>
+              <p className="text-xs font-medium uppercase tracking-[0.05em] text-muted-foreground">Work</p>
+              <p className="text-sm font-semibold text-foreground">{workCount} active</p>
+            </div>
+            <Button size="sm" type="button" variant="ghost" onClick={() => setWorkOpen(false)}>
+              Close
+            </Button>
+          </div>
+          <div className="flex flex-wrap gap-1 border-b border-border p-2">
+            {(["jobs", "files", "agents", "memory"] as const).map((section) => (
+              <Button
+                key={section}
+                size="sm"
+                type="button"
+                variant={workSection === section ? "secondary" : "ghost"}
+                onClick={() => {
+                  setWorkSection(section);
+                  if (section === "files") {
+                    setWorkspacePaneNonce((n) => n + 1);
+                  }
+                  if (section === "memory") {
+                    setMemoryOpen(true);
+                    void loadSummaries(internalChatId);
+                  }
+                }}
+              >
+                {section === "jobs"
+                  ? "Jobs"
+                  : section === "files"
+                    ? "Files"
+                    : section === "agents"
+                      ? "Agents"
+                      : "Memory"}
+              </Button>
+            ))}
+          </div>
+          <div className="min-h-0 flex-1 overflow-y-auto p-3">
+            {workSection === "jobs" ? (
+              <div className="space-y-3">
+                {jobs.length === 0 && notifications.length === 0 ? (
+                  <p className="text-sm text-muted-foreground">No jobs or notifications.</p>
+                ) : null}
+                {jobs.map((job) => (
+                  <div className="rounded-lg border border-border p-3" key={job.job_id}>
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="text-sm font-medium">{job.kind}</p>
+                      <span className="text-[10px] uppercase tracking-wide text-muted-foreground">{job.state}</span>
+                    </div>
+                    <div className="mt-2 flex gap-3 text-xs">
+                      <button className="text-primary" type="button" onClick={() => jumpToThread(job.chat_id)}>
+                        Open thread
+                      </button>
+                      <button
+                        className="text-destructive"
+                        type="button"
+                        onClick={() => {
+                          showConfirm("Dismiss Job", "Dismiss this background job?", () => {
+                            void dismissBackgroundJob(job.job_id);
+                          });
+                        }}
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                  </div>
+                ))}
+                {notifications.map((item) => (
+                  <div className="rounded-lg border border-border p-3" key={item.notification_id}>
+                    <p className="text-[10px] uppercase tracking-wide text-muted-foreground">{item.kind}</p>
+                    <p className="mt-1 text-sm font-medium">{item.title}</p>
+                    <p className="mt-1 text-xs text-muted-foreground">{item.body}</p>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {item.kind === "clarification_ticket" && !item.resolved_at_ms ? (
+                        <Button
+                          size="sm"
+                          type="button"
+                          onClick={() => {
+                            showPrompt("Reply to request", "Enter your response:", "", (reply) => {
+                              if (reply.trim()) {
+                                void replyToTicket(item.action_payload || "", reply.trim());
+                              }
+                            });
+                          }}
+                        >
+                          Reply
+                        </Button>
+                      ) : null}
+                      <Button size="sm" type="button" variant="outline" onClick={() => jumpToThread(item.chat_id)}>
+                        View
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+            {workSection === "files" ? <WorkspaceFilePane key={workspacePaneNonce} /> : null}
+            {workSection === "agents" ? (
+              agents.length === 0 ? (
+                <p className="text-sm text-muted-foreground">No agent tasks yet.</p>
+              ) : (
+                <ul className="space-y-2">
+                  {agents.map((agent) => (
+                    <li className="rounded-lg border border-border p-3" key={agent.task_id}>
+                      <p className="text-sm font-medium">
+                        {agent.agent_name || agent.display_name || agent.task_id.slice(0, 8)}
+                      </p>
+                      <p className="mt-1 text-xs uppercase tracking-wide text-muted-foreground">{agent.status}</p>
+                    </li>
+                  ))}
+                </ul>
+              )
+            ) : null}
+            {workSection === "memory" ? (
+              <div className="space-y-3">
+                {summariesLoading ? (
+                  <p className="text-sm text-muted-foreground">Loading memory…</p>
+                ) : null}
+                {!summariesLoading && summaries.length === 0 ? (
+                  <p className="text-sm text-muted-foreground">No memory entries yet.</p>
+                ) : null}
+                {summaries.map((summary) => (
+                  <button
+                    className="w-full rounded-lg border border-border p-3 text-left hover:bg-accent"
+                    key={summary.id}
+                    type="button"
+                    onClick={() => setMemoryOpen(true)}
+                  >
+                    <p className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                      {summary.thread_id.split(":")[1] || summary.thread_id}
+                    </p>
+                    <p className="mt-1 line-clamp-3 text-sm text-foreground">{summary.summary}</p>
+                  </button>
+                ))}
+              </div>
+            ) : null}
+          </div>
+        </aside>
+      ) : null}
+      {memoryOpen ? (
+        <SummaryList
+          summaries={summaries}
+          onUpdate={updateSummary}
+          onDelete={deleteSummary}
+          onClose={() => setMemoryOpen(false)}
+        />
+      ) : null}
     </div>
   );
 }

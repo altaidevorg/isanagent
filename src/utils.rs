@@ -544,6 +544,19 @@ pub fn build_reqwest_client() -> reqwest::Client {
         .expect("failed to build reqwest client")
 }
 
+/// Gemini's streaming endpoint does not start on the HTTP/1.1 client above:
+/// `streamGenerateContent` sits until that client's request timeout and the
+/// chat never receives text. A fresh client may use HTTP/2, and idle
+/// connections are not reused, so one stalled call cannot block the next.
+pub fn build_gemini_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(10))
+        .pool_max_idle_per_host(0)
+        .build()
+        .expect("failed to build gemini reqwest client")
+}
+
 impl LLMClient {
     /// Create a new client with default settings (temp=0.7, timeout=600s).
     pub fn new_openai_compatible(base_url: &str, api_key: &str, model: &str) -> Self {
@@ -760,6 +773,128 @@ impl LLMClient {
         })
     }
 
+    /// OpenAI-compatible streaming chat. Text deltas are reported as they arrive;
+    /// the returned [`LLMResponse`] is the assembled message, including tool calls.
+    ///
+    /// A provider that ignores `stream: true` and returns one JSON object is
+    /// accepted: the whole text is then reported as a single delta.
+    pub async fn chat_stream(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<serde_json::Value>,
+        text_tx: &tokio::sync::mpsc::Sender<String>,
+    ) -> Result<LLMResponse, LLMError> {
+        let mut body = json!({
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "stream": true
+        });
+        let model_lower = self.model.to_ascii_lowercase();
+        if !model_lower.contains("deepseek") {
+            if let Some(msgs) = body["messages"].as_array_mut() {
+                for msg in msgs.iter_mut() {
+                    if let Some(obj) = msg.as_object_mut() {
+                        obj.remove("reasoning_content");
+                    }
+                }
+            }
+        }
+        if let Some(t) = tools {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("tools".to_string(), t);
+                obj.insert("tool_choice".to_string(), json!("auto"));
+            }
+        }
+
+        let client = build_reqwest_client();
+        let mut res = client
+            .post(&self.base_url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .timeout(self.timeout)
+            .json(&body)
+            .send()
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::BAD_REQUEST
+                && LLMError::looks_like_context_overflow(&text)
+            {
+                return Err(LLMError::ContextOverflow {
+                    tokens_attempted: 0,
+                    max: None,
+                });
+            }
+            return Err(LLMError::ApiError(format_api_error(
+                status.as_u16(),
+                &text,
+                &self.base_url,
+                &self.model,
+            )));
+        }
+
+        let mut acc = OpenAiStreamAcc::default();
+        let mut raw_fallback = String::new();
+        let mut saw_sse = false;
+        let mut line_buf = String::new();
+        loop {
+            match res
+                .chunk()
+                .await
+                .map_err(|e| LLMError::ApiError(e.to_string()))?
+            {
+                Some(bytes) => {
+                    line_buf.push_str(&String::from_utf8_lossy(&bytes));
+                    while let Some(idx) = line_buf.find('\n') {
+                        let line = line_buf[..idx].trim_end_matches('\r').trim().to_string();
+                        line_buf.drain(..=idx);
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if !saw_sse && !line.starts_with("data:") && !line.starts_with("event:") {
+                            raw_fallback.push_str(&line);
+                            raw_fallback.push('\n');
+                            continue;
+                        }
+                        saw_sse = true;
+                        if let Some(delta) = acc.push_sse_line(&line) {
+                            if !delta.is_empty() {
+                                let _ = text_tx.send(delta).await;
+                            }
+                        }
+                    }
+                }
+                None => break,
+            }
+        }
+        let tail = line_buf.trim().to_string();
+        if !tail.is_empty() {
+            if saw_sse {
+                if let Some(delta) = acc.push_sse_line(&tail) {
+                    if !delta.is_empty() {
+                        let _ = text_tx.send(delta).await;
+                    }
+                }
+            } else {
+                raw_fallback.push_str(&tail);
+            }
+        }
+
+        if !saw_sse {
+            let json_resp: serde_json::Value =
+                serde_json::from_str(raw_fallback.trim()).map_err(LLMError::ParseError)?;
+            let parsed = llm_response_from_openai_json(&json_resp)?;
+            if !parsed.content.is_empty() {
+                let _ = text_tx.send(parsed.content.clone()).await;
+            }
+            return Ok(parsed);
+        }
+
+        Ok(acc.into_response())
+    }
+
     /// Simple one-shot prompt.
     pub async fn ask(&self, prompt: &str) -> Result<LLMResponse, LLMError> {
         let messages = vec![ChatMessage::user(prompt)];
@@ -771,6 +906,177 @@ impl LLMClient {
         let messages = vec![ChatMessage::system(system), ChatMessage::user(user)];
         self.chat(&messages, None).await
     }
+}
+
+#[derive(Default)]
+struct OpenAiStreamAcc {
+    content: String,
+    reasoning: String,
+    calls: Vec<ToolCallRequest>,
+    usage: Option<TokenUsage>,
+}
+
+impl OpenAiStreamAcc {
+    /// Apply one SSE line. Returns the new visible text, if this line carried any.
+    fn push_sse_line(&mut self, line: &str) -> Option<String> {
+        let Some(data) = line.strip_prefix("data:") else {
+            return None;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            return None;
+        }
+        let value: serde_json::Value = serde_json::from_str(data).ok()?;
+        self.push_chunk(&value)
+    }
+
+    fn push_chunk(&mut self, value: &serde_json::Value) -> Option<String> {
+        if let Some(usage) = value.get("usage").filter(|u| !u.is_null()) {
+            self.usage = Some(usage_from_openai(usage));
+        }
+        let choice = &value["choices"][0];
+        let delta = &choice["delta"];
+        let mut text = String::new();
+        if let Some(piece) = delta["content"].as_str() {
+            text.push_str(piece);
+            self.content.push_str(piece);
+        } else if let Some(parts) = delta["content"].as_array() {
+            for part in parts {
+                if let Some(piece) = part.get("text").and_then(|t| t.as_str()) {
+                    text.push_str(piece);
+                    self.content.push_str(piece);
+                }
+            }
+        }
+        if let Some(piece) = delta["reasoning_content"].as_str() {
+            self.reasoning.push_str(piece);
+        }
+        if let Some(calls) = delta["tool_calls"].as_array() {
+            for call in calls {
+                let index = call["index"].as_u64().unwrap_or(0) as usize;
+                if self.calls.len() <= index {
+                    self.calls.resize_with(index + 1, || ToolCallRequest {
+                        id: String::new(),
+                        tool_type: "function".to_string(),
+                        extra_content: None,
+                        function: ToolCallFunction {
+                            name: String::new(),
+                            arguments: String::new(),
+                        },
+                    });
+                }
+                let slot = &mut self.calls[index];
+                if let Some(id) = call["id"].as_str() {
+                    if !id.is_empty() {
+                        slot.id = id.to_string();
+                    }
+                }
+                if let Some(name) = call["function"]["name"].as_str() {
+                    slot.function.name.push_str(name);
+                }
+                match &call["function"]["arguments"] {
+                    serde_json::Value::String(args) => slot.function.arguments.push_str(args),
+                    serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                        slot.function
+                            .arguments
+                            .push_str(&call["function"]["arguments"].to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+
+    fn into_response(self) -> LLMResponse {
+        let calls: Vec<ToolCallRequest> = self
+            .calls
+            .into_iter()
+            .filter(|call| !call.function.name.is_empty() || !call.id.is_empty())
+            .map(|mut call| {
+                if call.id.is_empty() {
+                    call.id = format!("call_{}", call.function.name);
+                }
+                call
+            })
+            .collect();
+        LLMResponse {
+            content: self.content,
+            tool_calls: (!calls.is_empty()).then_some(calls),
+            reasoning_content: (!self.reasoning.is_empty()).then_some(self.reasoning),
+            usage: self.usage,
+        }
+    }
+}
+
+fn usage_from_openai(usage_obj: &serde_json::Value) -> TokenUsage {
+    let cache_read = usage_obj
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    TokenUsage {
+        prompt_tokens: usage_obj["prompt_tokens"].as_u64().unwrap_or(0) as u32,
+        completion_tokens: usage_obj["completion_tokens"].as_u64().unwrap_or(0) as u32,
+        total_tokens: usage_obj["total_tokens"].as_u64().unwrap_or(0) as u32,
+        cache_read_tokens: cache_read,
+        cache_creation_tokens: 0,
+    }
+}
+
+fn llm_response_from_openai_json(json_resp: &serde_json::Value) -> Result<LLMResponse, LLMError> {
+    let content_val = &json_resp["choices"][0]["message"]["content"];
+    let content = if content_val.is_null() {
+        String::new()
+    } else if let Some(s) = content_val.as_str() {
+        s.to_string()
+    } else if let Some(arr) = content_val.as_array() {
+        arr.iter()
+            .filter_map(|part| part.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("")
+    } else {
+        return Err(LLMError::NoContent);
+    };
+    let tool_calls_val = &json_resp["choices"][0]["message"]["tool_calls"];
+    let tool_calls = if tool_calls_val.is_null() {
+        None
+    } else {
+        let mut tc_json = tool_calls_val.clone();
+        if let Some(arr) = tc_json.as_array_mut() {
+            for tc in arr.iter_mut() {
+                if let Some(args) = tc.get_mut("function").and_then(|f| f.get_mut("arguments")) {
+                    if args.is_object() || args.is_array() {
+                        *args = serde_json::Value::String(args.to_string());
+                    }
+                }
+            }
+        }
+        match serde_json::from_value::<Vec<ToolCallRequest>>(tc_json) {
+            Ok(calls) => Some(calls),
+            Err(e) => {
+                warn!("Failed to parse tool_calls from provider response: {e}");
+                None
+            }
+        }
+    };
+    let reasoning_content = json_resp["choices"][0]["message"]["reasoning_content"]
+        .as_str()
+        .map(str::to_string);
+    let usage = json_resp
+        .get("usage")
+        .filter(|u| !u.is_null())
+        .map(usage_from_openai);
+    Ok(LLMResponse {
+        content,
+        tool_calls,
+        reasoning_content,
+        usage,
+    })
 }
 
 /// Joins `relative` under `root`, applying `.` / `..` lexically without traversing above `root`.
@@ -999,6 +1305,32 @@ pub fn extract_markdown_from_pdf_bytes(pdf_bytes: &[u8]) -> Result<String, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn openai_stream_chunks_assemble_text_and_tool_calls() {
+        let mut acc = OpenAiStreamAcc::default();
+        let text = serde_json::json!({"choices":[{"delta":{"content":"Hello"}}]});
+        let first = acc.push_sse_line(&format!("data: {text}")).expect("text");
+        assert_eq!(first, "Hello");
+        let call = serde_json::json!({"choices":[{"delta":{"tool_calls":[{
+            "index": 0,
+            "id": "call_1",
+            "function": {"name": "exec", "arguments": "{\"c"}
+        }]}}]});
+        assert!(acc.push_sse_line(&format!("data: {call}")).is_none());
+        let more = serde_json::json!({"choices":[{"delta":{"tool_calls":[{
+            "index": 0,
+            "function": {"arguments": "md\":\"pwd\"}"}
+        }]}}]});
+        assert!(acc.push_sse_line(&format!("data: {more}")).is_none());
+        assert!(acc.push_sse_line("data: [DONE]").is_none());
+        let response = acc.into_response();
+        assert_eq!(response.content, "Hello");
+        let calls = response.tool_calls.expect("tool call");
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].function.name, "exec");
+        assert_eq!(calls[0].function.arguments, "{\"cmd\":\"pwd\"}");
+    }
 
     #[test]
     fn looks_like_context_overflow_recognizes_known_signals() {

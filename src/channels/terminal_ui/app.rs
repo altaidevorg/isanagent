@@ -731,28 +731,19 @@ impl App {
         FRAMES[self.spinner_tick % FRAMES.len()]
     }
 
+    /// Tab opens one work drawer (jobs, files, agents) or returns to the transcript.
+    /// It does not walk the other panes; those stay on their slash commands.
     pub fn toggle_ui_focus(&mut self) {
-        self.ui_focus = match self.ui_focus {
-            TerminalUiFocus::Transcript => TerminalUiFocus::Conversations,
-            TerminalUiFocus::Conversations => TerminalUiFocus::Executions,
-            TerminalUiFocus::Executions => TerminalUiFocus::ToolHistory,
-            TerminalUiFocus::ToolHistory => TerminalUiFocus::AgentTasks,
-            TerminalUiFocus::AgentTasks => TerminalUiFocus::BackgroundJobs,
-            TerminalUiFocus::BackgroundJobs => TerminalUiFocus::Transcript,
+        self.ui_focus = if self.ui_focus == TerminalUiFocus::Transcript {
+            TerminalUiFocus::BackgroundJobs
+        } else {
+            TerminalUiFocus::Transcript
         };
         self.tool_history_scroll = 0;
     }
 
     pub fn toggle_ui_focus_back(&mut self) {
-        self.ui_focus = match self.ui_focus {
-            TerminalUiFocus::Transcript => TerminalUiFocus::BackgroundJobs,
-            TerminalUiFocus::BackgroundJobs => TerminalUiFocus::AgentTasks,
-            TerminalUiFocus::AgentTasks => TerminalUiFocus::ToolHistory,
-            TerminalUiFocus::ToolHistory => TerminalUiFocus::Executions,
-            TerminalUiFocus::Executions => TerminalUiFocus::Conversations,
-            TerminalUiFocus::Conversations => TerminalUiFocus::Transcript,
-        };
-        self.tool_history_scroll = 0;
+        self.toggle_ui_focus();
     }
 
     pub fn focus_tool_history(&mut self) {
@@ -766,7 +757,7 @@ impl App {
     }
 
     pub fn focus_agent_tasks(&mut self) {
-        self.ui_focus = TerminalUiFocus::AgentTasks;
+        self.focus_background_jobs();
     }
 
     pub fn focus_background_jobs(&mut self) {
@@ -1244,6 +1235,21 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_toggles_the_work_drawer() {
+        let mut app = App::new();
+        assert_eq!(app.ui_focus, TerminalUiFocus::Transcript);
+        app.toggle_ui_focus();
+        assert_eq!(app.ui_focus, TerminalUiFocus::BackgroundJobs);
+        app.toggle_ui_focus();
+        assert_eq!(app.ui_focus, TerminalUiFocus::Transcript);
+        app.focus_conversations();
+        app.toggle_ui_focus();
+        assert_eq!(app.ui_focus, TerminalUiFocus::Transcript);
+        app.focus_agent_tasks();
+        assert_eq!(app.ui_focus, TerminalUiFocus::BackgroundJobs);
+    }
 
     #[test]
     fn scroll_clamps() {

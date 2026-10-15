@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use crate::bus::{BusMessage, LogEvent, OutboundMessage};
 use crate::logging::LoggerHandle;
-use crate::traits::Provider;
+use crate::traits::{FinishReason, Provider, StreamChunk};
 
 /// A configured alternate LLM provider to fail over to when the primary's retries are exhausted.
 /// Holds everything [`crate::provider::create_provider`] needs; resolved once at startup from the
@@ -223,6 +223,12 @@ pub(crate) enum ChatRetryOutcome {
 /// Wrap `provider.chat` with a small retry loop for transient errors (network/5xx/429).
 /// Up to 3 total attempts with exponential backoff (1s/2s/4s); the cancel token preempts
 /// both the chat and the sleep.
+pub(crate) const DISCARD_PARTIAL_STREAM: &str = "discard_partial";
+
+pub(crate) fn is_discard_partial(chunk: &StreamChunk) -> bool {
+    matches!(chunk, StreamChunk::Finish(FinishReason::Other(reason)) if reason == DISCARD_PARTIAL_STREAM)
+}
+
 pub(crate) async fn chat_with_retry(
     provider: &dyn crate::traits::Provider,
     context: &[crate::utils::ChatMessage],
@@ -230,6 +236,7 @@ pub(crate) async fn chat_with_retry(
     _fallback_providers: &[FallbackProviderSpec],
     cancel_token: &tokio_util::sync::CancellationToken,
     log_ctx: FailoverLogCtx<'_>,
+    delta_tx: &tokio::sync::mpsc::Sender<StreamChunk>,
 ) -> ChatRetryOutcome {
     let FailoverLogCtx {
         logger_tx,
@@ -240,16 +247,59 @@ pub(crate) async fn chat_with_retry(
     const BACKOFF_BASE_MS: u64 = 1000;
     let mut last_err: Option<crate::utils::LLMError> = None;
     for attempt in 0..MAX_ATTEMPTS {
-        let res = tokio::select! {
-            r = provider.chat(context, tools_payload.clone()) => r,
-            _ = cancel_token.cancelled() => {
-                let _ = logger_tx.send(BusMessage::Log(LogEvent::info(
-                    name,
-                    "Reasoning loop cancelled during LLM call.",
-                ).with_chat_id(chat_id)));
-                return ChatRetryOutcome::Cancelled;
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel(256);
+        let mut stream_fut =
+            std::pin::pin!(provider.stream(context, tools_payload.clone(), chunk_tx,));
+        let mut stream_result: Option<Result<crate::utils::LLMResponse, crate::utils::LLMError>> =
+            None;
+        let mut attempt_sent_text = false;
+        let mut cancelled = false;
+        let mut chunks_closed = false;
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel_token.cancelled() => {
+                    cancelled = true;
+                    break;
+                }
+                chunk = chunk_rx.recv(), if !chunks_closed => {
+                    match chunk {
+                        Some(StreamChunk::TextDelta(text)) if !text.is_empty() => {
+                            attempt_sent_text = true;
+                            let _ = delta_tx.send(StreamChunk::TextDelta(text)).await;
+                        }
+                        Some(_) => {}
+                        None => chunks_closed = true,
+                    }
+                }
+                res = &mut stream_fut, if stream_result.is_none() => {
+                    stream_result = Some(res);
+                }
             }
-        };
+            if cancelled || (stream_result.is_some() && chunks_closed) {
+                while let Ok(chunk) = chunk_rx.try_recv() {
+                    if let StreamChunk::TextDelta(text) = chunk {
+                        if !text.is_empty() {
+                            attempt_sent_text = true;
+                            let _ = delta_tx.send(StreamChunk::TextDelta(text)).await;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        if cancelled {
+            let _ = logger_tx.send(BusMessage::Log(
+                LogEvent::info(name, "Reasoning loop cancelled during LLM call.")
+                    .with_chat_id(chat_id),
+            ));
+            return ChatRetryOutcome::Cancelled;
+        }
+        let res = stream_result.unwrap_or_else(|| {
+            Err(crate::utils::LLMError::ApiError(
+                "LLM stream ended without a response".into(),
+            ))
+        });
         match res {
             Ok(resp) => {
                 return ChatRetryOutcome::Ok {
@@ -263,12 +313,26 @@ pub(crate) async fn chat_with_retry(
             }) => {
                 // PR-4: short-circuit — retrying the identical payload guarantees
                 // the same overflow. Caller decides whether to compact and retry.
+                if attempt_sent_text {
+                    let _ = delta_tx
+                        .send(StreamChunk::Finish(FinishReason::Other(
+                            DISCARD_PARTIAL_STREAM.into(),
+                        )))
+                        .await;
+                }
                 return ChatRetryOutcome::ContextOverflow {
                     tokens_attempted,
                     max,
                 };
             }
             Err(e) => {
+                if attempt_sent_text {
+                    let _ = delta_tx
+                        .send(StreamChunk::Finish(FinishReason::Other(
+                            DISCARD_PARTIAL_STREAM.into(),
+                        )))
+                        .await;
+                }
                 let transient = e.is_transient();
                 let is_last = attempt + 1 >= MAX_ATTEMPTS;
                 if !transient || is_last {

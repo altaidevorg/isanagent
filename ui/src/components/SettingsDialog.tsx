@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -82,6 +82,7 @@ export function SettingsDialog({
   const [pendingKey, setPendingKey] = useState<string | null>(null);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [keyDrafts, setKeyDrafts] = useState<Record<string, string>>({});
+  const rememberedKeys = useRef<Record<string, string>>({});
   const [notice, setNotice] = useState<string | null>(null);
   const [harness, setHarness] = useState<HarnessSettings | null>(null);
   const [harnessDraft, setHarnessDraft] = useState<HarnessSettings | null>(null);
@@ -207,23 +208,26 @@ export function SettingsDialog({
   const selectedKeyDraft = selectedModel
     ? (keyDrafts[selectedModel.provider_name]?.trim() ?? "")
     : "";
-  const modelDirty = Boolean(
-    selectedModel &&
-      (selectedModel.key !== models?.active_key || selectedKeyDraft.length > 0),
+  const canSaveModel = Boolean(
+    selectedModel && (selectedModel.has_api_key || selectedKeyDraft.length > 0),
   );
 
-  const selectModel = async (model: ModelEntry) => {
+  const selectModel = async (model: ModelEntry): Promise<boolean> => {
     setError(null);
     setNotice(null);
     setPendingKey(model.key);
+    setSelectedKey(model.key);
+    const previousActive = models?.active_key ?? null;
+    setModels((current) => (current ? { ...current, active_key: null } : current));
     try {
       const draft = keyDrafts[model.provider_name]?.trim() ?? "";
+      const apiKey = draft || rememberedKeys.current[model.provider_name] || "";
       const response = await fetch("/v1/settings/model", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           key: model.key,
-          ...(draft ? { api_key: draft } : {}),
+          ...(apiKey ? { api_key: apiKey } : {}),
         }),
       });
       if (!response.ok) {
@@ -243,14 +247,39 @@ export function SettingsDialog({
             }
           : current,
       );
+      if (apiKey) {
+        rememberedKeys.current[model.provider_name] = apiKey;
+      }
       setKeyDrafts((current) => ({ ...current, [model.provider_name]: "" }));
+      setSelectedKey(body.active_key);
       onActiveModel(body.model_name);
-      onClose();
+      setNotice(`${body.model_name} is active.`);
+      return true;
     } catch (err) {
+      setModels((current) =>
+        current ? { ...current, active_key: previousActive } : current,
+      );
       setError(err instanceof Error ? err.message : "Could not switch model");
+      return false;
     } finally {
       setPendingKey(null);
     }
+  };
+
+  const saveAndClose = () => {
+    if (!selectedModel) {
+      return;
+    }
+    const draft = keyDrafts[selectedModel.provider_name]?.trim() ?? "";
+    if (selectedModel.key === models?.active_key && draft.length === 0) {
+      onClose();
+      return;
+    }
+    void selectModel(selectedModel).then((saved) => {
+      if (saved) {
+        onClose();
+      }
+    });
   };
 
   return (
@@ -276,13 +305,10 @@ export function SettingsDialog({
           <div className="flex items-center gap-2">
             {tab === "models" ? (
               <Button
+                type="button"
                 size="sm"
-                disabled={!modelDirty || pendingKey !== null}
-                onClick={() => {
-                  if (selectedModel) {
-                    void selectModel(selectedModel);
-                  }
-                }}
+                disabled={!canSaveModel || pendingKey !== null}
+                onClick={saveAndClose}
               >
                 {pendingKey ? "Saving…" : "Save"}
               </Button>
@@ -311,11 +337,12 @@ export function SettingsDialog({
               notice={notice}
               groups={groups}
               activeKey={models?.active_key ?? null}
-              selectedKey={selectedKey}
               pendingKey={pendingKey}
               keyDrafts={keyDrafts}
               onDraft={(key, value) => setKeyDrafts((current) => ({ ...current, [key]: value }))}
-              onSelect={(model) => setSelectedKey(model.key)}
+              onSelect={(model) => {
+                void selectModel(model);
+              }}
             />
           ) : null}
           {tab === "harness" ? (
@@ -422,7 +449,7 @@ function settingsSubtitle(tab: SettingsTab): string {
   if (tab === "skills") {
     return "Installed skills are available on the next message. Add a GitHub repo or owner/repo shorthand.";
   }
-  return "One API key covers every model from that provider. Choose a model, then Save. Active is what the next message uses.";
+  return "One API key covers every model from that provider. Use activates that model and leaves this page open. Save stores the choice and closes settings.";
 }
 
 function harnessFromResponse(body: HarnessResponse): HarnessSettings {
@@ -472,7 +499,6 @@ function ModelsPane({
   notice,
   groups,
   activeKey,
-  selectedKey,
   pendingKey,
   keyDrafts,
   onDraft,
@@ -483,12 +509,19 @@ function ModelsPane({
   notice: string | null;
   groups: Array<[string, ModelEntry[]]>;
   activeKey: string | null;
-  selectedKey: string | null;
   pendingKey: string | null;
   keyDrafts: Record<string, string>;
   onDraft: (key: string, value: string) => void;
   onSelect: (model: ModelEntry) => void;
 }) {
+  const [clearing, setClearing] = useState<Record<string, boolean>>({});
+  const pendingWas = useRef<string | null>(null);
+  useEffect(() => {
+    if (pendingWas.current && pendingKey === null) {
+      setClearing({});
+    }
+    pendingWas.current = pendingKey;
+  }, [pendingKey]);
   if (loading) {
     return <p className="text-sm text-muted-foreground">Loading models…</p>;
   }
@@ -510,7 +543,9 @@ function ModelsPane({
         groups.map(([providerName, providerModels]) => {
           const ready = providerModels.some((model) => model.has_api_key);
           const envName = providerModels[0]?.api_key_env ?? "API_KEY";
-          const draft = keyDrafts[providerName]?.trim() ?? "";
+          const draft = keyDrafts[providerName] ?? "";
+          const trimmed = draft.trim();
+          const showSavedMask = ready && trimmed.length === 0 && !clearing[providerName];
           return (
             <section key={providerName} className="space-y-2">
               <h3 className="text-xs font-semibold uppercase tracking-[0.05em] text-muted-foreground">
@@ -518,30 +553,49 @@ function ModelsPane({
               </h3>
               <p className="text-xs text-muted-foreground">
                 {ready
-                  ? `Key ready. It covers every ${providerName} model.`
+                  ? `A key is saved for every ${providerName} model. Clear the dots to replace it.`
                   : `One $${envName} covers every ${providerName} model.`}
               </p>
-              {ready ? null : (
+              <div className="flex items-center gap-2">
                 <input
                   type="password"
                   autoComplete="off"
-                  className="h-9 w-full rounded-md border border-border bg-background px-3 text-sm"
+                  className="h-9 min-w-0 flex-1 rounded-md border border-border bg-background px-3 text-sm"
                   placeholder="API key"
-                  value={keyDrafts[providerName] ?? ""}
-                  onChange={(event) => onDraft(providerName, event.target.value)}
+                  value={showSavedMask ? "••••••••" : draft}
+                  onChange={(event) => {
+                    const next = event.target.value;
+                    if (showSavedMask) {
+                      const added = next.startsWith("••••••••")
+                        ? next.slice("••••••••".length)
+                        : "••••••••".startsWith(next)
+                          ? ""
+                          : next;
+                      setClearing((current) => ({ ...current, [providerName]: true }));
+                      onDraft(providerName, added);
+                      return;
+                    }
+                    onDraft(providerName, next);
+                  }}
                 />
-              )}
+                {ready || trimmed.length > 0 ? (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => {
+                      setClearing((current) => ({ ...current, [providerName]: true }));
+                      onDraft(providerName, "");
+                    }}
+                  >
+                    Clear
+                  </Button>
+                ) : null}
+              </div>
               <ul className="space-y-2">
                 {providerModels.map((model) => {
                   const active = model.key === activeKey;
-                  const selected = model.key === selectedKey;
-                  const label = pendingKey === model.key
-                    ? "Saving…"
-                    : selected && !active
-                      ? "Selected"
-                      : active
-                        ? "Active"
-                        : "Use";
+                  const label = pendingKey === model.key ? "Saving…" : active ? "Active" : "Use";
                   return (
                     <li key={model.key} className="rounded-lg border border-border px-3 py-3">
                       <div className="flex items-center justify-between gap-3">
@@ -551,8 +605,8 @@ function ModelsPane({
                         <Button
                           type="button"
                           size="sm"
-                          variant={selected ? "secondary" : "outline"}
-                          disabled={pendingKey !== null || (!ready && !draft)}
+                          variant={active ? "secondary" : "outline"}
+                          disabled={pendingKey !== null || active || (!ready && trimmed.length === 0)}
                           onClick={() => onSelect(model)}
                         >
                           {label}

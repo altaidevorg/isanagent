@@ -458,8 +458,8 @@ const TERMINAL_HELP: &str = r#"Commands (leading slash):
 
 Keys:
   Enter             Send the compose line; in past-sessions pane: load selected and continue
-  Tab / Ctrl+T      Next pane: transcript → past sessions → executions → tool activity → sub-agents
-  Shift+Tab         Previous pane (reverse of Tab)
+  Tab / Ctrl+T      Open or close the work drawer. The transcript stays beside it, or above it on a narrow screen
+  Shift+Tab         Same toggle as Tab
   Esc               From any pane: return to transcript
   PgUp / PgDn       Scroll the focused pane; on executions: output pane (Ctrl+Pg*: code pane)
   F5                Refresh list (executions or past-sessions pane)
@@ -806,21 +806,46 @@ impl LayoutDensity {
     }
 }
 
-/// Split the main content region for wide terminals when a secondary pane is focused.
+/// Split the main content region when a secondary pane is focused.
+///
+/// The transcript stays on screen: beside the pane on medium and wide
+/// terminals, above it on a narrow one. A terminal too small to split keeps
+/// the single full-area pane.
 fn split_main_content(
     area: Rect,
     density: LayoutDensity,
     focus: TerminalUiFocus,
 ) -> (Rect, Option<Rect>) {
-    if density == LayoutDensity::Wide && focus != TerminalUiFocus::Transcript {
-        let side = (area.width / 3).clamp(28, 56);
-        let parts = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(24), Constraint::Length(side)])
-            .split(area);
-        (parts[0], Some(parts[1]))
-    } else {
-        (area, None)
+    if focus == TerminalUiFocus::Transcript || area.width < 20 || area.height < 8 {
+        return (area, None);
+    }
+    match density {
+        LayoutDensity::Narrow => {
+            let panel_h = (area.height * 2 / 5).clamp(5, 12);
+            if area.height.saturating_sub(panel_h) < 4 {
+                return (area, None);
+            }
+            let parts = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(4), Constraint::Length(panel_h)])
+                .split(area);
+            (parts[0], Some(parts[1]))
+        }
+        LayoutDensity::Medium | LayoutDensity::Wide => {
+            let side = if density == LayoutDensity::Wide {
+                (area.width / 3).clamp(28, 56)
+            } else {
+                (area.width * 2 / 5).clamp(24, 40)
+            };
+            if area.width.saturating_sub(side) < 20 {
+                return (area, None);
+            }
+            let parts = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(20), Constraint::Length(side)])
+                .split(area);
+            (parts[0], Some(parts[1]))
+        }
     }
 }
 
@@ -831,8 +856,40 @@ fn chunks_line_width(spans: &[Span<'static>]) -> usize {
         .sum()
 }
 
-/// Build lines for the agent-tasks pane (sub-agent lifecycle).
-fn background_pane_paragraph(app: &App) -> Vec<Line<'static>> {
+fn workspace_file_names(dir: &std::path::Path) -> Vec<String> {
+    let mut names = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return names;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let suffix = if entry.path().is_dir() { "/" } else { "" };
+        names.push(format!("{name}{suffix}"));
+    }
+    names.sort();
+    names.truncate(12);
+    names
+}
+
+fn work_item_count(app: &App) -> usize {
+    let jobs = app
+        .background_jobs
+        .iter()
+        .filter(|job| job.state == "running" || job.state == "waiting")
+        .count();
+    let agents = app
+        .agent_tasks
+        .iter()
+        .filter(|entry| !entry.status.is_terminal())
+        .count();
+    jobs + agents + app.notifications.len()
+}
+
+/// Jobs, agents, and workspace files in one drawer.
+fn background_pane_paragraph(app: &App, files: &[String]) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
 
     // 1. Notifications (High Priority)
@@ -924,14 +981,24 @@ fn background_pane_paragraph(app: &App) -> Vec<Line<'static>> {
             line_text.push_str(&format_age(age));
             out.push(Line::from(Span::styled(line_text, style)));
         }
+        out.push(Line::from(""));
     }
 
-    if out.is_empty() {
-        return vec![Line::from(Span::styled(
-            "No background jobs or sub-agent tasks found.",
+    out.push(Line::from(Span::styled(
+        "--- FILES ---",
+        Theme::tool_call(),
+    )));
+    if files.is_empty() {
+        out.push(Line::from(Span::styled(
+            "Workspace is empty.",
             Theme::dim(),
-        ))];
+        )));
+    } else {
+        for name in files {
+            out.push(Line::from(Span::styled(name.clone(), Theme::dim())));
+        }
     }
+
     out
 }
 
@@ -1176,7 +1243,7 @@ fn build_status_line(
         vec![
             Span::styled(" · ", dim),
             Span::styled(
-                "Enter send · ^G jobs · Tab panes · ^C cancel · ^D exit",
+                "Enter send · Tab work · ^C cancel · ^D exit",
                 Theme::status_bar(),
             ),
         ],
@@ -2318,6 +2385,19 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 max_exec_out_scroll_holder.set(0);
                                 app.last_executions_code_rect = None;
                                 app.last_executions_output_rect = None;
+                                let msg = app
+                                    .executions_detail_error
+                                    .as_deref()
+                                    .unwrap_or("Pick a run from the list (↑↓).");
+                                let empty =
+                                    Paragraph::new(Line::from(Span::styled(msg, Theme::dim())))
+                                        .block(
+                                            Block::default()
+                                                .borders(Borders::ALL)
+                                                .title(Span::styled(" detail ", Theme::dim()))
+                                                .border_style(Theme::dim()),
+                                        );
+                                f.render_widget(empty, hareas[1]);
                             }
                         }
                     }
@@ -2332,12 +2412,9 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         app.last_agent_tasks_rect = None;
                     }
                     TerminalUiFocus::AgentTasks | TerminalUiFocus::BackgroundJobs => {
-                        let list = background_pane_paragraph(&app);
-                        let title = if app.ui_focus == TerminalUiFocus::BackgroundJobs {
-                            " background "
-                        } else {
-                            " sub-agents "
-                        };
+                        let files = workspace_file_names(&sandbox_dir);
+                        let list = background_pane_paragraph(&app, &files);
+                        let title = format!(" work · {} ", work_item_count(&app));
                         let w = Paragraph::new(Text::from(list))
                             .block(
                                 Block::default()
@@ -2463,12 +2540,9 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         app.last_agent_tasks_rect = None;
                     }
                     TerminalUiFocus::AgentTasks | TerminalUiFocus::BackgroundJobs => {
-                        let list = background_pane_paragraph(&app);
-                        let title = if app.ui_focus == TerminalUiFocus::BackgroundJobs {
-                            " background "
-                        } else {
-                            " sub-agents "
-                        };
+                        let files = workspace_file_names(&sandbox_dir);
+                        let list = background_pane_paragraph(&app, &files);
+                        let title = format!(" work · {} ", work_item_count(&app));
                         let w = Paragraph::new(Text::from(list))
                             .block(
                                 Block::default()
@@ -4433,16 +4507,36 @@ mod width_fit_tests {
     }
 
     #[test]
-    fn wide_layout_splits_secondary_pane() {
-        let area = Rect::new(0, 0, 160, 40);
+    fn secondary_pane_keeps_the_transcript_visible() {
+        let wide = Rect::new(0, 0, 160, 40);
         let (left, right) =
-            split_main_content(area, LayoutDensity::Wide, TerminalUiFocus::ToolHistory);
+            split_main_content(wide, LayoutDensity::Wide, TerminalUiFocus::ToolHistory);
+        let right = right.expect("wide side pane");
+        assert!(left.width >= 20);
+        assert_eq!(left.y, wide.y);
+        assert!(left.width + right.width <= wide.width);
+
+        let medium = Rect::new(0, 0, 100, 30);
+        let (left, right) =
+            split_main_content(medium, LayoutDensity::Medium, TerminalUiFocus::ToolHistory);
         assert!(right.is_some());
-        assert!(left.width + right.unwrap().width <= area.width);
+        assert!(left.width >= 20);
+
+        let narrow = Rect::new(0, 0, 70, 24);
+        let (top, bottom) = split_main_content(
+            narrow,
+            LayoutDensity::Narrow,
+            TerminalUiFocus::Conversations,
+        );
+        let bottom = bottom.expect("narrow panel under the transcript");
+        assert!(top.height >= 4);
+        assert!(bottom.y > top.y);
+        assert_eq!(top.width, narrow.width);
+
         let (only, none) =
-            split_main_content(area, LayoutDensity::Medium, TerminalUiFocus::ToolHistory);
+            split_main_content(wide, LayoutDensity::Wide, TerminalUiFocus::Transcript);
         assert!(none.is_none());
-        assert_eq!(only, area);
+        assert_eq!(only, wide);
     }
 }
 

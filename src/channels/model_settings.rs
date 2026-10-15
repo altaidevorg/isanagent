@@ -4,7 +4,7 @@
 //! API keys are never serialized. A submitted key is stored in the OS keychain and
 //! applied to later reasoning runs through `BusMessage::SwitchModel`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -22,9 +22,8 @@ pub struct ModelCatalog {
     pub providers: HashMap<String, ProviderConfig>,
     pub active_key: Arc<RwLock<Option<String>>>,
     /// Providers given a key during this process. Keychain reads can fail in the
-    /// same session that just stored the secret, so the settings list remembers
-    /// the provider name without keeping the secret.
-    keyed_providers: Arc<RwLock<HashSet<String>>>,
+    /// same session that just stored the secret, so a later Save can reuse it.
+    keyed_providers: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl ModelCatalog {
@@ -37,22 +36,31 @@ impl ModelCatalog {
             workspace_dir,
             providers,
             active_key: Arc::new(RwLock::new(active_key)),
-            keyed_providers: Arc::new(RwLock::new(HashSet::new())),
+            keyed_providers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    pub fn note_provider_key(&self, provider_name: &str) {
+    pub fn note_provider_key(&self, provider_name: &str, api_key: &str) {
+        let secret = api_key.trim();
+        if provider_name.is_empty() || secret.is_empty() {
+            return;
+        }
         self.keyed_providers
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(provider_name.to_string());
+            .insert(provider_name.to_string(), secret.to_string());
     }
 
     fn provider_has_noted_key(&self, provider_name: &str) -> bool {
+        self.noted_provider_key(provider_name).is_some()
+    }
+
+    fn noted_provider_key(&self, provider_name: &str) -> Option<String> {
         self.keyed_providers
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(provider_name)
+            .get(provider_name)
+            .cloned()
     }
 
     pub fn active_key(&self) -> Option<String> {
@@ -151,11 +159,14 @@ pub fn prepare_model_switch(
     } else {
         match cfg.resolve_api_key() {
             Ok(existing) => (existing, false),
-            Err(_) => {
-                return Err(ModelSwitchError::MissingApiKey {
-                    api_key_env: cfg.resolved_api_key_env(),
-                })
-            }
+            Err(_) => match catalog.noted_provider_key(&cfg.provider_name) {
+                Some(existing) => (existing, false),
+                None => {
+                    return Err(ModelSwitchError::MissingApiKey {
+                        api_key_env: cfg.resolved_api_key_env(),
+                    })
+                }
+            },
         }
     };
     let base_url = cfg
@@ -268,6 +279,17 @@ mod tests {
         let error =
             prepare_model_switch(&catalog(None), "gpt-4o", Some("<changethis>")).unwrap_err();
         assert_eq!(error, ModelSwitchError::PlaceholderApiKey);
+    }
+
+    #[test]
+    fn later_save_reuses_a_key_from_this_process() {
+        let catalog = catalog(None);
+        let first = prepare_model_switch(&catalog, "gemini-2.5-flash", Some("test-key-value"))
+            .expect("prepared");
+        catalog.note_provider_key(&first.provider_name, &first.api_key);
+        let again = prepare_model_switch(&catalog, "gemini-2.5-flash", None).expect("reused");
+        assert!(!again.store_in_keychain);
+        assert_eq!(again.api_key, "test-key-value");
     }
 
     #[test]
