@@ -125,7 +125,11 @@ pub enum KeySource {
 pub struct ModelCatalog {
     pub workspace_dir: PathBuf,
     pub providers: HashMap<String, ProviderConfig>,
+    /// The runtime default the agent uses (startup provider or the last switch).
     pub active_key: Arc<RwLock<Option<String>>>,
+    /// The model picked in the web settings during this process. Starts empty on every
+    /// start, so the web UI shows no current model until the user chooses one.
+    selected_key: Arc<RwLock<Option<String>>>,
     key_store: Arc<dyn ProviderKeyStore>,
     session_keys: Arc<RwLock<HashMap<String, SessionKey>>>,
 }
@@ -140,6 +144,7 @@ impl ModelCatalog {
             workspace_dir,
             providers,
             active_key: Arc::new(RwLock::new(active_key)),
+            selected_key: Arc::new(RwLock::new(None)),
             key_store: Arc::new(OsKeychainStore),
             session_keys: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -163,6 +168,24 @@ impl ModelCatalog {
             .active_key
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(key);
+    }
+
+    /// The model chosen in this process through the settings screen, if any.
+    pub fn selected_key(&self) -> Option<String> {
+        self.selected_key
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Record a successful selection: it becomes both the runtime default and the
+    /// session's selected model.
+    pub fn select(&self, key: String) {
+        *self
+            .selected_key
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(key.clone());
+        self.set_active_key(key);
     }
 
     /// Provider name of the active model, when there is one.
@@ -270,7 +293,10 @@ pub struct ModelEntry {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ModelList {
+    /// Runtime default the agent would use for the next run.
     pub active_key: Option<String>,
+    /// Model chosen in the web settings during this process; `None` after every start.
+    pub selected_key: Option<String>,
     pub models: Vec<ModelEntry>,
 }
 
@@ -330,7 +356,14 @@ pub fn list_models(catalog: &ModelCatalog) -> ModelList {
     let active_key = catalog
         .active_key()
         .filter(|key| models.iter().any(|model| &model.key == key));
-    ModelList { active_key, models }
+    let selected_key = catalog
+        .selected_key()
+        .filter(|key| models.iter().any(|model| &model.key == key));
+    ModelList {
+        active_key,
+        selected_key,
+        models,
+    }
 }
 
 pub fn prepare_model_switch(
@@ -512,6 +545,31 @@ mod tests {
         assert!(!listed.models.iter().any(|model| model.has_api_key));
         let encoded = serde_json::to_value(&listed).expect("json");
         assert!(encoded["models"][0].get("api_key").is_none());
+    }
+
+    #[test]
+    fn selected_key_starts_empty_and_is_set_by_select() {
+        let catalog = catalog(Some("gpt-4o"));
+        let listed = list_models(&catalog);
+        assert_eq!(listed.active_key.as_deref(), Some("gpt-4o"));
+        assert_eq!(listed.selected_key, None);
+        let encoded = serde_json::to_value(&listed).expect("json");
+        assert!(encoded["selected_key"].is_null());
+
+        catalog.select("gemini-2.5-flash".to_string());
+        let listed = list_models(&catalog);
+        assert_eq!(listed.selected_key.as_deref(), Some("gemini-2.5-flash"));
+        assert_eq!(listed.active_key.as_deref(), Some("gemini-2.5-flash"));
+
+        // A fresh catalog (a restart) forgets the selection again.
+        assert_eq!(
+            list_models(&catalog_with_store(
+                Some("gemini-2.5-flash"),
+                MemoryKeyStore::new(true)
+            ))
+            .selected_key,
+            None
+        );
     }
 
     #[test]

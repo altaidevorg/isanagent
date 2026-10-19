@@ -18,12 +18,16 @@ type ModelEntry = {
 };
 
 type ModelList = {
+  /** Runtime default the agent uses for other API clients. */
   active_key: string | null;
+  /** Model chosen in this web settings screen since the server started; null after a restart. */
+  selected_key: string | null;
   models: ModelEntry[];
 };
 
 type SelectModelResponse = {
   active_key: string;
+  selected_key?: string;
   provider_name: string;
   model_name: string;
   keychain_saved?: boolean;
@@ -34,7 +38,7 @@ type ProviderKeyResponse = ModelList & {
   applied_to_active: boolean;
 };
 
-type Notice = { kind: "success" | "warning" | "error"; text: string };
+type Notice = { kind: "success" | "warning" | "error" | "info"; text: string };
 
 type ProviderGroup = {
   name: string;
@@ -88,9 +92,12 @@ async function readError(response: Response): Promise<string> {
 }
 
 export function SettingsDialog({
+  notice,
   onClose,
   onActiveModel,
 }: {
+  /** Short note shown on the Models tab, e.g. why the dialog opened. */
+  notice?: string | null;
   onClose: () => void;
   onActiveModel: (label: string) => void;
 }) {
@@ -218,7 +225,7 @@ export function SettingsDialog({
             Skills
           </SettingsTabButton>
         </div>
-        {tab === "models" ? <ModelsPane settings={modelSettings} /> : null}
+        {tab === "models" ? <ModelsPane settings={modelSettings} notice={notice ?? null} /> : null}
         {tab === "models" ? null : (
         <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
           {tab === "harness" ? (
@@ -407,6 +414,7 @@ const NOTICE_STYLES: Record<Notice["kind"], string> = {
     "border-amber-600/40 bg-amber-500/10 text-amber-900 dark:border-amber-400/30 dark:text-amber-200",
   error:
     "border-destructive/40 bg-destructive/10 text-destructive dark:text-red-300",
+  info: "border-border bg-muted/40 text-foreground",
 };
 
 function NoticeLine({ notice, className }: { notice: Notice; className?: string }) {
@@ -451,8 +459,10 @@ function useModelSettings(onActiveModel: (label: string) => void) {
         }
         const body = (await response.json()) as ModelList;
         if (!cancelled) {
-          setList({ active_key: body.active_key, models: body.models });
-          setSelectedKey(body.active_key);
+          const current = body.selected_key ?? null;
+          setList({ active_key: body.active_key, selected_key: current, models: body.models });
+          // The radio starts on the model chosen in this session; nothing after a restart.
+          setSelectedKey(current);
         }
       } catch (err) {
         if (!cancelled) {
@@ -470,11 +480,14 @@ function useModelSettings(onActiveModel: (label: string) => void) {
   }, [reloadToken]);
 
   const models = useMemo(() => list?.models ?? [], [list]);
-  const activeKey = list?.active_key ?? null;
-  const activeModel = models.find((model) => model.key === activeKey) ?? null;
+  // "Current" is the model chosen in this session (selected_key), never the runtime
+  // default left over from an earlier run.
+  const currentKey = list?.selected_key ?? null;
+  const currentModel = models.find((model) => model.key === currentKey) ?? null;
   const selectedModel = models.find((model) => model.key === selectedKey) ?? null;
   const pendingModel =
-    selectedModel && selectedModel.key !== activeKey && selectedModel.has_api_key ? selectedModel : null;
+    selectedModel && selectedModel.key !== currentKey && selectedModel.has_api_key ? selectedModel : null;
+  const anyUsableKey = models.some((model) => model.has_api_key);
 
   const groups = useMemo<ProviderGroup[]>(() => {
     const byProvider = new Map<string, ModelEntry[]>();
@@ -500,10 +513,11 @@ function useModelSettings(onActiveModel: (label: string) => void) {
   }, [models]);
 
   const applyList = useCallback((next: ModelList) => {
-    setList({ active_key: next.active_key, models: next.models });
+    const nextCurrent = next.selected_key ?? null;
+    setList({ active_key: next.active_key, selected_key: nextCurrent, models: next.models });
     setSelectedKey((current) => {
       const still = next.models.find((model) => model.key === current);
-      return still && still.has_api_key ? current : next.active_key;
+      return still && still.has_api_key ? current : nextCurrent;
     });
   }, []);
 
@@ -540,8 +554,11 @@ function useModelSettings(onActiveModel: (label: string) => void) {
         throw new Error(await readError(response));
       }
       const body = (await response.json()) as SelectModelResponse;
-      setList((current) => (current ? { ...current, active_key: body.active_key } : current));
-      setSelectedKey(body.active_key);
+      const chosen = body.selected_key ?? body.active_key;
+      setList((current) =>
+        current ? { ...current, active_key: body.active_key, selected_key: chosen } : current,
+      );
+      setSelectedKey(chosen);
       setFooterNotice({ kind: "success", text: `Now using ${body.model_name} for new messages.` });
       onActiveModel(body.model_name);
     } catch (err) {
@@ -579,7 +596,11 @@ function useModelSettings(onActiveModel: (label: string) => void) {
       }
       const body = (await response.json()) as ProviderKeyResponse;
       applyList(body);
-      const applied = body.applied_to_active ? " The active model now uses it." : "";
+      // Only mention the switch when it touched the model chosen here, not a hidden default.
+      const applied =
+        body.applied_to_active && currentModel?.provider_name === provider
+          ? " The current model now uses it."
+          : "";
       setProviderNotice(
         provider,
         body.keychain_saved === false
@@ -616,9 +637,10 @@ function useModelSettings(onActiveModel: (label: string) => void) {
       applyList(body);
       setProviderNotice(provider, {
         kind: "success",
-        text: body.applied_to_active
-          ? "Saved key removed. The active model now uses the environment key."
-          : "Saved key removed.",
+        text:
+          body.applied_to_active && currentModel?.provider_name === provider
+            ? "Saved key removed. The current model now uses the environment key."
+            : "Saved key removed.",
       });
     } catch (err) {
       setProviderNotice(provider, {
@@ -637,7 +659,8 @@ function useModelSettings(onActiveModel: (label: string) => void) {
     reload: () => setReloadToken((token) => token + 1),
     models,
     groups,
-    activeModel,
+    currentModel,
+    anyUsableKey,
     selectedKey,
     pendingModel,
     switching,
@@ -651,7 +674,7 @@ function useModelSettings(onActiveModel: (label: string) => void) {
     setFilter,
     select,
     cancelSelection: () => {
-      setSelectedKey(activeKey);
+      setSelectedKey(currentKey);
       setFooterNotice(null);
     },
     switchToSelected,
@@ -675,7 +698,7 @@ function focusKeyAction(provider: string) {
   });
 }
 
-function ModelsPane({ settings }: { settings: ModelSettings }) {
+function ModelsPane({ settings, notice }: { settings: ModelSettings; notice: string | null }) {
   const query = settings.filter.trim().toLowerCase();
   const visibleGroups = query
     ? settings.groups
@@ -689,8 +712,8 @@ function ModelsPane({ settings }: { settings: ModelSettings }) {
         }))
         .filter((group) => group.models.length > 0)
     : settings.groups;
-  const activeGroup = settings.activeModel
-    ? settings.groups.find((group) => group.name === settings.activeModel?.provider_name) ?? null
+  const currentGroup = settings.currentModel
+    ? settings.groups.find((group) => group.name === settings.currentModel?.provider_name) ?? null
     : null;
 
   let body: ReactNode;
@@ -714,7 +737,12 @@ function ModelsPane({ settings }: { settings: ModelSettings }) {
   } else {
     body = (
       <div className="space-y-4">
-        <CurrentModelCard model={settings.activeModel} group={activeGroup} />
+        {notice && !settings.currentModel ? <NoticeLine notice={{ kind: "info", text: notice }} /> : null}
+        {settings.currentModel ? (
+          <CurrentModelCard model={settings.currentModel} group={currentGroup} />
+        ) : (
+          <NoModelSelected anyUsableKey={settings.anyUsableKey} />
+        )}
         {settings.models.length > MODEL_FILTER_THRESHOLD ? (
           <div>
             <label htmlFor="model-filter" className="sr-only">
@@ -753,13 +781,33 @@ function ModelsPane({ settings }: { settings: ModelSettings }) {
   return (
     <>
       <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">{body}</div>
-      {settings.models.length > 0 ? <ModelsFooter settings={settings} /> : null}
+      {settings.models.length > 0 && (settings.currentModel || settings.pendingModel || settings.footerNotice) ? (
+        <ModelsFooter settings={settings} />
+      ) : null}
     </>
   );
 }
 
-function CurrentModelCard({ model, group }: { model: ModelEntry | null; group: ProviderGroup | null }) {
-  const source = model ? keySourceOf(model) : "none";
+/** Shown instead of the Current model card until a model is chosen in this session. */
+function NoModelSelected({ anyUsableKey }: { anyUsableKey: boolean }) {
+  return (
+    <p
+      className={cn(
+        "rounded-xl border px-4 py-3 text-sm",
+        anyUsableKey
+          ? "border-dashed border-border text-muted-foreground"
+          : NOTICE_STYLES.warning,
+      )}
+    >
+      {anyUsableKey
+        ? "No model selected yet. Choose one below to start chatting."
+        : "No model selected yet. Add an API key below, then choose a model to start chatting."}
+    </p>
+  );
+}
+
+function CurrentModelCard({ model, group }: { model: ModelEntry; group: ProviderGroup | null }) {
+  const source = keySourceOf(model);
   return (
     <section
       aria-labelledby="current-model-heading"
@@ -771,27 +819,16 @@ function CurrentModelCard({ model, group }: { model: ModelEntry | null; group: P
       >
         Current model
       </h3>
-      {model ? (
-        <>
-          <p className="mt-1 break-all text-base font-semibold text-foreground">{model.model_name}</p>
-          <p className="mt-0.5 text-sm text-muted-foreground">
-            {model.provider_name}
-            <span aria-hidden="true"> · </span>
-            <span className={source === "none" ? "font-medium text-amber-800 dark:text-amber-300" : undefined}>
-              {source === "none"
-                ? "No API key. Add one below to use this model."
-                : keySourceLabel(source, group?.envName ?? model.api_key_env)}
-            </span>
-          </p>
-          <p className="mt-2 text-xs text-muted-foreground">
-            {source === "session"
-              ? "Remembered after restart. The key isn't, so enter it again after restarting."
-              : "Remembered after restart."}
-          </p>
-        </>
-      ) : (
-        <p className="mt-1 text-sm text-muted-foreground">No model is active yet. Pick one below.</p>
-      )}
+      <p className="mt-1 break-all text-base font-semibold text-foreground">{model.model_name}</p>
+      <p className="mt-0.5 text-sm text-muted-foreground">
+        {model.provider_name}
+        <span aria-hidden="true"> · </span>
+        <span className={source === "none" ? "font-medium text-amber-800 dark:text-amber-300" : undefined}>
+          {source === "none"
+            ? "No API key. Add one below to use this model."
+            : keySourceLabel(source, group?.envName ?? model.api_key_env)}
+        </span>
+      </p>
     </section>
   );
 }
@@ -963,7 +1000,7 @@ function ModelRadioGroup({
   labelledBy: string;
   settings: ModelSettings;
 }) {
-  const activeKey = settings.activeModel?.key ?? null;
+  const activeKey = settings.currentModel?.key ?? null;
   const enabled = group.models.filter((model) => model.has_api_key);
   const tabStop =
     enabled.find((model) => model.key === settings.selectedKey)?.key ?? enabled[0]?.key ?? null;
@@ -1190,21 +1227,17 @@ function EyeIcon({ crossed }: { crossed: boolean }) {
 function ModelsFooter({ settings }: { settings: ModelSettings }) {
   const pending = settings.pendingModel;
   const notice = settings.footerNotice;
-  const active = settings.activeModel;
+  const active = settings.currentModel;
   return (
     <div className="border-t border-border bg-card px-5 py-3">
       <div aria-live="polite">{notice ? <NoticeLine notice={notice} /> : null}</div>
       {pending ? (
         <div className={cn("flex flex-wrap items-center justify-end gap-2", notice && "mt-2")}>
-          <p className="mr-auto min-w-0 truncate text-sm text-muted-foreground">
-            {active ? (
-              <>
-                From <span className="text-foreground">{active.model_name}</span>
-              </>
-            ) : (
-              "No model active"
-            )}
-          </p>
+          {active ? (
+            <p className="mr-auto min-w-0 truncate text-sm text-muted-foreground">
+              From <span className="text-foreground">{active.model_name}</span>
+            </p>
+          ) : null}
           <Button
             type="button"
             variant="ghost"
@@ -1222,19 +1255,17 @@ function ModelsFooter({ settings }: { settings: ModelSettings }) {
             onClick={() => void settings.switchToSelected()}
           >
             <span className="truncate">
-              {settings.switching ? "Switching…" : `Switch to ${pending.model_name}`}
+              {settings.switching
+                ? "Switching…"
+                : active
+                  ? `Switch to ${pending.model_name}`
+                  : `Use ${pending.model_name}`}
             </span>
           </Button>
         </div>
-      ) : notice ? null : (
+      ) : notice || !active ? null : (
         <p className="truncate text-sm text-muted-foreground">
-          {active ? (
-            <>
-              Active: <span className="text-foreground">{active.model_name}</span>
-            </>
-          ) : (
-            "No model active. Pick one above."
-          )}
+          Active: <span className="text-foreground">{active.model_name}</span>
         </p>
       )}
     </div>

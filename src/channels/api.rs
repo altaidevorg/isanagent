@@ -1062,6 +1062,7 @@ struct SelectModelRequest {
 #[derive(Serialize)]
 struct SelectModelResponse {
     active_key: String,
+    selected_key: String,
     provider_name: String,
     model_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1259,6 +1260,7 @@ async fn handle_list_models(State(state): State<ApiState>) -> Response {
     let Some(catalog) = state.model_catalog.as_ref() else {
         return Json(crate::channels::model_settings::ModelList {
             active_key: None,
+            selected_key: None,
             models: Vec::new(),
         })
         .into_response();
@@ -1339,7 +1341,7 @@ async fn handle_select_model(
         .into_response();
     }
 
-    catalog.set_active_key(prepared.key.clone());
+    catalog.select(prepared.key.clone());
     if let Err(error) = crate::channels::model_settings::persist_active_model_key(
         &catalog.workspace_dir,
         &prepared.key,
@@ -1354,7 +1356,8 @@ async fn handle_select_model(
     }
 
     Json(SelectModelResponse {
-        active_key: prepared.key,
+        active_key: prepared.key.clone(),
+        selected_key: prepared.key,
         provider_name: prepared.provider_name,
         model_name: prepared.model_name,
         keychain_saved,
@@ -4356,12 +4359,14 @@ bind_address = "127.0.0.1"
             .expect("list body");
         let listed_json: Value = serde_json::from_slice(&listed_body).expect("list json");
         assert!(listed_json["active_key"].is_null());
+        assert!(listed_json["selected_key"].is_null());
         assert_eq!(listed_json["models"][0]["key"], "proxy-model");
         assert!(listed_json["models"][0].get("api_key").is_none());
         assert_eq!(listed_json["models"][0]["has_api_key"], false);
 
         let secret = "super-secret-test-key";
         let switched = app
+            .clone()
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
@@ -4382,6 +4387,7 @@ bind_address = "127.0.0.1"
         assert!(!switched_text.contains(secret));
         let switched_json: Value = serde_json::from_str(&switched_text).expect("switch json");
         assert_eq!(switched_json["active_key"], "proxy-model");
+        assert_eq!(switched_json["selected_key"], "proxy-model");
         assert_eq!(switched_json["model_name"], "proxy-model");
         assert!(switched_json.get("api_key").is_none());
 
@@ -4401,6 +4407,11 @@ bind_address = "127.0.0.1"
             .expect("last model file");
         assert_eq!(remembered, "proxy-model");
         assert_eq!(switched_json["keychain_saved"], true);
+
+        let (status, relisted) = send_json(&app, "GET", "/v1/settings/models", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(relisted["selected_key"], "proxy-model");
+        assert_eq!(relisted["active_key"], "proxy-model");
     }
 
     async fn send_json(
@@ -4499,6 +4510,8 @@ bind_address = "127.0.0.1"
         assert_eq!(body["keychain_saved"], false);
         assert_eq!(body["applied_to_active"], true);
         assert_eq!(body["active_key"], "alpha-1");
+        // A runtime default from startup is not a selection made in this process.
+        assert!(body["selected_key"].is_null());
         assert_eq!(body["models"][0]["key"], "alpha-1");
         assert_eq!(body["models"][0]["key_source"], "session");
         assert_eq!(body["models"][1]["key_source"], "none");

@@ -758,14 +758,19 @@ function QueuedMessages({
   items,
   paused,
   canResume,
+  waitingForModel,
   onRemove,
   onResume,
+  onChooseModel,
 }: {
   items: QueuedMessage[];
   paused: boolean;
   canResume: boolean;
+  /** No model is selected in this session yet: nothing is sent until one is. */
+  waitingForModel: boolean;
   onRemove: (id: string) => void;
   onResume: () => void;
+  onChooseModel: () => void;
 }) {
   if (items.length === 0) {
     return null;
@@ -775,9 +780,17 @@ function QueuedMessages({
       <div className="flex items-center justify-between gap-2 px-1.5 pb-1.5">
         <p className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
           Queued · {items.length}
-          {paused ? <span className="ml-1.5 normal-case tracking-normal">(paused)</span> : null}
+          {waitingForModel ? (
+            <span className="ml-1.5 normal-case tracking-normal">(waiting for a model)</span>
+          ) : paused ? (
+            <span className="ml-1.5 normal-case tracking-normal">(paused)</span>
+          ) : null}
         </p>
-        {paused && canResume ? (
+        {waitingForModel ? (
+          <Button className="h-6 px-2 text-xs" size="sm" type="button" variant="outline" onClick={onChooseModel}>
+            Choose model
+          </Button>
+        ) : paused && canResume ? (
           <Button className="h-6 px-2 text-xs" size="sm" type="button" variant="outline" onClick={onResume}>
             Send next
           </Button>
@@ -830,7 +843,16 @@ export default function App() {
   /** Off-canvas thread list below `md`. */
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [activeModelLabel, setActiveModelLabel] = useState<string | null>(null);
+  /** Shown in the Models tab when the dialog was opened by a send without a model. */
+  const [settingsNotice, setSettingsNotice] = useState<string | null>(null);
+  /** Model chosen in the web settings during this server process (`selected_key`). */
+  const [selectedModelLabel, setSelectedModelLabel] = useState<string | null>(null);
+  /**
+   * `loading`: not known yet. `none`: the server has models but none was chosen in this
+   * session, so web sends wait. `selected`: one was chosen. `ungated`: older server or no
+   * model catalog; sends go straight through to the runtime default.
+   */
+  const [modelState, setModelState] = useState<"loading" | "none" | "selected" | "ungated">("loading");
   const [workspacePaneNonce, setWorkspacePaneNonce] = useState(0);
   /** Assistant text streamed for the running turn (cleared on `text_reset` and at turn end). */
   const [streamingText, setStreamingText] = useState("");
@@ -1239,14 +1261,28 @@ export default function App() {
         }
         const body = (await response.json()) as {
           active_key: string | null;
+          selected_key?: string | null;
           models: Array<{ key: string; model_name: string }>;
         };
-        const active = body.models.find((model) => model.key === body.active_key);
-        if (!cancelled && active) {
-          setActiveModelLabel(active.model_name);
+        if (cancelled) {
+          return;
+        }
+        if (!("selected_key" in body) || body.models.length === 0) {
+          // Older server or no model catalog: nothing to choose, keep sending as before.
+          setModelState("ungated");
+          return;
+        }
+        const selected = body.models.find((model) => model.key === body.selected_key);
+        if (selected) {
+          setSelectedModelLabel(selected.model_name);
+          setModelState("selected");
+        } else {
+          setModelState("none");
         }
       } catch {
-        /* settings label is optional */
+        if (!cancelled) {
+          setModelState("ungated");
+        }
       }
     })();
     return () => {
@@ -1684,21 +1720,63 @@ export default function App() {
     setQueue((prev) => [...prev, { ...payload, id: createId() }]);
   };
 
-  /** Composer and MCP App messages: send now, or queue behind the running turn. */
+  const openModelSettings = (notice: string | null) => {
+    setSidebarOpen(false);
+    setSettingsNotice(notice);
+    setShowSettings(true);
+  };
+
+  const modelReady = modelState === "selected" || modelState === "ungated";
+
+  /**
+   * Composer and MCP App messages: send now, or queue behind the running turn. Without a
+   * model chosen in this session the message waits in the queue and the Models tab opens;
+   * it goes out once a model is selected.
+   */
   const sendOrQueue = (payload: ComposerPayload) => {
     if (!payload.text.trim() && payload.imageDataUrls.length === 0) {
       return;
     }
-    if (pendingRef.current) {
+    if (pendingRef.current || !modelReady) {
       enqueueMessage(payload);
+      if (modelState === "none") {
+        openModelSettings("Choose a model to send your message.");
+      }
       return;
     }
     void submitMessage(payload);
   };
 
-  // When a turn ends, send the next queued message (unless the queue is paused).
+  // A message typed before the model list loaded: ask for a model once we know none is chosen.
   useEffect(() => {
-    if (pending || historyLoading || queuePaused || queue.length === 0 || pendingRef.current) {
+    if (modelState === "none" && queue.length > 0 && !showSettings) {
+      openModelSettings("Choose a model to send your message.");
+    }
+    // Only the model state resolving should open the dialog, not later queue edits.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [modelState]);
+
+  const onModelSelected = (label: string) => {
+    setSelectedModelLabel(label);
+    setModelState("selected");
+    if (settingsNotice && queue.length > 0) {
+      // The dialog was opened to send a message; close it so the user sees it go out.
+      setShowSettings(false);
+      setSettingsNotice(null);
+    }
+  };
+
+  // When a turn ends, send the next queued message (unless the queue is paused or no model
+  // is selected yet).
+  useEffect(() => {
+    if (
+      !modelReady ||
+      pending ||
+      historyLoading ||
+      queuePaused ||
+      queue.length === 0 ||
+      pendingRef.current
+    ) {
       return;
     }
     const [next, ...rest] = queue;
@@ -1706,7 +1784,7 @@ export default function App() {
     void submitMessage({ text: next.text, imageDataUrls: next.imageDataUrls });
     // submitMessage is recreated each render; this effect only reacts to queue/turn state.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pending, historyLoading, queuePaused, queue]);
+  }, [modelReady, pending, historyLoading, queuePaused, queue]);
 
   const resumeQueue = () => {
     setQueuePaused(false);
@@ -1763,8 +1841,12 @@ export default function App() {
       ) : null}
       {showSettings ? (
         <SettingsDialog
-          onClose={() => setShowSettings(false)}
-          onActiveModel={setActiveModelLabel}
+          notice={settingsNotice}
+          onClose={() => {
+            setShowSettings(false);
+            setSettingsNotice(null);
+          }}
+          onActiveModel={onModelSelected}
         />
       ) : null}
       {dialogConfig ? (
@@ -1851,10 +1933,19 @@ export default function App() {
               </Button>
             </div>
           </div>
-          {activeModelLabel ? (
-            <p className="mt-1 truncate text-xs text-muted-foreground" title={activeModelLabel}>
-              {activeModelLabel}
+          {selectedModelLabel ? (
+            <p className="mt-1 truncate text-xs text-muted-foreground" title={selectedModelLabel}>
+              {selectedModelLabel}
             </p>
+          ) : modelState === "none" ? (
+            <button
+              className="mt-1 block max-w-full truncate rounded text-left text-xs text-muted-foreground/80 hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+              title="Choose a model in Settings"
+              type="button"
+              onClick={() => openModelSettings(null)}
+            >
+              No model selected
+            </button>
           ) : null}
           <Button className="mt-2 w-full" size="sm" onClick={startNewConversation}>
             New chat
@@ -1884,8 +1975,7 @@ export default function App() {
               variant="outline"
               onClick={() => {
                 // On narrow screens the sidebar overlays the page; close it so it does not cover the dialog.
-                setSidebarOpen(false);
-                setShowSettings(true);
+                openModelSettings(null);
               }}
             >
               Settings
@@ -2111,8 +2201,10 @@ export default function App() {
                 canResume={!pending && !historyLoading}
                 items={queue}
                 paused={queuePaused}
+                waitingForModel={modelState === "none"}
                 onRemove={(id) => setQueue((prev) => prev.filter((item) => item.id !== id))}
                 onResume={resumeQueue}
+                onChooseModel={() => openModelSettings("Choose a model to send your message.")}
               />
               <Composer
                 locked={historyLoading}
