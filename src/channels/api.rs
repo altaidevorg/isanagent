@@ -48,6 +48,12 @@ const AGENT_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_API_USER: &str = "api_user";
 const DEFAULT_RESPONSE_MODEL: &str = "isanagent";
 const MAX_RESPONSE_CACHE_ENTRIES: u64 = 1024;
+/// SSE event queue depth for one streaming `/v1/responses` turn.
+const STREAM_EVENT_CAPACITY: usize = 256;
+/// Queue slots kept free for control events (tool lifecycle, completion, error). Text deltas
+/// that would eat into this reserve are coalesced into `unsent_text` instead of queued, so a slow
+/// SSE reader can never cause the final `completion` to be dropped.
+const STREAM_CONTROL_RESERVE: usize = 32;
 
 include!(concat!(env!("OUT_DIR"), "/ui_assets.rs"));
 
@@ -87,6 +93,8 @@ struct StreamingResponsePending {
     model: String,
     previous_response_id: Option<String>,
     store_response: bool,
+    /// Streamed text not yet queued because the SSE queue was near capacity.
+    unsent_text: String,
 }
 
 #[derive(Serialize)]
@@ -116,6 +124,13 @@ enum StreamEvent {
     AgentThought {
         thought: String,
     },
+    /// Incremental assistant text for the current model call.
+    TextDelta {
+        text: String,
+    },
+    /// Drop the text streamed so far: the agent discarded it (the model call ended in tool
+    /// calls, or is being retried). The `completion` content is always authoritative.
+    TextReset,
     Completion {
         content: String,
         thread_id: String,
@@ -707,7 +722,50 @@ impl Channel for ApiChannel {
     }
 }
 
+/// Queue one provider stream chunk on a streaming turn's SSE channel. Text deltas are coalesced
+/// (never dropped) while the queue is within [`STREAM_CONTROL_RESERVE`] of capacity; the pending
+/// text goes out with the next delta that fits.
+fn relay_stream_chunk(pending: &mut StreamingResponsePending, chunk: crate::traits::StreamChunk) {
+    use crate::traits::StreamChunk;
+    use tokio::sync::mpsc::error::TrySendError;
+    match chunk {
+        StreamChunk::TextDelta(text) => {
+            pending.unsent_text.push_str(&text);
+            if pending.unsent_text.is_empty()
+                || pending.stream_tx.capacity() <= STREAM_CONTROL_RESERVE
+            {
+                return;
+            }
+            let text = std::mem::take(&mut pending.unsent_text);
+            match pending.stream_tx.try_send(StreamEvent::TextDelta { text }) {
+                Ok(()) => {}
+                Err(TrySendError::Full(StreamEvent::TextDelta { text })) => {
+                    pending.unsent_text = text;
+                }
+                Err(_) => {}
+            }
+        }
+        StreamChunk::Reset => {
+            pending.unsent_text.clear();
+            if let Err(e) = pending.stream_tx.try_send(StreamEvent::TextReset) {
+                error!("Failed to send text_reset to stream: {e}");
+            }
+        }
+        _ => {}
+    }
+}
+
 impl ApiChannel {
+    /// Relay a [`BusMessage::StreamDelta`] to the streaming `/v1/responses` request for
+    /// `chat_id`, if one is in flight. Non-streaming requests ignore deltas.
+    pub fn handle_stream_delta(&self, chat_id: &str, chunk: &crate::traits::StreamChunk) {
+        if let Some(mut pending) = self.pending_requests.get_mut(chat_id) {
+            if let PendingRequest::Stream(pending) = pending.value_mut() {
+                relay_stream_chunk(pending, chunk.clone());
+            }
+        }
+    }
+
     pub async fn handle_telemetry(&self, event: TelemetryEvent) {
         match event {
             TelemetryEvent::ToolCallStarted {
@@ -1573,7 +1631,7 @@ async fn handle_responses(
     };
 
     if stream_requested {
-        let (stream_tx, mut stream_rx) = mpsc::channel(100);
+        let (stream_tx, mut stream_rx) = mpsc::channel(STREAM_EVENT_CAPACITY);
         match state.pending_requests.entry(conv_thread_id.clone()) {
             Entry::Occupied(_) => {
                 return ApiError::new(
@@ -1590,6 +1648,7 @@ async fn handle_responses(
                     model: model.clone(),
                     previous_response_id: previous_response_id.clone(),
                     store_response,
+                    unsent_text: String::new(),
                 }));
             }
         }
@@ -1609,7 +1668,10 @@ async fn handle_responses(
             thread_id: None,
             content: input.content,
             attachments: input.attachments,
-            metadata: Default::default(),
+            metadata: HashMap::from([(
+                crate::bus::METADATA_STREAM_TEXT.to_string(),
+                Value::Bool(true),
+            )]),
         };
 
         if let Err(e) = state.bus_tx.send(BusMessage::Inbound(inbound)).await {
@@ -3242,6 +3304,94 @@ mod tests {
             let encoded = serde_json::to_value(event).expect("serialize stream event");
             assert_eq!(encoded["tool_call_id"], "call-7");
         }
+    }
+
+    fn stream_pending(
+        capacity: usize,
+    ) -> (
+        super::StreamingResponsePending,
+        tokio::sync::mpsc::Receiver<StreamEvent>,
+    ) {
+        let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(capacity);
+        (
+            super::StreamingResponsePending {
+                stream_tx,
+                sender_id: "u".to_string(),
+                model: "m".to_string(),
+                previous_response_id: None,
+                store_response: false,
+                unsent_text: String::new(),
+            },
+            stream_rx,
+        )
+    }
+
+    fn drain_json(rx: &mut tokio::sync::mpsc::Receiver<StreamEvent>) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            out.push(serde_json::to_value(event).expect("serialize stream event"));
+        }
+        out
+    }
+
+    #[test]
+    fn text_stream_events_serialize_with_snake_case_types() {
+        let delta = serde_json::to_value(StreamEvent::TextDelta {
+            text: "Hel".to_string(),
+        })
+        .unwrap();
+        assert_eq!(
+            delta,
+            serde_json::json!({"type": "text_delta", "text": "Hel"})
+        );
+        let reset = serde_json::to_value(StreamEvent::TextReset).unwrap();
+        assert_eq!(reset, serde_json::json!({"type": "text_reset"}));
+    }
+
+    #[test]
+    fn stream_chunks_relay_as_text_delta_and_reset_events() {
+        use crate::traits::{FinishReason, StreamChunk};
+        let (mut pending, mut rx) = stream_pending(super::STREAM_EVENT_CAPACITY);
+        super::relay_stream_chunk(&mut pending, StreamChunk::TextDelta("Let me ".into()));
+        super::relay_stream_chunk(&mut pending, StreamChunk::TextDelta("check".into()));
+        // Non-text chunks are not part of the SSE contract.
+        super::relay_stream_chunk(&mut pending, StreamChunk::ReasoningDelta("hmm".into()));
+        super::relay_stream_chunk(&mut pending, StreamChunk::Finish(FinishReason::ToolCalls));
+        super::relay_stream_chunk(&mut pending, StreamChunk::Reset);
+        super::relay_stream_chunk(&mut pending, StreamChunk::TextDelta("Done.".into()));
+        assert_eq!(
+            drain_json(&mut rx),
+            vec![
+                serde_json::json!({"type": "text_delta", "text": "Let me "}),
+                serde_json::json!({"type": "text_delta", "text": "check"}),
+                serde_json::json!({"type": "text_reset"}),
+                serde_json::json!({"type": "text_delta", "text": "Done."}),
+            ]
+        );
+    }
+
+    #[test]
+    fn stream_text_is_coalesced_not_dropped_when_queue_is_near_full() {
+        use crate::traits::StreamChunk;
+        let capacity = super::STREAM_CONTROL_RESERVE + 2;
+        let (mut pending, mut rx) = stream_pending(capacity);
+        for word in ["a", "b", "c", "d", "e"] {
+            super::relay_stream_chunk(&mut pending, StreamChunk::TextDelta(word.into()));
+        }
+        // Two deltas fit above the reserve; the rest waits in `unsent_text`.
+        assert_eq!(pending.unsent_text, "cde");
+        let first = drain_json(&mut rx);
+        assert_eq!(first.len(), 2);
+        // Once the reader drains, the next delta carries the backlog.
+        super::relay_stream_chunk(&mut pending, StreamChunk::TextDelta("f".into()));
+        assert_eq!(
+            drain_json(&mut rx),
+            vec![serde_json::json!({"type": "text_delta", "text": "cdef"})]
+        );
+        // A reset discards the backlog as well.
+        pending.unsent_text.push_str("stale");
+        super::relay_stream_chunk(&mut pending, StreamChunk::Reset);
+        assert!(pending.unsent_text.is_empty());
     }
 
     struct LocalTempDir {

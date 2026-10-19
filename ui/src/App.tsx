@@ -1,4 +1,5 @@
 import {
+  memo,
   useCallback,
   useEffect,
   useMemo,
@@ -8,11 +9,23 @@ import {
   type MouseEvent,
 } from "react";
 
+import { MarkdownText, preloadMarkdown } from "@/components/MarkdownText";
 import { McpAppFrame, type McpAppRef } from "@/components/McpAppFrame";
 import { SettingsDialog } from "@/components/SettingsDialog";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import { WorkDrawer, type WorkTab } from "@/components/WorkDrawer";
+import {
+  buildErrorMessage,
+  isActiveJob,
+  isUnreadNotification,
+  type ApiErrorPayload,
+  type BackgroundJob,
+  type NotificationItem,
+  type SummaryEntry,
+} from "@/lib/api";
 import { useDialog } from "@/lib/useDialog";
+import { useMediaQuery } from "@/lib/useMediaQuery";
 import { cn } from "@/lib/utils";
 
 const THREAD_ID_STORAGE_KEY = "isanagent_thread_id";
@@ -133,6 +146,10 @@ type StreamEvent =
       mcp_app?: McpAppRef;
     }
   | { type: "agent_thought"; thought: string }
+  /** Incremental assistant text for the current model call. */
+  | { type: "text_delta"; text: string }
+  /** The agent discarded the text streamed so far (tool calls follow, or a retry). */
+  | { type: "text_reset" }
   | {
       type: "completion";
       content: string;
@@ -156,64 +173,6 @@ type ThreadListEntry = {
   /** From API; older servers may omit. */
   preview?: string;
 };
-
-type SummaryEntry = {
-  id: number;
-  thread_id: string;
-  summary: string;
-  key_info: string;
-  knowledge_gaps: string;
-  created_at: string;
-};
-
-type BackgroundJob = {
-  job_id: string;
-  kind: string;
-  chat_id: string;
-  state: string;
-  updated_at_ms: number;
-};
-
-type NotificationItem = {
-  notification_id: string;
-  kind: string;
-  title: string;
-  body: string;
-  chat_id: string;
-  action_kind?: string | null;
-  action_payload?: string | null;
-  seen_at_ms?: number | null;
-  resolved_at_ms?: number | null;
-  created_at_ms: number;
-};
-
-type WorkspaceListEntryDto = {
-  name: string;
-  kind: string;
-  size?: number;
-};
-
-type WorkspaceListDto = {
-  path: string;
-  entries: WorkspaceListEntryDto[];
-};
-
-type WorkspaceFileDto = {
-  path: string;
-  content: string;
-};
-
-function workspaceParentPath(rel: string): string {
-  const parts = rel.split("/").filter(Boolean);
-  parts.pop();
-  return parts.join("/");
-}
-
-function workspaceJoinPath(dir: string, name: string): string {
-  return dir ? `${dir}/${name}` : name;
-}
-
-type ApiErrorPayload = { error?: { code?: string; message?: string } } | null;
 
 function pickResponseId(raw: unknown): string | null {
   if (!raw || typeof raw !== "object") {
@@ -360,13 +319,6 @@ function apiUserId(): string {
   return id;
 }
 
-function buildErrorMessage(error: unknown) {
-  if (error instanceof Error && error.message) {
-    return error.message;
-  }
-  return "Request failed. Try again.";
-}
-
 /** Server no longer has this id (deleted chat, wiped DB, or different workspace). */
 function isStalePreviousResponseError(status: number, payload: ApiErrorPayload): boolean {
   if (status !== 404 || !payload?.error) {
@@ -400,36 +352,126 @@ function bubbleStyle(role: string) {
     return "ml-auto bg-primary text-primary-foreground shadow-btn-inset";
   }
   if (role === "assistant") {
-    return "mr-auto border border-border bg-card text-card-foreground shadow-none";
+    return "mr-auto border border-border bg-card text-card-foreground shadow-none max-sm:!max-w-full";
   }
   return "mx-auto max-w-[90%] border border-dashed border-[color:var(--ghost-border)] bg-muted text-foreground";
 }
 
-function TypingIndicator({ step }: { step: string | null }) {
+function TypingDots() {
   return (
-    <div className="mr-auto flex max-w-[82%] flex-col gap-2">
-      <div
-        aria-label="Assistant is typing"
-        className="flex items-center gap-3 rounded-xl border border-border bg-card px-5 py-4"
-      >
-        <div className="flex items-center gap-1.5">
-          <span
-            className="inline-block h-2 w-2 animate-bounce rounded-full bg-muted-foreground/80"
-            style={{ animationDuration: "0.55s", animationDelay: "0ms" }}
-          />
-          <span
-            className="inline-block h-2 w-2 animate-bounce rounded-full bg-muted-foreground/80"
-            style={{ animationDuration: "0.55s", animationDelay: "0.12s" }}
-          />
-          <span
-            className="inline-block h-2 w-2 animate-bounce rounded-full bg-muted-foreground/80"
-            style={{ animationDuration: "0.55s", animationDelay: "0.24s" }}
-          />
-        </div>
-        {step && <span className="text-sm text-muted-foreground animate-pulse">{step}</span>}
-      </div>
-    </div>
+    <span aria-hidden className="flex items-center gap-1.5">
+      {[0, 0.12, 0.24].map((delay) => (
+        <span
+          className="inline-block h-2 w-2 animate-bounce rounded-full bg-muted-foreground/80"
+          key={delay}
+          style={{ animationDuration: "0.55s", animationDelay: `${delay}s` }}
+        />
+      ))}
+    </span>
   );
+}
+
+/**
+ * The assistant reply being produced: streamed markdown text, MCP App panels and the current
+ * step. Replaced by the final message (whose `completion` text is authoritative) when the turn ends.
+ */
+function PendingAssistantBubble({
+  text,
+  step,
+  toolCalls,
+  onChatMessage,
+}: {
+  text: string;
+  step: string | null;
+  toolCalls: ToolCall[];
+  onChatMessage: (text: string) => void;
+}) {
+  const hasApps = toolCalls.some((toolCall) => toolCall.mcpApp);
+  const finished = toolCalls.filter((toolCall) => toolCall.tool_name).length;
+  return (
+    <article
+      aria-busy="true"
+      aria-label="Assistant is responding"
+      className={cn(
+        "rounded-xl px-4 py-3",
+        bubbleStyle("assistant"),
+        hasApps ? "w-full min-w-0 max-w-full" : text ? "max-w-[82%]" : "max-w-[82%] min-w-[12rem]",
+      )}
+    >
+      <span className="text-[11px] font-semibold uppercase tracking-[0.2em] opacity-70">assistant</span>
+      {text ? <MarkdownText className="mt-2" content={text} /> : null}
+      <McpAppList onChatMessage={onChatMessage} toolCalls={toolCalls} />
+      <div aria-live="polite" className={cn("flex items-center gap-3", text || hasApps ? "mt-3" : "mt-2")}>
+        <TypingDots />
+        <span className="min-w-0 truncate text-sm text-muted-foreground">
+          {step ?? (text ? "Writing…" : "Thinking…")}
+        </span>
+        {finished > 0 ? (
+          <span className="ml-auto shrink-0 text-[11px] text-muted-foreground">
+            {finished} tool call{finished === 1 ? "" : "s"}
+          </span>
+        ) : null}
+      </div>
+    </article>
+  );
+}
+
+/** One finished chat message. Memoized so streaming tokens never re-render (or re-parse) history. */
+const MessageBubble = memo(function MessageBubble({
+  message,
+  choicesEnabled,
+  onChatMessage,
+  onChoose,
+}: {
+  message: Message;
+  choicesEnabled: boolean;
+  onChatMessage: (text: string) => void;
+  onChoose: (choice: string) => void;
+}) {
+  return (
+    <article
+      className={cn(
+        "rounded-xl px-4 py-3",
+        bubbleStyle(message.role),
+        message.toolCalls?.some((toolCall) => toolCall.mcpApp) ? "w-full min-w-0 max-w-full" : "max-w-[82%]",
+      )}
+    >
+      <div className="flex items-center gap-4">
+        <span className="text-[11px] font-semibold uppercase tracking-[0.2em] opacity-70">{message.role}</span>
+      </div>
+      {message.content ? (
+        message.role === "assistant" ? (
+          <MarkdownText className="mt-2" content={message.content} />
+        ) : (
+          <p className="mt-2 whitespace-pre-wrap break-words text-sm leading-7">{message.content}</p>
+        )
+      ) : null}
+      <McpAppList onChatMessage={onChatMessage} toolCalls={message.toolCalls} />
+      {message.clarification && (
+        <ClarificationCard clarification={message.clarification} disabled={!choicesEnabled} onChoose={onChoose} />
+      )}
+      {message.toolCalls && <ToolAccordion toolCalls={message.toolCalls} />}
+      {message.imageUrls?.length ? (
+        <div className="mt-2 flex flex-col gap-2">
+          {message.imageUrls.map((url, idx) => (
+            <img
+              alt=""
+              className="max-h-64 max-w-full rounded-lg object-contain"
+              key={`${message.id}-img-${idx}`}
+              src={url}
+            />
+          ))}
+        </div>
+      ) : null}
+    </article>
+  );
+});
+
+/** Stable function identity that always calls the latest `fn` (for memoized children). */
+function useStableCallback<A extends unknown[], R>(fn: (...args: A) => R): (...args: A) => R {
+  const ref = useRef(fn);
+  ref.current = fn;
+  return useCallback((...args: A) => ref.current(...args), []);
 }
 
 function diffLineClass(line: string) {
@@ -572,31 +614,38 @@ function fileToDataUrl(file: File): Promise<string> {
   });
 }
 
+type ComposerPayload = { text: string; imageDataUrls: string[] };
+
+/** A message typed while a turn was running; sent automatically when the turn ends. */
+type QueuedMessage = ComposerPayload & { id: string };
+
 type ComposerProps = {
-  disabled: boolean;
+  /** Thread history is loading: nothing can be typed or sent. */
+  locked: boolean;
+  /** A turn is running: Send queues the message instead. */
   pending: boolean;
   onStop: () => void;
-  onSubmit: (payload: { text: string; imageDataUrls: string[] }) => Promise<void>;
+  onSubmit: (payload: ComposerPayload) => void;
 };
 
-function Composer({ disabled: streamingResponse, pending, onStop, onSubmit }: ComposerProps) {
+function Composer({ locked, pending, onStop, onSubmit }: ComposerProps) {
   const [draft, setDraft] = useState("");
   const [attachments, setAttachments] = useState<{ id: string; url: string; name: string }[]>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  const submit = async () => {
+  const submit = () => {
     const trimmed = draft.trim();
-    if ((!trimmed && attachments.length === 0) || streamingResponse) {
+    if ((!trimmed && attachments.length === 0) || locked) {
       return;
     }
     const urls = attachments.map((a) => a.url);
     setDraft("");
     setAttachments([]);
-    await onSubmit({ text: trimmed, imageDataUrls: urls });
+    onSubmit({ text: trimmed, imageDataUrls: urls });
   };
 
   const onPickFiles = async (list: FileList | null) => {
-    if (!list?.length || streamingResponse) {
+    if (!list?.length || locked) {
       return;
     }
     const imageFiles = Array.from(list).filter((f) => f.type.startsWith("image/"));
@@ -615,8 +664,10 @@ function Composer({ disabled: streamingResponse, pending, onStop, onSubmit }: Co
     }
   };
 
+  const empty = draft.trim().length === 0 && attachments.length === 0;
+
   return (
-    <div className="rounded-xl border border-border bg-card p-4 shadow-focus-soft">
+    <div className="rounded-xl border border-border bg-card p-3 shadow-focus-soft sm:p-4">
       {attachments.length > 0 ? (
         <div className="mb-3 flex flex-wrap gap-2">
           {attachments.map((a) => (
@@ -626,8 +677,9 @@ function Composer({ disabled: streamingResponse, pending, onStop, onSubmit }: Co
             >
               <img alt="" className="h-full w-full object-cover" src={a.url} />
               <button
+                aria-label={`Remove ${a.name}`}
                 className="absolute right-0.5 top-0.5 rounded bg-background/90 px-1 text-[10px] font-medium text-foreground shadow"
-                disabled={streamingResponse}
+                disabled={locked}
                 type="button"
                 onClick={() => setAttachments((prev) => prev.filter((x) => x.id !== a.id))}
               >
@@ -638,19 +690,25 @@ function Composer({ disabled: streamingResponse, pending, onStop, onSubmit }: Co
         </div>
       ) : null}
       <Textarea
-        className="min-h-[116px] resize-none border-0 bg-transparent p-0 text-[15px] shadow-none focus-visible:ring-0"
+        aria-label="Message"
+        className="min-h-[88px] resize-none border-0 bg-transparent p-0 text-[15px] shadow-none focus-visible:ring-0 sm:min-h-[116px]"
+        disabled={locked}
         onChange={(event) => setDraft(event.target.value)}
         onKeyDown={(event) => {
-          if (event.key === "Enter" && !event.shiftKey) {
+          if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
             event.preventDefault();
-            void submit();
+            submit();
           }
         }}
-        placeholder="Message isanagent (images: attach below). Shift+Enter for newline."
+        placeholder={
+          pending
+            ? "Type your next message — it is sent when this turn ends."
+            : "Message isanagent (images: attach below). Shift+Enter for newline."
+        }
         value={draft}
       />
-      <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
-        <div className="flex flex-wrap items-center gap-2">
+      <div className="mt-3 flex flex-wrap items-center justify-between gap-3 sm:mt-4">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
           <input
             accept="image/jpeg,image/png,image/gif,image/webp"
             className="hidden"
@@ -660,7 +718,7 @@ function Composer({ disabled: streamingResponse, pending, onStop, onSubmit }: Co
             onChange={(e) => void onPickFiles(e.target.files)}
           />
           <Button
-            disabled={streamingResponse}
+            disabled={locked}
             size="sm"
             type="button"
             variant="outline"
@@ -668,28 +726,87 @@ function Composer({ disabled: streamingResponse, pending, onStop, onSubmit }: Co
           >
             Add images
           </Button>
-          <p className="text-xs text-muted-foreground">
-            {streamingResponse ? "Waiting for response…" : "JPEG, PNG, GIF, WebP · up to 8"}
+          <p className="hidden text-xs text-muted-foreground sm:block">
+            {locked
+              ? "Loading conversation…"
+              : pending
+                ? "Agent is working · Enter queues"
+                : "JPEG, PNG, GIF, WebP · up to 8"}
           </p>
         </div>
         <div className="flex gap-2">
           {pending && (
             <Button
               variant="outline"
-              className="text-destructive border-destructive hover:bg-destructive/10"
+              className="border-destructive text-destructive hover:bg-destructive/10"
+              type="button"
               onClick={onStop}
             >
               Stop
             </Button>
           )}
-          <Button
-            disabled={streamingResponse || (draft.trim().length === 0 && attachments.length === 0)}
-            onClick={() => void submit()}
-          >
-            {streamingResponse ? "Working…" : "Send"}
+          <Button disabled={locked || empty} type="button" onClick={submit}>
+            {pending ? "Queue" : "Send"}
           </Button>
         </div>
       </div>
+    </div>
+  );
+}
+
+function QueuedMessages({
+  items,
+  paused,
+  canResume,
+  onRemove,
+  onResume,
+}: {
+  items: QueuedMessage[];
+  paused: boolean;
+  canResume: boolean;
+  onRemove: (id: string) => void;
+  onResume: () => void;
+}) {
+  if (items.length === 0) {
+    return null;
+  }
+  return (
+    <div aria-label="Queued messages" className="mb-3 rounded-xl border border-dashed border-[color:var(--ghost-border)] bg-[color:var(--ghost-fill-strong)] p-2" role="region">
+      <div className="flex items-center justify-between gap-2 px-1.5 pb-1.5">
+        <p className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
+          Queued · {items.length}
+          {paused ? <span className="ml-1.5 normal-case tracking-normal">(paused)</span> : null}
+        </p>
+        {paused && canResume ? (
+          <Button className="h-6 px-2 text-xs" size="sm" type="button" variant="outline" onClick={onResume}>
+            Send next
+          </Button>
+        ) : null}
+      </div>
+      <ul className="max-h-36 space-y-1 overflow-y-auto">
+        {items.map((item, index) => (
+          <li className="flex items-center gap-2 rounded-lg bg-card px-2.5 py-1.5 text-sm" key={item.id}>
+            <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">{index + 1}</span>
+            <span className="min-w-0 flex-1 truncate text-foreground" title={item.text}>
+              {item.text || "(image)"}
+              {item.imageDataUrls.length > 0 && item.text ? (
+                <span className="ml-1.5 text-xs text-muted-foreground">
+                  +{item.imageDataUrls.length} image{item.imageDataUrls.length === 1 ? "" : "s"}
+                </span>
+              ) : null}
+            </span>
+            <button
+              aria-label={`Remove queued message ${index + 1}`}
+              className="shrink-0 rounded-md px-1.5 text-base leading-6 text-muted-foreground hover:bg-destructive/15 hover:text-destructive"
+              title="Remove"
+              type="button"
+              onClick={() => onRemove(item.id)}
+            >
+              ×
+            </button>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
@@ -708,12 +825,21 @@ export default function App() {
   const [sessionsError, setSessionsError] = useState<string | null>(null);
   const [sidebarHints, setSidebarHints] = useState<Record<string, string>>(loadSidebarHints);
   const [sessionToDelete, setSessionToDelete] = useState<ThreadListEntry | null>(null);
-  const [showSummaries, setShowSummaries] = useState(false);
-  const [showWorkspaceModal, setShowWorkspaceModal] = useState(false);
-  const [showBackgroundPanel, setShowBackgroundPanel] = useState(false);
+  const [workOpen, setWorkOpen] = useState(false);
+  const [workTab, setWorkTab] = useState<WorkTab>("jobs");
+  /** Off-canvas thread list below `md`. */
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [activeModelLabel, setActiveModelLabel] = useState<string | null>(null);
   const [workspacePaneNonce, setWorkspacePaneNonce] = useState(0);
+  /** Assistant text streamed for the running turn (cleared on `text_reset` and at turn end). */
+  const [streamingText, setStreamingText] = useState("");
+  /** Messages typed (or sent by MCP Apps) while a turn runs; the next one goes out when it ends. */
+  const [queue, setQueue] = useState<QueuedMessage[]>([]);
+  /** Stop, an error or switching threads pauses the queue instead of firing the next item. */
+  const [queuePaused, setQueuePaused] = useState(false);
+  const isDesktopDrawer = useMediaQuery("(min-width: 1024px)");
+  const isWideSidebar = useMediaQuery("(min-width: 768px)");
 
   // Custom dialog state to replace window.confirm/prompt
   const [dialogConfig, setDialogConfig] = useState<{
@@ -727,11 +853,9 @@ export default function App() {
 
   const dialogInputRef = useRef<HTMLInputElement>(null);
   const pendingRef = useRef(false);
-  const queuedUiMessages = useRef<string[]>([]);
 
   const deleteDialogRef = useDialog(sessionToDelete !== null, () => setSessionToDelete(null));
-  const backgroundDialogRef = useDialog(showBackgroundPanel, () => setShowBackgroundPanel(false));
-  const workspaceDialogRef = useDialog(showWorkspaceModal, () => setShowWorkspaceModal(false));
+  const sidebarRef = useDialog<HTMLElement>(sidebarOpen && !isWideSidebar, () => setSidebarOpen(false));
   const appDialogRef = useDialog(dialogConfig !== null, () => dialogConfig?.onCancel());
 
   const showConfirm = (title: string, message: string, onConfirm: () => void) => {
@@ -779,6 +903,10 @@ export default function App() {
   const lastScrollTopRef = useRef(0);
 
   const requestUserId = useMemo(() => apiUserId(), []);
+
+  useEffect(() => {
+    preloadMarkdown();
+  }, []);
 
   const loadAllSummaries = useCallback(async () => {
     setSummariesLoading(true);
@@ -867,6 +995,9 @@ export default function App() {
 
   const openSession = (entry: ThreadListEntry) => {
     stickToBottomRef.current = true;
+    setSidebarOpen(false);
+    // Queued text was written for the previous thread; hold it until the user sends it on.
+    setQueuePaused(true);
     startTransition(() => {
       setErrorMessage(null);
       persistSessionPointers(entry.thread_id, entry.latest_response_id);
@@ -890,8 +1021,12 @@ export default function App() {
       void loadHistory(targetId);
       void loadSummaries(targetId);
     }
-    setShowBackgroundPanel(false);
-  }, [sessions, loadHistory, loadSummaries]);
+    // The chat stays visible next to the docked drawer; the overlay drawer would cover it.
+    if (!isDesktopDrawer) {
+      setWorkOpen(false);
+    }
+    setSidebarOpen(false);
+  }, [sessions, loadHistory, loadSummaries, isDesktopDrawer]);
 
   const loadBackgroundData = useCallback(async (): Promise<NotificationItem[] | null> => {
     try {
@@ -913,18 +1048,7 @@ export default function App() {
     return null;
   }, []);
 
-  const loadNotifications = useCallback(async () => {
-    try {
-      const res = await fetch("/v1/notifications?limit=100");
-      if (res.ok) {
-        setNotifications((await res.json()) as NotificationItem[]);
-      }
-    } catch {
-      // best-effort; the unread dot just stays as it was
-    }
-  }, []);
-
-  /** Mark unseen notifications as seen on the server (the Background panel is showing them). */
+  /** Mark unseen notifications as seen on the server (the Work drawer is showing them). */
   const markNotificationsSeen = useCallback(async (items: NotificationItem[]) => {
     const unseen = items.filter((n) => !n.seen_at_ms);
     if (unseen.length === 0) {
@@ -952,16 +1076,17 @@ export default function App() {
     );
   }, []);
 
+  // Jobs and notifications feed the Work badge, so poll both (paused while the tab is hidden).
   useEffect(() => {
-    void loadNotifications();
+    void loadBackgroundData();
     const timer = window.setInterval(() => {
       if (!document.hidden) {
-        void loadNotifications();
+        void loadBackgroundData();
       }
     }, 20_000);
     const onVisibility = () => {
       if (!document.hidden) {
-        void loadNotifications();
+        void loadBackgroundData();
       }
     };
     document.addEventListener("visibilitychange", onVisibility);
@@ -969,7 +1094,46 @@ export default function App() {
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [loadNotifications]);
+  }, [loadBackgroundData]);
+
+  // Notifications count as seen once the Jobs tab of the open drawer shows them.
+  useEffect(() => {
+    if (workOpen && workTab === "jobs") {
+      void markNotificationsSeen(notifications);
+    }
+  }, [workOpen, workTab, notifications, markNotificationsSeen]);
+
+  const openWork = (tab?: WorkTab) => {
+    const nextTab = tab ?? workTab;
+    setWorkTab(nextTab);
+    setWorkspacePaneNonce((n) => n + 1);
+    setWorkOpen(true);
+    setSidebarOpen(false);
+    void loadBackgroundData();
+    if (nextTab === "summaries") {
+      void loadAllSummaries();
+    }
+  };
+
+  const toggleWork = () => {
+    if (workOpen) {
+      setWorkOpen(false);
+    } else {
+      openWork();
+    }
+  };
+
+  const changeWorkTab = (tab: WorkTab) => {
+    setWorkTab(tab);
+    if (tab === "summaries") {
+      void loadAllSummaries();
+    } else if (tab === "jobs" || tab === "agents") {
+      void loadBackgroundData();
+    }
+  };
+
+  const workBadge =
+    jobs.filter(isActiveJob).length + notifications.filter(isUnreadNotification).length;
 
   const replyToTicket = async (ticketId: string, response: string) => {
     try {
@@ -1122,10 +1286,42 @@ export default function App() {
     endOfMessagesRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages.length, pending, currentStep, currentToolCalls.length, threadSummaries.length]);
 
+  // Follow streamed text without smooth-scroll jitter on every token.
+  useEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!streamingText || !el || !stickToBottomRef.current) {
+      return;
+    }
+    el.scrollTop = el.scrollHeight;
+    lastScrollTopRef.current = el.scrollTop;
+  }, [streamingText]);
+
+  /** Coalesce streamed text updates to one render per animation frame. */
+  const streamFrameRef = useRef<number | null>(null);
+  const streamTextRef = useRef("");
+  const publishStreamingText = useCallback((text: string, immediate = false) => {
+    streamTextRef.current = text;
+    if (immediate) {
+      if (streamFrameRef.current !== null) {
+        cancelAnimationFrame(streamFrameRef.current);
+        streamFrameRef.current = null;
+      }
+      setStreamingText(text);
+      return;
+    }
+    if (streamFrameRef.current === null) {
+      streamFrameRef.current = requestAnimationFrame(() => {
+        streamFrameRef.current = null;
+        setStreamingText(streamTextRef.current);
+      });
+    }
+  }, []);
+
   const startNewConversation = () => {
     // Drop the turn that is still waiting on the model. Otherwise the new
     // conversation sits behind that request and looks frozen.
     void stopGeneration();
+    setSidebarOpen(false);
     startTransition(() => {
       clearSessionPointers();
       setInternalChatId(null);
@@ -1209,9 +1405,12 @@ export default function App() {
     }
 
     pendingRef.current = false;
+    // Queued messages wait for an explicit "Send next" after a stop.
+    setQueuePaused(true);
     setPending(false);
     setCurrentStep(null);
     setCurrentToolCalls([]);
+    publishStreamingText("", true);
 
     const chatToCancel = cancelChatIdRef.current ?? internalChatId;
     if (!chatToCancel) {
@@ -1254,6 +1453,7 @@ export default function App() {
     setPending(true);
     setCurrentStep(null);
     setCurrentToolCalls([]);
+    publishStreamingText("", true);
 
     cancelChatIdRef.current = turnChatId;
     if (!hadSessionBefore) {
@@ -1264,7 +1464,6 @@ export default function App() {
     abortControllerRef.current = controller;
 
     let previousResponseId: string | undefined = latestResponseId ?? undefined;
-    let turnCompleted = false;
 
     try {
       const response = await fetch("/v1/responses", {
@@ -1300,6 +1499,8 @@ export default function App() {
 
       let decoder = new TextDecoder();
       let assistantContent = "";
+      /** Text streamed for the current model call; the `completion` content replaces it. */
+      let streamedText = "";
       let toolCalls: ToolCall[] = [];
       /** In-flight calls keyed by tool_call_id (or `name:<tool>` from older servers); FIFO per key. */
       const inFlightToolCalls = new Map<string, ToolCall[]>();
@@ -1335,6 +1536,18 @@ export default function App() {
           switch (event.type) {
             case "agent_thought":
               setCurrentStep(`Thinking: ${event.thought}`);
+              break;
+            case "text_delta":
+              if (event.text) {
+                streamedText += event.text;
+                publishStreamingText(streamedText);
+                // A tool/thought step is over once the model writes text again.
+                setCurrentStep(null);
+              }
+              break;
+            case "text_reset":
+              streamedText = "";
+              publishStreamingText("", true);
               break;
             case "tool_call_started": {
               const key = toolCallKey(event.tool_name, event.tool_call_id);
@@ -1395,6 +1608,10 @@ export default function App() {
       } else if (!finalResponseId && !assistantContent) {
         streamError = "The response ended before the assistant replied.";
       }
+      // `completion` is authoritative; without one (stream error) keep the partial streamed text.
+      if (!finalResponseId && !assistantContent && streamedText.trim()) {
+        assistantContent = streamedText;
+      }
 
       // Keep whatever the turn produced; skip an empty bubble when there is nothing to show.
       if (assistantContent || toolCalls.length > 0 || clarification) {
@@ -1413,7 +1630,7 @@ export default function App() {
 
       if (streamError !== null) {
         // The server accepted the turn, so the user message stays; only surface the failure.
-        queuedUiMessages.current = [];
+        setQueuePaused(true);
         setErrorMessage(streamError);
         void loadSessions();
         return;
@@ -1435,10 +1652,9 @@ export default function App() {
       }
 
       void loadSessions();
-      turnCompleted = true;
     } catch (error) {
+      setQueuePaused(true);
       if (error instanceof Error && (error.name === "AbortError" || error.message.includes("aborted"))) {
-        queuedUiMessages.current = [];
         return;
       }
       setMessages((prev) => prev.filter((m) => m.id !== optimisticId));
@@ -1456,26 +1672,56 @@ export default function App() {
       setPending(false);
       setCurrentStep(null);
       setCurrentToolCalls([]);
-      if (turnCompleted) {
-        const next = queuedUiMessages.current.shift();
-        if (next) {
-          void submitMessage({ text: next, imageDataUrls: [] });
-        }
-      }
+      publishStreamingText("", true);
     }
   };
 
-  const deliverUiMessage = (text: string) => {
-    const trimmed = text.trim();
-    if (!trimmed) {
+  const enqueueMessage = (payload: ComposerPayload) => {
+    if (queue.length === 0) {
+      // A pause only holds back messages that were waiting when the turn stopped.
+      setQueuePaused(false);
+    }
+    setQueue((prev) => [...prev, { ...payload, id: createId() }]);
+  };
+
+  /** Composer and MCP App messages: send now, or queue behind the running turn. */
+  const sendOrQueue = (payload: ComposerPayload) => {
+    if (!payload.text.trim() && payload.imageDataUrls.length === 0) {
       return;
     }
     if (pendingRef.current) {
-      queuedUiMessages.current.push(trimmed);
+      enqueueMessage(payload);
       return;
     }
-    void submitMessage({ text: trimmed, imageDataUrls: [] });
+    void submitMessage(payload);
   };
+
+  // When a turn ends, send the next queued message (unless the queue is paused).
+  useEffect(() => {
+    if (pending || historyLoading || queuePaused || queue.length === 0 || pendingRef.current) {
+      return;
+    }
+    const [next, ...rest] = queue;
+    setQueue(rest);
+    void submitMessage({ text: next.text, imageDataUrls: next.imageDataUrls });
+    // submitMessage is recreated each render; this effect only reacts to queue/turn state.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pending, historyLoading, queuePaused, queue]);
+
+  const resumeQueue = () => {
+    setQueuePaused(false);
+  };
+
+  const deliverUiMessage = useStableCallback((text: string) => {
+    const trimmed = text.trim();
+    if (trimmed) {
+      sendOrQueue({ text: trimmed, imageDataUrls: [] });
+    }
+  });
+
+  const chooseClarification = useStableCallback((choice: string) => {
+    void submitMessage({ text: choice, imageDataUrls: [] });
+  });
 
   return (
     <div className="flex h-dvh overflow-hidden bg-background font-sans">
@@ -1521,191 +1767,6 @@ export default function App() {
           onActiveModel={setActiveModelLabel}
         />
       ) : null}
-      {showBackgroundPanel ? (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 outline-none"
-          ref={backgroundDialogRef}
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="background-runtime-title"
-          onClick={(e) => {
-            if (e.target === e.currentTarget) {
-              setShowBackgroundPanel(false);
-            }
-          }}
-        >
-          <div className="flex h-full max-h-[85vh] w-full max-w-4xl flex-col rounded-2xl border border-border bg-card shadow-2xl overflow-hidden animate-in fade-in zoom-in duration-200">
-            <div className="flex items-center justify-between border-b border-border px-6 py-4 bg-muted/30">
-              <div className="flex items-center gap-3">
-                <div className="h-2 w-2 rounded-full bg-primary animate-pulse" />
-                <h2 id="background-runtime-title" className="text-lg font-semibold tracking-tight text-foreground">Background Runtime</h2>
-              </div>
-              <Button variant="ghost" size="sm" className="h-8 w-8 p-0 rounded-full" aria-label="Close" onClick={() => setShowBackgroundPanel(false)}>
-                ×
-              </Button>
-            </div>
-            <div className="flex flex-1 overflow-hidden">
-              {/* Jobs column */}
-              <div className="w-1/2 flex flex-col border-r border-border">
-                <div className="p-4 border-b border-border bg-muted/10">
-                  <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">Active Jobs</p>
-                </div>
-                <div className="flex-1 overflow-y-auto p-4 space-y-3">
-                  {jobs.length === 0 ? (
-                    <div className="flex h-full items-center justify-center text-muted-foreground text-sm italic">
-                      No active background jobs
-                    </div>
-                  ) : (
-                    jobs.map((job) => (
-                      <div 
-                        key={job.job_id} 
-                        className={cn(
-                          "group rounded-xl border border-border p-4 transition-all hover:bg-muted/50 cursor-pointer",
-                          job.state === "waiting" ? "border-yellow-500/50 bg-yellow-500/5 shadow-sm" : ""
-                        )}
-                        onClick={() => jumpToThread(job.chat_id)}
-                      >
-                        <div className="flex items-center justify-between mb-2">
-                          <span className="font-mono text-[10px] text-muted-foreground truncate max-w-[150px]">{job.job_id}</span>
-                          <span className={cn(
-                            "px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-tighter",
-                            job.state === "running" ? "bg-primary/20 text-primary animate-pulse" : 
-                            job.state === "waiting" ? "bg-yellow-500/20 text-yellow-600 dark:text-yellow-400" :
-                            "bg-muted text-muted-foreground"
-                          )}>
-                            {job.state}
-                          </span>
-                        </div>
-                        <p className="text-sm font-medium text-foreground">{job.kind}</p>
-                        <div className="mt-3 flex items-center justify-between">
-                          <div className="flex items-center gap-2">
-                            <span className="text-[10px] text-muted-foreground">Updated {new Date(job.updated_at_ms).toLocaleTimeString()}</span>
-                            <button 
-                              className="text-[10px] text-destructive hover:underline"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                showConfirm("Dismiss Job", "Dismiss this background job and all associated requests?", () => {
-                                  void dismissBackgroundJob(job.job_id);
-                                });
-                              }}
-                            >
-                              Dismiss
-                            </button>
-                          </div>
-                          <span className="text-[10px] text-primary opacity-0 group-hover:opacity-100 transition-opacity">View thread →</span>
-                        </div>
-                      </div>
-                    ))
-                  )}
-                </div>
-              </div>
-
-              {/* Notifications column */}
-              <div className="w-1/2 flex flex-col">
-                <div className="p-4 border-b border-border bg-muted/10">
-                  <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">Notifications</p>
-                </div>
-                <div className="flex-1 overflow-y-auto p-4 space-y-3">
-                  {notifications.length === 0 ? (
-                    <div className="flex h-full items-center justify-center text-muted-foreground text-sm italic">
-                      No notifications
-                    </div>
-                  ) : (
-                    notifications.map((n) => (
-                      <div 
-                        key={n.notification_id} 
-                        className={cn(
-                          "rounded-xl border border-border p-4 transition-all",
-                          !n.seen_at_ms ? "bg-primary/5 border-primary/30" : "bg-card",
-                          n.kind === "clarification_ticket" && !n.resolved_at_ms ? "border-yellow-500/50 shadow-sm" : ""
-                        )}
-                      >
-                        <div className="flex items-center justify-between mb-2">
-                          <span className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
-                            {n.kind.replace(/_/g, ' ')}
-                          </span>
-                          <span className="text-[10px] text-muted-foreground">{new Date(n.created_at_ms).toLocaleTimeString()}</span>
-                        </div>
-                        <h4 className="text-sm font-semibold text-foreground mb-1">{n.title}</h4>
-                        <p className="text-xs text-muted-foreground leading-relaxed mb-4">{n.body}</p>
-                        
-                        <div className="flex flex-wrap gap-2">
-                          {n.kind === "clarification_ticket" && !n.resolved_at_ms ? (
-                            <Button 
-                              size="sm" 
-                              className="h-7 text-[10px] font-bold uppercase tracking-widest bg-yellow-500 hover:bg-yellow-600 text-white border-0"
-                              onClick={() => {
-                                showPrompt("Reply to request", "Enter your response:", "", (reply) => {
-                                  if (reply.trim()) {
-                                    void replyToTicket(n.action_payload || "", reply.trim());
-                                  }
-                                });
-                              }}
-                            >
-                              Reply to request
-                            </Button>
-                          ) : null}
-                          <Button 
-                            variant="outline" 
-                            size="sm" 
-                            className="h-7 text-[10px] font-bold uppercase tracking-widest"
-                            onClick={() => jumpToThread(n.chat_id)}
-                          >
-                            View context
-                          </Button>
-                          {n.kind === "clarification_ticket" && !n.resolved_at_ms && (
-                            <Button 
-                              variant="ghost" 
-                              size="sm" 
-                              className="h-7 text-[10px] font-bold uppercase tracking-widest text-destructive hover:text-destructive hover:bg-destructive/10"
-                              onClick={() => {
-                                showConfirm("Dismiss Request", "Dismiss this request? This will also mark the background job as completed.", () => {
-                                  void dismissTicket(n.action_payload || "");
-                                });
-                              }}
-                            >
-                              Dismiss
-                            </Button>
-                          )}
-                        </div>
-                      </div>
-                    ))
-                  )}
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      ) : null}
-      {showWorkspaceModal ? (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 outline-none"
-          ref={workspaceDialogRef}
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="workspace-modal-title"
-          onClick={(e) => {
-            if (e.target === e.currentTarget) {
-              setShowWorkspaceModal(false);
-            }
-          }}
-        >
-          <div className="flex h-full max-h-[90vh] w-full max-w-2xl flex-col rounded-xl border border-border bg-card shadow-lg overflow-hidden">
-            <div className="flex items-center justify-between border-b border-border p-4">
-              <h2 id="workspace-modal-title" className="text-lg font-semibold text-foreground">
-                Workspace
-              </h2>
-              <Button variant="ghost" size="sm" onClick={() => setShowWorkspaceModal(false)}>
-                Close
-              </Button>
-            </div>
-            <div className="flex-1 overflow-y-auto p-6">
-              <WorkspaceFilePane key={workspacePaneNonce} />
-            </div>
-          </div>
-        </div>
-      ) : null}
-
       {dialogConfig ? (
         <div
           className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4 outline-none"
@@ -1756,11 +1817,39 @@ export default function App() {
           </div>
         </div>
       ) : null}
-      <aside className="flex w-64 shrink-0 flex-col border-r border-border bg-background/90 backdrop-blur-md">
+      {sidebarOpen && !isWideSidebar ? (
+        <div aria-hidden className="fixed inset-0 z-40 bg-black/40 md:hidden" onClick={() => setSidebarOpen(false)} />
+      ) : null}
+      <aside
+        aria-label="Threads"
+        aria-modal={sidebarOpen && !isWideSidebar ? true : undefined}
+        className={cn(
+          "flex w-72 shrink-0 flex-col border-r border-border bg-background outline-none",
+          // Off-canvas menu below md; docked column from md up.
+          "fixed inset-y-0 left-0 z-50 shadow-2xl transition-transform duration-200 ease-out",
+          sidebarOpen ? "visible translate-x-0" : "invisible -translate-x-full",
+          "md:visible md:static md:z-auto md:w-64 md:translate-x-0 md:bg-background/90 md:shadow-none md:backdrop-blur-md md:transition-none",
+        )}
+        id="thread-sidebar"
+        ref={sidebarRef}
+        role={sidebarOpen && !isWideSidebar ? "dialog" : undefined}
+      >
         <div className="border-b border-border p-3">
           <div className="flex items-center justify-between gap-2">
             <p className="text-sm font-semibold tracking-[-0.02em] text-foreground">isanagent</p>
-            <ThemeToggle />
+            <div className="flex items-center gap-1">
+              <ThemeToggle />
+              <Button
+                aria-label="Close menu"
+                className="h-9 w-9 text-lg md:hidden"
+                size="icon"
+                type="button"
+                variant="ghost"
+                onClick={() => setSidebarOpen(false)}
+              >
+                ×
+              </Button>
+            </div>
           </div>
           {activeModelLabel ? (
             <p className="mt-1 truncate text-xs text-muted-foreground" title={activeModelLabel}>
@@ -1770,55 +1859,29 @@ export default function App() {
           <Button className="mt-2 w-full" size="sm" onClick={startNewConversation}>
             New chat
           </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            className="mt-2 w-full"
-            onClick={() => setShowSettings(true)}
-          >
-            Settings
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            className="mt-2 w-full"
-            onClick={() => {
-              setShowSummaries(true);
-              void loadAllSummaries();
-            }}
-            disabled={summariesLoading}
-          >
-            {summariesLoading ? "Loading…" : "Summaries"}
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            className="mt-2 w-full relative"
-            onClick={() => {
-              setShowBackgroundPanel(true);
-              void loadBackgroundData().then((items) => {
-                if (items) {
-                  void markNotificationsSeen(items);
-                }
-              });
-            }}
-          >
-            Background
-            {notifications.some(n => !n.seen_at_ms || (n.kind === "clarification_ticket" && !n.resolved_at_ms)) && (
-              <span className="absolute -top-1 -right-1 h-3 w-3 rounded-full bg-primary border-2 border-background animate-pulse" />
-            )}
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            className="mt-2 w-full"
-            onClick={() => {
-              setWorkspacePaneNonce((n) => n + 1);
-              setShowWorkspaceModal(true);
-            }}
-          >
-            Workspace Files
-          </Button>
+          <div className="mt-2 flex gap-2">
+            <Button
+              aria-controls="work-drawer"
+              aria-expanded={workOpen}
+              className={cn("relative flex-1", workOpen && "bg-[color:var(--ghost-fill)]")}
+              size="sm"
+              variant="outline"
+              onClick={toggleWork}
+            >
+              Work
+              {workBadge > 0 ? (
+                <span
+                  aria-label={`${workBadge} items need attention`}
+                  className="ml-1.5 min-w-[1.25rem] rounded-full bg-primary px-1.5 text-[10px] font-semibold leading-[1.15rem] text-primary-foreground"
+                >
+                  {workBadge}
+                </span>
+              ) : null}
+            </Button>
+            <Button className="flex-1" size="sm" variant="outline" onClick={() => setShowSettings(true)}>
+              Settings
+            </Button>
+          </div>
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto p-2">
           <p className="px-2 pb-1 text-xs font-medium uppercase tracking-[0.05em] text-muted-foreground">
@@ -1896,36 +1959,60 @@ export default function App() {
         </div>
       </aside>
 
-      <div className="flex min-w-0 flex-1 flex-col overflow-hidden px-3 py-4 sm:px-5">
+      <div className="flex min-w-0 flex-1 flex-col overflow-hidden px-2 py-2 sm:px-5 sm:py-4">
         <div className="flex h-full min-h-0 flex-col overflow-hidden rounded-xl border border-border bg-card shadow-panel">
-          <div className="flex items-center justify-between gap-3 border-b border-border px-5 py-4 sm:px-6">
-            <div>
-              <p className="text-xs font-medium uppercase tracking-[0.05em] text-muted-foreground">
-                Chat
-              </p>
-              <h1 className="mt-1 text-xl font-semibold tracking-[-0.02em] text-foreground">isanagent</h1>
-              <p className="mt-1 max-w-xl text-sm leading-relaxed text-muted-foreground">
-                Workspace-backed memory, multimodal input, and a thread list for this browser profile.
-              </p>
+          <div className="flex items-center justify-between gap-3 border-b border-border px-3 py-3 sm:px-6 sm:py-4">
+            <div className="flex min-w-0 items-center gap-2">
+              <Button
+                aria-controls="thread-sidebar"
+                aria-expanded={sidebarOpen}
+                aria-label="Open menu"
+                className="h-9 w-9 shrink-0 md:hidden"
+                size="icon"
+                type="button"
+                variant="ghost"
+                onClick={() => setSidebarOpen(true)}
+              >
+                <MenuIcon />
+              </Button>
+              <div className="min-w-0">
+                <p className="hidden text-xs font-medium uppercase tracking-[0.05em] text-muted-foreground sm:block">
+                  Chat
+                </p>
+                <h1 className="truncate text-lg font-semibold tracking-[-0.02em] text-foreground sm:mt-1 sm:text-xl">
+                  isanagent
+                </h1>
+                <p className="mt-1 hidden max-w-xl text-sm leading-relaxed text-muted-foreground lg:block">
+                  Workspace-backed memory, multimodal input, and a thread list for this browser profile.
+                </p>
+              </div>
             </div>
-            <div className="flex items-center gap-3">
-              <span className="shrink-0 rounded-full border border-[color:var(--ghost-border)] bg-muted px-3 py-1 text-xs font-medium text-muted-foreground">
+            <div className="flex shrink-0 items-center gap-2">
+              <span className="hidden shrink-0 rounded-full border border-[color:var(--ghost-border)] bg-muted px-3 py-1 text-xs font-medium text-muted-foreground sm:inline">
                 {pending || historyLoading ? "Syncing…" : internalChatId ? "In thread" : "New thread"}
               </span>
+              <Button
+                aria-controls="work-drawer"
+                aria-expanded={workOpen}
+                aria-label={workBadge > 0 ? `Work (${workBadge})` : "Work"}
+                className="relative h-9 md:hidden"
+                size="sm"
+                type="button"
+                variant="outline"
+                onClick={toggleWork}
+              >
+                Work
+                {workBadge > 0 ? (
+                  <span className="ml-1.5 min-w-[1.25rem] rounded-full bg-primary px-1.5 text-[10px] font-semibold leading-[1.15rem] text-primary-foreground">
+                    {workBadge}
+                  </span>
+                ) : null}
+              </Button>
             </div>
           </div>
 
-          {showSummaries && (
-            <SummaryList
-              summaries={summaries}
-              onUpdate={updateSummary}
-              onDelete={deleteSummary}
-              onClose={() => setShowSummaries(false)}
-            />
-          )}
-
           <div
-            className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4 sm:px-6"
+            className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-3 py-4 sm:px-6"
             ref={scrollContainerRef}
             onScroll={onMessagesScroll}
           >
@@ -1955,55 +2042,23 @@ export default function App() {
                   </div>
                 )}
                 {messages.map((message, index) => (
-                  <article
-                    className={cn(
-                      "rounded-xl px-4 py-3",
-                      bubbleStyle(message.role),
-                      message.toolCalls?.some((toolCall) => toolCall.mcpApp)
-                        ? "w-full min-w-0 max-w-full"
-                        : "max-w-[82%]",
-                    )}
+                  <MessageBubble
+                    choicesEnabled={!pending && index === messages.length - 1}
                     key={message.id}
-                  >
-                    <div className="flex items-center gap-4">
-                      <span className="text-[11px] font-semibold uppercase tracking-[0.2em] opacity-70">
-                        {message.role}
-                      </span>
-                    </div>
-                    {message.content ? (
-                      <p className="mt-2 whitespace-pre-wrap text-sm leading-7">{message.content}</p>
-                    ) : null}
-                    <McpAppList onChatMessage={deliverUiMessage} toolCalls={message.toolCalls} />
-                    {message.clarification && (
-                      <ClarificationCard
-                        clarification={message.clarification}
-                        disabled={pending || index !== messages.length - 1}
-                        onChoose={(choice) => void submitMessage({ text: choice, imageDataUrls: [] })}
-                      />
-                    )}
-                    {message.toolCalls && <ToolAccordion toolCalls={message.toolCalls} />}
-                    {message.imageUrls?.length ? (
-                      <div className="mt-2 flex flex-col gap-2">
-                        {message.imageUrls.map((url, idx) => (
-                          <img
-                            alt=""
-                            className="max-h-64 max-w-full rounded-lg object-contain"
-                            key={`${message.id}-img-${idx}`}
-                            src={url}
-                          />
-                        ))}
-                      </div>
-                    ) : null}
-                  </article>
+                    message={message}
+                    onChatMessage={deliverUiMessage}
+                    onChoose={chooseClarification}
+                  />
                 ))}
 
-                {pending && currentToolCalls.some((toolCall) => toolCall.mcpApp) ? (
-                  <div className="mr-auto w-full min-w-0 max-w-full rounded-xl border border-border bg-card px-4 py-3">
-                    <McpAppList onChatMessage={deliverUiMessage} toolCalls={currentToolCalls} />
-                  </div>
+                {pending ? (
+                  <PendingAssistantBubble
+                    onChatMessage={deliverUiMessage}
+                    step={currentStep}
+                    text={streamingText}
+                    toolCalls={currentToolCalls}
+                  />
                 ) : null}
-
-                {pending ? <TypingIndicator step={currentStep} /> : null}
 
                 <div ref={endOfMessagesRef} />
               </div>
@@ -2024,7 +2079,7 @@ export default function App() {
             )}
           </div>
 
-          <div className="border-t border-border/70 px-4 py-4 sm:px-6">
+          <div className="border-t border-border/70 px-3 py-3 sm:px-6 sm:py-4">
             <div className="mx-auto max-w-3xl">
               {errorMessage ? (
                 <div
@@ -2043,17 +2098,78 @@ export default function App() {
                   </button>
                 </div>
               ) : null}
-              <Composer 
-                disabled={pending || historyLoading} 
+              <QueuedMessages
+                canResume={!pending && !historyLoading}
+                items={queue}
+                paused={queuePaused}
+                onRemove={(id) => setQueue((prev) => prev.filter((item) => item.id !== id))}
+                onResume={resumeQueue}
+              />
+              <Composer
+                locked={historyLoading}
                 pending={pending}
-                onStop={stopGeneration}
-                onSubmit={submitMessage} 
+                onStop={() => void stopGeneration()}
+                onSubmit={sendOrQueue}
               />
             </div>
           </div>
         </div>
       </div>
+
+      <WorkDrawer
+        filesNonce={workspacePaneNonce}
+        jobs={jobs}
+        notifications={notifications}
+        open={workOpen}
+        overlay={!isDesktopDrawer}
+        summaries={summaries}
+        summariesLoading={summariesLoading}
+        tab={workTab}
+        onClose={() => setWorkOpen(false)}
+        onDeleteSummary={deleteSummary}
+        onDismissJob={(job) =>
+          showConfirm("Dismiss Job", "Dismiss this background job and all associated requests?", () => {
+            void dismissBackgroundJob(job.job_id);
+          })
+        }
+        onDismissTicket={(n) =>
+          showConfirm(
+            "Dismiss Request",
+            "Dismiss this request? This will also mark the background job as completed.",
+            () => {
+              void dismissTicket(n.action_payload || "");
+            },
+          )
+        }
+        onJumpToThread={jumpToThread}
+        onRefresh={() => {
+          void loadBackgroundData();
+          if (workTab === "summaries") {
+            void loadAllSummaries();
+          }
+          if (workTab === "files") {
+            setWorkspacePaneNonce((n) => n + 1);
+          }
+        }}
+        onReplyTicket={(n) =>
+          showPrompt("Reply to request", "Enter your response:", "", (reply) => {
+            if (reply.trim()) {
+              void replyToTicket(n.action_payload || "", reply.trim());
+            }
+          })
+        }
+        onTabChange={changeWorkTab}
+        onUpdateSummary={updateSummary}
+      />
     </div>
+  );
+}
+
+function MenuIcon() {
+  return (
+    <svg aria-hidden className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path d="M4 6h16M4 12h16M4 18h16" strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} />
+    </svg>
   );
 }
 
@@ -2120,531 +2236,3 @@ function TrashIcon() {
   );
 }
 
-function PencilIcon() {
-  return (
-    <svg aria-hidden className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-      <path
-        d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        strokeWidth={2}
-      />
-    </svg>
-  );
-}
-
-function WorkspaceFilePane() {
-  const [currentPath, setCurrentPath] = useState("");
-  const [entries, setEntries] = useState<WorkspaceListEntryDto[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [preview, setPreview] = useState<WorkspaceFileDto | null>(null);
-  const [previewLoading, setPreviewLoading] = useState(false);
-  const [editing, setEditing] = useState(false);
-  const [editDraft, setEditDraft] = useState("");
-  const [savePending, setSavePending] = useState(false);
-  const [renamingRel, setRenamingRel] = useState<string | null>(null);
-  const [renameDraft, setRenameDraft] = useState("");
-  const [renamePending, setRenamePending] = useState(false);
-
-  const loadDirectory = useCallback(async (rel: string) => {
-    setLoading(true);
-    setError(null);
-    try {
-      const qs = rel ? `?path=${encodeURIComponent(rel)}` : "";
-      const response = await fetch(`/v1/workspace/list${qs}`);
-      if (!response.ok) {
-        const payload = (await response.json().catch(() => null)) as ApiErrorPayload;
-        const apiMessage = payload?.error?.message?.trim();
-        if (apiMessage) {
-          throw new Error(apiMessage);
-        }
-        const hint =
-          response.status === 404
-            ? " (is the API running on :8080? With Vite dev, the /v1 proxy targets 127.0.0.1:8080. Rebuild isanagent if you use the embedded UI.)"
-            : "";
-        throw new Error(`Workspace list failed (${response.status})${hint}`);
-      }
-      const data = (await response.json()) as WorkspaceListDto;
-      setCurrentPath(data.path);
-      setEntries(data.entries);
-    } catch (err) {
-      setError(buildErrorMessage(err));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    void loadDirectory("");
-  }, [loadDirectory]);
-
-  const openFile = async (rel: string) => {
-    setPreviewLoading(true);
-    setError(null);
-    try {
-      const response = await fetch(`/v1/workspace/file?path=${encodeURIComponent(rel)}`);
-      if (!response.ok) {
-        throw new Error(`Open file failed (${response.status})`);
-      }
-      const data = (await response.json()) as WorkspaceFileDto;
-      setPreview(data);
-      setEditing(false);
-      setEditDraft("");
-    } catch (err) {
-      setError(buildErrorMessage(err));
-      setPreview(null);
-      setEditing(false);
-      setEditDraft("");
-    } finally {
-      setPreviewLoading(false);
-    }
-  };
-
-  const saveFile = async () => {
-    if (!preview) {
-      return;
-    }
-    setSavePending(true);
-    setError(null);
-    try {
-      const response = await fetch("/v1/workspace/file/save", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path: preview.path, content: editDraft }),
-      });
-      if (!response.ok) {
-        const payload = (await response.json().catch(() => null)) as
-          | { error?: { message?: string } }
-          | null;
-        throw new Error(payload?.error?.message || `Save failed (${response.status})`);
-      }
-      const data = (await response.json()) as WorkspaceFileDto;
-      setPreview(data);
-      setEditing(false);
-      setEditDraft("");
-      void loadDirectory(currentPath);
-    } catch (err) {
-      setError(buildErrorMessage(err));
-    } finally {
-      setSavePending(false);
-    }
-  };
-
-  const cancelRename = () => {
-    setRenamingRel(null);
-    setRenameDraft("");
-  };
-
-  const applyRename = async () => {
-    if (!renamingRel) {
-      return;
-    }
-    const newName = renameDraft.trim();
-    if (!newName) {
-      setError("Enter a name.");
-      return;
-    }
-    if (newName.includes("/") || newName.includes("\\")) {
-      setError("Use a single file or folder name (no path separators).");
-      return;
-    }
-    const newRel = workspaceJoinPath(currentPath, newName);
-    if (newRel === renamingRel) {
-      cancelRename();
-      return;
-    }
-    setRenamePending(true);
-    setError(null);
-    try {
-      const response = await fetch("/v1/workspace/rename", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ from: renamingRel, to: newRel }),
-      });
-      if (!response.ok) {
-        const payload = (await response.json().catch(() => null)) as ApiErrorPayload;
-        throw new Error(payload?.error?.message || `Rename failed (${response.status})`);
-      }
-      const data = (await response.json()) as { path: string };
-      const hadPreview = preview?.path === renamingRel;
-      cancelRename();
-      void loadDirectory(currentPath);
-      if (hadPreview) {
-        void openFile(data.path);
-      }
-    } catch (err) {
-      setError(buildErrorMessage(err));
-    } finally {
-      setRenamePending(false);
-    }
-  };
-
-  return (
-    <div className="rounded-xl border border-border bg-muted/10 p-4">
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/60 pb-3">
-        <div>
-          <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
-            Workspace Files
-          </p>
-          <p className="mt-1 font-mono text-xs text-foreground/80 break-all">
-            {currentPath || "/"}
-          </p>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            disabled={loading || !currentPath}
-            onClick={() => void loadDirectory(workspaceParentPath(currentPath))}
-          >
-            Up
-          </Button>
-          <Button type="button" variant="outline" size="sm" disabled={loading} onClick={() => void loadDirectory(currentPath)}>
-            Refresh
-          </Button>
-        </div>
-      </div>
-
-      {error ? (
-        <p className="mt-3 text-sm text-destructive">{error}</p>
-      ) : null}
-
-      {loading ? (
-        <p className="mt-4 text-sm text-muted-foreground">Loading workspace…</p>
-      ) : (
-        <ul className="mt-3 max-h-80 space-y-1 overflow-y-auto rounded-lg border border-border/50 bg-background/60 p-2">
-          {entries.length === 0 ? (
-            <li className="px-2 py-1 text-sm text-muted-foreground">This folder is empty.</li>
-          ) : (
-            entries.map((e) => {
-              const rel = workspaceJoinPath(currentPath, e.name);
-              const isDir = e.kind === "dir";
-              const isRenaming = renamingRel === rel;
-              return (
-                <li key={rel}>
-                  {isRenaming ? (
-                    <div className="flex flex-col gap-2 rounded-md border border-border/60 bg-background/80 p-2">
-                      <label
-                        className="text-[10px] font-medium text-muted-foreground"
-                        htmlFor={`rename-${rel.replace(/\//g, "-")}`}
-                      >
-                        New name
-                      </label>
-                      <div className="flex flex-wrap items-center gap-2">
-                        <input
-                          id={`rename-${rel.replace(/\//g, "-")}`}
-                          type="text"
-                          value={renameDraft}
-                          onChange={(ev) => setRenameDraft(ev.target.value)}
-                          onKeyDown={(ev) => {
-                            if (ev.key === "Enter") {
-                              ev.preventDefault();
-                              void applyRename();
-                            }
-                            if (ev.key === "Escape") {
-                              ev.preventDefault();
-                              cancelRename();
-                            }
-                          }}
-                          disabled={renamePending}
-                          className={cn(
-                            "min-w-0 flex-1 rounded-[6px] border border-border bg-card px-2 py-1.5 font-mono text-xs text-foreground shadow-none",
-                            "focus-visible:border-transparent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
-                            "disabled:cursor-not-allowed disabled:opacity-50",
-                          )}
-                          autoFocus
-                        />
-                        <Button
-                          type="button"
-                          size="sm"
-                          className="h-7 text-xs"
-                          disabled={renamePending}
-                          onClick={() => void applyRename()}
-                        >
-                          {renamePending ? "…" : "Rename"}
-                        </Button>
-                        <Button
-                          type="button"
-                          variant="outline"
-                          size="sm"
-                          className="h-7 text-xs"
-                          disabled={renamePending}
-                          onClick={cancelRename}
-                        >
-                          Cancel
-                        </Button>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="flex items-stretch gap-1">
-                      <button
-                        type="button"
-                        className={cn(
-                          "flex min-w-0 flex-1 items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors hover:bg-muted",
-                          preview?.path === rel && !isDir ? "bg-muted" : "",
-                        )}
-                        onClick={() => {
-                          if (isDir) {
-                            setPreview(null);
-                            setEditing(false);
-                            setEditDraft("");
-                            void loadDirectory(rel);
-                          } else {
-                            void openFile(rel);
-                          }
-                        }}
-                      >
-                        <span className="min-w-0 truncate">
-                          {isDir ? "📁 " : "📄 "}
-                          {e.name}
-                        </span>
-                        {!isDir && typeof e.size === "number" ? (
-                          <span className="shrink-0 text-[10px] text-muted-foreground">{e.size} B</span>
-                        ) : null}
-                      </button>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        className="h-auto shrink-0 px-2 py-1.5 text-muted-foreground hover:text-foreground"
-                        title="Rename"
-                        aria-label={`Rename ${e.name}`}
-                        disabled={loading}
-                        onClick={(ev) => {
-                          ev.stopPropagation();
-                          setRenamingRel(rel);
-                          setRenameDraft(e.name);
-                          setError(null);
-                        }}
-                      >
-                        <PencilIcon />
-                      </Button>
-                    </div>
-                  )}
-                </li>
-              );
-            })
-          )}
-        </ul>
-      )}
-
-      {previewLoading ? (
-        <p className="mt-3 text-xs text-muted-foreground">Loading file…</p>
-      ) : null}
-
-      {preview ? (
-        <div className="mt-4 space-y-2">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
-              {editing ? "Edit" : "Preview"}
-            </p>
-            <div className="flex flex-wrap items-center gap-2">
-              {editing ? (
-                <>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="h-7 text-xs"
-                    disabled={savePending}
-                    onClick={() => {
-                      setEditing(false);
-                      setEditDraft(preview.content);
-                    }}
-                  >
-                    Cancel
-                  </Button>
-                  <Button
-                    type="button"
-                    size="sm"
-                    className="h-7 text-xs"
-                    disabled={savePending}
-                    onClick={() => void saveFile()}
-                  >
-                    {savePending ? "Saving…" : "Save"}
-                  </Button>
-                </>
-              ) : (
-                <>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="h-7 text-xs"
-                    disabled={previewLoading}
-                    onClick={() => {
-                      setEditing(true);
-                      setEditDraft(preview.content);
-                    }}
-                  >
-                    Edit
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    className="h-7 text-xs"
-                    onClick={() => {
-                      setPreview(null);
-                      setEditing(false);
-                      setEditDraft("");
-                    }}
-                  >
-                    Close
-                  </Button>
-                </>
-              )}
-            </div>
-          </div>
-          {editing ? (
-            <Textarea
-              className="min-h-[220px] max-h-80 resize-y font-mono text-xs leading-relaxed"
-              value={editDraft}
-              onChange={(e) => setEditDraft(e.target.value)}
-              spellCheck={false}
-            />
-          ) : (
-            <pre className="max-h-64 overflow-auto rounded-lg border border-border bg-background p-3 text-xs leading-relaxed text-foreground/90 whitespace-pre-wrap break-words">
-              {preview.content}
-            </pre>
-          )}
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-function SummaryList({
-  summaries,
-  onUpdate,
-  onDelete,
-  onClose,
-}: {
-  summaries: SummaryEntry[];
-  onUpdate: (id: number, updated: Partial<SummaryEntry>) => Promise<void>;
-  onDelete: (id: number) => void;
-  onClose: () => void;
-}) {
-  const [editingId, setEditingId] = useState<number | null>(null);
-  const [editForm, setEditForm] = useState<Partial<SummaryEntry>>({});
-
-  useEffect(() => {
-    if (editingId !== null) {
-      const s = summaries.find((x) => x.id === editingId);
-      if (s) {
-        setEditForm({
-          summary: s.summary,
-          key_info: s.key_info,
-          knowledge_gaps: s.knowledge_gaps,
-        });
-      }
-    }
-  }, [editingId, summaries]);
-
-  const save = async () => {
-    if (editingId !== null) {
-      await onUpdate(editingId, editForm);
-      setEditingId(null);
-    }
-  };
-
-  // Escape first leaves edit mode, then closes the panel.
-  const dialogRef = useDialog(true, () => (editingId !== null ? setEditingId(null) : onClose()));
-
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 outline-none"
-      ref={dialogRef}
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="memory-store-title"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
-    >
-      <div className="flex h-full max-h-[90vh] w-full max-w-2xl flex-col rounded-xl border border-border bg-card shadow-lg overflow-hidden">
-        <div className="flex items-center justify-between border-b border-border p-4">
-          <h2 id="memory-store-title" className="text-lg font-semibold text-foreground">Memory Store</h2>
-          <Button variant="ghost" size="sm" onClick={onClose}>
-            Close
-          </Button>
-        </div>
-        <div className="flex-1 overflow-y-auto p-6 space-y-6">
-          {summaries.length === 0 ? (
-            <p className="text-center text-muted-foreground py-10">No memory entries found.</p>
-          ) : (
-            <div className="space-y-8">
-              {summaries.map((s) => (
-                <div key={s.id} className="space-y-4 border-b border-border pb-8 last:border-0">
-                  <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
-                    <span>Thread: {s.thread_id.split(":")[1] || s.thread_id}</span>
-                    <span>{new Date(s.created_at).toLocaleString()}</span>
-                  </div>
-
-                  {editingId === s.id ? (
-                    <div className="space-y-4 rounded-lg bg-muted/20 p-4 border border-border">
-                      <div className="space-y-2">
-                        <label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                          Summary
-                        </label>
-                        <Textarea
-                          value={editForm.summary}
-                          onChange={(e) => setEditForm({ ...editForm, summary: e.target.value })}
-                          className="min-h-[120px] leading-relaxed"
-                        />
-                      </div>
-                      <div className="space-y-2">
-                        <label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                          Key Knowledge
-                        </label>
-                        <Textarea
-                          value={editForm.key_info}
-                          onChange={(e) => setEditForm({ ...editForm, key_info: e.target.value })}
-                          className="min-h-[80px] leading-relaxed"
-                        />
-                      </div>
-                      <div className="flex justify-end gap-2 pt-2">
-                        <Button variant="outline" size="sm" onClick={() => setEditingId(null)}>
-                          Cancel
-                        </Button>
-                        <Button size="sm" onClick={save}>
-                          Save
-                        </Button>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="space-y-4">
-                      <div className="space-y-2">
-                        <p className="text-xs font-bold uppercase tracking-widest text-muted-foreground">Summary</p>
-                        <p className="text-sm leading-relaxed text-foreground/90">{s.summary}</p>
-                      </div>
-                      <div className="space-y-2">
-                        <p className="text-xs font-bold uppercase tracking-widest text-muted-foreground">Key Knowledge</p>
-                        <p className="text-sm leading-relaxed text-foreground/90">{s.key_info}</p>
-                      </div>
-                      <div className="flex justify-end gap-2 pt-2">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="text-destructive hover:bg-destructive/10"
-                          onClick={() => void onDelete(s.id)}
-                        >
-                          Delete
-                        </Button>
-                        <Button variant="outline" size="sm" onClick={() => setEditingId(s.id)}>
-                          Edit
-                        </Button>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}

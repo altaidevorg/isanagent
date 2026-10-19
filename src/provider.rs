@@ -218,6 +218,16 @@ impl Provider for OpenAIProvider {
         let messages = messages_with_document_text_fallback(messages);
         self.client.chat(&messages, tools).await
     }
+
+    async fn stream(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<serde_json::Value>,
+        sink: tokio::sync::mpsc::Sender<crate::traits::StreamChunk>,
+    ) -> Result<LLMResponse, LLMError> {
+        let messages = messages_with_document_text_fallback(messages);
+        self.client.chat_stream(&messages, tools, sink).await
+    }
 }
 
 /// Gemini `Schema` is a subset of JSON Schema. MCP servers (FastMCP/Pydantic) emit

@@ -199,6 +199,79 @@ where
     FallbackOutcome::Exhausted
 }
 
+/// Forwards provider text deltas for one run to the bus as [`BusMessage::StreamDelta`] so a
+/// streaming client can render the reply as it is generated. Created only when the inbound asked
+/// for it ([`crate::bus::METADATA_STREAM_TEXT`]).
+///
+/// Every provider call (a new loop iteration, a transient retry, a nudge re-prompt) starts with a
+/// [`crate::traits::StreamChunk::Reset`] when text was streamed earlier in the run, because the
+/// loop discards that text: either it preceded tool calls or the call was retried. The final
+/// `Outbound` stays authoritative.
+pub(crate) struct TextStreamRelay {
+    chat_id: String,
+    outbound_tx: tokio::sync::mpsc::Sender<BusMessage>,
+    streamed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl TextStreamRelay {
+    pub(crate) fn new(chat_id: String, outbound_tx: tokio::sync::mpsc::Sender<BusMessage>) -> Self {
+        Self {
+            chat_id,
+            outbound_tx,
+            streamed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Tell clients to drop previously streamed text, if any was sent.
+    pub(crate) async fn reset_if_streamed(&self) {
+        if self
+            .streamed
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            let _ = self
+                .outbound_tx
+                .send(BusMessage::StreamDelta {
+                    chat_id: self.chat_id.clone(),
+                    chunk: crate::traits::StreamChunk::Reset,
+                })
+                .await;
+        }
+    }
+
+    /// One provider call through [`Provider::stream`], relaying text deltas. Returns only after
+    /// every relayed delta is on the bus, so deltas never trail the events that follow the call.
+    pub(crate) async fn stream_call(
+        &self,
+        provider: &dyn Provider,
+        context: &[crate::utils::ChatMessage],
+        tools_payload: Option<serde_json::Value>,
+    ) -> Result<crate::utils::LLMResponse, crate::utils::LLMError> {
+        self.reset_if_streamed().await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::traits::StreamChunk>(256);
+        let outbound_tx = self.outbound_tx.clone();
+        let chat_id = self.chat_id.clone();
+        let streamed = self.streamed.clone();
+        let forward = async move {
+            while let Some(chunk) = rx.recv().await {
+                if let crate::traits::StreamChunk::TextDelta(text) = &chunk {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    streamed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let _ = outbound_tx
+                        .send(BusMessage::StreamDelta {
+                            chat_id: chat_id.clone(),
+                            chunk,
+                        })
+                        .await;
+                }
+            }
+        };
+        let (res, ()) = tokio::join!(provider.stream(context, tools_payload, tx), forward);
+        res
+    }
+}
+
 /// Outcome of a `provider.chat` invocation that may be retried for transient errors.
 pub(crate) enum ChatRetryOutcome {
     Ok {
@@ -230,6 +303,7 @@ pub(crate) async fn chat_with_retry(
     _fallback_providers: &[FallbackProviderSpec],
     cancel_token: &tokio_util::sync::CancellationToken,
     log_ctx: FailoverLogCtx<'_>,
+    text_stream: Option<&TextStreamRelay>,
 ) -> ChatRetryOutcome {
     let FailoverLogCtx {
         logger_tx,
@@ -240,8 +314,18 @@ pub(crate) async fn chat_with_retry(
     const BACKOFF_BASE_MS: u64 = 1000;
     let mut last_err: Option<crate::utils::LLMError> = None;
     for attempt in 0..MAX_ATTEMPTS {
+        let call = async {
+            match text_stream {
+                Some(relay) => {
+                    relay
+                        .stream_call(provider, context, tools_payload.clone())
+                        .await
+                }
+                None => provider.chat(context, tools_payload.clone()).await,
+            }
+        };
         let res = tokio::select! {
-            r = provider.chat(context, tools_payload.clone()) => r,
+            r = call => r,
             _ = cancel_token.cancelled() => {
                 let _ = logger_tx.send(BusMessage::Log(LogEvent::info(
                     name,

@@ -96,7 +96,7 @@ Sub-agents (`subagent_spawn`, `task_*`, `subagent_plan_execute`, `task_history_l
 
 **Authoritative Session Projections** (`src/projections.rs`): `SessionProjection` provides structured snapshots (`todos`, `subagents`, `jobs`, `run_status`) emitted over the actor bus, allowing frontend clients like `altai-app` to treat client stores as disposable projections of server truth.
 
-**Native LLM Streaming** (`src/traits.rs`): `Provider::stream` sends typed `StreamChunk` events (`TextDelta`, `ReasoningDelta`, `ToolCallDelta`, `Usage`, `Finish`) and emits `BusMessage::StreamDelta` for real-time frontend rendering.
+**Native LLM Streaming** (`src/traits.rs`): `Provider::stream` sends typed `StreamChunk` events (`TextDelta`, `ReasoningDelta`, `ToolCallDelta`, `Usage`, `Finish`); `OpenAIProvider` streams over SSE (`LLMClient::chat_stream`), other providers fall back to one delta after `chat`. The reasoning loop streams only when the inbound carries `isanagent_stream_text = true` (set by streaming `POST /v1/responses`; never for sub-agents or background jobs): `TextStreamRelay` (`src/agent/failover.rs`) forwards text deltas as `BusMessage::StreamDelta` and emits `StreamChunk::Reset` before the next model call (tool-call turn, retry, nudge) once text was streamed. The host routes `StreamDelta` to the API channel, which sends SSE `{"type":"text_delta","text":…}` and `{"type":"text_reset"}`; the final `completion` content stays authoritative.
 
 ### Structured LLM Extraction
 If you are asking the LLM to yield a structured JSON payload internally (e.g. for reflection or summarization outside of the standard `ToolCall` registry):

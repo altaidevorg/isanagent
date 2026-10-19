@@ -20,6 +20,9 @@ pub const METADATA_BACKGROUND_JOB_ID: &str = "isanagent_background_job_id";
 pub const METADATA_CLARIFICATION_TICKET_ID: &str = "clarification_ticket_id";
 /// Trusted caller-provided identifier for one foreground reasoning run.
 pub const METADATA_RUN_ID: &str = "isanagent_run_id";
+/// Inbound metadata flag (bool): the client renders assistant text incrementally, so the
+/// reasoning loop streams provider output as `BusMessage::StreamDelta` for this run.
+pub const METADATA_STREAM_TEXT: &str = "isanagent_stream_text";
 
 /// An inbound message received from a Channel (e.g. Slack, Email).
 //

@@ -1264,6 +1264,19 @@ impl AgentLogic {
             .await
             .map_err(ReasoningLoopError::persistence)?;
 
+        // Stream provider text to clients that asked for it (web UI over SSE). Background jobs and
+        // sub-agents never stream: nobody renders their intermediate text.
+        let text_stream = (!is_subagent
+            && inbound
+                .metadata
+                .get(crate::bus::METADATA_STREAM_TEXT)
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            && crate::bus::get_background_job_id(&inbound.metadata).is_none())
+        .then(|| {
+            super::failover::TextStreamRelay::new(inbound.chat_id.clone(), outbound_tx.clone())
+        });
+
         // Emit an initial thought so the user knows reasoning has started
         let _ = outbound_tx
             .send(BusMessage::Telemetry(TelemetryEvent::AgentThought {
@@ -1561,6 +1574,7 @@ impl AgentLogic {
                     name: &name,
                     chat_id: &inbound.chat_id,
                 },
+                text_stream.as_ref(),
             )
             .await
             {

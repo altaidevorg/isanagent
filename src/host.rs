@@ -1469,6 +1469,13 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                         }
                     }
                 }
+                BusMessage::StreamDelta { chat_id, chunk } => {
+                    if let Some(api_chan) = delivery_channels.get("api") {
+                        if let Some(api_chan) = api_chan.as_any().downcast_ref::<ApiChannel>() {
+                            api_chan.handle_stream_delta(chat_id, chunk);
+                        }
+                    }
+                }
                 BusMessage::Telemetry(tel) => {
                     if let Some(acp_chan) = delivery_channels.get("acp") {
                         if let Some(acp_chan) = acp_chan
