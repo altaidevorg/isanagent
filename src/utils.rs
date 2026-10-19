@@ -727,12 +727,7 @@ impl LLMClient {
             return Err(err);
         }
 
-        let is_sse = res
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|ct| ct.contains("text/event-stream"));
-        if !is_sse {
+        if !is_event_stream(&res) {
             let raw_text = res
                 .text()
                 .await
@@ -747,35 +742,13 @@ impl LLMClient {
         }
 
         let mut acc = StreamAccumulator::default();
-        let mut buf: Vec<u8> = Vec::new();
-        'read: loop {
-            let chunk = res
-                .chunk()
-                .await
-                .map_err(|e| LLMError::ApiError(e.to_string()))?;
-            let Some(chunk) = chunk else { break };
-            buf.extend_from_slice(&chunk);
-            while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
-                let line: Vec<u8> = buf.drain(..=pos).collect();
-                let line = String::from_utf8_lossy(&line);
-                match acc.push_sse_line(line.trim_end_matches(['\r', '\n']))? {
-                    SseLineOutcome::Done => break 'read,
-                    SseLineOutcome::Chunks(chunks) => {
-                        for c in chunks {
-                            let _ = sink.send(c).await;
-                        }
-                    }
-                }
-            }
-        }
-        if !buf.is_empty() {
-            let line = String::from_utf8_lossy(&buf).to_string();
-            if let SseLineOutcome::Chunks(chunks) = acc.push_sse_line(line.trim_end())? {
-                for c in chunks {
-                    let _ = sink.send(c).await;
-                }
-            }
-        }
+        drive_sse(
+            &mut res,
+            &sink,
+            |e| LLMError::ApiError(e.to_string()),
+            |event, out| acc.push_data(&event.data, out),
+        )
+        .await?;
 
         let resp = acc.finish();
         if let Some(usage) = &resp.usage {
@@ -918,9 +891,146 @@ fn parse_chat_completion_body(raw_text: &str) -> Result<LLMResponse, LLMError> {
     })
 }
 
-enum SseLineOutcome {
-    Chunks(Vec<crate::traits::StreamChunk>),
+/// One server-sent event payload: the `data:` value of a single line, tagged with the most
+/// recent `event:` field of the same event block (Anthropic names its events; OpenAI and Gemini
+/// do not). Each `data:` line is dispatched on its own, which is how every LLM provider frames
+/// its JSON payloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SseEvent {
+    pub event: Option<String>,
+    pub data: String,
+}
+
+/// Whether an SSE consumer wants more events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SseStep {
+    Continue,
     Done,
+}
+
+/// Incremental SSE line decoder shared by every streaming provider. Bytes may arrive split at
+/// arbitrary points (inside a line or a UTF-8 sequence); only complete lines are decoded.
+#[derive(Default)]
+pub(crate) struct SseDecoder {
+    buf: Vec<u8>,
+    event: Option<String>,
+}
+
+impl SseDecoder {
+    /// Feed raw bytes and return every `data:` payload completed by them.
+    pub(crate) fn push(&mut self, bytes: &[u8]) -> Vec<SseEvent> {
+        self.buf.extend_from_slice(bytes);
+        let mut events = Vec::new();
+        while let Some(pos) = self.buf.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&line);
+            if let Some(event) = self.line(line.trim_end_matches(['\r', '\n'])) {
+                events.push(event);
+            }
+        }
+        events
+    }
+
+    /// Flush a trailing line that was not newline-terminated (end of body).
+    pub(crate) fn finish(&mut self) -> Vec<SseEvent> {
+        if self.buf.is_empty() {
+            return Vec::new();
+        }
+        let rest = std::mem::take(&mut self.buf);
+        let line = String::from_utf8_lossy(&rest).to_string();
+        self.line(line.trim_end()).into_iter().collect()
+    }
+
+    fn line(&mut self, line: &str) -> Option<SseEvent> {
+        if line.is_empty() {
+            // Blank line ends the event block.
+            self.event = None;
+            return None;
+        }
+        if let Some(name) = line.strip_prefix("event:") {
+            self.event = Some(name.trim().to_string());
+            return None;
+        }
+        // Comments (`:`) and `id:` / `retry:` fields carry no payload.
+        let data = line.strip_prefix("data:")?;
+        Some(SseEvent {
+            event: self.event.clone(),
+            data: data.trim().to_string(),
+        })
+    }
+}
+
+/// Read an SSE response body to the end (or until `on_event` returns [`SseStep::Done`]),
+/// forwarding the chunks each event produces into `sink` as soon as they are decoded.
+/// `map_read_err` classifies a body read failure the same way the provider's non-streaming
+/// path classifies its own body read failure, so retry semantics stay identical.
+pub(crate) async fn drive_sse<F>(
+    res: &mut reqwest::Response,
+    sink: &tokio::sync::mpsc::Sender<crate::traits::StreamChunk>,
+    map_read_err: fn(reqwest::Error) -> LLMError,
+    mut on_event: F,
+) -> Result<(), LLMError>
+where
+    F: FnMut(&SseEvent, &mut Vec<crate::traits::StreamChunk>) -> Result<SseStep, LLMError>,
+{
+    let mut decoder = SseDecoder::default();
+    loop {
+        let chunk = res.chunk().await.map_err(map_read_err)?;
+        let events = match &chunk {
+            Some(bytes) => decoder.push(bytes),
+            None => decoder.finish(),
+        };
+        for event in &events {
+            let mut out = Vec::new();
+            let step = on_event(event, &mut out)?;
+            for c in out {
+                let _ = sink.send(c).await;
+            }
+            if step == SseStep::Done {
+                return Ok(());
+            }
+        }
+        if chunk.is_none() {
+            return Ok(());
+        }
+    }
+}
+
+/// True when the response carries an SSE body (as opposed to a plain JSON body from a server
+/// that ignored the streaming request).
+pub(crate) fn is_event_stream(res: &reqwest::Response) -> bool {
+    res.headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.contains("text/event-stream"))
+}
+
+/// Emit an already complete response as stream chunks (one text delta), used when a
+/// streaming request falls back to the non-streaming endpoint.
+pub(crate) async fn emit_whole_response(
+    sink: &tokio::sync::mpsc::Sender<crate::traits::StreamChunk>,
+    resp: &LLMResponse,
+) {
+    use crate::traits::{FinishReason, StreamChunk};
+    if let Some(reasoning) = &resp.reasoning_content {
+        let _ = sink
+            .send(StreamChunk::ReasoningDelta(reasoning.clone()))
+            .await;
+    }
+    if !resp.content.is_empty() {
+        let _ = sink
+            .send(StreamChunk::TextDelta(resp.content.clone()))
+            .await;
+    }
+    if let Some(usage) = &resp.usage {
+        let _ = sink.send(StreamChunk::Usage(usage.clone())).await;
+    }
+    let reason = if resp.tool_calls.as_ref().is_some_and(|c| !c.is_empty()) {
+        FinishReason::ToolCalls
+    } else {
+        FinishReason::Stop
+    };
+    let _ = sink.send(StreamChunk::Finish(reason)).await;
 }
 
 #[derive(Default)]
@@ -942,18 +1052,18 @@ struct StreamAccumulator {
 }
 
 impl StreamAccumulator {
-    fn push_sse_line(&mut self, line: &str) -> Result<SseLineOutcome, LLMError> {
+    /// Consume the `data:` payload of one SSE event, pushing UI deltas into `out`.
+    fn push_data(
+        &mut self,
+        data: &str,
+        out: &mut Vec<crate::traits::StreamChunk>,
+    ) -> Result<SseStep, LLMError> {
         use crate::traits::StreamChunk;
-        let Some(data) = line.strip_prefix("data:") else {
-            // Comments (`:`), `event:`/`id:` fields and blank separators carry no payload.
-            return Ok(SseLineOutcome::Chunks(Vec::new()));
-        };
-        let data = data.trim();
         if data == "[DONE]" {
-            return Ok(SseLineOutcome::Done);
+            return Ok(SseStep::Done);
         }
         if data.is_empty() {
-            return Ok(SseLineOutcome::Chunks(Vec::new()));
+            return Ok(SseStep::Continue);
         }
         let value: serde_json::Value = serde_json::from_str(data).map_err(LLMError::ParseError)?;
         if let Some(err) = value.get("error") {
@@ -967,13 +1077,12 @@ impl StreamAccumulator {
         if let Some(usage) = value.get("usage").filter(|u| !u.is_null()) {
             self.usage = Some(parse_openai_usage(usage));
         }
-        let mut out = Vec::new();
         let Some(delta) = value
             .get("choices")
             .and_then(|c| c.get(0))
             .and_then(|c| c.get("delta"))
         else {
-            return Ok(SseLineOutcome::Chunks(out));
+            return Ok(SseStep::Continue);
         };
         if let Some(text) = delta.get("content").and_then(openai_content_text) {
             if !text.is_empty() {
@@ -1024,7 +1133,7 @@ impl StreamAccumulator {
                 });
             }
         }
-        Ok(SseLineOutcome::Chunks(out))
+        Ok(SseStep::Continue)
     }
 
     fn finish(self) -> LLMResponse {
@@ -1291,32 +1400,33 @@ mod tests {
     fn sse_accumulator_assembles_text_tool_calls_and_usage() {
         use crate::traits::StreamChunk;
         let mut acc = StreamAccumulator::default();
-        let lines = [
-            ": keep-alive",
-            r#"data: {"choices":[{"delta":{"role":"assistant","content":"Hel"}}]}"#,
-            "",
-            r#"data: {"choices":[{"delta":{"content":"lo"}}]}"#,
-            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"pa"}}]}}]}"#,
-            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":\"a\"}"}}]}}]}"#,
-            r#"data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}"#,
-        ];
+        let body = concat!(
+            ": keep-alive\n",
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"}}]}\n",
+            "\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"pa\"}}]}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"th\\\":\\\"a\\\"}\"}}]}}]}\r\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n",
+            "data: [DONE]",
+        );
+        let mut decoder = SseDecoder::default();
+        // Split at an awkward byte boundary to exercise partial-line buffering.
+        let mut events = decoder.push(&body.as_bytes()[..37]);
+        events.extend(decoder.push(&body.as_bytes()[37..]));
+        events.extend(decoder.finish());
         let mut text = String::new();
-        for line in lines {
-            match acc.push_sse_line(line).expect("valid line") {
-                SseLineOutcome::Chunks(chunks) => {
-                    for c in chunks {
-                        if let StreamChunk::TextDelta(t) = c {
-                            text.push_str(&t);
-                        }
-                    }
+        let mut steps = Vec::new();
+        for event in &events {
+            let mut out = Vec::new();
+            steps.push(acc.push_data(&event.data, &mut out).expect("valid line"));
+            for c in out {
+                if let StreamChunk::TextDelta(t) = c {
+                    text.push_str(&t);
                 }
-                SseLineOutcome::Done => panic!("not done yet"),
             }
         }
-        assert!(matches!(
-            acc.push_sse_line("data: [DONE]").unwrap(),
-            SseLineOutcome::Done
-        ));
+        assert_eq!(steps.last(), Some(&SseStep::Done));
         assert_eq!(text, "Hello");
         let resp = acc.finish();
         assert_eq!(resp.content, "Hello");
@@ -1329,12 +1439,30 @@ mod tests {
     }
 
     #[test]
+    fn sse_decoder_tracks_event_names_per_block() {
+        let mut decoder = SseDecoder::default();
+        let events = decoder.push(b"event: ping\ndata: {}\n\ndata: {\"a\":1}\n\n");
+        assert_eq!(
+            events,
+            vec![
+                SseEvent {
+                    event: Some("ping".to_string()),
+                    data: "{}".to_string()
+                },
+                SseEvent {
+                    event: None,
+                    data: "{\"a\":1}".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn sse_accumulator_surfaces_mid_stream_errors() {
         let mut acc = StreamAccumulator::default();
         let err = acc
-            .push_sse_line(r#"data: {"error":{"message":"overloaded"}}"#)
-            .err()
-            .expect("error");
+            .push_data(r#"{"error":{"message":"overloaded"}}"#, &mut Vec::new())
+            .expect_err("error");
         assert!(err.to_string().contains("overloaded"));
     }
 
