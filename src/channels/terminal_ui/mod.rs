@@ -21,7 +21,10 @@ pub use app::{
     ModelSelectorStage, TerminalUiFocus, TerminalUiMode, ToastKind, ToolNoticePhase, ToolRailEntry,
     TranscriptSelection,
 };
-pub use approval::{approval_hotkey_reply, EditDiffPayload, APPROVAL_CHOICES};
+pub use approval::{
+    approval_hotkey_reply, clarification_hotkey_reply, is_approval_choice_set, EditDiffPayload,
+    APPROVAL_CHOICES,
+};
 pub use attachments::{
     load_host_file_attachments, load_sandbox_file_attachment, parse_terminal_attachments,
 };

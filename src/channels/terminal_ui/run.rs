@@ -447,7 +447,8 @@ const TERMINAL_HELP: &str = r#"Commands (leading slash):
   /copy          Copy the last assistant reply to the clipboard
   /install-python Install uv (best effort) in the background; UI stays responsive
   /cancel, /stop Stop the in-flight reply for this chat (drops queued prompts)
-  /background, /bg Promote the in-flight execution_run to a background job
+  /background, /bg Promote the in-flight tool call (e.g. execution_run) to a background job;
+                 with nothing running, open the background jobs pane (same as Ctrl+G)
   /retry         Re-submit the last user message after an LLM-failed banner
   /tools         Open the tool activity pane
   /exec          Open the executions browser (workspace execution_runs.jsonl)
@@ -458,6 +459,8 @@ const TERMINAL_HELP: &str = r#"Commands (leading slash):
 
 Keys:
   Enter             Send the compose line; in past-sessions pane: load selected and continue
+                    (while a reply is running, /cancel it first)
+  Shift/Alt+Enter   Insert a newline (also Ctrl+J)
   Tab / Ctrl+T      Next pane: transcript → past sessions → executions → tool activity → sub-agents
   Shift+Tab         Previous pane (reverse of Tab)
   Esc               From any pane: return to transcript
@@ -466,7 +469,9 @@ Keys:
   Mouse drag        Select text in transcript; auto-copies to clipboard on release
   Ctrl+Shift+M      Toggle application mouse: on = wheel scrolls panes; off = native selection/copy
   Ctrl+Shift+Y      Copy last assistant reply
-  Ctrl+W / Ctrl+U   Delete word / clear line
+  Ctrl+W / Ctrl+U   Delete word / delete to line start
+  Ctrl+K            Delete to line end
+  Ctrl+A / Ctrl+E   Move to line start / end
   Ctrl+G            Open background jobs & notifications pane
   Ctrl+C            Cancel in-flight work (same as /cancel; does not exit)
   Ctrl+D            Exit if compose line is empty (like /exit); else delete forward (readline-style)
@@ -565,6 +570,7 @@ fn slash_hint_action(matches: &[(&str, &str)], selected: usize) -> SlashHintActi
 /// Same as `/cancel`: cancel in-flight work; quit only if the bus is gone.
 fn try_cancel_inflight(app: &mut App, bus_tx: &Sender<BusMessage>, chat_id: &str) {
     app.thinking = false;
+    app.pending_clarification = None;
     if bus_tx
         .blocking_send(BusMessage::Cancel(chat_id.to_string()))
         .is_err()
@@ -577,6 +583,21 @@ fn try_cancel_inflight(app: &mut App, bus_tx: &Sender<BusMessage>, chat_id: &str
         app.cells.push(Cell::System {
             message: "Cancel sent for this thread (queued prompts cleared).".into(),
         });
+    }
+}
+
+/// Masked view of a key being typed in the `/model` key popup: first 3 and last 4 characters
+/// for long keys, all stars otherwise. Counts chars, so non-ASCII input never splits a byte.
+fn mask_key_input(input: &str) -> String {
+    let n = input.chars().count();
+    if n == 0 {
+        "<paste or type key here>".into()
+    } else if n <= 8 {
+        "*".repeat(n)
+    } else {
+        let head: String = input.chars().take(3).collect();
+        let tail: String = input.chars().skip(n - 4).collect();
+        format!("{head}...{tail}")
     }
 }
 
@@ -834,6 +855,21 @@ fn chunks_line_width(spans: &[Span<'static>]) -> usize {
 /// Build lines for the agent-tasks pane (sub-agent lifecycle).
 fn background_pane_paragraph(app: &App) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
+    // Rows are numbered like `App::background_panel_items` (notifications, jobs, sub-agents);
+    // the one at `background_jobs_selected_idx` is the Enter target and is drawn highlighted.
+    let mut row = 0usize;
+    let mut item_line = |label: String, style: Style| {
+        let selected = app.background_jobs_selected_idx == Some(row);
+        row += 1;
+        if selected {
+            Line::from(Span::styled(
+                format!("› {label}"),
+                style.add_modifier(Modifier::REVERSED),
+            ))
+        } else {
+            Line::from(Span::styled(format!("  {label}"), style))
+        }
+    };
 
     // 1. Notifications (High Priority)
     if !app.notifications.is_empty() {
@@ -853,7 +889,7 @@ fn background_pane_paragraph(app: &App) -> Vec<Line<'static>> {
                 .duration_since(created_at)
                 .unwrap_or_default();
             let label = format!("[{}] {} ({})", entry.kind, entry.title, format_age(age));
-            out.push(Line::from(Span::styled(label, style)));
+            out.push(item_line(label, style));
         }
         out.push(Line::from(""));
     }
@@ -885,8 +921,7 @@ fn background_pane_paragraph(app: &App) -> Vec<Line<'static>> {
                 entry.state,
                 format_age(age)
             );
-            let line = Line::from(Span::styled(label, style));
-            out.push(line);
+            out.push(item_line(label, style));
         }
         out.push(Line::from(""));
     }
@@ -922,7 +957,7 @@ fn background_pane_paragraph(app: &App) -> Vec<Line<'static>> {
             }
             line_text.push_str("  ·  ");
             line_text.push_str(&format_age(age));
-            out.push(Line::from(Span::styled(line_text, style)));
+            out.push(item_line(line_text, style));
         }
     }
 
@@ -1764,6 +1799,70 @@ pub(crate) struct RatatuiMainConfig {
 }
 
 /// Run until user quits. Restores terminal on exit.
+type PanicHook = dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static;
+
+/// Best-effort terminal reset: raw mode off, main screen, cursor shown, mouse and paste off.
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        stdout(),
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        crossterm::cursor::Show
+    );
+}
+
+/// Restores the terminal however the TUI loop ends: normal return, a `?` error (on drop), or a
+/// panic on the TUI thread (via a panic hook that runs before the panic message is printed, so
+/// the message lands on the main screen). The previous hook is chained and put back on drop.
+struct TerminalRestoreGuard {
+    restored: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    prev_hook: Option<std::sync::Arc<PanicHook>>,
+}
+
+impl TerminalRestoreGuard {
+    fn install() -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let restored = Arc::new(AtomicBool::new(false));
+        let prev: Arc<PanicHook> = Arc::from(std::panic::take_hook());
+        let chained = Arc::clone(&prev);
+        let flag = Arc::clone(&restored);
+        // Panics on other threads (e.g. a tokio task) must not tear down a live TUI.
+        let tui_thread = std::thread::current().id();
+        std::panic::set_hook(Box::new(move |info| {
+            if std::thread::current().id() == tui_thread && !flag.swap(true, Ordering::SeqCst) {
+                restore_terminal();
+            }
+            chained(info);
+        }));
+        Self {
+            restored,
+            prev_hook: Some(prev),
+        }
+    }
+}
+
+impl Drop for TerminalRestoreGuard {
+    fn drop(&mut self) {
+        if !self
+            .restored
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            restore_terminal();
+        }
+        // `set_hook` panics when called on a panicking thread; leave our hook in place then.
+        if !std::thread::panicking() {
+            if let Some(prev) = self.prev_hook.take() {
+                let _ = std::panic::take_hook();
+                std::panic::set_hook(Box::new(move |info| prev(info)));
+            }
+        }
+    }
+}
+
 pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
     let RatatuiMainConfig {
         bus_tx,
@@ -1799,6 +1898,8 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
     super::init_from_host(theme, !color_enabled);
 
     let mut stdout = stdout();
+    // Installed before raw mode so every exit path below (including `?`) restores the terminal.
+    let _terminal_guard = TerminalRestoreGuard::install();
     enable_raw_mode()?;
     execute!(
         stdout,
@@ -2181,8 +2282,8 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     app.upsert_tool_notice(tool_call_id, phase, content);
                 }
                 other => {
-                    if matches!(other, Cell::Clarification { .. }) {
-                        app.pending_approval = true;
+                    if let Cell::Clarification { choices, .. } = &other {
+                        app.pending_clarification = Some(choices.clone());
                     }
                     append_cell_merging_thought(&mut app.cells, other);
                 }
@@ -2698,17 +2799,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             let inner = inner_block.inner(popup_area);
                             f.render_widget(inner_block, popup_area);
 
-                            let masked: String = if input.is_empty() {
-                                "<paste or type key here>".into()
-                            } else if input.len() <= 8 {
-                                "*".repeat(input.len())
-                            } else {
-                                format!(
-                                    "{}...{}",
-                                    &input[..3],
-                                    &input[input.len().saturating_sub(4)..]
-                                )
-                            };
+                            let masked = mask_key_input(input);
 
                             let mut lines = vec![
                                 Line::from(Span::styled(
@@ -2994,7 +3085,11 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             input,
                             error,
                         } => match key.code {
-                            KeyCode::Char(c) => {
+                            KeyCode::Char(c)
+                                if !c.is_control()
+                                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                                        == key.modifiers.contains(KeyModifiers::ALT) =>
+                            {
                                 input.push(c);
                                 *error = None;
                             }
@@ -3105,7 +3200,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                         app.delete_word();
                     }
                     KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        app.clear_line();
+                        app.kill_to_line_start();
                     }
                     KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
                         app.move_left_word()
@@ -3123,7 +3218,11 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     {
                         app.move_right_word()
                     }
-                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    KeyCode::Enter
+                        if key
+                            .modifiers
+                            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                    {
                         app.insert_char('\n');
                     }
                     KeyCode::Enter => {
@@ -3189,7 +3288,15 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                     (target_id, cid)
                                 };
 
-                                try_cancel_inflight(&mut app, &bus_tx, &chat_id);
+                                // Switching threads must not silently drop the running reply.
+                                if app.thinking || app.pending_clarification.is_some() {
+                                    app.set_toast(
+                                        ToastKind::Err,
+                                        "A reply is still running here. /cancel it first, then pick the session.".into(),
+                                        Duration::from_secs(5),
+                                    );
+                                    continue;
+                                }
                                 match load_thread_transcript_cells(&rt, &memory_node, &thread_id) {
                                     Ok(mut cells) => {
                                         chat_id = new_cid;
@@ -3205,6 +3312,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                         );
                                         app.cells = cells;
                                         app.thinking = false;
+                                        app.pending_clarification = None;
                                         app.llm_retry_available = false;
                                         app.last_inbound_text = None;
                                         app.tool_rail.clear();
@@ -3266,6 +3374,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 chat_id = uuid::Uuid::new_v4().to_string();
                                 sync_terminal_session_chat(&bus_tx, &chat_id);
                                 app.thinking = false;
+                                app.pending_clarification = None;
                                 app.cells.push(Cell::System {
                                     message: format!("New thread: {chat_id}"),
                                 });
@@ -3338,14 +3447,6 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 app.focus_agent_tasks();
                                 continue;
                             }
-                            if text.eq_ignore_ascii_case("/background")
-                                || text.eq_ignore_ascii_case("/bg")
-                            {
-                                app.focus_background_jobs();
-                                let _ = poll_trigger_tx.send(chat_id.clone());
-
-                                continue;
-                            }
                             if text.eq_ignore_ascii_case("/chats") {
                                 app.focus_conversations();
                                 refresh_conversations_list(&rt, &memory_node, &mut app);
@@ -3361,6 +3462,12 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             if text.eq_ignore_ascii_case("/background")
                                 || text.eq_ignore_ascii_case("/bg")
                             {
+                                // Nothing running in the foreground: just open the jobs pane.
+                                if !(app.thinking && app.active_tool_line.is_some()) {
+                                    app.focus_background_jobs();
+                                    let _ = poll_trigger_tx.send(chat_id.clone());
+                                    continue;
+                                }
                                 if bus_tx
                                     .blocking_send(BusMessage::PromoteSyncToBackground(
                                         chat_id.clone(),
@@ -3686,7 +3793,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 
                         app.cells.push(Cell::User { text: raw.clone() });
                         app.thinking = true;
-                        app.pending_approval = false;
+                        app.pending_clarification = None;
                         app.last_inbound_text = Some(text.to_string());
                         app.llm_retry_available = false;
                         let (clean_text, attachments) =
@@ -3825,6 +3932,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 | TerminalUiFocus::Executions
                                 | TerminalUiFocus::Conversations
                                 | TerminalUiFocus::AgentTasks
+                                | TerminalUiFocus::BackgroundJobs
                         ) {
                             app.focus_transcript();
                         }
@@ -3999,21 +4107,40 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             }
                         }
                     }
-                    KeyCode::Char(c) if app.pending_approval && app.input.is_empty() => {
-                        if let Some(reply) = crate::channels::terminal_ui::approval_hotkey_reply(c)
-                        {
+                    KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.line_home();
+                    }
+                    KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.line_end();
+                    }
+                    KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.kill_to_line_end();
+                    }
+                    KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.insert_char('\n');
+                    }
+                    // Ctrl+<key> / Alt+<key> with no binding above: ignore instead of typing the
+                    // bare letter. Ctrl+Alt together is AltGr on Windows layouts (`@`, `{`, …),
+                    // so that combination still types.
+                    KeyCode::Char(_)
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            != key.modifiers.contains(KeyModifiers::ALT) => {}
+                    KeyCode::Char(c)
+                        if app.input.is_empty() && app.clarification_hotkey_reply(c).is_some() =>
+                    {
+                        if let Some(reply) = app.clarification_hotkey_reply(c) {
                             app.cells.push(Cell::User {
-                                text: reply.to_string(),
+                                text: reply.clone(),
                             });
                             app.thinking = true;
-                            app.pending_approval = false;
-                            app.last_inbound_text = Some(reply.to_string());
+                            app.pending_clarification = None;
+                            app.last_inbound_text = Some(reply.clone());
                             let msg = InboundMessage {
                                 channel: channel_name.clone(),
                                 sender_id: "local_user".to_string(),
                                 chat_id: chat_id.clone(),
                                 thread_id: None,
-                                content: reply.to_string(),
+                                content: reply,
                                 attachments: Vec::new(),
                                 metadata: Default::default(),
                             };
@@ -4029,7 +4156,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             app.insert_char(c);
                         }
                     }
-                    KeyCode::Char(c) => app.insert_char(c),
+                    KeyCode::Char(c) if !c.is_control() => app.insert_char(c),
                     _ => {}
                 }
             } // end Event::Key block
@@ -4292,7 +4419,15 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                 }
             }
             Event::Paste(ref s) => {
-                if settings_popup.is_some() {
+                if let Some(ModelSelectorStage::ApiKeyInput { input, error, .. }) =
+                    app.model_selector.as_mut().map(|sel| &mut sel.stage)
+                {
+                    // Keys are one line; drop the newline a copied key often carries.
+                    input.extend(s.chars().filter(|c| !c.is_control()));
+                    *error = None;
+                } else if app.model_selector.is_some() {
+                    // Other selector stages are list pickers; a paste has nowhere to go.
+                } else if settings_popup.is_some() {
                     if let Some(popup) = settings_popup.as_mut() {
                         let effect = popup.on_paste(s);
                         apply_settings_effect(
@@ -4320,16 +4455,7 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
         }
     }
 
-    disable_raw_mode()?;
-    if application_mouse_enabled {
-        let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
-    }
-    execute!(
-        terminal.backend_mut(),
-        DisableBracketedPaste,
-        LeaveAlternateScreen,
-        crossterm::cursor::Show
-    )?;
+    // `_terminal_guard` restores the terminal when it drops here (and on every early return).
     Ok(())
 }
 
@@ -4519,7 +4645,7 @@ mod execution_strip_tests {
 #[cfg(test)]
 mod api_key_persist_tests {
     use super::{
-        key_looks_like_placeholder, mask_api_key_suffix, persist_provider_api_key,
+        key_looks_like_placeholder, mask_api_key_suffix, mask_key_input, persist_provider_api_key,
         resolve_initial_active_provider_key,
     };
     use std::collections::HashMap;
@@ -4653,6 +4779,15 @@ mod api_key_persist_tests {
         assert_eq!(mask_api_key_suffix("sk-ant-real-secret-1234"), "…1234");
         assert_eq!(mask_api_key_suffix("ab"), "…ab");
         assert_eq!(mask_api_key_suffix(""), "****");
+    }
+
+    #[test]
+    fn key_popup_mask_counts_chars_not_bytes() {
+        assert_eq!(mask_key_input(""), "<paste or type key here>");
+        assert_eq!(mask_key_input("ab€"), "***");
+        assert_eq!(mask_key_input("sk-ant-real-1234"), "sk-...1234");
+        // Multi-byte chars at both cut points used to panic on a byte slice.
+        assert_eq!(mask_key_input("ééé-secret-ü€ßä"), "ééé...ü€ßä");
     }
 
     #[test]

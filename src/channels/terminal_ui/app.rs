@@ -578,8 +578,9 @@ pub struct App {
     pub status_permission: String,
     /// Short session / chat id for the status header.
     pub status_session: String,
-    /// Blocking approval overlay (shell / edit) awaiting a four-way reply.
-    pub pending_approval: bool,
+    /// Options of the clarification (`ask_user`, shell / edit approval) awaiting a reply;
+    /// `None` when nothing is pending. Drives the single-key hotkeys on an empty compose line.
+    pub pending_clarification: Option<Vec<String>>,
 }
 
 impl Default for App {
@@ -681,7 +682,7 @@ impl App {
             status_workspace: String::new(),
             status_permission: String::new(),
             status_session: String::new(),
-            pending_approval: false,
+            pending_clarification: None,
         }
     }
 
@@ -772,7 +773,9 @@ impl App {
     pub fn focus_background_jobs(&mut self) {
         self.ui_focus = TerminalUiFocus::BackgroundJobs;
         if self.background_jobs_selected_idx.is_none()
-            && (!self.background_jobs.is_empty() || !self.notifications.is_empty())
+            && (!self.background_jobs.is_empty()
+                || !self.notifications.is_empty()
+                || !self.agent_tasks.is_empty())
         {
             self.background_jobs_selected_idx = Some(0);
         }
@@ -941,10 +944,56 @@ impl App {
         self.cursor = 0;
     }
 
+    /// Byte offset where the cursor's line starts (multi-line compose aware).
+    fn line_start_offset(&self) -> usize {
+        self.input[..self.cursor]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0)
+    }
+
+    /// Byte offset where the cursor's line ends (before its newline, if any).
+    fn line_end_offset(&self) -> usize {
+        self.input[self.cursor..]
+            .find('\n')
+            .map(|i| self.cursor + i)
+            .unwrap_or(self.input.len())
+    }
+
+    /// Ctrl+A: move to the start of the current line.
+    pub fn line_home(&mut self) {
+        self.cursor = self.line_start_offset();
+    }
+
+    /// Ctrl+E: move to the end of the current line.
+    pub fn line_end(&mut self) {
+        self.cursor = self.line_end_offset();
+    }
+
+    /// Ctrl+U: delete from the start of the current line to the cursor.
+    pub fn kill_to_line_start(&mut self) {
+        let start = self.line_start_offset();
+        self.input.drain(start..self.cursor);
+        self.cursor = start;
+    }
+
+    /// Ctrl+K: delete from the cursor to the end of the current line.
+    pub fn kill_to_line_end(&mut self) {
+        let end = self.line_end_offset();
+        self.input.drain(self.cursor..end);
+    }
+
+    /// Reply to send for a single key pressed while a clarification is pending.
+    pub fn clarification_hotkey_reply(&self, ch: char) -> Option<String> {
+        let choices = self.pending_clarification.as_ref()?;
+        super::clarification_hotkey_reply(choices, ch)
+    }
+
     /// Take the current input for submission; records history when non-empty.
+    /// `/key …` lines are never recorded because they carry an API key.
     pub fn take_input(&mut self) -> String {
         let text = self.input.clone();
-        if !text.trim().is_empty() {
+        if !text.trim().is_empty() && !is_key_command(&text) {
             self.history.push(text.clone());
         }
         self.clear_line();
@@ -1241,9 +1290,54 @@ impl App {
     }
 }
 
+/// True for a `/key` slash command (which carries an API key and must not reach history).
+fn is_key_command(text: &str) -> bool {
+    let t = text.trim_start();
+    let cmd = t.split_whitespace().next().unwrap_or("");
+    cmd.eq_ignore_ascii_case("/key")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_command_is_not_recorded_in_history() {
+        let mut app = App::new();
+        app.input = "/key sk-secret-123".into();
+        assert_eq!(app.take_input(), "/key sk-secret-123");
+        app.input = "  /KEY openai sk-x".into();
+        app.take_input();
+        app.input = "/keyboard layout".into();
+        app.take_input();
+        assert_eq!(app.history, vec!["/keyboard layout".to_string()]);
+    }
+
+    #[test]
+    fn readline_line_edits_stay_on_the_cursor_line() {
+        let mut app = App::new();
+        app.input = "first\nsecond line".into();
+        app.cursor = "first\nsec".len();
+        app.line_home();
+        assert_eq!(app.cursor, "first\n".len());
+        app.line_end();
+        assert_eq!(app.cursor, app.input.len());
+        app.cursor = "first\nsec".len();
+        app.kill_to_line_end();
+        assert_eq!(app.input, "first\nsec");
+        app.kill_to_line_start();
+        assert_eq!(app.input, "first\n");
+        assert_eq!(app.cursor, "first\n".len());
+    }
+
+    #[test]
+    fn hotkeys_only_while_a_clarification_is_pending() {
+        let mut app = App::new();
+        assert_eq!(app.clarification_hotkey_reply('1'), None);
+        app.pending_clarification = Some(vec!["alpha".into(), "beta".into()]);
+        assert_eq!(app.clarification_hotkey_reply('2').as_deref(), Some("beta"));
+        assert_eq!(app.clarification_hotkey_reply('n'), None);
+    }
 
     #[test]
     fn scroll_clamps() {
