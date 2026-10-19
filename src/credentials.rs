@@ -9,6 +9,19 @@ use log::{debug, warn};
 /// Service name used for OS Keychain entries. Matches `altai-app` and the plugin extension namespace.
 pub const KEYRING_SERVICE: &str = "dev.altai.isanagent";
 
+/// Whether keys written through this module survive a process restart.
+///
+/// `keyring` falls back to its in-memory mock store when no platform backend feature is
+/// compiled in. Writes to that store succeed but are gone as soon as the entry is
+/// dropped, so callers that promise "saved in keychain" must check this first.
+pub fn keychain_is_persistent() -> bool {
+    use keyring::credential::CredentialPersistence;
+    matches!(
+        keyring::default::default_credential_builder().persistence(),
+        CredentialPersistence::UntilDelete | CredentialPersistence::UntilReboot
+    )
+}
+
 /// Retrieve an API key for the given provider from the OS keychain.
 /// Returns `None` if not found or if the platform keyring is unavailable.
 pub fn get_provider_key(provider_name: &str) -> Option<String> {

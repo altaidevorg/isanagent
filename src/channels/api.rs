@@ -935,6 +935,11 @@ fn build_router(state: ApiState, serve_ui: bool) -> Router {
         )
         .route("/v1/settings/models", get(handle_list_models))
         .route("/v1/settings/model", post(handle_select_model))
+        .route("/v1/settings/provider-key", post(handle_set_provider_key))
+        .route(
+            "/v1/settings/provider-key/{provider_name}",
+            delete(handle_delete_provider_key),
+        )
         .route(
             "/v1/settings/harness",
             get(handle_get_harness).patch(handle_patch_harness),
@@ -1061,6 +1066,23 @@ struct SelectModelResponse {
     model_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     keychain_saved: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct ProviderKeyRequest {
+    provider_name: String,
+    api_key: String,
+}
+
+#[derive(Serialize)]
+struct ProviderKeyResponse {
+    #[serde(flatten)]
+    list: crate::channels::model_settings::ModelList,
+    /// False when the key is held in memory only and is lost on restart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keychain_saved: Option<bool>,
+    /// True when the running agent was switched to the changed key.
+    applied_to_active: bool,
 }
 
 #[derive(Serialize)]
@@ -1293,10 +1315,7 @@ async fn handle_select_model(
     };
 
     let keychain_saved = if prepared.store_in_keychain {
-        Some(
-            crate::credentials::set_provider_key(&prepared.provider_name, &prepared.api_key)
-                .is_ok(),
-        )
+        Some(catalog.remember_provider_key(&prepared.provider_name, &prepared.api_key))
     } else {
         None
     };
@@ -1321,7 +1340,6 @@ async fn handle_select_model(
     }
 
     catalog.set_active_key(prepared.key.clone());
-    catalog.note_provider_key(&prepared.provider_name);
     if let Err(error) = crate::channels::model_settings::persist_active_model_key(
         &catalog.workspace_dir,
         &prepared.key,
@@ -1340,6 +1358,144 @@ async fn handle_select_model(
         provider_name: prepared.provider_name,
         model_name: prepared.model_name,
         keychain_saved,
+    })
+    .into_response()
+}
+
+fn no_model_catalog() -> Response {
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "models_unavailable",
+        "This host has no model catalog.",
+    )
+    .into_response()
+}
+
+fn provider_key_error(
+    error: crate::channels::model_settings::ProviderKeyError,
+    provider_name: &str,
+) -> Response {
+    use crate::channels::model_settings::ProviderKeyError;
+    match error {
+        ProviderKeyError::UnknownProvider => ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unknown_provider",
+            format!("No configured provider named '{}'.", provider_name.trim()),
+        ),
+        ProviderKeyError::PlaceholderApiKey => ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_api_key",
+            "That value looks like a placeholder, not an API key.",
+        ),
+        ProviderKeyError::KeyInUse { model_name } => ApiError::new(
+            StatusCode::CONFLICT,
+            "key_in_use",
+            format!(
+                "{model_name} is active and uses this key. Switch to another model before removing it."
+            ),
+        ),
+    }
+    .into_response()
+}
+
+/// Re-apply the active model when its provider's key changed, so the next run uses it.
+async fn apply_active_key_change(
+    state: &ApiState,
+    catalog: &crate::channels::model_settings::ModelCatalog,
+    provider_name: &str,
+) -> Result<bool, Response> {
+    let Some(prepared) =
+        crate::channels::model_settings::active_switch_for_provider(catalog, provider_name)
+    else {
+        return Ok(false);
+    };
+    state
+        .bus_tx
+        .send(BusMessage::SwitchModel {
+            provider_name: prepared.provider_name,
+            model_name: prepared.model_name,
+            base_url: prepared.base_url,
+            api_key: prepared.api_key,
+        })
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bus_closed",
+                "The agent is no longer accepting model changes.",
+            )
+            .into_response()
+        })?;
+    Ok(true)
+}
+
+async fn handle_set_provider_key(
+    State(state): State<ApiState>,
+    Json(payload): Json<ProviderKeyRequest>,
+) -> Response {
+    let Some(catalog) = state.model_catalog.as_ref() else {
+        return no_model_catalog();
+    };
+    let provider = match crate::channels::model_settings::validate_provider_key(
+        catalog,
+        &payload.provider_name,
+        &payload.api_key,
+    ) {
+        Ok(provider) => provider,
+        Err(error) => return provider_key_error(error, &payload.provider_name),
+    };
+    let keychain_saved = catalog.remember_provider_key(&provider, &payload.api_key);
+    if !keychain_saved {
+        log_api(
+            &state.logger_tx,
+            LogEvent::warn(
+                "ApiChannel",
+                &format!(
+                    "API key for '{provider}' is kept for this session only: the OS keychain is unavailable."
+                ),
+            ),
+        );
+    }
+    let applied_to_active = match apply_active_key_change(&state, catalog, &provider).await {
+        Ok(applied) => applied,
+        Err(response) => return response,
+    };
+    Json(ProviderKeyResponse {
+        list: crate::channels::model_settings::list_models(catalog),
+        keychain_saved: Some(keychain_saved),
+        applied_to_active,
+    })
+    .into_response()
+}
+
+async fn handle_delete_provider_key(
+    State(state): State<ApiState>,
+    AxumPath(provider_name): AxumPath<String>,
+) -> Response {
+    let Some(catalog) = state.model_catalog.as_ref() else {
+        return no_model_catalog();
+    };
+    let provider = match crate::channels::model_settings::check_provider_key_removal(
+        catalog,
+        &provider_name,
+    ) {
+        Ok(provider) => provider,
+        Err(error) => return provider_key_error(error, &provider_name),
+    };
+    if let Err(message) = catalog.forget_provider_key(&provider) {
+        return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "keychain_error", message)
+            .into_response();
+    }
+    // The active provider can only lose its stored key when an env key remains; switch the
+    // running agent onto it.
+    let applied_to_active = match apply_active_key_change(&state, catalog, &provider).await {
+        Ok(applied) => applied,
+        Err(response) => return response,
+    };
+    Json(ProviderKeyResponse {
+        list: crate::channels::model_settings::list_models(catalog),
+        keychain_saved: None,
+        applied_to_active,
     })
     .into_response()
 }
@@ -4177,7 +4333,10 @@ bind_address = "127.0.0.1"
             },
         );
         state.model_catalog = Some(Arc::new(
-            crate::channels::model_settings::ModelCatalog::new(temp.path.clone(), providers, None),
+            crate::channels::model_settings::ModelCatalog::new(temp.path.clone(), providers, None)
+                .with_key_store(Arc::new(
+                    crate::channels::model_settings::MemoryKeyStore::new(true),
+                )),
         ));
         let app = build_router(state, false);
 
@@ -4241,7 +4400,143 @@ bind_address = "127.0.0.1"
         let remembered = std::fs::read_to_string(temp.path.join(".system_generated/last_model"))
             .expect("last model file");
         assert_eq!(remembered, "proxy-model");
-        let _ = crate::credentials::delete_provider_key("openai_compatible");
+        assert_eq!(switched_json["keychain_saved"], true);
+    }
+
+    async fn send_json(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        body: Option<String>,
+    ) -> (StatusCode, Value) {
+        let mut request = axum::http::Request::builder().method(method).uri(uri);
+        if body.is_some() {
+            request = request.header("content-type", "application/json");
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                request
+                    .body(body.map(Body::from).unwrap_or_else(Body::empty))
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn settings_provider_key_routes_store_apply_and_guard_the_active_key() {
+        let temp = LocalTempDir::new();
+        let (bus_tx, mut bus_rx) = mpsc::channel(8);
+        let mut state = build_state(&temp.db_path(), bus_tx, None);
+        let provider = |name: &str, model: &str, env: &str| crate::config::ProviderConfig {
+            provider_name: name.to_string(),
+            model_name: model.to_string(),
+            models: None,
+            api_key_env: env.to_string(),
+            api_key: None,
+            base_url: Some(format!("https://{name}.example/v1/chat/completions")),
+        };
+        let mut providers = HashMap::new();
+        providers.insert(
+            "alpha-1".to_string(),
+            provider("alpha", "alpha-1", "ISANAGENT_PROVIDER_KEY_ROUTE_ALPHA"),
+        );
+        providers.insert(
+            "beta-1".to_string(),
+            provider("beta", "beta-1", "ISANAGENT_PROVIDER_KEY_ROUTE_BETA"),
+        );
+        state.model_catalog = Some(Arc::new(
+            crate::channels::model_settings::ModelCatalog::new(
+                temp.path.clone(),
+                providers,
+                Some("alpha-1".to_string()),
+            )
+            // No keychain: keys stay in memory and the response says so.
+            .with_key_store(Arc::new(
+                crate::channels::model_settings::MemoryKeyStore::new(false),
+            )),
+        ));
+        let app = build_router(state, false);
+
+        let (status, body) = send_json(
+            &app,
+            "POST",
+            "/v1/settings/provider-key",
+            Some(r#"{"provider_name":"alpha","api_key":"<changethis>"}"#.to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_api_key");
+
+        let (status, body) = send_json(
+            &app,
+            "POST",
+            "/v1/settings/provider-key",
+            Some(r#"{"provider_name":"gamma","api_key":"real-key-1"}"#.to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "unknown_provider");
+
+        let (status, body) = send_json(
+            &app,
+            "POST",
+            "/v1/settings/provider-key",
+            Some(r#"{"provider_name":"alpha","api_key":"alpha-secret-1"}"#.to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.to_string().contains("alpha-secret-1"));
+        assert_eq!(body["keychain_saved"], false);
+        assert_eq!(body["applied_to_active"], true);
+        assert_eq!(body["active_key"], "alpha-1");
+        assert_eq!(body["models"][0]["key"], "alpha-1");
+        assert_eq!(body["models"][0]["key_source"], "session");
+        assert_eq!(body["models"][1]["key_source"], "none");
+        let BusMessage::SwitchModel {
+            model_name,
+            api_key,
+            ..
+        } = bus_rx.recv().await.expect("switch message")
+        else {
+            panic!("expected SwitchModel");
+        };
+        assert_eq!(model_name, "alpha-1");
+        assert_eq!(api_key, "alpha-secret-1");
+
+        let (status, body) = send_json(
+            &app,
+            "POST",
+            "/v1/settings/provider-key",
+            Some(r#"{"provider_name":"beta","api_key":"beta-secret-1"}"#.to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["applied_to_active"], false);
+        assert!(bus_rx.try_recv().is_err());
+
+        let (status, body) =
+            send_json(&app, "DELETE", "/v1/settings/provider-key/alpha", None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "key_in_use");
+
+        let (status, body) =
+            send_json(&app, "DELETE", "/v1/settings/provider-key/beta", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["models"][1]["key_source"], "none");
+        assert_eq!(body["models"][1]["has_api_key"], false);
+
+        let (status, _) = send_json(&app, "DELETE", "/v1/settings/provider-key/gamma", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

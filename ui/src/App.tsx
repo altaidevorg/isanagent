@@ -1878,7 +1878,16 @@ export default function App() {
                 </span>
               ) : null}
             </Button>
-            <Button className="flex-1" size="sm" variant="outline" onClick={() => setShowSettings(true)}>
+            <Button
+              className="flex-1"
+              size="sm"
+              variant="outline"
+              onClick={() => {
+                // On narrow screens the sidebar overlays the page; close it so it does not cover the dialog.
+                setSidebarOpen(false);
+                setShowSettings(true);
+              }}
+            >
               Settings
             </Button>
           </div>

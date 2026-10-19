@@ -1,14 +1,18 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react";
 
 import { Button } from "@/components/ui/button";
 import { useDialog } from "@/lib/useDialog";
 import { cn } from "@/lib/utils";
+
+type KeySource = "env" | "keychain" | "session" | "none";
 
 type ModelEntry = {
   key: string;
   provider_name: string;
   model_name: string;
   has_api_key: boolean;
+  key_source?: KeySource;
   api_key_env: string;
   base_url: string;
 };
@@ -23,6 +27,20 @@ type SelectModelResponse = {
   provider_name: string;
   model_name: string;
   keychain_saved?: boolean;
+};
+
+type ProviderKeyResponse = ModelList & {
+  keychain_saved?: boolean;
+  applied_to_active: boolean;
+};
+
+type Notice = { kind: "success" | "warning" | "error"; text: string };
+
+type ProviderGroup = {
+  name: string;
+  models: ModelEntry[];
+  source: KeySource;
+  envName: string;
 };
 
 type SettingsTab = "models" | "harness" | "skills";
@@ -77,13 +95,7 @@ export function SettingsDialog({
   onActiveModel: (label: string) => void;
 }) {
   const [tab, setTab] = useState<SettingsTab>("models");
-  const [models, setModels] = useState<ModelList | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [pendingKey, setPendingKey] = useState<string | null>(null);
-  const [selectedKey, setSelectedKey] = useState<string | null>(null);
-  const [keyDrafts, setKeyDrafts] = useState<Record<string, string>>({});
-  const [notice, setNotice] = useState<string | null>(null);
+  const modelSettings = useModelSettings(onActiveModel);
   const [harness, setHarness] = useState<HarnessSettings | null>(null);
   const [harnessDraft, setHarnessDraft] = useState<HarnessSettings | null>(null);
   const [harnessLoading, setHarnessLoading] = useState(false);
@@ -100,35 +112,7 @@ export function SettingsDialog({
   const [repoDraft, setRepoDraft] = useState("");
   const [skillNameDraft, setSkillNameDraft] = useState("");
   // Escape is ignored while a save is in flight so its result is not lost.
-  const dialogRef = useDialog(true, onClose, pendingKey === null && !harnessSaving && !skillsInstalling);
-
-  useEffect(() => {
-    let cancelled = false;
-    void (async () => {
-      try {
-        const response = await fetch("/v1/settings/models");
-        if (!response.ok) {
-          throw new Error(await readError(response));
-        }
-        const body = (await response.json()) as ModelList;
-        if (!cancelled) {
-          setModels(body);
-          setSelectedKey(body.active_key);
-        }
-      } catch (err) {
-        if (!cancelled) {
-          setError(err instanceof Error ? err.message : "Could not load models");
-        }
-      } finally {
-        if (!cancelled) {
-          setLoading(false);
-        }
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  const dialogRef = useDialog(true, onClose, !modelSettings.busy && !harnessSaving && !skillsInstalling);
 
   useEffect(() => {
     if (tab !== "harness" || harnessLoaded) {
@@ -196,66 +180,6 @@ export function SettingsDialog({
     };
   }, [tab, skillsLoaded]);
 
-  const groups = useMemo(() => {
-    const byProvider = new Map<string, ModelEntry[]>();
-    for (const model of models?.models ?? []) {
-      const list = byProvider.get(model.provider_name) ?? [];
-      list.push(model);
-      byProvider.set(model.provider_name, list);
-    }
-    return [...byProvider.entries()];
-  }, [models]);
-
-  const selectedModel = models?.models.find((entry) => entry.key === selectedKey) ?? null;
-  const selectedKeyDraft = selectedModel
-    ? (keyDrafts[selectedModel.provider_name]?.trim() ?? "")
-    : "";
-  const modelDirty = Boolean(
-    selectedModel &&
-      (selectedModel.key !== models?.active_key || selectedKeyDraft.length > 0),
-  );
-
-  const selectModel = async (model: ModelEntry) => {
-    setError(null);
-    setNotice(null);
-    setPendingKey(model.key);
-    try {
-      const draft = keyDrafts[model.provider_name]?.trim() ?? "";
-      const response = await fetch("/v1/settings/model", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          key: model.key,
-          ...(draft ? { api_key: draft } : {}),
-        }),
-      });
-      if (!response.ok) {
-        throw new Error(await readError(response));
-      }
-      const body = (await response.json()) as SelectModelResponse;
-      setModels((current) =>
-        current
-          ? {
-              ...current,
-              active_key: body.active_key,
-              models: current.models.map((entry) =>
-                entry.provider_name === body.provider_name
-                  ? { ...entry, has_api_key: true }
-                  : entry,
-              ),
-            }
-          : current,
-      );
-      setKeyDrafts((current) => ({ ...current, [model.provider_name]: "" }));
-      onActiveModel(body.model_name);
-      onClose();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not switch model");
-    } finally {
-      setPendingKey(null);
-    }
-  };
-
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 outline-none"
@@ -278,19 +202,6 @@ export function SettingsDialog({
             <p className="mt-1 text-sm text-muted-foreground">{settingsSubtitle(tab)}</p>
           </div>
           <div className="flex items-center gap-2">
-            {tab === "models" ? (
-              <Button
-                size="sm"
-                disabled={!modelDirty || pendingKey !== null}
-                onClick={() => {
-                  if (selectedModel) {
-                    void selectModel(selectedModel);
-                  }
-                }}
-              >
-                {pendingKey ? "Saving…" : "Save"}
-              </Button>
-            ) : null}
             <Button variant="ghost" size="sm" onClick={onClose}>
               Close
             </Button>
@@ -307,21 +218,9 @@ export function SettingsDialog({
             Skills
           </SettingsTabButton>
         </div>
+        {tab === "models" ? <ModelsPane settings={modelSettings} /> : null}
+        {tab === "models" ? null : (
         <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
-          {tab === "models" ? (
-            <ModelsPane
-              loading={loading}
-              error={error}
-              notice={notice}
-              groups={groups}
-              activeKey={models?.active_key ?? null}
-              selectedKey={selectedKey}
-              pendingKey={pendingKey}
-              keyDrafts={keyDrafts}
-              onDraft={(key, value) => setKeyDrafts((current) => ({ ...current, [key]: value }))}
-              onSelect={(model) => setSelectedKey(model.key)}
-            />
-          ) : null}
           {tab === "harness" ? (
             <HarnessPane
               loading={harnessLoading}
@@ -419,6 +318,7 @@ export function SettingsDialog({
             />
           ) : null}
         </div>
+        )}
       </div>
     </div>
   );
@@ -431,7 +331,7 @@ function settingsSubtitle(tab: SettingsTab): string {
   if (tab === "skills") {
     return "Installed skills are available on the next message. Add a GitHub repo or owner/repo shorthand.";
   }
-  return "One API key covers every model from that provider. Choose a model, then Save. Active is what the next message uses.";
+  return "Choose the model new messages use. One API key covers every model from a provider.";
 }
 
 function harnessFromResponse(body: HarnessResponse): HarnessSettings {
@@ -475,105 +375,867 @@ function SettingsTabButton({
   );
 }
 
-function ModelsPane({
-  loading,
-  error,
-  notice,
-  groups,
-  activeKey,
-  selectedKey,
-  pendingKey,
-  keyDrafts,
-  onDraft,
-  onSelect,
-}: {
-  loading: boolean;
-  error: string | null;
-  notice: string | null;
-  groups: Array<[string, ModelEntry[]]>;
-  activeKey: string | null;
-  selectedKey: string | null;
-  pendingKey: string | null;
-  keyDrafts: Record<string, string>;
-  onDraft: (key: string, value: string) => void;
-  onSelect: (model: ModelEntry) => void;
-}) {
-  if (loading) {
-    return <p className="text-sm text-muted-foreground">Loading models…</p>;
+const MODEL_FILTER_THRESHOLD = 8;
+
+const SOURCE_RANK: Record<KeySource, number> = { env: 3, keychain: 2, session: 1, none: 0 };
+
+function keySourceOf(model: ModelEntry): KeySource {
+  return model.key_source ?? (model.has_api_key ? "keychain" : "none");
+}
+
+function domId(prefix: string, value: string): string {
+  return `${prefix}-${value.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+}
+
+function keySourceLabel(source: KeySource, envName: string): string {
+  switch (source) {
+    case "env":
+      return `Key from $${envName}`;
+    case "keychain":
+      return "Key saved in keychain";
+    case "session":
+      return "Key for this session only";
+    default:
+      return "No API key";
   }
+}
+
+const NOTICE_STYLES: Record<Notice["kind"], string> = {
+  success:
+    "border-emerald-600/30 bg-emerald-500/10 text-emerald-900 dark:border-emerald-400/30 dark:text-emerald-200",
+  warning:
+    "border-amber-600/40 bg-amber-500/10 text-amber-900 dark:border-amber-400/30 dark:text-amber-200",
+  error:
+    "border-destructive/40 bg-destructive/10 text-destructive dark:text-red-300",
+};
+
+function NoticeLine({ notice, className }: { notice: Notice; className?: string }) {
   return (
-    <div className="space-y-4">
-      {error ? (
-        <p className="rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-          {error}
+    <p
+      role={notice.kind === "error" ? "alert" : "status"}
+      className={cn("rounded-lg border px-3 py-2 text-sm", NOTICE_STYLES[notice.kind], className)}
+    >
+      {notice.text}
+    </p>
+  );
+}
+
+type KeyEditorState = { provider: string; mode: "add" | "replace" };
+
+type ModelSettings = ReturnType<typeof useModelSettings>;
+
+/** State and requests for the Models tab. Lives in the dialog so tab switches keep it. */
+function useModelSettings(onActiveModel: (label: string) => void) {
+  const [list, setList] = useState<ModelList | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [reloadToken, setReloadToken] = useState(0);
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const [switching, setSwitching] = useState(false);
+  const [footerNotice, setFooterNotice] = useState<Notice | null>(null);
+  const [editor, setEditor] = useState<KeyEditorState | null>(null);
+  const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
+  const [keyBusy, setKeyBusy] = useState<string | null>(null);
+  const [providerNotices, setProviderNotices] = useState<Record<string, Notice>>({});
+  const [filter, setFilter] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setLoadError(null);
+    void (async () => {
+      try {
+        const response = await fetch("/v1/settings/models");
+        if (!response.ok) {
+          throw new Error(await readError(response));
+        }
+        const body = (await response.json()) as ModelList;
+        if (!cancelled) {
+          setList({ active_key: body.active_key, models: body.models });
+          setSelectedKey(body.active_key);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setLoadError(err instanceof Error ? err.message : "Could not load models");
+        }
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [reloadToken]);
+
+  const models = useMemo(() => list?.models ?? [], [list]);
+  const activeKey = list?.active_key ?? null;
+  const activeModel = models.find((model) => model.key === activeKey) ?? null;
+  const selectedModel = models.find((model) => model.key === selectedKey) ?? null;
+  const pendingModel =
+    selectedModel && selectedModel.key !== activeKey && selectedModel.has_api_key ? selectedModel : null;
+
+  const groups = useMemo<ProviderGroup[]>(() => {
+    const byProvider = new Map<string, ModelEntry[]>();
+    for (const model of models) {
+      const entries = byProvider.get(model.provider_name) ?? [];
+      entries.push(model);
+      byProvider.set(model.provider_name, entries);
+    }
+    return [...byProvider.entries()].map(([name, entries]) => {
+      let best = entries[0];
+      for (const entry of entries) {
+        if (SOURCE_RANK[keySourceOf(entry)] > SOURCE_RANK[keySourceOf(best)]) {
+          best = entry;
+        }
+      }
+      return {
+        name,
+        models: entries,
+        source: keySourceOf(best),
+        envName: best.api_key_env,
+      };
+    });
+  }, [models]);
+
+  const applyList = useCallback((next: ModelList) => {
+    setList({ active_key: next.active_key, models: next.models });
+    setSelectedKey((current) => {
+      const still = next.models.find((model) => model.key === current);
+      return still && still.has_api_key ? current : next.active_key;
+    });
+  }, []);
+
+  const setProviderNotice = (provider: string, notice: Notice | null) => {
+    setProviderNotices((current) => {
+      const next = { ...current };
+      if (notice) {
+        next[provider] = notice;
+      } else {
+        delete next[provider];
+      }
+      return next;
+    });
+  };
+
+  const select = (key: string) => {
+    setSelectedKey(key);
+    setFooterNotice(null);
+  };
+
+  const switchToSelected = async () => {
+    if (!pendingModel) {
+      return;
+    }
+    setSwitching(true);
+    setFooterNotice(null);
+    try {
+      const response = await fetch("/v1/settings/model", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ key: pendingModel.key }),
+      });
+      if (!response.ok) {
+        throw new Error(await readError(response));
+      }
+      const body = (await response.json()) as SelectModelResponse;
+      setList((current) => (current ? { ...current, active_key: body.active_key } : current));
+      setSelectedKey(body.active_key);
+      setFooterNotice({ kind: "success", text: `Now using ${body.model_name} for new messages.` });
+      onActiveModel(body.model_name);
+    } catch (err) {
+      setFooterNotice({
+        kind: "error",
+        text: err instanceof Error ? err.message : "Could not switch model",
+      });
+    } finally {
+      setSwitching(false);
+    }
+  };
+
+  const openEditor = (provider: string, mode: KeyEditorState["mode"]) => {
+    setEditor({ provider, mode });
+    setConfirmRemove(null);
+    setProviderNotice(provider, null);
+  };
+
+  const saveKey = async (provider: string, value: string): Promise<boolean> => {
+    const apiKey = value.trim();
+    if (!apiKey) {
+      setProviderNotice(provider, { kind: "error", text: "Enter an API key." });
+      return false;
+    }
+    setKeyBusy(provider);
+    setProviderNotice(provider, null);
+    try {
+      const response = await fetch("/v1/settings/provider-key", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ provider_name: provider, api_key: apiKey }),
+      });
+      if (!response.ok) {
+        throw new Error(await readError(response));
+      }
+      const body = (await response.json()) as ProviderKeyResponse;
+      applyList(body);
+      const applied = body.applied_to_active ? " The active model now uses it." : "";
+      setProviderNotice(
+        provider,
+        body.keychain_saved === false
+          ? {
+              kind: "warning",
+              text: `Saved for this session only: the OS keychain isn't available, so enter it again after a restart.${applied}`,
+            }
+          : { kind: "success", text: `Key saved in the OS keychain.${applied}` },
+      );
+      setEditor(null);
+      return true;
+    } catch (err) {
+      setProviderNotice(provider, {
+        kind: "error",
+        text: err instanceof Error ? err.message : "Could not save the key",
+      });
+      return false;
+    } finally {
+      setKeyBusy(null);
+    }
+  };
+
+  const removeKey = async (provider: string) => {
+    setKeyBusy(provider);
+    setProviderNotice(provider, null);
+    try {
+      const response = await fetch(`/v1/settings/provider-key/${encodeURIComponent(provider)}`, {
+        method: "DELETE",
+      });
+      if (!response.ok) {
+        throw new Error(await readError(response));
+      }
+      const body = (await response.json()) as ProviderKeyResponse;
+      applyList(body);
+      setProviderNotice(provider, {
+        kind: "success",
+        text: body.applied_to_active
+          ? "Saved key removed. The active model now uses the environment key."
+          : "Saved key removed.",
+      });
+    } catch (err) {
+      setProviderNotice(provider, {
+        kind: "error",
+        text: err instanceof Error ? err.message : "Could not remove the key",
+      });
+    } finally {
+      setKeyBusy(null);
+      setConfirmRemove(null);
+    }
+  };
+
+  return {
+    loading,
+    loadError,
+    reload: () => setReloadToken((token) => token + 1),
+    models,
+    groups,
+    activeModel,
+    selectedKey,
+    pendingModel,
+    switching,
+    footerNotice,
+    editor,
+    confirmRemove,
+    keyBusy,
+    providerNotices,
+    filter,
+    busy: switching || keyBusy !== null,
+    setFilter,
+    select,
+    cancelSelection: () => {
+      setSelectedKey(activeKey);
+      setFooterNotice(null);
+    },
+    switchToSelected,
+    openEditor,
+    closeEditor: () => setEditor(null),
+    askRemove: (provider: string) => {
+      setConfirmRemove(provider);
+      setEditor(null);
+      setProviderNotice(provider, null);
+    },
+    cancelRemove: () => setConfirmRemove(null),
+    saveKey,
+    removeKey,
+  };
+}
+
+/** Return focus to a provider's key action after an inline panel closes. */
+function focusKeyAction(provider: string) {
+  requestAnimationFrame(() => {
+    document.getElementById(domId("key-action", provider))?.focus();
+  });
+}
+
+function ModelsPane({ settings }: { settings: ModelSettings }) {
+  const query = settings.filter.trim().toLowerCase();
+  const visibleGroups = query
+    ? settings.groups
+        .map((group) => ({
+          ...group,
+          models: group.models.filter((model) =>
+            [model.model_name, model.key, model.provider_name].some((field) =>
+              field.toLowerCase().includes(query),
+            ),
+          ),
+        }))
+        .filter((group) => group.models.length > 0)
+    : settings.groups;
+  const activeGroup = settings.activeModel
+    ? settings.groups.find((group) => group.name === settings.activeModel?.provider_name) ?? null
+    : null;
+
+  let body: ReactNode;
+  if (settings.loading) {
+    body = <p className="text-sm text-muted-foreground">Loading models…</p>;
+  } else if (settings.loadError) {
+    body = (
+      <div className="space-y-3">
+        <NoticeLine notice={{ kind: "error", text: settings.loadError }} />
+        <Button type="button" variant="outline" size="sm" onClick={settings.reload}>
+          Try again
+        </Button>
+      </div>
+    );
+  } else if (settings.models.length === 0) {
+    body = (
+      <p className="text-sm text-muted-foreground">
+        No providers in config.toml. Add a [providers.*] block, then reopen settings.
+      </p>
+    );
+  } else {
+    body = (
+      <div className="space-y-4">
+        <CurrentModelCard model={settings.activeModel} group={activeGroup} />
+        {settings.models.length > MODEL_FILTER_THRESHOLD ? (
+          <div>
+            <label htmlFor="model-filter" className="sr-only">
+              Filter models
+            </label>
+            <input
+              id="model-filter"
+              type="search"
+              autoComplete="off"
+              spellCheck={false}
+              placeholder="Filter models"
+              value={settings.filter}
+              onChange={(event) => settings.setFilter(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Escape" && settings.filter) {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  settings.setFilter("");
+                }
+              }}
+              className="h-9 w-full rounded-md border border-border bg-background px-3 text-sm text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+            />
+          </div>
+        ) : null}
+        {visibleGroups.length === 0 ? (
+          <p className="text-sm text-muted-foreground">No models match “{settings.filter.trim()}”.</p>
+        ) : (
+          visibleGroups.map((group) => (
+            <ProviderCard key={group.name} group={group} settings={settings} />
+          ))
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">{body}</div>
+      {settings.models.length > 0 ? <ModelsFooter settings={settings} /> : null}
+    </>
+  );
+}
+
+function CurrentModelCard({ model, group }: { model: ModelEntry | null; group: ProviderGroup | null }) {
+  const source = model ? keySourceOf(model) : "none";
+  return (
+    <section
+      aria-labelledby="current-model-heading"
+      className="rounded-xl border border-border bg-muted/50 px-4 py-3"
+    >
+      <h3
+        id="current-model-heading"
+        className="text-xs font-semibold uppercase tracking-[0.05em] text-muted-foreground"
+      >
+        Current model
+      </h3>
+      {model ? (
+        <>
+          <p className="mt-1 break-all text-base font-semibold text-foreground">{model.model_name}</p>
+          <p className="mt-0.5 text-sm text-muted-foreground">
+            {model.provider_name}
+            <span aria-hidden="true"> · </span>
+            <span className={source === "none" ? "font-medium text-amber-800 dark:text-amber-300" : undefined}>
+              {source === "none"
+                ? "No API key. Add one below to use this model."
+                : keySourceLabel(source, group?.envName ?? model.api_key_env)}
+            </span>
+          </p>
+          <p className="mt-2 text-xs text-muted-foreground">
+            {source === "session"
+              ? "Remembered after restart. The key isn't, so enter it again after restarting."
+              : "Remembered after restart."}
+          </p>
+        </>
+      ) : (
+        <p className="mt-1 text-sm text-muted-foreground">No model is active yet. Pick one below.</p>
+      )}
+    </section>
+  );
+}
+
+function KeyChip({ source, envName }: { source: KeySource; envName: string }) {
+  const styles: Record<KeySource, string> = {
+    env: "border-emerald-700/25 bg-emerald-500/10 text-emerald-800 dark:border-emerald-400/30 dark:text-emerald-300",
+    keychain:
+      "border-emerald-700/25 bg-emerald-500/10 text-emerald-800 dark:border-emerald-400/30 dark:text-emerald-300",
+    session: "border-sky-700/25 bg-sky-500/10 text-sky-900 dark:border-sky-400/30 dark:text-sky-200",
+    none: "border-amber-700/35 bg-amber-400/15 text-amber-900 dark:border-amber-400/35 dark:text-amber-200",
+  };
+  return (
+    <span
+      className={cn(
+        "inline-flex max-w-full items-center gap-1.5 truncate rounded-full border px-2 py-0.5 text-xs font-medium",
+        styles[source],
+      )}
+    >
+      <span
+        aria-hidden="true"
+        className={cn(
+          "h-1.5 w-1.5 shrink-0 rounded-full",
+          source === "none" ? "bg-amber-600 dark:bg-amber-300" : source === "session" ? "bg-sky-600 dark:bg-sky-300" : "bg-emerald-600 dark:bg-emerald-300",
+        )}
+      />
+      <span className="truncate">{keySourceLabel(source, envName)}</span>
+    </span>
+  );
+}
+
+function ProviderCard({ group, settings }: { group: ProviderGroup; settings: ModelSettings }) {
+  const headingId = domId("provider", group.name);
+  const editorId = domId("key-editor", group.name);
+  const editing = settings.editor?.provider === group.name ? settings.editor : null;
+  const confirming = settings.confirmRemove === group.name;
+  const busy = settings.keyBusy === group.name;
+  const notice = settings.providerNotices[group.name];
+  const stored = group.source === "keychain" || group.source === "session";
+  const actionClass = "h-8 px-3 text-xs";
+
+  return (
+    <section aria-labelledby={headingId} className="overflow-hidden rounded-xl border border-border bg-card">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-3">
+        <h3 id={headingId} className="text-sm font-semibold text-foreground">
+          {group.name}
+        </h3>
+        <KeyChip source={group.source} envName={group.envName} />
+        {editing || confirming ? null : (
+          <div className="ml-auto flex items-center gap-1.5">
+            {group.source === "none" ? (
+              <Button
+                id={domId("key-action", group.name)}
+                type="button"
+                variant="outline"
+                className={actionClass}
+                disabled={settings.busy}
+                onClick={() => settings.openEditor(group.name, "add")}
+              >
+                Add key
+              </Button>
+            ) : null}
+            {stored ? (
+              <>
+                <Button
+                  id={domId("key-action", group.name)}
+                  type="button"
+                  variant="outline"
+                  className={actionClass}
+                  disabled={settings.busy}
+                  onClick={() => settings.openEditor(group.name, "replace")}
+                >
+                  Replace key
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  className={cn(actionClass, "text-destructive hover:text-destructive dark:text-red-300")}
+                  disabled={settings.busy}
+                  onClick={() => settings.askRemove(group.name)}
+                >
+                  Remove
+                </Button>
+              </>
+            ) : null}
+          </div>
+        )}
+      </div>
+      {group.source === "env" ? (
+        <p className="-mt-1 px-4 pb-3 text-xs text-muted-foreground">
+          Set in the environment. Change ${group.envName} to use a different key.
         </p>
+      ) : null}
+      {editing ? (
+        <KeyEditor
+          id={editorId}
+          provider={group.name}
+          mode={editing.mode}
+          envName={group.envName}
+          busy={busy}
+          onSave={async (value) => {
+            if (await settings.saveKey(group.name, value)) {
+              focusKeyAction(group.name);
+            }
+          }}
+          onCancel={() => {
+            settings.closeEditor();
+            focusKeyAction(group.name);
+          }}
+        />
+      ) : null}
+      {confirming ? (
+        <div
+          className="flex flex-wrap items-center gap-2 border-t border-border bg-muted/40 px-4 py-3"
+          onKeyDown={(event) => {
+            if (event.key === "Escape" && !busy) {
+              event.preventDefault();
+              event.stopPropagation();
+              settings.cancelRemove();
+              focusKeyAction(group.name);
+            }
+          }}
+        >
+          <p className="min-w-0 flex-1 text-sm text-foreground">
+            Remove the saved {group.name} key? Models from this provider will need a new key.
+          </p>
+          <div className="flex gap-2">
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              autoFocus
+              disabled={busy}
+              onClick={() => {
+                settings.cancelRemove();
+                focusKeyAction(group.name);
+              }}
+            >
+              Keep
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              className="bg-destructive text-destructive-foreground hover:opacity-90"
+              disabled={busy}
+              onClick={() => void settings.removeKey(group.name)}
+            >
+              {busy ? "Removing…" : "Remove key"}
+            </Button>
+          </div>
+        </div>
       ) : null}
       {notice ? (
-        <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm text-foreground">{notice}</p>
+        <div className="px-4 pb-3">
+          <NoticeLine notice={notice} />
+        </div>
       ) : null}
-      {groups.length === 0 ? (
-        error ? null : <p className="text-sm text-muted-foreground">
-          No providers in config.toml. Add a [providers.*] block, then reopen settings.
-        </p>
-      ) : (
-        groups.map(([providerName, providerModels]) => {
-          const ready = providerModels.some((model) => model.has_api_key);
-          const envName = providerModels[0]?.api_key_env ?? "API_KEY";
-          const draft = keyDrafts[providerName]?.trim() ?? "";
-          return (
-            <section key={providerName} className="space-y-2">
-              <h3 className="text-xs font-semibold uppercase tracking-[0.05em] text-muted-foreground">
-                {providerName}
-              </h3>
-              <p className="text-xs text-muted-foreground">
-                {ready
-                  ? `Key ready. It covers every ${providerName} model.`
-                  : `One $${envName} covers every ${providerName} model.`}
-              </p>
-              {ready ? null : (
-                <input
-                  type="password"
-                  autoComplete="off"
-                  className="h-9 w-full rounded-md border border-border bg-background px-3 text-sm"
-                  placeholder="API key"
-                  value={keyDrafts[providerName] ?? ""}
-                  onChange={(event) => onDraft(providerName, event.target.value)}
-                />
+      <ModelRadioGroup group={group} labelledBy={headingId} settings={settings} />
+    </section>
+  );
+}
+
+function ModelRadioGroup({
+  group,
+  labelledBy,
+  settings,
+}: {
+  group: ProviderGroup;
+  labelledBy: string;
+  settings: ModelSettings;
+}) {
+  const activeKey = settings.activeModel?.key ?? null;
+  const enabled = group.models.filter((model) => model.has_api_key);
+  const tabStop =
+    enabled.find((model) => model.key === settings.selectedKey)?.key ?? enabled[0]?.key ?? null;
+
+  const onKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>, model: ModelEntry) => {
+    if (event.key === " " || event.key === "Enter") {
+      event.preventDefault();
+      if (model.has_api_key && !settings.busy) {
+        settings.select(model.key);
+      }
+      return;
+    }
+    const step =
+      event.key === "ArrowDown" || event.key === "ArrowRight"
+        ? 1
+        : event.key === "ArrowUp" || event.key === "ArrowLeft"
+          ? -1
+          : 0;
+    if (step === 0) {
+      return;
+    }
+    event.preventDefault();
+    const radios = Array.from(
+      event.currentTarget.parentElement?.querySelectorAll<HTMLElement>(
+        '[role="radio"]:not([aria-disabled="true"])',
+      ) ?? [],
+    );
+    if (radios.length === 0) {
+      return;
+    }
+    const index = radios.indexOf(event.currentTarget);
+    const next = radios[(index + step + radios.length) % radios.length];
+    next.focus();
+    const key = next.dataset.modelKey;
+    if (key && !settings.busy) {
+      settings.select(key);
+    }
+  };
+
+  return (
+    <div role="radiogroup" aria-labelledby={labelledBy} className="space-y-1 border-t border-border p-2">
+      {group.models.map((model) => {
+        const active = model.key === activeKey;
+        const selected = model.key === settings.selectedKey;
+        const disabled = !model.has_api_key || settings.busy;
+        const idle = active && selected;
+        return (
+          <div
+            key={model.key}
+            role="radio"
+            aria-checked={selected}
+            aria-disabled={disabled}
+            tabIndex={model.key === tabStop ? 0 : -1}
+            data-model-key={model.key}
+            onClick={() => {
+              if (!disabled) {
+                settings.select(model.key);
+              }
+            }}
+            onKeyDown={(event) => onKeyDown(event, model)}
+            className={cn(
+              "flex min-h-11 w-full items-center gap-3 rounded-lg border px-3 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/60",
+              selected && !active
+                ? "border-foreground/30 bg-accent"
+                : "border-transparent",
+              !model.has_api_key
+                ? "cursor-not-allowed"
+                : settings.busy || idle
+                  ? "cursor-default"
+                  : "cursor-pointer hover:bg-accent/70",
+            )}
+          >
+            <span
+              aria-hidden="true"
+              className={cn(
+                "flex h-4 w-4 shrink-0 items-center justify-center rounded-full border-2",
+                selected ? "border-foreground" : "border-muted-foreground/60",
+                !model.has_api_key && "opacity-50",
               )}
-              <ul className="space-y-2">
-                {providerModels.map((model) => {
-                  const active = model.key === activeKey;
-                  const selected = model.key === selectedKey;
-                  const label = pendingKey === model.key
-                    ? "Saving…"
-                    : selected && !active
-                      ? "Selected"
-                      : active
-                        ? "Active"
-                        : "Use";
-                  return (
-                    <li key={model.key} className="rounded-lg border border-border px-3 py-3">
-                      <div className="flex items-center justify-between gap-3">
-                        <p className="min-w-0 truncate text-sm font-medium text-foreground">
-                          {model.model_name}
-                        </p>
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant={selected ? "secondary" : "outline"}
-                          disabled={pendingKey !== null || (!ready && !draft)}
-                          onClick={() => onSelect(model)}
-                        >
-                          {label}
-                        </Button>
-                      </div>
-                    </li>
-                  );
-                })}
-              </ul>
-            </section>
-          );
-        })
+            >
+              {selected ? <span className="h-2 w-2 rounded-full bg-foreground" /> : null}
+            </span>
+            <span className="min-w-0 flex-1">
+              <span
+                className={cn(
+                  "block truncate text-sm font-medium",
+                  model.has_api_key ? "text-foreground" : "text-muted-foreground",
+                )}
+              >
+                {model.model_name}
+              </span>
+              {!model.has_api_key ? (
+                <span className="block text-xs text-muted-foreground">Add a key to use this model</span>
+              ) : model.key !== model.model_name ? (
+                <span className="block truncate text-xs text-muted-foreground">{model.key}</span>
+              ) : null}
+            </span>
+            {active ? (
+              <span className="shrink-0 rounded-full border border-emerald-700/25 bg-emerald-500/10 px-2 py-0.5 text-xs font-medium text-emerald-800 dark:border-emerald-400/30 dark:text-emerald-300">
+                Active
+              </span>
+            ) : selected ? (
+              <span className="shrink-0 text-xs font-medium text-muted-foreground">Selected</span>
+            ) : null}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function KeyEditor({
+  id,
+  provider,
+  mode,
+  envName,
+  busy,
+  onSave,
+  onCancel,
+}: {
+  id: string;
+  provider: string;
+  mode: KeyEditorState["mode"];
+  envName: string;
+  busy: boolean;
+  onSave: (value: string) => Promise<void>;
+  onCancel: () => void;
+}) {
+  const [value, setValue] = useState("");
+  const [visible, setVisible] = useState(false);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const inputId = `${id}-input`;
+  const hintId = `${id}-hint`;
+
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
+
+  return (
+    <form
+      id={id}
+      className="space-y-2 border-t border-border bg-muted/40 px-4 py-3"
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (!busy && value.trim()) {
+          void onSave(value);
+        }
+      }}
+    >
+      <label htmlFor={inputId} className="block text-xs font-medium text-foreground">
+        {mode === "add" ? `API key for ${provider}` : `New API key for ${provider}`}
+      </label>
+      <div className="relative">
+        <input
+          ref={inputRef}
+          id={inputId}
+          type={visible ? "text" : "password"}
+          autoComplete="off"
+          autoCapitalize="off"
+          autoCorrect="off"
+          spellCheck={false}
+          aria-describedby={hintId}
+          value={value}
+          disabled={busy}
+          onChange={(event) => setValue(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") {
+              // Close only this field; the dialog's own Escape handler must not fire.
+              event.preventDefault();
+              event.stopPropagation();
+              if (!busy) {
+                onCancel();
+              }
+            }
+          }}
+          className="h-9 w-full rounded-md border border-border bg-background pl-3 pr-10 font-mono text-sm text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 disabled:opacity-60"
+        />
+        <button
+          type="button"
+          aria-label={visible ? "Hide key" : "Show key"}
+          aria-pressed={visible}
+          aria-controls={inputId}
+          onClick={() => setVisible((current) => !current)}
+          className="absolute inset-y-0 right-0 flex w-9 items-center justify-center rounded-r-md text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+        >
+          <EyeIcon crossed={visible} />
+        </button>
+      </div>
+      <p id={hintId} className="text-xs text-muted-foreground">
+        Stored in the OS keychain and used for every {provider} model.
+        {envName ? ` $${envName} takes precedence when it is set.` : ""}
+      </p>
+      <div className="flex justify-end gap-2 pt-1">
+        <Button type="button" variant="ghost" size="sm" disabled={busy} onClick={onCancel}>
+          Cancel
+        </Button>
+        <Button type="submit" size="sm" disabled={busy || value.trim() === ""}>
+          {busy ? "Saving…" : "Save key"}
+        </Button>
+      </div>
+    </form>
+  );
+}
+
+function EyeIcon({ crossed }: { crossed: boolean }) {
+  return (
+    <svg
+      aria-hidden="true"
+      viewBox="0 0 24 24"
+      className="h-4 w-4"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z" />
+      <circle cx="12" cy="12" r="3" />
+      {crossed ? <path d="M4 4l16 16" /> : null}
+    </svg>
+  );
+}
+
+function ModelsFooter({ settings }: { settings: ModelSettings }) {
+  const pending = settings.pendingModel;
+  const notice = settings.footerNotice;
+  const active = settings.activeModel;
+  return (
+    <div className="border-t border-border bg-card px-5 py-3">
+      <div aria-live="polite">{notice ? <NoticeLine notice={notice} /> : null}</div>
+      {pending ? (
+        <div className={cn("flex flex-wrap items-center justify-end gap-2", notice && "mt-2")}>
+          <p className="mr-auto min-w-0 truncate text-sm text-muted-foreground">
+            {active ? (
+              <>
+                From <span className="text-foreground">{active.model_name}</span>
+              </>
+            ) : (
+              "No model active"
+            )}
+          </p>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            disabled={settings.switching}
+            onClick={settings.cancelSelection}
+          >
+            Cancel
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            className="min-w-0 max-w-full"
+            disabled={settings.switching}
+            onClick={() => void settings.switchToSelected()}
+          >
+            <span className="truncate">
+              {settings.switching ? "Switching…" : `Switch to ${pending.model_name}`}
+            </span>
+          </Button>
+        </div>
+      ) : notice ? null : (
+        <p className="truncate text-sm text-muted-foreground">
+          {active ? (
+            <>
+              Active: <span className="text-foreground">{active.model_name}</span>
+            </>
+          ) : (
+            "No model active. Pick one above."
+          )}
+        </p>
       )}
     </div>
   );
