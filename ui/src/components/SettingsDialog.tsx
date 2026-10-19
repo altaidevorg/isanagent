@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 
 import { Button } from "@/components/ui/button";
+import { useDialog } from "@/lib/useDialog";
 import { cn } from "@/lib/utils";
 
 type ModelEntry = {
@@ -98,6 +99,8 @@ export function SettingsDialog({
   const [skillsInstalling, setSkillsInstalling] = useState(false);
   const [repoDraft, setRepoDraft] = useState("");
   const [skillNameDraft, setSkillNameDraft] = useState("");
+  // Escape is ignored while a save is in flight so its result is not lost.
+  const dialogRef = useDialog(true, onClose, pendingKey === null && !harnessSaving && !skillsInstalling);
 
   useEffect(() => {
     let cancelled = false;
@@ -255,7 +258,8 @@ export function SettingsDialog({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 outline-none"
+      ref={dialogRef}
       role="dialog"
       aria-modal="true"
       aria-labelledby="settings-title"
@@ -348,7 +352,12 @@ export function SettingsDialog({
                     const next = harnessFromResponse(body);
                     setHarness(next);
                     setHarnessDraft(next);
-                    onClose();
+                    if (body.restart_required) {
+                      // Keep the dialog open so the user sees that the change is not live yet.
+                      setHarnessNotice("Saved to config.toml. Restart isanagent for these changes to take effect.");
+                    } else {
+                      onClose();
+                    }
                   } catch (err) {
                     setHarnessError(err instanceof Error ? err.message : "Could not save harness settings");
                   } finally {
@@ -503,7 +512,7 @@ function ModelsPane({
         <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm text-foreground">{notice}</p>
       ) : null}
       {groups.length === 0 ? (
-        <p className="text-sm text-muted-foreground">
+        error ? null : <p className="text-sm text-muted-foreground">
           No providers in config.toml. Add a [providers.*] block, then reopen settings.
         </p>
       ) : (

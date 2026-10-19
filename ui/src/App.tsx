@@ -12,6 +12,7 @@ import { McpAppFrame, type McpAppRef } from "@/components/McpAppFrame";
 import { SettingsDialog } from "@/components/SettingsDialog";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import { useDialog } from "@/lib/useDialog";
 import { cn } from "@/lib/utils";
 
 const THREAD_ID_STORAGE_KEY = "isanagent_thread_id";
@@ -116,16 +117,19 @@ type ToolCall = {
   tool_name: string;
   args: string;
   result?: string;
+  isError?: boolean;
   mcpApp?: McpAppRef;
 };
 
 type StreamEvent =
-  | { type: "tool_call_started"; tool_name: string; args: string }
-  | { type: "tool_progress"; tool_name: string; message: string }
+  | { type: "tool_call_started"; tool_name: string; args: string; tool_call_id?: string }
+  | { type: "tool_progress"; tool_name: string; message: string; tool_call_id?: string }
   | {
       type: "tool_call_finished";
       tool_name: string;
       result: string;
+      is_error?: boolean;
+      tool_call_id?: string;
       mcp_app?: McpAppRef;
     }
   | { type: "agent_thought"; thought: string }
@@ -504,6 +508,7 @@ function McpAppList({
 function ToolAccordion({ toolCalls }: { toolCalls: ToolCall[] }) {
   const [isOpen, setIsOpen] = useState(false);
   const listed = toolCalls.filter((toolCall) => toolCall.tool_name);
+  const failed = listed.filter((toolCall) => toolCall.isError).length;
 
   if (listed.length === 0) return null;
 
@@ -522,13 +527,25 @@ function ToolAccordion({ toolCalls }: { toolCalls: ToolCall[] }) {
           <path d="M9 5l7 7-7 7" strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} />
         </svg>
         {isOpen ? "Hide tool calls" : `Show ${listed.length} tool calls`}
+        {!isOpen && failed > 0 ? <span className="text-destructive">({failed} failed)</span> : null}
       </button>
       {isOpen && (
         <div className="mt-3 flex flex-col gap-3">
           {listed.map((tc, i) => (
-            <div key={i} className="rounded-lg border border-border bg-muted/30 p-3 text-xs">
+            <div
+              key={i}
+              className={cn(
+                "rounded-lg border bg-muted/30 p-3 text-xs",
+                tc.isError ? "border-destructive/40" : "border-border",
+              )}
+            >
               <div className="flex items-center justify-between gap-2">
                 <span className="font-semibold text-yellow-600 dark:text-yellow-400">{tc.tool_name}</span>
+                {tc.isError ? (
+                  <span className="rounded-full bg-destructive/15 px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest text-destructive">
+                    Failed
+                  </span>
+                ) : null}
               </div>
               <div className="mt-2 font-mono text-[11px] opacity-70 break-all">
                 <span className="font-semibold">Args:</span> {tc.args}
@@ -688,6 +705,7 @@ export default function App() {
   const [historyLoading, setHistoryLoading] = useState(false);
   const [sessionsLoading, setSessionsLoading] = useState(false);
   const [sessions, setSessions] = useState<ThreadListEntry[]>([]);
+  const [sessionsError, setSessionsError] = useState<string | null>(null);
   const [sidebarHints, setSidebarHints] = useState<Record<string, string>>(loadSidebarHints);
   const [sessionToDelete, setSessionToDelete] = useState<ThreadListEntry | null>(null);
   const [showSummaries, setShowSummaries] = useState(false);
@@ -710,6 +728,11 @@ export default function App() {
   const dialogInputRef = useRef<HTMLInputElement>(null);
   const pendingRef = useRef(false);
   const queuedUiMessages = useRef<string[]>([]);
+
+  const deleteDialogRef = useDialog(sessionToDelete !== null, () => setSessionToDelete(null));
+  const backgroundDialogRef = useDialog(showBackgroundPanel, () => setShowBackgroundPanel(false));
+  const workspaceDialogRef = useDialog(showWorkspaceModal, () => setShowWorkspaceModal(false));
+  const appDialogRef = useDialog(dialogConfig !== null, () => dialogConfig?.onCancel());
 
   const showConfirm = (title: string, message: string, onConfirm: () => void) => {
     setDialogConfig({
@@ -739,23 +762,28 @@ export default function App() {
   };
   const [jobs, setJobs] = useState<BackgroundJob[]>([]);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
+  /** All summaries, for the Memory Store panel. */
   const [summaries, setSummaries] = useState<SummaryEntry[]>([]);
   const [summariesLoading, setSummariesLoading] = useState(false);
+  /** Summaries of the open thread, shown inline above the chat. */
+  const [threadSummaries, setThreadSummaries] = useState<SummaryEntry[]>([]);
+  const threadSummariesForRef = useRef<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   /** Active streaming turn chat id (matches server); set before fetch so Stop can cancel immediately. */
   const cancelChatIdRef = useRef<string | null>(null);
   const [, startTransition] = useTransition();
   const endOfMessagesRef = useRef<HTMLDivElement | null>(null);
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  /** True while the user is at (or near) the bottom of the chat; new content only scrolls then. */
+  const stickToBottomRef = useRef(true);
+  const lastScrollTopRef = useRef(0);
 
   const requestUserId = useMemo(() => apiUserId(), []);
 
-  const loadSummaries = useCallback(async (sessionId: string | null) => {
+  const loadAllSummaries = useCallback(async () => {
     setSummariesLoading(true);
     try {
-      const url = sessionId 
-        ? `/v1/threads/${encodeURIComponent(sessionId)}/summaries`
-        : `/v1/summaries`;
-      const response = await fetch(url);
+      const response = await fetch(`/v1/summaries`);
       if (!response.ok) {
         throw new Error(`Failed to load summaries (${response.status})`);
       }
@@ -766,6 +794,26 @@ export default function App() {
       setErrorMessage(buildErrorMessage(error));
     } finally {
       setSummariesLoading(false);
+    }
+  }, []);
+
+  const loadSummaries = useCallback(async (sessionId: string) => {
+    threadSummariesForRef.current = sessionId;
+    setThreadSummaries([]);
+    try {
+      const response = await fetch(`/v1/threads/${encodeURIComponent(sessionId)}/summaries`);
+      if (!response.ok) {
+        throw new Error(`Failed to load summaries (${response.status})`);
+      }
+      const data = (await response.json()) as SummaryEntry[];
+      if (threadSummariesForRef.current === sessionId) {
+        setThreadSummaries(data);
+      }
+    } catch (error) {
+      console.error(error);
+      if (threadSummariesForRef.current === sessionId) {
+        setErrorMessage(buildErrorMessage(error));
+      }
     }
   }, []);
 
@@ -794,6 +842,12 @@ export default function App() {
     try {
       const q = new URLSearchParams({ user: requestUserId, limit: "100" });
       const response = await fetch(`/v1/threads?${q.toString()}`);
+      if (response.status === 404) {
+        /* sidebar is optional if API older */
+        setSessions([]);
+        setSessionsError(null);
+        return;
+      }
       if (!response.ok) {
         const payload = (await response.json().catch(() => null)) as
           | { error?: { message?: string } }
@@ -802,15 +856,17 @@ export default function App() {
       }
       const rows = (await response.json()) as ThreadListEntry[];
       setSessions(rows);
-    } catch {
-      /* sidebar is optional if API older */
-      setSessions([]);
+      setSessionsError(null);
+    } catch (error) {
+      console.error("Failed to load threads:", error);
+      setSessionsError("Can't reach the isanagent server.");
     } finally {
       setSessionsLoading(false);
     }
   }, [requestUserId]);
 
   const openSession = (entry: ThreadListEntry) => {
+    stickToBottomRef.current = true;
     startTransition(() => {
       setErrorMessage(null);
       persistSessionPointers(entry.thread_id, entry.latest_response_id);
@@ -828,6 +884,7 @@ export default function App() {
     if (entry) {
       openSession(entry);
     } else {
+      stickToBottomRef.current = true;
       setInternalChatId(targetId);
       setLatestResponseId(null);
       void loadHistory(targetId);
@@ -836,7 +893,7 @@ export default function App() {
     setShowBackgroundPanel(false);
   }, [sessions, loadHistory, loadSummaries]);
 
-  const loadBackgroundData = useCallback(async () => {
+  const loadBackgroundData = useCallback(async (): Promise<NotificationItem[] | null> => {
     try {
       const [jobsRes, notifRes] = await Promise.all([
         fetch("/v1/background-jobs?limit=100"),
@@ -846,12 +903,73 @@ export default function App() {
         setJobs((await jobsRes.json()) as BackgroundJob[]);
       }
       if (notifRes.ok) {
-        setNotifications((await notifRes.json()) as NotificationItem[]);
+        const items = (await notifRes.json()) as NotificationItem[];
+        setNotifications(items);
+        return items;
       }
     } catch {
       // keep UI best-effort
     }
+    return null;
   }, []);
+
+  const loadNotifications = useCallback(async () => {
+    try {
+      const res = await fetch("/v1/notifications?limit=100");
+      if (res.ok) {
+        setNotifications((await res.json()) as NotificationItem[]);
+      }
+    } catch {
+      // best-effort; the unread dot just stays as it was
+    }
+  }, []);
+
+  /** Mark unseen notifications as seen on the server (the Background panel is showing them). */
+  const markNotificationsSeen = useCallback(async (items: NotificationItem[]) => {
+    const unseen = items.filter((n) => !n.seen_at_ms);
+    if (unseen.length === 0) {
+      return;
+    }
+    const results = await Promise.all(
+      unseen.map(async (n) => {
+        try {
+          const res = await fetch(`/v1/notifications/${encodeURIComponent(n.notification_id)}/seen`, {
+            method: "POST",
+          });
+          return res.ok ? n.notification_id : null;
+        } catch {
+          return null;
+        }
+      }),
+    );
+    const marked = new Set(results.filter((id): id is string => id !== null));
+    if (marked.size === 0) {
+      return;
+    }
+    const now = Date.now();
+    setNotifications((prev) =>
+      prev.map((n) => (marked.has(n.notification_id) && !n.seen_at_ms ? { ...n, seen_at_ms: now } : n)),
+    );
+  }, []);
+
+  useEffect(() => {
+    void loadNotifications();
+    const timer = window.setInterval(() => {
+      if (!document.hidden) {
+        void loadNotifications();
+      }
+    }, 20_000);
+    const onVisibility = () => {
+      if (!document.hidden) {
+        void loadNotifications();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [loadNotifications]);
 
   const replyToTicket = async (ticketId: string, response: string) => {
     try {
@@ -917,6 +1035,7 @@ export default function App() {
         throw new Error(`Failed to update summary (${response.status})`);
       }
       setSummaries((prev) => prev.map((s) => (s.id === id ? { ...s, ...updated } : s)));
+      setThreadSummaries((prev) => prev.map((s) => (s.id === id ? { ...s, ...updated } : s)));
     } catch (error) {
       console.error(error);
       setErrorMessage(buildErrorMessage(error));
@@ -933,6 +1052,7 @@ export default function App() {
           throw new Error(`Failed to delete summary (${response.status})`);
         }
         setSummaries((prev) => prev.filter((s) => s.id !== id));
+        setThreadSummaries((prev) => prev.filter((s) => s.id !== id));
       } catch (error) {
         console.error(error);
         setErrorMessage(buildErrorMessage(error));
@@ -980,9 +1100,27 @@ export default function App() {
     }
   }, [loadHistory, loadSummaries]);
 
+  const onMessagesScroll = () => {
+    const el = scrollContainerRef.current;
+    if (!el) {
+      return;
+    }
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 120;
+    if (nearBottom) {
+      stickToBottomRef.current = true;
+    } else if (el.scrollTop < lastScrollTopRef.current) {
+      // Only an upward scroll unpins; a smooth scroll toward the bottom never does.
+      stickToBottomRef.current = false;
+    }
+    lastScrollTopRef.current = el.scrollTop;
+  };
+
   useEffect(() => {
+    if (!stickToBottomRef.current) {
+      return;
+    }
     endOfMessagesRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages.length, pending]);
+  }, [messages.length, pending, currentStep, currentToolCalls.length, threadSummaries.length]);
 
   const startNewConversation = () => {
     // Drop the turn that is still waiting on the model. Otherwise the new
@@ -993,7 +1131,8 @@ export default function App() {
       setInternalChatId(null);
       setLatestResponseId(null);
       setMessages([]);
-      setSummaries([]);
+      threadSummariesForRef.current = null;
+      setThreadSummaries([]);
       setErrorMessage(null);
     });
   };
@@ -1109,6 +1248,7 @@ export default function App() {
     const turnChatId = internalChatId ?? newThreadUuid();
 
     setErrorMessage(null);
+    stickToBottomRef.current = true;
     setMessages((prev) => [...prev, optimisticUser]);
     pendingRef.current = true;
     setPending(true);
@@ -1161,13 +1301,17 @@ export default function App() {
       let decoder = new TextDecoder();
       let assistantContent = "";
       let toolCalls: ToolCall[] = [];
-      let currentToolCall: ToolCall | null = null;
+      /** In-flight calls keyed by tool_call_id (or `name:<tool>` from older servers); FIFO per key. */
+      const inFlightToolCalls = new Map<string, ToolCall[]>();
+      const toolCallKey = (toolName: string, toolCallId?: string) =>
+        toolCallId ? `id:${toolCallId}` : `name:${toolName}`;
+      let streamError: string | null = null;
       let finalChatId: string | null = null;
       let finalResponseId: string | null = null;
       let clarification: Clarification | undefined;
       let buffer = "";
 
-      while (true) {
+      while (streamError === null) {
         const { done, value } = await reader.read();
         if (done) break;
 
@@ -1181,72 +1325,99 @@ export default function App() {
           if (!trimmedLine || !trimmedLine.startsWith("data: ")) continue;
 
           const data = trimmedLine.slice(6);
+          let event: StreamEvent;
           try {
-            const event = JSON.parse(data) as StreamEvent;
-            switch (event.type) {
-              case "agent_thought":
-                setCurrentStep(`Thinking: ${event.thought}`);
-                break;
-              case "tool_call_started":
-                currentToolCall = { tool_name: event.tool_name, args: event.args };
-                setCurrentStep(`Using tool: ${event.tool_name}`);
-                break;
-              case "tool_progress":
-                setCurrentStep(`${event.tool_name}: ${event.message}`);
-                break;
-              case "tool_call_finished":
-                if (currentToolCall && currentToolCall.tool_name === event.tool_name) {
-                  currentToolCall.result = event.result;
-                  currentToolCall.mcpApp = event.mcp_app;
-                  toolCalls.push({ ...currentToolCall });
-                  setCurrentToolCalls([...toolCalls]);
-                  currentToolCall = null;
-                } else if (event.mcp_app) {
-                  toolCalls.push({
-                    tool_name: event.tool_name,
-                    args: "",
-                    result: event.result,
-                    mcpApp: event.mcp_app,
-                  });
-                  setCurrentToolCalls([...toolCalls]);
-                }
-                // Don't set currentStep to null here, let the next event (thought or next tool) replace it
-                // This prevents the indicator from flickering or disappearing between steps
-                break;
-              case "completion":
-                if (event.content === "" && event.response_id === "") {
-                  // Initial ID hint (older servers); client already knows id via header / body.
-                  if (event.thread_id) {
-                    cancelChatIdRef.current = event.thread_id;
-                  }
-                  break;
-                }
-                assistantContent = event.content;
-                finalChatId = event.thread_id;
-                finalResponseId = event.response_id;
-                clarification = event.clarification;
-                setCurrentStep(null); // Clear step when completion arrives
-                break;
-              case "error":
-                throw new Error(event.message);
-            }
+            event = JSON.parse(data) as StreamEvent;
           } catch (e) {
             console.error("Failed to parse SSE event", e, "Line:", trimmedLine);
+            continue;
+          }
+          switch (event.type) {
+            case "agent_thought":
+              setCurrentStep(`Thinking: ${event.thought}`);
+              break;
+            case "tool_call_started": {
+              const key = toolCallKey(event.tool_name, event.tool_call_id);
+              const queue = inFlightToolCalls.get(key) ?? [];
+              queue.push({ tool_name: event.tool_name, args: event.args });
+              inFlightToolCalls.set(key, queue);
+              setCurrentStep(`Using tool: ${event.tool_name}`);
+              break;
+            }
+            case "tool_progress":
+              setCurrentStep(`${event.tool_name}: ${event.message}`);
+              break;
+            case "tool_call_finished": {
+              const key = toolCallKey(event.tool_name, event.tool_call_id);
+              const queue = inFlightToolCalls.get(key);
+              const started = queue?.shift();
+              if (queue && queue.length === 0) {
+                inFlightToolCalls.delete(key);
+              }
+              toolCalls.push({
+                tool_name: event.tool_name,
+                args: started?.args ?? "",
+                result: event.result,
+                isError: event.is_error === true,
+                mcpApp: event.mcp_app,
+              });
+              setCurrentToolCalls([...toolCalls]);
+              // Don't set currentStep to null here, let the next event (thought or next tool) replace it
+              // This prevents the indicator from flickering or disappearing between steps
+              break;
+            }
+            case "completion":
+              if (event.content === "" && event.response_id === "") {
+                // Initial ID hint (older servers); client already knows id via header / body.
+                if (event.thread_id) {
+                  cancelChatIdRef.current = event.thread_id;
+                }
+                break;
+              }
+              assistantContent = event.content;
+              finalChatId = event.thread_id;
+              finalResponseId = event.response_id;
+              clarification = event.clarification;
+              setCurrentStep(null); // Clear step when completion arrives
+              break;
+            case "error":
+              streamError = event.message || "The agent reported an error.";
+              break;
+          }
+          if (streamError !== null) {
+            break;
           }
         }
       }
 
-      const assistantId = createId();
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: assistantId,
-          role: "assistant",
-          content: assistantContent,
-          toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
-          clarification,
-        },
-      ]);
+      if (streamError !== null) {
+        void reader.cancel().catch(() => undefined);
+      } else if (!finalResponseId && !assistantContent) {
+        streamError = "The response ended before the assistant replied.";
+      }
+
+      // Keep whatever the turn produced; skip an empty bubble when there is nothing to show.
+      if (assistantContent || toolCalls.length > 0 || clarification) {
+        const assistantId = createId();
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: assistantId,
+            role: "assistant",
+            content: assistantContent,
+            toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+            clarification,
+          },
+        ]);
+      }
+
+      if (streamError !== null) {
+        // The server accepted the turn, so the user message stays; only surface the failure.
+        queuedUiMessages.current = [];
+        setErrorMessage(streamError);
+        void loadSessions();
+        return;
+      }
 
       if (finalChatId && finalResponseId) {
         persistSessionPointers(finalChatId, finalResponseId);
@@ -1310,7 +1481,8 @@ export default function App() {
     <div className="flex h-dvh overflow-hidden bg-background font-sans">
       {sessionToDelete ? (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 outline-none"
+          ref={deleteDialogRef}
           role="dialog"
           aria-modal="true"
           aria-labelledby="delete-session-title"
@@ -1351,7 +1523,8 @@ export default function App() {
       ) : null}
       {showBackgroundPanel ? (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 outline-none"
+          ref={backgroundDialogRef}
           role="dialog"
           aria-modal="true"
           aria-labelledby="background-runtime-title"
@@ -1367,7 +1540,7 @@ export default function App() {
                 <div className="h-2 w-2 rounded-full bg-primary animate-pulse" />
                 <h2 id="background-runtime-title" className="text-lg font-semibold tracking-tight text-foreground">Background Runtime</h2>
               </div>
-              <Button variant="ghost" size="sm" className="h-8 w-8 p-0 rounded-full" onClick={() => setShowBackgroundPanel(false)}>
+              <Button variant="ghost" size="sm" className="h-8 w-8 p-0 rounded-full" aria-label="Close" onClick={() => setShowBackgroundPanel(false)}>
                 ×
               </Button>
             </div>
@@ -1506,7 +1679,8 @@ export default function App() {
       ) : null}
       {showWorkspaceModal ? (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 outline-none"
+          ref={workspaceDialogRef}
           role="dialog"
           aria-modal="true"
           aria-labelledby="workspace-modal-title"
@@ -1534,9 +1708,11 @@ export default function App() {
 
       {dialogConfig ? (
         <div
-          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4"
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4 outline-none"
+          ref={appDialogRef}
           role="dialog"
           aria-modal="true"
+          aria-labelledby="app-dialog-title"
           onClick={(e) => {
             if (e.target === e.currentTarget) {
               dialogConfig.onCancel();
@@ -1544,20 +1720,18 @@ export default function App() {
           }}
         >
           <div className="w-full max-w-md rounded-xl border border-border bg-card p-6 shadow-xl">
-            <h2 className="text-lg font-semibold text-foreground mb-2">{dialogConfig.title}</h2>
+            <h2 id="app-dialog-title" className="text-lg font-semibold text-foreground mb-2">{dialogConfig.title}</h2>
             <p className="text-sm text-muted-foreground mb-6">{dialogConfig.message}</p>
             
             {dialogConfig.type === 'prompt' && (
               <input
                 ref={dialogInputRef}
-                autoFocus
+                data-autofocus
                 className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm mb-6 focus:outline-none focus:ring-2 focus:ring-primary"
                 defaultValue={dialogConfig.defaultValue}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') {
                     dialogConfig.onConfirm(dialogInputRef.current?.value || '');
-                  } else if (e.key === 'Escape') {
-                    dialogConfig.onCancel();
                   }
                 }}
               />
@@ -1610,7 +1784,7 @@ export default function App() {
             className="mt-2 w-full"
             onClick={() => {
               setShowSummaries(true);
-              void loadSummaries(null); // Load all summaries
+              void loadAllSummaries();
             }}
             disabled={summariesLoading}
           >
@@ -1621,8 +1795,12 @@ export default function App() {
             size="sm"
             className="mt-2 w-full relative"
             onClick={() => {
-              void loadBackgroundData();
               setShowBackgroundPanel(true);
+              void loadBackgroundData().then((items) => {
+                if (items) {
+                  void markNotificationsSeen(items);
+                }
+              });
             }}
           >
             Background
@@ -1646,10 +1824,27 @@ export default function App() {
           <p className="px-2 pb-1 text-xs font-medium uppercase tracking-[0.05em] text-muted-foreground">
             Threads
           </p>
-          {sessionsLoading && sessions.length === 0 ? (
+          {sessionsError ? (
+            <div className="mx-2 mb-2 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive" role="alert">
+              <p>{sessionsError}</p>
+              <Button
+                className="mt-2 h-7 text-xs"
+                disabled={sessionsLoading}
+                size="sm"
+                type="button"
+                variant="outline"
+                onClick={() => void loadSessions()}
+              >
+                {sessionsLoading ? "Retrying…" : "Retry"}
+              </Button>
+            </div>
+          ) : null}
+          {sessionsLoading && sessions.length === 0 && !sessionsError ? (
             <p className="px-2 text-xs text-muted-foreground">Loading…</p>
           ) : sessions.length === 0 ? (
-            <p className="px-2 text-xs text-muted-foreground">No saved chats yet.</p>
+            sessionsError ? null : (
+              <p className="px-2 text-xs text-muted-foreground">No saved chats yet.</p>
+            )
           ) : (
             <ul className="space-y-1">
               {sessions.map((s) => {
@@ -1668,6 +1863,10 @@ export default function App() {
                       title={s.thread_id}
                       onClick={() => openSession(s)}
                       onKeyDown={(e) => {
+                        // Let the nested delete button handle its own keys.
+                        if (e.target !== e.currentTarget) {
+                          return;
+                        }
                         if (e.key === "Enter" || e.key === " ") {
                           e.preventDefault();
                           openSession(s);
@@ -1680,7 +1879,7 @@ export default function App() {
                         </p>
                       </div>
                       <button
-                        className="shrink-0 rounded-lg p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-destructive/15 hover:text-destructive group-hover:opacity-100"
+                        className="shrink-0 rounded-lg p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-destructive/15 hover:text-destructive focus-visible:opacity-100 group-hover:opacity-100 group-focus-within:opacity-100"
                         title="Delete conversation"
                         type="button"
                         onClick={(e) => requestDeleteSession(s, e)}
@@ -1725,14 +1924,18 @@ export default function App() {
             />
           )}
 
-          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4 sm:px-6">
-            {(messages.length > 0 || summaries.length > 0 || pending) ? (
+          <div
+            className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4 sm:px-6"
+            ref={scrollContainerRef}
+            onScroll={onMessagesScroll}
+          >
+            {(messages.length > 0 || threadSummaries.length > 0 || pending) ? (
               <div className="mx-auto flex min-h-full w-full min-w-0 max-w-3xl flex-col gap-4">
-                {summaries.length > 0 && (
+                {threadSummaries.length > 0 && (
                   <div className="space-y-4">
                     {/* Only show the most recent summary (which is now the ONLY summary) */}
                     {(() => {
-                      const s = summaries[0];
+                      const s = threadSummaries[0];
                       return (
                         <div key={`msg-sum-${s.id}`} className="rounded-xl border border-border bg-muted/10 p-4 shadow-sm">
                           <div className="flex items-center gap-2 mb-2">
@@ -1824,8 +2027,20 @@ export default function App() {
           <div className="border-t border-border/70 px-4 py-4 sm:px-6">
             <div className="mx-auto max-w-3xl">
               {errorMessage ? (
-                <div className="mb-3 rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">
-                  {errorMessage}
+                <div
+                  className="mb-3 flex items-start justify-between gap-3 rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive"
+                  role="alert"
+                >
+                  <p className="min-w-0 flex-1 whitespace-pre-wrap break-words">{errorMessage}</p>
+                  <button
+                    aria-label="Dismiss error"
+                    className="-my-1 shrink-0 rounded-md px-1.5 text-base leading-6 hover:bg-destructive/15"
+                    title="Dismiss"
+                    type="button"
+                    onClick={() => setErrorMessage(null)}
+                  >
+                    ×
+                  </button>
                 </div>
               ) : null}
               <Composer 
@@ -2335,9 +2550,13 @@ function SummaryList({
     }
   };
 
+  // Escape first leaves edit mode, then closes the panel.
+  const dialogRef = useDialog(true, () => (editingId !== null ? setEditingId(null) : onClose()));
+
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 outline-none"
+      ref={dialogRef}
       role="dialog"
       aria-modal="true"
       aria-labelledby="memory-store-title"
