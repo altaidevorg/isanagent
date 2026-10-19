@@ -5,6 +5,7 @@ mod conversations;
 mod executions;
 mod tool_history;
 mod transcript;
+mod work;
 
 pub use cell_render::wrap_text;
 pub use conversations::{conversations_ensure_list_shows_selection, conversations_list_paragraph};
@@ -14,3 +15,4 @@ pub use executions::{
 };
 pub use tool_history::tool_history_paragraph;
 pub use transcript::{extract_selection_text, transcript_paragraph};
+pub use work::{work_drawer_lines, work_drawer_paragraph};

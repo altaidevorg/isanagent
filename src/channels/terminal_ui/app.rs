@@ -278,10 +278,9 @@ pub enum TerminalUiFocus {
     /// Browse `execution_runs.jsonl` + per-run journals for this terminal thread (`chat_id`).
     Executions,
     ToolHistory,
-    /// Sub-agent task lifecycle pane (running / finished named agents, plan steps).
-    AgentTasks,
-    /// Detailed list of background jobs and notifications.
-    BackgroundJobs,
+    /// The work drawer: running / background jobs, notifications, sub-agents and workspace
+    /// files in one list. `Tab` toggles between it and the transcript.
+    Work,
 }
 
 const TOOL_RAIL_CAP: usize = 150;
@@ -526,15 +525,20 @@ pub struct App {
     pub execution_stream_label: Option<(String, String)>,
     /// Multi-job execution strip rows (Colab MCP background calls, auto-promoted runs, etc.).
     pub jobs_strip: VecDeque<JobStripEntry>,
-    /// Sub-agent task rows (named agents, plan steps) — shown in the AgentTasks pane.
+    /// Sub-agent task rows (named agents, plan steps) — shown in the work drawer.
     pub agent_tasks: VecDeque<AgentTaskEntry>,
-    /// Lines hidden below the agent-tasks viewport top (`0` = follow tail).
-    pub agent_tasks_scroll_top: usize,
-    pub last_agent_tasks_rect: Option<Rect>,
+    /// Lines hidden above the work drawer viewport.
+    pub work_scroll_top: usize,
+    /// Last frame's work drawer block (wheel hit-test).
+    pub last_work_rect: Option<Rect>,
     pub background_jobs: Vec<crate::memory::BackgroundJobRecord>,
     pub notifications: Vec<crate::memory::NotificationRecord>,
-    pub background_jobs_selected_idx: Option<usize>,
-    pub last_background_jobs_rect: Option<Rect>,
+    /// Highlighted row in the work drawer, indexing [`App::work_items`].
+    pub work_selected_idx: Option<usize>,
+    /// Newest files in the agent's sandbox (relative paths), refreshed while the drawer is open.
+    pub workspace_files: Vec<String>,
+    /// Files found by the last scan before `workspace_files` was capped.
+    pub workspace_files_total: usize,
     /// True when the most recent reasoning turn ended with an exhausted-retry LLM failure
     /// banner. Cleared once the next user message (or `/retry`) is sent.
     pub llm_retry_available: bool,
@@ -589,35 +593,100 @@ impl Default for App {
     }
 }
 
-pub enum BackgroundPanelItem<'a> {
+/// One selectable row of the work drawer, in display order.
+pub enum WorkItem<'a> {
     Notification(&'a crate::memory::NotificationRecord),
+    /// A job from the live execution strip that has no persisted background-job record.
+    LiveJob(&'a JobStripEntry),
     Job(&'a crate::memory::BackgroundJobRecord),
-    AgentTask(&'a crate::channels::terminal_ui::app::AgentTaskEntry),
+    AgentTask(&'a AgentTaskEntry),
+    /// Sandbox-relative path of a workspace file.
+    File(&'a str),
 }
 
-impl<'a> BackgroundPanelItem<'a> {
-    pub fn chat_id(&self) -> &'a str {
+impl<'a> WorkItem<'a> {
+    /// Chat a job-like row belongs to; `None` for files.
+    pub fn chat_id(&self) -> Option<&'a str> {
         match self {
-            Self::Notification(n) => &n.chat_id,
-            Self::Job(j) => &j.chat_id,
-            Self::AgentTask(t) => &t.child_chat_id,
+            Self::Notification(n) => Some(&n.chat_id),
+            Self::LiveJob(j) => Some(&j.chat_id),
+            Self::Job(j) => Some(&j.chat_id),
+            Self::AgentTask(t) => Some(&t.child_chat_id),
+            Self::File(_) => None,
         }
     }
 }
 
 impl App {
-    pub fn background_panel_items(&self) -> Vec<BackgroundPanelItem<'_>> {
+    /// Live strip jobs not already listed as persisted background jobs.
+    pub fn work_live_jobs(&self) -> impl Iterator<Item = &JobStripEntry> {
+        self.jobs_strip
+            .iter()
+            .filter(move |e| !self.background_jobs.iter().any(|j| j.job_id == e.job_id))
+    }
+
+    /// Selectable work drawer rows: notifications, jobs, sub-agents, then files.
+    pub fn work_items(&self) -> Vec<WorkItem<'_>> {
         let mut items = Vec::new();
-        for n in &self.notifications {
-            items.push(BackgroundPanelItem::Notification(n));
-        }
-        for j in &self.background_jobs {
-            items.push(BackgroundPanelItem::Job(j));
-        }
-        for a in &self.agent_tasks {
-            items.push(BackgroundPanelItem::AgentTask(a));
-        }
+        items.extend(self.notifications.iter().map(WorkItem::Notification));
+        items.extend(self.work_live_jobs().map(WorkItem::LiveJob));
+        items.extend(self.background_jobs.iter().map(WorkItem::Job));
+        items.extend(self.agent_tasks.iter().map(WorkItem::AgentTask));
+        items.extend(
+            self.workspace_files
+                .iter()
+                .map(|f| WorkItem::File(f.as_str())),
+        );
         items
+    }
+
+    /// Work still in progress or waiting on the user: running / waiting jobs, running
+    /// sub-agents and unseen, unresolved notifications. Shown as ` work · N `.
+    pub fn work_count(&self) -> usize {
+        let live = self
+            .work_live_jobs()
+            .filter(|e| !e.status.is_terminal())
+            .count();
+        let jobs = self
+            .background_jobs
+            .iter()
+            .filter(|j| matches!(j.state.as_str(), "running" | "waiting" | "queued"))
+            .count();
+        let agents = self
+            .agent_tasks
+            .iter()
+            .filter(|t| !t.status.is_terminal())
+            .count();
+        let notes = self
+            .notifications
+            .iter()
+            .filter(|n| n.resolved_at_ms.is_none() && n.seen_at_ms.is_none())
+            .count();
+        live + jobs + agents + notes
+    }
+
+    /// Keep the drawer selection on a real row after the lists change.
+    pub fn clamp_work_selection(&mut self) {
+        let n = self.work_items().len();
+        self.work_selected_idx = match (n, self.work_selected_idx) {
+            (0, _) => None,
+            (_, None) => Some(0),
+            (n, Some(i)) => Some(i.min(n - 1)),
+        };
+    }
+
+    pub fn work_select_prev(&mut self) {
+        if let Some(i) = self.work_selected_idx {
+            self.work_selected_idx = Some(i.saturating_sub(1));
+        }
+        self.clamp_work_selection();
+    }
+
+    pub fn work_select_next(&mut self) {
+        if let Some(i) = self.work_selected_idx {
+            self.work_selected_idx = Some(i + 1);
+        }
+        self.clamp_work_selection();
     }
 
     pub fn new() -> Self {
@@ -649,12 +718,13 @@ impl App {
             execution_stream_label: None,
             jobs_strip: VecDeque::new(),
             agent_tasks: VecDeque::new(),
-            agent_tasks_scroll_top: 0,
-            last_agent_tasks_rect: None,
+            work_scroll_top: 0,
+            last_work_rect: None,
             background_jobs: Vec::new(),
             notifications: Vec::new(),
-            background_jobs_selected_idx: None,
-            last_background_jobs_rect: None,
+            work_selected_idx: None,
+            workspace_files: Vec::new(),
+            workspace_files_total: 0,
             llm_retry_available: false,
             last_inbound_text: None,
             executions_runs: Vec::new(),
@@ -732,28 +802,14 @@ impl App {
         FRAMES[self.spinner_tick % FRAMES.len()]
     }
 
-    pub fn toggle_ui_focus(&mut self) {
-        self.ui_focus = match self.ui_focus {
-            TerminalUiFocus::Transcript => TerminalUiFocus::Conversations,
-            TerminalUiFocus::Conversations => TerminalUiFocus::Executions,
-            TerminalUiFocus::Executions => TerminalUiFocus::ToolHistory,
-            TerminalUiFocus::ToolHistory => TerminalUiFocus::AgentTasks,
-            TerminalUiFocus::AgentTasks => TerminalUiFocus::BackgroundJobs,
-            TerminalUiFocus::BackgroundJobs => TerminalUiFocus::Transcript,
-        };
-        self.tool_history_scroll = 0;
-    }
-
-    pub fn toggle_ui_focus_back(&mut self) {
-        self.ui_focus = match self.ui_focus {
-            TerminalUiFocus::Transcript => TerminalUiFocus::BackgroundJobs,
-            TerminalUiFocus::BackgroundJobs => TerminalUiFocus::AgentTasks,
-            TerminalUiFocus::AgentTasks => TerminalUiFocus::ToolHistory,
-            TerminalUiFocus::ToolHistory => TerminalUiFocus::Executions,
-            TerminalUiFocus::Executions => TerminalUiFocus::Conversations,
-            TerminalUiFocus::Conversations => TerminalUiFocus::Transcript,
-        };
-        self.tool_history_scroll = 0;
+    /// `Tab` / `Shift+Tab`: open the work drawer from the transcript; from the drawer or any
+    /// other pane, go back to the transcript.
+    pub fn toggle_work_drawer(&mut self) {
+        if self.ui_focus == TerminalUiFocus::Transcript {
+            self.focus_work();
+        } else {
+            self.focus_transcript();
+        }
     }
 
     pub fn focus_tool_history(&mut self) {
@@ -766,19 +822,9 @@ impl App {
         self.tool_history_scroll = 0;
     }
 
-    pub fn focus_agent_tasks(&mut self) {
-        self.ui_focus = TerminalUiFocus::AgentTasks;
-    }
-
-    pub fn focus_background_jobs(&mut self) {
-        self.ui_focus = TerminalUiFocus::BackgroundJobs;
-        if self.background_jobs_selected_idx.is_none()
-            && (!self.background_jobs.is_empty()
-                || !self.notifications.is_empty()
-                || !self.agent_tasks.is_empty())
-        {
-            self.background_jobs_selected_idx = Some(0);
-        }
+    pub fn focus_work(&mut self) {
+        self.ui_focus = TerminalUiFocus::Work;
+        self.clamp_work_selection();
     }
 
     pub fn focus_executions(&mut self) {
@@ -1297,6 +1343,74 @@ fn is_key_command(text: &str) -> bool {
     cmd.eq_ignore_ascii_case("/key")
 }
 
+/// Directories never worth listing in the work drawer.
+const SKIPPED_WORKSPACE_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    "__pycache__",
+    "venv",
+    "dist",
+    "build",
+];
+
+/// Newest files under `root` as `/`-separated relative paths, at most `cap` of them, plus how
+/// many files the walk saw. Kept cheap for the UI thread: hidden entries and build/vendor dirs
+/// are skipped, the walk stops at depth 3 and after `MAX_VISITED` directory entries.
+pub fn scan_workspace_files(root: &std::path::Path, cap: usize) -> (Vec<String>, usize) {
+    const MAX_DEPTH: usize = 3;
+    const MAX_VISITED: usize = 2000;
+    let mut found: Vec<(std::time::SystemTime, String)> = Vec::new();
+    let mut queue: VecDeque<(std::path::PathBuf, usize)> = VecDeque::new();
+    queue.push_back((root.to_path_buf(), 0));
+    let mut visited = 0usize;
+    while let Some((dir, depth)) = queue.pop_front() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > MAX_VISITED {
+                break;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if file_type.is_dir() {
+                if depth + 1 < MAX_DEPTH && !SKIPPED_WORKSPACE_DIRS.contains(&name.as_ref()) {
+                    queue.push_back((path, depth + 1));
+                }
+            } else if file_type.is_file() {
+                let Ok(rel) = path.strip_prefix(root) else {
+                    continue;
+                };
+                let rel = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let modified = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                found.push((modified, rel));
+            }
+        }
+        if visited > MAX_VISITED {
+            break;
+        }
+    }
+    let total = found.len();
+    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    found.truncate(cap);
+    (found.into_iter().map(|(_, p)| p).collect(), total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1554,6 +1668,87 @@ mod tests {
         app.upsert_tool_notice(None, ToolNoticePhase::Call, "a".into());
         app.upsert_tool_notice(None, ToolNoticePhase::Result, "b".into());
         assert_eq!(app.cells.len(), 2);
+    }
+
+    #[test]
+    fn tab_toggles_between_transcript_and_work_drawer() {
+        let mut app = App::new();
+        assert_eq!(app.ui_focus, TerminalUiFocus::Transcript);
+        app.toggle_work_drawer();
+        assert_eq!(app.ui_focus, TerminalUiFocus::Work);
+        app.toggle_work_drawer();
+        assert_eq!(app.ui_focus, TerminalUiFocus::Transcript);
+        // From a pane opened by slash command, Tab goes back to the conversation.
+        app.focus_executions();
+        app.toggle_work_drawer();
+        assert_eq!(app.ui_focus, TerminalUiFocus::Transcript);
+    }
+
+    #[test]
+    fn work_count_tracks_in_progress_items() {
+        let mut app = App::new();
+        assert_eq!(app.work_count(), 0);
+        app.job_strip_started("job-1", "s", "execution_run", None, "chat-1");
+        app.agent_task_started("task-1", "subagent-1", Some("coder"), None);
+        app.agent_task_started("task-2", "subagent-2", None, None);
+        assert_eq!(app.work_count(), 3);
+        app.job_strip_finished("job-1", "completed", "ok", "chat-1");
+        app.agent_task_finished("task-2", "failed", "boom");
+        assert_eq!(app.work_count(), 1);
+        // Finished rows stay selectable; files come last.
+        app.workspace_files = vec!["out/report.md".into()];
+        let items = app.work_items();
+        assert_eq!(items.len(), 4);
+        assert!(matches!(items[3], WorkItem::File("out/report.md")));
+        assert_eq!(items[0].chat_id(), Some("chat-1"));
+    }
+
+    #[test]
+    fn work_selection_stays_on_a_row() {
+        let mut app = App::new();
+        app.focus_work();
+        assert_eq!(app.work_selected_idx, None);
+        app.workspace_files = vec!["a".into(), "b".into()];
+        app.work_select_next();
+        assert_eq!(app.work_selected_idx, Some(0));
+        app.work_select_next();
+        app.work_select_next();
+        assert_eq!(app.work_selected_idx, Some(1));
+        app.workspace_files.pop();
+        app.clamp_work_selection();
+        assert_eq!(app.work_selected_idx, Some(0));
+        app.work_select_prev();
+        assert_eq!(app.work_selected_idx, Some(0));
+    }
+
+    #[test]
+    fn scan_lists_newest_visible_files_with_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("sub/deeper/too_deep")).expect("dirs");
+        std::fs::create_dir_all(root.join("node_modules")).expect("dirs");
+        std::fs::create_dir_all(root.join(".hidden")).expect("dirs");
+        for p in [
+            "a.txt",
+            "sub/b.py",
+            "sub/deeper/c.md",
+            "sub/deeper/too_deep/d.md",
+            "node_modules/x.js",
+            ".hidden/y",
+            ".env",
+        ] {
+            std::fs::write(root.join(p), "x").expect("write");
+        }
+        let (files, total) = scan_workspace_files(root, 10);
+        let mut sorted = files.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["a.txt", "sub/b.py", "sub/deeper/c.md"]);
+        assert_eq!(total, 3);
+        let (capped, total) = scan_workspace_files(root, 2);
+        assert_eq!(capped.len(), 2);
+        assert_eq!(total, 3);
+        let (none, _) = scan_workspace_files(&root.join("missing"), 5);
+        assert!(none.is_empty());
     }
 
     #[test]

@@ -17,9 +17,9 @@ mod text_format;
 mod theme;
 
 pub use app::{
-    AgentTaskEntry, AgentTaskStatus, App, Cell, JobStripEntry, JobStripStatus, ModelSelector,
-    ModelSelectorStage, TerminalUiFocus, TerminalUiMode, ToastKind, ToolNoticePhase, ToolRailEntry,
-    TranscriptSelection,
+    scan_workspace_files, AgentTaskEntry, AgentTaskStatus, App, Cell, JobStripEntry,
+    JobStripStatus, ModelSelector, ModelSelectorStage, TerminalUiFocus, TerminalUiMode, ToastKind,
+    ToolNoticePhase, ToolRailEntry, TranscriptSelection, WorkItem,
 };
 pub use approval::{
     approval_hotkey_reply, clarification_hotkey_reply, is_approval_choice_set, EditDiffPayload,

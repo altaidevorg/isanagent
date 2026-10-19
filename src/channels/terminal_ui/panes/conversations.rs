@@ -30,7 +30,7 @@ pub fn conversations_list_paragraph(app: &App, area: Rect) -> (Paragraph<'static
         )));
     } else if app.conversations_items.is_empty() {
         slice.push(Line::from(Span::styled(
-            "No saved terminal sessions yet. Send a message, use Tab to switch panes, or F5 to refresh.",
+            "No saved terminal sessions yet. Send a message, press F5 to refresh, or Esc to return.",
             Theme::dim(),
         )));
     } else {
