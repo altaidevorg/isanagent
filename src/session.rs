@@ -59,6 +59,22 @@ impl SessionProxy {
             memory_node,
         }
     }
+
+    /// [`Memory::add_message`] that also returns the persisted row id.
+    pub async fn add_message_returning_id(&self, message: ChatMessage) -> Result<i64, String> {
+        let (tx, rx) = oneshot::channel();
+        let msg = MemoryMessage::AddMessageReturningId {
+            thread_id: self.thread_id.clone(),
+            message,
+            reply: SharedReply::new(tx),
+        };
+        self.memory_node
+            .send_packet(msg)
+            .await
+            .map_err(|e| e.to_string())?;
+        rx.await
+            .map_err(|_| "Memory Actor Channel Closed".to_string())?
+    }
 }
 
 #[async_trait]

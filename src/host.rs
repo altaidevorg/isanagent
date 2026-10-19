@@ -1257,6 +1257,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                 BusMessage::Inbound(_)
                     | BusMessage::Cancel(_)
                     | BusMessage::CancelRun { .. }
+                    | BusMessage::RollbackRun { .. }
                     | BusMessage::Steer { .. }
                     | BusMessage::SwitchModel { .. }
             ) {

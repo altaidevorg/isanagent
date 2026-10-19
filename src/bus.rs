@@ -419,6 +419,41 @@ pub enum TelemetryEvent {
         chat_id: String,
         tool_call_id: String,
     },
+    /// A foreground run persisted its user message. `message_id` is the stable
+    /// `messages.id` clients use to edit / truncate from this turn.
+    UserTurnPersisted {
+        chat_id: String,
+        run_id: String,
+        message_id: i64,
+    },
+    /// Answer to [`BusMessage::RollbackRun`], emitted once the targeted run has unwound
+    /// (or immediately when there was nothing to roll back). `rolled_back` is true only
+    /// when the run ended cancelled and its rows were deleted (or it was still queued and
+    /// was dropped before persisting anything).
+    TurnRollbackFinished {
+        chat_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        rolled_back: bool,
+        removed_messages: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<RollbackSkipReason>,
+    },
+}
+
+/// Why a [`BusMessage::RollbackRun`] did not roll anything back.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RollbackSkipReason {
+    /// No run is active (or queued) for the chat: the turn already finished.
+    NoActiveRun,
+    /// A run is active but its id is not the requested `run_id`.
+    RunMismatch,
+    /// The run finished on its own (completed, failed, …) before observing the cancel.
+    RunFinished,
+    /// The rows could not be deleted (or the pre-run baseline was unknown).
+    StorageError,
 }
 
 /// Log severity levels for verbose diagnostics.
@@ -783,6 +818,16 @@ pub enum BusMessage {
     CancelRun {
         chat_id: String,
         run_id: String,
+    },
+    /// Stop-and-undo: cancel the active run for `chat_id` (only if it is `run_id`, when
+    /// given) and, once the run has unwound, delete every history row it appended (user
+    /// message, partial assistant text, tool calls and results). Queued inbounds for the
+    /// chat are dropped like [`BusMessage::Cancel`]. The agent always answers with
+    /// [`TelemetryEvent::TurnRollbackFinished`]. Side effects of tools already run stay.
+    RollbackRun {
+        chat_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
     },
     /// Apply new user direction to one exact active run at its next safe
     /// boundary, after the provider or current tool call completes.

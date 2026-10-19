@@ -493,6 +493,64 @@ pub struct SummaryEntry {
     pub sections_json: Option<String>,
 }
 
+/// Full persisted history of one thread with stable row ids, plus the compaction boundary.
+///
+/// `summarized_through` is the thread's reflection cursor (`session_metadata.last_reflection_msg_id`):
+/// rows with `id <= summarized_through` were folded into the thread summary by auto-compaction or
+/// idle reflection and are no longer sent to the model. Only rows after it are "live" history.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct ThreadHistory {
+    pub messages: Vec<(i64, ChatMessage)>,
+    pub summarized_through: Option<i64>,
+}
+
+impl ThreadHistory {
+    /// True when the row is still part of the model's live context (after the compaction boundary).
+    pub fn is_live(&self, message_id: i64) -> bool {
+        self.summarized_through
+            .is_none_or(|cursor| message_id > cursor)
+    }
+}
+
+/// What a history truncation removed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct TruncateOutcome {
+    /// `messages` rows deleted (user, assistant, tool rows).
+    pub removed_messages: usize,
+    /// `tool_result_cache` rows deleted for the removed tool calls.
+    pub removed_tool_results: usize,
+}
+
+/// Why [`MemoryMessage::TruncateFromUserMessage`] refused to truncate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum TruncateError {
+    /// No row with that id in the thread.
+    MessageNotFound,
+    /// The row exists but is not a `user` message.
+    NotAUserMessage,
+    /// The row is at or before the compaction boundary: it lives only in the summary now.
+    Compacted { summarized_through: i64 },
+    /// SQLite failure.
+    Storage(String),
+}
+
+impl std::fmt::Display for TruncateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MessageNotFound => write!(f, "message not found in this thread"),
+            Self::NotAUserMessage => write!(f, "only user messages can be edited"),
+            Self::Compacted { summarized_through } => write!(
+                f,
+                "message was summarized by compaction (history is summarized through row {summarized_through})"
+            ),
+            Self::Storage(e) => write!(f, "storage error: {e}"),
+        }
+    }
+}
+
 /// Messages sent to the SqliteMemoryActor
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -502,9 +560,51 @@ pub enum MemoryMessage {
         message: ChatMessage,
         reply: SharedReply<Result<(), String>>,
     },
+    /// Same insert as [`MemoryMessage::AddMessage`], replying with the new row id.
+    AddMessageReturningId {
+        thread_id: String,
+        message: ChatMessage,
+        reply: SharedReply<Result<i64, String>>,
+    },
     GetContext {
         thread_id: String,
         reply: SharedReply<Result<Vec<ChatMessage>, String>>,
+    },
+    /// Every row of the thread with its id, plus the compaction boundary (see [`ThreadHistory`]).
+    GetThreadHistory {
+        thread_id: String,
+        reply: SharedReply<Result<ThreadHistory, String>>,
+    },
+    /// Highest `messages.id` in the thread (`None` when empty). A run records it before it
+    /// starts so a rollback can remove exactly the rows the run appended.
+    MaxMessageId {
+        thread_id: String,
+        reply: SharedReply<Result<Option<i64>, String>>,
+    },
+    /// Edit / resend: delete the user message `from_message_id` and every later row of the
+    /// thread, plus `tool_result_cache` rows of the removed tool calls, in one transaction.
+    ///
+    /// Refuses (without deleting) when the row is not in the thread, is not a `user` row, or is
+    /// at/before the compaction boundary. The thread summary and reflection cursor are kept: the
+    /// boundary is strictly before the removed rows, so the summary still describes only rows
+    /// that remain.
+    TruncateFromUserMessage {
+        thread_id: String,
+        from_message_id: i64,
+        reply: SharedReply<Result<TruncateOutcome, TruncateError>>,
+    },
+    /// Stop-with-rollback: delete every row of the thread after `after_message_id` (all rows when
+    /// `None`) — the turn's user message, streamed/partial assistant text, tool calls, tool
+    /// results and the cancel notice — plus their `tool_result_cache` rows. Sent by the agent
+    /// only after the cancelled run has unwound, so no write of that run can land later.
+    ///
+    /// If compaction ran inside the turn and moved the reflection cursor past `after_message_id`,
+    /// the cursor is pulled back to `after_message_id` so the remaining rows stay consistent; the
+    /// summary text itself is not rewritten.
+    RollbackMessagesAfter {
+        thread_id: String,
+        after_message_id: Option<i64>,
+        reply: SharedReply<Result<TruncateOutcome, String>>,
     },
     /// Plain-text preview from the earliest user turn (for thread list titles).
     FirstUserMessagePreview {
@@ -1003,23 +1103,123 @@ impl ActorLogic<MemoryMessage> for SqliteMemoryActor {
                 message,
                 reply,
             } => {
-                let content_str = match &message.content {
-                    Some(MessageContent::Text(s)) => Some(s.clone()),
-                    Some(MessageContent::Parts(parts)) => serde_json::to_string(parts).ok(),
-                    None => None,
-                };
-                let tool_calls_str = message
-                    .tool_calls
-                    .map(|tc| serde_json::to_string(&tc).unwrap_or_default());
-                let mcp_app_str = message
-                    .mcp_app
-                    .as_ref()
-                    .and_then(|app| serde_json::to_string(app).ok());
-                let res = self.conn.execute(
-                    "INSERT INTO messages (thread_id, role, content, name, tool_calls, tool_call_id, reasoning_content, mcp_app) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    params![thread_id, message.role, content_str, message.name, tool_calls_str, message.tool_call_id, message.reasoning_content, mcp_app_str],
-                ).map_err(|e| e.to_string()).map(|_| ());
-
+                let res = insert_message(&self.conn, &thread_id, &message).map(|_| ());
+                let _ = reply.send(res);
+            }
+            MemoryMessage::AddMessageReturningId {
+                thread_id,
+                message,
+                reply,
+            } => {
+                let _ = reply.send(insert_message(&self.conn, &thread_id, &message));
+            }
+            MemoryMessage::GetThreadHistory { thread_id, reply } => {
+                let res = (|| -> Result<ThreadHistory, String> {
+                    let summarized_through = reflection_cursor(&self.conn, &thread_id)?;
+                    let mut stmt = self
+                        .conn
+                        .prepare(
+                            "SELECT id, role, content, name, tool_calls, tool_call_id, reasoning_content, mcp_app
+                             FROM messages WHERE thread_id = ?1 ORDER BY id ASC",
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let rows = stmt
+                        .query_map(params![thread_id], id_message_from_row)
+                        .map_err(|e| e.to_string())?;
+                    let messages = rows
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| e.to_string())?;
+                    Ok(ThreadHistory {
+                        messages,
+                        summarized_through,
+                    })
+                })();
+                let _ = reply.send(res);
+            }
+            MemoryMessage::MaxMessageId { thread_id, reply } => {
+                let res = self
+                    .conn
+                    .query_row(
+                        "SELECT MAX(id) FROM messages WHERE thread_id = ?1",
+                        params![thread_id],
+                        |row| row.get::<_, Option<i64>>(0),
+                    )
+                    .map_err(|e| e.to_string());
+                let _ = reply.send(res);
+            }
+            MemoryMessage::TruncateFromUserMessage {
+                thread_id,
+                from_message_id,
+                reply,
+            } => {
+                let res = (|| -> Result<TruncateOutcome, TruncateError> {
+                    let storage = |e: rusqlite::Error| TruncateError::Storage(e.to_string());
+                    let tx = self.conn.transaction().map_err(storage)?;
+                    let role: Option<String> = tx
+                        .query_row(
+                            "SELECT role FROM messages WHERE thread_id = ?1 AND id = ?2",
+                            params![thread_id, from_message_id],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(storage)?;
+                    match role.as_deref() {
+                        None => return Err(TruncateError::MessageNotFound),
+                        Some("user") => {}
+                        Some(_) => return Err(TruncateError::NotAUserMessage),
+                    }
+                    if let Some(cursor) =
+                        reflection_cursor(&tx, &thread_id).map_err(TruncateError::Storage)?
+                    {
+                        if from_message_id <= cursor {
+                            return Err(TruncateError::Compacted {
+                                summarized_through: cursor,
+                            });
+                        }
+                    }
+                    let outcome = delete_thread_rows_after(
+                        &tx,
+                        &thread_id,
+                        Some(from_message_id.saturating_sub(1)),
+                    )
+                    .map_err(TruncateError::Storage)?;
+                    tx.commit().map_err(storage)?;
+                    Ok(outcome)
+                })();
+                let _ = reply.send(res);
+            }
+            MemoryMessage::RollbackMessagesAfter {
+                thread_id,
+                after_message_id,
+                reply,
+            } => {
+                let res = (|| -> Result<TruncateOutcome, String> {
+                    let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+                    let outcome = delete_thread_rows_after(&tx, &thread_id, after_message_id)?;
+                    // Compaction inside the rolled-back turn may have advanced the cursor past
+                    // the kept rows; pull it back so it never points at a deleted row.
+                    if let Some(cursor) = reflection_cursor(&tx, &thread_id)? {
+                        match after_message_id {
+                            Some(after) if cursor > after => {
+                                tx.execute(
+                                    "UPDATE session_metadata SET last_reflection_msg_id = ?1 WHERE thread_id = ?2",
+                                    params![after, thread_id],
+                                )
+                                .map_err(|e| e.to_string())?;
+                            }
+                            Some(_) => {}
+                            None => {
+                                tx.execute(
+                                    "DELETE FROM session_metadata WHERE thread_id = ?1",
+                                    params![thread_id],
+                                )
+                                .map_err(|e| e.to_string())?;
+                            }
+                        }
+                    }
+                    tx.commit().map_err(|e| e.to_string())?;
+                    Ok(outcome)
+                })();
                 let _ = reply.send(res);
             }
             MemoryMessage::GetContext { thread_id, reply } => {
@@ -2465,6 +2665,100 @@ fn dropped_tool_call_ids(
     Ok(out)
 }
 
+/// Insert one message row and return its id (shared by `AddMessage` / `AddMessageReturningId`).
+fn insert_message(
+    conn: &Connection,
+    thread_id: &str,
+    message: &ChatMessage,
+) -> Result<i64, String> {
+    let content_str = match &message.content {
+        Some(MessageContent::Text(s)) => Some(s.clone()),
+        Some(MessageContent::Parts(parts)) => serde_json::to_string(parts).ok(),
+        None => None,
+    };
+    let tool_calls_str = message
+        .tool_calls
+        .as_ref()
+        .map(|tc| serde_json::to_string(tc).unwrap_or_default());
+    let mcp_app_str = message
+        .mcp_app
+        .as_ref()
+        .and_then(|app| serde_json::to_string(app).ok());
+    conn.execute(
+        "INSERT INTO messages (thread_id, role, content, name, tool_calls, tool_call_id, reasoning_content, mcp_app) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![thread_id, message.role, content_str, message.name, tool_calls_str, message.tool_call_id, message.reasoning_content, mcp_app_str],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Decode a `SELECT id, role, content, name, tool_calls, tool_call_id, reasoning_content, mcp_app` row.
+fn id_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, ChatMessage)> {
+    let tool_calls_str: Option<String> = row.get(4)?;
+    let content_raw: Option<String> = row.get(2)?;
+    let mcp_app_raw: Option<String> = row.get(7)?;
+    Ok((
+        row.get(0)?,
+        ChatMessage {
+            role: row.get(1)?,
+            content: content_raw.map(message_content_from_stored),
+            name: row.get(3)?,
+            tool_calls: tool_calls_str.and_then(|s| serde_json::from_str(&s).ok()),
+            tool_call_id: row.get(5)?,
+            reasoning_content: row.get(6)?,
+            is_error: None,
+            mcp_app: persisted_mcp_app_from_stored(mcp_app_raw),
+        },
+    ))
+}
+
+/// The thread's compaction / reflection cursor (`None` when the thread was never summarized).
+fn reflection_cursor(conn: &Connection, thread_id: &str) -> Result<Option<i64>, String> {
+    conn.query_row(
+        "SELECT last_reflection_msg_id FROM session_metadata WHERE thread_id = ?1",
+        params![thread_id],
+        |row| row.get::<_, Option<i64>>(0),
+    )
+    .optional()
+    .map(Option::flatten)
+    .map_err(|e| e.to_string())
+}
+
+/// Delete the thread's rows with `id > after` (every row when `None`) and the cached tool
+/// results of the removed tool calls. Runs inside the caller's transaction.
+fn delete_thread_rows_after(
+    tx: &rusqlite::Transaction,
+    thread_id: &str,
+    after: Option<i64>,
+) -> Result<TruncateOutcome, String> {
+    let tool_call_ids = dropped_tool_call_ids(tx, thread_id, after)?;
+    let removed_messages = match after {
+        Some(after) => tx.execute(
+            "DELETE FROM messages WHERE thread_id = ?1 AND id > ?2",
+            params![thread_id, after],
+        ),
+        None => tx.execute(
+            "DELETE FROM messages WHERE thread_id = ?1",
+            params![thread_id],
+        ),
+    }
+    .map_err(|e| e.to_string())?;
+    let mut removed_tool_results = 0;
+    for tool_call_id in &tool_call_ids {
+        // Scoped to this thread: providers reuse short ids like `call_1` across threads.
+        removed_tool_results += tx
+            .execute(
+                "DELETE FROM tool_result_cache WHERE tool_call_id = ?1 AND session_key = ?2",
+                params![tool_call_id, thread_id],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(TruncateOutcome {
+        removed_messages,
+        removed_tool_results,
+    })
+}
+
 #[cfg(test)]
 mod root_thread_id_tests {
     use super::{
@@ -3159,5 +3453,309 @@ mod root_thread_id_tests {
             )
             .unwrap();
         assert_eq!(oldest_gone, 0, "oldest row must be evicted");
+    }
+}
+
+#[cfg(test)]
+mod truncate_from_tests {
+    use super::{
+        MemoryMessage, SharedReply, SqliteMemoryActor, ThreadHistory, TruncateError,
+        TruncateOutcome,
+    };
+    use crate::utils::{ChatMessage, ToolCallFunction, ToolCallRequest};
+    use crate::NodeHandle;
+    use std::time::Duration;
+
+    const THREAD: &str = "api:edit-thread:";
+    const OTHER: &str = "api:other-thread:";
+
+    fn node() -> NodeHandle<MemoryMessage> {
+        let actor = SqliteMemoryActor::new(":memory:").expect("memory actor");
+        NodeHandle::new(actor, 16, 1, Duration::from_millis(1))
+    }
+
+    async fn ask<T: Send + 'static>(
+        node: &NodeHandle<MemoryMessage>,
+        build: impl FnOnce(SharedReply<T>) -> MemoryMessage,
+    ) -> T {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.send_packet(build(SharedReply::new(tx)))
+            .await
+            .expect("send");
+        rx.await.expect("reply")
+    }
+
+    async fn add(node: &NodeHandle<MemoryMessage>, thread: &str, message: ChatMessage) -> i64 {
+        ask(node, |reply| MemoryMessage::AddMessageReturningId {
+            thread_id: thread.to_string(),
+            message,
+            reply,
+        })
+        .await
+        .expect("insert")
+    }
+
+    async fn history(node: &NodeHandle<MemoryMessage>, thread: &str) -> ThreadHistory {
+        ask(node, |reply| MemoryMessage::GetThreadHistory {
+            thread_id: thread.to_string(),
+            reply,
+        })
+        .await
+        .expect("history")
+    }
+
+    async fn cache(node: &NodeHandle<MemoryMessage>, thread: &str, tool_call_id: &str) {
+        ask(node, |reply| MemoryMessage::CacheToolResult {
+            tool_call_id: tool_call_id.to_string(),
+            chat_id: thread.to_string(),
+            session_key: thread.to_string(),
+            tool_name: "demo".to_string(),
+            full_content: format!("full {thread}"),
+            compact_summary: "s".to_string(),
+            reply,
+        })
+        .await
+        .expect("cache");
+    }
+
+    async fn cached(node: &NodeHandle<MemoryMessage>, tool_call_id: &str) -> Option<String> {
+        ask(node, |reply| MemoryMessage::FetchToolResult {
+            tool_call_id: tool_call_id.to_string(),
+            reply,
+        })
+        .await
+        .expect("fetch")
+    }
+
+    async fn set_cursor(node: &NodeHandle<MemoryMessage>, thread: &str, id: i64) {
+        ask(node, |reply| MemoryMessage::UpdateThreadMetadata {
+            thread_id: thread.to_string(),
+            last_reflection_msg_id: Some(id),
+            reply,
+        })
+        .await
+        .expect("cursor");
+    }
+
+    fn assistant_calling(id: &str) -> ChatMessage {
+        let mut m = ChatMessage::assistant("");
+        m.tool_calls = Some(vec![ToolCallRequest {
+            id: id.to_string(),
+            tool_type: "function".to_string(),
+            extra_content: None,
+            function: ToolCallFunction {
+                name: "demo".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]);
+        m
+    }
+
+    /// u1 a1 | u2 a2(call_x) tool(call_x) a2' | u3 a3 — returns (u1, u2, u3) ids.
+    async fn seed(node: &NodeHandle<MemoryMessage>) -> (i64, i64, i64) {
+        let u1 = add(node, THREAD, ChatMessage::user("u1")).await;
+        add(node, THREAD, ChatMessage::assistant("a1")).await;
+        let u2 = add(node, THREAD, ChatMessage::user("u2")).await;
+        add(node, THREAD, assistant_calling("call_x")).await;
+        add(
+            node,
+            THREAD,
+            ChatMessage::tool("result x", "call_x", Some("demo")),
+        )
+        .await;
+        add(node, THREAD, ChatMessage::assistant("a2")).await;
+        let u3 = add(node, THREAD, ChatMessage::user("u3")).await;
+        add(node, THREAD, ChatMessage::assistant("a3")).await;
+        (u1, u2, u3)
+    }
+
+    #[tokio::test]
+    async fn history_carries_ids_and_the_compaction_boundary() {
+        let node = node();
+        let (u1, u2, _) = seed(&node).await;
+        let h = history(&node, THREAD).await;
+        assert_eq!(h.messages.len(), 8);
+        assert!(h.messages.windows(2).all(|w| w[0].0 < w[1].0));
+        assert_eq!(h.summarized_through, None);
+        assert!(h.is_live(u1));
+
+        set_cursor(&node, THREAD, u2 - 1).await;
+        let h = history(&node, THREAD).await;
+        assert_eq!(h.summarized_through, Some(u2 - 1));
+        assert!(!h.is_live(u1));
+        assert!(h.is_live(u2));
+
+        let max = ask(&node, |reply| MemoryMessage::MaxMessageId {
+            thread_id: THREAD.to_string(),
+            reply,
+        })
+        .await
+        .expect("max");
+        assert_eq!(max, h.messages.last().map(|(id, _)| *id));
+        let empty = ask(&node, |reply| MemoryMessage::MaxMessageId {
+            thread_id: "api:none:".to_string(),
+            reply,
+        })
+        .await
+        .expect("max");
+        assert_eq!(empty, None);
+    }
+
+    #[tokio::test]
+    async fn truncate_from_user_message_drops_it_and_everything_after() {
+        let node = node();
+        let (u1, u2, _) = seed(&node).await;
+        // Same provider-style id in another thread must survive the prune.
+        add(
+            &node,
+            OTHER,
+            ChatMessage::tool("other", "call_x", Some("demo")),
+        )
+        .await;
+        cache(&node, OTHER, "call_x").await;
+        cache(&node, THREAD, "call_y_unrelated").await;
+        // Summary + cursor before the edit point are kept.
+        set_cursor(&node, THREAD, u1).await;
+        ask(&node, |reply| MemoryMessage::AddSummary {
+            thread_id: THREAD.to_string(),
+            summary: "about u1".to_string(),
+            key_info: String::new(),
+            knowledge_gaps: String::new(),
+            reply,
+        })
+        .await
+        .expect("summary");
+
+        let outcome = ask(&node, |reply| MemoryMessage::TruncateFromUserMessage {
+            thread_id: THREAD.to_string(),
+            from_message_id: u2,
+            reply,
+        })
+        .await
+        .expect("truncate");
+        assert_eq!(outcome.removed_messages, 6);
+
+        let h = history(&node, THREAD).await;
+        let texts: Vec<String> = h
+            .messages
+            .iter()
+            .map(|(_, m)| {
+                m.content
+                    .as_ref()
+                    .map(|c| c.text_content())
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(texts, vec!["u1".to_string(), "a1".to_string()]);
+        assert_eq!(h.summarized_through, Some(u1), "cursor kept");
+        let summaries = ask(&node, |reply| MemoryMessage::GetSummaries {
+            thread_id: THREAD.to_string(),
+            limit: 5,
+            reply,
+        })
+        .await
+        .expect("summaries");
+        assert_eq!(summaries.len(), 1, "summary of kept rows kept");
+        assert_eq!(history(&node, OTHER).await.messages.len(), 1);
+        assert_eq!(cached(&node, "call_x").await, Some(format!("full {OTHER}")));
+        assert!(cached(&node, "call_y_unrelated").await.is_some());
+
+        // Next id keeps growing (AUTOINCREMENT): a new turn never reuses a deleted id.
+        let next = add(&node, THREAD, ChatMessage::user("u2 edited")).await;
+        assert!(next > u2);
+    }
+
+    #[tokio::test]
+    async fn truncate_prunes_the_removed_tool_results_from_the_cache() {
+        let node = node();
+        let (_, u2, _) = seed(&node).await;
+        cache(&node, THREAD, "call_x").await;
+        let outcome = ask(&node, |reply| MemoryMessage::TruncateFromUserMessage {
+            thread_id: THREAD.to_string(),
+            from_message_id: u2,
+            reply,
+        })
+        .await
+        .expect("truncate");
+        assert_eq!(
+            outcome,
+            TruncateOutcome {
+                removed_messages: 6,
+                removed_tool_results: 1
+            }
+        );
+        assert_eq!(cached(&node, "call_x").await, None);
+    }
+
+    #[tokio::test]
+    async fn truncate_refuses_missing_non_user_and_compacted_rows() {
+        let node = node();
+        let (u1, u2, u3) = seed(&node).await;
+        let try_from = |id: i64| {
+            let node = node.clone();
+            async move {
+                ask(&node, |reply| MemoryMessage::TruncateFromUserMessage {
+                    thread_id: THREAD.to_string(),
+                    from_message_id: id,
+                    reply,
+                })
+                .await
+            }
+        };
+        assert_eq!(try_from(9_999).await, Err(TruncateError::MessageNotFound));
+        assert_eq!(try_from(u1 + 1).await, Err(TruncateError::NotAUserMessage));
+        // Another thread's id is "not found" here, never deleted.
+        let foreign = add(&node, OTHER, ChatMessage::user("x")).await;
+        assert_eq!(try_from(foreign).await, Err(TruncateError::MessageNotFound));
+
+        set_cursor(&node, THREAD, u2).await;
+        assert_eq!(
+            try_from(u2).await,
+            Err(TruncateError::Compacted {
+                summarized_through: u2
+            })
+        );
+        assert_eq!(
+            history(&node, THREAD).await.messages.len(),
+            8,
+            "nothing deleted"
+        );
+        assert!(try_from(u3).await.is_ok(), "live rows stay editable");
+    }
+
+    #[tokio::test]
+    async fn rollback_after_baseline_removes_the_turn_and_clamps_the_cursor() {
+        let node = node();
+        let (_, u2, _) = seed(&node).await;
+        let baseline = u2 - 1;
+        cache(&node, THREAD, "call_x").await;
+        // Compaction ran inside the turn and moved the cursor into it.
+        set_cursor(&node, THREAD, u2 + 2).await;
+
+        let outcome = ask(&node, |reply| MemoryMessage::RollbackMessagesAfter {
+            thread_id: THREAD.to_string(),
+            after_message_id: Some(baseline),
+            reply,
+        })
+        .await
+        .expect("rollback");
+        assert_eq!(outcome.removed_messages, 6);
+        assert_eq!(outcome.removed_tool_results, 1);
+        let h = history(&node, THREAD).await;
+        assert_eq!(h.messages.len(), 2);
+        assert_eq!(h.summarized_through, Some(baseline));
+
+        // `None` baseline = the run started on an empty thread: everything goes.
+        let outcome = ask(&node, |reply| MemoryMessage::RollbackMessagesAfter {
+            thread_id: THREAD.to_string(),
+            after_message_id: None,
+            reply,
+        })
+        .await
+        .expect("rollback all");
+        assert_eq!(outcome.removed_messages, 2);
+        let h = history(&node, THREAD).await;
+        assert!(h.messages.is_empty());
+        assert_eq!(h.summarized_through, None);
     }
 }

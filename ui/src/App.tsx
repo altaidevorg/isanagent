@@ -1,6 +1,8 @@
 import {
+  Fragment,
   memo,
   useCallback,
+  useLayoutEffect,
   useEffect,
   useMemo,
   useRef,
@@ -118,6 +120,10 @@ type Message = {
   imageUrls?: string[];
   toolCalls?: ToolCall[];
   clarification?: Clarification;
+  /** Persisted `messages.id` (user rows: what an edit truncates from). */
+  serverId?: number;
+  /** User rows: false once compaction summarized the row (it can no longer be edited). */
+  editable?: boolean;
 };
 
 /** The agent paused on a question (ask_user or an approval); the reply is the next message. */
@@ -150,16 +156,23 @@ type StreamEvent =
   | { type: "text_delta"; text: string }
   /** The agent discarded the text streamed so far (tool calls follow, or a retry). */
   | { type: "text_reset" }
+  /** The server persisted this turn's user message: Stop can target `run_id`, Edit can use the id. */
+  | { type: "turn_started"; run_id: string; user_message_id: number }
+  /** Stop-with-rollback removed everything this turn wrote; the stream ends. */
+  | { type: "turn_rolled_back"; run_id?: string; removed_messages: number }
   | {
       type: "completion";
       content: string;
       thread_id: string;
       response_id: string;
+      user_message_id?: number;
       clarification?: Clarification;
     }
   | { type: "error"; message: string };
 
 type HistoryRow = {
+  id?: number;
+  editable?: boolean;
   role: string;
   content: string;
   image_urls?: string[];
@@ -333,7 +346,9 @@ function isStalePreviousResponseError(status: number, payload: ApiErrorPayload):
 
 function historyRowsToMessages(rows: HistoryRow[]): Message[] {
   return rows.map((row, i) => ({
-    id: `srv-${i}-${row.role}`,
+    id: row.id != null ? `srv-${row.id}` : `srv-${i}-${row.role}`,
+    serverId: row.id,
+    editable: row.editable,
     role: row.role,
     content: row.content,
     imageUrls: row.image_urls && row.image_urls.length > 0 ? row.image_urls : undefined,
@@ -416,19 +431,127 @@ function PendingAssistantBubble({
   );
 }
 
+/** Inline editor for a sent user message (Enter sends, Shift+Enter newline, Esc cancels). */
+function EditUserMessage({
+  message,
+  onCancel,
+  onSubmit,
+}: {
+  message: Message;
+  onCancel: () => void;
+  onSubmit: (text: string) => void;
+}) {
+  const imageCount = message.imageUrls?.length ?? 0;
+  const [text, setText] = useState(
+    message.content === "(image)" && imageCount > 0 ? "" : message.content,
+  );
+  const ref = useRef<HTMLTextAreaElement | null>(null);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (el) {
+      el.focus();
+      el.setSelectionRange(el.value.length, el.value.length);
+    }
+  }, []);
+  const canSend = text.trim().length > 0 || imageCount > 0;
+  const send = () => {
+    if (canSend) {
+      onSubmit(text.trim());
+    }
+  };
+  return (
+    <div
+      aria-label="Edit message"
+      className="ml-auto w-full max-w-[82%] rounded-xl border border-primary/60 bg-card p-3 shadow-focus-soft max-sm:max-w-full"
+      role="group"
+    >
+      <Textarea
+        aria-label="Edited message"
+        className="min-h-[76px] resize-y border-0 bg-transparent p-0 text-sm leading-7 shadow-none focus-visible:ring-0"
+        onChange={(event) => setText(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            onCancel();
+          } else if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+            event.preventDefault();
+            send();
+          }
+        }}
+        ref={ref}
+        value={text}
+      />
+      {imageCount > 0 ? (
+        <div className="mt-2 flex flex-wrap gap-2">
+          {message.imageUrls?.map((url, idx) => (
+            <img
+              alt=""
+              className="h-14 w-14 rounded-md border border-border object-cover"
+              key={`${message.id}-edit-img-${idx}`}
+              src={url}
+            />
+          ))}
+        </div>
+      ) : null}
+      <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
+        <p className="text-xs text-muted-foreground">
+          Sending replaces this message and everything after it.
+        </p>
+        <div className="flex gap-2">
+          <Button onClick={onCancel} size="sm" type="button" variant="outline">
+            Cancel
+          </Button>
+          <Button disabled={!canSend} onClick={send} size="sm" type="button">
+            Save &amp; send
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PencilIcon() {
+  return (
+    <svg aria-hidden className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+      <path d="M12 20h9" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
 /** One finished chat message. Memoized so streaming tokens never re-render (or re-parse) history. */
 const MessageBubble = memo(function MessageBubble({
   message,
   choicesEnabled,
+  canEdit,
+  editing,
   onChatMessage,
   onChoose,
+  onStartEdit,
+  onCancelEdit,
+  onSubmitEdit,
 }: {
   message: Message;
   choicesEnabled: boolean;
+  /** Show the Edit action (user row in the live history, no turn running). */
+  canEdit: boolean;
+  editing: boolean;
   onChatMessage: (text: string) => void;
   onChoose: (choice: string) => void;
+  onStartEdit: (id: string) => void;
+  onCancelEdit: () => void;
+  onSubmitEdit: (id: string, text: string) => void;
 }) {
-  return (
+  if (editing) {
+    return (
+      <EditUserMessage
+        message={message}
+        onCancel={onCancelEdit}
+        onSubmit={(text) => onSubmitEdit(message.id, text)}
+      />
+    );
+  }
+  const article = (
     <article
       className={cn(
         "rounded-xl px-4 py-3",
@@ -464,6 +587,28 @@ const MessageBubble = memo(function MessageBubble({
         </div>
       ) : null}
     </article>
+  );
+  if (message.role !== "user") {
+    return article;
+  }
+  return (
+    <div className="group/msg flex min-w-0 flex-col items-end">
+      {article}
+      <div className="mt-1 flex h-7 items-center">
+        {canEdit ? (
+          <button
+            aria-label="Edit message"
+            className="flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium text-muted-foreground opacity-0 transition-opacity hover:bg-muted hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 group-hover/msg:opacity-100 [@media(hover:none)]:opacity-100"
+            onClick={() => onStartEdit(message.id)}
+            title="Edit and resend"
+            type="button"
+          >
+            <PencilIcon />
+            Edit
+          </button>
+        ) : null}
+      </div>
+    </div>
   );
 });
 
@@ -619,19 +764,49 @@ type ComposerPayload = { text: string; imageDataUrls: string[] };
 /** A message typed while a turn was running; sent automatically when the turn ends. */
 type QueuedMessage = ComposerPayload & { id: string };
 
+/** Text (and images) put back into the composer, e.g. after Stop undid the turn. */
+type ComposerRestore = ComposerPayload & { nonce: number };
+
 type ComposerProps = {
   /** Thread history is loading: nothing can be typed or sent. */
   locked: boolean;
+  /** Stop is undoing the turn on the server. */
+  stopping: boolean;
   /** A turn is running: Send queues the message instead. */
   pending: boolean;
+  /** Applied once per `nonce`, ahead of any draft typed meanwhile; focuses the textarea. */
+  restore: ComposerRestore | null;
   onStop: () => void;
   onSubmit: (payload: ComposerPayload) => void;
 };
 
-function Composer({ locked, pending, onStop, onSubmit }: ComposerProps) {
+function Composer({ locked, stopping, pending, restore, onStop, onSubmit }: ComposerProps) {
   const [draft, setDraft] = useState("");
   const [attachments, setAttachments] = useState<{ id: string; url: string; name: string }[]>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const appliedRestoreRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (!restore || locked || appliedRestoreRef.current === restore.nonce) {
+      return;
+    }
+    appliedRestoreRef.current = restore.nonce;
+    setDraft((prev) => (prev.trim() ? `${restore.text}\n\n${prev}` : restore.text));
+    setAttachments((prev) =>
+      [
+        ...restore.imageDataUrls.map((url, i) => ({ id: createId(), url, name: `image ${i + 1}` })),
+        ...prev,
+      ].slice(0, 8),
+    );
+    requestAnimationFrame(() => {
+      const el = textareaRef.current;
+      if (el) {
+        el.focus();
+        el.setSelectionRange(el.value.length, el.value.length);
+      }
+    });
+  }, [restore, locked]);
 
   const submit = () => {
     const trimmed = draft.trim();
@@ -700,6 +875,7 @@ function Composer({ locked, pending, onStop, onSubmit }: ComposerProps) {
             submit();
           }
         }}
+        ref={textareaRef}
         placeholder={
           pending
             ? "Type your next message — it is sent when this turn ends."
@@ -727,7 +903,9 @@ function Composer({ locked, pending, onStop, onSubmit }: ComposerProps) {
             Add images
           </Button>
           <p className="hidden text-xs text-muted-foreground sm:block">
-            {locked
+            {stopping
+              ? "Stopping and undoing this turn…"
+              : locked
               ? "Loading conversation…"
               : pending
                 ? "Agent is working · Enter queues"
@@ -860,6 +1038,20 @@ export default function App() {
   const [queue, setQueue] = useState<QueuedMessage[]>([]);
   /** Stop, an error or switching threads pauses the queue instead of firing the next item. */
   const [queuePaused, setQueuePaused] = useState(false);
+  /** Stop is waiting for the server to undo the turn; sending is held until it answers. */
+  const [stopping, setStopping] = useState(false);
+  const stoppingRef = useRef(false);
+  const [composerRestore, setComposerRestore] = useState<ComposerRestore | null>(null);
+  /** Client id of the user message being edited inline. */
+  const [editingId, setEditingId] = useState<string | null>(null);
+  /** The running turn: what Stop puts back into the composer and which run it undoes. */
+  const activeTurnRef = useRef<{
+    optimisticId: string;
+    text: string;
+    imageDataUrls: string[];
+    runId: string | null;
+    chatId: string;
+  } | null>(null);
   const isDesktopDrawer = useMediaQuery("(min-width: 1024px)");
   const isWideSidebar = useMediaQuery("(min-width: 768px)");
 
@@ -970,6 +1162,7 @@ export default function App() {
   const loadHistory = useCallback(async (sessionId: string) => {
     setHistoryLoading(true);
     setErrorMessage(null);
+    setEditingId(null);
     try {
       const response = await fetch(`/v1/threads/${encodeURIComponent(sessionId)}/messages`);
       if (!response.ok) {
@@ -1355,8 +1548,10 @@ export default function App() {
 
   const startNewConversation = () => {
     // Drop the turn that is still waiting on the model. Otherwise the new
-    // conversation sits behind that request and looks frozen.
-    void stopGeneration();
+    // conversation sits behind that request and looks frozen. (No rollback: the old
+    // thread keeps that turn, as before.)
+    void stopGeneration({ rollback: false });
+    setEditingId(null);
     setSidebarOpen(false);
     startTransition(() => {
       clearSessionPointers();
@@ -1434,7 +1629,14 @@ export default function App() {
     return parts;
   };
 
-  const stopGeneration = async () => {
+  /**
+   * Stop the running turn. With `rollback` (the Stop button) the server deletes everything the
+   * turn persisted once the run has stopped; the user bubble is removed and its text goes back
+   * into the composer. If the turn finished before the stop landed, the thread is reloaded.
+   */
+  const stopGeneration = async ({ rollback = true }: { rollback?: boolean } = {}) => {
+    const turn = activeTurnRef.current;
+    activeTurnRef.current = null;
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
@@ -1448,22 +1650,55 @@ export default function App() {
     setCurrentToolCalls([]);
     publishStreamingText("", true);
 
-    const chatToCancel = cancelChatIdRef.current ?? internalChatId;
+    const chatToCancel = cancelChatIdRef.current ?? turn?.chatId ?? internalChatId;
     if (!chatToCancel) {
       return;
     }
 
+    if (!rollback || !turn) {
+      try {
+        await fetch(`/v1/chat/cancel/${encodeURIComponent(chatToCancel)}`, {
+          method: "POST",
+        });
+      } catch (error) {
+        console.error("Failed to notify server about cancellation:", error);
+      }
+      return;
+    }
+
+    stoppingRef.current = true;
+    setStopping(true);
     try {
-      await fetch(`/v1/chat/cancel/${encodeURIComponent(chatToCancel)}`, {
+      const response = await fetch(`/v1/chat/cancel/${encodeURIComponent(chatToCancel)}`, {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rollback: true, run_id: turn.runId ?? undefined }),
       });
+      const payload = (await response.json().catch(() => null)) as
+        | { rolled_back?: boolean; pending?: boolean; error?: { message?: string } }
+        | null;
+      if (!response.ok) {
+        throw new Error(payload?.error?.message || `Stop failed (${response.status}).`);
+      }
+      if (payload?.rolled_back || payload?.pending) {
+        // `pending`: the run is still unwinding; it is flagged and rolls back when it stops.
+        setMessages((prev) => prev.filter((m) => m.id !== turn.optimisticId));
+        setComposerRestore({ text: turn.text, imageDataUrls: turn.imageDataUrls, nonce: Date.now() });
+      } else {
+        // The turn finished before the stop landed: show what the server kept.
+        await loadHistory(turn.chatId);
+      }
     } catch (error) {
-      console.error("Failed to notify server about cancellation:", error);
+      console.error("Stop with rollback failed:", error);
+      setErrorMessage(buildErrorMessage(error));
+    } finally {
+      stoppingRef.current = false;
+      setStopping(false);
     }
   };
 
   const submitMessage = async ({ text, imageDataUrls }: { text: string; imageDataUrls: string[] }) => {
-    if (pendingRef.current) {
+    if (pendingRef.current || stoppingRef.current) {
       return;
     }
     if (!text.trim() && imageDataUrls.length === 0) {
@@ -1492,6 +1727,8 @@ export default function App() {
     publishStreamingText("", true);
 
     cancelChatIdRef.current = turnChatId;
+    activeTurnRef.current = { optimisticId, text, imageDataUrls, runId: null, chatId: turnChatId };
+    setEditingId(null);
     if (!hadSessionBefore) {
       setInternalChatId(turnChatId);
     }
@@ -1546,7 +1783,13 @@ export default function App() {
       let finalChatId: string | null = null;
       let finalResponseId: string | null = null;
       let clarification: Clarification | undefined;
+      let rolledBack = false;
       let buffer = "";
+      const learnUserMessageId = (serverId: number) => {
+        setMessages((prev) =>
+          prev.map((m) => (m.id === optimisticId ? { ...m, serverId, editable: true } : m)),
+        );
+      };
 
       while (streamError === null) {
         const { done, value } = await reader.read();
@@ -1584,6 +1827,15 @@ export default function App() {
             case "text_reset":
               streamedText = "";
               publishStreamingText("", true);
+              break;
+            case "turn_started":
+              if (activeTurnRef.current?.optimisticId === optimisticId) {
+                activeTurnRef.current.runId = event.run_id;
+              }
+              learnUserMessageId(event.user_message_id);
+              break;
+            case "turn_rolled_back":
+              rolledBack = true;
               break;
             case "tool_call_started": {
               const key = toolCallKey(event.tool_name, event.tool_call_id);
@@ -1624,6 +1876,9 @@ export default function App() {
                 break;
               }
               assistantContent = event.content;
+              if (typeof event.user_message_id === "number") {
+                learnUserMessageId(event.user_message_id);
+              }
               finalChatId = event.thread_id;
               finalResponseId = event.response_id;
               clarification = event.clarification;
@@ -1639,6 +1894,10 @@ export default function App() {
         }
       }
 
+      if (rolledBack) {
+        // Stop already removed this turn on the server; stopGeneration updates the view.
+        return;
+      }
       if (streamError !== null) {
         void reader.cancel().catch(() => undefined);
       } else if (!finalResponseId && !assistantContent) {
@@ -1703,6 +1962,9 @@ export default function App() {
       if (abortControllerRef.current === controller) {
         abortControllerRef.current = null;
       }
+      if (activeTurnRef.current?.optimisticId === optimisticId) {
+        activeTurnRef.current = null;
+      }
       cancelChatIdRef.current = null;
       pendingRef.current = false;
       setPending(false);
@@ -1737,7 +1999,7 @@ export default function App() {
     if (!payload.text.trim() && payload.imageDataUrls.length === 0) {
       return;
     }
-    if (pendingRef.current || !modelReady) {
+    if (pendingRef.current || stoppingRef.current || !modelReady) {
       enqueueMessage(payload);
       if (modelState === "none") {
         openModelSettings("Choose a model to send your message.");
@@ -1772,6 +2034,7 @@ export default function App() {
     if (
       !modelReady ||
       pending ||
+      stopping ||
       historyLoading ||
       queuePaused ||
       queue.length === 0 ||
@@ -1784,7 +2047,7 @@ export default function App() {
     void submitMessage({ text: next.text, imageDataUrls: next.imageDataUrls });
     // submitMessage is recreated each render; this effect only reacts to queue/turn state.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [modelReady, pending, historyLoading, queuePaused, queue]);
+  }, [modelReady, pending, stopping, historyLoading, queuePaused, queue]);
 
   const resumeQueue = () => {
     setQueuePaused(false);
@@ -1800,6 +2063,69 @@ export default function App() {
   const chooseClarification = useStableCallback((choice: string) => {
     void submitMessage({ text: choice, imageDataUrls: [] });
   });
+
+  const startEdit = useStableCallback((id: string) => {
+    if (!pendingRef.current && !stoppingRef.current) {
+      setEditingId(id);
+    }
+  });
+  const cancelEdit = useStableCallback(() => setEditingId(null));
+
+  /** Edit & resend: truncate the thread from this user message on the server, then send anew. */
+  const submitEdit = useStableCallback(async (id: string, text: string) => {
+    const target = messages.find((m) => m.id === id);
+    const threadId = internalChatId;
+    if (!target || target.serverId == null || !threadId || pendingRef.current || stoppingRef.current) {
+      return;
+    }
+    const imageDataUrls = target.imageUrls ?? [];
+    if (!text.trim() && imageDataUrls.length === 0) {
+      return;
+    }
+    setEditingId(null);
+    setErrorMessage(null);
+    try {
+      const response = await fetch(`/v1/threads/${encodeURIComponent(threadId)}/truncate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ from_message_id: target.serverId }),
+      });
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as ApiErrorPayload;
+        if (payload?.error?.code === "message_compacted" || payload?.error?.code === "message_not_found") {
+          void loadHistory(threadId);
+          throw new Error(
+            payload.error.code === "message_compacted"
+              ? "That message is part of the summarized history and can no longer be edited."
+              : "That message is no longer in this conversation.",
+          );
+        }
+        throw new Error(payload?.error?.message || `Edit failed (${response.status}).`);
+      }
+      setMessages((prev) => {
+        const index = prev.findIndex((m) => m.id === id);
+        return index < 0 ? prev : prev.slice(0, index);
+      });
+      void submitMessage({ text, imageDataUrls });
+    } catch (error) {
+      setErrorMessage(buildErrorMessage(error));
+    }
+  });
+
+  /** Index of the first message after the compaction boundary (null when nothing is summarized). */
+  const summarizedBoundary = useMemo(() => {
+    let lastSummarized = -1;
+    messages.forEach((m, i) => {
+      if (m.role === "user" && m.editable === false) {
+        lastSummarized = i;
+      }
+    });
+    if (lastSummarized < 0) {
+      return null;
+    }
+    const next = messages.findIndex((m, i) => i > lastSummarized && m.role === "user" && m.editable !== false);
+    return next < 0 ? messages.length : next;
+  }, [messages]);
 
   return (
     <div className="flex h-dvh overflow-hidden bg-background font-sans">
@@ -2141,14 +2467,29 @@ export default function App() {
                   </div>
                 )}
                 {messages.map((message, index) => (
-                  <MessageBubble
-                    choicesEnabled={!pending && index === messages.length - 1}
-                    key={message.id}
-                    message={message}
-                    onChatMessage={deliverUiMessage}
-                    onChoose={chooseClarification}
-                  />
+                  <Fragment key={message.id}>
+                    {summarizedBoundary === index ? <SummarizedDivider /> : null}
+                    <MessageBubble
+                      canEdit={
+                        !pending &&
+                        !stopping &&
+                        !historyLoading &&
+                        message.role === "user" &&
+                        message.serverId != null &&
+                        message.editable !== false
+                      }
+                      choicesEnabled={!pending && index === messages.length - 1}
+                      editing={editingId === message.id}
+                      message={message}
+                      onCancelEdit={cancelEdit}
+                      onChatMessage={deliverUiMessage}
+                      onChoose={chooseClarification}
+                      onStartEdit={startEdit}
+                      onSubmitEdit={submitEdit}
+                    />
+                  </Fragment>
                 ))}
+                {summarizedBoundary === messages.length && !pending ? <SummarizedDivider /> : null}
 
                 {pending ? (
                   <PendingAssistantBubble
@@ -2207,9 +2548,11 @@ export default function App() {
                 onChooseModel={() => openModelSettings("Choose a model to send your message.")}
               />
               <Composer
-                locked={historyLoading}
+                locked={historyLoading || stopping}
                 pending={pending}
-                onStop={() => void stopGeneration()}
+                restore={composerRestore}
+                stopping={stopping}
+                onStop={() => void stopGeneration({ rollback: true })}
                 onSubmit={sendOrQueue}
               />
             </div>
@@ -2262,6 +2605,17 @@ export default function App() {
         onTabChange={changeWorkTab}
         onUpdateSummary={updateSummary}
       />
+    </div>
+  );
+}
+
+/** Marks where the live history starts: earlier turns were summarized and cannot be edited. */
+function SummarizedDivider() {
+  return (
+    <div className="flex items-center gap-3 py-1 text-[11px] text-muted-foreground" role="note">
+      <div className="h-px flex-1 bg-border" />
+      <span>Earlier messages are summarized and can&apos;t be edited</span>
+      <div className="h-px flex-1 bg-border" />
     </div>
   );
 }

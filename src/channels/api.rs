@@ -50,6 +50,8 @@ const DEFAULT_RESPONSE_MODEL: &str = "isanagent";
 const MAX_RESPONSE_CACHE_ENTRIES: u64 = 1024;
 /// SSE event queue depth for one streaming `/v1/responses` turn.
 const STREAM_EVENT_CAPACITY: usize = 256;
+/// How long `POST /v1/chat/cancel/{chat_id}` with `rollback: true` waits for the run to unwind.
+const ROLLBACK_WAIT_SECS: u64 = 30;
 /// Queue slots kept free for control events (tool lifecycle, completion, error). Text deltas
 /// that would eat into this reserve are coalesced into `unsent_text` instead of queued, so a slow
 /// SSE reader can never cause the final `completion` to be dropped.
@@ -79,7 +81,22 @@ struct ApiState {
     skills: Option<crate::skills::SharedSkillRegistry>,
     /// MCP App views rendered by the embedded web UI.
     mcp_apps: crate::tools::mcp::McpAppBridge,
+    /// Stop-with-rollback requests waiting for the agent's `TurnRollbackFinished`, by chat id.
+    rollback_waiters: RollbackWaiters,
 }
+
+/// Agent answer to a rollback request (from `TelemetryEvent::TurnRollbackFinished`).
+#[derive(Clone, Debug, Serialize)]
+struct RollbackResult {
+    rolled_back: bool,
+    removed_messages: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<crate::bus::RollbackSkipReason>,
+}
+
+type RollbackWaiters = std::sync::Arc<DashMap<String, Vec<oneshot::Sender<RollbackResult>>>>;
 
 enum PendingRequest {
     Sync(oneshot::Sender<OutboundMessage>),
@@ -95,6 +112,8 @@ struct StreamingResponsePending {
     store_response: bool,
     /// Streamed text not yet queued because the SSE queue was near capacity.
     unsent_text: String,
+    /// `messages.id` of this turn's user row, once the agent persisted it.
+    user_message_id: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -131,10 +150,25 @@ enum StreamEvent {
     /// Drop the text streamed so far: the agent discarded it (the model call ended in tool
     /// calls, or is being retried). The `completion` content is always authoritative.
     TextReset,
+    /// The agent persisted this turn's user message: `run_id` targets Stop-with-rollback at
+    /// exactly this turn and `user_message_id` is the row an edit truncates from.
+    TurnStarted {
+        run_id: String,
+        user_message_id: i64,
+    },
+    /// Stop-with-rollback finished: everything this turn wrote was deleted. The stream ends.
+    TurnRolledBack {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        removed_messages: usize,
+    },
     Completion {
         content: String,
         thread_id: String,
         response_id: String,
+        /// `messages.id` of the user message that started this turn (when known).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        user_message_id: Option<i64>,
         /// Set when the turn ends on a question to the user (`ask_user`, a shell or edit
         /// approval); the reply is the next message on the same thread.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -238,8 +272,15 @@ struct ResponsesResponse {
 
 #[derive(Serialize)]
 struct SessionHistoryMessage {
+    /// Stable `messages.id` of the row this entry was built from (absent for synthesized rows).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<i64>,
     role: String,
     content: String,
+    /// User rows only: whether the row is still in the model's live history (after the
+    /// compaction boundary), i.e. whether `POST /v1/threads/{id}/truncate` accepts it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    editable: Option<bool>,
     /// Image URLs or `data:` URIs from multimodal user/assistant turns (OpenAI-style parts).
     #[serde(skip_serializing_if = "Option::is_none")]
     image_urls: Option<Vec<String>>,
@@ -375,6 +416,7 @@ pub struct ApiChannel {
     config_path: Option<std::path::PathBuf>,
     skills: Option<crate::skills::SharedSkillRegistry>,
     mcp_apps: crate::tools::mcp::McpAppBridge,
+    rollback_waiters: RollbackWaiters,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     task_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -431,6 +473,7 @@ impl ApiChannel {
             config_path: None,
             skills: None,
             mcp_apps: crate::tools::mcp::McpAppBridge::new(),
+            rollback_waiters: std::sync::Arc::new(DashMap::new()),
             shutdown_tx,
             task_handle: Mutex::new(None),
         })
@@ -587,6 +630,7 @@ impl Channel for ApiChannel {
             config_path: self.config_path.clone(),
             skills: self.skills.clone(),
             mcp_apps: self.mcp_apps.clone(),
+            rollback_waiters: self.rollback_waiters.clone(),
         };
 
         let resolved_bind = self.resolved_bind_address();
@@ -705,6 +749,7 @@ impl Channel for ApiChannel {
                         content: msg.content,
                         thread_id,
                         response_id,
+                        user_message_id: pending.user_message_id,
                         clarification,
                     }) {
                         error!("Failed to send completion to stream: {e}");
@@ -829,6 +874,41 @@ impl ApiChannel {
                     }
                 }
             }
+            TelemetryEvent::UserTurnPersisted {
+                chat_id,
+                run_id,
+                message_id,
+            } => {
+                if let Some(mut pending) = self.pending_requests.get_mut(&chat_id) {
+                    if let PendingRequest::Stream(pending) = pending.value_mut() {
+                        pending.user_message_id = Some(message_id);
+                        if let Err(e) = pending.stream_tx.try_send(StreamEvent::TurnStarted {
+                            run_id,
+                            user_message_id: message_id,
+                        }) {
+                            error!("Failed to send turn_started to stream: {e}");
+                        }
+                    }
+                }
+            }
+            TelemetryEvent::TurnRollbackFinished {
+                chat_id,
+                run_id,
+                rolled_back,
+                removed_messages,
+                reason,
+            } => {
+                resolve_rollback_waiters(
+                    &self.rollback_waiters,
+                    &chat_id,
+                    RollbackResult {
+                        rolled_back,
+                        removed_messages,
+                        run_id,
+                        reason,
+                    },
+                );
+            }
             TelemetryEvent::AgentThought {
                 chat_id, thought, ..
             } => {
@@ -903,6 +983,10 @@ fn build_router(state: ApiState, serve_ui: bool) -> Router {
             get(handle_thread_messages),
         )
         .route("/v1/threads/{thread_id}", delete(handle_delete_thread))
+        .route(
+            "/v1/threads/{thread_id}/truncate",
+            post(handle_truncate_thread),
+        )
         .route(
             "/v1/threads/{thread_id}/summaries",
             get(handle_get_thread_summaries),
@@ -1808,6 +1892,7 @@ async fn handle_responses(
                     previous_response_id: previous_response_id.clone(),
                     store_response,
                     unsent_text: String::new(),
+                    user_message_id: None,
                 }));
             }
         }
@@ -1817,6 +1902,7 @@ async fn handle_responses(
             content: String::new(),
             thread_id: conv_thread_id.clone(),
             response_id: String::new(),
+            user_message_id: None,
             clarification: None,
         });
 
@@ -2221,10 +2307,12 @@ fn text_and_images_from_message(message: &ChatMessage) -> (String, Vec<String>) 
 /// Transcript rows suitable for the web UI: hides tool traces, runtime injection prefixes, and
 /// tool-only assistant turns (no user-visible assistant text). MCP App pointers saved on tool
 /// rows are attached to the assistant reply that follows them.
-fn chat_messages_to_ui_transcript(messages: &[ChatMessage]) -> Vec<SessionHistoryMessage> {
+fn chat_messages_to_ui_transcript(
+    history: &crate::memory::ThreadHistory,
+) -> Vec<SessionHistoryMessage> {
     let mut out = Vec::new();
     let mut pending_apps = Vec::new();
-    for message in messages {
+    for (row_id, message) in &history.messages {
         if message.role == "tool" {
             if let Some(app) = &message.mcp_app {
                 pending_apps.push(app.clone());
@@ -2262,7 +2350,9 @@ fn chat_messages_to_ui_transcript(messages: &[ChatMessage]) -> Vec<SessionHistor
         };
 
         out.push(SessionHistoryMessage {
+            id: Some(*row_id),
             role: message.role.clone(),
+            editable: (message.role == "user").then(|| history.is_live(*row_id)),
             content: text,
             image_urls: if image_urls.is_empty() {
                 None
@@ -2292,7 +2382,9 @@ fn flush_pending_mcp_apps(
         return;
     }
     out.push(SessionHistoryMessage {
+        id: None,
         role: "assistant".to_string(),
+        editable: None,
         content: String::new(),
         image_urls: None,
         mcp_apps: Some(apps),
@@ -2324,12 +2416,12 @@ fn resolve_memory_thread_id<'a>(state: &ApiState, raw: &'a str) -> Cow<'a, str> 
     }
 }
 
-async fn memory_get_context(
+async fn memory_get_thread_history(
     memory_node: &NodeHandle<MemoryMessage>,
     memory_thread_id: &str,
-) -> Result<Vec<ChatMessage>, String> {
+) -> Result<crate::memory::ThreadHistory, String> {
     let (tx, rx) = oneshot::channel();
-    let msg = MemoryMessage::GetContext {
+    let msg = MemoryMessage::GetThreadHistory {
         thread_id: memory_thread_id.to_string(),
         reply: SharedReply::new(tx),
     };
@@ -2533,9 +2625,9 @@ async fn handle_thread_messages(
         .into_response();
     }
     let memory_thread_id = resolve_memory_thread_id(&state, thread_id);
-    match memory_get_context(&state.memory_node, memory_thread_id.as_ref()).await {
-        Ok(rows) => {
-            let body = chat_messages_to_ui_transcript(&rows);
+    match memory_get_thread_history(&state.memory_node, memory_thread_id.as_ref()).await {
+        Ok(history) => {
+            let body = chat_messages_to_ui_transcript(&history);
             Json(body).into_response()
         }
         Err(message) => ApiError::new(
@@ -3069,10 +3161,51 @@ async fn handle_workspace_rename(
     .into_response()
 }
 
+/// Optional body of `POST /v1/chat/cancel/{chat_id}`. An empty body is a plain cancel.
+#[derive(Debug, Default, Deserialize)]
+struct CancelChatRequest {
+    /// Undo the turn: delete everything it persisted once the run has stopped.
+    #[serde(default)]
+    rollback: bool,
+    /// Only act on this run (from the `turn_started` stream event).
+    #[serde(default)]
+    run_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CancelChatResponse {
+    cancelled: bool,
+    #[serde(flatten)]
+    rollback: RollbackResult,
+    /// The run did not unwind within the wait; it is still flagged and rolls back when it does.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pending: bool,
+}
+
 async fn handle_cancel_chat(
     State(state): State<ApiState>,
     AxumPath(chat_id): AxumPath<String>,
+    body: Bytes,
 ) -> Response {
+    let request: CancelChatRequest = if body.iter().all(u8::is_ascii_whitespace) {
+        CancelChatRequest::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(request) => request,
+            Err(e) => {
+                return ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_cancel_request",
+                    format!("Invalid cancel body: {e}"),
+                )
+                .into_response()
+            }
+        }
+    };
+    if request.rollback {
+        return cancel_with_rollback(&state, chat_id, request.run_id).await;
+    }
+
     // 1. Signal the agent to stop reasoning
     let msg = BusMessage::Cancel(chat_id.clone());
     if let Err(e) = state.bus_tx.send(msg).await {
@@ -3088,6 +3221,191 @@ async fn handle_cancel_chat(
     state.pending_requests.remove(&chat_id);
 
     StatusCode::OK.into_response()
+}
+
+/// Stop-and-undo. The agent flags the run, cancels it and, after the reasoning loop has
+/// unwound (so no late write can land), deletes the rows the run appended; then it answers
+/// with `TurnRollbackFinished`. Only then is the in-flight request released: its SSE stream
+/// gets `turn_rolled_back` and ends, and the response reports what was removed.
+async fn cancel_with_rollback(
+    state: &ApiState,
+    chat_id: String,
+    run_id: Option<String>,
+) -> Response {
+    let (tx, rx) = oneshot::channel();
+    state
+        .rollback_waiters
+        .entry(chat_id.clone())
+        .or_default()
+        .push(tx);
+    let msg = BusMessage::RollbackRun {
+        chat_id: chat_id.clone(),
+        run_id: run_id.clone(),
+    };
+    if let Err(e) = state.bus_tx.send(msg).await {
+        prune_rollback_waiters(&state.rollback_waiters, &chat_id);
+        return ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "agent_unavailable",
+            e.to_string(),
+        )
+        .into_response();
+    }
+
+    let answer = tokio::time::timeout(Duration::from_secs(ROLLBACK_WAIT_SECS), rx).await;
+    let (status, rollback, pending) = match answer {
+        Ok(Ok(result)) => (StatusCode::OK, result, false),
+        _ => {
+            prune_rollback_waiters(&state.rollback_waiters, &chat_id);
+            (
+                StatusCode::ACCEPTED,
+                RollbackResult {
+                    rolled_back: false,
+                    removed_messages: 0,
+                    run_id,
+                    reason: None,
+                },
+                true,
+            )
+        }
+    };
+    if let Some((_, PendingRequest::Stream(pending_stream))) =
+        state.pending_requests.remove(&chat_id)
+    {
+        if rollback.rolled_back {
+            let _ = pending_stream
+                .stream_tx
+                .try_send(StreamEvent::TurnRolledBack {
+                    run_id: rollback.run_id.clone(),
+                    removed_messages: rollback.removed_messages,
+                });
+        }
+    }
+    log_api(
+        &state.logger_tx,
+        LogEvent::info(
+            "ApiChannel",
+            &format!(
+                "Cancel with rollback: rolled_back={} removed_messages={} pending={pending}",
+                rollback.rolled_back, rollback.removed_messages
+            ),
+        )
+        .with_chat_id(&chat_id),
+    );
+    (
+        status,
+        Json(CancelChatResponse {
+            cancelled: true,
+            rollback,
+            pending,
+        }),
+    )
+        .into_response()
+}
+
+fn resolve_rollback_waiters(waiters: &RollbackWaiters, chat_id: &str, result: RollbackResult) {
+    if let Some((_, senders)) = waiters.remove(chat_id) {
+        for sender in senders {
+            let _ = sender.send(result.clone());
+        }
+    }
+}
+
+/// Drop waiters whose request already gave up (timeout or failed send).
+fn prune_rollback_waiters(waiters: &RollbackWaiters, chat_id: &str) {
+    if let Some(mut senders) = waiters.get_mut(chat_id) {
+        senders.retain(|sender| !sender.is_closed());
+    }
+    waiters.remove_if(chat_id, |_, senders| senders.is_empty());
+}
+
+#[derive(Debug, Deserialize)]
+struct TruncateThreadRequest {
+    /// `id` of a user row from `GET /v1/threads/{id}/messages` (or `turn_started`).
+    from_message_id: i64,
+}
+
+#[derive(Serialize)]
+struct TruncateThreadResponse {
+    thread_id: String,
+    from_message_id: i64,
+    removed_messages: usize,
+    removed_tool_results: usize,
+}
+
+/// Edit / resend: delete the user message `from_message_id` and everything after it from the
+/// thread's persisted history. The client then sends the edited text as a new turn.
+async fn handle_truncate_thread(
+    State(state): State<ApiState>,
+    AxumPath(thread_id): AxumPath<String>,
+    Json(body): Json<TruncateThreadRequest>,
+) -> Response {
+    let thread_id = thread_id.trim();
+    let bare_id = thread_id
+        .rsplit(':')
+        .find(|s| !s.is_empty())
+        .unwrap_or(thread_id);
+    if bare_id.is_empty() {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_thread",
+            "Empty thread id.",
+        )
+        .into_response();
+    }
+    if state.pending_requests.contains_key(bare_id) {
+        return ApiError::new(
+            StatusCode::CONFLICT,
+            "conversation_busy",
+            "A turn is running in this conversation; stop it before editing.",
+        )
+        .into_response();
+    }
+    let memory_thread_id = resolve_memory_thread_id(&state, thread_id).into_owned();
+    let (tx, rx) = oneshot::channel();
+    let msg = MemoryMessage::TruncateFromUserMessage {
+        thread_id: memory_thread_id,
+        from_message_id: body.from_message_id,
+        reply: SharedReply::new(tx),
+    };
+    if let Err(e) = state.memory_node.send_packet(msg).await {
+        return ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "memory_unavailable",
+            e.to_string(),
+        )
+        .into_response();
+    }
+    let result = match rx.await {
+        Ok(result) => result,
+        Err(_) => {
+            return ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "memory_unavailable",
+                "Memory actor channel closed",
+            )
+            .into_response()
+        }
+    };
+    use crate::memory::TruncateError;
+    match result {
+        Ok(outcome) => Json(TruncateThreadResponse {
+            thread_id: bare_id.to_string(),
+            from_message_id: body.from_message_id,
+            removed_messages: outcome.removed_messages,
+            removed_tool_results: outcome.removed_tool_results,
+        })
+        .into_response(),
+        Err(error) => {
+            let (status, code) = match &error {
+                TruncateError::MessageNotFound => (StatusCode::NOT_FOUND, "message_not_found"),
+                TruncateError::NotAUserMessage => (StatusCode::BAD_REQUEST, "not_a_user_message"),
+                TruncateError::Compacted { .. } => (StatusCode::CONFLICT, "message_compacted"),
+                TruncateError::Storage(_) => (StatusCode::INTERNAL_SERVER_ERROR, "memory_error"),
+            };
+            ApiError::new(status, code, error.to_string()).into_response()
+        }
+    }
 }
 
 async fn handle_list_background_jobs(
@@ -3285,11 +3603,13 @@ fn log_api(logger_tx: &LoggerHandle, event: LogEvent) {
 #[cfg(test)]
 mod tests {
     use super::{
-        bearer_token_matches, build_router, is_loopback_bind, validate_bind_security, ApiState,
-        Clarification, PendingRequest, StreamEvent, EMBEDDED_UI_ASSETS,
+        bearer_token_matches, build_router, is_loopback_bind, validate_bind_security, ApiChannel,
+        ApiState, Clarification, PendingRequest, StreamEvent, EMBEDDED_UI_ASSETS,
     };
+    use crate::bus::TelemetryEvent;
     use crate::bus::{BusMessage, OutboundMessage};
     use crate::channels::api_store::ResponseStore;
+    use crate::channels::Channel;
     use crate::config::ApiConfig;
     use crate::logging::create_logger_channel;
     use crate::memory::{MemoryMessage, SharedReply, SqliteMemoryActor};
@@ -3299,6 +3619,7 @@ mod tests {
     use crate::NodeHandle;
     use async_trait::async_trait;
     use axum::body::{to_bytes, Body};
+    use axum::Router;
     use reqwest::StatusCode;
     use serde_json::Value;
     use std::collections::HashMap;
@@ -3318,7 +3639,15 @@ mod tests {
             ),
             ChatMessage::assistant("Here is the dashboard."),
         ];
-        let rows = super::chat_messages_to_ui_transcript(&messages);
+        let history = crate::memory::ThreadHistory {
+            messages: messages
+                .into_iter()
+                .enumerate()
+                .map(|(i, m)| (i as i64 + 1, m))
+                .collect(),
+            summarized_through: None,
+        };
+        let rows = super::chat_messages_to_ui_transcript(&history);
         assert_eq!(rows.len(), 2);
         assert!(rows[0].mcp_apps.is_none());
         let apps = rows[1].mcp_apps.as_ref().expect("panel on the reply");
@@ -3349,6 +3678,7 @@ mod tests {
             content: question.content.clone(),
             thread_id: "t".to_string(),
             response_id: "r".to_string(),
+            user_message_id: None,
             clarification: Clarification::from_outbound(&question),
         };
         let encoded = serde_json::to_value(event).expect("serialize stream event");
@@ -3388,6 +3718,7 @@ mod tests {
             content: answer.content,
             thread_id: "t".to_string(),
             response_id: "r".to_string(),
+            user_message_id: None,
             clarification: None,
         };
         let encoded = serde_json::to_value(event).expect("serialize stream event");
@@ -3480,6 +3811,7 @@ mod tests {
                 previous_response_id: None,
                 store_response: false,
                 unsent_text: String::new(),
+                user_message_id: None,
             },
             stream_rx,
         )
@@ -3651,6 +3983,7 @@ mod tests {
             config_path: None,
             skills: None,
             mcp_apps: crate::tools::mcp::McpAppBridge::new(),
+            rollback_waiters: Arc::new(dashmap::DashMap::new()),
         }
     }
 
@@ -3992,6 +4325,7 @@ bind_address = "127.0.0.1"
             config_path: None,
             skills: None,
             mcp_apps: crate::tools::mcp::McpAppBridge::new(),
+            rollback_waiters: Arc::new(dashmap::DashMap::new()),
         };
         let app = build_router(state, true);
 
@@ -4660,5 +4994,356 @@ bind_address = "127.0.0.1"
             .status()
             .expect("git");
         assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Edit (truncate) and Stop-with-rollback routes
+    // ---------------------------------------------------------------------------------
+
+    async fn add_row(state: &ApiState, thread: &str, message: ChatMessage) -> i64 {
+        let (tx, rx) = oneshot::channel();
+        state
+            .memory_node
+            .send_packet(MemoryMessage::AddMessageReturningId {
+                thread_id: thread.to_string(),
+                message,
+                reply: SharedReply::new(tx),
+            })
+            .await
+            .expect("send");
+        rx.await.expect("reply").expect("insert")
+    }
+
+    async fn call(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let request = axum::http::Request::builder()
+            .uri(uri)
+            .method(method)
+            .header("content-type", "application/json")
+            .body(match body {
+                Some(v) => Body::from(v.to_string()),
+                None => Body::empty(),
+            })
+            .expect("request");
+        let response = app.clone().oneshot(request).await.expect("response");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn thread_messages_expose_row_ids_and_edit_boundary() {
+        let temp = LocalTempDir::new();
+        let (bus_tx, _bus_rx) = mpsc::channel(4);
+        let state = build_state(&temp.db_path(), bus_tx, None);
+        let thread = "api:ids-thread:";
+        let u1 = add_row(&state, thread, ChatMessage::user("first")).await;
+        let a1 = add_row(&state, thread, ChatMessage::assistant("one")).await;
+        let u2 = add_row(&state, thread, ChatMessage::user("second")).await;
+        let (tx, rx) = oneshot::channel();
+        state
+            .memory_node
+            .send_packet(MemoryMessage::UpdateThreadMetadata {
+                thread_id: thread.to_string(),
+                last_reflection_msg_id: Some(a1),
+                reply: SharedReply::new(tx),
+            })
+            .await
+            .expect("send");
+        rx.await.expect("reply").expect("cursor");
+
+        let app = build_router(state, false);
+        let (status, rows) = call(&app, "GET", "/v1/threads/ids-thread/messages", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(rows[0]["id"], u1);
+        assert_eq!(rows[0]["editable"], false, "summarized by compaction");
+        assert_eq!(rows[1]["id"], a1);
+        assert!(
+            rows[1].get("editable").is_none(),
+            "only user rows carry the flag"
+        );
+        assert_eq!(rows[2]["id"], u2);
+        assert_eq!(rows[2]["editable"], true);
+    }
+
+    #[tokio::test]
+    async fn truncate_route_removes_the_message_and_its_tail() {
+        let temp = LocalTempDir::new();
+        let (bus_tx, _bus_rx) = mpsc::channel(4);
+        let state = build_state(&temp.db_path(), bus_tx, None);
+        let thread = "api:edit-route:";
+        add_row(&state, thread, ChatMessage::user("keep")).await;
+        let a1 = add_row(&state, thread, ChatMessage::assistant("kept reply")).await;
+        let u2 = add_row(&state, thread, ChatMessage::user("edit me")).await;
+        add_row(&state, thread, ChatMessage::assistant("stale reply")).await;
+        let pending = state.pending_requests.clone();
+        let app = build_router(state, false);
+
+        // Not a user row / unknown row.
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/threads/edit-route/truncate",
+            Some(serde_json::json!({ "from_message_id": a1 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "not_a_user_message");
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/threads/edit-route/truncate",
+            Some(serde_json::json!({ "from_message_id": 424242 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "message_not_found");
+
+        // A running turn blocks edits.
+        let (stream, _rx) = stream_pending(4);
+        pending.insert("edit-route".to_string(), PendingRequest::Stream(stream));
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/threads/edit-route/truncate",
+            Some(serde_json::json!({ "from_message_id": u2 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "conversation_busy");
+        pending.remove("edit-route");
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/threads/edit-route/truncate",
+            Some(serde_json::json!({ "from_message_id": u2 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["thread_id"], "edit-route");
+        assert_eq!(body["from_message_id"], u2);
+        assert_eq!(body["removed_messages"], 2);
+
+        let (_, rows) = call(&app, "GET", "/v1/threads/edit-route/messages", None).await;
+        let contents: Vec<&str> = rows
+            .as_array()
+            .expect("rows")
+            .iter()
+            .filter_map(|r| r["content"].as_str())
+            .collect();
+        assert_eq!(contents, vec!["keep", "kept reply"]);
+    }
+
+    #[tokio::test]
+    async fn truncate_route_refuses_compacted_messages() {
+        let temp = LocalTempDir::new();
+        let (bus_tx, _bus_rx) = mpsc::channel(4);
+        let state = build_state(&temp.db_path(), bus_tx, None);
+        let thread = "api:compacted-route:";
+        let u1 = add_row(&state, thread, ChatMessage::user("old")).await;
+        let (tx, rx) = oneshot::channel();
+        state
+            .memory_node
+            .send_packet(MemoryMessage::UpdateThreadMetadata {
+                thread_id: thread.to_string(),
+                last_reflection_msg_id: Some(u1),
+                reply: SharedReply::new(tx),
+            })
+            .await
+            .expect("send");
+        rx.await.expect("reply").expect("cursor");
+        let app = build_router(state, false);
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/threads/compacted-route/truncate",
+            Some(serde_json::json!({ "from_message_id": u1 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "message_compacted");
+    }
+
+    #[tokio::test]
+    async fn cancel_with_rollback_waits_for_the_agent_then_ends_the_stream() {
+        let temp = LocalTempDir::new();
+        let (bus_tx, mut bus_rx) = mpsc::channel(4);
+        let state = build_state(&temp.db_path(), bus_tx, None);
+        let waiters = state.rollback_waiters.clone();
+        let pending = state.pending_requests.clone();
+        let (stream, mut stream_rx) = stream_pending(8);
+        pending.insert("chat-rb".to_string(), PendingRequest::Stream(stream));
+        let app = build_router(state, false);
+
+        let agent = tokio::spawn(async move {
+            let msg = bus_rx.recv().await.expect("bus message");
+            let BusMessage::RollbackRun { chat_id, run_id } = msg else {
+                panic!("expected RollbackRun, got {msg:?}");
+            };
+            assert_eq!(chat_id, "chat-rb");
+            assert_eq!(run_id.as_deref(), Some("run-7"));
+            // The request is still holding the conversation while the run unwinds.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(pending.contains_key("chat-rb"));
+            super::resolve_rollback_waiters(
+                &waiters,
+                "chat-rb",
+                super::RollbackResult {
+                    rolled_back: true,
+                    removed_messages: 3,
+                    run_id: Some("run-7".to_string()),
+                    reason: None,
+                },
+            );
+            pending
+        });
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/chat/cancel/chat-rb",
+            Some(serde_json::json!({ "rollback": true, "run_id": "run-7" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "cancelled": true,
+                "rolled_back": true,
+                "removed_messages": 3,
+                "run_id": "run-7",
+            })
+        );
+        let pending = agent.await.expect("fake agent");
+        assert!(
+            pending.is_empty(),
+            "conversation released after the rollback"
+        );
+        let event =
+            serde_json::to_value(stream_rx.recv().await.expect("rolled back event")).expect("json");
+        assert_eq!(
+            event,
+            serde_json::json!({"type": "turn_rolled_back", "run_id": "run-7", "removed_messages": 3})
+        );
+        assert!(stream_rx.recv().await.is_none(), "SSE stream ends");
+    }
+
+    #[tokio::test]
+    async fn cancel_without_body_keeps_the_plain_cancel_contract() {
+        let temp = LocalTempDir::new();
+        let (bus_tx, mut bus_rx) = mpsc::channel(4);
+        let state = build_state(&temp.db_path(), bus_tx, None);
+        let pending = state.pending_requests.clone();
+        let (stream, _rx) = stream_pending(4);
+        pending.insert("chat-plain".to_string(), PendingRequest::Stream(stream));
+        let app = build_router(state, false);
+        let (status, _) = call(&app, "POST", "/v1/chat/cancel/chat-plain", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(matches!(
+            bus_rx.recv().await,
+            Some(BusMessage::Cancel(chat)) if chat == "chat-plain"
+        ));
+        assert!(pending.is_empty());
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/chat/cancel/chat-plain",
+            Some(serde_json::json!({ "rollback": "yes" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_cancel_request");
+    }
+
+    #[tokio::test]
+    async fn channel_telemetry_feeds_turn_started_and_resolves_rollback_waiters() {
+        let temp = LocalTempDir::new();
+        let (logger_tx, _logger_rx) = create_logger_channel(32);
+        let memory_actor =
+            SqliteMemoryActor::new(temp.db_path().to_str().expect("utf8")).expect("memory actor");
+        let memory_node =
+            NodeHandle::<MemoryMessage>::new(memory_actor, 16, 1, Duration::from_millis(5));
+        let sandbox = temp.path.join("workspace");
+        std::fs::create_dir_all(&sandbox).expect("sandbox");
+        let channel = ApiChannel::new(
+            ApiConfig {
+                enabled: Some(true),
+                port: 0,
+                serve_ui: None,
+                bind_address: None,
+                auth_token: None,
+            },
+            temp.db_path(),
+            logger_tx,
+            memory_node,
+            &sandbox,
+        )
+        .expect("api channel");
+
+        let (stream, mut stream_rx) = stream_pending(8);
+        channel
+            .pending_requests
+            .insert("chat-t".to_string(), PendingRequest::Stream(stream));
+        channel
+            .handle_telemetry(TelemetryEvent::UserTurnPersisted {
+                chat_id: "chat-t".to_string(),
+                run_id: "run-1".to_string(),
+                message_id: 41,
+            })
+            .await;
+        let event =
+            serde_json::to_value(stream_rx.recv().await.expect("turn_started")).expect("json");
+        assert_eq!(
+            event,
+            serde_json::json!({"type": "turn_started", "run_id": "run-1", "user_message_id": 41})
+        );
+        // The final completion repeats the id so a client that missed the event still learns it.
+        channel
+            .send(OutboundMessage {
+                channel: "api".to_string(),
+                chat_id: "chat-t".to_string(),
+                thread_id: None,
+                content: "done".to_string(),
+                metadata: HashMap::new(),
+            })
+            .await
+            .expect("send");
+        let completion =
+            serde_json::to_value(stream_rx.recv().await.expect("completion")).expect("json");
+        assert_eq!(completion["type"], "completion");
+        assert_eq!(completion["user_message_id"], 41);
+
+        let (tx, rx) = oneshot::channel();
+        channel
+            .rollback_waiters
+            .entry("chat-t".to_string())
+            .or_default()
+            .push(tx);
+        channel
+            .handle_telemetry(TelemetryEvent::TurnRollbackFinished {
+                chat_id: "chat-t".to_string(),
+                run_id: None,
+                rolled_back: false,
+                removed_messages: 0,
+                reason: Some(crate::bus::RollbackSkipReason::RunFinished),
+            })
+            .await;
+        let result = rx.await.expect("resolved");
+        assert!(!result.rolled_back);
+        assert_eq!(
+            serde_json::to_value(&result).expect("json")["reason"],
+            "run_finished"
+        );
+        assert!(channel.rollback_waiters.is_empty());
     }
 }

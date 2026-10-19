@@ -577,12 +577,14 @@ pub(crate) fn spawn_main_chat_reasoning_turn(
     let chat_id = inbound.chat_id.clone();
     let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
     let steering = Arc::new(Mutex::new(SteeringInbox::open()));
+    let rollback_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
     args.cancellation_tokens.insert(
         chat_id.clone(),
         ActiveRunHandle {
             run_id: run_id.clone(),
             token: cancel_token.clone(),
             steering: steering.clone(),
+            rollback_requested: rollback_requested.clone(),
         },
     );
 
@@ -677,6 +679,24 @@ pub(crate) fn spawn_main_chat_reasoning_turn(
                 None,
             );
         }
+
+        // Rollback baseline: this task owns the chat until it finalizes, so every row of the
+        // thread with a larger id is written by this run. `None` = the lookup failed and a
+        // rollback must not guess (an empty thread is `Some(None)`).
+        let rollback_baseline: Option<Option<i64>> = {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let memory_node = session_manager_for_chain.get_memory_node();
+            match memory_node
+                .send_packet(MemoryMessage::MaxMessageId {
+                    thread_id: session_key.clone(),
+                    reply: SharedReply::new(tx),
+                })
+                .await
+            {
+                Ok(()) => rx.await.ok().and_then(Result::ok),
+                Err(_) => None,
+            }
+        };
 
         let res = AssertUnwindSafe(AgentLogic::run_reasoning_loop(ReasoningLoopCtx {
             name,
@@ -782,6 +802,44 @@ pub(crate) fn spawn_main_chat_reasoning_turn(
                 );
                 let _ = outbound_tx.send(BusMessage::Outbound(notice)).await;
             }
+        }
+
+        // Stop-with-rollback. The loop has returned, so none of its writes can still land;
+        // the delete is queued on the memory actor after all of them. Done before `Terminated`
+        // and before ownership is released, so a follow-up inbound for this chat queues behind
+        // it and is built from the rolled-back history.
+        if rollback_requested.load(std::sync::atomic::Ordering::SeqCst) {
+            let finished = rollback_cancelled_turn(
+                &session_manager_for_chain,
+                &session_key,
+                rollback_baseline,
+                matches!(&res, Ok(Ok(ReasoningLoopExit::Cancelled { .. }))),
+            )
+            .await;
+            let (rolled_back, removed_messages, reason) = match finished {
+                Ok(removed) => (true, removed, None),
+                Err(reason) => (false, 0, Some(reason)),
+            };
+            let _ = logger_tx.send(BusMessage::Log(
+                LogEvent::info(
+                    &agent_name,
+                    &format!(
+                        "Rollback for run {run_id}: rolled_back={rolled_back} removed_messages={removed_messages} reason={reason:?}"
+                    ),
+                )
+                .with_chat_id(&task_chat_id),
+            ));
+            let _ = outbound_tx
+                .send(BusMessage::Telemetry(
+                    TelemetryEvent::TurnRollbackFinished {
+                        chat_id: task_chat_id.clone(),
+                        run_id: Some(run_id.clone()),
+                        rolled_back,
+                        removed_messages,
+                        reason,
+                    },
+                ))
+                .await;
         }
 
         let outcome = match &res {
@@ -912,6 +970,38 @@ pub(crate) fn spawn_main_chat_reasoning_turn(
             }
         }
     });
+}
+
+/// Delete the rows a cancelled run appended (everything after `baseline`). Returns the number
+/// of removed rows, or why nothing was removed. A run that ended any other way (it completed
+/// before it saw the cancel) keeps its history.
+async fn rollback_cancelled_turn(
+    session_manager: &SessionManager,
+    session_key: &str,
+    baseline: Option<Option<i64>>,
+    cancelled: bool,
+) -> Result<usize, crate::bus::RollbackSkipReason> {
+    use crate::bus::RollbackSkipReason;
+    if !cancelled {
+        return Err(RollbackSkipReason::RunFinished);
+    }
+    let Some(after_message_id) = baseline else {
+        return Err(RollbackSkipReason::StorageError);
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    session_manager
+        .get_memory_node()
+        .send_packet(MemoryMessage::RollbackMessagesAfter {
+            thread_id: session_key.to_string(),
+            after_message_id,
+            reply: SharedReply::new(tx),
+        })
+        .await
+        .map_err(|_| RollbackSkipReason::StorageError)?;
+    match rx.await {
+        Ok(Ok(outcome)) => Ok(outcome.removed_messages),
+        _ => Err(RollbackSkipReason::StorageError),
+    }
 }
 
 pub(crate) struct ReasoningLoopCtx {
@@ -1260,9 +1350,20 @@ impl AgentLogic {
                 &inbound.attachments,
             )
         };
-        mem.add_message(user_msg)
+        let user_message_id = mem
+            .add_message_returning_id(user_msg)
             .await
             .map_err(ReasoningLoopError::persistence)?;
+        if !is_subagent {
+            // Lets clients address this turn (edit / truncate) without reloading history.
+            let _ = outbound_tx
+                .send(BusMessage::Telemetry(TelemetryEvent::UserTurnPersisted {
+                    chat_id: inbound.chat_id.clone(),
+                    run_id: run_id.clone(),
+                    message_id: user_message_id,
+                }))
+                .await;
+        }
 
         // Stream provider text to clients that asked for it (web UI over SSE). Background jobs and
         // sub-agents never stream: nobody renders their intermediate text.
