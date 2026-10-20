@@ -1394,6 +1394,14 @@ async fn handle_select_model(
             )
             .into_response();
         }
+        Err(crate::channels::model_settings::ModelSwitchError::NonAsciiApiKey(error)) => {
+            return ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_api_key_characters",
+                error.to_string(),
+            )
+            .into_response();
+        }
         Err(crate::channels::model_settings::ModelSwitchError::UnresolvedBaseUrl(message)) => {
             return ApiError::new(StatusCode::BAD_REQUEST, "invalid_provider", message)
                 .into_response();
@@ -1474,6 +1482,11 @@ fn provider_key_error(
             "invalid_api_key",
             "That value looks like a placeholder, not an API key.",
         ),
+        ProviderKeyError::NonAsciiApiKey(error) => ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_api_key_characters",
+            error.to_string(),
+        ),
         ProviderKeyError::KeyInUse { model_name } => ApiError::new(
             StatusCode::CONFLICT,
             "key_in_use",
@@ -1523,15 +1536,18 @@ async fn handle_set_provider_key(
     let Some(catalog) = state.model_catalog.as_ref() else {
         return no_model_catalog();
     };
-    let provider = match crate::channels::model_settings::validate_provider_key(
+    let crate::channels::model_settings::ValidatedProviderKey {
+        provider_name: provider,
+        api_key,
+    } = match crate::channels::model_settings::validate_provider_key(
         catalog,
         &payload.provider_name,
         &payload.api_key,
     ) {
-        Ok(provider) => provider,
+        Ok(validated) => validated,
         Err(error) => return provider_key_error(error, &payload.provider_name),
     };
-    let keychain_saved = catalog.remember_provider_key(&provider, &payload.api_key);
+    let keychain_saved = catalog.remember_provider_key(&provider, &api_key);
     if !keychain_saved {
         log_api(
             &state.logger_tx,
@@ -4746,6 +4762,35 @@ bind_address = "127.0.0.1"
         assert_eq!(status, StatusCode::OK);
         assert_eq!(relisted["selected_key"], "proxy-model");
         assert_eq!(relisted["active_key"], "proxy-model");
+
+        let (status, body) = send_json(
+            &app,
+            "POST",
+            "/v1/settings/model",
+            Some(r#"{"key":"proxy-model","api_key":"sk-ab\u00e7d"}"#.to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_api_key_characters");
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("U+00E7"), "{message}");
+        assert!(message.contains("position 6"), "{message}");
+        assert!(bus_rx.try_recv().is_err());
+
+        // Invisible characters from copy-paste are removed before the key is used.
+        let (status, _) = send_json(
+            &app,
+            "POST",
+            "/v1/settings/model",
+            Some(r#"{"key":"proxy-model","api_key":"\ufeffpasted-key\u200b\n"}"#.to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let BusMessage::SwitchModel { api_key, .. } = bus_rx.recv().await.expect("switch message")
+        else {
+            panic!("expected SwitchModel");
+        };
+        assert_eq!(api_key, "pasted-key");
     }
 
     async fn send_json(
@@ -4826,6 +4871,19 @@ bind_address = "127.0.0.1"
             &app,
             "POST",
             "/v1/settings/provider-key",
+            Some(r#"{"provider_name":"alpha","api_key":"sk-ab\u00e7d"}"#.to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_api_key_characters");
+        assert!(body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("U+00E7")));
+
+        let (status, body) = send_json(
+            &app,
+            "POST",
+            "/v1/settings/provider-key",
             Some(r#"{"provider_name":"gamma","api_key":"real-key-1"}"#.to_string()),
         )
         .await;
@@ -4836,7 +4894,8 @@ bind_address = "127.0.0.1"
             &app,
             "POST",
             "/v1/settings/provider-key",
-            Some(r#"{"provider_name":"alpha","api_key":"alpha-secret-1"}"#.to_string()),
+            // Stray zero-width space and newline from copy-paste are stripped before storing.
+            Some(r#"{"provider_name":"alpha","api_key":"alpha-secret-1\u200b\n"}"#.to_string()),
         )
         .await;
         assert_eq!(status, StatusCode::OK);

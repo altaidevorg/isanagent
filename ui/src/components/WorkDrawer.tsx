@@ -15,9 +15,17 @@ import { cn } from "@/lib/utils";
 
 export type WorkTab = "jobs" | "files" | "agents" | "summaries";
 
-/** Background job kinds that represent delegated agents rather than plain tool jobs. */
-export function isAgentJob(job: BackgroundJob): boolean {
-  return /agent|task/i.test(job.kind);
+/**
+ * Background job kinds that represent delegated agents rather than plain tool jobs.
+ * Matches whole tokens of the kind (split on any non-alphanumeric, so snake_case,
+ * kebab-case and dotted kinds work): "subagent_run" and "agent_task" are agents,
+ * "batch_task", "file_task_runner" and "reagent_mix" are not.
+ */
+export function isAgentJob(job: Pick<BackgroundJob, "kind">): boolean {
+  return job.kind
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .some((token) => token === "agent" || token === "subagent");
 }
 
 type WorkDrawerProps = {

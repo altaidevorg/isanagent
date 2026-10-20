@@ -119,32 +119,17 @@ pub(crate) fn resolve_initial_active_provider_key(
     None
 }
 
-/// Lightweight placeholder check for interactively entered API keys. Mirrors
-/// `config::api_key_looks_like_placeholder` (kept private there) without depending on config
-/// internals: rejects empty values, angle-bracket templates (`<changethis>`), and common
-/// placeholder tokens.
-pub(crate) fn key_looks_like_placeholder(s: &str) -> bool {
-    let t = s.trim();
-    if t.is_empty() || t.starts_with('<') {
-        return true;
-    }
-    if !t.is_ascii() {
-        return true;
-    }
-    let lower = t.to_ascii_lowercase();
-    if lower == "changethis" {
-        return true;
-    }
-    [
-        "optional",
-        "placeholder",
-        "replace_me",
-        "replaceme",
-        "your_api_key",
-        "changeme",
-    ]
-    .iter()
-    .any(|pat| lower.contains(pat))
+/// Clean an interactively entered API key (see [`crate::credentials::normalize_api_key_input`]).
+/// On failure returns the message to show: a precise one for a non-ASCII character, otherwise
+/// the generic "not a real key" text.
+pub(crate) fn clean_api_key_input(raw: &str) -> Result<String, String> {
+    crate::credentials::normalize_api_key_input(raw).map_err(|error| match error {
+        crate::credentials::ApiKeyInputError::NonAscii { .. } => error.to_string(),
+        crate::credentials::ApiKeyInputError::Empty
+        | crate::credentials::ApiKeyInputError::Placeholder => {
+            "That doesn't look like a real API key.".to_string()
+        }
+    })
 }
 
 /// Never echo a full API key in toasts/cells: show only the trailing 4 characters, e.g. `…cd34`.
@@ -283,10 +268,13 @@ fn apply_settings_effect(
             }
         }
         SettingsEffect::SetApiKey { key, secret } => {
-            if key_looks_like_placeholder(&secret) {
-                popup.fail("That doesn't look like a real API key.");
-                return;
-            }
+            let secret = match clean_api_key_input(&secret) {
+                Ok(cleaned) => cleaned,
+                Err(message) => {
+                    popup.fail(message);
+                    return;
+                }
+            };
             try_set_api_key(
                 app,
                 bus_tx,
@@ -379,12 +367,18 @@ fn try_set_api_key(
     api_key: &str,
     active_provider_key: &mut Option<String>,
 ) {
-    if key_looks_like_placeholder(api_key) {
-        app.cells.push(Cell::Error {
-            message: "That doesn't look like a real API key. Usage: /key <api_key>  (or /key <provider_config_key> <api_key>)".into(),
-        });
-        return;
-    }
+    let api_key = match clean_api_key_input(api_key) {
+        Ok(cleaned) => cleaned,
+        Err(message) => {
+            app.cells.push(Cell::Error {
+                message: format!(
+                    "{message} Usage: /key <api_key>  (or /key <provider_config_key> <api_key>)"
+                ),
+            });
+            return;
+        }
+    };
+    let api_key = api_key.as_str();
     let Some(cfg) = providers.get_mut(config_key) else {
         let mut available: Vec<&str> = providers.keys().map(|s| s.as_str()).collect();
         available.sort_unstable();
@@ -4564,7 +4558,7 @@ mod execution_strip_tests {
 #[cfg(test)]
 mod api_key_persist_tests {
     use super::{
-        key_looks_like_placeholder, mask_api_key_suffix, mask_key_input, persist_provider_api_key,
+        clean_api_key_input, mask_api_key_suffix, mask_key_input, persist_provider_api_key,
         resolve_initial_active_provider_key,
     };
     use std::collections::HashMap;
@@ -4685,12 +4679,26 @@ mod api_key_persist_tests {
             "YOUR_API_KEY",
             "replace_me",
         ] {
-            assert!(
-                key_looks_like_placeholder(bad),
+            assert_eq!(
+                clean_api_key_input(bad),
+                Err("That doesn't look like a real API key.".to_string()),
                 "expected placeholder rejection for {bad:?}"
             );
         }
-        assert!(!key_looks_like_placeholder("sk-ant-real-secret-1234"));
+        assert_eq!(
+            clean_api_key_input("sk-ant-real-secret-1234").as_deref(),
+            Ok("sk-ant-real-secret-1234")
+        );
+        assert_eq!(
+            clean_api_key_input("\u{200B}sk-ant-real\u{00A0}-1234\n").as_deref(),
+            Ok("sk-ant-real-1234")
+        );
+        let message = clean_api_key_input("sk-ab\u{e7}d").unwrap_err();
+        assert!(
+            message.starts_with("The key contains a non-ASCII character (U+00E7"),
+            "{message}"
+        );
+        assert!(message.contains("position 6"), "{message}");
     }
 
     #[test]

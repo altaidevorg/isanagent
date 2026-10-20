@@ -12,6 +12,7 @@ use std::sync::{Arc, RwLock};
 use serde::Serialize;
 
 use crate::config::ProviderConfig;
+use crate::credentials::{normalize_api_key_input, ApiKeyInputError};
 
 const LAST_MODEL_FILE: &str = ".system_generated/last_model";
 
@@ -228,8 +229,7 @@ impl ModelCatalog {
         }
         self.key_store
             .get(&cfg.provider_name)
-            .map(|key| key.trim().to_string())
-            .filter(|key| !api_key_looks_like_placeholder(key))
+            .and_then(|key| normalize_api_key_input(&key).ok())
             .map(|key| (key, KeySource::Keychain))
     }
 
@@ -276,8 +276,7 @@ fn env_key(cfg: &ProviderConfig) -> Option<String> {
     }
     std::env::var(&env_var)
         .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !api_key_looks_like_placeholder(value))
+        .and_then(|value| normalize_api_key_input(&value).ok())
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -313,8 +312,12 @@ pub struct PreparedModelSwitch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelSwitchError {
     UnknownModel,
-    MissingApiKey { api_key_env: String },
+    MissingApiKey {
+        api_key_env: String,
+    },
     PlaceholderApiKey,
+    /// The supplied key has a character that cannot go into an HTTP header.
+    NonAsciiApiKey(ApiKeyInputError),
     UnresolvedBaseUrl(String),
 }
 
@@ -322,6 +325,8 @@ pub enum ModelSwitchError {
 pub enum ProviderKeyError {
     UnknownProvider,
     PlaceholderApiKey,
+    /// The submitted key has a character that cannot go into an HTTP header.
+    NonAsciiApiKey(ApiKeyInputError),
     /// Removing the key would leave the active model without one.
     KeyInUse {
         model_name: String,
@@ -376,14 +381,19 @@ pub fn prepare_model_switch(
         .providers
         .get(key)
         .ok_or(ModelSwitchError::UnknownModel)?;
-    let provided = provided_api_key
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let (api_key, store_in_keychain) = if let Some(provided) = provided {
-        if api_key_looks_like_placeholder(provided) {
-            return Err(ModelSwitchError::PlaceholderApiKey);
+    // A blank (or whitespace/invisible-only) key means "use the stored one".
+    let provided = match provided_api_key.map(normalize_api_key_input) {
+        None | Some(Err(ApiKeyInputError::Empty)) => None,
+        Some(Ok(cleaned)) => Some(cleaned),
+        Some(Err(ApiKeyInputError::Placeholder)) => {
+            return Err(ModelSwitchError::PlaceholderApiKey)
         }
-        (provided.to_string(), true)
+        Some(Err(error @ ApiKeyInputError::NonAscii { .. })) => {
+            return Err(ModelSwitchError::NonAsciiApiKey(error))
+        }
+    };
+    let (api_key, store_in_keychain) = if let Some(provided) = provided {
+        (provided, true)
     } else {
         match catalog.resolve_key(cfg) {
             Some((existing, _)) => (existing, false),
@@ -407,19 +417,35 @@ pub fn prepare_model_switch(
     })
 }
 
-/// Validate a key submitted for `provider_name`. Returns the configured provider name.
+/// A provider key that passed [`validate_provider_key`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedProviderKey {
+    /// The configured provider name.
+    pub provider_name: String,
+    /// The cleaned key (whitespace and invisible paste characters removed); store this one.
+    pub api_key: String,
+}
+
+/// Validate a key submitted for `provider_name`. Returns the configured provider name and
+/// the cleaned key.
 pub fn validate_provider_key(
     catalog: &ModelCatalog,
     provider_name: &str,
     api_key: &str,
-) -> Result<String, ProviderKeyError> {
+) -> Result<ValidatedProviderKey, ProviderKeyError> {
     let provider = catalog
         .find_provider_name(provider_name)
         .ok_or(ProviderKeyError::UnknownProvider)?;
-    if api_key_looks_like_placeholder(api_key) {
-        return Err(ProviderKeyError::PlaceholderApiKey);
-    }
-    Ok(provider)
+    let api_key = normalize_api_key_input(api_key).map_err(|error| match error {
+        ApiKeyInputError::NonAscii { .. } => ProviderKeyError::NonAsciiApiKey(error),
+        ApiKeyInputError::Empty | ApiKeyInputError::Placeholder => {
+            ProviderKeyError::PlaceholderApiKey
+        }
+    })?;
+    Ok(ValidatedProviderKey {
+        provider_name: provider,
+        api_key,
+    })
 }
 
 /// The switch that re-applies the active model's key after `provider_name`'s stored key
@@ -466,24 +492,6 @@ pub fn persist_active_model_key(workspace_dir: &Path, key: &str) -> Result<(), S
     let path = workspace_dir.join(LAST_MODEL_FILE);
     std::fs::write(&path, key)
         .map_err(|error| format!("Failed to write {}: {error}", path.display()))
-}
-
-fn api_key_looks_like_placeholder(value: &str) -> bool {
-    let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.starts_with('<') || !trimmed.is_ascii() {
-        return true;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    lower == "changethis"
-        || [
-            "optional",
-            "placeholder",
-            "replace_me",
-            "replaceme",
-            "your_api_key",
-        ]
-        .iter()
-        .any(|pattern| lower.contains(pattern))
 }
 
 #[cfg(test)]
@@ -597,6 +605,51 @@ mod tests {
     }
 
     #[test]
+    fn switch_cleans_pasted_keys_and_rejects_non_ascii_ones() {
+        let prepared = prepare_model_switch(
+            &catalog(None),
+            "gpt-4o",
+            Some("\u{FEFF}sk-real\u{200B}-value\u{00A0}\n"),
+        )
+        .expect("prepared");
+        assert_eq!(prepared.api_key, "sk-real-value");
+        assert!(prepared.store_in_keychain);
+
+        let error =
+            prepare_model_switch(&catalog(None), "gpt-4o", Some("sk-ab\u{e7}d")).unwrap_err();
+        assert_eq!(
+            error,
+            ModelSwitchError::NonAsciiApiKey(ApiKeyInputError::NonAscii {
+                ch: '\u{e7}',
+                position: 6,
+            })
+        );
+
+        // An invisible-only key counts as "no key supplied".
+        let error = prepare_model_switch(&catalog(None), "gpt-4o", Some("\u{200B} ")).unwrap_err();
+        assert!(matches!(error, ModelSwitchError::MissingApiKey { .. }));
+    }
+
+    #[test]
+    fn provider_key_validation_cleans_and_reports_non_ascii() {
+        let catalog = catalog(None);
+        assert_eq!(
+            validate_provider_key(&catalog, "openai", "sk-real\u{200B}\r\n")
+                .map(|validated| validated.api_key),
+            Ok("sk-real".to_string())
+        );
+        assert_eq!(
+            validate_provider_key(&catalog, "openai", "sk-ab\u{e7}d"),
+            Err(ProviderKeyError::NonAsciiApiKey(
+                ApiKeyInputError::NonAscii {
+                    ch: '\u{e7}',
+                    position: 6,
+                }
+            ))
+        );
+    }
+
+    #[test]
     fn switch_uses_a_supplied_key_without_echoing_it_into_the_list_type() {
         let prepared =
             prepare_model_switch(&catalog(None), "gemini-2.5-flash", Some("test-key-value"))
@@ -689,8 +742,11 @@ mod tests {
             Err(ProviderKeyError::UnknownProvider)
         );
         assert_eq!(
-            validate_provider_key(&catalog, "OpenAI", "sk-real").as_deref(),
-            Ok("openai")
+            validate_provider_key(&catalog, "OpenAI", "sk-real"),
+            Ok(ValidatedProviderKey {
+                provider_name: "openai".to_string(),
+                api_key: "sk-real".to_string(),
+            })
         );
     }
 
