@@ -575,19 +575,12 @@ impl LLMClient {
         self
     }
 
-    /// Send a chat completion request with history.
-    pub async fn chat(
+    /// Build the OpenAI-compatible `/chat/completions` request body.
+    fn chat_request_body(
         &self,
         messages: &[ChatMessage],
         tools: Option<serde_json::Value>,
-    ) -> Result<LLMResponse, LLMError> {
-        debug!(
-            "Sending chat request to {} with {} messages",
-            self.model,
-            messages.len()
-        );
-
-        // Construct body for OpenAI-compatible
+    ) -> serde_json::Value {
         let mut body = json!({
             "model": self.model,
             "messages": messages,
@@ -613,11 +606,47 @@ impl LLMClient {
                 obj.insert("tool_choice".to_string(), json!("auto"));
             }
         }
+        body
+    }
+
+    /// Map a non-success HTTP status + body to a typed `LLMError`.
+    fn classify_http_error(&self, status: reqwest::StatusCode, text: &str) -> LLMError {
+        log::warn!(
+            "LLM Request to '{}' returned HTTP {}: {}",
+            self.model,
+            status,
+            text
+        );
+        // PR-4: classify context-length overflow as a typed error so the
+        // reasoning loop can compact-and-retry instead of bouncing the turn.
+        if status == reqwest::StatusCode::BAD_REQUEST && LLMError::looks_like_context_overflow(text)
+        {
+            return LLMError::ContextOverflow {
+                tokens_attempted: 0,
+                max: None,
+            };
+        }
+        let friendly = format_api_error(status.as_u16(), text, &self.base_url, &self.model);
+        LLMError::ApiError(friendly)
+    }
+
+    /// Send a chat completion request with history.
+    pub async fn chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<serde_json::Value>,
+    ) -> Result<LLMResponse, LLMError> {
+        debug!(
+            "Sending chat request to {} with {} messages",
+            self.model,
+            messages.len()
+        );
+
+        let body = self.chat_request_body(messages, tools);
 
         // Normally "openai compatible" implies base_url is something like https://api.openai.com/v1
         // and we append /chat/completions.
         // But some services give you the exact endpoint.
-        // We'll look for "completions" in the URL. If missing, we append /chat/completions?
         // Let's stick to the convention in the example: The URL passed IS the endpoint.
         let url = &self.base_url;
 
@@ -634,130 +663,110 @@ impl LLMClient {
         let status = res.status();
         if !status.is_success() {
             let text = res.text().await.unwrap_or_default();
-            log::warn!(
-                "LLM Request to '{}' returned HTTP {}: {}",
-                self.model,
-                status,
-                text
-            );
-            // PR-4: classify context-length overflow as a typed error so the
-            // reasoning loop can compact-and-retry instead of bouncing the turn.
-            if status == reqwest::StatusCode::BAD_REQUEST
-                && LLMError::looks_like_context_overflow(&text)
-            {
-                return Err(LLMError::ContextOverflow {
-                    tokens_attempted: 0,
-                    max: None,
-                });
-            }
-            let friendly = format_api_error(status.as_u16(), &text, &self.base_url, &self.model);
-            return Err(LLMError::ApiError(friendly));
+            return Err(self.classify_http_error(status, &text));
         }
 
         let raw_text = res
             .text()
             .await
             .map_err(|e| LLMError::ApiError(e.to_string()))?;
-        let json_resp: serde_json::Value =
-            serde_json::from_str(&raw_text).map_err(LLMError::ParseError)?;
+        parse_chat_completion_body(&raw_text)
+    }
 
-        let content_val = &json_resp["choices"][0]["message"]["content"];
-        let content = if content_val.is_null() {
-            "".to_string()
-        } else if let Some(s) = content_val.as_str() {
-            s.to_string()
-        } else if let Some(arr) = content_val.as_array() {
-            // Some providers (Gemini, OpenRouter) return content as an array of parts
-            arr.iter()
-                .filter_map(|part| part.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join("")
-        } else {
-            return Err(LLMError::NoContent);
-        };
+    /// Streaming variant of [`Self::chat`]: requests `stream: true`, forwards text and
+    /// reasoning deltas into `sink` as they arrive, and returns the assembled response
+    /// (same shape as `chat`). Falls back to the non-streaming request when the endpoint
+    /// rejects streaming parameters, and accepts a plain JSON body from endpoints that
+    /// ignore `stream`.
+    pub async fn chat_stream(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<serde_json::Value>,
+        sink: tokio::sync::mpsc::Sender<crate::traits::StreamChunk>,
+    ) -> Result<LLMResponse, LLMError> {
+        use crate::traits::{FinishReason, StreamChunk};
 
-        // Parse tool calls — normalize `arguments` from object to string for providers
-        // (e.g. Gemini) that return it as a JSON object instead of a JSON-encoded string.
-        let tool_calls_val = &json_resp["choices"][0]["message"]["tool_calls"];
-        let tool_calls = if tool_calls_val.is_null() {
-            None
-        } else {
-            let mut tc_json = tool_calls_val.clone();
-            if let Some(arr) = tc_json.as_array_mut() {
-                for tc in arr.iter_mut() {
-                    if let Some(args) = tc.get_mut("function").and_then(|f| f.get_mut("arguments"))
-                    {
-                        if args.is_object() || args.is_array() {
-                            *args = serde_json::Value::String(args.to_string());
-                        }
-                    }
-                }
-            }
-            match serde_json::from_value::<Vec<ToolCallRequest>>(tc_json) {
-                Ok(calls) => Some(calls),
-                Err(e) => {
-                    warn!("Failed to parse tool_calls from provider response: {e}");
-                    None
-                }
-            }
-        };
-
-        let reasoning_content = json_resp["choices"][0]["message"]["reasoning_content"]
-            .as_str()
-            .map(|s| s.to_string());
-
-        let usage = json_resp.get("usage").map(|usage_obj| {
-            // PR-6.1: OpenAI exposes cache hits at
-            // `usage.prompt_tokens_details.cached_tokens` (gpt-4o+). Older models
-            // and other OpenAI-compatible providers omit it; default to 0. OpenAI
-            // doesn't bill cache writes separately, so `cache_creation_tokens`
-            // stays at 0 for this path.
-            let cache_read = usage_obj
-                .get("prompt_tokens_details")
-                .and_then(|d| d.get("cached_tokens"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
-            TokenUsage {
-                prompt_tokens: usage_obj["prompt_tokens"].as_u64().unwrap_or(0) as u32,
-                completion_tokens: usage_obj["completion_tokens"].as_u64().unwrap_or(0) as u32,
-                total_tokens: usage_obj["total_tokens"].as_u64().unwrap_or(0) as u32,
-                cache_read_tokens: cache_read,
-                cache_creation_tokens: 0,
-            }
-        });
-
-        let finish_reason = json_resp["choices"][0]["finish_reason"]
-            .as_str()
-            .unwrap_or("unknown")
-            .to_string();
-
-        if usage
-            .as_ref()
-            .map(|u| u.completion_tokens == 0)
-            .unwrap_or(false)
-            || content.trim().is_empty()
-        {
-            debug!(
-                "LLM returned empty content or zero completion tokens. finish_reason={} raw_response_len={}",
-                finish_reason,
-                raw_text.len()
+        let mut body = self.chat_request_body(messages, tools.clone());
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("stream".to_string(), json!(true));
+            obj.insert(
+                "stream_options".to_string(),
+                json!({ "include_usage": true }),
             );
         }
 
-        info!(
-            "LLM Response received ({} chars content, tool_calls: {}, reasoning: {}, usage: {})",
-            content.len(),
-            tool_calls.as_ref().map(|v| v.len()).unwrap_or(0),
-            reasoning_content.is_some(),
-            usage.is_some()
-        );
+        let client = build_reqwest_client();
+        let mut res = client
+            .post(&self.base_url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream")
+            .timeout(self.timeout)
+            .json(&body)
+            .send()
+            .await?;
 
-        Ok(LLMResponse {
-            content,
-            tool_calls,
-            reasoning_content,
-            usage,
-        })
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            let err = self.classify_http_error(status, &text);
+            // Some OpenAI-compatible servers reject `stream`/`stream_options`; retry the
+            // request without streaming and emit the whole text as one delta.
+            if status == reqwest::StatusCode::BAD_REQUEST
+                && !matches!(err, LLMError::ContextOverflow { .. })
+            {
+                debug!("Streaming request rejected; retrying without stream");
+                let resp = self.chat(messages, tools).await?;
+                if !resp.content.is_empty() {
+                    let _ = sink
+                        .send(StreamChunk::TextDelta(resp.content.clone()))
+                        .await;
+                }
+                return Ok(resp);
+            }
+            return Err(err);
+        }
+
+        if !is_event_stream(&res) {
+            let raw_text = res
+                .text()
+                .await
+                .map_err(|e| LLMError::ApiError(e.to_string()))?;
+            let resp = parse_chat_completion_body(&raw_text)?;
+            if !resp.content.is_empty() {
+                let _ = sink
+                    .send(StreamChunk::TextDelta(resp.content.clone()))
+                    .await;
+            }
+            return Ok(resp);
+        }
+
+        let mut acc = StreamAccumulator::default();
+        drive_sse(
+            &mut res,
+            &sink,
+            |e| LLMError::ApiError(e.to_string()),
+            |event, out| acc.push_data(&event.data, out),
+        )
+        .await?;
+
+        let resp = acc.finish();
+        if let Some(usage) = &resp.usage {
+            let _ = sink.send(StreamChunk::Usage(usage.clone())).await;
+        }
+        let reason = if resp.tool_calls.as_ref().is_some_and(|c| !c.is_empty()) {
+            FinishReason::ToolCalls
+        } else {
+            FinishReason::Stop
+        };
+        let _ = sink.send(StreamChunk::Finish(reason)).await;
+        info!(
+            "LLM streamed response received ({} chars content, tool_calls: {}, usage: {})",
+            resp.content.len(),
+            resp.tool_calls.as_ref().map(|v| v.len()).unwrap_or(0),
+            resp.usage.is_some()
+        );
+        Ok(resp)
     }
 
     /// Simple one-shot prompt.
@@ -770,6 +779,393 @@ impl LLMClient {
     pub async fn ask_with_system(&self, system: &str, user: &str) -> Result<LLMResponse, LLMError> {
         let messages = vec![ChatMessage::system(system), ChatMessage::user(user)];
         self.chat(&messages, None).await
+    }
+}
+
+fn parse_openai_usage(usage_obj: &serde_json::Value) -> TokenUsage {
+    // PR-6.1: OpenAI exposes cache hits at
+    // `usage.prompt_tokens_details.cached_tokens` (gpt-4o+). Older models
+    // and other OpenAI-compatible providers omit it; default to 0. OpenAI
+    // doesn't bill cache writes separately, so `cache_creation_tokens`
+    // stays at 0 for this path.
+    let cache_read = usage_obj
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    TokenUsage {
+        prompt_tokens: usage_obj["prompt_tokens"].as_u64().unwrap_or(0) as u32,
+        completion_tokens: usage_obj["completion_tokens"].as_u64().unwrap_or(0) as u32,
+        total_tokens: usage_obj["total_tokens"].as_u64().unwrap_or(0) as u32,
+        cache_read_tokens: cache_read,
+        cache_creation_tokens: 0,
+    }
+}
+
+/// Text of an OpenAI `content` value: a string, or an array of `{text}` parts
+/// (Gemini / OpenRouter). `None` when the shape is unrecognized.
+fn openai_content_text(content_val: &serde_json::Value) -> Option<String> {
+    if content_val.is_null() {
+        Some(String::new())
+    } else if let Some(s) = content_val.as_str() {
+        Some(s.to_string())
+    } else {
+        content_val.as_array().map(|arr| {
+            arr.iter()
+                .filter_map(|part| part.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+    }
+}
+
+/// Parse tool calls — normalize `arguments` from object to string for providers
+/// (e.g. Gemini) that return it as a JSON object instead of a JSON-encoded string.
+fn parse_openai_tool_calls(tool_calls_val: &serde_json::Value) -> Option<Vec<ToolCallRequest>> {
+    if tool_calls_val.is_null() {
+        return None;
+    }
+    let mut tc_json = tool_calls_val.clone();
+    if let Some(arr) = tc_json.as_array_mut() {
+        for tc in arr.iter_mut() {
+            if let Some(args) = tc.get_mut("function").and_then(|f| f.get_mut("arguments")) {
+                if args.is_object() || args.is_array() {
+                    *args = serde_json::Value::String(args.to_string());
+                }
+            }
+        }
+    }
+    match serde_json::from_value::<Vec<ToolCallRequest>>(tc_json) {
+        Ok(calls) => Some(calls),
+        Err(e) => {
+            warn!("Failed to parse tool_calls from provider response: {e}");
+            None
+        }
+    }
+}
+
+/// Parse a non-streaming OpenAI-compatible `/chat/completions` response body.
+fn parse_chat_completion_body(raw_text: &str) -> Result<LLMResponse, LLMError> {
+    let json_resp: serde_json::Value =
+        serde_json::from_str(raw_text).map_err(LLMError::ParseError)?;
+
+    let content = openai_content_text(&json_resp["choices"][0]["message"]["content"])
+        .ok_or(LLMError::NoContent)?;
+    let tool_calls = parse_openai_tool_calls(&json_resp["choices"][0]["message"]["tool_calls"]);
+    let reasoning_content = json_resp["choices"][0]["message"]["reasoning_content"]
+        .as_str()
+        .map(|s| s.to_string());
+    let usage = json_resp.get("usage").map(parse_openai_usage);
+
+    let finish_reason = json_resp["choices"][0]["finish_reason"]
+        .as_str()
+        .unwrap_or("unknown")
+        .to_string();
+
+    if usage
+        .as_ref()
+        .map(|u| u.completion_tokens == 0)
+        .unwrap_or(false)
+        || content.trim().is_empty()
+    {
+        debug!(
+            "LLM returned empty content or zero completion tokens. finish_reason={} raw_response_len={}",
+            finish_reason,
+            raw_text.len()
+        );
+    }
+
+    info!(
+        "LLM Response received ({} chars content, tool_calls: {}, reasoning: {}, usage: {})",
+        content.len(),
+        tool_calls.as_ref().map(|v| v.len()).unwrap_or(0),
+        reasoning_content.is_some(),
+        usage.is_some()
+    );
+
+    Ok(LLMResponse {
+        content,
+        tool_calls,
+        reasoning_content,
+        usage,
+    })
+}
+
+/// One server-sent event payload: the `data:` value of a single line, tagged with the most
+/// recent `event:` field of the same event block (Anthropic names its events; OpenAI and Gemini
+/// do not). Each `data:` line is dispatched on its own, which is how every LLM provider frames
+/// its JSON payloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SseEvent {
+    pub event: Option<String>,
+    pub data: String,
+}
+
+/// Whether an SSE consumer wants more events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SseStep {
+    Continue,
+    Done,
+}
+
+/// Incremental SSE line decoder shared by every streaming provider. Bytes may arrive split at
+/// arbitrary points (inside a line or a UTF-8 sequence); only complete lines are decoded.
+#[derive(Default)]
+pub(crate) struct SseDecoder {
+    buf: Vec<u8>,
+    event: Option<String>,
+}
+
+impl SseDecoder {
+    /// Feed raw bytes and return every `data:` payload completed by them.
+    pub(crate) fn push(&mut self, bytes: &[u8]) -> Vec<SseEvent> {
+        self.buf.extend_from_slice(bytes);
+        let mut events = Vec::new();
+        while let Some(pos) = self.buf.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&line);
+            if let Some(event) = self.line(line.trim_end_matches(['\r', '\n'])) {
+                events.push(event);
+            }
+        }
+        events
+    }
+
+    /// Flush a trailing line that was not newline-terminated (end of body).
+    pub(crate) fn finish(&mut self) -> Vec<SseEvent> {
+        if self.buf.is_empty() {
+            return Vec::new();
+        }
+        let rest = std::mem::take(&mut self.buf);
+        let line = String::from_utf8_lossy(&rest).to_string();
+        self.line(line.trim_end()).into_iter().collect()
+    }
+
+    fn line(&mut self, line: &str) -> Option<SseEvent> {
+        if line.is_empty() {
+            // Blank line ends the event block.
+            self.event = None;
+            return None;
+        }
+        if let Some(name) = line.strip_prefix("event:") {
+            self.event = Some(name.trim().to_string());
+            return None;
+        }
+        // Comments (`:`) and `id:` / `retry:` fields carry no payload.
+        let data = line.strip_prefix("data:")?;
+        Some(SseEvent {
+            event: self.event.clone(),
+            data: data.trim().to_string(),
+        })
+    }
+}
+
+/// Read an SSE response body to the end (or until `on_event` returns [`SseStep::Done`]),
+/// forwarding the chunks each event produces into `sink` as soon as they are decoded.
+/// `map_read_err` classifies a body read failure the same way the provider's non-streaming
+/// path classifies its own body read failure, so retry semantics stay identical.
+pub(crate) async fn drive_sse<F>(
+    res: &mut reqwest::Response,
+    sink: &tokio::sync::mpsc::Sender<crate::traits::StreamChunk>,
+    map_read_err: fn(reqwest::Error) -> LLMError,
+    mut on_event: F,
+) -> Result<(), LLMError>
+where
+    F: FnMut(&SseEvent, &mut Vec<crate::traits::StreamChunk>) -> Result<SseStep, LLMError>,
+{
+    let mut decoder = SseDecoder::default();
+    loop {
+        let chunk = res.chunk().await.map_err(map_read_err)?;
+        let events = match &chunk {
+            Some(bytes) => decoder.push(bytes),
+            None => decoder.finish(),
+        };
+        for event in &events {
+            let mut out = Vec::new();
+            let step = on_event(event, &mut out)?;
+            for c in out {
+                let _ = sink.send(c).await;
+            }
+            if step == SseStep::Done {
+                return Ok(());
+            }
+        }
+        if chunk.is_none() {
+            return Ok(());
+        }
+    }
+}
+
+/// True when the response carries an SSE body (as opposed to a plain JSON body from a server
+/// that ignored the streaming request).
+pub(crate) fn is_event_stream(res: &reqwest::Response) -> bool {
+    res.headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.contains("text/event-stream"))
+}
+
+/// Emit an already complete response as stream chunks (one text delta), used when a
+/// streaming request falls back to the non-streaming endpoint.
+pub(crate) async fn emit_whole_response(
+    sink: &tokio::sync::mpsc::Sender<crate::traits::StreamChunk>,
+    resp: &LLMResponse,
+) {
+    use crate::traits::{FinishReason, StreamChunk};
+    if let Some(reasoning) = &resp.reasoning_content {
+        let _ = sink
+            .send(StreamChunk::ReasoningDelta(reasoning.clone()))
+            .await;
+    }
+    if !resp.content.is_empty() {
+        let _ = sink
+            .send(StreamChunk::TextDelta(resp.content.clone()))
+            .await;
+    }
+    if let Some(usage) = &resp.usage {
+        let _ = sink.send(StreamChunk::Usage(usage.clone())).await;
+    }
+    let reason = if resp.tool_calls.as_ref().is_some_and(|c| !c.is_empty()) {
+        FinishReason::ToolCalls
+    } else {
+        FinishReason::Stop
+    };
+    let _ = sink.send(StreamChunk::Finish(reason)).await;
+}
+
+#[derive(Default)]
+struct StreamToolCallAcc {
+    id: String,
+    name: String,
+    arguments: String,
+    extra_content: Option<serde_json::Value>,
+}
+
+/// Assembles an OpenAI-compatible SSE `chat.completion.chunk` stream into an
+/// [`LLMResponse`], yielding UI deltas along the way.
+#[derive(Default)]
+struct StreamAccumulator {
+    content: String,
+    reasoning: String,
+    tool_calls: Vec<StreamToolCallAcc>,
+    usage: Option<TokenUsage>,
+}
+
+impl StreamAccumulator {
+    /// Consume the `data:` payload of one SSE event, pushing UI deltas into `out`.
+    fn push_data(
+        &mut self,
+        data: &str,
+        out: &mut Vec<crate::traits::StreamChunk>,
+    ) -> Result<SseStep, LLMError> {
+        use crate::traits::StreamChunk;
+        if data == "[DONE]" {
+            return Ok(SseStep::Done);
+        }
+        if data.is_empty() {
+            return Ok(SseStep::Continue);
+        }
+        let value: serde_json::Value = serde_json::from_str(data).map_err(LLMError::ParseError)?;
+        if let Some(err) = value.get("error") {
+            let msg = err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| err.to_string());
+            return Err(LLMError::ApiError(format!("Stream error: {msg}")));
+        }
+        if let Some(usage) = value.get("usage").filter(|u| !u.is_null()) {
+            self.usage = Some(parse_openai_usage(usage));
+        }
+        let Some(delta) = value
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("delta"))
+        else {
+            return Ok(SseStep::Continue);
+        };
+        if let Some(text) = delta.get("content").and_then(openai_content_text) {
+            if !text.is_empty() {
+                self.content.push_str(&text);
+                out.push(StreamChunk::TextDelta(text));
+            }
+        }
+        if let Some(r) = delta.get("reasoning_content").and_then(|r| r.as_str()) {
+            if !r.is_empty() {
+                self.reasoning.push_str(r);
+                out.push(StreamChunk::ReasoningDelta(r.to_string()));
+            }
+        }
+        if let Some(calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+            for (pos, call) in calls.iter().enumerate() {
+                let index = call
+                    .get("index")
+                    .and_then(|i| i.as_u64())
+                    .map(|i| i as usize)
+                    .unwrap_or(pos);
+                while self.tool_calls.len() <= index {
+                    self.tool_calls.push(StreamToolCallAcc::default());
+                }
+                let acc = &mut self.tool_calls[index];
+                if let Some(id) = call.get("id").and_then(|v| v.as_str()) {
+                    if !id.is_empty() {
+                        acc.id = id.to_string();
+                    }
+                }
+                if let Some(extra) = call.get("extra_content").filter(|v| !v.is_null()) {
+                    acc.extra_content = Some(extra.clone());
+                }
+                let func = call.get("function");
+                let name = func.and_then(|f| f.get("name")).and_then(|v| v.as_str());
+                if let Some(name) = name {
+                    acc.name.push_str(name);
+                }
+                let args_delta = match func.and_then(|f| f.get("arguments")) {
+                    Some(serde_json::Value::String(s)) => s.clone(),
+                    Some(v) if !v.is_null() => v.to_string(),
+                    _ => String::new(),
+                };
+                acc.arguments.push_str(&args_delta);
+                out.push(StreamChunk::ToolCallDelta {
+                    id: acc.id.clone(),
+                    name: name.map(str::to_string),
+                    args_delta,
+                });
+            }
+        }
+        Ok(SseStep::Continue)
+    }
+
+    fn finish(self) -> LLMResponse {
+        let tool_calls: Vec<ToolCallRequest> = self
+            .tool_calls
+            .into_iter()
+            .filter(|c| !c.name.is_empty())
+            .enumerate()
+            .map(|(i, c)| ToolCallRequest {
+                id: if c.id.is_empty() {
+                    format!("call_{i}")
+                } else {
+                    c.id
+                },
+                tool_type: "function".to_string(),
+                extra_content: c.extra_content,
+                function: ToolCallFunction {
+                    name: c.name,
+                    arguments: if c.arguments.trim().is_empty() {
+                        "{}".to_string()
+                    } else {
+                        c.arguments
+                    },
+                },
+            })
+            .collect();
+        LLMResponse {
+            content: self.content,
+            tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+            reasoning_content: (!self.reasoning.is_empty()).then_some(self.reasoning),
+            usage: self.usage,
+        }
     }
 }
 
@@ -999,6 +1395,76 @@ pub fn extract_markdown_from_pdf_bytes(pdf_bytes: &[u8]) -> Result<String, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sse_accumulator_assembles_text_tool_calls_and_usage() {
+        use crate::traits::StreamChunk;
+        let mut acc = StreamAccumulator::default();
+        let body = concat!(
+            ": keep-alive\n",
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"}}]}\n",
+            "\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"pa\"}}]}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"th\\\":\\\"a\\\"}\"}}]}}]}\r\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n",
+            "data: [DONE]",
+        );
+        let mut decoder = SseDecoder::default();
+        // Split at an awkward byte boundary to exercise partial-line buffering.
+        let mut events = decoder.push(&body.as_bytes()[..37]);
+        events.extend(decoder.push(&body.as_bytes()[37..]));
+        events.extend(decoder.finish());
+        let mut text = String::new();
+        let mut steps = Vec::new();
+        for event in &events {
+            let mut out = Vec::new();
+            steps.push(acc.push_data(&event.data, &mut out).expect("valid line"));
+            for c in out {
+                if let StreamChunk::TextDelta(t) = c {
+                    text.push_str(&t);
+                }
+            }
+        }
+        assert_eq!(steps.last(), Some(&SseStep::Done));
+        assert_eq!(text, "Hello");
+        let resp = acc.finish();
+        assert_eq!(resp.content, "Hello");
+        let calls = resp.tool_calls.expect("tool call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[0].function.arguments, r#"{"path":"a"}"#);
+        assert_eq!(resp.usage.expect("usage").total_tokens, 8);
+    }
+
+    #[test]
+    fn sse_decoder_tracks_event_names_per_block() {
+        let mut decoder = SseDecoder::default();
+        let events = decoder.push(b"event: ping\ndata: {}\n\ndata: {\"a\":1}\n\n");
+        assert_eq!(
+            events,
+            vec![
+                SseEvent {
+                    event: Some("ping".to_string()),
+                    data: "{}".to_string()
+                },
+                SseEvent {
+                    event: None,
+                    data: "{\"a\":1}".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn sse_accumulator_surfaces_mid_stream_errors() {
+        let mut acc = StreamAccumulator::default();
+        let err = acc
+            .push_data(r#"{"error":{"message":"overloaded"}}"#, &mut Vec::new())
+            .expect_err("error");
+        assert!(err.to_string().contains("overloaded"));
+    }
 
     #[test]
     fn looks_like_context_overflow_recognizes_known_signals() {

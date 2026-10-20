@@ -350,14 +350,17 @@ For headless or piped runs, set [terminal] enabled = false in config.toml (requi
                             let _ = std::io::Write::flush(&mut std::io::stdout());
                             continue;
                         };
-                        if crate::channels::terminal_ui::key_looks_like_placeholder(secret) {
-                            println!(
-                                "[system] That doesn't look like a real API key. Usage: /key <api_key>"
-                            );
-                            print!("> ");
-                            let _ = std::io::Write::flush(&mut std::io::stdout());
-                            continue;
-                        }
+                        let secret = match crate::channels::terminal_ui::clean_api_key_input(secret)
+                        {
+                            Ok(cleaned) => cleaned,
+                            Err(message) => {
+                                println!("[system] {message} Usage: /key <api_key>");
+                                print!("> ");
+                                let _ = std::io::Write::flush(&mut std::io::stdout());
+                                continue;
+                            }
+                        };
+                        let secret = secret.as_str();
                         match providers.get_mut(&resolved_config_key) {
                             None => {
                                 let mut available: Vec<&str> =

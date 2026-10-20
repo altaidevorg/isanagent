@@ -261,6 +261,7 @@ impl LoggingActor {
             BusMessage::LoggerControl(_) => return,
             BusMessage::Cancel(_) => return,
             BusMessage::CancelRun { .. } => return,
+            BusMessage::RollbackRun { .. } => return,
             BusMessage::Steer { .. } => return,
             BusMessage::PromoteSyncToBackground(_) => return,
             BusMessage::SetTerminalSessionChat { .. } => return,
@@ -363,6 +364,14 @@ impl LoggingActor {
             BusMessage::CancelRun { chat_id, run_id } => LogEvent::info(
                 "BusMessage",
                 &format!("Cancel reasoning loop for chat_id={chat_id} run_id={run_id}"),
+            )
+            .with_chat_id(chat_id),
+            BusMessage::RollbackRun { chat_id, run_id } => LogEvent::info(
+                "BusMessage",
+                &format!(
+                    "Cancel and roll back run for chat_id={chat_id} run_id={}",
+                    run_id.as_deref().unwrap_or("-")
+                ),
             )
             .with_chat_id(chat_id),
             BusMessage::Steer {
@@ -1063,6 +1072,29 @@ fn telemetry_to_log_event(telemetry: &TelemetryEvent) -> LogEvent {
         } => LogEvent::info(
             "Telemetry",
             &format!("ToolResultRefetch tool_call_id={tool_call_id}"),
+        )
+        .with_chat_id(chat_id),
+        TelemetryEvent::UserTurnPersisted {
+            chat_id,
+            run_id,
+            message_id,
+        } => LogEvent::debug(
+            "Telemetry",
+            &format!("UserTurnPersisted run_id={run_id} message_id={message_id}"),
+        )
+        .with_chat_id(chat_id),
+        TelemetryEvent::TurnRollbackFinished {
+            chat_id,
+            run_id,
+            rolled_back,
+            removed_messages,
+            reason,
+        } => LogEvent::info(
+            "Telemetry",
+            &format!(
+                "TurnRollbackFinished run_id={} rolled_back={rolled_back} removed_messages={removed_messages} reason={reason:?}",
+                run_id.as_deref().unwrap_or("-")
+            ),
         )
         .with_chat_id(chat_id),
     }

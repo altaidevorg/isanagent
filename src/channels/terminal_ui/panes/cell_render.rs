@@ -117,10 +117,13 @@ pub(crate) fn cell_block_lines(cell: &Cell, inner_width: usize) -> Vec<Line<'sta
             edit_diff,
         } => {
             let inner = w.saturating_sub(2).max(8);
+            let is_approval = crate::channels::terminal_ui::is_approval_choice_set(choices);
             let title = if edit_diff.is_some() {
                 "edit approval"
-            } else {
+            } else if is_approval {
                 "approval"
+            } else {
+                "question"
             };
             let mut v = vec![Line::from(vec![
                 Span::styled(" ? ", Theme::clarification()),
@@ -141,21 +144,13 @@ pub(crate) fn cell_block_lines(cell: &Cell, inner_width: usize) -> Vec<Line<'sta
             for ln in wrap_text(text, inner) {
                 v.push(Line::from(Span::styled(ln, Theme::clarification())));
             }
-            let shown_choices = if choices.is_empty() {
-                crate::channels::terminal_ui::APPROVAL_CHOICES
-                    .iter()
-                    .map(|s| (*s).to_string())
-                    .collect::<Vec<_>>()
-            } else {
-                choices.clone()
-            };
-            if !shown_choices.is_empty() {
+            if !choices.is_empty() {
                 v.push(Line::from(Span::styled(
-                    "1 approve · 2 deny · 3 always · 4 abort  (or type the option)",
+                    clarification_hint(choices, is_approval),
                     Theme::dim(),
                 )));
                 let indent = "   ";
-                for (i, choice) in shown_choices.iter().enumerate() {
+                for (i, choice) in choices.iter().enumerate() {
                     let n = i + 1;
                     let head = format!("{n}. ");
                     let first = format!("{head}{choice}");
@@ -195,10 +190,76 @@ pub(crate) fn cell_block_lines(cell: &Cell, inner_width: usize) -> Vec<Line<'sta
     }
 }
 
+/// Key hint above a clarification's numbered option list.
+fn clarification_hint(choices: &[String], is_approval: bool) -> String {
+    if is_approval {
+        return "y/1 approve · n/2 deny · a/3 always · x/4 abort  (or type a reply)".into();
+    }
+    match choices.len().min(9) {
+        0 => "type a reply".into(),
+        1 => "press 1 to choose it, or type a reply".into(),
+        n => format!("press 1-{n} to choose, or type a reply"),
+    }
+}
+
 pub(crate) fn flatten_cells_to_lines(cells: &[Cell], inner_width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for cell in cells {
         lines.extend(cell_block_lines(cell, inner_width));
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text_of(cell: &Cell) -> Vec<String> {
+        cell_block_lines(cell, 80)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn custom_question_shows_its_own_options() {
+        let cell = Cell::Clarification {
+            text: "Pick a color".into(),
+            choices: vec!["red".into(), "green".into()],
+            edit_diff: None,
+        };
+        let lines = text_of(&cell);
+        assert!(lines[0].contains("question"), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("approve")), "{lines:?}");
+        assert!(lines.iter().any(|l| l == "1. red"), "{lines:?}");
+        assert!(lines.iter().any(|l| l == "2. green"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("press 1-2")), "{lines:?}");
+    }
+
+    #[test]
+    fn approval_prompt_keeps_hotkey_hint() {
+        let cell = Cell::Clarification {
+            text: "Run `rm -rf build`?".into(),
+            choices: crate::channels::terminal_ui::APPROVAL_CHOICES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            edit_diff: None,
+        };
+        let lines = text_of(&cell);
+        assert!(lines[0].contains("approval"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("n/2 deny")), "{lines:?}");
+    }
+
+    #[test]
+    fn free_text_question_lists_no_options() {
+        let cell = Cell::Clarification {
+            text: "What is the project name?".into(),
+            choices: Vec::new(),
+            edit_diff: None,
+        };
+        let lines = text_of(&cell);
+        assert!(lines[0].contains("question"), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.starts_with("1. ")), "{lines:?}");
+    }
 }

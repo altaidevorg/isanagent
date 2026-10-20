@@ -17,11 +17,14 @@ mod text_format;
 mod theme;
 
 pub use app::{
-    AgentTaskEntry, AgentTaskStatus, App, Cell, JobStripEntry, JobStripStatus, ModelSelector,
-    ModelSelectorStage, TerminalUiFocus, TerminalUiMode, ToastKind, ToolNoticePhase, ToolRailEntry,
-    TranscriptSelection,
+    scan_workspace_files, AgentTaskEntry, AgentTaskStatus, App, Cell, JobStripEntry,
+    JobStripStatus, ModelSelector, ModelSelectorStage, TerminalUiFocus, TerminalUiMode, ToastKind,
+    ToolNoticePhase, ToolRailEntry, TranscriptSelection, WorkItem,
 };
-pub use approval::{approval_hotkey_reply, EditDiffPayload, APPROVAL_CHOICES};
+pub use approval::{
+    approval_hotkey_reply, clarification_hotkey_reply, is_approval_choice_set, EditDiffPayload,
+    APPROVAL_CHOICES,
+};
 pub use attachments::{
     load_host_file_attachments, load_sandbox_file_attachment, parse_terminal_attachments,
 };
@@ -31,7 +34,7 @@ pub use theme::{
 };
 
 pub(crate) use run::{
-    key_looks_like_placeholder, mask_api_key_suffix, persist_provider_api_key,
+    clean_api_key_input, mask_api_key_suffix, persist_provider_api_key,
     resolve_initial_active_provider_key, run_ratatui_main, RatatuiMainConfig,
 };
 

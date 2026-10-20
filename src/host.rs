@@ -1257,6 +1257,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                 BusMessage::Inbound(_)
                     | BusMessage::Cancel(_)
                     | BusMessage::CancelRun { .. }
+                    | BusMessage::RollbackRun { .. }
                     | BusMessage::Steer { .. }
                     | BusMessage::SwitchModel { .. }
             ) {
@@ -1466,6 +1467,13 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
                                     "Failed to deliver tool-result notice to terminal: {e}"
                                 );
                             }
+                        }
+                    }
+                }
+                BusMessage::StreamDelta { chat_id, chunk } => {
+                    if let Some(api_chan) = delivery_channels.get("api") {
+                        if let Some(api_chan) = api_chan.as_any().downcast_ref::<ApiChannel>() {
+                            api_chan.handle_stream_delta(chat_id, chunk);
                         }
                     }
                 }

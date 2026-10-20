@@ -179,6 +179,10 @@ pub enum StreamChunk {
     Usage(crate::utils::TokenUsage),
     /// Stream finished event.
     Finish(FinishReason),
+    /// Emitted by the reasoning loop (never by a provider): text streamed earlier in
+    /// this run was discarded — a new model call or a retry is starting. Clients
+    /// should clear any partially rendered assistant text.
+    Reset,
 }
 
 /// A Provider abstracts the generation capabilities of an LLM.

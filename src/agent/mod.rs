@@ -86,6 +86,9 @@ struct ActiveRunHandle {
     run_id: String,
     token: Arc<tokio_util::sync::CancellationToken>,
     steering: Arc<Mutex<SteeringInbox>>,
+    /// Set by [`BusMessage::RollbackRun`] before the token is cancelled. The run's own task
+    /// reads it after the reasoning loop has unwound and then deletes the rows the run wrote.
+    rollback_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Constructor arguments for [`AgentLogic`], grouped to keep call sites readable.
@@ -483,6 +486,68 @@ impl AgentLogic {
     }
 }
 
+impl AgentLogic {
+    /// [`BusMessage::RollbackRun`]: flag the matching active run for rollback and cancel it.
+    /// The run's task performs the deletion after the loop unwinds and answers with
+    /// [`crate::bus::TelemetryEvent::TurnRollbackFinished`]; every other case answers here.
+    async fn rollback_run(&self, chat_id: &str, run_id: Option<String>) {
+        use crate::bus::{RollbackSkipReason, TelemetryEvent};
+        let active = self
+            .cancellation_tokens
+            .get(chat_id)
+            .map(|entry| entry.value().clone());
+        let skipped =
+            |reason: RollbackSkipReason, rolled_back: bool| TelemetryEvent::TurnRollbackFinished {
+                chat_id: chat_id.to_string(),
+                run_id: run_id.clone(),
+                rolled_back,
+                removed_messages: 0,
+                reason: (!rolled_back).then_some(reason),
+            };
+        let event = match active {
+            Some(active) if run_id.as_deref().is_none_or(|id| id == active.run_id) => {
+                active
+                    .rollback_requested
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                // Also drops queued inbounds for the chat, exactly like `Cancel`.
+                self.cancel_active_run(chat_id, Some(&active.run_id));
+                return;
+            }
+            Some(_) => {
+                // Not the active run: if it is still queued it never persisted anything, so
+                // dropping it from the FIFO is a complete rollback.
+                let removed = run_id
+                    .as_deref()
+                    .is_some_and(|wanted| self.remove_queued_run(chat_id, wanted));
+                skipped(RollbackSkipReason::RunMismatch, removed)
+            }
+            None => skipped(RollbackSkipReason::NoActiveRun, false),
+        };
+        let _ = self.outbound_tx.send(BusMessage::Telemetry(event)).await;
+    }
+
+    /// Remove one queued inbound by run id. Returns whether it was found.
+    fn remove_queued_run(&self, chat_id: &str, run_id: &str) -> bool {
+        let Some(queue) = self.pending_inbound.get(chat_id) else {
+            return false;
+        };
+        let mut guard = match queue.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let before = guard.len();
+        guard.retain(|queued| {
+            queued
+                .inbound
+                .metadata
+                .get(crate::bus::METADATA_RUN_ID)
+                .and_then(|v| v.as_str())
+                != Some(run_id)
+        });
+        guard.len() != before
+    }
+}
+
 /// The Agent processes incoming BusMessages, updates memory based on session key,
 /// and outputs BusMessages (specifically Outbound) back to the channel.
 #[async_trait]
@@ -505,6 +570,10 @@ impl ActorLogic<BusMessage> for AgentLogic {
             }
             BusMessage::CancelRun { chat_id, run_id } => {
                 self.cancel_active_run(&chat_id, Some(&run_id));
+                return Ok(None);
+            }
+            BusMessage::RollbackRun { chat_id, run_id } => {
+                self.rollback_run(&chat_id, run_id).await;
                 return Ok(None);
             }
             BusMessage::Steer {
@@ -1205,11 +1274,12 @@ mod tests {
 
     use crate::bus::{
         clarification_session_key, BusMessage, InboundMessage, RunBudgetSnapshot, RunFailureKind,
-        RunLifecycleEvent, RunOutcome, RunStuckReason, METADATA_RUN_ID,
+        RunLifecycleEvent, RunOutcome, RunStuckReason, TelemetryEvent, METADATA_RUN_ID,
     };
     use crate::clarification::ClarificationHub;
     use crate::logging::create_logger_channel;
     use crate::memory::SqliteMemoryActor;
+    use crate::memory::{MemoryMessage, SharedReply};
     use crate::multi_tenant_edge::{ActivityHeartbeatClient, HeartbeatTransport};
     use crate::session::SessionManager;
     use crate::skills::SkillRegistry;
@@ -2020,13 +2090,29 @@ mod tests {
         fallback_providers: Vec<super::FallbackProviderSpec>,
         clarification_hub: Arc<ClarificationHub>,
     ) -> (AgentLogic, mpsc::Receiver<BusMessage>) {
+        build_agent_with_provider_state_and_tool_delay(
+            provider,
+            provider_credentials,
+            fallback_providers,
+            clarification_hub,
+            Duration::from_millis(0),
+        )
+    }
+
+    fn build_agent_with_provider_state_and_tool_delay(
+        provider: Box<dyn Provider>,
+        provider_credentials: crate::provider::ProviderCredentials,
+        fallback_providers: Vec<super::FallbackProviderSpec>,
+        clarification_hub: Arc<ClarificationHub>,
+        tool_delay: Duration,
+    ) -> (AgentLogic, mpsc::Receiver<BusMessage>) {
         let memory_actor = SqliteMemoryActor::new(":memory:").expect("memory actor");
         let memory_node = NodeHandle::new(memory_actor, 16, 1, Duration::from_millis(1));
         let session_manager = SessionManager::new(memory_node);
 
         let mut tools = ToolRegistry::new();
         tools.register(Box::new(SlowTool {
-            delay: Duration::from_millis(0),
+            delay: tool_delay,
             result: "tool complete".to_string(),
         }));
 
@@ -3446,5 +3532,432 @@ mod tests {
             missing.is_err(),
             "unknown skill should still error after rescan: {missing:?}"
         );
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Stop-with-rollback (`BusMessage::RollbackRun`)
+    // ---------------------------------------------------------------------------------
+
+    /// Call 0: plain answer. Call 1: `slow_tool` call. Call 2: blocks until cancelled.
+    /// Later calls: plain answer. Records every request's messages.
+    #[derive(Clone)]
+    struct ScriptedRollbackProvider {
+        calls: Arc<AtomicUsize>,
+        seen: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+        /// Script index offset: `1` starts at the tool-call step (no completed first turn).
+        offset: usize,
+    }
+
+    #[async_trait]
+    impl Provider for ScriptedRollbackProvider {
+        async fn chat(
+            &self,
+            messages: &[ChatMessage],
+            _tools: Option<serde_json::Value>,
+        ) -> Result<LLMResponse, LLMError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + self.offset;
+            if let Ok(mut seen) = self.seen.lock() {
+                seen.push(messages.to_vec());
+            }
+            let text = |content: &str| LLMResponse {
+                content: content.to_string(),
+                tool_calls: None,
+                reasoning_content: None,
+                usage: None,
+            };
+            match n {
+                0 => Ok(text("first answer")),
+                1 => Ok(LLMResponse {
+                    content: "partial thoughts before the tool".to_string(),
+                    tool_calls: Some(vec![crate::utils::ToolCallRequest {
+                        id: "call_undo".to_string(),
+                        tool_type: "function".to_string(),
+                        extra_content: None,
+                        function: crate::utils::ToolCallFunction {
+                            name: "slow_tool".to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                    }]),
+                    reasoning_content: None,
+                    usage: None,
+                }),
+                2 => {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    Err(LLMError::ApiError("should have been cancelled".into()))
+                }
+                _ => Ok(text("answer after rollback")),
+            }
+        }
+    }
+
+    async fn next_bus<F: FnMut(&BusMessage) -> bool>(
+        rx: &mut mpsc::Receiver<BusMessage>,
+        mut pick: F,
+    ) -> BusMessage {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match rx.recv().await {
+                    Some(msg) if pick(&msg) => return msg,
+                    Some(_) => continue,
+                    None => panic!("outbound channel closed"),
+                }
+            }
+        })
+        .await
+        .expect("bus event within 10s")
+    }
+
+    async fn wait_for_calls(calls: &AtomicUsize, at_least: usize) {
+        for _ in 0..1000 {
+            if calls.load(Ordering::SeqCst) >= at_least {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("provider never reached {at_least} calls");
+    }
+
+    async fn thread_history(agent: &AgentLogic, thread_id: &str) -> crate::memory::ThreadHistory {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        agent
+            .session_manager
+            .get_memory_node()
+            .send_packet(MemoryMessage::GetThreadHistory {
+                thread_id: thread_id.to_string(),
+                reply: SharedReply::new(tx),
+            })
+            .await
+            .expect("send");
+        rx.await.expect("reply").expect("history")
+    }
+
+    fn started_run_id(msg: &BusMessage) -> String {
+        match msg {
+            BusMessage::RunLifecycle(RunLifecycleEvent::Started { run_id, .. }) => run_id.clone(),
+            other => panic!("expected Started, got {other:?}"),
+        }
+    }
+
+    fn message_text(message: &ChatMessage) -> String {
+        message
+            .content
+            .as_ref()
+            .map(|c| c.text_content())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn rollback_removes_the_cancelled_turn_and_the_next_turn_never_sees_it() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (mut agent, mut rx) = build_agent_with_provider(Box::new(ScriptedRollbackProvider {
+            calls: calls.clone(),
+            seen: seen.clone(),
+            offset: 0,
+        }));
+        let chat_id = "rollback-chat";
+        let thread = "terminal:rollback-chat:";
+
+        // Turn 1 completes and must survive.
+        agent
+            .process(BusMessage::Inbound(test_inbound(chat_id, "keep me")))
+            .await
+            .expect("turn 1");
+        next_bus(&mut rx, |m| {
+            matches!(
+                m,
+                BusMessage::RunLifecycle(RunLifecycleEvent::Terminated { .. })
+            )
+        })
+        .await;
+        let kept = thread_history(&agent, thread).await;
+        assert_eq!(kept.messages.len(), 2, "user + assistant of turn 1");
+
+        // Turn 2: tool round, then the provider hangs. Stop with rollback mid-turn.
+        agent
+            .process(BusMessage::Inbound(test_inbound(chat_id, "undo me")))
+            .await
+            .expect("turn 2");
+        let run_id = started_run_id(
+            &next_bus(&mut rx, |m| {
+                matches!(
+                    m,
+                    BusMessage::RunLifecycle(RunLifecycleEvent::Started { .. })
+                )
+            })
+            .await,
+        );
+        let user_message_id = match next_bus(&mut rx, |m| {
+            matches!(
+                m,
+                BusMessage::Telemetry(TelemetryEvent::UserTurnPersisted { .. })
+            )
+        })
+        .await
+        {
+            BusMessage::Telemetry(TelemetryEvent::UserTurnPersisted {
+                run_id: persisted_run,
+                message_id,
+                ..
+            }) => {
+                assert_eq!(persisted_run, run_id);
+                message_id
+            }
+            _ => unreachable!(),
+        };
+        wait_for_calls(&calls, 3).await;
+        let mid_turn = thread_history(&agent, thread).await;
+        assert!(
+            mid_turn.messages.len() >= 5,
+            "turn 2 persisted user, tool-call and tool rows before Stop"
+        );
+
+        agent
+            .process(BusMessage::RollbackRun {
+                chat_id: chat_id.to_string(),
+                run_id: Some(run_id.clone()),
+            })
+            .await
+            .expect("rollback accepted");
+
+        // The answer comes from the run's own task after the loop unwound, before Terminated.
+        let mut saw_rollback = None;
+        loop {
+            match next_bus(&mut rx, |m| {
+                matches!(
+                    m,
+                    BusMessage::Telemetry(TelemetryEvent::TurnRollbackFinished { .. })
+                        | BusMessage::RunLifecycle(RunLifecycleEvent::Terminated { .. })
+                )
+            })
+            .await
+            {
+                BusMessage::Telemetry(TelemetryEvent::TurnRollbackFinished {
+                    run_id: rolled,
+                    rolled_back,
+                    removed_messages,
+                    reason,
+                    ..
+                }) => {
+                    assert_eq!(rolled.as_deref(), Some(run_id.as_str()));
+                    assert!(rolled_back, "rollback reason: {reason:?}");
+                    saw_rollback = Some(removed_messages);
+                }
+                BusMessage::RunLifecycle(RunLifecycleEvent::Terminated { outcome, .. }) => {
+                    assert_eq!(outcome, RunOutcome::Cancelled);
+                    break;
+                }
+                _ => unreachable!(),
+            }
+        }
+        let removed = saw_rollback.expect("TurnRollbackFinished precedes Terminated");
+        // user + assistant(tool call) + tool result + the cancel notice the loop wrote *after*
+        // the cancel arrived (a late write a truncate-at-request-time design would miss).
+        assert_eq!(removed, mid_turn.messages.len() - 2 + 1);
+
+        let after = thread_history(&agent, thread).await;
+        let after_ids: Vec<i64> = after.messages.iter().map(|(id, _)| *id).collect();
+        let kept_ids: Vec<i64> = kept.messages.iter().map(|(id, _)| *id).collect();
+        assert_eq!(after_ids, kept_ids, "only turn 1 remains");
+        assert!(after_ids.iter().all(|id| *id < user_message_id));
+
+        // Turn 3 is built from the rolled-back history.
+        agent
+            .process(BusMessage::Inbound(test_inbound(chat_id, "fresh question")))
+            .await
+            .expect("turn 3");
+        next_bus(&mut rx, |m| {
+            matches!(
+                m,
+                BusMessage::RunLifecycle(RunLifecycleEvent::Terminated { .. })
+            )
+        })
+        .await;
+        let requests = seen.lock().expect("seen").clone();
+        let last = requests.last().expect("turn 3 request");
+        let texts: Vec<String> = last.iter().map(message_text).collect();
+        assert!(texts.iter().any(|t| t.contains("keep me")));
+        assert!(texts.iter().any(|t| t.contains("fresh question")));
+        for t in &texts {
+            assert!(!t.contains("undo me"), "rolled-back user text leaked: {t}");
+            assert!(
+                !t.contains("partial thoughts"),
+                "rolled-back assistant text leaked"
+            );
+            assert!(
+                !t.contains("tool complete"),
+                "rolled-back tool result leaked"
+            );
+            assert!(!t.contains("Request cancelled"), "cancel notice leaked");
+        }
+        assert!(last
+            .iter()
+            .all(|m| m.role != "tool" && m.tool_calls.is_none()));
+    }
+
+    #[tokio::test]
+    async fn rollback_while_a_tool_runs_waits_for_the_late_writes_then_empties_the_thread() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (mut agent, mut rx) = build_agent_with_provider_state_and_tool_delay(
+            Box::new(ScriptedRollbackProvider {
+                calls: calls.clone(),
+                seen: Arc::new(Mutex::new(Vec::new())),
+                offset: 1,
+            }),
+            crate::provider::ProviderCredentials::empty(),
+            Vec::new(),
+            ClarificationHub::shared(),
+            Duration::from_secs(3600),
+        );
+        let chat_id = "rollback-tool-chat";
+        let thread = "terminal:rollback-tool-chat:";
+        agent
+            .process(BusMessage::Inbound(test_inbound(chat_id, "first and only")))
+            .await
+            .expect("turn");
+        next_bus(&mut rx, |m| {
+            matches!(
+                m,
+                BusMessage::Telemetry(TelemetryEvent::ToolCallStarted { .. })
+            )
+        })
+        .await;
+        // Chat-scoped rollback (no run id) while the tool is mid-flight; a second turn queued
+        // behind it is dropped like a plain Cancel.
+        agent
+            .process(BusMessage::Inbound(test_inbound(
+                chat_id,
+                "queued follow-up",
+            )))
+            .await
+            .expect("queue");
+        agent
+            .process(BusMessage::RollbackRun {
+                chat_id: chat_id.to_string(),
+                run_id: None,
+            })
+            .await
+            .expect("rollback");
+        match next_bus(&mut rx, |m| {
+            matches!(
+                m,
+                BusMessage::Telemetry(TelemetryEvent::TurnRollbackFinished { .. })
+            )
+        })
+        .await
+        {
+            BusMessage::Telemetry(TelemetryEvent::TurnRollbackFinished {
+                rolled_back,
+                removed_messages,
+                ..
+            }) => {
+                assert!(rolled_back);
+                assert!(removed_messages >= 2);
+            }
+            _ => unreachable!(),
+        }
+        next_bus(&mut rx, |m| {
+            matches!(
+                m,
+                BusMessage::RunLifecycle(RunLifecycleEvent::Terminated { .. })
+            )
+        })
+        .await;
+        // Give a would-be late writer every chance to land, then check nothing did.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(thread_history(&agent, thread).await.messages.is_empty());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "queued follow-up never ran"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_for_another_run_or_an_idle_chat_changes_nothing() {
+        let (mut agent, mut rx) = build_agent_with_provider(Box::new(LongSleepProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+        let chat_id = "rollback-mismatch-chat";
+
+        agent
+            .process(BusMessage::RollbackRun {
+                chat_id: chat_id.to_string(),
+                run_id: None,
+            })
+            .await
+            .expect("idle rollback");
+        match next_bus(&mut rx, |m| {
+            matches!(
+                m,
+                BusMessage::Telemetry(TelemetryEvent::TurnRollbackFinished { .. })
+            )
+        })
+        .await
+        {
+            BusMessage::Telemetry(TelemetryEvent::TurnRollbackFinished {
+                rolled_back,
+                reason,
+                ..
+            }) => {
+                assert!(!rolled_back);
+                assert_eq!(reason, Some(crate::bus::RollbackSkipReason::NoActiveRun));
+            }
+            _ => unreachable!(),
+        }
+
+        agent
+            .process(BusMessage::Inbound(test_inbound(chat_id, "long")))
+            .await
+            .expect("start");
+        let run_id = started_run_id(
+            &next_bus(&mut rx, |m| {
+                matches!(
+                    m,
+                    BusMessage::RunLifecycle(RunLifecycleEvent::Started { .. })
+                )
+            })
+            .await,
+        );
+        agent
+            .process(BusMessage::RollbackRun {
+                chat_id: chat_id.to_string(),
+                run_id: Some("someone-else".to_string()),
+            })
+            .await
+            .expect("mismatched rollback");
+        match next_bus(&mut rx, |m| {
+            matches!(
+                m,
+                BusMessage::Telemetry(TelemetryEvent::TurnRollbackFinished { .. })
+                    | BusMessage::RunLifecycle(RunLifecycleEvent::Terminated { .. })
+            )
+        })
+        .await
+        {
+            BusMessage::Telemetry(TelemetryEvent::TurnRollbackFinished {
+                rolled_back,
+                reason,
+                ..
+            }) => {
+                assert!(!rolled_back);
+                assert_eq!(reason, Some(crate::bus::RollbackSkipReason::RunMismatch));
+            }
+            other => panic!("mismatched rollback must not stop the run: {other:?}"),
+        }
+        assert!(agent.cancellation_tokens.contains_key(chat_id));
+        let user_rows = thread_history(&agent, "terminal:rollback-mismatch-chat:")
+            .await
+            .messages
+            .len();
+        assert_eq!(user_rows, 1, "active run's user row is untouched");
+
+        agent
+            .process(BusMessage::CancelRun {
+                chat_id: chat_id.to_string(),
+                run_id,
+            })
+            .await
+            .expect("cleanup cancel");
     }
 }

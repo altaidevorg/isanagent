@@ -91,6 +91,27 @@ pub fn approval_hotkey_reply(ch: char) -> Option<&'static str> {
     }
 }
 
+/// True when `choices` is exactly the shell / edit approval set (in order), so the
+/// single-key approval hotkeys apply. Custom `ask_user` questions return false.
+pub fn is_approval_choice_set(choices: &[String]) -> bool {
+    choices.len() == APPROVAL_CHOICES.len()
+        && choices
+            .iter()
+            .zip(APPROVAL_CHOICES)
+            .all(|(c, a)| c.trim().eq_ignore_ascii_case(a))
+}
+
+/// Reply for a single key pressed on an empty compose line while a clarification is pending.
+/// Approval prompts keep the y/n/a/x + 1-4 hotkeys; other questions only map digit `N` to
+/// option `N` of their own list. `None` means the key should be typed normally.
+pub fn clarification_hotkey_reply(choices: &[String], ch: char) -> Option<String> {
+    if is_approval_choice_set(choices) {
+        return approval_hotkey_reply(ch).map(str::to_string);
+    }
+    let n = ch.to_digit(10)? as usize;
+    n.checked_sub(1).and_then(|i| choices.get(i)).cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +131,37 @@ mod tests {
         assert_eq!(approval_hotkey_reply('y'), Some("approve"));
         assert_eq!(approval_hotkey_reply('3'), Some("always"));
         assert_eq!(approval_hotkey_reply('x'), Some("abort"));
+    }
+
+    fn owned(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn approval_prompts_keep_letter_hotkeys() {
+        let c = owned(APPROVAL_CHOICES);
+        assert!(is_approval_choice_set(&c));
+        assert_eq!(clarification_hotkey_reply(&c, 'n').as_deref(), Some("deny"));
+        assert_eq!(
+            clarification_hotkey_reply(&c, '3').as_deref(),
+            Some("always")
+        );
+        assert_eq!(clarification_hotkey_reply(&c, 'q'), None);
+    }
+
+    #[test]
+    fn custom_questions_map_digits_to_their_own_options() {
+        let c = owned(&["red", "green", "blue"]);
+        assert!(!is_approval_choice_set(&c));
+        assert_eq!(
+            clarification_hotkey_reply(&c, '2').as_deref(),
+            Some("green")
+        );
+        assert_eq!(clarification_hotkey_reply(&c, '0'), None);
+        assert_eq!(clarification_hotkey_reply(&c, '4'), None);
+        // Letters are free text, never an approval reply.
+        assert_eq!(clarification_hotkey_reply(&c, 'n'), None);
+        assert_eq!(clarification_hotkey_reply(&c, 'y'), None);
+        assert_eq!(clarification_hotkey_reply(&[], '1'), None);
     }
 }

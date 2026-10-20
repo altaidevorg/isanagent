@@ -82,3 +82,207 @@
     min-height: 100dvh;
   }
 }
+
+/* Assistant markdown. Spacing/typography only; colors come from the theme tokens.
+   Kept outside @layer so Tailwind does not purge selectors (e.g. highlight.js classes)
+   that never appear literally in the sources. */
+  .md-body > :first-child {
+    margin-top: 0;
+  }
+  .md-body > :last-child {
+    margin-bottom: 0;
+  }
+  .md-body p {
+    margin: 0.5rem 0;
+  }
+  .md-body h1,
+  .md-body h2,
+  .md-body h3,
+  .md-body h4,
+  .md-body h5,
+  .md-body h6 {
+    margin: 1.1rem 0 0.4rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    line-height: 1.35;
+  }
+  .md-body h1 {
+    font-size: 1.3rem;
+  }
+  .md-body h2 {
+    font-size: 1.15rem;
+  }
+  .md-body h3 {
+    font-size: 1.02rem;
+  }
+  .md-body h4,
+  .md-body h5,
+  .md-body h6 {
+    font-size: 0.95rem;
+  }
+  .md-body ul,
+  .md-body ol {
+    margin: 0.5rem 0;
+    padding-left: 1.4rem;
+  }
+  .md-body ul {
+    list-style: disc;
+  }
+  .md-body ol {
+    list-style: decimal;
+  }
+  .md-body ul ul {
+    list-style: circle;
+  }
+  .md-body ul ul ul {
+    list-style: square;
+  }
+  .md-body li {
+    margin: 0.15rem 0;
+  }
+  .md-body li > ul,
+  .md-body li > ol {
+    margin: 0.15rem 0;
+  }
+  .md-body li > p {
+    margin: 0.2rem 0;
+  }
+  .md-body li.task-list-item {
+    list-style: none;
+  }
+  .md-body li.task-list-item input {
+    margin: 0 0.4rem 0 -1.2rem;
+    vertical-align: middle;
+  }
+  .md-body blockquote {
+    margin: 0.6rem 0;
+    border-left: 3px solid hsl(var(--border));
+    padding: 0.1rem 0 0.1rem 0.85rem;
+    color: hsl(var(--muted-foreground));
+  }
+  .md-body hr {
+    margin: 1rem 0;
+    border-color: hsl(var(--border));
+  }
+  .md-body tbody tr:last-child td {
+    border-bottom: 0;
+  }
+  .md-body img {
+    max-width: 100%;
+    border-radius: 0.5rem;
+  }
+
+  /* highlight.js tokens, light theme */
+  .hljs {
+    color: hsl(var(--foreground));
+    background: transparent;
+  }
+  .hljs-comment,
+  .hljs-quote {
+    color: hsl(60 2% 45%);
+    font-style: italic;
+  }
+  .hljs-keyword,
+  .hljs-selector-tag,
+  .hljs-literal,
+  .hljs-doctag,
+  .hljs-meta .hljs-keyword {
+    color: hsl(280 55% 42%);
+  }
+  .hljs-string,
+  .hljs-regexp,
+  .hljs-addition,
+  .hljs-meta .hljs-string {
+    color: hsl(140 50% 30%);
+  }
+  .hljs-number,
+  .hljs-symbol,
+  .hljs-bullet,
+  .hljs-variable.constant_ {
+    color: hsl(24 80% 40%);
+  }
+  .hljs-title,
+  .hljs-title.function_,
+  .hljs-section {
+    color: hsl(217 70% 45%);
+  }
+  .hljs-type,
+  .hljs-built_in,
+  .hljs-title.class_,
+  .hljs-class .hljs-title {
+    color: hsl(190 70% 32%);
+  }
+  .hljs-attr,
+  .hljs-attribute,
+  .hljs-property,
+  .hljs-variable,
+  .hljs-template-variable,
+  .hljs-params {
+    color: hsl(0 55% 45%);
+  }
+  .hljs-meta {
+    color: hsl(60 2% 40%);
+  }
+  .hljs-deletion {
+    color: hsl(0 65% 45%);
+    background: hsl(0 72% 51% / 0.08);
+  }
+  .hljs-addition {
+    background: hsl(140 50% 40% / 0.1);
+  }
+  .hljs-emphasis {
+    font-style: italic;
+  }
+  .hljs-strong {
+    font-weight: 600;
+  }
+
+  /* dark theme */
+  .dark .hljs-comment,
+  .dark .hljs-quote {
+    color: hsl(60 3% 55%);
+  }
+  .dark .hljs-keyword,
+  .dark .hljs-selector-tag,
+  .dark .hljs-literal,
+  .dark .hljs-doctag,
+  .dark .hljs-meta .hljs-keyword {
+    color: hsl(286 60% 75%);
+  }
+  .dark .hljs-string,
+  .dark .hljs-regexp,
+  .dark .hljs-addition,
+  .dark .hljs-meta .hljs-string {
+    color: hsl(95 40% 65%);
+  }
+  .dark .hljs-number,
+  .dark .hljs-symbol,
+  .dark .hljs-bullet,
+  .dark .hljs-variable.constant_ {
+    color: hsl(29 70% 65%);
+  }
+  .dark .hljs-title,
+  .dark .hljs-title.function_,
+  .dark .hljs-section {
+    color: hsl(210 80% 72%);
+  }
+  .dark .hljs-type,
+  .dark .hljs-built_in,
+  .dark .hljs-title.class_,
+  .dark .hljs-class .hljs-title {
+    color: hsl(180 45% 62%);
+  }
+  .dark .hljs-attr,
+  .dark .hljs-attribute,
+  .dark .hljs-property,
+  .dark .hljs-variable,
+  .dark .hljs-template-variable,
+  .dark .hljs-params {
+    color: hsl(355 65% 72%);
+  }
+  .dark .hljs-meta {
+    color: hsl(60 3% 60%);
+  }
+  .dark .hljs-deletion {
+    color: hsl(0 70% 72%);
+  }

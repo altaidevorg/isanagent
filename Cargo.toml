@@ -77,6 +77,14 @@ pdf_oxide = "0.3.37"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# keyring 3 has no platform store by default (it falls back to an in-memory mock),
+# so API keys saved from settings would be lost on restart. Enable the native stores.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
 [profile.dev]
 debug = false
 
