@@ -292,6 +292,9 @@ impl ShellPolicyMode {
 /// `ask`, `false` → outside `allow`), then the
 /// defaults. `[harness.shell_policy].edit_mode` / `edit_unattended_default`, when set, stay a
 /// ceiling on file edits (plan mode keeps blocking edits even with a per-tool `allow`).
+/// A per-tool entry for a code-exec tool (`exec`, `exec_send`, `execution_run*`) only replaces
+/// the interactive `[harness.shell_policy].mode` for that tool (see
+/// [`ResolvedShellPolicy::code_exec_mode`]); its working directory keeps the location rules.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct ToolPermissionsConfig {
     /// File tools on paths inside the sandbox (default `allow`).
@@ -376,6 +379,34 @@ impl ResolvedToolPermissions {
             .map(|mode| self.apply_session(*mode, is_edit, unattended))
     }
 
+    /// The per-tool entry when it replaces the location / default rules for `tool_name`.
+    /// A code-exec tool's entry never does: it only sets that tool's shell-policy mode (see
+    /// [`ResolvedShellPolicy::code_exec_mode`]), and its working directory keeps the location
+    /// rules.
+    pub fn rule_override(
+        &self,
+        tool_name: &str,
+        is_edit: bool,
+        unattended: bool,
+    ) -> Option<ShellPolicyMode> {
+        if is_code_exec_tool(tool_name) {
+            None
+        } else {
+            self.tool_override(tool_name, is_edit, unattended)
+        }
+    }
+
+    /// Mode for `tool_name` touching a path outside the sandbox in one kind of session.
+    fn outside_mode_for(
+        &self,
+        tool_name: &str,
+        is_edit: bool,
+        unattended: bool,
+    ) -> ShellPolicyMode {
+        self.rule_override(tool_name, is_edit, unattended)
+            .unwrap_or_else(|| self.location_mode(false, is_edit, unattended))
+    }
+
     /// Mode for a file-tool access inside or outside the sandbox.
     pub fn location_mode(&self, inside: bool, is_edit: bool, unattended: bool) -> ShellPolicyMode {
         let base = if inside {
@@ -397,11 +428,30 @@ impl ResolvedToolPermissions {
     /// sandbox (outside paths fail, `..` is clamped at the sandbox root).
     pub fn sandbox_enforced_for(&self, tool_name: &str, is_edit: bool) -> bool {
         [false, true].iter().all(|&unattended| {
-            self.tool_override(tool_name, is_edit, unattended)
-                .unwrap_or_else(|| self.location_mode(false, is_edit, unattended))
-                == ShellPolicyMode::Deny
+            self.outside_mode_for(tool_name, is_edit, unattended) == ShellPolicyMode::Deny
         })
     }
+
+    /// True when `tool_name` may reach paths outside the sandbox without a prompt in every kind
+    /// of session (interactive and unattended both resolve to `allow`). For process-wide
+    /// switches the dispatcher cannot judge per call (checkpoint restore root, `execution_*`
+    /// working directories): the stricter session wins.
+    pub fn allowed_outside_in_all_sessions(&self, tool_name: &str, is_edit: bool) -> bool {
+        [false, true].iter().all(|&unattended| {
+            self.outside_mode_for(tool_name, is_edit, unattended) == ShellPolicyMode::Allow
+        })
+    }
+}
+
+/// Tools that execute model-authored code/commands on the host or a session. All of these run
+/// arbitrary code, so they share the shell-policy approval gate — not just `exec`. Keying the
+/// gate on this category (rather than the literal name `"exec"`) is what stops `execution_run`
+/// / `execution_run_background` from bypassing approval entirely.
+pub(crate) fn is_code_exec_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "exec" | "exec_send" | "execution_run" | "execution_run_background"
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -419,6 +469,29 @@ impl Default for ResolvedShellPolicy {
     /// Same as an empty `config.toml`.
     fn default() -> Self {
         AppConfig::default().resolved_shell_policy()
+    }
+}
+
+impl ResolvedShellPolicy {
+    /// Shell-policy mode for a code-exec tool (`exec`, `exec_send`, `execution_run*`). A
+    /// `[harness.permissions.tools]` entry for the tool replaces `[harness.shell_policy].mode`
+    /// in interactive sessions only; unattended sessions use the stricter of the entry (`ask`
+    /// read as `deny`) and `unattended_default`, so an entry can never loosen unattended runs.
+    pub fn code_exec_mode(&self, tool_name: &str, unattended: bool) -> ShellPolicyMode {
+        let entry = self.permissions.tools.get(tool_name).copied();
+        if unattended {
+            entry.map_or(self.unattended_mode, |mode| {
+                mode.for_unattended().stricter(self.unattended_mode)
+            })
+        } else {
+            entry.unwrap_or(self.interactive_mode)
+        }
+    }
+
+    /// True when a `[harness.permissions.tools]` entry sets this code-exec tool to `deny`: every
+    /// call is blocked, not only commands that match an approval pattern.
+    pub fn code_exec_tool_denied(&self, tool_name: &str) -> bool {
+        self.permissions.tools.get(tool_name) == Some(&ShellPolicyMode::Deny)
     }
 }
 
@@ -2569,6 +2642,68 @@ bogus = "sometimes"
         );
         assert_eq!(p.default_mode_for("cron", false), ShellPolicyMode::Ask);
         assert!(!p.tools.contains_key("bogus"));
+    }
+
+    #[test]
+    fn outside_allowed_in_all_sessions_takes_the_stricter_session() {
+        assert!(!perms("").allowed_outside_in_all_sessions("write_file", true));
+        let open = perms("[harness.permissions]\noutside_workspace = \"allow\"\n");
+        assert!(open.allowed_outside_in_all_sessions("write_file", true));
+        assert!(open.allowed_outside_in_all_sessions("execution_run", false));
+        // The unattended edit ceiling keeps outside edits from being "allowed everywhere".
+        let unattended_cap = perms(
+            "[harness.permissions]\noutside_workspace = \"allow\"\n[harness.shell_policy]\nedit_unattended_default = \"ask\"\n",
+        );
+        assert!(!unattended_cap.allowed_outside_in_all_sessions("write_file", true));
+        assert!(unattended_cap.allowed_outside_in_all_sessions("read_file", false));
+        // A per-tool `allow` holds in both sessions unless a ceiling caps one of them.
+        let tool_allow = perms("[harness.permissions.tools]\nwrite_file = \"allow\"\n");
+        assert!(tool_allow.allowed_outside_in_all_sessions("write_file", true));
+        let tool_allow_capped = perms(
+            "[harness.permissions.tools]\nwrite_file = \"allow\"\n[harness.shell_policy]\nedit_unattended_default = \"deny\"\n",
+        );
+        assert!(!tool_allow_capped.allowed_outside_in_all_sessions("write_file", true));
+        // A code-exec entry sets the shell policy, not the location rule.
+        let exec_entry =
+            perms("[harness.permissions.tools]\nexecution_run = \"allow\"\nexec = \"deny\"\n");
+        assert!(!exec_entry.allowed_outside_in_all_sessions("execution_run", false));
+        assert_eq!(exec_entry.rule_override("exec", false, false), None);
+        assert!(!exec_entry.sandbox_enforced_for("exec", false));
+    }
+
+    #[test]
+    fn code_exec_entry_replaces_only_the_interactive_shell_mode() {
+        let policy = |src: &str| -> ResolvedShellPolicy {
+            toml::from_str::<AppConfig>(src)
+                .expect("parse")
+                .resolved_shell_policy()
+        };
+        let none = policy("");
+        assert_eq!(none.code_exec_mode("exec", false), ShellPolicyMode::Ask);
+        assert_eq!(none.code_exec_mode("exec", true), ShellPolicyMode::Deny);
+        let allow = policy("[harness.permissions.tools]\nexec = \"allow\"\n");
+        assert_eq!(allow.code_exec_mode("exec", false), ShellPolicyMode::Allow);
+        assert_eq!(allow.code_exec_mode("exec", true), ShellPolicyMode::Deny);
+        assert_eq!(
+            allow.code_exec_mode("execution_run", false),
+            ShellPolicyMode::Ask
+        );
+        assert!(!allow.code_exec_tool_denied("exec"));
+        // Unattended: the stricter of the entry (ask -> deny) and `unattended_default`.
+        let open_unattended = policy(
+            "[harness.shell_policy]\nunattended_default = \"allow\"\n[harness.permissions.tools]\nexec = \"ask\"\nexecution_run = \"allow\"\n",
+        );
+        assert_eq!(
+            open_unattended.code_exec_mode("exec", true),
+            ShellPolicyMode::Deny
+        );
+        assert_eq!(
+            open_unattended.code_exec_mode("execution_run", true),
+            ShellPolicyMode::Allow
+        );
+        let deny = policy("[harness.shell_policy]\nmode = \"allow\"\n[harness.permissions.tools]\nexec = \"deny\"\n");
+        assert_eq!(deny.code_exec_mode("exec", false), ShellPolicyMode::Deny);
+        assert!(deny.code_exec_tool_denied("exec"));
     }
 
     #[test]

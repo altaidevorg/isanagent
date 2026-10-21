@@ -172,6 +172,12 @@ impl ToolRegistry {
         }
     }
 
+    /// Whether the named tool reports its paths (see [`Tool::reports_path_accesses`]).
+    pub fn reports_path_accesses(&self, name: &str) -> bool {
+        self.get_tool(name)
+            .is_some_and(|tool| tool.reports_path_accesses())
+    }
+
     /// Ask a tool for its file-mutation preview without executing it.
     pub async fn preview_mutation_scoped(
         &self,

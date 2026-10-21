@@ -338,6 +338,10 @@ impl Tool for ReadFileTool {
         "read_file"
     }
 
+    fn reports_path_accesses(&self) -> bool {
+        true
+    }
+
     fn path_accesses(&self, args: &Value) -> Result<Vec<PathAccess>, String> {
         required_path_access(
             args,
@@ -469,6 +473,10 @@ impl Tool for WriteFileTool {
 
     fn name(&self) -> &str {
         "write_file"
+    }
+
+    fn reports_path_accesses(&self) -> bool {
+        true
     }
 
     fn path_accesses(&self, args: &Value) -> Result<Vec<PathAccess>, String> {
@@ -636,6 +644,10 @@ impl Tool for EditFileTool {
 
     fn name(&self) -> &str {
         "edit_file"
+    }
+
+    fn reports_path_accesses(&self) -> bool {
+        true
     }
 
     fn path_accesses(&self, args: &Value) -> Result<Vec<PathAccess>, String> {
@@ -845,6 +857,10 @@ impl Tool for ListDirTool {
         "list_dir"
     }
 
+    fn reports_path_accesses(&self) -> bool {
+        true
+    }
+
     fn path_accesses(&self, args: &Value) -> Result<Vec<PathAccess>, String> {
         required_path_access(
             args,
@@ -951,6 +967,10 @@ impl Tool for GlobFilesTool {
 
     fn name(&self) -> &str {
         "glob_files"
+    }
+
+    fn reports_path_accesses(&self) -> bool {
+        true
     }
 
     fn path_accesses(&self, args: &Value) -> Result<Vec<PathAccess>, String> {
@@ -1274,6 +1294,10 @@ impl Tool for SearchTextTool {
 
     fn name(&self) -> &str {
         "search_text"
+    }
+
+    fn reports_path_accesses(&self) -> bool {
+        true
     }
 
     fn path_accesses(&self, args: &Value) -> Result<Vec<PathAccess>, String> {
@@ -1696,6 +1720,10 @@ impl ShellExecTool {
 impl Tool for ShellExecTool {
     fn name(&self) -> &str {
         "exec"
+    }
+
+    fn reports_path_accesses(&self) -> bool {
+        true
     }
 
     fn path_accesses(&self, args: &Value) -> Result<Vec<PathAccess>, String> {
@@ -3125,13 +3153,22 @@ impl Tool for GitWorktreeTool {
         "git_worktree"
     }
 
+    /// `allow_path_outside_sandbox = true` is an explicit grant for this tool: its paths are
+    /// then not subject to the location rules (it reports none and falls under `default`).
+    fn reports_path_accesses(&self) -> bool {
+        !self.allow_path_outside_sandbox
+    }
+
     fn path_accesses(&self, args: &Value) -> Result<Vec<PathAccess>, String> {
-        // `allow_path_outside_sandbox = true` is an explicit grant for this tool: its paths are
-        // not subject to the location rules.
         if self.allow_path_outside_sandbox {
             return Ok(Vec::new());
         }
-        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        // Mirror `execute`'s argument errors (missing / unknown action, missing `path`) as `Err`
+        // so a malformed call is never classified as touching no paths.
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing or invalid 'action'")?;
         let base_path = args
             .get("base_path")
             .and_then(|v| v.as_str())
@@ -3139,16 +3176,22 @@ impl Tool for GitWorktreeTool {
         let access = |path: &str, kind| {
             path_access(path, &self.workspace_dir, self.restrict_to_workspace, kind)
         };
-        let mut accesses = Vec::new();
-        if matches!(action, "list" | "add") {
-            accesses.push(access(base_path, PathAccessKind::Read)?);
+        let target = || {
+            args.get("path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("{action} requires 'path'"))
+        };
+        match action {
+            "list" => Ok(vec![access(base_path, PathAccessKind::Read)?]),
+            "add" => Ok(vec![
+                access(base_path, PathAccessKind::Read)?,
+                access(target()?, PathAccessKind::Write)?,
+            ]),
+            "remove" => Ok(vec![access(target()?, PathAccessKind::Write)?]),
+            _ => Err(format!(
+                "Unknown action {action:?}; expected list, add, or remove"
+            )),
         }
-        if matches!(action, "add" | "remove") {
-            if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-                accesses.push(access(path, PathAccessKind::Write)?);
-            }
-        }
-        Ok(accesses)
     }
 
     fn description(&self) -> &str {
@@ -4165,10 +4208,29 @@ mod path_access_tests {
             .path_accesses(&json!({"action": "add", "path": "/tmp/wt"}))
             .unwrap()
             .is_empty());
+        // The explicit grant opts out of the location rules entirely.
+        assert!(!granted.reports_path_accesses());
         let gated = GitWorktreeTool {
             allow_path_outside_sandbox: false,
             ..granted
         };
+        assert!(gated.reports_path_accesses());
+        // Malformed calls are argument errors, never "touches no paths".
+        for args in [
+            json!({}),
+            json!({"action": "prune"}),
+            json!({"action": "remove"}),
+            json!({"action": "add"}),
+        ] {
+            assert!(gated.path_accesses(&args).is_err(), "{args}");
+        }
+        assert_eq!(
+            gated
+                .path_accesses(&json!({"action": "list"}))
+                .unwrap()
+                .len(),
+            1
+        );
         let accesses = gated
             .path_accesses(
                 &json!({"action": "add", "path": d.outside.join("wt").to_string_lossy()}),

@@ -154,7 +154,7 @@ default = "allow"            # every other tool not covered below or by the shel
 # web_fetch = "ask"
 # git_worktree = "deny"
 # mcp__github__create_issue = "ask"   # MCP-proxied and plugin tools use their registered name
-# exec = "ask"                        # replaces [harness.shell_policy] for exec: ask before every command
+# exec = "ask"                        # replaces [harness.shell_policy].mode for exec (interactive only)
 ```
 
 | Key | Default | Applies to |
@@ -162,7 +162,7 @@ default = "allow"            # every other tool not covered below or by the shel
 | `inside_workspace` | `allow` | `read_file`, `write_file`, `edit_file`, `list_dir`, `glob_files`, `search_text`, `exec` (working directory), `git_worktree` on paths inside `sandbox_dir` |
 | `outside_workspace` | `ask` | the same tools on any other path |
 | `default` | `allow` | web, memory, cron, MCP, plugin and other tools without paths (`ask_user` is never gated) |
-| `tools.<name>` | — | that tool only; replaces the location, default and shell rules for it |
+| `tools.<name>` | — | that tool only; replaces the location and default rules for it (for `exec`, `exec_send`, `execution_run*`: see *Shell policy* below) |
 
 ### Inside vs. outside
 - **Inside** means inside `sandbox_dir` (`workspace_dir/workspace` by default, or the `sandbox` /
@@ -174,6 +174,8 @@ default = "allow"            # every other tool not covered below or by the shel
   symlinks that lead out of the sandbox count as **outside**; a dangling symlink is judged by its
   target (writing through it would create the target).
 - A call that touches several paths (e.g. `git_worktree add`) is judged by its strictest path.
+- A file tool that reports no path for a call is judged by the stricter of `inside_workspace` and
+  `outside_workspace`, never by `default`.
 
 ### Approval prompts
 `ask` uses the same approval channel as shell and edit approvals (web approval card, TUI prompt,
@@ -219,17 +221,30 @@ plan mode (`edit_mode = "deny"`) blocking every edit, and `edit_mode = "ask"` re
 edits inside the sandbox. Left unset (the default), edits follow `[harness.permissions]`.
 
 The shell policy (`[harness.shell_policy]`: `mode`, risky-pattern approvals, `unattended_default`)
-still governs what `exec` and `execution_*` run, unless `[harness.permissions.tools]` has an entry
-for that tool. Steering hooks run first and can only tighten (`permissionDecision: "ask"` turns
-`allow` into a prompt; it never lifts a `deny`).
+governs what `exec`, `exec_send` and `execution_*` run. A `[harness.permissions.tools]` entry for one
+of these tools does **not** replace the shell policy; it replaces only `[harness.shell_policy].mode`
+for that tool in interactive sessions:
+- `allow`: no prompts, as with `mode = "allow"`.
+- `ask`: the shell-policy prompt for risky commands (approval patterns; every `execution_run*` call),
+  as with `mode = "ask"`. Safe `exec` commands run without a prompt.
+- `deny`: the tool is off — every call is blocked.
+
+Unattended sessions use the **stricter** of the entry (`ask` read as `deny`) and
+`unattended_default`, so an entry can never loosen autonomous runs: with the default
+`unattended_default = "deny"`, `exec = "allow"` still blocks risky commands there. Approval prompts
+and `ShellPolicyDecision` telemetry are the shell policy's own, and the `exec` working directory is
+still judged by `inside_workspace` / `outside_workspace`. Steering hooks run first and can only
+tighten (`permissionDecision: "ask"` turns `allow` into a prompt; it never lifts a `deny`).
 
 ### Hard sandbox and other boundaries
 - A tool that can never reach outside the sandbox (outside resolves to `deny` interactively and
   unattended, i.e. an explicit `outside_workspace = "deny"` or a per-tool `deny`) keeps the hard
   `resolve_path` boundary: outside paths fail and `..` is clamped at the sandbox root.
 - `execution_*` working directories are resolved by the execution provider, so they leave the
-  sandbox only when `outside_workspace = "allow"`.
-- `checkpoint` restores stay confined to the sandbox unless outside edits are `allow`.
+  sandbox only when outside access resolves to `allow` in both interactive and unattended sessions
+  (`outside_workspace = "allow"`; a per-tool `execution_run` entry does not change this).
+- `checkpoint` restores stay confined to the sandbox unless outside edits are `allow` in both
+  interactive and unattended sessions (an `edit_unattended_default` ceiling keeps them confined).
 - `[harness.git_worktree] allow_path_outside_sandbox = true` remains an explicit grant: worktree
   paths are then not subject to the location rules.
 - Embedding hosts: `HostPermissionMode::Bypass` also sets `outside_workspace = "allow"`;

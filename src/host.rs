@@ -486,14 +486,12 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         }
         if workspace.config.checkpoint_enabled() {
             // Backups live in the outer rim (never inside the agent's editable sandbox); restores are
-            // confined to the sandbox unless edits outside it are allowed without a prompt
-            // (an approved outside edit can then not be undone through `checkpoint`).
-            let outside_edits_allowed = ["write_file", "edit_file"].iter().all(|tool| {
-                tool_permissions
-                    .tool_override(tool, true, false)
-                    .unwrap_or_else(|| tool_permissions.location_mode(false, true, false))
-                    == crate::config::ShellPolicyMode::Allow
-            });
+            // confined to the sandbox unless edits outside it are allowed without a prompt in
+            // every session (an approved outside edit can then not be undone through
+            // `checkpoint`). The flag is process-wide, so the stricter session decides.
+            let outside_edits_allowed = ["write_file", "edit_file"]
+                .iter()
+                .all(|tool| tool_permissions.allowed_outside_in_all_sessions(tool, true));
             crate::checkpoint::init(
                 workspace.dir.join(".system_generated").join("checkpoints"),
                 (!outside_edits_allowed).then(|| workspace.sandbox_dir.clone()),
@@ -502,12 +500,12 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         }
         if workspace.config.execution_harness_enabled() {
             // `execution_*` working directories are resolved by the execution provider, not by a
-            // tool the dispatcher can ask about, so they leave the sandbox only when
-            // `outside_workspace = "allow"` (otherwise the old hard sandbox applies).
-            let execution_sandboxed = tool_permissions
-                .tool_override("execution_run", false, false)
-                .unwrap_or(tool_permissions.outside_workspace)
-                != crate::config::ShellPolicyMode::Allow;
+            // tool the dispatcher can ask about, so they leave the sandbox only when outside
+            // access resolves to `allow` in both interactive and unattended sessions (otherwise
+            // the old hard sandbox applies). A per-tool `execution_run` entry sets its shell
+            // policy, not this location rule.
+            let execution_sandboxed =
+                !tool_permissions.allowed_outside_in_all_sessions("execution_run", false);
             let harness = crate::execution::build_execution_harness(
                 workspace.dir.clone(),
                 workspace.sandbox_dir.clone(),

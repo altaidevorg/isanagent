@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use serde_json::Value;
 
 use crate::clarification::ASK_USER_REPLY_PREFIX;
-use crate::config::{ResolvedShellPolicy, ResolvedToolPermissions, ShellPolicyMode};
+use crate::config::{ResolvedToolPermissions, ShellPolicyMode};
 use crate::traits::{PathAccess, PathAccessKind};
 use crate::utils::path_starts_with;
 use std::path::{Path, PathBuf};
@@ -180,17 +180,6 @@ pub(crate) fn command_preview(command: &str) -> String {
     command_preview_with_flag(command).0
 }
 
-pub(crate) fn shell_policy_mode_for_session(
-    policy: &ResolvedShellPolicy,
-    unattended_session: bool,
-) -> ShellPolicyMode {
-    if unattended_session {
-        policy.unattended_mode
-    } else {
-        policy.interactive_mode
-    }
-}
-
 /// Reason shown when the legacy edit ceiling (`[harness.shell_policy].edit_mode` /
 /// `edit_unattended_default`) blocks a mutation. Plan mode sets `edit_mode = "deny"`; the
 /// unattended ceiling is independent of it, so the message distinguishes the two cases rather
@@ -206,14 +195,25 @@ pub(crate) fn edit_policy_block_reason(unattended_session: bool) -> &'static str
 /// What `[harness.permissions]` decides for one call, before any prompt is shown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PermissionGate {
-    /// A `[harness.permissions.tools]` entry; it replaces the shell, location and default rules.
-    ToolOverride(ShellPolicyMode),
+    /// A `[harness.permissions.tools]` entry; it replaces the location and default rules.
+    /// Never produced for code-exec tools (their entry sets the shell-policy mode instead).
+    /// `ceiling_denied` is true when only the legacy edit ceiling turned the entry into a deny.
+    ToolOverride {
+        mode: ShellPolicyMode,
+        ceiling_denied: bool,
+    },
     /// A file tool: the strictest location rule over the paths the call touches. `access` is
     /// the path that decided it; `ceiling_denied` is true when only the legacy edit ceiling
     /// (`edit_mode` / plan mode, `edit_unattended_default`) turned it into a deny.
     Location {
         mode: ShellPolicyMode,
         access: PathAccess,
+        ceiling_denied: bool,
+    },
+    /// A file tool (one that reports its paths) reported none for this call. It is not let
+    /// through under `default`: the stricter of the inside and outside rules applies.
+    UnreportedPaths {
+        mode: ShellPolicyMode,
         ceiling_denied: bool,
     },
     /// Any other tool: `[harness.permissions].default`.
@@ -225,23 +225,41 @@ pub(crate) enum PermissionGate {
 }
 
 /// Classify one call against `[harness.permissions]`. `accesses` is `None` when the tool could
-/// not resolve its arguments.
+/// not resolve its arguments; `reports_paths` is the tool's [`crate::traits::Tool::reports_path_accesses`].
 pub(crate) fn permission_gate(
     perms: &ResolvedToolPermissions,
     tool_name: &str,
     accesses: Option<&[PathAccess]>,
+    reports_paths: bool,
     unattended: bool,
 ) -> PermissionGate {
     if tool_name == "ask_user" {
         return PermissionGate::Exempt;
     }
     let is_edit = is_file_mutate_tool(tool_name);
-    if let Some(mode) = perms.tool_override(tool_name, is_edit, unattended) {
-        return PermissionGate::ToolOverride(mode);
+    if let Some(mode) = perms.rule_override(tool_name, is_edit, unattended) {
+        return PermissionGate::ToolOverride {
+            mode,
+            ceiling_denied: mode == ShellPolicyMode::Deny
+                && perms.rule_override(tool_name, false, unattended) != Some(ShellPolicyMode::Deny),
+        };
     }
     let Some(accesses) = accesses else {
         return PermissionGate::Exempt;
     };
+    if accesses.is_empty() && reports_paths {
+        let strictest = |edit: bool| {
+            perms
+                .location_mode(true, edit, unattended)
+                .stricter(perms.location_mode(false, edit, unattended))
+        };
+        let mode = strictest(is_edit);
+        return PermissionGate::UnreportedPaths {
+            mode,
+            ceiling_denied: mode == ShellPolicyMode::Deny
+                && strictest(false) != ShellPolicyMode::Deny,
+        };
+    }
     let mut decided: Option<(ShellPolicyMode, &PathAccess)> = None;
     for access in accesses {
         let edit = is_edit && access.kind == PathAccessKind::Write;
@@ -417,16 +435,7 @@ pub(crate) async fn remember_path_grant(grant: PathGrant) {
     }
 }
 
-/// Tools that execute model-authored code/commands on the host or a session. All of these run
-/// arbitrary code, so they share the shell-policy approval gate — not just `exec`. Keying the
-/// gate on this category (rather than the literal name `"exec"`) is what stops `execution_run`
-/// / `execution_run_background` from bypassing approval entirely.
-pub(crate) fn is_code_exec_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "exec" | "exec_send" | "execution_run" | "execution_run_background"
-    )
-}
+pub(crate) use crate::config::is_code_exec_tool;
 
 /// Tools that mutate a workspace file and therefore need the edit policy gate.
 pub(crate) fn is_file_mutate_tool(tool_name: &str) -> bool {

@@ -18,8 +18,8 @@ use super::approval::{
     approval_already_granted, classify_approval_reply, code_exec_requires_approval,
     command_preview, command_preview_with_flag, edit_policy_block_reason,
     extract_code_exec_command, is_code_exec_tool, is_file_mutate_tool, path_already_granted,
-    permission_gate, remember_approval_grant, remember_path_grant, shell_policy_mode_for_session,
-    ApprovalReply, PathGrant, PermissionGate,
+    permission_gate, remember_approval_grant, remember_path_grant, ApprovalReply, PathGrant,
+    PermissionGate,
 };
 use super::WAIT_SIGNAL_PREFIX;
 
@@ -402,6 +402,21 @@ fn location_denied_message(tool_name: &str, access: &PathAccess) -> String {
     )
 }
 
+/// Deny message for a `[harness.permissions.tools]` entry that resolved to `deny` by itself
+/// (`deny`, or `ask` in an unattended session); the edit ceiling has its own message.
+fn tool_entry_denied_message(tool_name: &str, unattended_session: bool) -> String {
+    if unattended_session {
+        format!("Permission denied: `{tool_name}` is blocked by [harness.permissions.tools].{tool_name} (deny, or ask in an unattended session where nobody can approve).")
+    } else {
+        format!("Permission denied: `{tool_name}` is blocked by [harness.permissions.tools].{tool_name} (deny).")
+    }
+}
+
+/// Deny message for a file tool that reported no paths for this call.
+fn unreported_paths_denied_message(tool_name: &str) -> String {
+    format!("Permission denied: `{tool_name}` did not report which paths it touches, so the stricter of [harness.permissions].inside_workspace / outside_workspace applies (deny, or ask in an unattended session).")
+}
+
 /// Session-scoped wiring for tools that need the active chat (e.g. `ask_user`).
 #[derive(Clone)]
 pub(crate) struct ToolCallRuntime {
@@ -552,21 +567,30 @@ pub(crate) async fn execute_tool_call_with_activity(
             &runtime.shell_policy.permissions,
             &tool_name,
             accesses.as_deref(),
+            tools.reports_path_accesses(&tool_name),
             runtime.unattended_session,
         );
-        // The shell policy applies unless a per-tool entry replaced it.
-        let shell_policy_applies = !matches!(gate, PermissionGate::ToolOverride(_));
         // Mode for the edit gate below (diff approval) plus what to tell the user.
         // The third element is the deciding path when it lies outside the sandbox.
         let mut edit_gate: Option<(ShellPolicyMode, String, Option<PathAccess>)> = None;
         match gate {
             PermissionGate::Exempt => {}
-            PermissionGate::ToolOverride(mode) if is_edit_tool => {
-                edit_gate = Some((
-                    mode,
-                    format!("Permission denied: `{tool_name}` is set to \"deny\" in [harness.permissions.tools]."),
-                    None,
-                ));
+            PermissionGate::ToolOverride {
+                mode,
+                ceiling_denied,
+            }
+            | PermissionGate::UnreportedPaths {
+                mode,
+                ceiling_denied,
+            } if is_edit_tool => {
+                let deny_reason = if ceiling_denied {
+                    edit_policy_block_reason(runtime.unattended_session).to_string()
+                } else if matches!(gate, PermissionGate::UnreportedPaths { .. }) {
+                    unreported_paths_denied_message(&tool_name)
+                } else {
+                    tool_entry_denied_message(&tool_name, runtime.unattended_session)
+                };
+                edit_gate = Some((mode, deny_reason, None));
             }
             PermissionGate::Location {
                 mode,
@@ -581,20 +605,22 @@ pub(crate) async fn execute_tool_call_with_activity(
                 let outside = (!access.inside_sandbox).then_some(access);
                 edit_gate = Some((mode, deny_reason, outside));
             }
-            PermissionGate::ToolOverride(mode) | PermissionGate::Default(mode) => {
-                let from_tools_table = !shell_policy_applies;
+            PermissionGate::ToolOverride { mode, .. }
+            | PermissionGate::UnreportedPaths { mode, .. }
+            | PermissionGate::Default(mode) => {
                 match force_ask_mode(mode, hook_ask_reason.is_some()) {
                     ShellPolicyMode::Allow => {}
                     ShellPolicyMode::Deny => {
-                        let source = if from_tools_table {
-                            format!("[harness.permissions.tools].{tool_name}")
-                        } else {
-                            "[harness.permissions].default".to_string()
+                        let message = match gate {
+                            PermissionGate::ToolOverride { .. } => {
+                                tool_entry_denied_message(&tool_name, runtime.unattended_session)
+                            }
+                            PermissionGate::UnreportedPaths { .. } => {
+                                unreported_paths_denied_message(&tool_name)
+                            }
+                            _ => format!("Permission denied: `{tool_name}` is blocked by [harness.permissions].default (deny, or ask in an unattended session)."),
                         };
-                        return ToolExecutionFinished::error(
-                            ToolErrorCode::PolicyDenied,
-                            format!("Permission denied: `{tool_name}` is blocked by {source} (deny, or ask in an unattended session)."),
-                        );
+                        return ToolExecutionFinished::error(ToolErrorCode::PolicyDenied, message);
                     }
                     ShellPolicyMode::Ask => {
                         hook_ask_handled = true;
@@ -660,14 +686,38 @@ pub(crate) async fn execute_tool_call_with_activity(
             },
         }
 
-        if shell_policy_applies && is_code_exec_tool(&tool_name) {
+        if is_code_exec_tool(&tool_name) {
+            // A `[harness.permissions.tools]` entry for a code-exec tool sets the shell-policy
+            // mode for that tool (interactive; unattended keeps the stricter `unattended_default`)
+            // and `deny` turns the tool off entirely.
+            let tool_denied = runtime.shell_policy.code_exec_tool_denied(&tool_name);
+            if tool_denied {
+                let preview = extract_code_exec_command(&tool_name, &args)
+                    .map(|command| command_preview(&command))
+                    .unwrap_or_default();
+                let _ = outbound_tx
+                    .send(BusMessage::Telemetry(TelemetryEvent::ShellPolicyDecision {
+                        chat_id: chat_id.clone(),
+                        channel: channel.clone(),
+                        mode: "deny".to_string(),
+                        decision: "blocked".to_string(),
+                        command_preview: preview,
+                    }))
+                    .await;
+                return ToolExecutionFinished::error(
+                    ToolErrorCode::PolicyDenied,
+                    format!("Permission denied: `{tool_name}` is set to \"deny\" in [harness.permissions.tools]; call skipped."),
+                );
+            }
             if let Some(command) = extract_code_exec_command(&tool_name, &args) {
                 let preview = command_preview(&command);
                 // A hook's `ask` already answered by the working-directory prompt is not
                 // asked a second time.
                 let hook_pending = hook_ask_reason.is_some() && !hook_ask_handled;
                 let mode = force_ask_mode(
-                    shell_policy_mode_for_session(&runtime.shell_policy, runtime.unattended_session),
+                    runtime
+                        .shell_policy
+                        .code_exec_mode(&tool_name, runtime.unattended_session),
                     hook_pending,
                 );
                 let requires_approval = hook_pending
@@ -1397,6 +1447,65 @@ mod permission_dispatch_tests {
         }
     }
 
+    /// Stand-in for `exec`: reports its working directory like `ShellExecTool` and echoes the
+    /// command instead of running it.
+    struct FakeExec {
+        workspace_dir: PathBuf,
+    }
+
+    #[async_trait]
+    impl Tool for FakeExec {
+        fn name(&self) -> &str {
+            "exec"
+        }
+        fn description(&self) -> &str {
+            "exec"
+        }
+        fn parameters(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn reports_path_accesses(&self) -> bool {
+            true
+        }
+        fn path_accesses(&self, args: &Value) -> Result<Vec<PathAccess>, String> {
+            let dir = args
+                .get("working_dir")
+                .and_then(|v| v.as_str())
+                .unwrap_or(".");
+            let path = crate::tools::builtin::resolve_path(dir, &self.workspace_dir, false)?;
+            Ok(vec![PathAccess {
+                inside_sandbox: crate::utils::path_is_within(&self.workspace_dir, &path),
+                path,
+                kind: crate::traits::PathAccessKind::WorkingDir,
+            }])
+        }
+        async fn execute(&self, args: Value) -> Result<String, String> {
+            Ok(format!("ran: {}", args["command"].as_str().unwrap_or("")))
+        }
+    }
+
+    /// A file tool that (wrongly) reports no paths.
+    struct SilentFileTool;
+
+    #[async_trait]
+    impl Tool for SilentFileTool {
+        fn name(&self) -> &str {
+            "silent_read"
+        }
+        fn description(&self) -> &str {
+            "silent"
+        }
+        fn parameters(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn reports_path_accesses(&self) -> bool {
+            true
+        }
+        async fn execute(&self, _args: Value) -> Result<String, String> {
+            Ok("silent_read ran".to_string())
+        }
+    }
+
     struct Fixture {
         _tmp: tempfile::TempDir,
         sandbox: PathBuf,
@@ -1422,6 +1531,8 @@ mod permission_dispatch_tests {
     struct Outcome {
         result: ToolResult,
         prompts: Vec<Value>,
+        /// `ShellPolicyDecision` telemetry as `mode:decision`.
+        shell_decisions: Vec<String>,
     }
 
     async fn dispatch(
@@ -1450,12 +1561,17 @@ mod permission_dispatch_tests {
         }));
         registry.register(Box::new(Named("web_fetch")));
         registry.register(Box::new(Named("mcp__github__create_issue")));
+        registry.register(Box::new(Named("execution_run")));
+        registry.register(Box::new(FakeExec {
+            workspace_dir: fx.sandbox.clone(),
+        }));
+        registry.register(Box::new(SilentFileTool));
         registry.register(Box::new(ScriptedAsk {
             reply: reply.to_string(),
             prompts: prompts.clone(),
         }));
         let tools = Arc::new(registry);
-        let (tx, _rx) = mpsc::channel(64);
+        let (tx, mut rx) = mpsc::channel(64);
         let runtime = ToolCallRuntime {
             session: ToolExecCtx::new("test", "chat", None),
             hub: ClarificationHub::shared(),
@@ -1487,7 +1603,22 @@ mod permission_dispatch_tests {
             _ => panic!("unexpected outcome"),
         };
         let prompts = prompts.lock().map(|p| p.clone()).unwrap_or_default();
-        Outcome { result, prompts }
+        let mut shell_decisions = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            if let BusMessage::Telemetry(TelemetryEvent::ShellPolicyDecision {
+                mode,
+                decision,
+                ..
+            }) = message
+            {
+                shell_decisions.push(format!("{mode}:{decision}"));
+            }
+        }
+        Outcome {
+            result,
+            prompts,
+            shell_decisions,
+        }
     }
 
     fn perms(toml_src: &str) -> ResolvedToolPermissions {
@@ -2000,7 +2131,21 @@ web_fetch = "ask"
             std::fs::read_to_string(fx.sandbox.join("in.txt")).unwrap(),
             "inside content"
         );
-        // Without a per-tool entry the message names plan mode.
+        // The ceiling, not the per-tool entry, blocked it: the message names plan mode.
+        assert!(
+            outcome.result.content.contains("plan mode"),
+            "{}",
+            outcome.result.content
+        );
+        assert!(
+            !outcome
+                .result
+                .content
+                .contains("[harness.permissions.tools]"),
+            "{}",
+            outcome.result.content
+        );
+        // Without a per-tool entry the message names plan mode too.
         let plan = dispatch(
             &fx,
             perms("[harness.shell_policy]\nedit_mode = \"deny\"\n"),
@@ -2045,6 +2190,280 @@ web_fetch = "ask"
         assert!(!prompt_text(&outcome).contains("outside"));
     }
 
+    #[tokio::test]
+    async fn edit_entry_deny_messages_name_the_actual_cause() {
+        let fx = fixture();
+        let write = |p: ResolvedToolPermissions, unattended: bool| {
+            let fx = &fx;
+            async move {
+                dispatch(
+                    fx,
+                    p,
+                    unattended,
+                    "approve",
+                    "write_file",
+                    serde_json::json!({"path": "in.txt", "content": "x"}),
+                )
+                .await
+            }
+        };
+        // The entry itself says deny.
+        let denied = write(
+            perms("[harness.permissions.tools]\nwrite_file = \"deny\"\n"),
+            false,
+        )
+        .await;
+        assert_eq!(
+            denied.result.error_code(),
+            Some(ToolErrorCode::PolicyDenied)
+        );
+        assert!(
+            denied
+                .result
+                .content
+                .contains("[harness.permissions.tools].write_file (deny)"),
+            "{}",
+            denied.result.content
+        );
+        // `ask` in an unattended session: the entry, with the unattended explanation.
+        let unattended_ask = write(
+            perms("[harness.permissions.tools]\nwrite_file = \"ask\"\n"),
+            true,
+        )
+        .await;
+        assert_eq!(
+            unattended_ask.result.error_code(),
+            Some(ToolErrorCode::PolicyDenied)
+        );
+        assert!(unattended_ask.prompts.is_empty());
+        assert!(
+            unattended_ask
+                .result
+                .content
+                .contains("[harness.permissions.tools].write_file")
+                && unattended_ask.result.content.contains("unattended"),
+            "{}",
+            unattended_ask.result.content
+        );
+        // `allow` capped by the unattended edit ceiling: the ceiling's message.
+        let capped = write(
+            perms("[harness.shell_policy]\nedit_unattended_default = \"deny\"\n[harness.permissions.tools]\nwrite_file = \"allow\"\n"),
+            true,
+        )
+        .await;
+        assert_eq!(
+            capped.result.content,
+            format!("Error: {}", edit_policy_block_reason(true))
+        );
+        assert_eq!(
+            std::fs::read_to_string(fx.sandbox.join("in.txt")).unwrap(),
+            "inside content"
+        );
+    }
+
+    fn exec_args(command: &str) -> Value {
+        serde_json::json!({"command": command})
+    }
+
+    #[tokio::test]
+    async fn exec_allow_entry_acts_like_shell_mode_allow_interactively() {
+        let fx = fixture();
+        let p = perms("[harness.permissions.tools]\nexec = \"allow\"\n");
+        for command in ["ls -la", "rm -rf build"] {
+            let outcome = dispatch(&fx, p.clone(), false, "deny", "exec", exec_args(command)).await;
+            assert_eq!(outcome.result.content, format!("ran: {command}"));
+            assert!(outcome.prompts.is_empty());
+            assert!(outcome.shell_decisions.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn exec_allow_entry_keeps_unattended_default_in_unattended_sessions() {
+        let fx = fixture();
+        let p = perms("[harness.permissions.tools]\nexec = \"allow\"\n");
+        // Default `unattended_default = "deny"` still blocks risky commands.
+        let risky = dispatch(
+            &fx,
+            p.clone(),
+            true,
+            "approve",
+            "exec",
+            exec_args("rm -rf build"),
+        )
+        .await;
+        assert_eq!(risky.result.error_code(), Some(ToolErrorCode::PolicyDenied));
+        assert!(
+            risky.result.content.contains("shell policy (mode=deny)"),
+            "{}",
+            risky.result.content
+        );
+        assert!(risky.prompts.is_empty());
+        assert_eq!(risky.shell_decisions, vec!["deny:blocked".to_string()]);
+        // Safe commands run, exactly as without the entry.
+        let safe = dispatch(&fx, p, true, "approve", "exec", exec_args("ls")).await;
+        assert_eq!(safe.result.content, "ran: ls");
+    }
+
+    #[tokio::test]
+    async fn exec_ask_entry_uses_the_shell_prompt_for_risky_commands() {
+        let fx = fixture();
+        let p = perms("[harness.shell_policy]\nmode = \"allow\"\n[harness.permissions.tools]\nexec = \"ask\"\n");
+        let safe = dispatch(&fx, p.clone(), false, "deny", "exec", exec_args("ls")).await;
+        assert_eq!(safe.result.content, "ran: ls");
+        assert!(safe.prompts.is_empty());
+        let risky = dispatch(&fx, p, false, "deny", "exec", exec_args("rm -rf build")).await;
+        assert_eq!(risky.prompts.len(), 1);
+        let prompt = prompt_text(&risky);
+        assert!(prompt.starts_with("Approve running `exec`?"), "{prompt}");
+        assert!(prompt.contains("rm -rf build"), "{prompt}");
+        assert_eq!(risky.result.error_code(), Some(ToolErrorCode::PolicyDenied));
+        assert_eq!(
+            risky.shell_decisions,
+            vec![
+                "ask:approval_requested".to_string(),
+                "ask:approval_denied".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_deny_entry_blocks_every_call() {
+        let fx = fixture();
+        let p = perms("[harness.shell_policy]\nmode = \"allow\"\n[harness.permissions.tools]\nexec = \"deny\"\n");
+        for unattended in [false, true] {
+            let outcome = dispatch(
+                &fx,
+                p.clone(),
+                unattended,
+                "approve",
+                "exec",
+                exec_args("ls"),
+            )
+            .await;
+            assert_eq!(
+                outcome.result.error_code(),
+                Some(ToolErrorCode::PolicyDenied)
+            );
+            assert!(
+                outcome
+                    .result
+                    .content
+                    .contains("[harness.permissions.tools]"),
+                "{}",
+                outcome.result.content
+            );
+            assert!(outcome.prompts.is_empty());
+            assert_eq!(outcome.shell_decisions, vec!["deny:blocked".to_string()]);
+        }
+    }
+
+    #[tokio::test]
+    async fn exec_entry_keeps_working_directory_location_rules() {
+        let fx = fixture();
+        let p = perms("[harness.permissions.tools]\nexec = \"allow\"\n");
+        let outcome = dispatch(
+            &fx,
+            p,
+            false,
+            "deny",
+            "exec",
+            serde_json::json!({"command": "ls", "working_dir": fx.outside.to_string_lossy()}),
+        )
+        .await;
+        assert_eq!(outcome.prompts.len(), 1);
+        assert!(prompt_text(&outcome).contains("outside the workspace sandbox"));
+        assert_eq!(
+            outcome.result.error_code(),
+            Some(ToolErrorCode::PolicyDenied)
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_run_entry_follows_the_same_shell_rules() {
+        let fx = fixture();
+        let code = serde_json::json!({"code": "print(1)"});
+        let allow = perms("[harness.permissions.tools]\nexecution_run = \"allow\"\n");
+        let interactive = dispatch(
+            &fx,
+            allow.clone(),
+            false,
+            "deny",
+            "execution_run",
+            code.clone(),
+        )
+        .await;
+        assert_eq!(interactive.result.content, "execution_run ran");
+        assert!(interactive.prompts.is_empty());
+        // Unattended: arbitrary code needs approval and `unattended_default = "deny"` blocks it.
+        let unattended = dispatch(&fx, allow, true, "approve", "execution_run", code.clone()).await;
+        assert_eq!(
+            unattended.result.error_code(),
+            Some(ToolErrorCode::PolicyDenied)
+        );
+        assert_eq!(unattended.shell_decisions, vec!["deny:blocked".to_string()]);
+        let ask = perms("[harness.shell_policy]\nmode = \"allow\"\n[harness.permissions.tools]\nexecution_run = \"ask\"\n");
+        let asked = dispatch(&fx, ask, false, "deny", "execution_run", code.clone()).await;
+        assert_eq!(asked.prompts.len(), 1);
+        assert!(prompt_text(&asked).starts_with("Approve running `execution_run`?"));
+        assert_eq!(asked.result.error_code(), Some(ToolErrorCode::PolicyDenied));
+        let deny = perms("[harness.permissions.tools]\nexecution_run = \"deny\"\n");
+        let denied = dispatch(&fx, deny, false, "approve", "execution_run", code).await;
+        assert_eq!(
+            denied.result.error_code(),
+            Some(ToolErrorCode::PolicyDenied)
+        );
+        assert!(denied.prompts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn file_tool_reporting_no_paths_gets_the_stricter_location_rule() {
+        let fx = fixture();
+        // Default rules: inside allow, outside ask -> ask (not `default = "allow"`).
+        let asked = dispatch(
+            &fx,
+            perms(""),
+            false,
+            "deny",
+            "silent_read",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(asked.prompts.len(), 1);
+        assert_eq!(asked.result.error_code(), Some(ToolErrorCode::PolicyDenied));
+        // Unattended: ask -> deny, with a message saying why.
+        let unattended = dispatch(
+            &fx,
+            perms(""),
+            true,
+            "approve",
+            "silent_read",
+            serde_json::json!({}),
+        )
+        .await;
+        assert!(unattended.prompts.is_empty());
+        assert!(
+            unattended
+                .result
+                .content
+                .contains("did not report which paths"),
+            "{}",
+            unattended.result.content
+        );
+        // Both locations allowed: it runs.
+        let open =
+            perms("[harness.permissions]\noutside_workspace = \"allow\"\ndefault = \"deny\"\n");
+        let ran = dispatch(
+            &fx,
+            open,
+            true,
+            "deny",
+            "silent_read",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(ran.result.content, "silent_read ran");
+    }
+
     #[test]
     fn gate_classification_matrix() {
         use crate::agent::approval::{permission_gate, PermissionGate};
@@ -2061,7 +2480,13 @@ web_fetch = "ask"
         };
         let p = ResolvedToolPermissions::default();
         assert!(matches!(
-            permission_gate(&p, "read_file", Some(std::slice::from_ref(&inside)), false),
+            permission_gate(
+                &p,
+                "read_file",
+                Some(std::slice::from_ref(&inside)),
+                true,
+                false
+            ),
             PermissionGate::Location {
                 mode: ShellPolicyMode::Allow,
                 ..
@@ -2072,6 +2497,7 @@ web_fetch = "ask"
             &p,
             "glob_files",
             Some(&[inside.clone(), outside.clone()]),
+            true,
             false,
         ) {
             PermissionGate::Location { mode, access, .. } => {
@@ -2081,20 +2507,83 @@ web_fetch = "ask"
             other => panic!("{other:?}"),
         }
         assert_eq!(
-            permission_gate(&p, "ask_user", Some(&[]), false),
+            permission_gate(&p, "ask_user", Some(&[]), false, false),
             PermissionGate::Exempt
         );
         assert_eq!(
-            permission_gate(&p, "execution_run", Some(&[]), false),
+            permission_gate(&p, "execution_run", Some(&[]), false, false),
             PermissionGate::Exempt
         );
         assert_eq!(
-            permission_gate(&p, "read_file", None, false),
+            permission_gate(&p, "read_file", None, true, false),
             PermissionGate::Exempt
         );
         assert_eq!(
-            permission_gate(&p, "web_fetch", Some(&[]), false),
+            permission_gate(&p, "web_fetch", Some(&[]), false, false),
             PermissionGate::Default(ShellPolicyMode::Allow)
+        );
+        // A path-reporting tool with no paths never falls to `default`.
+        assert_eq!(
+            permission_gate(&p, "glob_files", Some(&[]), true, false),
+            PermissionGate::UnreportedPaths {
+                mode: ShellPolicyMode::Ask,
+                ceiling_denied: false
+            }
+        );
+        assert_eq!(
+            permission_gate(&p, "glob_files", Some(&[]), true, true),
+            PermissionGate::UnreportedPaths {
+                mode: ShellPolicyMode::Deny,
+                ceiling_denied: false
+            }
+        );
+        let plan = perms("[harness.shell_policy]\nedit_mode = \"deny\"\n[harness.permissions]\noutside_workspace = \"allow\"\n");
+        assert_eq!(
+            permission_gate(&plan, "write_file", Some(&[]), true, false),
+            PermissionGate::UnreportedPaths {
+                mode: ShellPolicyMode::Deny,
+                ceiling_denied: true
+            }
+        );
+        // A code-exec entry is not a rule override: the working directory is location-gated.
+        let exec_allow = perms("[harness.permissions.tools]\nexec = \"allow\"\n");
+        assert!(matches!(
+            permission_gate(
+                &exec_allow,
+                "exec",
+                Some(std::slice::from_ref(&outside)),
+                true,
+                false
+            ),
+            PermissionGate::Location {
+                mode: ShellPolicyMode::Ask,
+                ..
+            }
+        ));
+        // Edit entries: the ceiling is reported separately from the entry's own deny.
+        let capped = perms("[harness.shell_policy]\nedit_mode = \"deny\"\n[harness.permissions.tools]\nwrite_file = \"allow\"\n");
+        assert_eq!(
+            permission_gate(&capped, "write_file", None, true, false),
+            PermissionGate::ToolOverride {
+                mode: ShellPolicyMode::Deny,
+                ceiling_denied: true
+            }
+        );
+        let entry_deny = perms("[harness.shell_policy]\nedit_mode = \"deny\"\n[harness.permissions.tools]\nwrite_file = \"deny\"\n");
+        assert_eq!(
+            permission_gate(&entry_deny, "write_file", None, true, false),
+            PermissionGate::ToolOverride {
+                mode: ShellPolicyMode::Deny,
+                ceiling_denied: false
+            }
+        );
+        let entry_ask = perms("[harness.permissions.tools]\nwrite_file = \"ask\"\n");
+        assert_eq!(
+            permission_gate(&entry_ask, "write_file", None, true, true),
+            PermissionGate::ToolOverride {
+                mode: ShellPolicyMode::Deny,
+                ceiling_denied: false
+            }
         );
     }
 }

@@ -378,6 +378,14 @@ pub trait Tool: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// True for tools whose [`Tool::path_accesses`] reports the paths they touch. Such a tool
+    /// reporting an empty list is not treated as path-free (which would put it under
+    /// `[harness.permissions].default`): the dispatcher applies the stricter of the inside and
+    /// outside location rules instead. Override together with `path_accesses`.
+    fn reports_path_accesses(&self) -> bool {
+        false
+    }
+
     /// Execute a mutation after the dispatcher has obtained user approval.
     ///
     /// Mutation tools override this to validate `approved_preview` before

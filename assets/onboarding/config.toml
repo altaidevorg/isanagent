@@ -143,7 +143,7 @@ default = "allow"            # any other tool not matched below and not covered 
 [harness.permissions.tools]  # per-tool override by exact tool name (builtin, MCP-proxied, plugin)
 # web_fetch = "ask"
 # git_worktree = "deny"
-# exec = "ask"               # replaces [harness.shell_policy] for exec: ask before every command
+# exec = "ask"               # replaces [harness.shell_policy].mode for exec (interactive only; unattended keeps the stricter unattended_default)
 
 # ML policy overlay (embedded in the isanagent binary when enabled). Reference copy: workspace/ML_ENGINEER_OVERLAY.md (onboard). Optional rules merge: workspace/ML_POLICY.md.
 # Opt-in (audit X4): enable only for ML-focused workspaces; the general-purpose default is false.
