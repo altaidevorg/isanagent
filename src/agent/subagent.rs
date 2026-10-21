@@ -1393,7 +1393,6 @@ mod tests {
     use super::*;
     use crate::bus::BusMessage;
     use crate::clarification::ClarificationHub;
-    use crate::config::ResolvedShellPolicy;
     use crate::logging::create_logger_channel;
     use crate::memory::SqliteMemoryActor;
     use crate::session::SessionManager;
@@ -1486,14 +1485,7 @@ mod tests {
             doom_loop_enabled: false,
             memory_node,
             harness_runtime_summary: String::new(),
-            shell_policy: Arc::new(ResolvedShellPolicy {
-                interactive_mode: crate::config::ShellPolicyMode::Ask,
-                unattended_mode: crate::config::ShellPolicyMode::Deny,
-                interactive_edit_mode: crate::config::ShellPolicyMode::Ask,
-                unattended_edit_mode: crate::config::ShellPolicyMode::Deny,
-                approval_patterns: Vec::new(),
-                windows_runner: crate::config::WindowsShellRunner::default(),
-            }),
+            shell_policy: Arc::new(crate::config::AppConfig::default().resolved_shell_policy()),
             hook_tool_ctx: None,
             agent_registry: None,
             wake_on_completion: false,
@@ -1572,14 +1564,7 @@ mod tests {
             doom_loop_enabled: false,
             memory_node,
             harness_runtime_summary: String::new(),
-            shell_policy: Arc::new(ResolvedShellPolicy {
-                interactive_mode: crate::config::ShellPolicyMode::Ask,
-                unattended_mode: crate::config::ShellPolicyMode::Deny,
-                interactive_edit_mode: crate::config::ShellPolicyMode::Ask,
-                unattended_edit_mode: crate::config::ShellPolicyMode::Deny,
-                approval_patterns: Vec::new(),
-                windows_runner: crate::config::WindowsShellRunner::default(),
-            }),
+            shell_policy: Arc::new(crate::config::AppConfig::default().resolved_shell_policy()),
             hook_tool_ctx: None,
             agent_registry: None,
             wake_on_completion: false,

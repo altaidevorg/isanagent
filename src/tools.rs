@@ -1,4 +1,4 @@
-use crate::traits::{MutationPreview, Tool, ToolErrorCode, ToolResult};
+use crate::traits::{MutationPreview, PathAccess, Tool, ToolErrorCode, ToolResult};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -154,6 +154,28 @@ impl ToolRegistry {
             ),
             None => ToolResult::error(ToolErrorCode::NotFound, format!("Tool '{name}' not found")),
         }
+    }
+
+    /// Paths a call would touch (see [`Tool::path_accesses`]). `Err` when the tool is unknown,
+    /// not allowed in this scope, or cannot resolve its arguments — execution then reports it.
+    pub fn path_accesses_scoped(
+        &self,
+        name: &str,
+        args: &Value,
+        allowlist: Option<&HashSet<String>>,
+        is_subagent: bool,
+    ) -> Result<Vec<PathAccess>, String> {
+        self.authorize_scoped(name, allowlist, is_subagent)?;
+        match self.get_tool(name) {
+            Some(tool) => tool.path_accesses(args),
+            None => Err(format!("Tool '{name}' not found")),
+        }
+    }
+
+    /// Whether the named tool reports its paths (see [`Tool::reports_path_accesses`]).
+    pub fn reports_path_accesses(&self, name: &str) -> bool {
+        self.get_tool(name)
+            .is_some_and(|tool| tool.reports_path_accesses())
     }
 
     /// Ask a tool for its file-mutation preview without executing it.

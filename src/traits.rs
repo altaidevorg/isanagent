@@ -2,6 +2,37 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// What a file tool will do with a path (for `[harness.permissions]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathAccessKind {
+    /// Read a file, list or search a directory.
+    Read,
+    /// Create, overwrite or edit a file (or create a worktree).
+    Write,
+    /// Use the directory as the working directory of a command.
+    WorkingDir,
+}
+
+impl PathAccessKind {
+    pub fn verb(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::WorkingDir => "run a command in",
+        }
+    }
+}
+
+/// One path a tool call will touch, resolved exactly as the tool resolves it (canonical,
+/// symlinks followed; a not-yet-existing file is anchored on its nearest existing ancestor).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathAccess {
+    pub path: std::path::PathBuf,
+    pub kind: PathAccessKind,
+    /// True when `path` lies inside the agent sandbox (`sandbox_dir`).
+    pub inside_sandbox: bool,
+}
+
 /// A bounded, user-facing description of a pending file mutation.
 ///
 /// The agent dispatcher creates this before asking for approval. `base_fingerprint`
@@ -335,6 +366,24 @@ pub trait Tool: Send + Sync {
     /// dispatcher apply a single policy to the small set of mutation tools.
     async fn preview_mutation(&self, _args: &Value) -> Result<Option<MutationPreview>, String> {
         Ok(None)
+    }
+
+    /// Paths this call will touch, for the location rules in `[harness.permissions]`.
+    ///
+    /// File tools override this and resolve paths with the same function they execute with,
+    /// so the policy judges exactly what will be accessed. `Err` means the arguments cannot
+    /// be resolved; the dispatcher then lets the tool report its own error. The default (no
+    /// paths) puts the tool under `[harness.permissions].default`.
+    fn path_accesses(&self, _args: &Value) -> Result<Vec<PathAccess>, String> {
+        Ok(Vec::new())
+    }
+
+    /// True for tools whose [`Tool::path_accesses`] reports the paths they touch. Such a tool
+    /// reporting an empty list is not treated as path-free (which would put it under
+    /// `[harness.permissions].default`): the dispatcher applies the stricter of the inside and
+    /// outside location rules instead. Override together with `path_accesses`.
+    fn reports_path_accesses(&self) -> bool {
+        false
     }
 
     /// Execute a mutation after the dispatcher has obtained user approval.

@@ -279,11 +279,19 @@ fn matcher_matches(matcher: &Option<Regex>, text: &str) -> bool {
     }
 }
 
-fn shell_invocation() -> (&'static str, &'static str) {
+/// `sh -c <command>` on Unix; on Windows `cmd /D /S /C "<command>"` with the command appended
+/// verbatim so inner double quotes survive (see [`crate::windows_shell`]).
+fn shell_command(command: &str) -> Command {
     if cfg!(windows) {
-        ("cmd", "/C")
+        crate::windows_shell::windows_shell_invocation(
+            crate::config::WindowsShellRunner::Cmd,
+            command,
+        )
+        .to_tokio_command()
     } else {
-        ("sh", "-c")
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(command);
+        c
     }
 }
 
@@ -340,13 +348,10 @@ async fn spawn_hook(
     timeout_ms: u64,
     max_stdout: usize,
 ) -> Result<HookProcessOutput, String> {
-    let (shell, arg) = shell_invocation();
     // Hook commands come from workspace/plugin config (third-party code): run them in the
     // scrubbed safe environment so host master credentials never leak into hook processes.
-    let mut hook_cmd = Command::new(shell);
+    let mut hook_cmd = shell_command(command);
     hook_cmd
-        .arg(arg)
-        .arg(command)
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

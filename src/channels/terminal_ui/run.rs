@@ -238,6 +238,9 @@ fn harness_settings_message(
         HarnessSettingsError::InvalidShellMode => {
             "shell policy must be ask, deny, or allow.".to_string()
         }
+        HarnessSettingsError::InvalidPermissionMode => {
+            "file permissions must be allow, ask, or deny.".to_string()
+        }
     }
 }
 

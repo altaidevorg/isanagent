@@ -1329,6 +1329,11 @@ fn harness_settings_error(
             "invalid_shell_mode",
             "shell_mode must be ask, deny, or allow.",
         ),
+        HarnessSettingsError::InvalidPermissionMode => ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_permission_mode",
+            "inside_workspace and outside_workspace must be allow, ask, or deny.",
+        ),
         HarnessSettingsError::Parse(message) => {
             ApiError::new(StatusCode::BAD_REQUEST, "invalid_config", message)
         }
@@ -4093,6 +4098,94 @@ bind_address = "127.0.0.1"
             .await
             .expect("request succeeds");
         assert_ne!(authorized.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn harness_settings_round_trip_permissions() {
+        let temp = LocalTempDir::new();
+        let (bus_tx, _bus_rx) = mpsc::channel(4);
+        let mut state = build_state(&temp.db_path(), bus_tx, None);
+        let config_path = temp.path.join("config.toml");
+        std::fs::write(&config_path, "restrict_to_workspace = true\n").expect("seed config");
+        state.config_path = Some(config_path.clone());
+        let app = build_router(state, false);
+
+        let read = |response: axum::response::Response| async move {
+            let status = response.status();
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&body).expect("json"),
+            )
+        };
+
+        let (status, legacy) = read(
+            app.clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/v1/settings/harness")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .expect("get"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(legacy["outside_workspace"], "ask");
+        assert_eq!(legacy["inside_workspace"], "allow");
+        assert_eq!(legacy["restrict_to_workspace"], true);
+
+        let mut patch = legacy.clone();
+        patch["outside_workspace"] = serde_json::json!("allow");
+        patch["inside_workspace"] = serde_json::json!("allow");
+        let (status, saved) = read(
+            app.clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/v1/settings/harness")
+                        .method("PATCH")
+                        .header("content-type", "application/json")
+                        .body(Body::from(patch.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .expect("patch"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(saved["outside_workspace"], "allow");
+        assert_eq!(saved["restrict_to_workspace"], false);
+        assert_eq!(saved["restart_required"], true);
+        let text = std::fs::read_to_string(&config_path).expect("config");
+        assert!(!text.contains("restrict_to_workspace"), "{text}");
+        let written: crate::config::AppConfig = toml::from_str(&text).expect("valid config");
+        assert_eq!(
+            written.resolved_tool_permissions().outside_workspace,
+            crate::config::ShellPolicyMode::Allow
+        );
+
+        patch["outside_workspace"] = serde_json::json!("sometimes");
+        let (status, error) = read(
+            app.oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/settings/harness")
+                    .method("PATCH")
+                    .header("content-type", "application/json")
+                    .body(Body::from(patch.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .expect("patch"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            error.to_string().contains("invalid_permission_mode"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

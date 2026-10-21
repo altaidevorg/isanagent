@@ -127,8 +127,8 @@ Common fields (all events):
 | `args` (v1) | Same as `updatedInput`. |
 
 Notes:
-- **Hooks can tighten permissions, never loosen them.** The shell and edit policy evaluate the *rewritten* arguments, so a hook cannot smuggle a command past the denylist or the approval prompt. `allow` does not skip isanagent's own approval; `ask` cannot override `deny` mode, and in **unattended** sessions `ask` blocks the call (no one can answer a prompt).
-- An `ask` always prompts, even if the same command / file was granted "always (this run)" earlier. For tools outside the shell / edit policy the "always" grant is keyed by a digest of the full arguments.
+- **Hooks can tighten permissions, never loosen them.** The shell policy, the edit policy and `[harness.permissions]` (inside/outside-workspace file rules, per-tool entries) evaluate the *rewritten* arguments, so a hook cannot smuggle a command past the denylist or the approval prompt. `allow` does not skip isanagent's own approval; `ask` cannot override `deny` mode, and in **unattended** sessions `ask` blocks the call (no one can answer a prompt).
+- An `ask` always prompts, even if the same command / file was granted "always (this run)" earlier. For tools outside the shell / edit policy the "always" grant is keyed by a digest of the full arguments; an outside-workspace path grant covers the same operation under that directory (see `docs/harness-hardening-user-guide.md` §6).
 - When arguments were rewritten, the tool result tells the model what actually ran (the stored assistant message still holds the model's original arguments).
 
 Example (rewrite + context):
