@@ -16,7 +16,7 @@ use crate::config::ProviderConfig;
 
 use super::theme::Theme;
 
-const HARNESS_ROWS: usize = 6;
+const HARNESS_ROWS: usize = 7;
 const SKILL_ROWS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -366,12 +366,21 @@ impl SettingsPopup {
 
     fn toggle_harness_row(&mut self) {
         match self.cursor {
-            0 => self.harness.restrict_to_workspace = !self.harness.restrict_to_workspace,
-            1 => self.harness.shell_mode = next_shell_mode(&self.harness.shell_mode).to_string(),
-            2 => self.harness.execution_enabled = !self.harness.execution_enabled,
-            3 => self.harness.subagents_enabled = !self.harness.subagents_enabled,
-            4 => self.harness.builtin_tools_enabled = !self.harness.builtin_tools_enabled,
-            5 => self.harness.ml_engineer_enabled = !self.harness.ml_engineer_enabled,
+            0 => {
+                let next = next_permission_mode(permission_value(&self.harness.inside_workspace));
+                self.harness.inside_workspace = Some(next.to_string());
+            }
+            1 => {
+                let next = next_permission_mode(permission_value(&self.harness.outside_workspace));
+                self.harness.outside_workspace = Some(next.to_string());
+                // Keep the legacy view in step; the new key is what gets written.
+                self.harness.restrict_to_workspace = Some(next != "allow");
+            }
+            2 => self.harness.shell_mode = next_shell_mode(&self.harness.shell_mode).to_string(),
+            3 => self.harness.execution_enabled = !self.harness.execution_enabled,
+            4 => self.harness.subagents_enabled = !self.harness.subagents_enabled,
+            5 => self.harness.builtin_tools_enabled = !self.harness.builtin_tools_enabled,
+            6 => self.harness.ml_engineer_enabled = !self.harness.ml_engineer_enabled,
             _ => {}
         }
     }
@@ -478,6 +487,19 @@ fn previous_tab(tab: SettingsTab) -> SettingsTab {
         SettingsTab::Harness => SettingsTab::Models,
         SettingsTab::Skills => SettingsTab::Harness,
     }
+}
+
+/// Cycle `allow → ask → deny → allow` for the file permission rows.
+fn next_permission_mode(mode: &str) -> &'static str {
+    match mode {
+        "allow" => "ask",
+        "ask" => "deny",
+        _ => "allow",
+    }
+}
+
+fn permission_value(mode: &Option<String>) -> &str {
+    mode.as_deref().unwrap_or("ask")
 }
 
 fn next_shell_mode(mode: &str) -> &'static str {
@@ -702,12 +724,12 @@ fn sanitize_api_key(raw: &str) -> String {
 fn harness_lines(popup: &SettingsPopup) -> Vec<Line<'static>> {
     let rows = [
         (
-            "Sandbox file tools",
-            if popup.harness.restrict_to_workspace {
-                "on"
-            } else {
-                "off"
-            },
+            "Files inside workspace",
+            permission_value(&popup.harness.inside_workspace),
+        ),
+        (
+            "Files outside workspace",
+            permission_value(&popup.harness.outside_workspace),
         ),
         ("Shell policy", popup.harness.shell_mode.as_str()),
         (
@@ -1027,7 +1049,9 @@ mod tests {
 
     fn harness() -> HarnessSettings {
         HarnessSettings {
-            restrict_to_workspace: true,
+            inside_workspace: Some("allow".to_string()),
+            outside_workspace: Some("ask".to_string()),
+            restrict_to_workspace: Some(false),
             shell_mode: "ask".to_string(),
             execution_enabled: false,
             subagents_enabled: true,
@@ -1138,13 +1162,18 @@ mod tests {
         assert_eq!(popup.on_key(KeyCode::Right), SettingsEffect::None);
         assert_eq!(popup.tab, SettingsTab::Harness);
         assert_eq!(popup.on_key(KeyCode::Char(' ')), SettingsEffect::None);
-        assert!(!popup.harness.restrict_to_workspace);
+        assert_eq!(popup.harness.inside_workspace.as_deref(), Some("ask"));
+        assert_eq!(popup.on_key(KeyCode::Down), SettingsEffect::None);
+        assert_eq!(popup.on_key(KeyCode::Enter), SettingsEffect::None);
+        assert_eq!(popup.harness.outside_workspace.as_deref(), Some("deny"));
+        assert_eq!(popup.harness.restrict_to_workspace, Some(true));
         assert_eq!(popup.on_key(KeyCode::Down), SettingsEffect::None);
         assert_eq!(popup.on_key(KeyCode::Enter), SettingsEffect::None);
         assert_eq!(popup.harness.shell_mode, "deny");
         match popup.on_key(KeyCode::Char('s')) {
             SettingsEffect::SaveHarness(saved) => {
-                assert!(!saved.restrict_to_workspace);
+                assert_eq!(saved.inside_workspace.as_deref(), Some("ask"));
+                assert_eq!(saved.outside_workspace.as_deref(), Some("deny"));
                 assert_eq!(saved.shell_mode, "deny");
             }
             other => panic!("expected save, got {other:?}"),

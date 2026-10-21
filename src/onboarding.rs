@@ -67,6 +67,9 @@ impl BootstrapReport {
 #[derive(Debug, Clone, Default, Args)]
 #[command(next_help_heading = "config.toml overrides")]
 pub struct OnboardOptions {
+    /// Legacy: `true` asks before file-tool access outside the sandbox (same as the template
+    /// default), `false` allows it without asking. Sets `[harness.permissions].outside_workspace`;
+    /// edit that key for `deny`.
     #[arg(long, help_heading = "Workspace / limits")]
     pub restrict_to_workspace: Option<bool>,
     #[arg(long, help_heading = "Workspace / limits")]
@@ -178,7 +181,10 @@ pub fn build_merged_config_toml(options: &OnboardOptions) -> Result<String, Stri
         .map_err(|e| format!("config template parse (toml_edit): {e}"))?;
 
     if let Some(v) = options.restrict_to_workspace {
-        doc["restrict_to_workspace"] = value(v);
+        // The template sets `[harness.permissions].outside_workspace`, which wins over the
+        // legacy top-level key, so the flag writes the new key with the legacy meaning
+        // (true = ask, false = allow).
+        doc["harness"]["permissions"]["outside_workspace"] = value(if v { "ask" } else { "allow" });
     }
     if let Some(v) = options.max_iterations {
         doc["max_iterations"] =
@@ -742,6 +748,32 @@ mod tests {
             "allow_path_outside_sandbox should not appear as an active key in template output"
         );
         assert!(s.contains("test-model"));
+    }
+
+    #[test]
+    fn template_permissions_default_and_restrict_flag() {
+        use crate::config::{AppConfig, ShellPolicyMode};
+        let template: AppConfig =
+            toml::from_str(&build_merged_config_toml(&OnboardOptions::default()).expect("merge"))
+                .expect("template parses");
+        let p = template.resolved_tool_permissions();
+        assert_eq!(p.inside_workspace, ShellPolicyMode::Allow);
+        assert_eq!(p.outside_workspace, ShellPolicyMode::Ask);
+        assert_eq!(p.default_mode, ShellPolicyMode::Allow);
+        assert!(p.edit_ceiling.is_none());
+
+        for (flag, expected) in [
+            (true, ShellPolicyMode::Ask),
+            (false, ShellPolicyMode::Allow),
+        ] {
+            let merged = build_merged_config_toml(&OnboardOptions {
+                restrict_to_workspace: Some(flag),
+                ..Default::default()
+            })
+            .expect("merge");
+            let cfg: AppConfig = toml::from_str(&merged).expect("parses");
+            assert_eq!(cfg.resolved_tool_permissions().outside_workspace, expected);
+        }
     }
 
     #[test]

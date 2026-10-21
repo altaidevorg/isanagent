@@ -425,7 +425,12 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         .unwrap_or(3000);
 
     let mut tools = ToolRegistry::new();
-    let restrict = workspace.config.restrict_to_workspace.unwrap_or(true);
+    // `[harness.permissions]`: a tool keeps the hard `resolve_path` sandbox (the old
+    // `restrict_to_workspace = true`) only when it can never reach outside the sandbox; otherwise
+    // the dispatcher checks every path it touches (allow / ask / deny) before it runs.
+    let tool_permissions = workspace.config.resolved_tool_permissions();
+    let sandboxed =
+        |tool: &str, is_edit: bool| tool_permissions.sandbox_enforced_for(tool, is_edit);
     let builtin_tools = workspace.config.builtin_tools_enabled();
     let mut inflight_sync_outer: Option<Arc<InflightSyncRegistry>> = None;
     let mut execution_harness_for_shutdown: Option<Arc<crate::execution::ExecutionHarness>> = None;
@@ -433,27 +438,27 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
     if builtin_tools {
         tools.register(Box::new(ReadFileTool {
             workspace_dir: workspace.sandbox_dir.clone(),
-            restrict_to_workspace: restrict,
+            restrict_to_workspace: sandboxed("read_file", false),
         }));
         tools.register(Box::new(WriteFileTool {
             workspace_dir: workspace.sandbox_dir.clone(),
-            restrict_to_workspace: restrict,
+            restrict_to_workspace: sandboxed("write_file", true),
         }));
         tools.register(Box::new(EditFileTool {
             workspace_dir: workspace.sandbox_dir.clone(),
-            restrict_to_workspace: restrict,
+            restrict_to_workspace: sandboxed("edit_file", true),
         }));
         tools.register(Box::new(ListDirTool {
             workspace_dir: workspace.sandbox_dir.clone(),
-            restrict_to_workspace: restrict,
+            restrict_to_workspace: sandboxed("list_dir", false),
         }));
         tools.register(Box::new(GlobFilesTool {
             workspace_dir: workspace.sandbox_dir.clone(),
-            restrict_to_workspace: restrict,
+            restrict_to_workspace: sandboxed("glob_files", false),
         }));
         tools.register(Box::new(SearchTextTool {
             workspace_dir: workspace.sandbox_dir.clone(),
-            restrict_to_workspace: restrict,
+            restrict_to_workspace: sandboxed("search_text", false),
             ripgrep_timeout_secs: workspace
                 .config
                 .effective_search_text_ripgrep_timeout_secs(),
@@ -462,7 +467,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             crate::tools::exec_jobs::ExecJobRegistry::new(Some(global_outbound_tx.clone()));
         tools.register(Box::new(ShellExecTool {
             workspace_dir: workspace.sandbox_dir.clone(),
-            restrict_to_workspace: restrict,
+            restrict_to_workspace: sandboxed("exec", false),
             exec_jobs: Some(exec_jobs.clone()),
             windows_runner: workspace.config.windows_shell_runner(),
         }));
@@ -473,7 +478,7 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         if workspace.config.git_worktree_tool_enabled() {
             tools.register(Box::new(GitWorktreeTool {
                 workspace_dir: workspace.sandbox_dir.clone(),
-                restrict_to_workspace: restrict,
+                restrict_to_workspace: sandboxed("git_worktree", false),
                 allow_path_outside_sandbox: workspace
                     .config
                     .git_worktree_allow_path_outside_sandbox(),
@@ -481,18 +486,32 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
         }
         if workspace.config.checkpoint_enabled() {
             // Backups live in the outer rim (never inside the agent's editable sandbox); restores are
-            // confined to the sandbox when the file tools are workspace-restricted.
+            // confined to the sandbox unless edits outside it are allowed without a prompt
+            // (an approved outside edit can then not be undone through `checkpoint`).
+            let outside_edits_allowed = ["write_file", "edit_file"].iter().all(|tool| {
+                tool_permissions
+                    .tool_override(tool, true, false)
+                    .unwrap_or_else(|| tool_permissions.location_mode(false, true, false))
+                    == crate::config::ShellPolicyMode::Allow
+            });
             crate::checkpoint::init(
                 workspace.dir.join(".system_generated").join("checkpoints"),
-                restrict.then(|| workspace.sandbox_dir.clone()),
+                (!outside_edits_allowed).then(|| workspace.sandbox_dir.clone()),
             );
             tools.register(Box::new(crate::checkpoint::CheckpointTool));
         }
         if workspace.config.execution_harness_enabled() {
+            // `execution_*` working directories are resolved by the execution provider, not by a
+            // tool the dispatcher can ask about, so they leave the sandbox only when
+            // `outside_workspace = "allow"` (otherwise the old hard sandbox applies).
+            let execution_sandboxed = tool_permissions
+                .tool_override("execution_run", false, false)
+                .unwrap_or(tool_permissions.outside_workspace)
+                != crate::config::ShellPolicyMode::Allow;
             let harness = crate::execution::build_execution_harness(
                 workspace.dir.clone(),
                 workspace.sandbox_dir.clone(),
-                restrict,
+                execution_sandboxed,
                 &workspace.config,
             )
             .map_err(|e| std::io::Error::other(format!("execution harness: {e}")))?;
@@ -847,7 +866,22 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
 
     let harness_runtime_summary = workspace.config.runtime_harness_summary_lines().join("\n");
     let forbid_final_without_tools = workspace.config.ml_engineer_forbid_final_without_tools();
-    let shell_policy = workspace.config.resolved_shell_policy();
+    let mut shell_policy = workspace.config.resolved_shell_policy();
+    // "always" directory grants never widen onto the outer workspace's config and internal state.
+    shell_policy.permissions.protected_paths = ["config.toml", ".system_generated"]
+        .iter()
+        .map(|name| {
+            let path = workspace.dir.join(name);
+            std::fs::canonicalize(&path).unwrap_or(path)
+        })
+        .collect();
+    // ... and never widen to a filesystem root, the home directory, or above workspace_dir.
+    shell_policy.permissions.grant_home_dir = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .map(|home| std::fs::canonicalize(&home).unwrap_or(home));
+    shell_policy.permissions.grant_workspace_dir =
+        Some(std::fs::canonicalize(&workspace.dir).unwrap_or_else(|_| workspace.dir.clone()));
     let default_harness = crate::config::HarnessConfig::default();
     let harness_ref = workspace
         .config
@@ -1637,6 +1671,15 @@ fn apply_host_overrides(config: &mut AppConfig, host: &HostConfig) -> Result<(),
         };
         shell_policy.mode = Some(mode.to_string());
         shell_policy.edit_mode = Some(edit_mode.to_string());
+        if permission == HostPermissionMode::Bypass {
+            // Bypass also lifts the outside-the-sandbox prompt for file tools.
+            config
+                .harness
+                .get_or_insert_with(HarnessConfig::default)
+                .permissions
+                .get_or_insert_with(Default::default)
+                .outside_workspace = Some("allow".to_string());
+        }
     }
 
     Ok(())
@@ -2016,10 +2059,18 @@ mod tests {
 
             let policy = config
                 .harness
-                .and_then(|harness| harness.shell_policy)
+                .as_ref()
+                .and_then(|harness| harness.shell_policy.clone())
                 .expect("shell policy override");
             assert_eq!(policy.mode.as_deref(), Some(mode));
             assert_eq!(policy.edit_mode.as_deref(), Some(edit_mode));
+            let outside = config.resolved_tool_permissions().outside_workspace;
+            let expected_outside = if permission == HostPermissionMode::Bypass {
+                crate::config::ShellPolicyMode::Allow
+            } else {
+                crate::config::ShellPolicyMode::Ask
+            };
+            assert_eq!(outside, expected_outside);
         }
     }
 

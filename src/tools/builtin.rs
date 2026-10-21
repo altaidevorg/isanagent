@@ -15,7 +15,9 @@ use crate::tools::exec_jobs::{
     exec_status_str, ExecJobRecord, ExecJobRegistry, EXEC_JOB_CANCELLED, EXEC_JOB_COMPLETED,
     EXEC_JOB_FAILED, EXEC_JOB_RUNNING,
 };
-use crate::traits::{MutationPreview, Tool, ToolErrorCode, ToolPolicy, ToolResult};
+use crate::traits::{
+    MutationPreview, PathAccess, PathAccessKind, Tool, ToolErrorCode, ToolPolicy, ToolResult,
+};
 use crate::utils::{join_lexically_under_root, normalize_sandbox_relative_input};
 use crate::NodeHandle;
 use std::process::Stdio;
@@ -79,31 +81,7 @@ pub fn resolve_path(path: &str, workspace_dir: &Path, restrict: bool) -> Result<
     // 2. Canonicalize if it exists to cleanly remove `..` and `.`.
     // If it doesn't exist yet (e.g., writing a new file), we canonicalize the nearest existing parent
     // and append the remainder.
-    let canonical = if resolved.exists() {
-        std::fs::canonicalize(&resolved).map_err(|e| format!("Path normalization error: {e}"))?
-    } else {
-        // Find nearest existing parent
-        let mut parent = resolved.parent();
-        let mut missing_components = Vec::new();
-        while let Some(p) = parent {
-            if p.exists() {
-                break;
-            }
-            missing_components.push(p.file_name().unwrap_or_default());
-            parent = p.parent();
-        }
-
-        let mut safe_base = std::fs::canonicalize(parent.unwrap_or_else(|| Path::new(".")))
-            .map_err(|e| format!("Base path normalization error: {e}"))?;
-
-        for comp in missing_components.into_iter().rev() {
-            safe_base.push(comp);
-        }
-        if let Some(name) = resolved.file_name() {
-            safe_base.push(name);
-        }
-        safe_base
-    };
+    let canonical = canonicalize_allowing_missing(&resolved, MAX_DANGLING_SYMLINK_HOPS)?;
 
     // 3. Enforce sandbox boundary if restricted.
     if restrict {
@@ -120,6 +98,100 @@ pub fn resolve_path(path: &str, workspace_dir: &Path, restrict: bool) -> Result<
     }
 
     Ok(canonical)
+}
+
+/// Bound on dangling-symlink hops followed by [`canonicalize_allowing_missing`] (same order as
+/// the kernel's `ELOOP` limit).
+const MAX_DANGLING_SYMLINK_HOPS: usize = 40;
+
+/// Canonicalize `resolved`; when it does not exist yet (e.g. a file about to be written),
+/// canonicalize the nearest existing ancestor and append the missing remainder.
+///
+/// A missing entry that is itself a *dangling symlink* is followed: writing through it would
+/// create the link target, which may lie outside the sandbox, so the target is what gets
+/// resolved and boundary-checked (not the link's own location).
+fn canonicalize_allowing_missing(resolved: &Path, hops: usize) -> Result<PathBuf, String> {
+    if resolved.exists() {
+        return std::fs::canonicalize(resolved)
+            .map_err(|e| format!("Path normalization error: {e}"));
+    }
+    let mut missing_components = Vec::new();
+    let mut current = Some(resolved);
+    while let Some(p) = current {
+        if p.exists() {
+            break;
+        }
+        let is_dangling_link = std::fs::symlink_metadata(p)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        if is_dangling_link {
+            if hops == 0 {
+                return Err(format!(
+                    "Path normalization error: too many symlink levels at {}",
+                    p.display()
+                ));
+            }
+            let target =
+                std::fs::read_link(p).map_err(|e| format!("Path normalization error: {e}"))?;
+            let target = if target.is_absolute() {
+                target
+            } else {
+                p.parent().unwrap_or_else(|| Path::new(".")).join(target)
+            };
+            let mut base = canonicalize_allowing_missing(&target, hops - 1)?;
+            for comp in missing_components.into_iter().rev() {
+                base.push(comp);
+            }
+            return Ok(base);
+        }
+        if let Some(name) = p.file_name() {
+            missing_components.push(name);
+        }
+        current = p.parent();
+    }
+
+    let mut safe_base = std::fs::canonicalize(current.unwrap_or_else(|| Path::new(".")))
+        .map_err(|e| format!("Base path normalization error: {e}"))?;
+    for comp in missing_components.into_iter().rev() {
+        safe_base.push(comp);
+    }
+    Ok(safe_base)
+}
+
+/// One [`PathAccess`] for `path_str`, resolved exactly like the tool resolves it at execution.
+fn path_access(
+    path_str: &str,
+    workspace_dir: &Path,
+    restrict_to_workspace: bool,
+    kind: PathAccessKind,
+) -> Result<PathAccess, String> {
+    let path = resolve_path(path_str, workspace_dir, restrict_to_workspace)?;
+    let inside_sandbox = crate::utils::path_is_within(workspace_dir, &path);
+    Ok(PathAccess {
+        path,
+        kind,
+        inside_sandbox,
+    })
+}
+
+/// The `path` argument of a file tool (required) as one access.
+fn required_path_access(
+    args: &Value,
+    key: &str,
+    workspace_dir: &Path,
+    restrict_to_workspace: bool,
+    kind: PathAccessKind,
+) -> Result<Vec<PathAccess>, String> {
+    let path_str = args
+        .get(key)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("Missing '{key}' argument"))?;
+    Ok(vec![path_access(
+        path_str,
+        workspace_dir,
+        restrict_to_workspace,
+        kind,
+    )?])
 }
 
 /// Relative path from `base` to `path` using `/` separators, for glob matching.
@@ -266,6 +338,16 @@ impl Tool for ReadFileTool {
         "read_file"
     }
 
+    fn path_accesses(&self, args: &Value) -> Result<Vec<PathAccess>, String> {
+        required_path_access(
+            args,
+            "path",
+            &self.workspace_dir,
+            self.restrict_to_workspace,
+            PathAccessKind::Read,
+        )
+    }
+
     fn description(&self) -> &str {
         "Read content from a local file within a specified line range (1-indexed, inclusive). If start_line and end_line are omitted, reads the first 100 lines. Each call returns at most 100 lines. For longer files, issue multiple read_file calls with adjacent ranges (e.g. 1–100, then 101–200). Prefer absolute or workspace-relative paths."
     }
@@ -387,6 +469,16 @@ impl Tool for WriteFileTool {
 
     fn name(&self) -> &str {
         "write_file"
+    }
+
+    fn path_accesses(&self, args: &Value) -> Result<Vec<PathAccess>, String> {
+        required_path_access(
+            args,
+            "path",
+            &self.workspace_dir,
+            self.restrict_to_workspace,
+            PathAccessKind::Write,
+        )
     }
 
     fn description(&self) -> &str {
@@ -544,6 +636,16 @@ impl Tool for EditFileTool {
 
     fn name(&self) -> &str {
         "edit_file"
+    }
+
+    fn path_accesses(&self, args: &Value) -> Result<Vec<PathAccess>, String> {
+        required_path_access(
+            args,
+            "path",
+            &self.workspace_dir,
+            self.restrict_to_workspace,
+            PathAccessKind::Write,
+        )
     }
 
     fn description(&self) -> &str {
@@ -743,6 +845,16 @@ impl Tool for ListDirTool {
         "list_dir"
     }
 
+    fn path_accesses(&self, args: &Value) -> Result<Vec<PathAccess>, String> {
+        required_path_access(
+            args,
+            "path",
+            &self.workspace_dir,
+            self.restrict_to_workspace,
+            PathAccessKind::Read,
+        )
+    }
+
     fn description(&self) -> &str {
         "List the contents of a directory."
     }
@@ -839,6 +951,16 @@ impl Tool for GlobFilesTool {
 
     fn name(&self) -> &str {
         "glob_files"
+    }
+
+    fn path_accesses(&self, args: &Value) -> Result<Vec<PathAccess>, String> {
+        let path_str = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        Ok(vec![path_access(
+            path_str,
+            &self.workspace_dir,
+            self.restrict_to_workspace,
+            PathAccessKind::Read,
+        )?])
     }
 
     fn description(&self) -> &str {
@@ -1152,6 +1274,16 @@ impl Tool for SearchTextTool {
 
     fn name(&self) -> &str {
         "search_text"
+    }
+
+    fn path_accesses(&self, args: &Value) -> Result<Vec<PathAccess>, String> {
+        let path_str = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        Ok(vec![path_access(
+            path_str,
+            &self.workspace_dir,
+            self.restrict_to_workspace,
+            PathAccessKind::Read,
+        )?])
     }
 
     fn description(&self) -> &str {
@@ -1564,6 +1696,19 @@ impl ShellExecTool {
 impl Tool for ShellExecTool {
     fn name(&self) -> &str {
         "exec"
+    }
+
+    fn path_accesses(&self, args: &Value) -> Result<Vec<PathAccess>, String> {
+        let path_str = args
+            .get("working_dir")
+            .and_then(|v| v.as_str())
+            .unwrap_or(".");
+        Ok(vec![path_access(
+            path_str,
+            &self.workspace_dir,
+            self.restrict_to_workspace,
+            PathAccessKind::WorkingDir,
+        )?])
     }
 
     fn description(&self) -> &str {
@@ -2980,6 +3125,32 @@ impl Tool for GitWorktreeTool {
         "git_worktree"
     }
 
+    fn path_accesses(&self, args: &Value) -> Result<Vec<PathAccess>, String> {
+        // `allow_path_outside_sandbox = true` is an explicit grant for this tool: its paths are
+        // not subject to the location rules.
+        if self.allow_path_outside_sandbox {
+            return Ok(Vec::new());
+        }
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        let base_path = args
+            .get("base_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or(".");
+        let access = |path: &str, kind| {
+            path_access(path, &self.workspace_dir, self.restrict_to_workspace, kind)
+        };
+        let mut accesses = Vec::new();
+        if matches!(action, "list" | "add") {
+            accesses.push(access(base_path, PathAccessKind::Read)?);
+        }
+        if matches!(action, "add" | "remove") {
+            if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+                accesses.push(access(path, PathAccessKind::Write)?);
+            }
+        }
+        Ok(accesses)
+    }
+
     fn description(&self) -> &str {
         "Manage git worktrees: list linked worktrees, add a new worktree on a fresh branch, or remove one. Requires git on PATH. Only available when enabled in config ([harness.git_worktree]). Worktree paths follow the same sandbox rules as other filesystem tools unless allow_path_outside_sandbox is set there."
     }
@@ -3848,5 +4019,211 @@ mod download_path_tests {
             "download escaped the sandbox: {target:?}"
         );
         let _ = fs::remove_dir_all(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod path_access_tests {
+    use super::*;
+    use serde_json::json;
+
+    struct Dirs {
+        _tmp: tempfile::TempDir,
+        sandbox: PathBuf,
+        outside: PathBuf,
+    }
+
+    fn dirs() -> Dirs {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canon");
+        let sandbox = root.join("workspace");
+        let outside = root.join("outside");
+        fs::create_dir_all(sandbox.join("src")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(sandbox.join("src").join("a.txt"), "inside").unwrap();
+        fs::write(outside.join("secret.txt"), "outside").unwrap();
+        Dirs {
+            _tmp: tmp,
+            sandbox,
+            outside,
+        }
+    }
+
+    fn read_tool(d: &Dirs, restrict: bool) -> ReadFileTool {
+        ReadFileTool {
+            workspace_dir: d.sandbox.clone(),
+            restrict_to_workspace: restrict,
+        }
+    }
+
+    fn one(tool: &dyn Tool, args: Value) -> PathAccess {
+        let mut accesses = tool.path_accesses(&args).expect("resolvable");
+        assert_eq!(accesses.len(), 1, "{accesses:?}");
+        accesses.remove(0)
+    }
+
+    #[test]
+    fn relative_and_absolute_inside_paths_are_inside() {
+        let d = dirs();
+        let tool = read_tool(&d, false);
+        let rel = one(&tool, json!({"path": "src/a.txt"}));
+        assert!(rel.inside_sandbox);
+        assert_eq!(rel.kind, PathAccessKind::Read);
+        let abs = one(
+            &tool,
+            json!({"path": d.sandbox.join("src/a.txt").to_string_lossy()}),
+        );
+        assert!(abs.inside_sandbox);
+        assert_eq!(rel.path, abs.path);
+    }
+
+    #[test]
+    fn absolute_outside_path_is_outside() {
+        let d = dirs();
+        let access = one(
+            &read_tool(&d, false),
+            json!({"path": d.outside.join("secret.txt").to_string_lossy()}),
+        );
+        assert!(!access.inside_sandbox);
+        assert_eq!(access.path, d.outside.join("secret.txt"));
+    }
+
+    #[test]
+    fn parent_escape_is_outside_unless_the_hard_sandbox_clamps_it() {
+        let d = dirs();
+        let escaped = one(
+            &read_tool(&d, false),
+            json!({"path": "../outside/secret.txt"}),
+        );
+        assert!(!escaped.inside_sandbox);
+        assert_eq!(escaped.path, d.outside.join("secret.txt"));
+        // With the legacy hard sandbox `..` is clamped lexically at the root (old behavior).
+        let clamped = one(&read_tool(&d, true), json!({"path": "../src/a.txt"}));
+        assert!(clamped.inside_sandbox);
+    }
+
+    #[test]
+    fn hard_sandbox_rejects_outside_paths_before_any_policy() {
+        let d = dirs();
+        let err = read_tool(&d, true)
+            .path_accesses(&json!({"path": d.outside.join("secret.txt").to_string_lossy()}))
+            .unwrap_err();
+        assert!(err.starts_with("PermissionError"), "{err}");
+    }
+
+    #[test]
+    fn not_yet_existing_file_is_anchored_on_its_existing_ancestor() {
+        let d = dirs();
+        let tool = WriteFileTool {
+            workspace_dir: d.sandbox.clone(),
+            restrict_to_workspace: false,
+        };
+        let access = one(&tool, json!({"path": "new/dir/file.txt", "content": "x"}));
+        assert!(access.inside_sandbox);
+        assert_eq!(access.kind, PathAccessKind::Write);
+        assert_eq!(access.path, d.sandbox.join("new/dir/file.txt"));
+        let outside_new = one(
+            &tool,
+            json!({"path": d.outside.join("n/f.txt").to_string_lossy(), "content": "x"}),
+        );
+        assert!(!outside_new.inside_sandbox);
+    }
+
+    #[test]
+    fn exec_working_dir_and_optional_paths_default_to_the_sandbox() {
+        let d = dirs();
+        let exec = ShellExecTool {
+            workspace_dir: d.sandbox.clone(),
+            restrict_to_workspace: false,
+            exec_jobs: None,
+            windows_runner: Default::default(),
+        };
+        let cwd = one(&exec, json!({"command": "ls"}));
+        assert!(cwd.inside_sandbox);
+        assert_eq!(cwd.kind, PathAccessKind::WorkingDir);
+        let outside = one(
+            &exec,
+            json!({"command": "ls", "working_dir": d.outside.to_string_lossy()}),
+        );
+        assert!(!outside.inside_sandbox);
+        let glob = GlobFilesTool {
+            workspace_dir: d.sandbox.clone(),
+            restrict_to_workspace: false,
+        };
+        assert!(one(&glob, json!({"pattern": "*.txt"})).inside_sandbox);
+    }
+
+    #[test]
+    fn git_worktree_outside_grant_skips_location_rules() {
+        let d = dirs();
+        let granted = GitWorktreeTool {
+            workspace_dir: d.sandbox.clone(),
+            restrict_to_workspace: false,
+            allow_path_outside_sandbox: true,
+        };
+        assert!(granted
+            .path_accesses(&json!({"action": "add", "path": "/tmp/wt"}))
+            .unwrap()
+            .is_empty());
+        let gated = GitWorktreeTool {
+            allow_path_outside_sandbox: false,
+            ..granted
+        };
+        let accesses = gated
+            .path_accesses(
+                &json!({"action": "add", "path": d.outside.join("wt").to_string_lossy()}),
+            )
+            .unwrap();
+        assert_eq!(accesses.len(), 2);
+        assert!(accesses[0].inside_sandbox);
+        assert!(!accesses[1].inside_sandbox);
+        assert_eq!(accesses[1].kind, PathAccessKind::Write);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_outside_is_outside() {
+        let d = dirs();
+        std::os::unix::fs::symlink(d.outside.join("secret.txt"), d.sandbox.join("link.txt"))
+            .unwrap();
+        std::os::unix::fs::symlink(&d.outside, d.sandbox.join("linkdir")).unwrap();
+        let tool = read_tool(&d, false);
+        let file = one(&tool, json!({"path": "link.txt"}));
+        assert!(!file.inside_sandbox);
+        assert_eq!(file.path, d.outside.join("secret.txt"));
+        let through_dir = one(&tool, json!({"path": "linkdir/secret.txt"}));
+        assert!(!through_dir.inside_sandbox);
+        // The legacy hard sandbox still refuses it.
+        assert!(read_tool(&d, true)
+            .path_accesses(&json!({"path": "link.txt"}))
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_resolves_to_its_target() {
+        // Writing through a dangling link creates the target, so the target is what counts.
+        let d = dirs();
+        let target = d.outside.join("created-by-write.txt");
+        std::os::unix::fs::symlink(&target, d.sandbox.join("dangling.txt")).unwrap();
+        let tool = WriteFileTool {
+            workspace_dir: d.sandbox.clone(),
+            restrict_to_workspace: false,
+        };
+        let access = one(&tool, json!({"path": "dangling.txt", "content": "x"}));
+        assert!(!access.inside_sandbox);
+        assert_eq!(access.path, target);
+        // Hard sandbox: refused (previously this escaped the boundary check).
+        let err = resolve_path("dangling.txt", &d.sandbox, true).unwrap_err();
+        assert!(err.starts_with("PermissionError"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_loop_is_an_error_not_a_hang() {
+        let d = dirs();
+        std::os::unix::fs::symlink(d.sandbox.join("b"), d.sandbox.join("a")).unwrap();
+        std::os::unix::fs::symlink(d.sandbox.join("a"), d.sandbox.join("b")).unwrap();
+        assert!(resolve_path("a", &d.sandbox, false).is_err());
     }
 }

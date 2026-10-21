@@ -91,7 +91,7 @@ When `default_provider = "ssh"`, add **`[harness.execution.ssh]`**:
 - **`workspace_dir`** (outer): holds `config.toml`, logs, `.system_generated/`, etc.
 - **`sandbox_dir`** (inner): usually `workspace_dir/workspace` — this is where execution runs and where paths are resolved.
 
-Filesystem tools and execution share the same **sandbox boundary** when `restrict_to_workspace = true` (default). Do not put secrets in the sandbox if the model can read them.
+File tools follow `[harness.permissions]` (inside the sandbox: `allow`; outside: `ask`; see `docs/harness-hardening-user-guide.md` §6). Execution working directories are resolved by the execution provider (no approval prompt is possible there), so they stay inside the sandbox unless `outside_workspace = "allow"` (or the legacy `restrict_to_workspace = false`); legacy `restrict_to_workspace = true` now means `ask` for file tools and keeps execution confined. Do not put secrets in the sandbox if the model can read them.
 
 Materialized run artifacts live under **`sandbox_dir/.execution_artifacts/`** (session segment is sanitized for path safety). Operator scenarios: **`docs/execution-use-cases.md`**.
 

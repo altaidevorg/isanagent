@@ -13,7 +13,19 @@ use crate::config::{AppConfig, ShellPolicyMode};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HarnessSettings {
-    pub restrict_to_workspace: bool,
+    /// `[harness.permissions].inside_workspace`: file tools on paths inside the sandbox
+    /// (`allow` / `ask` / `deny`). Always set in responses; omit in a write to keep the file's value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inside_workspace: Option<String>,
+    /// `[harness.permissions].outside_workspace`: file tools on paths outside the sandbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outside_workspace: Option<String>,
+    /// Legacy view of `outside_workspace` (`true` = outside access is not free, i.e. `ask` or
+    /// `deny`). Responses report it for older clients; a write uses it only when
+    /// `outside_workspace` is absent (`true` → `ask`, `false` → `allow`, matching how the legacy
+    /// config key is read).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restrict_to_workspace: Option<bool>,
     pub shell_mode: String,
     pub execution_enabled: bool,
     pub subagents_enabled: bool,
@@ -26,18 +38,18 @@ pub enum HarnessSettingsError {
     Io(String),
     Parse(String),
     InvalidShellMode,
+    InvalidPermissionMode,
 }
 
 impl HarnessSettings {
     pub fn from_app(config: &AppConfig) -> Self {
-        let shell_mode = match config.resolved_shell_policy().interactive_mode {
-            ShellPolicyMode::Ask => "ask",
-            ShellPolicyMode::Deny => "deny",
-            ShellPolicyMode::Allow => "allow",
-        };
+        let policy = config.resolved_shell_policy();
+        let outside = policy.permissions.outside_workspace;
         Self {
-            restrict_to_workspace: config.restrict_to_workspace.unwrap_or(true),
-            shell_mode: shell_mode.to_string(),
+            inside_workspace: Some(policy.permissions.inside_workspace.as_str().to_string()),
+            outside_workspace: Some(outside.as_str().to_string()),
+            restrict_to_workspace: Some(outside != ShellPolicyMode::Allow),
+            shell_mode: policy.interactive_mode.as_str().to_string(),
             execution_enabled: config.execution_harness_enabled(),
             subagents_enabled: config.subagent_harness_enabled(),
             builtin_tools_enabled: config.builtin_tools_enabled(),
@@ -68,6 +80,17 @@ pub fn write_harness_settings(
     patch: &HarnessSettings,
 ) -> Result<HarnessSettings, HarnessSettingsError> {
     let shell_mode = normalize_shell_mode(&patch.shell_mode)?;
+    let inside = patch
+        .inside_workspace
+        .as_deref()
+        .map(normalize_permission_mode)
+        .transpose()?;
+    let outside = match patch.outside_workspace.as_deref() {
+        Some(raw) => Some(normalize_permission_mode(raw)?),
+        None => patch
+            .restrict_to_workspace
+            .map(|restrict| if restrict { "ask" } else { "allow" }),
+    };
     let raw = if path.is_file() {
         fs::read_to_string(path).map_err(|error| {
             HarnessSettingsError::Io(format!("Failed to read {}: {error}", path.display()))
@@ -83,7 +106,14 @@ pub fn write_harness_settings(
         })?
     };
 
-    doc["restrict_to_workspace"] = value(patch.restrict_to_workspace);
+    if let Some(inside) = inside {
+        doc["harness"]["permissions"]["inside_workspace"] = value(inside);
+    }
+    if let Some(outside) = outside {
+        doc["harness"]["permissions"]["outside_workspace"] = value(outside);
+        // The new key wins over the legacy one anyway; drop it so the file has one source.
+        doc.remove("restrict_to_workspace");
+    }
     doc["harness"]["shell_policy"]["mode"] = value(shell_mode);
     doc["harness"]["execution"]["enabled"] = value(patch.execution_enabled);
     doc["harness"]["subagents"]["enabled"] = value(patch.subagents_enabled);
@@ -111,12 +141,15 @@ pub fn write_harness_settings(
 }
 
 fn normalize_shell_mode(raw: &str) -> Result<&'static str, HarnessSettingsError> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "ask" => Ok("ask"),
-        "deny" => Ok("deny"),
-        "allow" => Ok("allow"),
-        _ => Err(HarnessSettingsError::InvalidShellMode),
-    }
+    ShellPolicyMode::parse(raw)
+        .map(ShellPolicyMode::as_str)
+        .ok_or(HarnessSettingsError::InvalidShellMode)
+}
+
+fn normalize_permission_mode(raw: &str) -> Result<&'static str, HarnessSettingsError> {
+    ShellPolicyMode::parse(raw)
+        .map(ShellPolicyMode::as_str)
+        .ok_or(HarnessSettingsError::InvalidPermissionMode)
 }
 
 #[cfg(test)]
@@ -125,7 +158,9 @@ mod tests {
 
     fn sample() -> HarnessSettings {
         HarnessSettings {
-            restrict_to_workspace: false,
+            inside_workspace: Some("ask".to_string()),
+            outside_workspace: Some("allow".to_string()),
+            restrict_to_workspace: Some(false),
             shell_mode: "deny".to_string(),
             execution_enabled: true,
             subagents_enabled: true,
@@ -162,7 +197,9 @@ enabled = false
         let saved = write_harness_settings(&path, &sample()).expect("write");
         assert_eq!(saved, sample());
         let text = fs::read_to_string(&path).expect("read back");
-        assert!(text.contains("# workspace boundary"));
+        assert!(!text.contains("restrict_to_workspace"), "{text}");
+        assert!(text.contains("inside_workspace = \"ask\""), "{text}");
+        assert!(text.contains("outside_workspace = \"allow\""), "{text}");
         assert!(text.contains("# interactive shell"));
         assert!(text.contains("# off until a provider is configured"));
         assert!(text.contains("unattended_default = \"allow\""));
@@ -189,10 +226,50 @@ enabled = false
         let dir = tempfile::tempdir().expect("tempdir");
         let settings = read_harness_settings(&dir.path().join("config.toml")).expect("defaults");
         assert_eq!(settings, HarnessSettings::defaults());
-        assert!(settings.restrict_to_workspace);
+        assert_eq!(settings.inside_workspace.as_deref(), Some("allow"));
+        assert_eq!(settings.outside_workspace.as_deref(), Some("ask"));
+        assert_eq!(settings.restrict_to_workspace, Some(true));
         assert_eq!(settings.shell_mode, "ask");
         assert!(!settings.execution_enabled);
         assert!(settings.builtin_tools_enabled);
         assert!(!settings.ml_engineer_enabled);
+    }
+
+    #[test]
+    fn legacy_restrict_flag_reads_and_writes_through_the_new_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "restrict_to_workspace = true\n").expect("seed");
+        let read = read_harness_settings(&path).expect("read");
+        assert_eq!(read.outside_workspace.as_deref(), Some("ask"));
+        assert_eq!(read.restrict_to_workspace, Some(true));
+
+        // An older client that only knows the boolean.
+        let mut patch = read.clone();
+        patch.inside_workspace = None;
+        patch.outside_workspace = None;
+        patch.restrict_to_workspace = Some(false);
+        let saved = write_harness_settings(&path, &patch).expect("write");
+        assert_eq!(saved.outside_workspace.as_deref(), Some("allow"));
+        let text = fs::read_to_string(&path).expect("read back");
+        assert!(!text.contains("restrict_to_workspace"), "{text}");
+        patch.restrict_to_workspace = Some(true);
+        let saved = write_harness_settings(&path, &patch).expect("write");
+        assert_eq!(saved.outside_workspace.as_deref(), Some("ask"));
+    }
+
+    #[test]
+    fn invalid_permission_mode_does_not_touch_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "restrict_to_workspace = true\n").expect("seed");
+        let mut patch = sample();
+        patch.outside_workspace = Some("sometimes".to_string());
+        let error = write_harness_settings(&path, &patch).unwrap_err();
+        assert_eq!(error, HarnessSettingsError::InvalidPermissionMode);
+        assert_eq!(
+            fs::read_to_string(&path).expect("unchanged"),
+            "restrict_to_workspace = true\n"
+        );
     }
 }

@@ -31,7 +31,7 @@ use crate::tools::builtin::resolve_path;
 /// How user code is executed for a session.
 #[derive(Debug, Clone)]
 pub enum LocalExecMode {
-    /// POSIX `sh -c`, Windows `cmd /C`, or `powershell -Command`.
+    /// POSIX `sh -c`, Windows `cmd /D /S /C`, or `powershell -EncodedCommand`.
     Shell { language: Option<String> },
 }
 
@@ -888,15 +888,15 @@ fn build_command(
         LocalExecMode::Shell { language } => {
             let lang = language.as_deref().unwrap_or(platform_shell_name());
             if cfg!(target_os = "windows") {
-                if lang == "powershell" || lang == "pwsh" {
-                    let mut c = Command::new("powershell");
-                    c.arg("-Command").arg(code);
-                    (c, None)
+                // Windows PowerShell for both spellings (pwsh is not guaranteed to be installed).
+                let runner = if lang == "powershell" || lang == "pwsh" {
+                    crate::config::WindowsShellRunner::PowerShell
                 } else {
-                    let mut c = Command::new("cmd");
-                    c.arg("/C").arg(code);
-                    (c, None)
-                }
+                    crate::config::WindowsShellRunner::Cmd
+                };
+                let c =
+                    crate::windows_shell::windows_shell_invocation(runner, code).to_tokio_command();
+                (c, None)
             } else {
                 let mut c = Command::new("sh");
                 c.arg("-c").arg(code);

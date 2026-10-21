@@ -1228,6 +1228,36 @@ pub fn normalize_sandbox_relative_input(workspace_dir: &Path, path: &str) -> Pat
     raw.to_path_buf()
 }
 
+/// Whether the canonical `path` lies inside `root` (canonicalized here; symlinks in `root`
+/// resolved). Callers pass a path produced by `resolve_path`, whose existing prefix is
+/// canonical, so the on-disk case already matches on macOS. On Windows the comparison also
+/// ignores ASCII case (paths there are case-insensitive), so a differently-cased spelling of an
+/// inside path is not misclassified. Returns false when `root` cannot be canonicalized.
+pub fn path_is_within(root: &Path, path: &Path) -> bool {
+    let Ok(root) = std::fs::canonicalize(root) else {
+        return false;
+    };
+    path_starts_with(path, &root, cfg!(windows))
+}
+
+/// Component-wise prefix test (`/data2` never starts with `/data`), optionally ignoring ASCII case.
+pub(crate) fn path_starts_with(path: &Path, root: &Path, case_insensitive: bool) -> bool {
+    if path.starts_with(root) {
+        return true;
+    }
+    if !case_insensitive {
+        return false;
+    }
+    let mut components = path.components();
+    root.components().all(|r| {
+        components.next().is_some_and(|p| {
+            p.as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&r.as_os_str().to_string_lossy())
+        })
+    })
+}
+
 /// Resolves `agent_path` relative to `sandbox_dir`, ensuring the resulting
 /// canonical path stays within the sandbox boundary.
 ///
@@ -1751,5 +1781,44 @@ mod tests {
         assert_eq!(current.trim(), "line-4");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod path_within_tests {
+    use super::{path_is_within, path_starts_with};
+    use std::path::Path;
+
+    #[test]
+    fn prefix_is_component_wise() {
+        assert!(path_starts_with(
+            Path::new("/a/ws/x"),
+            Path::new("/a/ws"),
+            false
+        ));
+        assert!(!path_starts_with(
+            Path::new("/a/wsx/y"),
+            Path::new("/a/ws"),
+            false
+        ));
+        assert!(!path_starts_with(
+            Path::new("/a/WS/x"),
+            Path::new("/a/ws"),
+            false
+        ));
+        assert!(path_starts_with(
+            Path::new("/a/WS/x"),
+            Path::new("/a/ws"),
+            true
+        ));
+        assert!(!path_starts_with(Path::new("/a"), Path::new("/a/ws"), true));
+    }
+
+    #[test]
+    fn missing_root_is_never_inside() {
+        assert!(!path_is_within(
+            Path::new("/definitely/not/here/isanagent"),
+            Path::new("/definitely/not/here/isanagent/x")
+        ));
     }
 }

@@ -51,8 +51,11 @@ type SettingsTab = "models" | "harness" | "skills";
 
 type ShellMode = "ask" | "deny" | "allow";
 
+type PermissionMode = "allow" | "ask" | "deny";
+
 type HarnessSettings = {
-  restrict_to_workspace: boolean;
+  inside_workspace: PermissionMode;
+  outside_workspace: PermissionMode;
   shell_mode: ShellMode;
   execution_enabled: boolean;
   subagents_enabled: boolean;
@@ -61,6 +64,7 @@ type HarnessSettings = {
 };
 
 type HarnessResponse = HarnessSettings & {
+  restrict_to_workspace?: boolean;
   restart_required: boolean;
 };
 
@@ -343,7 +347,8 @@ function settingsSubtitle(tab: SettingsTab): string {
 
 function harnessFromResponse(body: HarnessResponse): HarnessSettings {
   return {
-    restrict_to_workspace: body.restrict_to_workspace,
+    inside_workspace: body.inside_workspace ?? "allow",
+    outside_workspace: body.outside_workspace ?? (body.restrict_to_workspace === false ? "allow" : "ask"),
     shell_mode: body.shell_mode,
     execution_enabled: body.execution_enabled,
     subagents_enabled: body.subagents_enabled,
@@ -1272,6 +1277,34 @@ function ModelsFooter({ settings }: { settings: ModelSettings }) {
   );
 }
 
+function PermissionSelect({
+  title,
+  detail,
+  value,
+  onChange,
+}: {
+  title: string;
+  detail: string;
+  value: PermissionMode;
+  onChange: (value: PermissionMode) => void;
+}) {
+  return (
+    <label className="block rounded-lg border border-border px-3 py-3">
+      <span className="text-sm font-medium text-foreground">{title}</span>
+      <span className="mt-1 block text-xs text-muted-foreground">{detail}</span>
+      <select
+        className="mt-3 h-9 w-full rounded-md border border-border bg-background px-3 text-sm"
+        value={value}
+        onChange={(event) => onChange(event.target.value as PermissionMode)}
+      >
+        <option value="allow">Allow</option>
+        <option value="ask">Ask</option>
+        <option value="deny">Deny</option>
+      </select>
+    </label>
+  );
+}
+
 function HarnessPane({
   loading,
   error,
@@ -1305,11 +1338,17 @@ function HarnessPane({
       {notice ? (
         <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm text-foreground">{notice}</p>
       ) : null}
-      <HarnessToggle
-        title="Sandbox file tools"
-        detail="Keep reads and writes inside the workspace."
-        checked={draft.restrict_to_workspace}
-        onChange={(checked) => onChange({ ...draft, restrict_to_workspace: checked })}
+      <PermissionSelect
+        title="Files inside the workspace"
+        detail="Reading, listing, searching, and editing files in the workspace folder."
+        value={draft.inside_workspace}
+        onChange={(value) => onChange({ ...draft, inside_workspace: value })}
+      />
+      <PermissionSelect
+        title="Files outside the workspace"
+        detail="The same file tools on any other path, including ../ and symlinks that lead out."
+        value={draft.outside_workspace}
+        onChange={(value) => onChange({ ...draft, outside_workspace: value })}
       />
       <label className="block rounded-lg border border-border px-3 py-3">
         <span className="text-sm font-medium text-foreground">Shell policy</span>

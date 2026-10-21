@@ -10,7 +10,10 @@ use std::collections::HashSet;
 use serde_json::Value;
 
 use crate::clarification::ASK_USER_REPLY_PREFIX;
-use crate::config::{ResolvedShellPolicy, ShellPolicyMode};
+use crate::config::{ResolvedShellPolicy, ResolvedToolPermissions, ShellPolicyMode};
+use crate::traits::{PathAccess, PathAccessKind};
+use crate::utils::path_starts_with;
+use std::path::{Path, PathBuf};
 
 /// Lowercase and collapse every run of whitespace (spaces, tabs, newlines) to a single space so a
 /// destructive command can't slip past a single-spaced approval pattern via `rm  -rf`, a tab, or a
@@ -188,25 +191,229 @@ pub(crate) fn shell_policy_mode_for_session(
     }
 }
 
-pub(crate) fn edit_policy_mode_for_session(
-    policy: &ResolvedShellPolicy,
-    unattended_session: bool,
-) -> ShellPolicyMode {
-    if unattended_session {
-        policy.unattended_edit_mode
-    } else {
-        policy.interactive_edit_mode
-    }
-}
-
-/// Reason shown when the edit policy blocks a mutation. Unattended sessions
-/// default to Deny independently of plan mode, so the message distinguishes the
-/// two cases rather than hardcoding "plan mode active" everywhere (PR #62 review #2).
+/// Reason shown when the legacy edit ceiling (`[harness.shell_policy].edit_mode` /
+/// `edit_unattended_default`) blocks a mutation. Plan mode sets `edit_mode = "deny"`; the
+/// unattended ceiling is independent of it, so the message distinguishes the two cases rather
+/// than hardcoding "plan mode active" everywhere (PR #62 review #2).
 pub(crate) fn edit_policy_block_reason(unattended_session: bool) -> &'static str {
     if unattended_session {
         "File edit blocked by policy: unattended edit mode is active."
     } else {
         "File edit blocked by policy: plan mode active — finalize or apply the plan first."
+    }
+}
+
+/// What `[harness.permissions]` decides for one call, before any prompt is shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PermissionGate {
+    /// A `[harness.permissions.tools]` entry; it replaces the shell, location and default rules.
+    ToolOverride(ShellPolicyMode),
+    /// A file tool: the strictest location rule over the paths the call touches. `access` is
+    /// the path that decided it; `ceiling_denied` is true when only the legacy edit ceiling
+    /// (`edit_mode` / plan mode, `edit_unattended_default`) turned it into a deny.
+    Location {
+        mode: ShellPolicyMode,
+        access: PathAccess,
+        ceiling_denied: bool,
+    },
+    /// Any other tool: `[harness.permissions].default`.
+    Default(ShellPolicyMode),
+    /// Not gated here: `ask_user` (the approval channel itself), code-exec tools without a
+    /// working directory (the shell policy gates them), and calls whose paths could not be
+    /// resolved (the tool reports that error without touching anything).
+    Exempt,
+}
+
+/// Classify one call against `[harness.permissions]`. `accesses` is `None` when the tool could
+/// not resolve its arguments.
+pub(crate) fn permission_gate(
+    perms: &ResolvedToolPermissions,
+    tool_name: &str,
+    accesses: Option<&[PathAccess]>,
+    unattended: bool,
+) -> PermissionGate {
+    if tool_name == "ask_user" {
+        return PermissionGate::Exempt;
+    }
+    let is_edit = is_file_mutate_tool(tool_name);
+    if let Some(mode) = perms.tool_override(tool_name, is_edit, unattended) {
+        return PermissionGate::ToolOverride(mode);
+    }
+    let Some(accesses) = accesses else {
+        return PermissionGate::Exempt;
+    };
+    let mut decided: Option<(ShellPolicyMode, &PathAccess)> = None;
+    for access in accesses {
+        let edit = is_edit && access.kind == PathAccessKind::Write;
+        let mode = perms.location_mode(access.inside_sandbox, edit, unattended);
+        let replace = match decided {
+            None => true,
+            Some((current, current_access)) => {
+                let stricter = mode.stricter(current);
+                (stricter == mode && stricter != current)
+                    || (mode == current && current_access.inside_sandbox && !access.inside_sandbox)
+            }
+        };
+        if replace {
+            decided = Some((mode, access));
+        }
+    }
+    match decided {
+        Some((mode, access)) => PermissionGate::Location {
+            mode,
+            ceiling_denied: mode == ShellPolicyMode::Deny
+                && perms.location_mode(access.inside_sandbox, false, unattended)
+                    != ShellPolicyMode::Deny,
+            access: access.clone(),
+        },
+        None if is_code_exec_tool(tool_name) => PermissionGate::Exempt,
+        None => PermissionGate::Default(perms.default_mode_for(tool_name, unattended)),
+    }
+}
+
+/// Path matching for grants follows the platform's default filesystem case rules.
+const GRANT_CASE_INSENSITIVE: bool = cfg!(any(windows, target_os = "macos"));
+
+/// An "always" answer to a location prompt (or an outside-edit prompt).
+///
+/// Outside the sandbox the grant covers the same operation kind (read / write+edit / working
+/// directory, kept separate) for the target's directory and everything below it: the parent
+/// directory for a file, the directory itself for a directory target. Inside the sandbox it covers
+/// only the exact path. A directory grant never widens onto a protected path (the outer
+/// workspace's `config.toml` / `.system_generated/`) unless the granted directory itself lies
+/// inside that protected path; the exact target is always covered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PathGrant {
+    kind: PathAccessKind,
+    exact: PathBuf,
+    exact_is_dir: bool,
+    scope: Option<PathBuf>,
+    /// The scope contains a protected path (shown as an exception in the prompt).
+    shielded: bool,
+}
+
+impl PathGrant {
+    /// The grant an "always" answer to `access` stores. A folder that would be a filesystem
+    /// root, the user's home directory, or an ancestor of `workspace_dir` is too broad: the grant
+    /// then falls back to the exact path.
+    pub(crate) fn for_access(perms: &ResolvedToolPermissions, access: &PathAccess) -> Self {
+        let exact_is_dir = access.kind == PathAccessKind::WorkingDir || access.path.is_dir();
+        let same =
+            |a: &Path, b: &Path| path_starts_with(a, b, true) && path_starts_with(b, a, true);
+        let scope = (!access.inside_sandbox)
+            .then(|| {
+                if exact_is_dir {
+                    access.path.clone()
+                } else {
+                    access
+                        .path
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| access.path.clone())
+                }
+            })
+            .filter(|scope| {
+                let is_root = scope.parent().is_none();
+                let is_home = perms
+                    .grant_home_dir
+                    .as_deref()
+                    .is_some_and(|home| same(scope, home));
+                let above_workspace = perms
+                    .grant_workspace_dir
+                    .as_deref()
+                    .is_some_and(|ws| path_starts_with(ws, scope, true) && !same(ws, scope));
+                !(is_root || is_home || above_workspace)
+            });
+        let shielded = scope.as_deref().is_some_and(|scope| {
+            perms
+                .protected_paths
+                .iter()
+                .any(|guarded| path_starts_with(guarded, scope, true))
+        });
+        Self {
+            kind: access.kind,
+            exact: access.path.clone(),
+            exact_is_dir,
+            scope,
+            shielded,
+        }
+    }
+
+    pub(crate) fn covers(&self, access: &PathAccess, protected: &[PathBuf]) -> bool {
+        self.covers_with(access, protected, GRANT_CASE_INSENSITIVE)
+    }
+
+    fn covers_with(
+        &self,
+        access: &PathAccess,
+        protected: &[PathBuf],
+        case_insensitive: bool,
+    ) -> bool {
+        if access.kind != self.kind {
+            return false;
+        }
+        let same = |a: &Path, b: &Path| {
+            path_starts_with(a, b, case_insensitive) && path_starts_with(b, a, case_insensitive)
+        };
+        if same(&access.path, &self.exact) {
+            return true;
+        }
+        let Some(scope) = self.scope.as_deref() else {
+            return false;
+        };
+        if !path_starts_with(&access.path, scope, case_insensitive) {
+            return false;
+        }
+        // Shield checks always ignore case: erring toward a fresh prompt is the safe side.
+        !protected.iter().any(|guarded| {
+            path_starts_with(&access.path, guarded, true) && !path_starts_with(scope, guarded, true)
+        })
+    }
+
+    /// What answering "always" will allow, for the prompt text.
+    pub(crate) fn describe(&self) -> String {
+        let what = match self.kind {
+            PathAccessKind::Read => "reads",
+            PathAccessKind::Write => "writes and edits",
+            PathAccessKind::WorkingDir => "running commands",
+        };
+        match &self.scope {
+            Some(scope) => format!(
+                "always = allow {what} under `{}`{} until isanagent restarts",
+                scope.display(),
+                if self.shielded {
+                    " (except isanagent config and data)"
+                } else {
+                    ""
+                }
+            ),
+            None => format!(
+                "always = allow {what} of this {} only (`{}`) until isanagent restarts",
+                if self.exact_is_dir { "folder" } else { "file" },
+                self.exact.display()
+            ),
+        }
+    }
+}
+
+fn process_path_grants() -> &'static tokio::sync::Mutex<Vec<PathGrant>> {
+    static GRANTS: std::sync::OnceLock<tokio::sync::Mutex<Vec<PathGrant>>> =
+        std::sync::OnceLock::new();
+    GRANTS.get_or_init(|| tokio::sync::Mutex::new(Vec::new()))
+}
+
+pub(crate) async fn path_already_granted(access: &PathAccess, protected: &[PathBuf]) -> bool {
+    process_path_grants()
+        .lock()
+        .await
+        .iter()
+        .any(|grant| grant.covers(access, protected))
+}
+
+pub(crate) async fn remember_path_grant(grant: PathGrant) {
+    let mut grants = process_path_grants().lock().await;
+    if !grants.contains(&grant) {
+        grants.push(grant);
     }
 }
 
@@ -281,6 +488,239 @@ mod code_exec_gate_tests {
         assert!(!is_file_mutate_tool("exec"));
         assert!(!is_file_mutate_tool("list_dir"));
         assert!(!is_file_mutate_tool("search_text"));
+    }
+
+    fn no_limits() -> ResolvedToolPermissions {
+        ResolvedToolPermissions::default()
+    }
+
+    /// Home `/home/u`, outer workspace `/home/u/.isanagent`.
+    fn limits() -> ResolvedToolPermissions {
+        ResolvedToolPermissions {
+            protected_paths: vec![
+                PathBuf::from("/home/u/.isanagent/config.toml"),
+                PathBuf::from("/home/u/.isanagent/.system_generated"),
+            ],
+            grant_home_dir: Some(PathBuf::from("/home/u")),
+            grant_workspace_dir: Some(PathBuf::from("/home/u/.isanagent")),
+            ..ResolvedToolPermissions::default()
+        }
+    }
+
+    #[test]
+    fn too_broad_folders_fall_back_to_the_exact_path() {
+        let p = limits();
+        let exact_only = |path: &str, kind| {
+            let grant = PathGrant::for_access(&p, &access(path, kind));
+            assert!(grant.covers_with(&access(path, kind), &p.protected_paths, false));
+            grant
+        };
+        // A file directly under `/`, a `/` working directory, a file in the home directory.
+        for (path, kind) in [
+            ("/x.txt", PathAccessKind::Read),
+            ("/", PathAccessKind::WorkingDir),
+            ("/home/u/notes.md", PathAccessKind::Read),
+            ("/home/u", PathAccessKind::WorkingDir),
+        ] {
+            let grant = exact_only(path, kind);
+            assert!(!grant.covers_with(
+                &access("/home/u/other.md", kind),
+                &p.protected_paths,
+                false
+            ));
+            assert!(grant.describe().contains("only"), "{}", grant.describe());
+        }
+        assert!(exact_only("/home/u/notes.md", PathAccessKind::Read)
+            .describe()
+            .contains("always = allow reads of this file only (`/home/u/notes.md`)"));
+        assert!(exact_only("/", PathAccessKind::WorkingDir)
+            .describe()
+            .contains("of this folder only"));
+        // An ancestor of workspace_dir that is not home (workspace elsewhere).
+        let mut elsewhere = limits();
+        elsewhere.grant_workspace_dir = Some(PathBuf::from("/srv/agents/ws"));
+        let grant = PathGrant::for_access(
+            &elsewhere,
+            &access("/srv/agents/readme", PathAccessKind::Read),
+        );
+        assert!(
+            grant.describe().contains("of this file only"),
+            "{}",
+            grant.describe()
+        );
+        // Case variants of home are still home.
+        let grant = PathGrant::for_access(&p, &access("/HOME/U/a.txt", PathAccessKind::Read));
+        assert!(
+            grant.describe().contains("of this file only"),
+            "{}",
+            grant.describe()
+        );
+        // A normal folder below home still widens.
+        let grant = PathGrant::for_access(&p, &access("/home/u/data/a.txt", PathAccessKind::Read));
+        assert!(
+            grant.describe().contains("under `/home/u/data`"),
+            "{}",
+            grant.describe()
+        );
+        assert!(!grant.describe().contains("except"), "{}", grant.describe());
+    }
+
+    #[test]
+    fn folder_containing_isanagent_data_says_so() {
+        let p = limits();
+        // Approving a file directly in workspace_dir grants workspace_dir minus config and data.
+        let grant = PathGrant::for_access(
+            &p,
+            &access("/home/u/.isanagent/notes.md", PathAccessKind::Read),
+        );
+        let text = grant.describe();
+        assert!(
+            text.contains("under `/home/u/.isanagent` (except isanagent config and data)"),
+            "{text}"
+        );
+        assert!(grant.covers_with(
+            &access("/home/u/.isanagent/other.md", PathAccessKind::Read),
+            &p.protected_paths,
+            false
+        ));
+        assert!(!grant.covers_with(
+            &access("/home/u/.isanagent/config.toml", PathAccessKind::Read),
+            &p.protected_paths,
+            false
+        ));
+        assert!(!grant.covers_with(
+            &access(
+                "/home/u/.isanagent/.system_generated/agent_memory.db",
+                PathAccessKind::Read
+            ),
+            &p.protected_paths,
+            false
+        ));
+    }
+
+    fn access(path: &str, kind: PathAccessKind) -> PathAccess {
+        PathAccess {
+            path: PathBuf::from(path),
+            kind,
+            inside_sandbox: false,
+        }
+    }
+
+    #[test]
+    fn outside_file_grant_covers_its_directory_tree_for_the_same_kind() {
+        let grant =
+            PathGrant::for_access(&no_limits(), &access("/srv/x/a.txt", PathAccessKind::Read));
+        let covers = |p: &str, kind| grant.covers_with(&access(p, kind), &[], false);
+        assert!(covers("/srv/x/a.txt", PathAccessKind::Read));
+        assert!(covers("/srv/x/b.txt", PathAccessKind::Read));
+        assert!(covers("/srv/x/deep/c.txt", PathAccessKind::Read));
+        // Sibling with the same string prefix is not inside the grant.
+        assert!(!covers("/srv/xy/c.txt", PathAccessKind::Read));
+        assert!(!covers("/srv/x2", PathAccessKind::Read));
+        assert!(!covers("/srv/a.txt", PathAccessKind::Read));
+        // Kinds stay separate.
+        assert!(!covers("/srv/x/b.txt", PathAccessKind::Write));
+        assert!(!covers("/srv/x/b.txt", PathAccessKind::WorkingDir));
+        assert!(
+            grant.describe().contains("allow reads under `/srv/x`"),
+            "{}",
+            grant.describe()
+        );
+    }
+
+    #[test]
+    fn working_dir_grant_covers_that_directory_and_below() {
+        let grant =
+            PathGrant::for_access(&no_limits(), &access("/data", PathAccessKind::WorkingDir));
+        assert!(grant.covers_with(&access("/data/sub", PathAccessKind::WorkingDir), &[], false));
+        assert!(!grant.covers_with(&access("/data2", PathAccessKind::WorkingDir), &[], false));
+    }
+
+    #[test]
+    fn inside_grants_stay_exact() {
+        let mut inside = access("/ws/workspace/a.txt", PathAccessKind::Read);
+        inside.inside_sandbox = true;
+        let grant = PathGrant::for_access(&no_limits(), &inside);
+        assert!(grant.covers_with(&inside, &[], false));
+        let mut sibling = access("/ws/workspace/b.txt", PathAccessKind::Read);
+        sibling.inside_sandbox = true;
+        assert!(!grant.covers_with(&sibling, &[], false));
+        assert!(grant
+            .describe()
+            .contains("of this file only (`/ws/workspace/a.txt`)"));
+    }
+
+    #[test]
+    fn grant_never_widens_onto_the_outer_workspace_secrets() {
+        let protected = vec![
+            PathBuf::from("/home/u/.isanagent/config.toml"),
+            PathBuf::from("/home/u/.isanagent/.system_generated"),
+        ];
+        // "always" on ~/x widens to ~, but not onto config.toml / .system_generated.
+        let grant = PathGrant::for_access(&no_limits(), &access("/home/u/x", PathAccessKind::Read));
+        let covers =
+            |p: &str| grant.covers_with(&access(p, PathAccessKind::Read), &protected, false);
+        assert!(covers("/home/u/notes.md"));
+        assert!(!covers("/home/u/.isanagent/config.toml"));
+        assert!(!covers(
+            "/home/u/.isanagent/.system_generated/agent_memory.db"
+        ));
+        // Case games do not get past the shield.
+        assert!(!covers("/home/u/.isanagent/CONFIG.toml"));
+        // A grant whose directory lies inside a protected path covers it.
+        let inner = PathGrant::for_access(
+            &no_limits(),
+            &access(
+                "/home/u/.isanagent/.system_generated/logs/runtime.log",
+                PathAccessKind::Read,
+            ),
+        );
+        assert!(inner.covers_with(
+            &access(
+                "/home/u/.isanagent/.system_generated/logs/old.log",
+                PathAccessKind::Read
+            ),
+            &protected,
+            false
+        ));
+        // Approving config.toml itself covers that exact file only.
+        let cfg = PathGrant::for_access(
+            &no_limits(),
+            &access("/home/u/.isanagent/config.toml", PathAccessKind::Read),
+        );
+        assert!(cfg.covers_with(
+            &access("/home/u/.isanagent/config.toml", PathAccessKind::Read),
+            &protected,
+            false
+        ));
+        assert!(!cfg.covers_with(
+            &access(
+                "/home/u/.isanagent/.system_generated/x",
+                PathAccessKind::Read
+            ),
+            &protected,
+            false
+        ));
+    }
+
+    #[test]
+    fn grant_case_handling_follows_the_platform_flag() {
+        let grant = PathGrant::for_access(
+            &no_limits(),
+            &access("/Users/a/Data/a.txt", PathAccessKind::Read),
+        );
+        let other_case = access("/users/a/data/b.txt", PathAccessKind::Read);
+        assert!(!grant.covers_with(&other_case, &[], false));
+        assert!(grant.covers_with(&other_case, &[], true));
+        assert!(!grant.covers_with(
+            &access("/users/a/data2/b.txt", PathAccessKind::Read),
+            &[],
+            true
+        ));
+        assert_eq!(
+            GRANT_CASE_INSENSITIVE,
+            cfg!(any(windows, target_os = "macos"))
+        );
     }
 
     #[test]

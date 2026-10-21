@@ -1,5 +1,3 @@
-restrict_to_workspace = true
-
 # Root-level limits (must stay above [terminal] so TOML does not nest them under [terminal]).
 max_iterations = 999
 max_tool_output_chars = 20000
@@ -128,6 +126,24 @@ enabled = true
 mode = "ask"                # ask | deny | allow
 unattended_default = "allow" # ask | deny | allow
 # interactive_requires_approval_for = ["rm -rf", "git reset --hard"]
+# edit_mode = "ask"          # optional ceiling for write_file/edit_file (plan mode = "deny"); unset = use [harness.permissions]
+
+# Tool permissions: allow | ask | deny. "Inside" is the sandbox (workspace/ by default); the outer
+# workspace folder with config.toml and .system_generated/ counts as outside. Paths are canonicalized,
+# so ../ escapes and symlinks that lead out are outside. In unattended sessions ask means deny.
+# "always" on an outside prompt allows that operation (read vs write) in the file's folder and below
+# until restart (never config.toml / .system_generated; never /, home or above the workspace). Precedence: [harness.permissions.tools] >
+# these keys > legacy restrict_to_workspace (true = outside ask, false = outside allow) > defaults.
+# Set outside_workspace = "deny" for a hard sandbox. Guide: docs/harness-hardening-user-guide.md (section 6).
+[harness.permissions]
+inside_workspace = "allow"   # file tools (read/list/search/write/edit, exec cwd) inside the sandbox
+outside_workspace = "ask"    # the same tools outside the sandbox: approval prompt with the absolute path
+default = "allow"            # any other tool not matched below and not covered by the shell policy
+
+[harness.permissions.tools]  # per-tool override by exact tool name (builtin, MCP-proxied, plugin)
+# web_fetch = "ask"
+# git_worktree = "deny"
+# exec = "ask"               # replaces [harness.shell_policy] for exec: ask before every command
 
 # ML policy overlay (embedded in the isanagent binary when enabled). Reference copy: workspace/ML_ENGINEER_OVERLAY.md (onboard). Optional rules merge: workspace/ML_POLICY.md.
 # Opt-in (audit X4): enable only for ML-focused workspaces; the general-purpose default is false.

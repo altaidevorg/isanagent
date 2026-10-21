@@ -40,6 +40,7 @@ pub mod tool_runtime;
 pub mod tools;
 pub mod traits;
 pub mod utils;
+pub mod windows_shell;
 pub mod workspace;
 
 // --- Message Protocol ---
