@@ -129,8 +129,21 @@ impl SettingsPopup {
             }
         }
         self.active_key = Some(key.to_string());
-        self.notice = Some(format!("Key saved for {key}. The next message uses it."));
+        self.notice = Some(if crate::credentials::keychain_enabled() {
+            format!("Key saved for {key}. The next message uses it.")
+        } else {
+            format!("Key set for {key} for this session. The next message uses it.")
+        });
         self.error = None;
+    }
+
+    /// The key works for this run, but the OS keychain did not store it.
+    pub fn note_key_session_only(&mut self, key: &str, reason: &str) {
+        self.note_key_saved(key);
+        self.notice = Some(format!(
+            "Key active for {key} for this session only: the OS keychain did not store it ({reason}). \
+             Set the provider's API key environment variable to keep it across restarts."
+        ));
     }
 
     pub fn note_harness_saved(&mut self) {
@@ -694,7 +707,11 @@ fn api_key_lines(popup: &SettingsPopup) -> Vec<Line<'static>> {
         Line::from(provider_name.to_string()),
         Line::from(""),
         Line::from("Paste the key here with Cmd+V, or type it."),
-        Line::from("It is saved in the OS keychain. The full key stays off this screen."),
+        Line::from(if crate::credentials::keychain_enabled() {
+            "It is saved in the OS keychain. The full key stays off this screen."
+        } else {
+            "It is used for this session only. The full key stays off this screen."
+        }),
         Line::from(""),
         Line::from(Span::styled(
             format!("Key  {masked}"),
