@@ -14,8 +14,8 @@
 //! like it rejected a correct password.
 //!
 //! Lookups therefore go through a process-wide cache keyed by the normalised provider
-//! name: the keychain is read at most once per provider, concurrent callers wait for that
-//! single read, and the outcome (key, no entry, or access denied/failed) is remembered.
+//! name: the keychain is read at most once per provider, concurrent callers for that
+//! provider wait for that single read (other providers are not blocked), and the outcome (key, no entry, or access denied/failed) is remembered.
 //! Writes and deletes made through this module update the cache. A key changed outside
 //! this process (Keychain Access, `altai-app`) is picked up on the next start.
 //!
@@ -33,7 +33,7 @@
 //! Set `ISANAGENT_KEYCHAIN=1` to read and save keys in the OS keychain instead.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use log::{debug, warn};
 
@@ -119,14 +119,26 @@ impl KeychainBackend for OsKeychain {
     }
 }
 
+/// Per-provider cache slot. `None` = not looked up yet; `Some(None)` = no key (no entry,
+/// or access denied / failed); `Some(Some(key))` = resolved key.
+type Slot = Arc<Mutex<Option<Option<String>>>>;
+
 /// Process-wide memo of keychain lookups (see the module docs).
 struct KeyCache<B: KeychainBackend> {
     backend: B,
     enabled: bool,
-    /// provider -> resolved key (`None` = no entry, or access denied / failed).
-    /// The lock is held across the backend read on purpose: concurrent callers for any
-    /// provider wait for the in-flight read instead of raising a second OS prompt.
-    entries: Mutex<HashMap<String, Option<String>>>,
+    /// One slot per provider. The map lock is only held to find or create a slot, never
+    /// across a keychain call. Each slot's own lock *is* held across that provider's
+    /// keychain read/write, so concurrent callers for the same provider wait for the
+    /// in-flight call instead of raising a second OS prompt, while other providers are
+    /// not blocked. No other lock is taken while a slot lock is held.
+    slots: Mutex<HashMap<String, Slot>>,
+}
+
+fn lock_recovering<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    // Every critical section here is a single assignment, so a panic in another thread
+    // cannot leave the data inconsistent: recover from poisoning.
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl<B: KeychainBackend> KeyCache<B> {
@@ -134,24 +146,26 @@ impl<B: KeychainBackend> KeyCache<B> {
         Self {
             backend,
             enabled,
-            entries: Mutex::new(HashMap::new()),
+            slots: Mutex::new(HashMap::new()),
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Option<String>>> {
-        // A panic while holding the lock cannot leave the map inconsistent (single
-        // insert), so recover from poisoning instead of failing every later lookup.
-        self.entries.lock().unwrap_or_else(|e| e.into_inner())
+    fn slot(&self, provider: &str) -> Slot {
+        lock_recovering(&self.slots)
+            .entry(provider.to_string())
+            .or_default()
+            .clone()
     }
 
     fn get(&self, provider: &str) -> Option<String> {
-        let mut entries = self.lock();
+        let slot = self.slot(provider);
+        let mut cached = lock_recovering(&slot);
+        if let Some(value) = cached.as_ref() {
+            return value.clone();
+        }
         if !self.enabled {
             // Keychain off: only keys entered during this session.
-            return entries.get(provider).cloned().flatten();
-        }
-        if let Some(cached) = entries.get(provider) {
-            return cached.clone();
+            return None;
         }
         let resolved = match self.backend.get(provider) {
             Ok(Some(secret)) => {
@@ -173,14 +187,15 @@ impl<B: KeychainBackend> KeyCache<B> {
                 None
             }
         };
-        entries.insert(provider.to_string(), resolved.clone());
+        *cached = Some(resolved.clone());
         resolved
     }
 
     fn set(&self, provider: &str, secret: &str) -> Result<(), String> {
-        let mut entries = self.lock();
+        let slot = self.slot(provider);
+        let mut cached = lock_recovering(&slot);
         // Usable for this process whatever happens to the keychain write below.
-        entries.insert(provider.to_string(), Some(secret.to_string()));
+        *cached = Some(Some(secret.to_string()));
         if !self.enabled {
             // Session-only storage is the intended mode, not an error.
             return Ok(());
@@ -200,20 +215,21 @@ impl<B: KeychainBackend> KeyCache<B> {
     }
 
     fn delete(&self, provider: &str) -> Result<(), String> {
-        let mut entries = self.lock();
+        let slot = self.slot(provider);
+        let mut cached = lock_recovering(&slot);
         if !self.enabled {
-            entries.remove(provider);
+            *cached = None;
             return Ok(());
         }
         match self.backend.delete(provider) {
             Ok(()) => {
-                entries.insert(provider.to_string(), None);
+                *cached = Some(None);
                 debug!("Deleted API key for provider '{provider}' from OS Keychain ({KEYRING_SERVICE})");
                 Ok(())
             }
             Err(e) => {
                 // State unknown after a failed delete: forget it so the next lookup re-reads.
-                entries.remove(provider);
+                *cached = None;
                 warn!("Failed to delete key from OS Keychain for '{provider}': {e}");
                 Err(e)
             }
@@ -538,6 +554,57 @@ mod tests {
         let err = cache.set("gemini", "AIza-typed").unwrap_err();
         assert!(err.contains("session only"), "{err}");
         assert_eq!(cache.get("gemini").as_deref(), Some("AIza-typed"));
+    }
+
+    #[test]
+    fn a_pending_read_for_one_provider_does_not_block_another() {
+        // Gemini's read is stuck behind a keychain dialog; OpenAI must still resolve.
+        struct GatedKeychain {
+            release: Mutex<bool>,
+            cv: std::sync::Condvar,
+        }
+        impl KeychainBackend for Arc<GatedKeychain> {
+            fn get(&self, provider: &str) -> Result<Option<String>, String> {
+                if provider == "gemini" {
+                    let mut open = self.release.lock().unwrap();
+                    while !*open {
+                        open = self.cv.wait(open).unwrap();
+                    }
+                }
+                Ok(Some(format!("key-{provider}")))
+            }
+            fn set(&self, _: &str, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn delete(&self, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let gate = Arc::new(GatedKeychain {
+            release: Mutex::new(false),
+            cv: std::sync::Condvar::new(),
+        });
+        let cache = Arc::new(KeyCache::new(gate.clone(), true));
+        let blocked = {
+            let cache = cache.clone();
+            std::thread::spawn(move || cache.get("gemini"))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let cache = cache.clone();
+            std::thread::spawn(move || tx.send(cache.get("openai")).unwrap());
+        }
+        let other = rx.recv_timeout(std::time::Duration::from_secs(2));
+        *gate.release.lock().unwrap() = true;
+        gate.cv.notify_all();
+        assert_eq!(
+            other
+                .expect("openai lookup was blocked by gemini")
+                .as_deref(),
+            Some("key-openai")
+        );
+        assert_eq!(blocked.join().unwrap().as_deref(), Some("key-gemini"));
     }
 
     #[test]

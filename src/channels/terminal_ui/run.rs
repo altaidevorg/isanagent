@@ -447,16 +447,17 @@ fn try_set_api_key(
             message: "Bus closed; exiting.".into(),
         });
         app.request_quit();
-    } else {
-        app.status_model = model_name;
-        persist_last_model(workspace_dir, config_key);
-        *active_provider_key = Some(config_key.to_string());
-        app.set_toast(
-            ToastKind::Ok,
-            format!("API key set for {config_key} ({masked})"),
-            Duration::from_secs(3),
-        );
+        // Shutting down: nothing left to report to the settings popup.
+        return None;
     }
+    app.status_model = model_name;
+    persist_last_model(workspace_dir, config_key);
+    *active_provider_key = Some(config_key.to_string());
+    app.set_toast(
+        ToastKind::Ok,
+        format!("API key set for {config_key} ({masked})"),
+        Duration::from_secs(3),
+    );
     keychain_error
 }
 

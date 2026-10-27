@@ -115,7 +115,8 @@ impl SettingsPopup {
         self.error = None;
     }
 
-    pub fn note_key_saved(&mut self, key: &str) {
+    /// Mark every model of `key`'s provider as having a key and make `key` active.
+    fn mark_key_present(&mut self, key: &str) {
         let provider = self
             .models
             .iter()
@@ -129,6 +130,10 @@ impl SettingsPopup {
             }
         }
         self.active_key = Some(key.to_string());
+    }
+
+    pub fn note_key_saved(&mut self, key: &str) {
+        self.mark_key_present(key);
         self.notice = Some(if crate::credentials::keychain_enabled() {
             format!("Key saved for {key}. The next message uses it.")
         } else {
@@ -139,7 +144,8 @@ impl SettingsPopup {
 
     /// The key works for this run, but the OS keychain did not store it.
     pub fn note_key_session_only(&mut self, key: &str, reason: &str) {
-        self.note_key_saved(key);
+        self.mark_key_present(key);
+        self.error = None;
         self.notice = Some(format!(
             "Key active for {key} for this session only: the OS keychain did not store it ({reason}). \
              Set the provider's API key environment variable to keep it across restarts."
@@ -1051,18 +1057,32 @@ fn field_text(value: &str, placeholder: &str, editing: bool) -> String {
 }
 
 fn mask_secret(secret: &str) -> String {
-    if secret.is_empty() {
+    // Count characters, not bytes: a draft may contain multi-byte characters (a stray
+    // smart quote from a paste), and slicing by byte offset would panic mid-character.
+    let chars: Vec<char> = secret.chars().collect();
+    if chars.is_empty() {
         "_".to_string()
-    } else if secret.len() <= 4 {
-        "*".repeat(secret.len())
+    } else if chars.len() <= 4 {
+        "*".repeat(chars.len())
     } else {
-        format!("…{}", &secret[secret.len() - 4..])
+        let tail: String = chars[chars.len() - 4..].iter().collect();
+        format!("…{tail}")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mask_secret_handles_multibyte_characters() {
+        assert_eq!(mask_secret(""), "_");
+        assert_eq!(mask_secret("ab"), "**");
+        assert_eq!(mask_secret("AIzaSyAbcd"), "…Abcd");
+        // Byte-offset slicing panicked here: byte len 9 - 4 = 5 lands inside the first '€'.
+        assert_eq!(mask_secret("abc€€"), "…bc€€");
+        assert_eq!(mask_secret("sk-ünïcödé"), "…cödé");
+    }
 
     fn harness() -> HarnessSettings {
         HarnessSettings {
