@@ -278,7 +278,7 @@ fn apply_settings_effect(
                     return;
                 }
             };
-            try_set_api_key(
+            let keychain_error = try_set_api_key(
                 app,
                 bus_tx,
                 providers,
@@ -288,7 +288,10 @@ fn apply_settings_effect(
                 active_provider_key,
             );
             if active_provider_key.as_deref() == Some(key.as_str()) {
-                popup.note_key_saved(&key);
+                match keychain_error {
+                    None => popup.note_key_saved(&key),
+                    Some(reason) => popup.note_key_session_only(&key, &reason),
+                }
             }
         }
         SettingsEffect::SaveHarness(settings) => {
@@ -360,6 +363,9 @@ fn try_switch_model(
 /// connection via `BusMessage::SwitchModel`, persists it to `config.toml`, and updates the
 /// in-memory `providers` map so a later `/model` picks up the new key. Never echoes the full
 /// key — only the trailing 4 characters are ever shown.
+///
+/// Returns why the OS keychain did not store the key, if it did not (the key is still
+/// used for this session).
 #[allow(clippy::too_many_arguments)]
 fn try_set_api_key(
     app: &mut App,
@@ -369,7 +375,7 @@ fn try_set_api_key(
     config_key: &str,
     api_key: &str,
     active_provider_key: &mut Option<String>,
-) {
+) -> Option<String> {
     let api_key = match clean_api_key_input(api_key) {
         Ok(cleaned) => cleaned,
         Err(message) => {
@@ -378,7 +384,7 @@ fn try_set_api_key(
                     "{message} Usage: /key <api_key>  (or /key <provider_config_key> <api_key>)"
                 ),
             });
-            return;
+            return None;
         }
     };
     let api_key = api_key.as_str();
@@ -392,27 +398,43 @@ fn try_set_api_key(
                 available.join(", ")
             ),
         });
-        return;
+        return None;
     };
     let provider_name = cfg.provider_name.clone();
     let model_name = cfg.model_name.clone();
     let resolved_url = cfg.resolved_base_url().unwrap_or_default();
     let masked = mask_api_key_suffix(api_key);
 
-    match crate::credentials::set_provider_key(&provider_name, api_key) {
-        Ok(()) => app.cells.push(Cell::System {
-            message: format!(
-                "API key updated for '{provider_name}' (ends in {masked}) and securely saved in OS Keychain ({}).",
-                crate::credentials::KEYRING_SERVICE
-            ),
-        }),
-        Err(e) => app.cells.push(Cell::System {
-            message: format!(
-                "API key updated for '{provider_name}' (ends in {masked}) for this session, but \
-                 could not save to OS Keychain: {e}"
-            ),
-        }),
-    }
+    let keychain_error = match crate::credentials::set_provider_key(&provider_name, api_key) {
+        Ok(()) if crate::credentials::keychain_enabled() => {
+            app.cells.push(Cell::System {
+                message: format!(
+                    "API key updated for '{provider_name}' (ends in {masked}) and securely saved in OS Keychain ({}).",
+                    crate::credentials::KEYRING_SERVICE
+                ),
+            });
+            None
+        }
+        Ok(()) => {
+            app.cells.push(Cell::System {
+                message: format!(
+                    "API key set for '{provider_name}' (ends in {masked}) for this session. \
+                     It is not stored: enter it again after a restart, or set {}_API_KEY.",
+                    provider_name.to_uppercase()
+                ),
+            });
+            None
+        }
+        Err(e) => {
+            app.cells.push(Cell::System {
+                message: format!(
+                    "API key updated for '{provider_name}' (ends in {masked}) for this session, but \
+                     could not save to OS Keychain: {e}"
+                ),
+            });
+            Some(e)
+        }
+    };
 
     let msg = BusMessage::SwitchModel {
         provider_name,
@@ -425,16 +447,18 @@ fn try_set_api_key(
             message: "Bus closed; exiting.".into(),
         });
         app.request_quit();
-    } else {
-        app.status_model = model_name;
-        persist_last_model(workspace_dir, config_key);
-        *active_provider_key = Some(config_key.to_string());
-        app.set_toast(
-            ToastKind::Ok,
-            format!("API key set for {config_key} ({masked})"),
-            Duration::from_secs(3),
-        );
+        // Shutting down: nothing left to report to the settings popup.
+        return None;
     }
+    app.status_model = model_name;
+    persist_last_model(workspace_dir, config_key);
+    *active_provider_key = Some(config_key.to_string());
+    app.set_toast(
+        ToastKind::Ok,
+        format!("API key set for {config_key} ({masked})"),
+        Duration::from_secs(3),
+    );
+    keychain_error
 }
 
 const TERMINAL_HELP: &str = r#"Commands (leading slash):
@@ -442,8 +466,8 @@ const TERMINAL_HELP: &str = r#"Commands (leading slash):
   /new           Start a new thread (new chat id)
   /model [name]  Switch LLM model (interactive picker, or /model <config_key>)
   /settings      Models, harness, and skills (same choices as the web settings screen)
-  /key [key]     Set/update an API key at runtime; hot-swaps the live model and saves it
-                 to the OS keychain. Usage: /key <api_key>  or  /key <provider_config_key> <api_key>
+  /key [key]     Set/update an API key for this session; hot-swaps the live model (saved to the
+                 OS keychain only with ISANAGENT_KEYCHAIN=1). Usage: /key <api_key>  or  /key <provider_config_key> <api_key>
                  (only the last 4 characters are ever shown back to you)
   /copy          Copy the last assistant reply to the clipboard
   /install-python Install uv (best effort) in the background; UI stays responsive
@@ -2565,10 +2589,15 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
 
                             let mut lines = vec![
                                 Line::from(Span::styled(
-                                    format!(
-                                        "Key will be securely saved in OS Keychain ({}):",
-                                        crate::credentials::KEYRING_SERVICE
-                                    ),
+                                    if crate::credentials::keychain_enabled() {
+                                        format!(
+                                            "Key will be securely saved in OS Keychain ({}):",
+                                            crate::credentials::KEYRING_SERVICE
+                                        )
+                                    } else {
+                                        "Key is used for this session only (not stored):"
+                                            .to_string()
+                                    },
                                     Style::default().fg(Color::DarkGray),
                                 )),
                                 Line::from(""),
@@ -2807,6 +2836,9 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                     continue;
                 }
                 // Model selector popup intercepts all keys when active.
+                // Set when a typed API key works for this session but the OS keychain
+                // refused to store it; reported once the selector borrow ends.
+                let mut session_only_key_warning: Option<String> = None;
                 if let Some(sel) = &mut app.model_selector {
                     match &mut sel.stage {
                         ModelSelectorStage::ProviderSelect => match key.code {
@@ -2860,31 +2892,36 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                                 *error = None;
                             }
                             KeyCode::Enter => {
-                                let trimmed = input.trim().to_string();
-                                if trimmed.is_empty() {
-                                    *error = Some("API key cannot be empty".to_string());
-                                } else {
+                                // Same cleaning as `/key`: strips pasted whitespace and
+                                // invisible characters, rejects placeholders and non-ASCII.
+                                let cleaned = crate::credentials::normalize_api_key_input(input);
+                                if let Err(e) = &cleaned {
+                                    *error = Some(e.to_string());
+                                } else if let Ok(trimmed) = cleaned {
                                     let p_name = provider_name.clone();
-                                    match crate::credentials::set_provider_key(&p_name, &trimmed) {
-                                        Ok(()) => {
-                                            if let Some(p) =
-                                                sel.providers.get_mut(sel.selected_provider)
-                                            {
-                                                p.has_key = true;
-                                            }
-                                            let models = ModelSelector::build_models_for_provider(
-                                                &p_name, &providers,
-                                            );
-                                            sel.stage = ModelSelectorStage::ModelSelect {
-                                                provider_name: p_name,
-                                                models,
-                                                selected_model: 0,
-                                            };
-                                        }
-                                        Err(e) => {
-                                            *error = Some(format!("Error saving key: {e}"));
-                                        }
+                                    // A keychain failure (denied prompt, locked keychain) must
+                                    // not reject the key: `set_provider_key` keeps it for this
+                                    // session and only reports that it was not persisted.
+                                    if let Err(e) =
+                                        crate::credentials::set_provider_key(&p_name, &trimmed)
+                                    {
+                                        let env_var = format!("{}_API_KEY", p_name.to_uppercase());
+                                        session_only_key_warning = Some(format!(
+                                            "API key for '{p_name}' is active for this session, but the OS keychain did not store it: {e}. \
+                                             To keep it across restarts, set {env_var} in your shell profile."
+                                        ));
                                     }
+                                    if let Some(p) = sel.providers.get_mut(sel.selected_provider) {
+                                        p.has_key = true;
+                                    }
+                                    let models = ModelSelector::build_models_for_provider(
+                                        &p_name, &providers,
+                                    );
+                                    sel.stage = ModelSelectorStage::ModelSelect {
+                                        provider_name: p_name,
+                                        models,
+                                        selected_model: 0,
+                                    };
                                 }
                             }
                             KeyCode::Esc => {
@@ -2940,6 +2977,14 @@ pub(crate) fn run_ratatui_main(config: RatatuiMainConfig) -> io::Result<()> {
                             }
                             _ => {}
                         },
+                    }
+                    if let Some(message) = session_only_key_warning.take() {
+                        app.cells.push(Cell::System { message });
+                        app.set_toast(
+                            ToastKind::Err,
+                            "Key not saved to keychain (session only)".to_string(),
+                            Duration::from_secs(6),
+                        );
                     }
                     continue;
                 }
