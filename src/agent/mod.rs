@@ -333,6 +333,7 @@ impl AgentLogic {
             let skill_reg = agent.skills.clone();
             let loader_tool = LoadSkillTool {
                 registry: skill_reg,
+                deferred: Some(tools_mut.deferred_handle()),
             };
             tools_mut.register(Box::new(loader_tool));
         }
@@ -1156,46 +1157,12 @@ impl AgentLogic {
 /// for a skill dynamically from the SkillRegistry.
 pub struct LoadSkillTool {
     registry: SharedSkillRegistry,
+    /// Activates a loaded skill's `allowed-tools` when they are deferred.
+    deferred: Option<crate::tools::deferred::DeferredTools>,
 }
 
-#[async_trait]
-impl Tool for LoadSkillTool {
-    fn name(&self) -> &str {
-        "load_skill_instructions"
-    }
-
-    fn description(&self) -> &str {
-        "Loads the full markdown instructions for a specific Agent Skill. Call this function through the native tool-calling interface; do not write JSON, XML, or markdown that looks like a tool call."
-    }
-
-    fn policy(&self) -> ToolPolicy {
-        // Read-only registry lookup.
-        ToolPolicy::parallel()
-    }
-
-    fn parameters(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["load", "list"],
-                    "description": "Use 'list' to enumerate discovered skills. Use 'load' (default) to fetch one skill by name."
-                },
-                "skill_name": {
-                    "type": "string",
-                    "description": "Exact skill name when action is load (e.g. 'code_review')."
-                },
-                "detail": {
-                    "type": "string",
-                    "enum": ["full", "metadata"],
-                    "description": "When action is load: 'full' returns instruction body (default). 'metadata' returns name, availability, description, and body length without the full body."
-                }
-            }
-        })
-    }
-
-    async fn execute(&self, args: Value) -> Result<String, String> {
+impl LoadSkillTool {
+    async fn load(&self, args: &Value) -> Result<String, String> {
         let action = args
             .get("action")
             .and_then(|v| v.as_str())
@@ -1244,6 +1211,89 @@ impl Tool for LoadSkillTool {
         } else {
             registry.get_skill_instructions(skill_name)
         }
+    }
+}
+
+#[async_trait]
+impl Tool for LoadSkillTool {
+    fn name(&self) -> &str {
+        "load_skill_instructions"
+    }
+
+    fn description(&self) -> &str {
+        "Loads the full markdown instructions for a specific Agent Skill. Call this function through the native tool-calling interface; do not write JSON, XML, or markdown that looks like a tool call."
+    }
+
+    fn policy(&self) -> ToolPolicy {
+        // Read-only registry lookup.
+        ToolPolicy::parallel()
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["load", "list"],
+                    "description": "Use 'list' to enumerate discovered skills. Use 'load' (default) to fetch one skill by name."
+                },
+                "skill_name": {
+                    "type": "string",
+                    "description": "Exact skill name when action is load (e.g. 'code_review')."
+                },
+                "detail": {
+                    "type": "string",
+                    "enum": ["full", "metadata"],
+                    "description": "When action is load: 'full' returns instruction body (default). 'metadata' returns name, availability, description, and body length without the full body."
+                }
+            }
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, String> {
+        let mut out = self.load(&args).await?;
+        let is_full_load = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("load")
+            == "load"
+            && args
+                .get("detail")
+                .and_then(|v| v.as_str())
+                .unwrap_or("full")
+                == "full";
+        if !is_full_load {
+            return Ok(out);
+        }
+        // Loading a skill activates the deferred tools its `allowed-tools` names, for this
+        // session, so the skill's instructions and its tools arrive together.
+        let (Some(deferred), Some(ctx)) = (
+            self.deferred.as_ref(),
+            crate::tool_runtime::current_tool_exec_ctx(),
+        ) else {
+            return Ok(out);
+        };
+        let Some(skill_name) = args.get("skill_name").and_then(|v| v.as_str()) else {
+            return Ok(out);
+        };
+        let patterns = self
+            .registry
+            .read()
+            .await
+            .get_skill_allowed_tools(skill_name);
+        if patterns.is_empty() {
+            return Ok(out);
+        }
+        let mut loaded = deferred.activate_matching(&ctx.session_key, &patterns);
+        if !loaded.is_empty() {
+            loaded.sort();
+            out.push_str(&format!(
+                "\n\n[Tools loaded for this skill, callable from your next step: {}]",
+                loaded.join(", ")
+            ));
+        }
+        Ok(out)
     }
 }
 
@@ -3426,6 +3476,7 @@ mod tests {
         let reg = Arc::new(tokio::sync::RwLock::new(SkillRegistry::new(skills_root)));
         let tool = super::LoadSkillTool {
             registry: reg.clone(),
+            deferred: None,
         };
         let listed = tool
             .execute(serde_json::json!({ "action": "list" }))
@@ -3451,6 +3502,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn loading_a_skill_activates_its_deferred_allowed_tools() {
+        use crate::skills::SkillRegistry;
+        let root = tempfile::tempdir().unwrap();
+        let skill = root.path().join("rdkit");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: rdkit\ndescription: RDKit helpers\nallowed-tools: chem__rdkit_*\n---\n\nuse rdkit\n",
+        )
+        .unwrap();
+        let reg = Arc::new(tokio::sync::RwLock::new(SkillRegistry::new(
+            root.path().to_path_buf(),
+        )));
+        let deferred = crate::tools::deferred::DeferredTools::new();
+        deferred.defer("chem__rdkit_logp", "chem");
+        deferred.defer("chem__stats_mean", "chem");
+        let tool = super::LoadSkillTool {
+            registry: reg,
+            deferred: Some(deferred.clone()),
+        };
+        let ctx = crate::tool_runtime::ToolExecCtx::new("tauri", "chat-9", None);
+        let key = ctx.session_key.clone();
+        let out = crate::tool_runtime::with_tool_exec_scope(ctx, async {
+            tool.execute(serde_json::json!({ "skill_name": "rdkit" }))
+                .await
+                .unwrap()
+        })
+        .await;
+        assert!(out.contains("use rdkit"));
+        assert!(out.contains("chem__rdkit_logp"), "{out}");
+        assert!(deferred.is_visible(Some(&key), "chem__rdkit_logp"));
+        assert!(!deferred.is_visible(Some(&key), "chem__stats_mean"));
+    }
+
+    #[tokio::test]
     async fn load_skill_rescans_on_miss_to_pick_up_a_new_skill() {
         let root = LocalTempDir::new();
         let skills_root = root.path().join("skills");
@@ -3469,6 +3555,7 @@ mod tests {
         )));
         let tool = super::LoadSkillTool {
             registry: reg.clone(),
+            deferred: None,
         };
 
         // A skill dropped into the directory AFTER the startup scan: the in-memory registry has

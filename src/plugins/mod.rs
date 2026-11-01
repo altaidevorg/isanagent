@@ -286,16 +286,51 @@ impl Plugin {
     }
 }
 
+/// Host settings for [`PluginRegistry::populate_tool_registry`].
+#[derive(Clone, Debug)]
+pub struct McpHostOptions {
+    pub uv_binary: String,
+    /// The agent sandbox: `${SANDBOX_DIR}`, `ISANAGENT_SANDBOX_DIR` and `roots/list`.
+    pub sandbox_dir: Option<PathBuf>,
+    pub harness: crate::config::McpHarnessConfig,
+    pub defer_mode: crate::config::McpDeferMode,
+    pub defer_threshold_chars: usize,
+    /// False when nothing could load a deferred tool (no `search_tools`): never defer.
+    pub defer_supported: bool,
+}
+
+impl McpHostOptions {
+    pub fn from_config(
+        config: &crate::config::AppConfig,
+        sandbox_dir: Option<PathBuf>,
+        defer_supported: bool,
+    ) -> Self {
+        let harness = config.mcp_harness();
+        Self {
+            uv_binary: config.execution_uv_binary(),
+            sandbox_dir,
+            defer_threshold_chars: harness
+                .defer_threshold_chars
+                .unwrap_or(crate::config::DEFAULT_MCP_DEFER_THRESHOLD_CHARS),
+            harness,
+            defer_mode: config.mcp_defer_mode(),
+            defer_supported,
+        }
+    }
+}
+
 /// Registry holding all discovered Agent Plugins.
 #[derive(Clone, Debug, Default)]
 pub struct PluginRegistry {
-    plugins: HashMap<String, Plugin>,
+    /// Name-ordered so everything derived from plugins (tools, prompts) is the same on every
+    /// start.
+    plugins: std::collections::BTreeMap<String, Plugin>,
 }
 
 impl PluginRegistry {
     pub fn new() -> Self {
         Self {
-            plugins: HashMap::new(),
+            plugins: std::collections::BTreeMap::new(),
         }
     }
 
@@ -415,77 +450,229 @@ impl PluginRegistry {
         section
     }
 
-    /// Ingests and initializes all plugin MCP tools into the provided `ToolRegistry`.
+    /// Launches every plugin MCP server (concurrently, each within its startup timeout) and
+    /// registers its tools as `{server}__{tool}` (see [`crate::tools::mcp::namespaced_tool_name`]).
+    ///
+    /// Registration follows plugin name, then server name, so the provider `tools` array is the
+    /// same on every start. A server that fails or times out is logged and skipped; it never
+    /// blocks the others. Tool filters (`includeTools` / `excludeTools`) and deferral follow
+    /// `[harness.mcp]` (see [`McpHostOptions`]).
     pub async fn populate_tool_registry(
         &self,
         tool_registry: &mut ToolRegistry,
-        uv_binary: &str,
+        opts: &McpHostOptions,
         mcp_apps: &crate::tools::mcp::McpAppBridge,
     ) {
-        for plugin in self.plugins.values() {
-            if let Some(ref mcp_path) = plugin.mcp_config_path {
-                let Ok(content) = std::fs::read_to_string(mcp_path) else {
-                    continue;
-                };
-                let Ok(config) = serde_json::from_str::<crate::tools::mcp::McpConfigFile>(&content)
-                else {
-                    log::warn!("Failed to parse MCP config at {}", mcp_path.display());
-                    continue;
-                };
+        use crate::tools::mcp::{McpClient, McpConfigFile, McpProxyTool};
 
-                for (server_name, entry) in config.mcp_servers {
-                    log::info!(
-                        "Launching MCP server '{server_name}' for plugin '{}'",
+        struct Job {
+            plugin: String,
+            server: String,
+            entry: crate::tools::mcp::McpServerEntry,
+            launch: crate::tools::mcp::McpLaunchOptions,
+            defer: Option<bool>,
+        }
+
+        let harness = &opts.harness;
+        let mut jobs: Vec<Job> = Vec::new();
+        let mut seen_servers: HashMap<String, String> = HashMap::new();
+        for plugin in self.plugins.values() {
+            let Some(ref mcp_path) = plugin.mcp_config_path else {
+                continue;
+            };
+            let Ok(content) = std::fs::read_to_string(mcp_path) else {
+                continue;
+            };
+            let config = match serde_json::from_str::<McpConfigFile>(&content) {
+                Ok(config) => config,
+                Err(e) => {
+                    log::warn!("Failed to parse MCP config at {}: {e}", mcp_path.display());
+                    continue;
+                }
+            };
+            for (server_name, mut entry) in config.mcp_servers {
+                let over = harness
+                    .servers
+                    .get(&server_name)
+                    .cloned()
+                    .unwrap_or_default();
+                if over.enabled == Some(false) {
+                    log::info!("MCP server '{server_name}' (plugin '{}') disabled in [harness.mcp.servers]", plugin.name);
+                    continue;
+                }
+                if let Some(previous) = seen_servers.get(&server_name) {
+                    log::warn!(
+                        "MCP server '{server_name}' in plugin '{}' has the same name as one in plugin '{previous}'; skipping it (tool names would collide). Rename one of the servers.",
                         plugin.name
                     );
-                    match crate::tools::mcp::McpClient::launch(&plugin.dir, &entry, uv_binary).await
-                    {
-                        Ok(client) => {
-                            let client_arc = std::sync::Arc::new(client);
-                            mcp_apps.retain_client(client_arc.clone());
-                            match client_arc.list_tools().await {
-                                Ok(tools) => {
-                                    for tool_def in tools {
-                                        if !crate::tools::mcp::tool_visible_to_model(
-                                            tool_def.meta.as_ref(),
-                                        ) {
-                                            log::info!(
-                                                "Skipping app-only MCP tool '{}' from plugin '{}'",
-                                                tool_def.name,
-                                                plugin.name
-                                            );
-                                            continue;
-                                        }
-                                        log::info!(
-                                            "Registering MCP tool '{}' from plugin '{}'",
-                                            tool_def.name,
-                                            plugin.name
-                                        );
-                                        let proxy = crate::tools::mcp::McpProxyTool::new(
-                                            tool_def,
-                                            client_arc.clone(),
-                                            mcp_apps.clone(),
-                                        );
-                                        tool_registry.register(Box::new(proxy));
-                                    }
-                                }
-                                Err(e) => {
-                                    log::warn!(
-                                        "Failed to list tools for MCP server '{server_name}' in plugin '{}': {e}",
-                                        plugin.name
-                                    );
-                                }
+                    continue;
+                }
+                seen_servers.insert(server_name.clone(), plugin.name.clone());
+                if entry.server_type != "stdio" {
+                    log::warn!(
+                        "MCP server '{server_name}' (plugin '{}') has type '{}'; only stdio is supported",
+                        plugin.name,
+                        entry.server_type
+                    );
+                    continue;
+                }
+
+                if over.include_tools.is_some() {
+                    entry.include_tools = over.include_tools.clone();
+                }
+                entry
+                    .exclude_tools
+                    .extend(over.exclude_tools.iter().cloned());
+                let startup = over
+                    .startup_timeout_secs
+                    .or(entry.startup_timeout_secs)
+                    .or(harness.startup_timeout_secs)
+                    .unwrap_or(crate::tools::mcp::DEFAULT_MCP_STARTUP_TIMEOUT_SECS)
+                    .max(1);
+                let tool_timeout = over
+                    .tool_timeout_secs
+                    .or(entry.tool_timeout_secs)
+                    .or(harness.tool_timeout_secs)
+                    .unwrap_or(crate::tools::mcp::DEFAULT_MCP_TOOL_TIMEOUT_SECS)
+                    .max(1);
+                let mut launch = crate::tools::mcp::McpLaunchOptions::new(
+                    server_name.clone(),
+                    &plugin.dir,
+                    &opts.uv_binary,
+                );
+                launch.expansion.sandbox_dir = opts.sandbox_dir.clone();
+                launch.expansion.env_passthrough = harness
+                    .env_passthrough
+                    .iter()
+                    .chain(over.env_passthrough.iter())
+                    .cloned()
+                    .collect();
+                launch.startup_timeout = std::time::Duration::from_secs(startup);
+                launch.tool_timeout = std::time::Duration::from_secs(tool_timeout);
+                let defer = over.defer_tools.or(entry.defer_tools);
+                jobs.push(Job {
+                    plugin: plugin.name.clone(),
+                    server: server_name,
+                    entry,
+                    launch,
+                    defer,
+                });
+            }
+        }
+        if jobs.is_empty() {
+            return;
+        }
+
+        // Launch concurrently: one slow server (first `uv run` installing packages) does not
+        // hold up the others, and each is bounded by its own startup timeout.
+        let launched = futures::future::join_all(jobs.iter().map(|job| async move {
+            log::info!(
+                "Launching MCP server '{}' for plugin '{}'",
+                job.server,
+                job.plugin
+            );
+            let client = McpClient::launch(&job.entry, &job.launch).await?;
+            let tools = client.list_tools().await?;
+            Ok::<_, String>((std::sync::Arc::new(client), tools))
+        }))
+        .await;
+
+        // Collect the tools that pass the filters, then decide deferral on the total size.
+        struct Ready {
+            server: String,
+            client: std::sync::Arc<McpClient>,
+            tools: Vec<crate::tools::mcp::McpToolDefinition>,
+            defer: Option<bool>,
+        }
+        let mut ready: Vec<Ready> = Vec::new();
+        for (job, result) in jobs.iter().zip(launched) {
+            match result {
+                Ok((client, tools)) => {
+                    mcp_apps.retain_client(client.clone());
+                    let total = tools.len();
+                    let kept: Vec<_> = tools
+                        .into_iter()
+                        .filter(|def| {
+                            if !crate::tools::mcp::tool_visible_to_model(def.meta.as_ref()) {
+                                log::info!(
+                                    "Skipping app-only MCP tool '{}' from server '{}'",
+                                    def.name,
+                                    job.server
+                                );
+                                return false;
                             }
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "Failed to launch MCP server '{server_name}' for plugin '{}': {e}",
-                                plugin.name
-                            );
-                        }
+                            crate::tools::mcp::tool_passes_filters(
+                                &def.name,
+                                job.entry.include_tools.as_deref(),
+                                &job.entry.exclude_tools,
+                            )
+                        })
+                        .collect();
+                    if kept.len() < total {
+                        log::info!(
+                            "MCP server '{}': registering {} of {} tools (filters / app-only)",
+                            job.server,
+                            kept.len(),
+                            total
+                        );
                     }
+                    ready.push(Ready {
+                        server: job.server.clone(),
+                        client,
+                        tools: kept,
+                        defer: job.defer,
+                    });
+                }
+                Err(e) => log::warn!(
+                    "MCP server '{}' (plugin '{}') is unavailable: {e}",
+                    job.server,
+                    job.plugin
+                ),
+            }
+        }
+
+        let schema_chars: usize = ready
+            .iter()
+            .flat_map(|r| r.tools.iter())
+            .map(|def| {
+                def.name.len()
+                    + def.description.as_deref().map_or(0, str::len)
+                    + def
+                        .input_schema
+                        .as_ref()
+                        .map_or(0, |schema| schema.to_string().len())
+            })
+            .sum();
+        let auto_defer = match opts.defer_mode {
+            crate::config::McpDeferMode::Always => true,
+            crate::config::McpDeferMode::Never => false,
+            crate::config::McpDeferMode::Auto => schema_chars > opts.defer_threshold_chars,
+        };
+        if !opts.defer_supported && (auto_defer || ready.iter().any(|r| r.defer == Some(true))) {
+            log::warn!(
+                "MCP tool schemas would be deferred, but search_tools is unavailable ([harness.builtin_tools] enabled = false); sending every schema instead"
+            );
+        }
+
+        for r in ready {
+            let defer = opts.defer_supported && r.defer.unwrap_or(auto_defer);
+            let mut registered = 0usize;
+            for def in r.tools {
+                let proxy = McpProxyTool::new(def, r.client.clone(), mcp_apps.clone());
+                let ok = if defer {
+                    tool_registry.register_deferred(Box::new(proxy), &r.server)
+                } else {
+                    tool_registry.register(Box::new(proxy))
+                };
+                if ok {
+                    registered += 1;
                 }
             }
+            log::info!(
+                "MCP server '{}': {registered} tools registered{}",
+                r.server,
+                if defer { " (deferred)" } else { "" }
+            );
         }
     }
 
@@ -752,6 +939,138 @@ fn dirs_next_home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_fake_mcp_plugin(container: &Path, plugin: &str, servers: serde_json::Value) {
+        let dir = container.join(plugin);
+        std::fs::create_dir_all(&dir).expect("mkdir plugin");
+        std::fs::write(
+            dir.join("plugin.json"),
+            format!(r#"{{"name": "{plugin}", "version": "0.1.0"}}"#),
+        )
+        .expect("manifest");
+        std::fs::write(
+            dir.join("mcp.json"),
+            serde_json::json!({ "mcpServers": servers }).to_string(),
+        )
+        .expect("mcp.json");
+    }
+
+    fn fake_server_entry(extra: serde_json::Value) -> serde_json::Value {
+        let script =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_mcp_server.py");
+        let mut entry = serde_json::json!({
+            "command": "python3",
+            "args": ["-u", script.to_string_lossy()],
+        });
+        if let (Some(obj), Some(extra)) = (entry.as_object_mut(), extra.as_object()) {
+            for (k, v) in extra {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        entry
+    }
+
+    fn host_options(defer_mode: crate::config::McpDeferMode) -> McpHostOptions {
+        McpHostOptions {
+            uv_binary: "uv".to_string(),
+            sandbox_dir: None,
+            harness: crate::config::McpHarnessConfig::default(),
+            defer_mode,
+            defer_threshold_chars: crate::config::DEFAULT_MCP_DEFER_THRESHOLD_CHARS,
+            defer_supported: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_are_namespaced_filtered_and_isolated_from_broken_servers() {
+        if which::which("python3").is_err() {
+            return;
+        }
+        let root = tempfile::tempdir().expect("tempdir");
+        write_fake_mcp_plugin(
+            root.path(),
+            "chem-plugin",
+            serde_json::json!({
+                "chem": fake_server_entry(serde_json::json!({"excludeTools": ["crash", "slow"]})),
+                "broken": {"command": "definitely-not-a-real-binary-xyz"},
+            }),
+        );
+        // A second plugin reusing the server name `chem` is skipped (names would collide).
+        write_fake_mcp_plugin(
+            root.path(),
+            "other-plugin",
+            serde_json::json!({ "chem": fake_server_entry(serde_json::json!({})) }),
+        );
+        let mut registry = PluginRegistry::new();
+        registry.scan_directory(root.path());
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(crate::tools::builtin::ReadFileTool {
+            workspace_dir: root.path().to_path_buf(),
+            restrict_to_workspace: true,
+        }));
+        let apps = crate::tools::mcp::McpAppBridge::new();
+        registry
+            .populate_tool_registry(
+                &mut tools,
+                &host_options(crate::config::McpDeferMode::Never),
+                &apps,
+            )
+            .await;
+
+        let mut names = tools.get_tool_names();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "chem__cancelled",
+                "chem__echo",
+                "chem__env",
+                "chem__roots",
+                "read_file"
+            ]
+        );
+        let out = tools
+            .execute_tool("chem__echo", serde_json::json!({"text": "routed"}))
+            .await
+            .expect("namespaced call reaches the original tool");
+        assert_eq!(out, "routed");
+    }
+
+    #[tokio::test]
+    async fn per_server_defer_keeps_schemas_out_until_activated() {
+        if which::which("python3").is_err() {
+            return;
+        }
+        let root = tempfile::tempdir().expect("tempdir");
+        write_fake_mcp_plugin(
+            root.path(),
+            "chem-plugin",
+            serde_json::json!({ "chem": fake_server_entry(serde_json::json!({"deferTools": true})) }),
+        );
+        let mut registry = PluginRegistry::new();
+        registry.scan_directory(root.path());
+        let mut tools = ToolRegistry::new();
+        let apps = crate::tools::mcp::McpAppBridge::new();
+        registry
+            .populate_tool_registry(
+                &mut tools,
+                &host_options(crate::config::McpDeferMode::Never),
+                &apps,
+            )
+            .await;
+        assert_eq!(tools.get_tool_names().len(), 6);
+        assert!(tools
+            .list_tools_for_session(None, false, Some("s"))
+            .is_empty());
+        tools
+            .deferred_handle()
+            .activate_matching("s", &["chem__e*".to_string()]);
+        assert_eq!(
+            tools.list_tools_for_session(None, false, Some("s")).len(),
+            2
+        );
+    }
 
     #[tokio::test]
     async fn installs_from_a_local_directory() {

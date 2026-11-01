@@ -1660,9 +1660,11 @@ impl AgentLogic {
             ));
 
             // Call Provider
-            let tools_payload = Some(serde_json::json!(
-                tools.list_tools_scoped(subagent_allowlist.as_deref(), is_subagent)
-            ));
+            let tools_payload = Some(serde_json::json!(tools.list_tools_for_session(
+                subagent_allowlist.as_deref(),
+                is_subagent,
+                Some(session_key.as_str()),
+            )));
 
             let (response, provider_retries) = match chat_with_retry(
                 provider.as_ref(),
