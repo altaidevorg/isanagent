@@ -507,7 +507,6 @@ impl PluginRegistry {
                     );
                     continue;
                 }
-                seen_servers.insert(server_name.clone(), plugin.name.clone());
                 if entry.server_type != "stdio" {
                     log::warn!(
                         "MCP server '{server_name}' (plugin '{}') has type '{}'; only stdio is supported",
@@ -516,6 +515,9 @@ impl PluginRegistry {
                     );
                     continue;
                 }
+                // Claim the name only for a server that will actually be launched, so a skipped
+                // entry never blocks a usable server of the same name in another plugin.
+                seen_servers.insert(server_name.clone(), plugin.name.clone());
 
                 if over.include_tools.is_some() {
                     entry.include_tools = over.include_tools.clone();
@@ -1035,6 +1037,37 @@ mod tests {
             .await
             .expect("namespaced call reaches the original tool");
         assert_eq!(out, "routed");
+    }
+
+    #[tokio::test]
+    async fn a_skipped_server_does_not_claim_its_name() {
+        if which::which("python3").is_err() {
+            return;
+        }
+        let root = tempfile::tempdir().expect("tempdir");
+        // `a-plugin` sorts first: its unsupported `sse` entry must not block `b-plugin`'s `chem`.
+        write_fake_mcp_plugin(
+            root.path(),
+            "a-plugin",
+            serde_json::json!({ "chem": {"type": "sse", "command": "unused"} }),
+        );
+        write_fake_mcp_plugin(
+            root.path(),
+            "b-plugin",
+            serde_json::json!({ "chem": fake_server_entry(serde_json::json!({})) }),
+        );
+        let mut registry = PluginRegistry::new();
+        registry.scan_directory(root.path());
+        let mut tools = ToolRegistry::new();
+        let apps = crate::tools::mcp::McpAppBridge::new();
+        registry
+            .populate_tool_registry(
+                &mut tools,
+                &host_options(crate::config::McpDeferMode::Never),
+                &apps,
+            )
+            .await;
+        assert!(tools.get_tool("chem__echo").is_some());
     }
 
     #[tokio::test]

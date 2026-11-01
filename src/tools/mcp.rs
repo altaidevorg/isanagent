@@ -235,14 +235,18 @@ impl McpExpansionContext {
         }
     }
 
-    fn host_var(&self, name: &str) -> Result<Option<String>, String> {
+    fn host_var(
+        &self,
+        name: &str,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Option<String>, String> {
         let policy = crate::environment::ExecutionEnvironmentPolicy::default_safe();
         if policy.is_secret_var(name) && !self.env_passthrough.iter().any(|k| k == name) {
             return Err(format!(
                 "'{name}' looks like a credential and is not listed in [harness.mcp] env_passthrough"
             ));
         }
-        Ok(std::env::var(name).ok())
+        Ok(lookup(name))
     }
 }
 
@@ -252,6 +256,16 @@ impl McpExpansionContext {
 /// [`McpExpansionContext::env_passthrough`]). An unset variable without a default expands to
 /// the empty string; the returned warnings say which.
 pub fn expand_mcp_vars(input: &str, ctx: &McpExpansionContext) -> (String, Vec<String>) {
+    expand_mcp_vars_with(input, ctx, &|name| std::env::var(name).ok())
+}
+
+/// [`expand_mcp_vars`] with an explicit host-environment lookup (tests pass a map instead of
+/// mutating the process environment, which is not thread-safe).
+fn expand_mcp_vars_with(
+    input: &str,
+    ctx: &McpExpansionContext,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> (String, Vec<String>) {
     let mut out = String::with_capacity(input.len());
     let mut warnings = Vec::new();
     let mut rest = input;
@@ -275,7 +289,7 @@ pub fn expand_mcp_vars(input: &str, ctx: &McpExpansionContext) -> (String, Vec<S
         } else {
             let value = match ctx.builtin(name) {
                 Some(v) => Some(v),
-                None => match ctx.host_var(name) {
+                None => match ctx.host_var(name, lookup) {
                     Ok(v) => v,
                     Err(reason) => {
                         warnings.push(reason);
@@ -1261,9 +1275,9 @@ impl Tool for McpProxyTool {
 #[cfg(test)]
 mod tests {
     use super::{
-        expand_mcp_vars, namespaced_tool_name, tool_passes_filters, tool_visible_to_model,
-        ui_resource_uri, McpAppBridge, McpClient, McpExpansionContext, McpLaunchOptions,
-        McpServerEntry, MAX_PROVIDER_TOOL_NAME_LEN,
+        namespaced_tool_name, tool_passes_filters, tool_visible_to_model, ui_resource_uri,
+        McpAppBridge, McpClient, McpExpansionContext, McpLaunchOptions, McpServerEntry,
+        MAX_PROVIDER_TOOL_NAME_LEN,
     };
     use serde_json::json;
     use std::path::PathBuf;
@@ -1309,9 +1323,18 @@ mod tests {
             sandbox_dir: Some(PathBuf::from("/ws/workspace")),
             env_passthrough: vec!["ISANAGENT_TEST_NCBI_API_KEY".to_string()],
         };
-        std::env::set_var("ISANAGENT_TEST_NCBI_API_KEY", "k-allowed");
-        std::env::set_var("ISANAGENT_TEST_OTHER_API_KEY", "k-hidden");
-        std::env::set_var("MCPTEST_PLAIN_VALUE", "plain");
+        // A fake host environment: mutating the real one (`set_var`) races other test threads.
+        let host: std::collections::HashMap<&str, &str> = [
+            ("ISANAGENT_TEST_NCBI_API_KEY", "k-allowed"),
+            ("ISANAGENT_TEST_OTHER_API_KEY", "k-hidden"),
+            ("MCPTEST_PLAIN_VALUE", "plain"),
+        ]
+        .into_iter()
+        .collect();
+        let lookup = |name: &str| host.get(name).map(|v| v.to_string());
+        let expand_mcp_vars = |input: &str, ctx: &McpExpansionContext| {
+            super::expand_mcp_vars_with(input, ctx, &lookup)
+        };
 
         let (v, w) = expand_mcp_vars("${PLUGIN_DIR}/server.py ${SANDBOX_DIR}", &ctx);
         assert_eq!(v, "/plugins/chem/server.py /ws/workspace");
