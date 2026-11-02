@@ -638,16 +638,31 @@ Enable [api], [slack], or [email] (with enabled = true) so the agent can receive
             memory_node: memory_node.clone(),
         }));
     }
-    let uv_bin = workspace.config.execution_uv_binary();
     let mcp_apps = crate::tools::mcp::McpAppBridge::new();
+    let mcp_options = crate::plugins::McpHostOptions::from_config(
+        &workspace.config,
+        Some(workspace.sandbox_dir.clone()),
+        // Deferred tools are loaded through `search_tools`, registered below with builtins.
+        builtin_tools,
+    );
     plugins
-        .populate_tool_registry(&mut tools, &uv_bin, &mcp_apps)
+        .populate_tool_registry(&mut tools, &mcp_options, &mcp_apps)
         .await;
+    // Always-on skills are in every prompt, so the tools they name stay in every request.
+    let always_on_tools = skills.always_on_allowed_tools();
+    if !always_on_tools.is_empty() {
+        let undeferred = tools.deferred_handle().undefer_matching(&always_on_tools);
+        if !undeferred.is_empty() {
+            log::info!(
+                "Not deferring {} MCP tools named by always-on skills",
+                undeferred.len()
+            );
+        }
+    }
     if builtin_tools {
         let tool_catalog = tools.catalog_handle();
-        tools.register(Box::new(ToolSearchTool {
-            catalog: tool_catalog,
-        }));
+        let deferred = tools.deferred_handle();
+        tools.register(Box::new(ToolSearchTool::new(tool_catalog, Some(deferred))));
     }
 
     // 5. Setup Provider (Dynamic from config)

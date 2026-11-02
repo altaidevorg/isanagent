@@ -18,6 +18,33 @@ pub struct SkillDefinition {
     pub path: PathBuf,
     pub always: bool,
     pub available: bool,
+    /// Tool names from the `allowed-tools` frontmatter (a trailing `*` matches a prefix).
+    /// Loading the skill activates the deferred ones among them for the session.
+    pub allowed_tools: Vec<String>,
+}
+
+/// `allowed-tools` is a space/comma separated string in the Agent Skills spec; a YAML list is
+/// accepted too.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum AllowedToolsFrontmatter {
+    Text(String),
+    List(Vec<String>),
+}
+
+impl AllowedToolsFrontmatter {
+    fn into_names(self) -> Vec<String> {
+        let raw = match self {
+            Self::Text(text) => vec![text],
+            Self::List(list) => list,
+        };
+        raw.iter()
+            .flat_map(|item| item.split(|c: char| c == ',' || c.is_whitespace()))
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -32,6 +59,8 @@ struct SkillFrontmatter {
     description: String,
     always: Option<bool>,
     requires: Option<SkillRequiresFrontmatter>,
+    #[serde(rename = "allowed-tools", alias = "allowed_tools")]
+    allowed_tools: Option<AllowedToolsFrontmatter>,
 }
 
 pub struct SkillRegistry {
@@ -184,6 +213,10 @@ impl SkillRegistry {
                     path: path.to_path_buf(),
                     always: metadata.always.unwrap_or(false),
                     available,
+                    allowed_tools: metadata
+                        .allowed_tools
+                        .map(AllowedToolsFrontmatter::into_names)
+                        .unwrap_or_default(),
                 })
             }
             Err(e) => {
@@ -237,6 +270,29 @@ impl SkillRegistry {
             }
             None => Err(format!("Skill '{name}' not found")),
         }
+    }
+
+    /// `allowed-tools` of a loadable skill (empty when unknown or unavailable).
+    pub fn get_skill_allowed_tools(&self, name: &str) -> Vec<String> {
+        self.skills
+            .get(name)
+            .filter(|skill| skill.available)
+            .map(|skill| skill.allowed_tools.clone())
+            .unwrap_or_default()
+    }
+
+    /// `allowed-tools` of every available always-on skill (their bodies are always in the
+    /// prompt, so their tools should not be deferred).
+    pub fn always_on_allowed_tools(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .skills
+            .values()
+            .filter(|skill| skill.always && skill.available)
+            .flat_map(|skill| skill.allowed_tools.iter().cloned())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     pub fn get_skill_names(&self) -> Vec<String> {
@@ -475,6 +531,37 @@ fn copy_symlink(src: &Path, dst: &Path) -> Result<(), String> {
 mod skill_metadata_tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn allowed_tools_frontmatter_accepts_string_and_list() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, field) in [
+            (
+                "a",
+                "allowed-tools: chem__rdkit_* chem__stats_mean, read_file",
+            ),
+            ("b", "allowed-tools:\n  - chem__rdkit_*\n  - read_file"),
+            ("c", "always: true\nallowed-tools: chem__kegg_*"),
+        ] {
+            let skill = dir.path().join(name);
+            fs::create_dir_all(&skill).unwrap();
+            fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: d\n{field}\n---\nbody\n"),
+            )
+            .unwrap();
+        }
+        let reg = SkillRegistry::new(dir.path().to_path_buf());
+        assert_eq!(
+            reg.get_skill_allowed_tools("a"),
+            vec!["chem__rdkit_*", "chem__stats_mean", "read_file"]
+        );
+        assert_eq!(
+            reg.get_skill_allowed_tools("b"),
+            vec!["chem__rdkit_*", "read_file"]
+        );
+        assert_eq!(reg.always_on_allowed_tools(), vec!["chem__kegg_*"]);
+    }
 
     #[test]
     fn metadata_and_directory_without_loading_full_body() {

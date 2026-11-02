@@ -158,6 +158,92 @@ Declare MCP servers at the plugin root in `mcp.json`:
 }
 ```
 
+### Tool names
+
+Every MCP tool is exposed to the model as `{server}__{tool}` — `chem__rdkit_mol_weight` for tool `rdkit_mol_weight` of server `chem`. Server and tool can therefore never shadow a built-in tool (`read_file`, `exec`, …) or another server's tool. Providers only accept `[A-Za-z0-9_-]` up to 64 characters, so other characters become `_`, and a longer name keeps a readable prefix plus a stable 8-character hash. The server still receives its own tool name in `tools/call`.
+
+Use the exposed name wherever isanagent refers to a tool: `[harness.permissions.tools]` (a trailing `*` covers a whole server: `"chem__*" = "ask"`), sub-agent `allowed_tools`, and a skill's `allowed-tools`. Two plugins declaring the same server name: the second is skipped with a warning.
+
+### Variables, environment and sandbox
+
+`command`, `args`, `env` and `cwd` expand `${VAR}` and `${VAR:-default}`:
+
+| Variable | Value |
+| :--- | :--- |
+| `${PLUGIN_DIR}` (also `${CLAUDE_PLUGIN_ROOT}`, `${CLAUDE_PLUGIN_DIR}`) | The plugin directory. |
+| `${SANDBOX_DIR}` | The agent sandbox (where `read_file` / `write_file` work). |
+| any other name | The host environment variable. |
+
+The server process starts from the scrubbed safe environment: it inherits nothing secret by default. A credential-looking variable (`*_KEY`, `*_TOKEN`, `*_SECRET`, …) expands only when the user lists it in `config.toml`, so a plugin cannot read the host's provider keys on its own:
+
+```toml
+[harness.mcp]
+env_passthrough = ["NCBI_API_KEY"]
+```
+
+Every server also gets `ISANAGENT_SANDBOX_DIR`, and answers to MCP `roots/list` name the sandbox, so file-reading tools can resolve relative paths against the same directory the agent writes to. The server's working directory stays the plugin directory unless `cwd` says otherwise (`"cwd": "${SANDBOX_DIR}"`). These tell the server where the sandbox is; they do not confine it: an MCP server is a normal process with the user's permissions.
+
+### Robustness
+
+- Servers start concurrently. Each must answer `initialize` and `tools/list` within the startup timeout (default 60 s); one that fails or times out is logged and skipped without delaying the others. A server whose first start installs packages (`uv run` resolving RDKit, …) should raise `startupTimeoutSecs`.
+- Each `tools/call` has a deadline (default 300 s). On timeout, or when the user stops the turn, the server receives `notifications/cancelled`.
+- stdout must carry JSON-RPC only. Lines that are not JSON (a library printing at import time) are skipped with a warning rather than failing the call, but servers should send logs to stderr. stderr is captured to the isanagent log (`debug`), and its last lines are attached to errors when a server exits.
+
+### Large servers: filters and deferred tools
+
+Every tool schema is sent with every model request. For a server with a hundred tools that is tens of thousands of tokens per turn, so isanagent offers two controls:
+
+- **Filters** — `includeTools` / `excludeTools` (original tool names, trailing `*` allowed) drop tools a plugin does not need, for example tools that duplicate isanagent's own sandboxed file and code-execution tools.
+- **Deferred tools** — a deferred tool is registered but its schema stays out of requests until the session loads it. The `search_tools` description lists deferred tools by name; a search loads the tools it returns (`select:a,b` loads exact names), and `load_skill_instructions` loads the tools named by the skill's `allowed-tools` frontmatter. Tools named by an always-on skill are never deferred. By default (`[harness.mcp] defer_tools = "auto"`) all MCP tools are deferred once their schemas exceed about 10k tokens (`defer_threshold_chars`, default 40000). Deferral needs `search_tools` (builtin tools enabled).
+
+Per-server isanagent extensions in `mcp.json` (other clients ignore them):
+
+```json
+{
+  "mcpServers": {
+    "chem": {
+      "command": "uv",
+      "args": ["run", "--project", "${PLUGIN_DIR}", "chem-mcp"],
+      "env": { "NCBI_API_KEY": "${NCBI_API_KEY}" },
+      "startupTimeoutSecs": 600,
+      "toolTimeoutSecs": 120,
+      "excludeTools": ["read_file", "write_file", "list_files", "python_interpreter"],
+      "deferTools": true
+    }
+  }
+}
+```
+
+A skill that should bring its tools along:
+
+```markdown
+---
+name: rdkit-descriptors
+description: Compute molecular descriptors with RDKit.
+allowed-tools: chem__rdkit_*
+---
+```
+
+The user can override any of this per server in `config.toml` (keys are the `mcpServers` names):
+
+```toml
+[harness.mcp]
+startup_timeout_secs = 60
+tool_timeout_secs = 300
+env_passthrough = ["NCBI_API_KEY"]
+defer_tools = "auto"            # auto | always | never
+
+[harness.mcp.servers.chem]
+enabled = true
+startup_timeout_secs = 900
+exclude_tools = ["kegg_*"]      # added to the server's excludeTools
+include_tools = ["rdkit_*", "stats_*"]
+defer_tools = false
+env_passthrough = ["CHEMSPIDER_API_KEY"]
+```
+
+### MCP Apps
+
 If a tool sets `_meta.ui.resourceUri` to a `ui://` HTML resource (`text/html;profile=mcp-app`), the embedded web UI renders that resource in a sandboxed iframe after the tool runs. The model still receives only the tool's text result. The iframe can call tools on the same server and can send a follow-up chat message. Tools whose `_meta.ui.visibility` does not include `model` are hidden from the LLM and remain callable from the widget.
 
 ---

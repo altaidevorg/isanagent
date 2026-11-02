@@ -374,9 +374,27 @@ impl ResolvedToolPermissions {
         is_edit: bool,
         unattended: bool,
     ) -> Option<ShellPolicyMode> {
+        self.tool_entry(tool_name)
+            .map(|mode| self.apply_session(mode, is_edit, unattended))
+    }
+
+    /// The `[harness.permissions.tools]` entry for `tool_name`: the exact name, else the
+    /// longest `prefix*` pattern matching it (e.g. `"chem__*" = "ask"` for every tool of the
+    /// `chem` MCP server).
+    pub fn tool_entry(&self, tool_name: &str) -> Option<ShellPolicyMode> {
+        if let Some(mode) = self.tools.get(tool_name) {
+            return Some(*mode);
+        }
         self.tools
-            .get(tool_name)
-            .map(|mode| self.apply_session(*mode, is_edit, unattended))
+            .iter()
+            .filter_map(|(pattern, mode)| {
+                let prefix = pattern.strip_suffix('*')?;
+                tool_name
+                    .starts_with(prefix)
+                    .then_some((prefix.len(), *mode))
+            })
+            .max_by_key(|(len, _)| *len)
+            .map(|(_, mode)| mode)
     }
 
     /// The per-tool entry when it replaces the location / default rules for `tool_name`.
@@ -596,7 +614,64 @@ pub struct HarnessConfig {
     pub hooks: Option<HarnessHooksConfig>,
     pub background_jobs: Option<BackgroundJobsConfig>,
     pub notifications: Option<NotificationsConfig>,
+    /// Plugin MCP servers: timeouts, credential pass-through, tool filters and deferred
+    /// schemas (`[harness.mcp]`, per server `[harness.mcp.servers.<name>]`).
+    pub mcp: Option<McpHarnessConfig>,
 }
+
+/// `[harness.mcp]`: host-wide defaults for plugin MCP servers. Every key also exists per server
+/// under `[harness.mcp.servers.<name>]`, which wins over both these defaults and the server's
+/// own `mcp.json` entry.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct McpHarnessConfig {
+    /// Deadline for `initialize` + `tools/list` (default 60).
+    pub startup_timeout_secs: Option<u64>,
+    /// Deadline for each `tools/call` (default 300).
+    pub tool_timeout_secs: Option<u64>,
+    /// Credential-looking host variables (`NCBI_API_KEY`, …) that `mcp.json` may read with
+    /// `${VAR}`. Non-secret variables need no listing; nothing is inherited without `${VAR}`.
+    #[serde(default)]
+    pub env_passthrough: Vec<String>,
+    /// `"auto"` (default): defer every MCP tool schema once their total size passes
+    /// `defer_threshold_chars`; `"always"`; `"never"`. Deferred tools load through
+    /// `search_tools` or a skill's `allowed-tools`. Needs builtin tools (`search_tools`).
+    pub defer_tools: Option<String>,
+    /// Size of all MCP tool schemas (JSON characters, ~4 per token) above which `"auto"`
+    /// defers them (default 40000, about 10k tokens).
+    pub defer_threshold_chars: Option<usize>,
+    #[serde(default)]
+    pub servers: std::collections::BTreeMap<String, McpServerHarnessConfig>,
+}
+
+/// `[harness.mcp.servers.<name>]` (keyed by the `mcpServers` name).
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct McpServerHarnessConfig {
+    /// `false` skips the server entirely.
+    pub enabled: Option<bool>,
+    pub startup_timeout_secs: Option<u64>,
+    pub tool_timeout_secs: Option<u64>,
+    /// Only these tools (original MCP names; trailing `*` = prefix).
+    pub include_tools: Option<Vec<String>>,
+    /// Never these tools (added to the server's own `excludeTools`).
+    #[serde(default)]
+    pub exclude_tools: Vec<String>,
+    /// Defer this server's tools (`true`) or always send them (`false`).
+    pub defer_tools: Option<bool>,
+    /// Extra credential variables for this server only.
+    #[serde(default)]
+    pub env_passthrough: Vec<String>,
+}
+
+/// How MCP tool schemas are deferred (`[harness.mcp] defer_tools`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpDeferMode {
+    Auto,
+    Always,
+    Never,
+}
+
+/// Default for `[harness.mcp] defer_threshold_chars`.
+pub const DEFAULT_MCP_DEFER_THRESHOLD_CHARS: usize = 40_000;
 
 /// Core host tools. On by default; set `[harness.builtin_tools] enabled = false` to leave only
 /// plugin MCP tools (and other harness-gated tools that are independently enabled).
@@ -1595,6 +1670,35 @@ impl AppConfig {
     }
 
     /// Binary for UV-managed local Python runtime.
+    /// `[harness.mcp]`, or defaults.
+    pub fn mcp_harness(&self) -> McpHarnessConfig {
+        self.harness
+            .as_ref()
+            .and_then(|h| h.mcp.clone())
+            .unwrap_or_default()
+    }
+
+    /// `[harness.mcp] defer_tools` (unknown values fall back to `auto` with a warning).
+    pub fn mcp_defer_mode(&self) -> McpDeferMode {
+        match self
+            .mcp_harness()
+            .defer_tools
+            .as_deref()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            None | Some("auto") => McpDeferMode::Auto,
+            Some("always") | Some("true") => McpDeferMode::Always,
+            Some("never") | Some("false") => McpDeferMode::Never,
+            Some(other) => {
+                log::warn!(
+                    "[harness.mcp] defer_tools = '{other}' is not auto/always/never; using auto"
+                );
+                McpDeferMode::Auto
+            }
+        }
+    }
+
     pub fn execution_uv_binary(&self) -> String {
         self.harness
             .as_ref()
@@ -2503,6 +2607,57 @@ interactive_requires_approval_for = ["terraform destroy"]
     fn perms(toml_src: &str) -> ResolvedToolPermissions {
         let c: AppConfig = toml::from_str(toml_src).expect("parse");
         c.resolved_tool_permissions()
+    }
+
+    #[test]
+    fn tool_permission_prefix_patterns_cover_a_whole_mcp_server() {
+        let p = perms(
+            r#"
+[harness.permissions.tools]
+"chem__*" = "ask"
+"chem__rdkit_*" = "allow"
+"chem__write_file" = "deny"
+"#,
+        );
+        assert_eq!(
+            p.tool_override("chem__stats_mean", false, false),
+            Some(ShellPolicyMode::Ask)
+        );
+        // Longest pattern wins; an exact name beats every pattern.
+        assert_eq!(
+            p.tool_override("chem__rdkit_logp", false, false),
+            Some(ShellPolicyMode::Allow)
+        );
+        assert_eq!(
+            p.tool_override("chem__write_file", false, false),
+            Some(ShellPolicyMode::Deny)
+        );
+        assert_eq!(p.tool_override("read_file", false, false), None);
+    }
+
+    #[test]
+    fn harness_mcp_section_parses() {
+        let c: AppConfig = toml::from_str(
+            r#"
+[harness.mcp]
+tool_timeout_secs = 120
+env_passthrough = ["NCBI_API_KEY"]
+defer_tools = "always"
+
+[harness.mcp.servers.chem]
+startup_timeout_secs = 600
+exclude_tools = ["read_file", "write_file"]
+"#,
+        )
+        .expect("parse");
+        let mcp = c.mcp_harness();
+        assert_eq!(mcp.tool_timeout_secs, Some(120));
+        assert_eq!(mcp.env_passthrough, vec!["NCBI_API_KEY"]);
+        assert_eq!(c.mcp_defer_mode(), McpDeferMode::Always);
+        let chem = &mcp.servers["chem"];
+        assert_eq!(chem.startup_timeout_secs, Some(600));
+        assert_eq!(chem.exclude_tools.len(), 2);
+        assert_eq!(AppConfig::default().mcp_defer_mode(), McpDeferMode::Auto);
     }
 
     #[test]

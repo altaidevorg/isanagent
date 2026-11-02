@@ -5,6 +5,7 @@ use std::sync::{Arc, RwLock};
 
 pub mod builtin;
 pub mod compact;
+pub mod deferred;
 pub mod exec_jobs;
 pub mod execution;
 pub mod isanagent_ignore;
@@ -84,6 +85,8 @@ pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn Tool>>,
     /// Registration order (name, description) for `search_tools` and stable listing.
     catalog: Arc<RwLock<Vec<(String, String)>>>,
+    /// Tools whose schemas are sent only after a session activates them.
+    deferred: deferred::DeferredTools,
 }
 
 impl ToolRegistry {
@@ -91,7 +94,24 @@ impl ToolRegistry {
         Self {
             tools: HashMap::new(),
             catalog: Arc::new(RwLock::new(Vec::new())),
+            deferred: deferred::DeferredTools::new(),
         }
+    }
+
+    /// Shared handle on the deferred-tool state (for `search_tools` and the skill loader).
+    pub fn deferred_handle(&self) -> deferred::DeferredTools {
+        self.deferred.clone()
+    }
+
+    /// Registers a tool whose schema stays out of provider requests until a session activates
+    /// it (see [`deferred::DeferredTools`]). Returns false when the name is already taken.
+    pub fn register_deferred(&mut self, tool: Box<dyn Tool>, group: &str) -> bool {
+        let name = tool.name().to_string();
+        if !self.register(tool) {
+            return false;
+        }
+        self.deferred.defer(name, group);
+        true
     }
 
     /// Clone the shared catalog handle (for registering [`workflow::ToolSearchTool`]).
@@ -99,14 +119,23 @@ impl ToolRegistry {
         Arc::clone(&self.catalog)
     }
 
-    pub fn register(&mut self, tool: Box<dyn Tool>) {
+    /// Registers a tool. The first registration of a name wins: a later tool with the same
+    /// name is dropped with a warning instead of silently replacing the earlier one (which
+    /// would also list the name twice in the provider `tools` array). Returns whether the tool
+    /// was registered.
+    pub fn register(&mut self, tool: Box<dyn Tool>) -> bool {
         let name = tool.name().to_string();
+        if self.tools.contains_key(&name) {
+            log::warn!("Tool '{name}' is already registered; ignoring the duplicate registration");
+            return false;
+        }
         let desc = tool.description().to_string();
         self.catalog
             .write()
             .expect("catalog write")
             .push((name.clone(), desc));
         self.tools.insert(name, tool);
+        true
     }
 
     pub fn get_tool(&self, name: &str) -> Option<&dyn Tool> {
@@ -117,6 +146,7 @@ impl ToolRegistry {
         self.tools.keys().cloned().collect()
     }
 
+    /// Every registered tool's schema, deferred ones included.
     pub fn list_tools(&self) -> Vec<Value> {
         let cat = self.catalog.read().expect("catalog read");
         cat.iter()
@@ -290,16 +320,30 @@ impl ToolRegistry {
         allowlist: Option<&HashSet<String>>,
         is_subagent: bool,
     ) -> Vec<Value> {
+        self.list_tools_for_session(allowlist, is_subagent, None)
+    }
+
+    /// Tool schemas for one provider request in `session_key`. Deferred tools appear only when
+    /// that session activated them, or when a non-empty allowlist names them explicitly.
+    pub fn list_tools_for_session(
+        &self,
+        allowlist: Option<&HashSet<String>>,
+        is_subagent: bool,
+        session_key: Option<&str>,
+    ) -> Vec<Value> {
         let cat = self.catalog.read().expect("catalog read");
+        let explicit = allowlist.filter(|set| !set.is_empty());
         cat.iter()
             .filter_map(|(name, _)| {
                 if is_subagent && Self::is_subagent_restricted_tool(name) {
                     return None;
                 }
-                if let Some(set) = allowlist {
-                    if !set.is_empty() && !set.contains(name) {
+                if let Some(set) = explicit {
+                    if !set.contains(name) {
                         return None;
                     }
+                } else if !self.deferred.is_visible(session_key, name) {
+                    return None;
                 }
                 self.tools.get(name).map(|t| {
                     serde_json::json!({
@@ -535,6 +579,45 @@ mod scoped_tools_tests {
         r.execute_tool_scoped("ask_user", Value::Null, None, true)
             .await
             .expect("system-initiated ask_user must bypass the allowlist");
+    }
+
+    #[test]
+    fn duplicate_registration_keeps_the_first_tool_and_lists_it_once() {
+        let mut r = ToolRegistry::new();
+        assert!(r.register(Box::new(NamedTool { n: "read_file" })));
+        assert!(!r.register(Box::new(NamedTool { n: "read_file" })));
+        assert_eq!(r.list_tools().len(), 1);
+    }
+
+    #[test]
+    fn deferred_tools_are_listed_only_after_session_activation() {
+        let mut r = ToolRegistry::new();
+        r.register(Box::new(NamedTool { n: "read_file" }));
+        assert!(r.register_deferred(Box::new(NamedTool { n: "chem__logp" }), "chem"));
+        let names = |v: Vec<Value>| -> Vec<String> {
+            v.iter()
+                .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(
+            names(r.list_tools_for_session(None, false, Some("s1"))),
+            vec!["read_file"]
+        );
+        r.deferred_handle().activate("s1", ["chem__logp"]);
+        assert_eq!(
+            names(r.list_tools_for_session(None, false, Some("s1"))),
+            vec!["read_file", "chem__logp"]
+        );
+        assert_eq!(
+            names(r.list_tools_for_session(None, false, Some("s2"))),
+            vec!["read_file"]
+        );
+        // An explicit sub-agent allowlist reaches deferred tools directly.
+        let allow: HashSet<String> = ["chem__logp".to_string()].into_iter().collect();
+        assert_eq!(
+            names(r.list_tools_for_session(Some(&allow), true, None)),
+            vec!["chem__logp"]
+        );
     }
 
     #[test]

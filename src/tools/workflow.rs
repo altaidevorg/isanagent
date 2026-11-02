@@ -16,6 +16,7 @@ use crate::tool_runtime::current_tool_exec_ctx;
 use crate::traits::{Tool, ToolPolicy};
 use crate::NodeHandle;
 
+use super::deferred::DeferredTools;
 use super::search_tool_index;
 
 pub use crate::memory::TodoRow;
@@ -174,8 +175,61 @@ impl Tool for TodoWriteTool {
 }
 
 /// Search registered tools by keywords (name + description).
+///
+/// Also the way deferred tools (see [`crate::tools::deferred`]) become callable: every deferred
+/// tool in the results is activated for the calling session, so its schema is sent from the
+/// next provider request on. `select:a,b` activates exact names without searching.
 pub struct ToolSearchTool {
     pub catalog: Arc<RwLock<Vec<(String, String)>>>,
+    deferred: Option<DeferredTools>,
+    description: String,
+}
+
+/// Cap on the deferred-tool name list embedded in the `search_tools` description.
+const DEFERRED_NAMES_DESCRIPTION_MAX_CHARS: usize = 6_000;
+
+impl ToolSearchTool {
+    /// `deferred`: the registry's handle; its current deferred tools are listed (by name) in
+    /// the tool description so the model knows they exist. Build this after every deferred
+    /// tool is registered.
+    pub fn new(
+        catalog: Arc<RwLock<Vec<(String, String)>>>,
+        deferred: Option<DeferredTools>,
+    ) -> Self {
+        let mut description = String::from(
+            "Find tools by keyword or short phrase. Use when unsure which tool fits a task. Matches tool names and descriptions.",
+        );
+        if let Some(groups) = deferred
+            .as_ref()
+            .map(|d| d.groups())
+            .filter(|g| !g.is_empty())
+        {
+            description.push_str(
+                "\n\nSome tools are deferred: they are not in your tool list until loaded. Searching loads every deferred tool it returns (callable from your next step); `select:name1,name2` loads exact names. Deferred tools by server:",
+            );
+            let mut listed = String::new();
+            let mut omitted = 0usize;
+            for (group, names) in &groups {
+                let line = format!("\n- {group}: {}", names.join(", "));
+                if listed.len() + line.len() <= DEFERRED_NAMES_DESCRIPTION_MAX_CHARS {
+                    listed.push_str(&line);
+                } else {
+                    omitted += names.len();
+                }
+            }
+            description.push_str(&listed);
+            if omitted > 0 {
+                description.push_str(&format!(
+                    "\n- … and {omitted} more (search by keyword to find them)"
+                ));
+            }
+        }
+        Self {
+            catalog,
+            deferred,
+            description,
+        }
+    }
 }
 
 #[async_trait]
@@ -185,11 +239,11 @@ impl Tool for ToolSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Find built-in tools by keyword or short phrase. Use when unsure which tool fits a task. Matches tool names and descriptions."
+        &self.description
     }
 
     fn policy(&self) -> ToolPolicy {
-        // Read-only registry lookup.
+        // Registry lookup; activation only touches per-session in-memory state.
         ToolPolicy::parallel()
     }
 
@@ -199,7 +253,7 @@ impl Tool for ToolSearchTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Keywords to search for (e.g. 'grep', 'schedule', 'memory')."
+                    "description": "Keywords to search for (e.g. 'grep', 'schedule', 'memory'), or `select:name1,name2` to load exact tool names."
                 },
                 "limit": {
                     "type": "integer",
@@ -228,23 +282,57 @@ impl Tool for ToolSearchTool {
             .map_err(|e| format!("catalog lock: {e}"))?
             .clone();
 
-        let hits = search_tool_index(&entries, query, limit);
+        let hits: Vec<(String, Option<usize>)> = match query.trim().strip_prefix("select:") {
+            Some(list) => list
+                .split(',')
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty() && entries.iter().any(|(e, _)| e == n))
+                .map(|n| (n, None))
+                .collect(),
+            None => search_tool_index(&entries, query, limit)
+                .into_iter()
+                .map(|(n, score)| (n, Some(score)))
+                .collect(),
+        };
         if hits.is_empty() {
             return Ok("No tools matched that query.".to_string());
         }
 
+        let session_key = current_tool_exec_ctx().map(|ctx| ctx.session_key);
+        let mut loaded: Vec<String> = Vec::new();
+        if let (Some(deferred), Some(key)) = (self.deferred.as_ref(), session_key.as_deref()) {
+            loaded = deferred.activate(key, hits.iter().map(|(n, _)| n.as_str()));
+        }
+
         let mut out = String::from("Matching tools:\n\n");
-        for (name, score) in hits {
+        for (name, score) in &hits {
             let desc = entries
                 .iter()
-                .find(|(n, _)| n == &name)
+                .find(|(n, _)| n == name)
                 .map(|(_, d)| d.as_str())
                 .unwrap_or("");
             let snippet: String = desc.chars().take(160).collect();
-            let ellipses = if desc.len() > 160 { "…" } else { "" };
-            out.push_str(&format!(
-                "- **{name}** (score {score})\n  {snippet}{ellipses}\n\n"
-            ));
+            let ellipses = if desc.chars().count() > 160 {
+                "…"
+            } else {
+                ""
+            };
+            let tag = if loaded.contains(name) {
+                " [loaded now]"
+            } else {
+                ""
+            };
+            match score {
+                Some(score) => out.push_str(&format!(
+                    "- **{name}** (score {score}){tag}\n  {snippet}{ellipses}\n\n"
+                )),
+                None => out.push_str(&format!("- **{name}**{tag}\n  {snippet}{ellipses}\n\n")),
+            }
+        }
+        if !loaded.is_empty() {
+            out.push_str(
+                "Tools marked [loaded now] were deferred; their full schemas are available from your next step.",
+            );
         }
         Ok(out.trim_end().to_string())
     }
@@ -840,6 +928,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_search_lists_and_activates_deferred_tools_per_session() {
+        let cat = Arc::new(RwLock::new(vec![
+            ("read_file".to_string(), "Read a file.".to_string()),
+            (
+                "chem__mol_weight".to_string(),
+                "Molecular weight of a SMILES.".to_string(),
+            ),
+            ("chem__logp".to_string(), "LogP of a SMILES.".to_string()),
+        ]));
+        let deferred = crate::tools::deferred::DeferredTools::new();
+        deferred.defer("chem__mol_weight", "chem");
+        deferred.defer("chem__logp", "chem");
+        let tool = ToolSearchTool::new(Arc::clone(&cat), Some(deferred.clone()));
+        assert!(tool
+            .description()
+            .contains("- chem: chem__logp, chem__mol_weight"));
+
+        let ctx = crate::tool_runtime::ToolExecCtx::new("tauri", "chat-1", None);
+        let key = ctx.session_key.clone();
+        let out = crate::tool_runtime::with_tool_exec_scope(ctx, async {
+            tool.execute(json!({"query": "molecular weight"}))
+                .await
+                .unwrap()
+        })
+        .await;
+        assert!(
+            out.contains("chem__mol_weight") && out.contains("[loaded now]"),
+            "{out}"
+        );
+        assert!(deferred.is_visible(Some(&key), "chem__mol_weight"));
+        assert!(!deferred.is_visible(Some(&key), "chem__logp"));
+
+        let ctx = crate::tool_runtime::ToolExecCtx::new("tauri", "chat-1", None);
+        let out = crate::tool_runtime::with_tool_exec_scope(ctx, async {
+            tool.execute(json!({"query": "select:chem__logp, nope"}))
+                .await
+                .unwrap()
+        })
+        .await;
+        assert!(out.contains("chem__logp") && !out.contains("nope"), "{out}");
+        assert!(deferred.is_visible(Some(&key), "chem__logp"));
+    }
+
+    #[tokio::test]
     async fn tool_search_ranks_name_matches() {
         let cat = Arc::new(RwLock::new(vec![
             (
@@ -855,9 +987,7 @@ mod tests {
                 "Search session memory summaries.".to_string(),
             ),
         ]));
-        let tool = ToolSearchTool {
-            catalog: Arc::clone(&cat),
-        };
+        let tool = ToolSearchTool::new(Arc::clone(&cat), None);
 
         let out = tool
             .execute(json!({"query": "memory", "limit": 5}))
